@@ -1,0 +1,158 @@
+use crate::button::Button;
+use camino::Utf8PathBuf;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    fmt::{Debug, Display},
+    num::NonZeroU32,
+    ops::{Deref, DerefMut},
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    #[serde(default = "default_width")]
+    pub width: NonZeroU32,
+    #[serde(default = "default_height")]
+    pub height: NonZeroU32,
+    #[serde(default)]
+    pub talk_button: Option<Button>,
+    #[serde(default)]
+    pub session_button: Option<Button>,
+    #[serde(default)]
+    pub microphone: Option<String>,
+    #[serde(default)]
+    pub speaker: Option<String>,
+    #[serde(default = "default_radio_effect")]
+    pub radio_effect: f32,
+    #[serde(default = "default_volume")]
+    pub master_volume: f32,
+    #[serde(default = "default_volume")]
+    pub engineer_volume: f32,
+    #[serde(default = "default_volume")]
+    pub spotter_volume: f32,
+    #[serde(default = "default_volume")]
+    pub beep_volume: f32,
+    #[serde(default = "default_true")]
+    pub auto_session: bool,
+    #[serde(default = "default_true")]
+    pub spotter: bool,
+    #[serde(default)]
+    pub spotter_language: Option<ArrayStr<2>>,
+    #[serde(default = "default_opponent_frequency")]
+    pub opponent_frequency: NonZeroU32,
+    #[serde(default)]
+    pub voices: BTreeMap<ArrayStr<2>, Utf8PathBuf>,
+    #[serde(default = "default_silence_level")]
+    pub silence_level: f32,
+    #[serde(default)]
+    pub whisper_model: Option<Utf8PathBuf>,
+    #[serde(default = "default_claude_model")]
+    pub claude_model: String,
+    #[serde(default = "default_claude_effort")]
+    pub claude_effort: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct ArrayStr<const N: usize>([u8; N]);
+
+impl<const N: usize> Debug for ArrayStr<N> {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(self.deref(), f)
+    }
+}
+
+impl<const N: usize> Display for ArrayStr<N> {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(self.deref(), f)
+    }
+}
+
+impl<const N: usize> Deref for ArrayStr<N> {
+    type Target = str;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        unsafe { std::str::from_utf8_unchecked(&self.0) }
+    }
+}
+
+impl<const N: usize> DerefMut for ArrayStr<N> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { std::str::from_utf8_unchecked_mut(&mut self.0) }
+    }
+}
+
+impl<const N: usize> Serialize for ArrayStr<N> {
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.deref().serialize(serializer)
+    }
+}
+
+impl<'de, const N: usize> Deserialize<'de> for ArrayStr<N> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = <&'de str>::deserialize(deserializer)?.as_bytes();
+        let arr = s.as_array::<N>().ok_or_else(|| {
+            let msg = format!("a {} byte{} UTF-8 string", N, if N == 1 { "" } else { "s" });
+            let msg = msg.as_str();
+            <D::Error as serde::de::Error>::invalid_length(s.len(), &msg)
+        })?;
+
+        return Ok(Self(*arr));
+    }
+}
+
+#[inline(always)]
+const fn default_width() -> NonZeroU32 {
+    const { NonZeroU32::new(600).unwrap() }
+}
+
+#[inline(always)]
+const fn default_height() -> NonZeroU32 {
+    const { NonZeroU32::new(900).unwrap() }
+}
+
+#[inline(always)]
+const fn default_radio_effect() -> f32 {
+    0.65
+}
+
+#[inline(always)]
+const fn default_volume() -> f32 {
+    1.0
+}
+
+#[inline(always)]
+const fn default_true() -> bool {
+    true
+}
+
+#[inline(always)]
+const fn default_opponent_frequency() -> NonZeroU32 {
+    const { NonZeroU32::new(5).unwrap() }
+}
+
+#[inline(always)]
+const fn default_silence_level() -> f32 {
+    0.003
+}
+
+#[inline(always)]
+fn default_claude_model() -> String {
+    String::from("claude-sonnet-5-5")
+}
+
+#[inline(always)]
+fn default_claude_effort() -> String {
+    String::from("high")
+}
