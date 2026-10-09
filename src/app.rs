@@ -1,11 +1,10 @@
-use std::io::ErrorKind;
-
 use crate::{
     button::{Button, ButtonWatcher},
     config::Config,
+    ui::Context,
 };
-use anyhow::Context;
-use camino::Utf8PathBuf;
+use anyhow::Context as AnyhowContext;
+use camino::{Utf8Path, Utf8PathBuf};
 use sdl3::{
     AudioSubsystem, EventSubsystem, JoystickSubsystem, VideoSubsystem,
     event::Event,
@@ -15,8 +14,10 @@ use sdl3::{
     render::WindowCanvas,
 };
 use sdl3_main::AppResult;
+use std::io::ErrorKind;
 
 pub struct App {
+    base_path: &'static Utf8Path,
     pref_path: Utf8PathBuf,
     config: Config,
     audio: AudioSubsystem,
@@ -24,22 +25,28 @@ pub struct App {
     joystick: JoystickSubsystem,
     event: EventSubsystem,
     canvas: WindowCanvas,
+    ui: Context,
 }
 
 impl App {
     pub async fn new() -> anyhow::Result<Self> {
+        let base_path = cfg_select! {
+            debug_assertions => Utf8Path::new(env!("CARGO_MANIFEST_DIR")),
+            _ => <&'static Utf8Path>::try_from(sdl3::filesystem::get_base_path()?)?
+        };
         let pref_path = Utf8PathBuf::try_from(get_pref_path(
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_NAME"),
         )?)?;
 
         let config = {
-            let data = match tokio::fs::read(pref_path.join("config.json")).await {
-                Ok(data) => data,
-                Err(ref e) if e.kind() == ErrorKind::NotFound => Vec::from(b"{}"),
+            match tokio::fs::read(pref_path.join("config.json")).await {
+                Ok(data) => serde_json::from_slice::<Config>(&data),
+                Err(ref e) if e.kind() == ErrorKind::NotFound => {
+                    serde_json::from_slice::<Config>(b"{}")
+                }
                 Err(e) => return Err(e.into()),
-            };
-            serde_json::from_slice::<Config>(&data)
+            }
         }?;
 
         let sdl = sdl3::init()?;
@@ -49,9 +56,11 @@ impl App {
         let event = sdl.event()?;
 
         let canvas =
-            video.window_and_renderer("Lambiese", config.width.get(), config.height.get())?;
+            video.window_and_renderer("Lambiase", config.width.get(), config.height.get())?;
+        let ui = Context::new(&base_path.join("assets"), &canvas)?;
 
         return Ok(Self {
+            base_path,
             pref_path,
             config,
             audio,
@@ -59,6 +68,7 @@ impl App {
             joystick,
             event,
             canvas,
+            ui,
         });
     }
 

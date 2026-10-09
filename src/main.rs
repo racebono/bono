@@ -16,6 +16,7 @@ mod app;
 mod button;
 mod config;
 mod task;
+mod ui;
 
 struct AppImpl {
     app: MainThreadData<RefCell<App>>,
