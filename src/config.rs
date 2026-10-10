@@ -1,15 +1,109 @@
 use crate::button::Button;
 use camino::Utf8PathBuf;
+use sdl3::messagebox::{MessageBoxFlag, show_simple_message_box};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fmt::{Debug, Display},
     num::NonZeroU32,
     ops::{Deref, DerefMut},
+    path::Path,
 };
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+pub struct Config {
+    send: tokio::sync::watch::Sender<RawConfig>,
+}
+
+impl Config {
+    pub async fn new(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let mut file = tokio::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)
+            .await?;
+
+        file.rewind().await?;
+        let mut contents = Vec::new();
+        if let Ok(len) = usize::try_from(file.metadata().await?.len()) {
+            if len == 0 {
+                contents.extend_from_slice(b"{}");
+            } else {
+                contents.try_reserve(len)?;
+                file.read_to_end(&mut contents).await?;
+            }
+        }
+
+        let (send, mut recv) =
+            tokio::sync::watch::channel(serde_json::from_slice::<RawConfig>(&contents)?);
+
+        tokio::spawn(async move {
+            while recv.changed().await.is_ok() {
+                let fut = async {
+                    contents.clear();
+                    {
+                        let raw = recv.borrow();
+                        serde_json::to_writer_pretty(&mut contents, &*raw)?;
+                    };
+
+                    file.set_len(0).await?;
+                    file.rewind().await?;
+                    file.write_all(&mut contents).await?;
+                    Ok::<_, anyhow::Error>(())
+                };
+
+                if let Err(e) = fut.await {
+                    log::error!("Error saving config changes: {e}");
+                    let _ = tokio::task::spawn_blocking(move || {
+                        show_simple_message_box(
+                            MessageBoxFlag::ERROR,
+                            "Error saving config changes",
+                            &format!("{e}"),
+                            None,
+                        )
+                    });
+                }
+            }
+        });
+
+        return Ok(Self { send });
+    }
+
+    #[inline]
+    pub fn width(&self) -> NonZeroU32 {
+        self.send.borrow().width
+    }
+
+    #[inline]
+    pub fn height(&self) -> NonZeroU32 {
+        self.send.borrow().height
+    }
+
+    #[inline]
+    pub fn window_size(&self) -> (NonZeroU32, NonZeroU32) {
+        let this = self.send.borrow();
+        (this.width, this.height)
+    }
+
+    pub(super) fn on_resize(&mut self, width: i32, height: i32) {
+        let w = u32::try_from(width).ok().and_then(NonZeroU32::new);
+        let h = u32::try_from(height).ok().and_then(NonZeroU32::new);
+
+        let Some((w, h)) = w.zip(h) else {
+            log::error!("Invalid window size");
+            return;
+        };
+
+        self.send.send_modify(|raw| {
+            raw.width = w;
+            raw.height = h;
+        });
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
+pub struct RawConfig {
     #[serde(default = "default_width")]
     pub width: NonZeroU32,
     #[serde(default = "default_height")]
@@ -114,12 +208,12 @@ impl<'de, const N: usize> Deserialize<'de> for ArrayStr<N> {
 
 #[inline(always)]
 const fn default_width() -> NonZeroU32 {
-    const { NonZeroU32::new(600).unwrap() }
+    const { NonZeroU32::new(900).unwrap() }
 }
 
 #[inline(always)]
 const fn default_height() -> NonZeroU32 {
-    const { NonZeroU32::new(900).unwrap() }
+    const { NonZeroU32::new(600).unwrap() }
 }
 
 #[inline(always)]

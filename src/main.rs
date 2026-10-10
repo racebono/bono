@@ -5,11 +5,8 @@ use sdl3::{
     sys::events::SDL_Event,
 };
 use sdl3_main::{AppResult, MainThreadData, MainThreadToken, app_impl};
-use std::{
-    cell::RefCell,
-    hint::unreachable_unchecked,
-    sync::atomic::{AtomicU8, Ordering},
-};
+use simple_logger::SimpleLogger;
+use std::cell::RefCell;
 use tokio::runtime::Runtime;
 
 mod app;
@@ -25,6 +22,7 @@ struct AppImpl {
 #[app_impl]
 impl AppImpl {
     fn app_init() -> Option<Box<Self>> {
+        SimpleLogger::new().init().unwrap();
         match init(MainThreadToken::get()?) {
             Ok(app) => Some(Box::new(app)),
             Err(e) => {
@@ -46,24 +44,13 @@ impl AppImpl {
     }
 
     fn app_event(&self, event: &SDL_Event) -> AppResult {
-        const CONTINUE: u8 = AppResult::Continue as u8;
-        const SUCCESS: u8 = AppResult::Success as u8;
-        const FAILURE: u8 = AppResult::Failure as u8;
-
         let event = Event::from_ll(*event);
-        let result = AtomicU8::new(CONTINUE);
+        let mut result = AppResult::Continue;
         let handle = self.rt.handle().clone();
 
         if !self.app.get_on_main_thread(|app| {
             let _guard = handle.enter();
-            result.store(
-                match app.borrow_mut().event(event) {
-                    AppResult::Continue => CONTINUE,
-                    AppResult::Success => SUCCESS,
-                    AppResult::Failure => FAILURE,
-                },
-                Ordering::Release,
-            );
+            result = app.borrow_mut().event(event);
         }) {
             log::error!("Unexpected error handling event");
             let _ = show_simple_message_box(
@@ -75,12 +62,7 @@ impl AppImpl {
             return AppResult::Failure;
         }
 
-        return match result.load(Ordering::Acquire) {
-            CONTINUE => AppResult::Continue,
-            SUCCESS => AppResult::Success,
-            FAILURE => AppResult::Failure,
-            _ => unsafe { unreachable_unchecked() },
-        };
+        return result;
     }
 }
 

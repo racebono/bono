@@ -37,6 +37,11 @@ pub struct JoinHandle<T> {
 
 impl<T> JoinHandle<T> {
     #[inline]
+    pub fn is_finished(&self) -> bool {
+        self.inner.is_finished()
+    }
+
+    #[inline]
     pub fn detach(self) -> tokio::task::JoinHandle<T> {
         let this = ManuallyDrop::new(self);
         unsafe { std::ptr::read(&raw const this.inner) }
