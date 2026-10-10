@@ -1,31 +1,31 @@
 use crate::{
     button::{Button, ButtonWatcher},
     config::Config,
-    ui::Context,
 };
 use anyhow::Context as AnyhowContext;
 use camino::{Utf8Path, Utf8PathBuf};
+use egui_sdl3::EguiCanvas;
 use sdl3::{
-    AudioSubsystem, EventSubsystem, JoystickSubsystem, VideoSubsystem,
+    AudioSubsystem, Error, EventSubsystem, JoystickSubsystem, VideoSubsystem,
     event::Event,
     filesystem::get_pref_path,
     get_error,
     messagebox::{MessageBoxFlag, show_simple_message_box},
-    render::WindowCanvas,
+    render::{Canvas, WindowCanvas},
+    surface::Surface,
+    sys::render::SDL_Renderer,
+    version::Version,
 };
 use sdl3_main::AppResult;
-use std::io::ErrorKind;
+use std::{
+    ffi::c_int,
+    io::ErrorKind,
+    ops::{Deref, DerefMut},
+};
 
 pub struct App {
-    base_path: &'static Utf8Path,
-    pref_path: Utf8PathBuf,
-    config: Config,
-    audio: AudioSubsystem,
-    video: VideoSubsystem,
-    joystick: JoystickSubsystem,
-    event: EventSubsystem,
-    canvas: WindowCanvas,
-    ui: Context,
+    state: AppState,
+    ui: EguiCanvas,
 }
 
 impl App {
@@ -55,44 +55,38 @@ impl App {
         let joystick = sdl.joystick()?;
         let event = sdl.event()?;
 
-        let canvas =
-            video.window_and_renderer("Lambiase", config.width.get(), config.height.get())?;
-        let ui = Context::new(&base_path.join("assets"), &canvas)?;
+        let mut ui = EguiCanvas::new(
+            video
+                .window("Lambiase", config.width.get(), config.height.get())
+                .resizable()
+                .high_pixel_density()
+                .build()?,
+        );
+        set_vsync(&mut ui.painter.canvas, 1)?;
 
         return Ok(Self {
-            base_path,
-            pref_path,
-            config,
-            audio,
-            video,
-            joystick,
-            event,
-            canvas,
+            state: AppState {
+                base_path,
+                pref_path,
+                config,
+                audio,
+                video,
+                joystick,
+                event,
+            },
             ui,
         });
     }
 
     pub fn iterate(&mut self) -> AppResult {
-        self.canvas.clear();
-
-        // FIXME(TODO): Render Window
-
-        if !self.canvas.present() {
-            let e = get_error();
-            log::error!("Unexpected error presenting frame: {e}");
-            let _ = show_simple_message_box(
-                MessageBoxFlag::ERROR,
-                "Unexpected error presenting frame",
-                &e.to_string(),
-                self.canvas.window(),
-            );
-            return AppResult::Failure;
-        }
-
+        self.ui.run(|ctx| self.state.update(ctx));
+        self.ui.paint();
+        self.ui.present();
         AppResult::Continue
     }
 
     pub fn event(&mut self, event: Event) -> AppResult {
+        self.ui.on_event(&event);
         match event {
             Event::Quit { .. } => return AppResult::Success,
             _ => {}
@@ -111,5 +105,59 @@ impl App {
                 .await
                 .context("Unexpected error waiting for next button input");
         };
+    }
+}
+
+impl Deref for App {
+    type Target = AppState;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl DerefMut for App {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
+pub struct AppState {
+    base_path: &'static Utf8Path,
+    pref_path: Utf8PathBuf,
+    config: Config,
+    audio: AudioSubsystem,
+    video: VideoSubsystem,
+    joystick: JoystickSubsystem,
+    event: EventSubsystem,
+}
+
+impl AppState {
+    fn update(&mut self, ctx: &egui::Context) {
+        // egui-sdl3 only hands us the `Context`, so build a root `Ui` the same way `Context::run_ui` does
+        let mut root_ui = egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new("root"),
+            egui::UiBuilder::new()
+                .layer_id(egui::LayerId::background())
+                .max_rect(ctx.viewport_rect()),
+        );
+        egui::CentralPanel::default().show(&mut root_ui, |ui| {
+            ui.label("Hello world!");
+        });
+    }
+}
+
+unsafe extern "C" {
+    fn SDL_SetRenderVSync(renderer: *mut SDL_Renderer, vsync: c_int) -> bool;
+}
+
+#[inline]
+fn set_vsync(canvas: &mut WindowCanvas, vsync: c_int) -> Result<(), Error> {
+    match unsafe { SDL_SetRenderVSync(canvas.raw(), vsync) } {
+        true => Ok(()),
+        false => Err(get_error()),
     }
 }
