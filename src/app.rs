@@ -1,4 +1,5 @@
 use crate::{
+    app::topbar::Topbar,
     button::{Button, ButtonWatcher},
     config::Config,
 };
@@ -19,7 +20,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::Arc,
 };
-use tokio::try_join;
+use tokio::{runtime::Runtime, try_join};
 
 mod topbar;
 
@@ -34,13 +35,13 @@ impl App {
             debug_assertions => Utf8Path::new(env!("CARGO_MANIFEST_DIR")),
             _ => <&'static Utf8Path>::try_from(sdl3::filesystem::get_base_path()?)?
         };
-        log::info!("Base Path: {base_path}");
+        log::debug!("Base Path: {base_path}");
 
         let pref_path = Utf8PathBuf::try_from(get_pref_path(
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_NAME"),
         )?)?;
-        log::info!("Prefered Path: {pref_path}");
+        log::debug!("Prefered Path: {pref_path}");
 
         let (config, fonts) = try_join!(load_config(&pref_path), load_fonts(&base_path))?;
         let sdl = sdl3::init()?;
@@ -49,7 +50,11 @@ impl App {
         let joystick = sdl.joystick()?;
         let event = sdl.event()?;
 
-        let (width, height) = config.window_size();
+        let (width, height) = {
+            let config = config.get();
+            (config.width, config.height)
+        };
+
         let mut ui = EguiCanvas::new(
             video
                 .window("Lambiase", width.get(), height.get())
@@ -65,16 +70,19 @@ impl App {
                 base_path,
                 pref_path,
                 config,
-                audio,
-                video,
-                joystick,
-                event,
+                subsystems: Subsystems {
+                    audio,
+                    video,
+                    joystick,
+                    event,
+                },
+                gui: Gui::default(),
             },
             ui,
         });
     }
 
-    pub fn iterate(&mut self) -> AppResult {
+    pub fn iterate(&mut self, rt: &Runtime) -> AppResult {
         self.ui.run(|ctx| {
             // egui-sdl3 only hands us the `Context`, so build a root `Ui` the same way `Context::run_ui` does
             let mut root_ui = egui::Ui::new(
@@ -85,7 +93,7 @@ impl App {
                     .max_rect(ctx.viewport_rect()),
             );
 
-            egui::CentralPanel::default().show(&mut root_ui, |ui| self.state.update(ui));
+            egui::CentralPanel::default().show(&mut root_ui, |ui| self.state.update(rt, ui));
         });
 
         self.ui.paint();
@@ -131,18 +139,41 @@ impl DerefMut for App {
 pub struct AppState {
     base_path: &'static Utf8Path,
     pref_path: Utf8PathBuf,
+    gui: Gui,
     config: Config,
+    subsystems: Subsystems,
+}
+
+impl AppState {
+    fn update(&mut self, rt: &Runtime, ui: &mut egui::Ui) {
+        self.gui.update(rt, &self.subsystems, ui, &mut self.config);
+    }
+}
+
+impl Deref for AppState {
+    type Target = Subsystems;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.subsystems
+    }
+}
+
+impl DerefMut for AppState {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.subsystems
+    }
+}
+
+pub struct Subsystems {
     audio: AudioSubsystem,
     video: VideoSubsystem,
     joystick: JoystickSubsystem,
     event: EventSubsystem,
 }
 
-impl AppState {
-    fn update(&mut self, ui: &mut egui::Ui) {
-        self.update_topbar(ui);
-    }
-
+impl Subsystems {
     fn next_button(&self) -> impl Future<Output = anyhow::Result<Button>> + Send + 'static {
         let watch = ButtonWatcher::new(&self.event);
         return async move {
@@ -152,6 +183,17 @@ impl AppState {
                 .await
                 .context("Unexpected error waiting for next button input");
         };
+    }
+}
+
+#[derive(Default)]
+pub struct Gui {
+    topbar: Topbar,
+}
+
+impl Gui {
+    fn update(&mut self, rt: &Runtime, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
+        self.topbar.update(rt, ss, ui, config);
     }
 }
 
@@ -173,11 +215,10 @@ async fn load_config(pref_path: &Utf8Path) -> anyhow::Result<Config> {
 
 async fn load_fonts(base_path: &Utf8Path) -> anyhow::Result<egui::FontDefinitions> {
     let mut fonts = egui::FontDefinitions::default();
-    let mut data = egui::FontData::from_owned(
+    let data = egui::FontData::from_owned(
         tokio::fs::read(base_path.join_os("assets/ProggyForever-Regular.ttf")).await?,
     );
 
-    data.tweak.scale = 1.25;
     fonts
         .font_data
         .insert("proggy-forever".into(), Arc::new(data));

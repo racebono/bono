@@ -1,10 +1,50 @@
 use pin_project::{pin_project, pinned_drop};
 use std::{
-    mem::ManuallyDrop,
     panic::resume_unwind,
     pin::Pin,
     task::{Poll, ready},
 };
+use tokio::{runtime::Runtime, task::coop::unconstrained};
+
+pub struct Task<T> {
+    handle: Option<JoinHandle<T>>,
+}
+
+impl<T> Task<T> {
+    #[inline]
+    pub fn spawn<F>(f: F) -> Self
+    where
+        F: IntoFuture<Output = T>,
+        F::IntoFuture: Send + 'static,
+        T: Send + 'static,
+    {
+        Self {
+            handle: Some(spawn(f)),
+        }
+    }
+
+    #[inline]
+    pub fn spawn_blocking<F>(f: F) -> Self
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        Self {
+            handle: Some(spawn_blocking(f)),
+        }
+    }
+
+    #[inline]
+    pub fn update(&mut self, rt: &Runtime) -> Option<T> {
+        let handle = self.handle.as_mut()?;
+        if handle.is_finished() {
+            let val = rt.block_on(unconstrained(handle));
+            self.handle = None;
+            return Some(val);
+        }
+        return None;
+    }
+}
 
 #[inline]
 pub fn spawn<F>(f: F) -> JoinHandle<F::Output>
@@ -39,12 +79,6 @@ impl<T> JoinHandle<T> {
     #[inline]
     pub fn is_finished(&self) -> bool {
         self.inner.is_finished()
-    }
-
-    #[inline]
-    pub fn detach(self) -> tokio::task::JoinHandle<T> {
-        let this = ManuallyDrop::new(self);
-        unsafe { std::ptr::read(&raw const this.inner) }
     }
 }
 

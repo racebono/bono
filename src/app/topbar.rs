@@ -1,43 +1,38 @@
-use tokio::{runtime::Runtime, task::coop::unconstrained};
+use crate::{
+    app::{Subsystems, topbar::settings::SettingsTopbar},
+    config::Config,
+};
+use egui::{
+    PopupCloseBehavior,
+    menu::{MenuButton, MenuConfig},
+};
+use tokio::runtime::Runtime;
 
-use crate::{app::AppState, button::Button, task::JoinHandle};
+mod audio;
+mod settings;
 
-impl AppState {
-    pub fn update_topbar(&mut self, ui: &mut egui::Ui) {
+#[derive(Default)]
+pub(super) struct Topbar {
+    settings: SettingsTopbar,
+}
+
+impl Topbar {
+    pub fn update(
+        &mut self,
+        rt: &Runtime,
+        ss: &Subsystems,
+        ui: &mut egui::Ui,
+        config: &mut Config,
+    ) {
         egui::Panel::top("tobpar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 // ui.visuals_mut().button_frame = false;
-                ui.menu_button(
-                    "Settings",
-                    |ui| {
-                        if ui.button("Select talk button").clicked() {}
-                    },
-                );
+                MenuButton::new("Settings")
+                    .config(
+                        MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
+                    )
+                    .ui(ui, |ui| self.settings.update(rt, ss, ui, config));
             });
         });
-    }
-
-    fn change_button(&mut self, ui: &mut egui::Ui, text: &str) {
-        if ui.button("Select talk button").clicked() {}
-    }
-}
-
-struct ChangeButton {
-    waiting: Option<JoinHandle<Button>>,
-}
-
-impl ChangeButton {
-    fn update(&mut self, rt: &Runtime, ui: &mut egui::Ui) -> Option<Button> {
-        if let Some(ref mut waiting) = self.waiting {
-            if waiting.is_finished() {
-                let button = rt.block_on(unconstrained(waiting));
-                self.waiting = None;
-                return Some(button);
-            } else {
-                todo!()
-            }
-        }
-
-        todo!()
     }
 }

@@ -1,4 +1,3 @@
-use anyhow::{Context, bail};
 use sdl3::{
     EventSubsystem,
     event::{Event, EventWatch, EventWatchCallback},

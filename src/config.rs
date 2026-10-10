@@ -1,6 +1,5 @@
-use crate::button::Button;
+use crate::{button::Button, error};
 use camino::Utf8PathBuf;
-use sdl3::messagebox::{MessageBoxFlag, show_simple_message_box};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -9,7 +8,10 @@ use std::{
     ops::{Deref, DerefMut},
     path::Path,
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::watch::Ref,
+};
 
 pub struct Config {
     send: tokio::sync::watch::Sender<RawConfig>,
@@ -54,15 +56,7 @@ impl Config {
                 };
 
                 if let Err(e) = fut.await {
-                    log::error!("Error saving config changes: {e}");
-                    let _ = tokio::task::spawn_blocking(move || {
-                        show_simple_message_box(
-                            MessageBoxFlag::ERROR,
-                            "Error saving config changes",
-                            &format!("{e}"),
-                            None,
-                        )
-                    });
+                    error("Error saving config changes", e);
                 }
             }
         });
@@ -71,19 +65,18 @@ impl Config {
     }
 
     #[inline]
-    pub fn width(&self) -> NonZeroU32 {
-        self.send.borrow().width
+    pub fn get(&self) -> Ref<'_, RawConfig> {
+        self.send.borrow()
     }
 
     #[inline]
-    pub fn height(&self) -> NonZeroU32 {
-        self.send.borrow().height
+    pub fn update(&mut self, f: impl FnOnce(&mut RawConfig)) {
+        self.send.send_modify(f);
     }
 
     #[inline]
-    pub fn window_size(&self) -> (NonZeroU32, NonZeroU32) {
-        let this = self.send.borrow();
-        (this.width, this.height)
+    pub fn maybe_update(&mut self, f: impl FnOnce(&mut RawConfig) -> bool) {
+        self.send.send_if_modified(f);
     }
 
     pub(super) fn on_resize(&mut self, width: i32, height: i32) {
@@ -149,6 +142,13 @@ pub struct RawConfig {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct ArrayStr<const N: usize>([u8; N]);
+
+impl<const N: usize> ArrayStr<N> {
+    #[inline]
+    pub const unsafe fn from_utf8_unchecked(buf: [u8; N]) -> Self {
+        Self(buf)
+    }
+}
 
 impl<const N: usize> Debug for ArrayStr<N> {
     #[inline]
