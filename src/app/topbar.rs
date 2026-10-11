@@ -30,7 +30,6 @@ impl Topbar {
     ) {
         egui::Panel::top("tobpar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                // ui.visuals_mut().button_frame = false;
                 MenuButton::new("Settings")
                     .config(
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),

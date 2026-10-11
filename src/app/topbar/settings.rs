@@ -45,6 +45,12 @@ impl SettingsTopbar {
             "Press a button",
         );
 
+        ui.separator();
+        config.maybe_update(|raw| {
+            ui.add(egui::Slider::new(&mut raw.text_scale, 0.25..=4.0).text("Text scale"))
+                .changed()
+        });
+
         if next_talk.is_some() || next_session.is_some() {
             config.update(|raw| {
                 if let Some(talk) = next_talk {

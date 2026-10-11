@@ -27,6 +27,26 @@ egui-sdl3 = { git = "https://github.com/Aandreba/egui-sdl3", branch = "main", fe
     "canvas-backend",
 ], default-features = false }
 simple_logger = "5.2.0"
+whisper-rs = { version = "0.16.0", features = ["log_backend"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+# Metal ships with the OS, so it needs no SDK and is always on.
+# Apple targets also get BLAS from the Accelerate framework.
+whisper-rs = { version = "0.16.0", features = ["metal"] }
+
+# Opt-in whisper backends. Each needs its SDK installed at build time.
+[features]
+default = ["cuda", "vulkan"]
+# Windows, Linux. Needs the CUDA toolkit (`CUDA_PATH` on Windows)
+cuda = ["whisper-rs/cuda"]
+# Linux only: whisper-rs-sys refuses to build it on Windows (broken ROCm 5.7). Needs ROCm (`HIP_PATH`)
+hipblas = ["whisper-rs/hipblas"]
+# Windows, Linux. Needs Intel oneAPI (`icx`/`icpx` compilers)
+intel-sycl = ["whisper-rs/intel-sycl"]
+# Windows, Linux. Needs OpenBLAS (`BLAS_INCLUDE_DIRS`, optionally `OPENBLAS_PATH`)
+openblas = ["whisper-rs/openblas"]
+# Windows, Linux. Needs the Vulkan SDK (`VULKAN_SDK`)
+vulkan = ["whisper-rs/vulkan"]
 
 # Build SDL in Release so it links the release CRT (`msvcrt`) like Rust does, not `MSVCRTD`
 [profile.dev.package.sdl3-sys]

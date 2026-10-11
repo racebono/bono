@@ -84,6 +84,13 @@ impl App {
 
     pub fn iterate(&mut self, rt: &Runtime) -> AppResult {
         self.ui.run(|ctx| {
+            // Must happen before the root `Ui` is built, since it copies the style on creation
+            let text_scale = self.state.config.get().text_scale;
+            if self.state.gui.applied_text_scale != Some(text_scale) {
+                set_text_scale(ctx, text_scale);
+                self.state.gui.applied_text_scale = Some(text_scale);
+            }
+
             // egui-sdl3 only hands us the `Context`, so build a root `Ui` the same way `Context::run_ui` does
             let mut root_ui = egui::Ui::new(
                 ctx.clone(),
@@ -93,7 +100,7 @@ impl App {
                     .max_rect(ctx.viewport_rect()),
             );
 
-            egui::CentralPanel::default().show(&mut root_ui, |ui| self.state.update(rt, ui));
+            self.state.update(rt, &mut root_ui);
         });
 
         self.ui.paint();
@@ -189,12 +196,30 @@ impl Subsystems {
 #[derive(Default)]
 pub struct Gui {
     topbar: Topbar,
+    applied_text_scale: Option<f32>,
 }
 
 impl Gui {
+    /// `ui` must be the root `Ui`: edge panels have to be added before the `CentralPanel`,
+    /// which then fills the remaining space.
     fn update(&mut self, rt: &Runtime, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
         self.topbar.update(rt, ss, ui, config);
+        egui::CentralPanel::default().show(ui, |_ui| {});
     }
+}
+
+/// Scales every text style relative to egui's defaults, so repeated calls don't compound.
+fn set_text_scale(ctx: &egui::Context, scale: f32) {
+    let base = egui::style::default_text_styles();
+    ctx.all_styles_mut(|style| {
+        style.text_styles = base
+            .iter()
+            .map(|(text_style, font)| {
+                let font = egui::FontId::new(font.size * scale, font.family.clone());
+                (text_style.clone(), font)
+            })
+            .collect();
+    });
 }
 
 #[inline]

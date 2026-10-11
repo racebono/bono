@@ -139,6 +139,8 @@ pub struct RawConfig {
     pub claude_model: String,
     #[serde(default = "default_claude_effort")]
     pub claude_effort: String,
+    #[serde(default = "default_text_scale")]
+    pub text_scale: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -306,6 +308,11 @@ const fn default_radio_effect() -> f32 {
 #[inline(always)]
 const fn default_volume() -> f32 {
     1.0
+}
+
+#[inline(always)]
+const fn default_text_scale() -> f32 {
+    1.2
 }
 
 #[inline(always)]

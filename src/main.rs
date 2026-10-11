@@ -13,6 +13,7 @@ mod app;
 mod button;
 mod config;
 mod task;
+mod whisper;
 
 struct AppImpl {
     app: MainThreadData<RefCell<App>>,
