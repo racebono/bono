@@ -1,4 +1,7 @@
-use crate::{app::Subsystems, config::Config};
+use crate::{
+    app::Subsystems,
+    config::{Config, RawConfig},
+};
 use egui::PopupCloseBehavior;
 use sdl3::{
     AudioSubsystem,
@@ -58,12 +61,22 @@ impl DeviceSelector {
             .close_behavior(PopupCloseBehavior::CloseOnClickOutside);
 
         config.maybe_update(|raw| {
-            combo.show_ui(ui, |ui| {
-                ui.selectable_value(&mut raw.microphone, None, "System default")
-                    .clicked();
-            });
+            return combo
+                .show_ui(ui, |ui| {
+                    let config = kind.config(raw);
 
-            todo!()
+                    let mut updated = ui
+                        .selectable_value(config, None, "System default")
+                        .clicked();
+
+                    for device in &self.devices {
+                        updated |= ui.selectable_value(config, Some(), text).clicked();
+                    }
+
+                    return updated;
+                })
+                .inner
+                .unwrap_or(false);
         });
 
         todo!()
@@ -88,6 +101,13 @@ impl Kind {
         match self {
             Kind::Playback => AudioDeviceID::Device(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK),
             Kind::Recording => AudioDeviceID::Device(SDL_AUDIO_DEVICE_DEFAULT_RECORDING),
+        }
+    }
+
+    pub const fn config<'a>(self, raw: &'a mut RawConfig) -> &'a mut Option<String> {
+        match self {
+            Kind::Playback => &mut raw.speaker,
+            Kind::Recording => &mut raw.microphone,
         }
     }
 
