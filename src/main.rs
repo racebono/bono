@@ -6,11 +6,7 @@ use sdl3::{
 };
 use sdl3_main::{AppResult, MainThreadData, MainThreadToken, app_impl};
 use simple_logger::SimpleLogger;
-use std::{
-    cell::RefCell,
-    fmt::{Debug, Display},
-    ops::Deref,
-};
+use std::{cell::RefCell, fmt::Display};
 use tokio::runtime::Runtime;
 
 mod app;

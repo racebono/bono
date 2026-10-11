@@ -1,5 +1,8 @@
 use crate::{
-    app::{Subsystems, topbar::settings::SettingsTopbar},
+    app::{
+        Subsystems,
+        topbar::{audio::AudioTopbar, settings::SettingsTopbar},
+    },
     config::Config,
 };
 use egui::{
@@ -14,6 +17,7 @@ mod settings;
 #[derive(Default)]
 pub(super) struct Topbar {
     settings: SettingsTopbar,
+    audio: AudioTopbar,
 }
 
 impl Topbar {
@@ -32,6 +36,12 @@ impl Topbar {
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
                     .ui(ui, |ui| self.settings.update(rt, ss, ui, config));
+
+                MenuButton::new("Audio")
+                    .config(
+                        MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
+                    )
+                    .ui(ui, |ui| self.audio.update(ss, ui, config));
             });
         });
     }

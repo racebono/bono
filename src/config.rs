@@ -1,5 +1,6 @@
 use crate::{button::Button, error};
 use camino::Utf8PathBuf;
+use sdl3::audio::AudioDeviceID;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -7,6 +8,7 @@ use std::{
     num::NonZeroU32,
     ops::{Deref, DerefMut},
     path::Path,
+    sync::Arc,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -106,9 +108,9 @@ pub struct RawConfig {
     #[serde(default)]
     pub session_button: Option<Button>,
     #[serde(default)]
-    pub microphone: Option<String>,
+    pub microphone: RawAudioDevice<true>,
     #[serde(default)]
-    pub speaker: Option<String>,
+    pub speaker: RawAudioDevice<false>,
     #[serde(default = "default_radio_effect")]
     pub radio_effect: f32,
     #[serde(default = "default_volume")]
@@ -203,6 +205,86 @@ impl<'de, const N: usize> Deserialize<'de> for ArrayStr<N> {
         })?;
 
         return Ok(Self(*arr));
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AudioDevice {
+    Device(AudioDeviceID, Arc<str>),
+    Unknown(Arc<str>),
+    #[default]
+    Default,
+}
+
+impl AudioDevice {
+    pub fn name(&self) -> &str {
+        match self {
+            AudioDevice::Device(_, name) => name.deref(),
+            AudioDevice::Unknown(name) => name.deref(),
+            AudioDevice::Default => "System default",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+#[repr(transparent)]
+pub struct RawAudioDevice<const RECORDING: bool>(AudioDevice);
+
+impl<const RECORDING: bool> Deref for RawAudioDevice<RECORDING> {
+    type Target = AudioDevice;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<const RECORDING: bool> DerefMut for RawAudioDevice<RECORDING> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<const RECORDING: bool> Serialize for RawAudioDevice<RECORDING> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        (match &self.0 {
+            AudioDevice::Device(_, name) => Some(name.deref()),
+            AudioDevice::Unknown(name) => Some(name.deref()),
+            AudioDevice::Default => None,
+        })
+        .serialize(serializer)
+    }
+}
+
+impl<'de, const RECORDING: bool> Deserialize<'de> for RawAudioDevice<RECORDING> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let Some(name) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(RawAudioDevice(AudioDevice::Default));
+        };
+
+        let devices = ((|| {
+            let audio = sdl3::init()?.audio()?;
+            match RECORDING {
+                true => audio.audio_recording_device_ids(),
+                false => audio.audio_playback_device_ids(),
+            }
+        })())
+        .map_err(<D::Error as serde::de::Error>::custom)?;
+
+        for device in devices {
+            if device.name().is_ok_and(|device_name| name == device_name) {
+                return Ok(RawAudioDevice(AudioDevice::Device(device, name.into())));
+            }
+        }
+
+        return Ok(RawAudioDevice(AudioDevice::Unknown(name.into())));
     }
 }
 
