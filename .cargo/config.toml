@@ -1,2 +1,10 @@
 [alias]
 xtask = "run --package xtask --"
+
+[env]
+# Build CMake dependencies (whisper.cpp, SDL) with Ninja instead of MSBuild on Windows.
+# whisper.cpp's Vulkan backend breaks under MSBuild: its nested `vulkan-shaders-gen` project
+# exceeds MSBuild FileTracker's 260-character path limit, and its ExternalProject steps
+# get built in parallel (CMP0147), so the build step runs before configure has finished.
+# Requires `ninja` on PATH.
+CMAKE_GENERATOR_x86_64_pc_windows_msvc = "Ninja"
