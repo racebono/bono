@@ -2,6 +2,7 @@ use crate::{
     app::topbar::Topbar,
     button::{Button, ButtonWatcher},
     config::{Config, RawConfig},
+    synthesizer::Synthesizer,
 };
 use anyhow::Context as AnyhowContext;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -31,7 +32,7 @@ pub struct App {
 }
 
 impl App {
-    pub async fn new() -> anyhow::Result<Self> {
+    pub async fn new(rt: &Handle) -> anyhow::Result<Self> {
         let base_path = cfg_select! {
             debug_assertions => Utf8Path::new(env!("CARGO_MANIFEST_DIR")),
             _ => <&'static Utf8Path>::try_from(sdl3::filesystem::get_base_path()?)?
@@ -84,6 +85,7 @@ impl App {
                 pref_path,
                 config,
                 gui,
+                synth: Synthesizer::new(rt.clone()),
             },
             ui,
         });
@@ -161,6 +163,7 @@ pub struct AppState {
     gui: Gui,
     config: Config,
     subsystems: Subsystems,
+    synth: Synthesizer,
 }
 
 impl AppState {

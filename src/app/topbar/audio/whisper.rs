@@ -367,8 +367,6 @@ impl WhisperSession {
         mut candidates: btree_map::Keys<'_, ArrayStr<2>, Utf8PathBuf>,
         min_confidence: f32,
     ) -> anyhow::Result<Option<ArrayStr<2>>> {
-        return Ok(Some(arrstr!("en")));
-
         if candidates.len() == 1 {
             return Ok(Some(
                 *candidates.next().context("Expected a language candidate")?,

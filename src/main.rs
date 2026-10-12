@@ -1,6 +1,5 @@
 use crate::{app::App, config::ArrayStr};
 use sdl3::{
-    dialog::{DialogError, DialogFileFilter},
     event::Event,
     messagebox::{MessageBoxFlag, show_simple_message_box},
     sys::{events::SDL_Event, guid::SDL_GUID},
@@ -23,6 +22,7 @@ pub extern crate std;
 mod app;
 mod button;
 mod config;
+mod synthesizer;
 mod task;
 
 struct AppImpl {
@@ -71,7 +71,7 @@ impl AppImpl {
 
 fn init(token: MainThreadToken) -> anyhow::Result<AppImpl> {
     let rt = Runtime::new()?;
-    let app = MainThreadData::new(token, RefCell::new(rt.block_on(App::new())?));
+    let app = MainThreadData::new(token, RefCell::new(rt.block_on(App::new(rt.handle()))?));
     Ok(AppImpl { app, rt })
 }
 

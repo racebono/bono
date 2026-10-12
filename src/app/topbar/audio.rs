@@ -24,7 +24,7 @@ use std::{
 };
 use tokio::runtime::Handle;
 
-mod synthesizer;
+mod voice;
 mod whisper;
 
 const DELAY: Duration = Duration::from_secs(1);

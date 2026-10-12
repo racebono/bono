@@ -47,8 +47,38 @@ async fn dist() -> anyhow::Result<()> {
     // 4. Copy assets
     copy_dir(root.join("assets"), dist.join("assets")).await?;
 
+    // 5. Copy espeak-ng's compiled data, which the synthesizer loads from next to the binary
+    let Some(espeak_data) = newest_espeak_data(&root.join("target/release/build")).await? else {
+        bail!("espeak-ng-data not found in espeak-rs-sys's build output");
+    };
+    copy_dir(espeak_data, dist.join("espeak-ng-data")).await?;
+
     println!("packaged into {}", dist.display());
     Ok(())
+}
+
+/// The most recently built `espeak-rs-sys-*/out/share/espeak-ng-data` in `build_dir`.
+async fn newest_espeak_data(build_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let mut newest = None::<(std::time::SystemTime, PathBuf)>;
+    let mut it = tokio::fs::read_dir(build_dir).await?;
+
+    while let Some(entry) = it.next_entry().await? {
+        if !entry.file_name().to_string_lossy().starts_with("espeak-rs-sys-") {
+            continue;
+        }
+
+        let data = entry.path().join("out/share/espeak-ng-data");
+        let Ok(metadata) = tokio::fs::metadata(data.join("phondata")).await else {
+            continue;
+        };
+
+        let modified = metadata.modified()?;
+        if newest.as_ref().is_none_or(|(time, _)| modified > *time) {
+            newest = Some((modified, data));
+        }
+    }
+
+    Ok(newest.map(|(_, data)| data))
 }
 
 fn copy_dir(
