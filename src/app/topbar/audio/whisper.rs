@@ -1,7 +1,7 @@
 use crate::{
     Download, arrstr,
     button::ConfigButton,
-    config::{ArrayStr, Config},
+    config::{ArrayStr, Config, RawConfig},
     error,
     task::{JoinHandle, MaybeDone, spawn, spawn_blocking},
     updating,
@@ -25,7 +25,6 @@ use std::{
     ffi::c_int,
     mem::MaybeUninit,
     num::{NonZero, NonZeroUsize},
-    ops::Deref,
     path::Path,
     sync::Arc,
     time::Duration,
@@ -53,6 +52,7 @@ pub struct Whisper {
 impl Whisper {
     pub fn new(
         pref_path: &Arc<Utf8Path>,
+        config: &RawConfig,
         client: reqwest::Client,
         threads: Option<NonZeroUsize>,
     ) -> Self {
@@ -61,7 +61,7 @@ impl Whisper {
             .or_else(|| std::thread::available_parallelism().ok())
             .unwrap_or(NonZeroUsize::MIN);
 
-        return Self {
+        let mut this = Self {
             client: client.clone(),
             ctx: None,
             stream: None,
@@ -76,6 +76,12 @@ impl Whisper {
             }),
             threads,
         };
+
+        if let Some(model) = config.whisper_model.clone() {
+            this.set_model(model);
+        }
+
+        return this;
     }
 
     pub fn update(&mut self, rt: &Handle, config: &mut Config, ui: &mut egui::Ui) {
@@ -210,6 +216,10 @@ impl Whisper {
             return Err(false);
         };
 
+        if self.stream.is_some() {
+            return Err(false);
+        }
+
         let ctx = match ctx.update(rt) {
             Some(Some(ctx)) => ctx,
             Some(None) | None => return Err(false),
@@ -227,6 +237,7 @@ impl Whisper {
                 },
             )?;
             stream.resume()?;
+            log::debug!("Started microphone recording");
 
             return Ok::<_, anyhow::Error>(WhisperStream {
                 recv,
@@ -257,6 +268,7 @@ impl Whisper {
         let Some(stream) = self.stream.take() else {
             return Err(false);
         };
+        log::debug!("Finishing microphone recording");
         return Ok(stream.finish(config.clone()));
     }
 }
@@ -276,10 +288,12 @@ impl Whisper {
         }
     }
 
-    pub fn set_model(&mut self, path: impl AsRef<Path> + Send + 'static) {
+    pub fn set_model(&mut self, path: Arc<Utf8Path>) {
         self.ctx = Some(MaybeDone::spawn_blocking(
-            move || match WhisperContext::new_with_params(path, WhisperContextParameters::default())
-            {
+            move || match WhisperContext::new_with_params(
+                path.as_os_str(),
+                WhisperContextParameters::default(),
+            ) {
                 Ok(ctx) => Some(ctx),
                 Err(e) => {
                     error("Error loading speech to text model", e);
@@ -344,6 +358,8 @@ impl WhisperSession {
         mut candidates: btree_map::Keys<'_, ArrayStr<2>, Utf8PathBuf>,
         min_confidence: f32,
     ) -> anyhow::Result<Option<ArrayStr<2>>> {
+        return Ok(Some(arrstr!("en")));
+
         if candidates.len() == 1 {
             return Ok(Some(
                 *candidates.next().context("Expected a language candidate")?,

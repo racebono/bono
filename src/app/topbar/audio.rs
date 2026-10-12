@@ -45,7 +45,7 @@ impl AudioTopbar {
         Self {
             microphone: DeviceSelector::new(Kind::Recording, &ss.audio, config, Instant::now()),
             speaker: DeviceSelector::new(Kind::Playback, &ss.audio, config, Instant::now()),
-            whisper: Whisper::new(pref_path, client.clone(), None),
+            whisper: Whisper::new(pref_path, config, client.clone(), None),
         }
     }
 
@@ -62,12 +62,12 @@ impl AudioTopbar {
                 Ok(handle) => {
                     // FIXME(TODO): Save into AI session
                     tokio::spawn(async move {
+                        log::debug!("TODO");
                         match handle.await {
                             Ok(Some((msg, lang))) => log::debug!("({lang}) {msg}"),
                             Ok(None) => log::debug!("Didn't understand"),
                             Err(e) => error("Failed speech to text", e),
                         }
-                        todo!()
                     });
                 }
                 Err(e) => return e,

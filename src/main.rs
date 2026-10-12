@@ -1,5 +1,6 @@
 use crate::{app::App, config::ArrayStr};
 use sdl3::{
+    dialog::{DialogError, DialogFileFilter},
     event::Event,
     messagebox::{MessageBoxFlag, show_simple_message_box},
     sys::{events::SDL_Event, guid::SDL_GUID},
