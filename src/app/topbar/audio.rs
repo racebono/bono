@@ -1,10 +1,12 @@
 use crate::{
     app::Subsystems,
     config::{AudioDevice, Config, RawConfig},
+    error,
+    whisper::RECORDING_SPEC,
 };
 use sdl3::{
     AudioSubsystem,
-    audio::AudioDeviceID,
+    audio::{AudioDeviceID, AudioSpec},
     get_error,
     sys::{
         audio::{
@@ -20,12 +22,21 @@ use std::{
     time::{Duration, Instant},
 };
 
+const DELAY: Duration = Duration::from_secs(1);
+
 pub struct AudioTopbar {
-    microphone: DeviceSelector,
-    speaker: DeviceSelector,
+    pub microphone: DeviceSelector,
+    pub speaker: DeviceSelector,
 }
 
 impl AudioTopbar {
+    pub fn new(ss: &Subsystems, config: &RawConfig) -> Self {
+        Self {
+            microphone: DeviceSelector::new(Kind::Recording, &ss.audio, config, Instant::now()),
+            speaker: DeviceSelector::new(Kind::Playback, &ss.audio, config, Instant::now()),
+        }
+    }
+
     pub fn update(&mut self, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
         let now = Instant::now();
         self.microphone.update(Kind::Recording, ss, ui, config, now);
@@ -33,33 +44,28 @@ impl AudioTopbar {
     }
 }
 
-impl Default for AudioTopbar {
-    fn default() -> Self {
-        let now = Instant::now();
-        Self {
-            microphone: DeviceSelector {
-                next: now,
-                delay: Duration::from_secs(1),
-                devices: Vec::new(),
-            },
-            speaker: DeviceSelector {
-                next: now,
-                delay: Duration::from_secs(1),
-                devices: Vec::new(),
-            },
-        }
-    }
-}
-
 struct DeviceSelector {
+    open: Option<sdl3::audio::AudioDevice>,
     next: Instant,
-    delay: Duration,
     devices: Vec<(AudioDeviceID, Arc<str>)>,
 }
 
 impl DeviceSelector {
-    fn update(
-        &mut self,
+    fn new(kind: Kind, audio: &AudioSubsystem, config: &RawConfig, now: Instant) -> Self {
+        Self {
+            open: kind.open(audio, kind.config(config)),
+            next: now,
+            devices: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn get(&self) -> Option<&sdl3::audio::AudioDevice> {
+        self.open.as_ref()
+    }
+
+    fn update<'a>(
+        &'a mut self,
         kind: Kind,
         ss: &Subsystems,
         ui: &mut egui::Ui,
@@ -68,14 +74,14 @@ impl DeviceSelector {
     ) {
         if now >= self.next {
             self.update_devices(kind, ss);
-            self.next = match self.next.checked_add(self.delay) {
+            self.next = match self.next.checked_add(DELAY) {
                 Some(next) => next.max(now),
                 None => now,
             };
         }
 
         config.maybe_update(|raw| {
-            let config = kind.config(raw);
+            let config = kind.config_mut(raw);
 
             // A sub-menu rather than a `ComboBox`: egui only tracks one open popup per viewport,
             // so opening a `ComboBox` popup would close the menu it lives in.
@@ -99,6 +105,10 @@ impl DeviceSelector {
                     ui.separator();
                     if ui.button("Test").clicked() {
                         log::debug!("TODO");
+                    }
+
+                    if updated {
+                        self.open = kind.open(&ss.audio, config);
                     }
 
                     return updated;
@@ -137,10 +147,52 @@ impl Kind {
         }
     }
 
-    pub fn config<'a>(self, raw: &'a mut RawConfig) -> &'a mut AudioDevice {
+    pub fn config<'a>(self, raw: &'a RawConfig) -> &'a AudioDevice {
+        match self {
+            Kind::Playback => raw.speaker.deref(),
+            Kind::Recording => raw.microphone.deref(),
+        }
+    }
+
+    pub fn config_mut<'a>(self, raw: &'a mut RawConfig) -> &'a mut AudioDevice {
         match self {
             Kind::Playback => raw.speaker.deref_mut(),
             Kind::Recording => raw.microphone.deref_mut(),
+        }
+    }
+
+    pub fn open(
+        self,
+        audio: &AudioSubsystem,
+        device: &AudioDevice,
+    ) -> Option<sdl3::audio::AudioDevice> {
+        let device = match device {
+            AudioDevice::Default => None,
+            AudioDevice::Device(id, _) => Some(id),
+            AudioDevice::Unknown(_) => return None,
+        };
+
+        let res = match self {
+            Kind::Playback => {
+                sdl3::audio::AudioDevice::open_playback(audio, device, &AudioSpec::default())
+            }
+            Kind::Recording => {
+                sdl3::audio::AudioDevice::open_recording(audio, device, &RECORDING_SPEC)
+            }
+        };
+
+        match res {
+            Ok(device) => Some(device),
+            Err(e) => {
+                error(
+                    match self {
+                        Kind::Playback => "Failed to open speaker device",
+                        Kind::Recording => "Failed to open microphone device",
+                    },
+                    e,
+                );
+                None
+            }
         }
     }
 

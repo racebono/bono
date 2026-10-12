@@ -9,6 +9,9 @@ use simple_logger::SimpleLogger;
 use std::{cell::RefCell, fmt::Display};
 use tokio::runtime::Runtime;
 
+#[doc(hidden)]
+pub extern crate std;
+
 mod app;
 mod button;
 mod config;

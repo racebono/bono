@@ -3,7 +3,7 @@ use crate::{
         Subsystems,
         topbar::{audio::AudioTopbar, settings::SettingsTopbar},
     },
-    config::Config,
+    config::{Config, RawConfig},
 };
 use egui::{
     PopupCloseBehavior,
@@ -14,13 +14,19 @@ use tokio::runtime::Runtime;
 mod audio;
 mod settings;
 
-#[derive(Default)]
-pub(super) struct Topbar {
+pub struct Topbar {
     settings: SettingsTopbar,
-    audio: AudioTopbar,
+    pub audio: AudioTopbar,
 }
 
 impl Topbar {
+    pub fn new(ss: &Subsystems, config: &RawConfig) -> Self {
+        Self {
+            settings: SettingsTopbar::default(),
+            audio: AudioTopbar::new(ss, config),
+        }
+    }
+
     pub fn update(
         &mut self,
         rt: &Runtime,

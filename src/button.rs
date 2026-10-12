@@ -1,18 +1,40 @@
 use sdl3::{
-    EventSubsystem,
+    EventSubsystem, IntegerOrSdlError, JoystickSubsystem,
     event::{Event, EventWatch, EventWatchCallback},
+    joystick::JoystickId,
     keyboard::{Mod, Scancode},
     sys::guid::SDL_GUID,
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Button {
+    Key(Scancode),
+    Joystick(JoystickId, u8),
+}
+
+impl Button {
+    pub fn to_config(
+        self,
+        joystick: &JoystickSubsystem,
+    ) -> Result<ConfigButton, IntegerOrSdlError> {
+        return Ok(match self {
+            Button::Key(scancode) => ConfigButton::Key(scancode),
+            Button::Joystick(id, button) => ConfigButton::Joystick {
+                guid: joystick.open(id)?.guid().raw(),
+                button,
+            },
+        });
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConfigButton {
     Key(#[serde(with = "scancode")] Scancode),
     Joystick {
         #[serde(with = "guid")]
         guid: SDL_GUID,
-        button: u32,
+        button: u8,
     },
 }
 
@@ -29,7 +51,7 @@ impl ButtonWatcher {
     }
 
     pub async fn next(&mut self) -> Option<Button> {
-        self.recv.recv().await
+        return self.recv.recv().await;
     }
 }
 
@@ -48,10 +70,10 @@ impl EventWatchCallback for ButtonWatcherCallback {
                 let _ = self.send.send(Button::Key(scancode));
             }
             Event::JoyButtonDown {
-                timestamp,
-                which,
-                button_idx,
-            } => {}
+                which, button_idx, ..
+            } => {
+                let _ = self.send.send(Button::Joystick(which, button_idx));
+            }
             _ => {}
         }
     }

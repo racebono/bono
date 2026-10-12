@@ -1,4 +1,6 @@
-use crate::{app::Subsystems, button::Button, config::Config, error, guid_to_str, task::Task};
+use crate::{
+    app::Subsystems, button::ConfigButton, config::Config, error, guid_to_str, task::Task,
+};
 use egui::IntoAtoms;
 use tokio::runtime::Runtime;
 
@@ -21,9 +23,9 @@ impl SettingsTopbar {
             (config.talk_button.clone(), config.session_button.clone())
         };
 
-        let button = |pre: &str, val: Option<Button>| match val {
-            Some(Button::Key(key)) => format!("{pre}: Key '{}'", key.name()),
-            Some(Button::Joystick { guid, button }) => {
+        let button = |pre: &str, val: Option<ConfigButton>| match val {
+            Some(ConfigButton::Key(key)) => format!("{pre}: Key '{}'", key.name()),
+            Some(ConfigButton::Joystick { guid, button }) => {
                 format!("{pre}: Button {button} (Device '{}')", guid_to_str(&guid))
             }
             None => format!("{pre}: Disabled"),
@@ -66,7 +68,7 @@ impl SettingsTopbar {
 
 #[derive(Default)]
 struct ChangeButton {
-    waiting: Option<Task<anyhow::Result<Button>>>,
+    waiting: Option<Task<anyhow::Result<ConfigButton>>>,
 }
 
 impl ChangeButton {
@@ -77,7 +79,7 @@ impl ChangeButton {
         ui: &mut egui::Ui,
         pending: impl IntoAtoms<'a>,
         working: impl IntoAtoms<'a>,
-    ) -> Option<Button> {
+    ) -> Option<ConfigButton> {
         if let Some(ref mut waiting) = self.waiting {
             if ui.button(working).clicked() {
                 self.waiting = None;

@@ -1,4 +1,4 @@
-use crate::{button::Button, error};
+use crate::{app::Subsystems, button::ConfigButton, error};
 use camino::Utf8PathBuf;
 use sdl3::audio::AudioDeviceID;
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ use tokio::{
     sync::watch::Ref,
 };
 
+#[derive(Clone)]
 pub struct Config {
     send: tokio::sync::watch::Sender<RawConfig>,
 }
@@ -72,12 +73,12 @@ impl Config {
     }
 
     #[inline]
-    pub fn update(&mut self, f: impl FnOnce(&mut RawConfig)) {
+    pub fn update(&self, f: impl FnOnce(&mut RawConfig)) {
         self.send.send_modify(f);
     }
 
     #[inline]
-    pub fn maybe_update(&mut self, f: impl FnOnce(&mut RawConfig) -> bool) {
+    pub fn maybe_update(&self, f: impl FnOnce(&mut RawConfig) -> bool) {
         self.send.send_if_modified(f);
     }
 
@@ -104,9 +105,9 @@ pub struct RawConfig {
     #[serde(default = "default_height")]
     pub height: NonZeroU32,
     #[serde(default)]
-    pub talk_button: Option<Button>,
+    pub talk_button: Option<ConfigButton>,
     #[serde(default)]
-    pub session_button: Option<Button>,
+    pub session_button: Option<ConfigButton>,
     #[serde(default)]
     pub microphone: RawAudioDevice<true>,
     #[serde(default)]
@@ -141,6 +142,23 @@ pub struct RawConfig {
     pub claude_effort: String,
     #[serde(default = "default_text_scale")]
     pub text_scale: f32,
+    #[serde(default = "default_min_confidence")]
+    pub min_confidence: f32,
+}
+
+#[macro_export(local_inner_macros)]
+macro_rules! arrstr {
+    ($s:literal) => {
+        const {
+            const fn r#impl<const N: usize>() -> $crate::config::ArrayStr<N> {
+                match $crate::config::ArrayStr::<N>::from_str($s) {
+                    Some(s) => s,
+                    None => ::std::panic!("invalid string length"),
+                }
+            }
+            r#impl()
+        }
+    };
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -148,6 +166,13 @@ pub struct RawConfig {
 pub struct ArrayStr<const N: usize>([u8; N]);
 
 impl<const N: usize> ArrayStr<N> {
+    pub const fn from_str(s: &str) -> Option<Self> {
+        match s.as_bytes().as_array::<N>() {
+            Some(arr) => Some(unsafe { Self::from_utf8_unchecked(*arr) }),
+            None => None,
+        }
+    }
+
     #[inline]
     pub const unsafe fn from_utf8_unchecked(buf: [u8; N]) -> Self {
         Self(buf)
@@ -328,6 +353,11 @@ const fn default_opponent_frequency() -> NonZeroU32 {
 #[inline(always)]
 const fn default_silence_level() -> f32 {
     0.003
+}
+
+#[inline(always)]
+const fn default_min_confidence() -> f32 {
+    0.1
 }
 
 #[inline(always)]

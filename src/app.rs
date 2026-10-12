@@ -1,13 +1,13 @@
 use crate::{
     app::topbar::Topbar,
-    button::{Button, ButtonWatcher},
-    config::Config,
+    button::{Button, ButtonWatcher, ConfigButton},
+    config::{Config, RawConfig},
 };
 use anyhow::Context as AnyhowContext;
 use camino::{Utf8Path, Utf8PathBuf};
 use egui_sdl3::EguiCanvas;
 use sdl3::{
-    AudioSubsystem, Error, EventSubsystem, JoystickSubsystem, VideoSubsystem,
+    AudioSubsystem, Error, EventSubsystem, JoystickSubsystem,
     event::{Event, WindowEvent},
     filesystem::get_pref_path,
     get_error,
@@ -65,18 +65,23 @@ impl App {
         ui.ctx.set_fonts(fonts);
         set_vsync(&mut ui.painter.canvas, 1)?;
 
+        let subsystems = Subsystems {
+            audio,
+            joystick,
+            event,
+        };
+
+        let guard = config.get();
+        let gui = Gui::new(&subsystems, &guard);
+        drop(guard);
+
         return Ok(Self {
             state: AppState {
+                subsystems,
                 base_path,
                 pref_path,
                 config,
-                subsystems: Subsystems {
-                    audio,
-                    video,
-                    joystick,
-                    event,
-                },
-                gui: Gui::default(),
+                gui,
             },
             ui,
         });
@@ -119,11 +124,22 @@ impl App {
                     WindowEvent::Resized(w, h) => self.config.on_resize(w, h),
                     _ => {}
                 },
+                Event::JoyButtonDown {
+                    timestamp,
+                    which,
+                    button_idx,
+                } => {
+                    todo!()
+                }
                 Event::Quit { .. } => return AppResult::Success,
                 _ => {}
             }
         }
         AppResult::Continue
+    }
+
+    fn test_button(&self, button: ConfigButton) -> bool {
+        todo!()
     }
 }
 
@@ -173,11 +189,11 @@ impl DerefMut for AppState {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Subsystems {
-    audio: AudioSubsystem,
-    video: VideoSubsystem,
-    joystick: JoystickSubsystem,
-    event: EventSubsystem,
+    pub audio: AudioSubsystem,
+    pub joystick: JoystickSubsystem,
+    pub event: EventSubsystem,
 }
 
 impl Subsystems {
@@ -193,13 +209,19 @@ impl Subsystems {
     }
 }
 
-#[derive(Default)]
 pub struct Gui {
-    topbar: Topbar,
+    pub topbar: Topbar,
     applied_text_scale: Option<f32>,
 }
 
 impl Gui {
+    fn new(ss: &Subsystems, config: &RawConfig) -> Self {
+        Self {
+            topbar: Topbar::new(ss, config),
+            applied_text_scale: None,
+        }
+    }
+
     /// `ui` must be the root `Ui`: edge panels have to be added before the `CentralPanel`,
     /// which then fills the remaining space.
     fn update(&mut self, rt: &Runtime, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
