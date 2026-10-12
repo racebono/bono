@@ -48,10 +48,5 @@ openblas = ["whisper-rs/openblas"]
 # Windows, Linux. Needs the Vulkan SDK (`VULKAN_SDK`)
 vulkan = ["whisper-rs/vulkan"]
 
-# Build SDL in Release so it links the release CRT (`msvcrt`) like Rust does, not `MSVCRTD`
-[profile.dev.package.sdl3-sys]
-opt-level = 3
-debug = false
-
 [workspace]
 members = ["xtask"]
