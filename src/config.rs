@@ -1,4 +1,4 @@
-use crate::{app::Subsystems, button::ConfigButton, error};
+use crate::{button::ConfigButton, error};
 use camino::Utf8PathBuf;
 use sdl3::audio::AudioDeviceID;
 use serde::{Deserialize, Serialize};

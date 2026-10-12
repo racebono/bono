@@ -1,50 +1,84 @@
 use crate::{
-    app::Subsystems,
+    app::{
+        Subsystems,
+        topbar::audio::whisper::{RECORDING_SPEC, Whisper},
+    },
     config::{AudioDevice, Config, RawConfig},
     error,
-    whisper::RECORDING_SPEC,
 };
+use camino::Utf8Path;
 use sdl3::{
     AudioSubsystem,
     audio::{AudioDeviceID, AudioSpec},
+    event::Event,
     get_error,
     sys::{
-        audio::{
-            SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, SDL_AUDIO_DEVICE_DEFAULT_RECORDING,
-            SDL_GetAudioPlaybackDevices, SDL_GetAudioRecordingDevices,
-        },
+        audio::{SDL_GetAudioPlaybackDevices, SDL_GetAudioRecordingDevices},
         stdinc::SDL_free,
     },
 };
 use std::{
     ops::{Deref, DerefMut},
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::runtime::Handle;
+
+mod whisper;
 
 const DELAY: Duration = Duration::from_secs(1);
 
 pub struct AudioTopbar {
     pub microphone: DeviceSelector,
     pub speaker: DeviceSelector,
+    pub whisper: Whisper,
 }
 
 impl AudioTopbar {
-    pub fn new(ss: &Subsystems, config: &RawConfig) -> Self {
+    pub fn new(
+        pref_path: &Arc<Utf8Path>,
+        ss: &Subsystems,
+        config: &RawConfig,
+        client: &reqwest::Client,
+    ) -> Self {
         Self {
             microphone: DeviceSelector::new(Kind::Recording, &ss.audio, config, Instant::now()),
             speaker: DeviceSelector::new(Kind::Playback, &ss.audio, config, Instant::now()),
+            whisper: Whisper::new(pref_path, client.clone(), None),
         }
     }
 
-    pub fn update(&mut self, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
+    pub fn update(&mut self, rt: &Handle, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
         let now = Instant::now();
         self.microphone.update(Kind::Recording, ss, ui, config, now);
         self.speaker.update(Kind::Playback, ss, ui, config, now);
+        self.whisper.update(rt, config, ui);
+    }
+
+    pub fn event(&mut self, rt: &Handle, config: &Config, event: &Event) -> bool {
+        if let Some(device) = self.microphone.get() {
+            match self.whisper.event(rt, &event, config, device) {
+                Ok(handle) => {
+                    // FIXME(TODO): Save into AI session
+                    tokio::spawn(async move {
+                        match handle.await {
+                            Ok(Some((msg, lang))) => log::debug!("({lang}) {msg}"),
+                            Ok(None) => log::debug!("Didn't understand"),
+                            Err(e) => error("Failed speech to text", e),
+                        }
+                        todo!()
+                    });
+                }
+                Err(e) => return e,
+            };
+        }
+
+        return false;
     }
 }
 
-struct DeviceSelector {
+pub struct DeviceSelector {
     open: Option<sdl3::audio::AudioDevice>,
     next: Instant,
     devices: Vec<(AudioDeviceID, Arc<str>)>,
@@ -137,13 +171,6 @@ impl Kind {
         match self {
             Kind::Playback => "Speaker",
             Kind::Recording => "Microphone",
-        }
-    }
-
-    pub const fn default_device(self) -> AudioDeviceID {
-        match self {
-            Kind::Playback => AudioDeviceID::Device(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK),
-            Kind::Recording => AudioDeviceID::Device(SDL_AUDIO_DEVICE_DEFAULT_RECORDING),
         }
     }
 

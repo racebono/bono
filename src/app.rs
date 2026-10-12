@@ -1,6 +1,6 @@
 use crate::{
     app::topbar::Topbar,
-    button::{Button, ButtonWatcher, ConfigButton},
+    button::{Button, ButtonWatcher},
     config::{Config, RawConfig},
 };
 use anyhow::Context as AnyhowContext;
@@ -19,8 +19,9 @@ use std::{
     ffi::c_int,
     ops::{Deref, DerefMut},
     sync::Arc,
+    time::Duration,
 };
-use tokio::{runtime::Runtime, try_join};
+use tokio::{runtime::Handle, try_join};
 
 mod topbar;
 
@@ -71,8 +72,9 @@ impl App {
             event,
         };
 
+        let pref_path = Arc::<Utf8Path>::from(pref_path);
         let guard = config.get();
-        let gui = Gui::new(&subsystems, &guard);
+        let gui = Gui::new(&pref_path, &subsystems, &guard)?;
         drop(guard);
 
         return Ok(Self {
@@ -87,7 +89,7 @@ impl App {
         });
     }
 
-    pub fn iterate(&mut self, rt: &Runtime) -> AppResult {
+    pub fn iterate(&mut self, rt: &Handle) -> AppResult {
         self.ui.run(|ctx| {
             // Must happen before the root `Ui` is built, since it copies the style on creation
             let text_scale = self.state.config.get().text_scale;
@@ -113,8 +115,12 @@ impl App {
         AppResult::Continue
     }
 
-    pub fn event(&mut self, event: Event) -> AppResult {
-        if !self.ui.on_event(&event).consumed {
+    pub fn event(&mut self, rt: &Handle, event: Event) -> AppResult {
+        if self.ui.on_event(&event).consumed {
+            return AppResult::Continue;
+        }
+
+        if !self.state.gui.event(rt, &self.state.config, &event) {
             match event {
                 Event::Window {
                     window_id,
@@ -124,22 +130,12 @@ impl App {
                     WindowEvent::Resized(w, h) => self.config.on_resize(w, h),
                     _ => {}
                 },
-                Event::JoyButtonDown {
-                    timestamp,
-                    which,
-                    button_idx,
-                } => {
-                    todo!()
-                }
                 Event::Quit { .. } => return AppResult::Success,
                 _ => {}
             }
         }
-        AppResult::Continue
-    }
 
-    fn test_button(&self, button: ConfigButton) -> bool {
-        todo!()
+        return AppResult::Continue;
     }
 }
 
@@ -161,14 +157,14 @@ impl DerefMut for App {
 
 pub struct AppState {
     base_path: &'static Utf8Path,
-    pref_path: Utf8PathBuf,
+    pref_path: Arc<Utf8Path>,
     gui: Gui,
     config: Config,
     subsystems: Subsystems,
 }
 
 impl AppState {
-    fn update(&mut self, rt: &Runtime, ui: &mut egui::Ui) {
+    fn update(&mut self, rt: &Handle, ui: &mut egui::Ui) {
         self.gui.update(rt, &self.subsystems, ui, &mut self.config);
     }
 }
@@ -215,18 +211,26 @@ pub struct Gui {
 }
 
 impl Gui {
-    fn new(ss: &Subsystems, config: &RawConfig) -> Self {
-        Self {
-            topbar: Topbar::new(ss, config),
+    fn new(pref_path: &Arc<Utf8Path>, ss: &Subsystems, config: &RawConfig) -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?;
+
+        return Ok(Self {
+            topbar: Topbar::new(pref_path, ss, config, &client),
             applied_text_scale: None,
-        }
+        });
     }
 
     /// `ui` must be the root `Ui`: edge panels have to be added before the `CentralPanel`,
     /// which then fills the remaining space.
-    fn update(&mut self, rt: &Runtime, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
+    fn update(&mut self, rt: &Handle, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
         self.topbar.update(rt, ss, ui, config);
         egui::CentralPanel::default().show(ui, |_ui| {});
+    }
+
+    fn event(&mut self, rt: &Handle, config: &Config, event: &Event) -> bool {
+        self.topbar.event(rt, config, event)
     }
 }
 

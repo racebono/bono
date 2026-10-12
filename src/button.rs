@@ -2,7 +2,7 @@ use sdl3::{
     EventSubsystem, IntegerOrSdlError, JoystickSubsystem,
     event::{Event, EventWatch, EventWatchCallback},
     joystick::JoystickId,
-    keyboard::{Mod, Scancode},
+    keyboard::Scancode,
     sys::guid::SDL_GUID,
 };
 use serde::{Deserialize, Serialize};
@@ -39,7 +39,7 @@ pub enum ConfigButton {
 }
 
 pub struct ButtonWatcher {
-    watch: EventWatch<ButtonWatcherCallback>,
+    _watch: EventWatch<ButtonWatcherCallback>,
     recv: tokio::sync::mpsc::UnboundedReceiver<Button>,
 }
 
@@ -47,7 +47,10 @@ impl ButtonWatcher {
     pub fn new(event: &EventSubsystem) -> anyhow::Result<Self> {
         let (send, recv) = tokio::sync::mpsc::unbounded_channel();
         let watch = event.add_event_watch(ButtonWatcherCallback { send });
-        Ok(Self { watch, recv })
+        Ok(Self {
+            _watch: watch,
+            recv,
+        })
     }
 
     pub async fn next(&mut self) -> Option<Button> {
@@ -64,7 +67,6 @@ impl EventWatchCallback for ButtonWatcherCallback {
         match event {
             Event::KeyDown {
                 scancode: Some(scancode),
-                keymod: Mod::NOMOD,
                 ..
             } => {
                 let _ = self.send.send(Button::Key(scancode));

@@ -1,8 +1,8 @@
 use crate::{
-    app::Subsystems, button::ConfigButton, config::Config, error, guid_to_str, task::Task,
+    app::Subsystems, button::ConfigButton, config::Config, error, guid_to_str, task::LocalTask,
 };
 use egui::IntoAtoms;
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 
 #[derive(Default)]
 pub struct SettingsTopbar {
@@ -11,13 +11,7 @@ pub struct SettingsTopbar {
 }
 
 impl SettingsTopbar {
-    pub fn update(
-        &mut self,
-        rt: &Runtime,
-        ss: &Subsystems,
-        ui: &mut egui::Ui,
-        config: &mut Config,
-    ) {
+    pub fn update(&mut self, rt: &Handle, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
         let (talk, session) = {
             let config = config.get();
             (config.talk_button.clone(), config.session_button.clone())
@@ -68,13 +62,13 @@ impl SettingsTopbar {
 
 #[derive(Default)]
 struct ChangeButton {
-    waiting: Option<Task<anyhow::Result<ConfigButton>>>,
+    waiting: Option<LocalTask<anyhow::Result<ConfigButton>>>,
 }
 
 impl ChangeButton {
     fn update<'a>(
         &mut self,
-        rt: &Runtime,
+        rt: &Handle,
         ss: &Subsystems,
         ui: &mut egui::Ui,
         pending: impl IntoAtoms<'a>,
@@ -95,7 +89,10 @@ impl ChangeButton {
         }
 
         if ui.button(pending).clicked() {
-            self.waiting = Some(Task::spawn(ss.next_button()));
+            let ss = ss.clone();
+            self.waiting = Some(LocalTask::spawn_local(async move {
+                Ok(ss.next_button().await?.to_config(&ss.joystick)?)
+            }));
         }
 
         return None;

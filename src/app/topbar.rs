@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{
     app::{
         Subsystems,
@@ -5,11 +7,13 @@ use crate::{
     },
     config::{Config, RawConfig},
 };
+use camino::Utf8Path;
 use egui::{
     PopupCloseBehavior,
     menu::{MenuButton, MenuConfig},
 };
-use tokio::runtime::Runtime;
+use sdl3::event::Event;
+use tokio::runtime::Handle;
 
 mod audio;
 mod settings;
@@ -20,20 +24,27 @@ pub struct Topbar {
 }
 
 impl Topbar {
-    pub fn new(ss: &Subsystems, config: &RawConfig) -> Self {
+    pub fn new(
+        pref_path: &Arc<Utf8Path>,
+        ss: &Subsystems,
+        config: &RawConfig,
+        client: &reqwest::Client,
+    ) -> Self {
         Self {
             settings: SettingsTopbar::default(),
-            audio: AudioTopbar::new(ss, config),
+            audio: AudioTopbar::new(pref_path, ss, config, client),
         }
     }
 
-    pub fn update(
-        &mut self,
-        rt: &Runtime,
-        ss: &Subsystems,
-        ui: &mut egui::Ui,
-        config: &mut Config,
-    ) {
+    pub fn event(&mut self, rt: &Handle, config: &Config, event: &Event) -> bool {
+        if self.audio.event(rt, config, event) {
+            return true;
+        }
+
+        return false;
+    }
+
+    pub fn update(&mut self, rt: &Handle, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
         egui::Panel::top("tobpar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 MenuButton::new("Settings")
@@ -46,7 +57,7 @@ impl Topbar {
                     .config(
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
-                    .ui(ui, |ui| self.audio.update(ss, ui, config));
+                    .ui(ui, |ui| self.audio.update(rt, ss, ui, config));
             });
         });
     }

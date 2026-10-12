@@ -1,5 +1,6 @@
 use pin_project::{pin_project, pinned_drop};
 use std::{
+    hint::unreachable_unchecked,
     panic::resume_unwind,
     pin::Pin,
     sync::{
@@ -8,10 +9,10 @@ use std::{
     },
     task::{Context, Poll, Wake, Waker, ready},
 };
-use tokio::{runtime::Runtime, task::coop::unconstrained};
+use tokio::{runtime::Handle, task::coop::unconstrained};
 
 pub struct Task<T> {
-    handle: Option<TaskKind<T>>,
+    handle: Option<JoinHandle<T>>,
 }
 
 impl<T> Task<T> {
@@ -23,7 +24,48 @@ impl<T> Task<T> {
         T: Send + 'static,
     {
         Self {
-            handle: Some(TaskKind::Handle(spawn(f))),
+            handle: Some(spawn(f)),
+        }
+    }
+
+    #[inline]
+    pub fn spawn_blocking<F>(f: F) -> Self
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        Self {
+            handle: Some(spawn_blocking(f)),
+        }
+    }
+
+    #[inline]
+    pub fn update(&mut self, rt: &Handle) -> Option<T> {
+        let handle = self.handle.as_mut()?;
+        if handle.is_finished() {
+            let val = rt.block_on(unconstrained(handle));
+            self.handle = None;
+            return Some(val);
+        }
+
+        return None;
+    }
+}
+
+pub struct LocalTask<T> {
+    handle: Option<LocalTaskKind<T>>,
+}
+
+impl<T> LocalTask<T> {
+    #[inline]
+    pub fn spawn<F>(f: F) -> Self
+    where
+        F: IntoFuture<Output = T>,
+        F::IntoFuture: Send + 'static,
+        T: Send + 'static,
+    {
+        Self {
+            handle: Some(LocalTaskKind::Handle(spawn(f))),
         }
     }
 
@@ -35,9 +77,11 @@ impl<T> Task<T> {
         T: 'static,
     {
         Self {
-            handle: Some(TaskKind::Local(
+            handle: Some(LocalTaskKind::Local(
                 Box::pin(f.into_future()),
-                Arc::new(AtomicBool::new(true)),
+                Arc::new(LocalWake {
+                    flag: AtomicBool::new(true),
+                }),
             )),
         }
     }
@@ -49,28 +93,28 @@ impl<T> Task<T> {
         T: Send + 'static,
     {
         Self {
-            handle: Some(TaskKind::Handle(spawn_blocking(f))),
+            handle: Some(LocalTaskKind::Handle(spawn_blocking(f))),
         }
     }
 
     #[inline]
-    pub fn update(&mut self, rt: &Runtime) -> Option<T> {
+    pub fn update(&mut self, rt: &Handle) -> Option<T> {
         let handle = self.handle.as_mut()?;
         match handle {
-            TaskKind::Handle(handle) => {
+            LocalTaskKind::Handle(handle) => {
                 if handle.is_finished() {
                     let val = rt.block_on(unconstrained(handle));
                     self.handle = None;
                     return Some(val);
                 }
             }
-            TaskKind::Local(fut, updated) => {
+            LocalTaskKind::Local(fut, updated) => {
                 if updated.flag.swap(false, Ordering::AcqRel) {
                     let waker = Waker::from(updated.clone());
                     let mut cx = Context::from_waker(&waker);
-                    match fut.as_mut().poll(&mut cx) {
-                        Poll::Ready(_) => todo!(),
-                        Poll::Pending => todo!(),
+                    if let Poll::Ready(val) = fut.as_mut().poll(&mut cx) {
+                        self.handle = None;
+                        return Some(val);
                     }
                 }
             }
@@ -80,11 +124,29 @@ impl<T> Task<T> {
     }
 }
 
+impl<T> From<JoinHandle<T>> for LocalTask<T> {
+    #[inline]
+    fn from(handle: JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(LocalTaskKind::Handle(handle)),
+        }
+    }
+}
+
 impl<T> From<JoinHandle<T>> for Task<T> {
     #[inline]
     fn from(handle: JoinHandle<T>) -> Self {
         Self {
-            handle: Some(TaskKind::Handle(handle)),
+            handle: Some(handle),
+        }
+    }
+}
+
+impl<T> From<Task<T>> for LocalTask<T> {
+    #[inline]
+    fn from(handle: Task<T>) -> Self {
+        Self {
+            handle: handle.handle.map(LocalTaskKind::Handle),
         }
     }
 }
@@ -148,7 +210,7 @@ impl<T> PinnedDrop for JoinHandle<T> {
     }
 }
 
-enum TaskKind<T> {
+enum LocalTaskKind<T> {
     Handle(JoinHandle<T>),
     Local(Pin<Box<dyn Future<Output = T> + 'static>>, Arc<LocalWake>),
 }
@@ -164,5 +226,44 @@ impl Wake for LocalWake {
 
     fn wake_by_ref(self: &Arc<Self>) {
         self.flag.store(true, Ordering::Release);
+    }
+}
+
+pub enum MaybeDone<T> {
+    Task(Task<T>),
+    Done(T),
+}
+
+impl<T> MaybeDone<T> {
+    #[inline]
+    pub fn spawn<F>(f: F) -> Self
+    where
+        F: IntoFuture<Output = T>,
+        F::IntoFuture: Send + 'static,
+        T: Send + 'static,
+    {
+        Self::Task(Task::spawn(f))
+    }
+
+    #[inline]
+    pub fn spawn_blocking<F>(f: F) -> Self
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        Self::Task(Task::spawn_blocking(f))
+    }
+
+    #[inline]
+    pub fn update<'a>(&'a mut self, rt: &Handle) -> Option<&'a mut T> {
+        if let Self::Task(task) = self {
+            let res = task.update(rt)?;
+            *self = Self::Done(res);
+        }
+
+        return Some(match self {
+            MaybeDone::Done(val) => val,
+            _ => unsafe { unreachable_unchecked() },
+        });
     }
 }
