@@ -1,5 +1,5 @@
 use crate::{button::ConfigButton, error};
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use sdl3::audio::AudioDeviceID;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -135,7 +135,7 @@ pub struct RawConfig {
     #[serde(default = "default_silence_level")]
     pub silence_level: f32,
     #[serde(default)]
-    pub whisper_model: Option<Utf8PathBuf>,
+    pub whisper_model: Option<Arc<Utf8Path>>,
     #[serde(default = "default_claude_model")]
     pub claude_model: String,
     #[serde(default = "default_claude_effort")]

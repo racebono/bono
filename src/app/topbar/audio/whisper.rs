@@ -66,7 +66,7 @@ impl Whisper {
             ctx: None,
             stream: None,
             catalog: MaybeDone::spawn(async move {
-                match Model::fetch_catalog(pref_path.as_std_path(), &client).await {
+                match Model::fetch_catalog(&pref_path, &client).await {
                     Ok(catalog) => Some(catalog),
                     Err(e) => {
                         error("Error fetching speech to text catalog", e);
@@ -78,7 +78,7 @@ impl Whisper {
         };
     }
 
-    pub fn update(&mut self, rt: &Handle, config: &Config, ui: &mut egui::Ui) {
+    pub fn update(&mut self, rt: &Handle, config: &mut Config, ui: &mut egui::Ui) {
         let client = self.client.clone();
         let catalog = self.catalog_mut(rt);
 
@@ -101,49 +101,55 @@ impl Whisper {
                         });
                     })
                     .body(|mut body| {
-                        let config = config.get();
-                        for model in catalog.unwrap_or_default() {
-                            body.row(18.0, |mut row| {
-                                row.col(|ui| {
-                                    ui.label(&model.name);
-                                });
-
-                                row.col(|ui| {
-                                    if let Some(ref q) = model.quantization {
-                                        ui.label(q);
-                                    }
-                                });
-
-                                row.col(|ui| {
-                                    ui.label(if model.english_only { "English" } else { "All" });
-                                });
-
-                                if let Some(on_disk) = model.on_disk() {
+                        config.maybe_update(|config| {
+                            let mut updated = false;
+                            for model in catalog.unwrap_or_default() {
+                                body.row(18.0, |mut row| {
                                     row.col(|ui| {
-                                        if on_disk {
-                                            ui.add_enabled_ui(
-                                                config
-                                                    .whisper_model
-                                                    .as_ref()
-                                                    .map(|p| p.as_std_path())
-                                                    != Some(model.path.deref()),
-                                                |ui| {
-                                                    if ui.button("Use").clicked() {
-                                                        log::debug!("Clicked!");
-                                                    }
-                                                },
-                                            );
-                                        } else if let Some(download) = model.download() {
-                                            egui::ProgressBar::new(download.progress() as f32)
-                                                .show_percentage()
-                                                .ui(ui);
-                                        } else if ui.button("Download").clicked() {
-                                            model.start_download(&client);
+                                        ui.label(&model.name);
+                                    });
+
+                                    row.col(|ui| {
+                                        if let Some(ref q) = model.quantization {
+                                            ui.label(q);
                                         }
                                     });
-                                }
-                            });
-                        }
+
+                                    row.col(|ui| {
+                                        ui.label(if model.english_only {
+                                            "English"
+                                        } else {
+                                            "All"
+                                        });
+                                    });
+
+                                    if let Some(on_disk) = model.on_disk() {
+                                        row.col(|ui| {
+                                            if on_disk {
+                                                ui.add_enabled_ui(
+                                                    config.whisper_model.as_ref()
+                                                        != Some(&model.path),
+                                                    |ui| {
+                                                        if ui.button("Use").clicked() {
+                                                            config.whisper_model =
+                                                                Some(model.path.clone());
+                                                            updated = true;
+                                                        }
+                                                    },
+                                                );
+                                            } else if let Some(download) = model.download() {
+                                                egui::ProgressBar::new(download.progress() as f32)
+                                                    .show_percentage()
+                                                    .ui(ui);
+                                            } else if ui.button("Download").clicked() {
+                                                model.start_download(&client);
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                            return updated;
+                        });
                     });
             });
         });
@@ -537,7 +543,7 @@ pub struct Model {
     pub quantization: Option<String>,
     pub sha256: Option<String>,
     pub file: String,
-    pub path: Arc<Path>,
+    pub path: Arc<Utf8Path>,
     on_disk: tokio::sync::watch::Receiver<Option<bool>>,
     download: Option<Download>,
 }
@@ -554,16 +560,18 @@ impl Model {
 
     pub fn start_download(&mut self, client: &reqwest::Client) -> &mut Download {
         self.download.get_or_insert_with(|| {
+            let path = Arc::into_raw(self.path.clone());
+            let path = unsafe { Arc::<Path>::from_raw(path as *const Path) };
             Download::new(
                 client.get(format!("{FILE_URL}{}", self.file)),
-                self.path.clone(),
+                path,
                 self.size,
             )
         })
     }
 
     async fn fetch_catalog(
-        pref_dir: &Path,
+        pref_dir: &Utf8Path,
         client: &reqwest::Client,
     ) -> reqwest::Result<Vec<Model>> {
         #[derive(Debug, Clone, Deserialize)]
@@ -639,7 +647,7 @@ impl Model {
                 (None, None) => None,
             };
 
-            let path = Arc::<Path>::from(pref_dir.join("whisper").join(&file));
+            let path = Arc::<Utf8Path>::from(pref_dir.join("whisper").join(&file));
             models.push(Model {
                 size,
                 name: name.to_owned(),
@@ -650,7 +658,7 @@ impl Model {
                 path: path.clone(),
                 on_disk: updating(Duration::from_millis(1234), None, move |_| {
                     let path = path.clone();
-                    async move { tokio::fs::try_exists(path).await.ok() }
+                    async move { tokio::fs::try_exists(&*path).await.ok() }
                 }),
                 download: None,
             });
