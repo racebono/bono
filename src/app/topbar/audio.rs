@@ -14,7 +14,7 @@ use crate::{
 use camino::Utf8Path;
 use sdl3::{
     AudioSubsystem,
-    audio::{AudioDeviceID, AudioSpec},
+    audio::{AudioDeviceID, AudioSpec, AudioStreamOwner},
     event::Event,
     get_error,
     sys::{
@@ -27,7 +27,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::runtime::Handle;
+use tokio::{runtime::Handle, sync::oneshot::error::TryRecvError};
 
 mod voice;
 mod whisper;
@@ -40,6 +40,8 @@ pub struct AudioTopbar {
     pub whisper: Whisper,
     pub voices: Voices,
     pub test: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Speech>>>,
+    /// The test speech's stream, kept until it's done playing (dropping it stops playback)
+    test_playback: Option<AudioStreamOwner>,
 }
 
 impl AudioTopbar {
@@ -55,6 +57,7 @@ impl AudioTopbar {
             whisper: Whisper::new(pref_path, config, client.clone(), None),
             voices: Voices::new(pref_path, client.clone()),
             test: None,
+            test_playback: None,
         }
     }
 
@@ -87,8 +90,9 @@ impl AudioTopbar {
                     self.test = None;
                     log::debug!("Test synthesized");
                     if let Some(device) = self.speaker.get() {
-                        if let Err(e) = speech.play(device) {
-                            error("Error playing test speech", e);
+                        match speech.play(device) {
+                            Ok(stream) => self.test_playback = Some(stream),
+                            Err(e) => error("Error playing test speech", e),
                         }
                     } else {
                         log::warn!("No speaker selected (audio will not be played)");
@@ -98,8 +102,19 @@ impl AudioTopbar {
                     self.test = None;
                     error("Error synthesizing speech", e);
                 }
-                Err(..) => {}
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Closed) => {
+                    self.test = None;
+                    log::error!("Test speech was dropped before it was synthesized");
+                }
             }
+        }
+
+        // Once SDL has consumed all of the test speech, its stream can go
+        if let Some(ref stream) = self.test_playback
+            && stream.queued_bytes().is_ok_and(|queued| queued == 0)
+        {
+            self.test_playback = None;
         }
     }
 
