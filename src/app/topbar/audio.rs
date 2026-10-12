@@ -1,10 +1,15 @@
 use crate::{
     app::{
         Subsystems,
-        topbar::audio::whisper::{RECORDING_SPEC, Whisper},
+        topbar::audio::{
+            voice::Voices,
+            whisper::{RECORDING_SPEC, Whisper},
+        },
     },
+    arrstr,
     config::{AudioDevice, Config, RawConfig},
     error,
+    synthesizer::{Speech, Synthesizer},
 };
 use camino::Utf8Path;
 use sdl3::{
@@ -33,6 +38,8 @@ pub struct AudioTopbar {
     pub microphone: DeviceSelector,
     pub speaker: DeviceSelector,
     pub whisper: Whisper,
+    pub voices: Voices,
+    pub test: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Speech>>>,
 }
 
 impl AudioTopbar {
@@ -46,14 +53,54 @@ impl AudioTopbar {
             microphone: DeviceSelector::new(Kind::Recording, &ss.audio, config, Instant::now()),
             speaker: DeviceSelector::new(Kind::Playback, &ss.audio, config, Instant::now()),
             whisper: Whisper::new(pref_path, config, client.clone(), None),
+            voices: Voices::new(pref_path, client.clone()),
+            test: None,
         }
     }
 
-    pub fn update(&mut self, rt: &Handle, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
+    pub fn update(
+        &mut self,
+        rt: &Handle,
+        ss: &Subsystems,
+        ui: &mut egui::Ui,
+        config: &mut Config,
+        synth: &mut Synthesizer,
+    ) {
         let now = Instant::now();
         self.microphone.update(Kind::Recording, ss, ui, config, now);
-        self.speaker.update(Kind::Playback, ss, ui, config, now);
+        if self.speaker.update(Kind::Playback, ss, ui, config, now) && self.test.is_none() {
+            log::debug!("Start test");
+            self.test = Some(synth.synthesize(
+                rt,
+                arrstr!("en"),
+                "Hello, world!".into(),
+                config.get().synth_effects(),
+            ));
+        }
+
         self.whisper.update(rt, config, ui);
+        self.voices.update(rt, config, ui, synth);
+
+        if let Some(ref mut test) = self.test {
+            match test.try_recv() {
+                Ok(Ok(speech)) => {
+                    self.test = None;
+                    log::debug!("Test synthesized");
+                    if let Some(device) = self.speaker.get() {
+                        if let Err(e) = speech.play(device) {
+                            error("Error playing test speech", e);
+                        }
+                    } else {
+                        log::warn!("No speaker selected (audio will not be played)");
+                    }
+                }
+                Ok(Err(e)) => {
+                    self.test = None;
+                    error("Error synthesizing speech", e);
+                }
+                Err(..) => {}
+            }
+        }
     }
 
     pub fn event(&mut self, rt: &Handle, config: &Config, event: &Event) -> bool {
@@ -105,7 +152,7 @@ impl DeviceSelector {
         ui: &mut egui::Ui,
         config: &mut Config,
         now: Instant,
-    ) {
+    ) -> bool {
         if now >= self.next {
             self.update_devices(kind, ss);
             self.next = match self.next.checked_add(DELAY) {
@@ -114,6 +161,7 @@ impl DeviceSelector {
             };
         }
 
+        let mut test = false;
         config.maybe_update(|raw| {
             let config = kind.config_mut(raw);
 
@@ -121,7 +169,7 @@ impl DeviceSelector {
             // so opening a `ComboBox` popup would close the menu it lives in.
             let label = format!("{}: {}", kind.label(), config.name());
             return ui
-                .menu_button(label, move |ui| {
+                .menu_button(label, |ui| {
                     let mut updated = ui
                         .selectable_value(config, AudioDevice::Default, "System default")
                         .clicked();
@@ -136,9 +184,9 @@ impl DeviceSelector {
                             .clicked();
                     }
 
-                    ui.separator();
-                    if ui.button("Test").clicked() {
-                        log::debug!("TODO");
+                    if kind == Kind::Playback {
+                        ui.separator();
+                        test = ui.button("Test").clicked();
                     }
 
                     if updated {
@@ -150,6 +198,8 @@ impl DeviceSelector {
                 .inner
                 .unwrap_or(false);
         });
+
+        return test;
     }
 
     fn update_devices(&mut self, kind: Kind, ss: &Subsystems) {

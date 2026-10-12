@@ -2,10 +2,11 @@ use crate::{
     app::topbar::Topbar,
     button::{Button, ButtonWatcher},
     config::{Config, RawConfig},
-    synthesizer::Synthesizer,
+    synthesizer::{Synthesizer, SynthesizerInner},
 };
 use anyhow::Context as AnyhowContext;
 use camino::{Utf8Path, Utf8PathBuf};
+use egui::{FontData, FontFamily, FontTweak};
 use egui_sdl3::EguiCanvas;
 use sdl3::{
     AudioSubsystem, Error, EventSubsystem, JoystickSubsystem,
@@ -76,6 +77,7 @@ impl App {
         let pref_path = Arc::<Utf8Path>::from(pref_path);
         let guard = config.get();
         let gui = Gui::new(&pref_path, &subsystems, &guard)?;
+        let synth = Synthesizer::new(rt, &guard);
         drop(guard);
 
         return Ok(Self {
@@ -85,7 +87,7 @@ impl App {
                 pref_path,
                 config,
                 gui,
-                synth: Synthesizer::new(rt.clone()),
+                synth,
             },
             ui,
         });
@@ -168,7 +170,8 @@ pub struct AppState {
 
 impl AppState {
     fn update(&mut self, rt: &Handle, ui: &mut egui::Ui) {
-        self.gui.update(rt, &self.subsystems, ui, &mut self.config);
+        self.gui
+            .update(rt, &self.subsystems, ui, &mut self.config, &mut self.synth);
     }
 }
 
@@ -227,8 +230,15 @@ impl Gui {
 
     /// `ui` must be the root `Ui`: edge panels have to be added before the `CentralPanel`,
     /// which then fills the remaining space.
-    fn update(&mut self, rt: &Handle, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
-        self.topbar.update(rt, ss, ui, config);
+    fn update(
+        &mut self,
+        rt: &Handle,
+        ss: &Subsystems,
+        ui: &mut egui::Ui,
+        config: &mut Config,
+        synth: &mut Synthesizer,
+    ) {
+        self.topbar.update(rt, ss, ui, config, synth);
         egui::CentralPanel::default().show(ui, |_ui| {});
     }
 
@@ -269,27 +279,44 @@ async fn load_config(pref_path: &Utf8Path) -> anyhow::Result<Config> {
 
 async fn load_fonts(base_path: &Utf8Path) -> anyhow::Result<egui::FontDefinitions> {
     let mut fonts = egui::FontDefinitions::default();
-    let data = egui::FontData::from_owned(
-        tokio::fs::read(base_path.join_os("assets/ProggyForever-Regular.ttf")).await?,
+    let (proggy, noto, ubuntu) = tokio::try_join!(
+        tokio::fs::read(base_path.join_os("assets/ProggyForever-Regular.ttf")),
+        tokio::fs::read(base_path.join_os("assets/NotoEmoji-Regular.ttf")),
+        tokio::fs::read(base_path.join_os("assets/Ubuntu-Light.ttf")),
+    )?;
+
+    fonts.font_data.insert(
+        "proggy-forever".into(),
+        Arc::new(egui::FontData::from_owned(proggy)),
+    );
+    fonts.font_data.insert(
+        "NotoEmoji-Regular".to_owned(),
+        Arc::new(egui::FontData::from_owned(noto).tweak(FontTweak {
+            scale: 0.81, // Make smaller
+            ..Default::default()
+        })),
+    );
+    fonts.font_data.insert(
+        "Ubuntu-Light".to_owned(),
+        Arc::new(egui::FontData::from_owned(ubuntu)),
     );
 
-    fonts
-        .font_data
-        .insert("proggy-forever".into(), Arc::new(data));
-
-    // Ponerla la primera en Proportional (texto normal)
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, "proggy-forever".into());
-
-    // Opcional: también para Monospace
-    fonts
-        .families
-        .entry(egui::FontFamily::Monospace)
-        .or_default()
-        .insert(0, "proggy-forever".into());
+    fonts.families.insert(
+        FontFamily::Monospace,
+        vec![
+            "proggy-forever".into(),
+            // "Ubuntu-Light".to_owned(), // fallback for √ etc
+            // "NotoEmoji-Regular".to_owned(),
+        ],
+    );
+    fonts.families.insert(
+        FontFamily::Proportional,
+        vec![
+            "proggy-forever".into(),
+            // "Ubuntu-Light".to_owned(),
+            // "NotoEmoji-Regular".to_owned(),
+        ],
+    );
 
     Ok(fonts)
 }

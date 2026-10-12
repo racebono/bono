@@ -353,7 +353,9 @@ impl WhisperSession {
             self.state.pcm_to_mel(&samples, self.threads.get())?;
             drop(samples);
 
-            if let Some(lang) = self.detect_language(config.voices.keys(), config.min_confidence)? {
+            if let Some(lang) =
+                self.detect_language(config.voices().keys(), config.min_confidence)?
+            {
                 drop(config);
                 return Ok(Some((self.speech_to_text(lang)?, lang)));
             } else {

@@ -6,6 +6,7 @@ use crate::{
         topbar::{audio::AudioTopbar, settings::SettingsTopbar},
     },
     config::{Config, RawConfig},
+    synthesizer::Synthesizer,
 };
 use camino::Utf8Path;
 use egui::{
@@ -44,7 +45,14 @@ impl Topbar {
         return false;
     }
 
-    pub fn update(&mut self, rt: &Handle, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
+    pub fn update(
+        &mut self,
+        rt: &Handle,
+        ss: &Subsystems,
+        ui: &mut egui::Ui,
+        config: &mut Config,
+        synth: &mut Synthesizer,
+    ) {
         egui::Panel::top("tobpar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 MenuButton::new("Settings")
@@ -57,7 +65,7 @@ impl Topbar {
                     .config(
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
-                    .ui(ui, |ui| self.audio.update(rt, ss, ui, config));
+                    .ui(ui, |ui| self.audio.update(rt, ss, ui, config, synth));
             });
         });
     }

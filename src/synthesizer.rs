@@ -7,7 +7,11 @@
 //!
 //! Each sentence is synthesized separately, like Piper does.
 
-use crate::{error, synthesizer::radio::Radio};
+use crate::{
+    config::{ArrayStr, RawConfig},
+    error,
+    synthesizer::radio::Radio,
+};
 use anyhow::{Context, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use espeak_rs_sys::{
@@ -43,6 +47,36 @@ const SENTENCE_SILENCE: f32 = 0.2;
 const BEEP_GAP: f32 = 0.1;
 
 pub struct Synthesizer {
+    pub(crate) inner: BTreeMap<ArrayStr<2>, SynthesizerInner>,
+}
+
+impl Synthesizer {
+    pub fn new(rt: &Handle, config: &RawConfig) -> Self {
+        let mut inner = BTreeMap::new();
+        for (&k, v) in config.voices() {
+            let synth = SynthesizerInner::new(rt.clone());
+            synth.set_model(Some(v.clone()));
+            inner.insert(k, synth);
+        }
+
+        Self { inner }
+    }
+
+    pub fn synthesize(
+        &mut self,
+        rt: &Handle,
+        lang: ArrayStr<2>,
+        text: String,
+        effects: Effects,
+    ) -> tokio::sync::oneshot::Receiver<anyhow::Result<Speech>> {
+        self.inner
+            .entry(lang)
+            .or_insert_with(|| SynthesizerInner::new(rt.clone()))
+            .synthesize(text, effects)
+    }
+}
+
+pub struct SynthesizerInner {
     handle: ManuallyDrop<std::thread::JoinHandle<()>>,
     model: ManuallyDrop<tokio::sync::watch::Sender<Option<Utf8PathBuf>>>,
     synths: ManuallyDrop<
@@ -54,7 +88,7 @@ pub struct Synthesizer {
     >,
 }
 
-impl Synthesizer {
+impl SynthesizerInner {
     pub fn new(rt: Handle) -> Self {
         let threads = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
         let (model_send, model_recv) = tokio::sync::watch::channel(None);
@@ -72,7 +106,7 @@ impl Synthesizer {
         let _ = self.model.send(model);
     }
 
-    pub fn synthesize(
+    fn synthesize(
         &self,
         text: String,
         effects: Effects,
@@ -151,7 +185,7 @@ impl Synthesizer {
     }
 }
 
-impl Drop for Synthesizer {
+impl Drop for SynthesizerInner {
     fn drop(&mut self) {
         let handle = unsafe { ManuallyDrop::take(&mut self.handle) };
         unsafe { ManuallyDrop::drop(&mut self.model) };

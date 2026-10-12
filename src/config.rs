@@ -1,4 +1,8 @@
-use crate::{button::ConfigButton, error};
+use crate::{
+    button::ConfigButton,
+    error,
+    synthesizer::{Effects, Synthesizer, SynthesizerInner},
+};
 use camino::{Utf8Path, Utf8PathBuf};
 use sdl3::audio::AudioDeviceID;
 use serde::{Deserialize, Serialize};
@@ -12,6 +16,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    runtime::Handle,
     sync::watch::Ref,
 };
 
@@ -82,6 +87,11 @@ impl Config {
         self.send.send_if_modified(f);
     }
 
+    #[inline]
+    pub fn watch(&self) -> tokio::sync::watch::Receiver<RawConfig> {
+        self.send.subscribe()
+    }
+
     pub(super) fn on_resize(&mut self, width: i32, height: i32) {
         let w = u32::try_from(width).ok().and_then(NonZeroU32::new);
         let h = u32::try_from(height).ok().and_then(NonZeroU32::new);
@@ -131,7 +141,7 @@ pub struct RawConfig {
     #[serde(default = "default_opponent_frequency")]
     pub opponent_frequency: NonZeroU32,
     #[serde(default)]
-    pub voices: BTreeMap<ArrayStr<2>, Utf8PathBuf>,
+    voices: BTreeMap<ArrayStr<2>, Utf8PathBuf>,
     #[serde(default = "default_silence_level")]
     pub silence_level: f32,
     #[serde(default)]
@@ -144,6 +154,44 @@ pub struct RawConfig {
     pub text_scale: f32,
     #[serde(default = "default_min_confidence")]
     pub min_confidence: f32,
+}
+
+impl RawConfig {
+    #[inline]
+    pub fn synth_effects(&self) -> Effects {
+        Effects {
+            radio: self.radio_effect,
+            beep_volume: self.beep_volume,
+        }
+    }
+
+    #[inline]
+    pub fn voices(&self) -> &BTreeMap<ArrayStr<2>, Utf8PathBuf> {
+        &self.voices
+    }
+
+    pub fn set_voice(
+        &mut self,
+        rt: &Handle,
+        lang: ArrayStr<2>,
+        model: Option<Utf8PathBuf>,
+        synth: &mut Synthesizer,
+    ) {
+        match model.clone() {
+            Some(model) => {
+                self.voices.entry(lang).insert_entry(model);
+            }
+            None => {
+                self.voices.remove(&lang);
+            }
+        }
+
+        synth
+            .inner
+            .entry(lang)
+            .or_insert_with(|| SynthesizerInner::new(rt.clone()))
+            .set_model(model);
+    }
 }
 
 #[macro_export(local_inner_macros)]
