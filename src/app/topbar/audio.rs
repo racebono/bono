@@ -19,12 +19,12 @@ use sdl3::{
 };
 use std::{
     ops::{Deref, DerefMut},
-    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::runtime::Handle;
 
+mod synthesizer;
 mod whisper;
 
 const DELAY: Duration = Duration::from_secs(1);

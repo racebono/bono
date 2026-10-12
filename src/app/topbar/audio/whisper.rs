@@ -15,7 +15,7 @@ use sdl3::{
     event::Event,
     get_error,
     sys::{
-        audio::SDL_GetAudioStreamData,
+        audio::{SDL_AudioStream, SDL_GetAudioStreamAvailable, SDL_GetAudioStreamData},
         joystick::{SDL_GetJoystickGUIDForID, SDL_JoystickID},
     },
 };
@@ -326,7 +326,7 @@ impl WhisperSession {
     fn finish(
         mut self,
         recv: oneshot::Receiver<anyhow::Result<Vec<f32>>>,
-        stream: AudioStreamWithCallback<Recorder>,
+        mut stream: AudioStreamWithCallback<Recorder>,
         config: Config,
     ) -> JoinHandle<anyhow::Result<Option<(String, ArrayStr<2>)>>> {
         if let Err(e) = stream.pause() {
@@ -337,8 +337,17 @@ impl WhisperSession {
             return spawn(std::future::ready(Err(e.into())));
         }
 
+        // The callback only runs when new data arrives, so read what `flush` released
+        // (and anything else still queued) ourselves before the `Recorder` is dropped
+        let raw = stream.raw();
+        match stream.lock() {
+            Some(mut recorder) => recorder.drain(raw),
+            None => return spawn(std::future::ready(Err(get_error().into()))),
+        }
+
         return spawn_blocking(move || {
             let samples = recv.recv()??;
+            log::debug!("Sample count: {}", samples.len());
             let config = config.get();
 
             self.state.pcm_to_mel(&samples, self.threads.get())?;
@@ -452,17 +461,57 @@ struct Recorder {
 }
 
 impl Recorder {
-    fn try_callback(
-        stream: &mut AudioStream,
-        available: i32,
+    /// Reads everything the stream currently has available.
+    fn drain(&mut self, stream: *mut SDL_AudioStream) {
+        if self.send.as_ref().is_none_or(oneshot::Sender::is_closed) {
+            self.send = None;
+            self.samples = Ok(Vec::new());
+            return;
+        }
+
+        let Ok(ref mut samples) = self.samples else {
+            return;
+        };
+
+        if let Err(e) = Self::try_drain(
+            stream,
+            samples,
+            &mut self.remaining_buf,
+            &mut self.remaining_count,
+        ) {
+            self.samples = Err(e);
+            self.send = None;
+        }
+    }
+
+    fn try_drain(
+        stream: *mut SDL_AudioStream,
         samples: &mut Vec<f32>,
         remaining_buf: &mut [u8; 3],
         remaining_count: &mut usize,
     ) -> anyhow::Result<()> {
-        let Some(available) = NonZero::new(available.max(0) as usize) else {
-            todo!()
-        };
+        loop {
+            let available = unsafe { SDL_GetAudioStreamAvailable(stream) };
+            let Some(available) =
+                NonZero::new(usize::try_from(available).map_err(|_| get_error())?)
+            else {
+                return Ok(());
+            };
 
+            if Self::try_read(stream, available, samples, remaining_buf, remaining_count)? == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Reads up to `available` bytes, returning how many were read.
+    fn try_read(
+        stream: *mut SDL_AudioStream,
+        available: NonZero<usize>,
+        samples: &mut Vec<f32>,
+        remaining_buf: &mut [u8; 3],
+        remaining_count: &mut usize,
+    ) -> anyhow::Result<usize> {
         unsafe {
             samples.try_reserve(
                 available
@@ -483,12 +532,12 @@ impl Recorder {
             pre.write_copy_of_slice(remaining_buf.get_unchecked(..*remaining_count));
 
             match usize::try_from(SDL_GetAudioStreamData(
-                stream.raw(),
+                stream,
                 post.as_mut_ptr().cast(),
                 post.len() as c_int,
             )) {
-                Ok(count) => {
-                    let count = remaining_count.unchecked_add(count);
+                Ok(read) => {
+                    let count = remaining_count.unchecked_add(read);
                     let (full, partial) = spare_bytes
                         .get_unchecked(..count)
                         .assume_init_ref()
@@ -503,37 +552,19 @@ impl Recorder {
                         partial.len(),
                     );
                     *remaining_count = partial.len();
+                    return Ok(read);
                 }
                 Err(_) => return Err(get_error().into()),
             }
-
-            return Ok(());
         }
     }
 }
 
 impl AudioRecordingCallback<f32> for Recorder {
-    fn callback(&mut self, stream: &mut AudioStream, available: i32) {
-        if self.send.as_ref().is_none_or(oneshot::Sender::is_closed) {
-            self.send = None;
-            self.samples = Ok(Vec::new());
-            return;
-        }
-
-        let Ok(ref mut samples) = self.samples else {
-            return;
-        };
-
-        if let Err(e) = Self::try_callback(
-            stream,
-            available,
-            samples,
-            &mut self.remaining_buf,
-            &mut self.remaining_count,
-        ) {
-            self.samples = Err(e);
-            self.send = None;
-        }
+    // `_available` is the number of bytes just added in the *device's* format (divided by
+    // `size_of::<f32>()` by sdl3-rs), not what can be read in `RECORDING_SPEC`, so ask SDL instead
+    fn callback(&mut self, stream: &mut AudioStream, _available: i32) {
+        self.drain(stream.raw());
     }
 }
 
