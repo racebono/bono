@@ -24,10 +24,16 @@ async fn dist() -> anyhow::Result<()> {
     let root = project_root();
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
 
-    // 1. Build the game in release
+    // 1. Build the game in release, and on Windows the Le Mans Ultimate plugin
+    let mut packages = vec!["--package", "lambiase"];
+    if cfg!(windows) {
+        packages.extend(["--package", "lambiase-lmu"]);
+    }
+
     let status = tokio::process::Command::new(&cargo)
         .current_dir(&root)
-        .args(["build", "--release", "--package", "lambiase"])
+        .args(["build", "--release"])
+        .args(packages)
         .status()
         .await?;
 
@@ -52,6 +58,16 @@ async fn dist() -> anyhow::Result<()> {
         bail!("espeak-ng-data not found in espeak-rs-sys's build output");
     };
     copy_dir(espeak_data, dist.join("espeak-ng-data")).await?;
+
+    // 6. The LMU plugin, which goes in the game's Plugins folder
+    if cfg!(windows) {
+        tokio::fs::create_dir_all(dist.join("plugins")).await?;
+        tokio::fs::copy(
+            root.join("target/release/lambiase_lmu.dll"),
+            dist.join("plugins/lambiase_lmu.dll"),
+        )
+        .await?;
+    }
 
     println!("packaged into {}", dist.display());
     Ok(())

@@ -1263,7 +1263,6 @@ name = "lambiase"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bindgen 0.72.1",
  "camino",
  "crossbeam",
  "egui",
@@ -1272,6 +1271,7 @@ dependencies = [
  "espeak-rs-sys",
  "futures",
  "httpdate",
+ "lambiase-sim",
  "log",
  "oneshot",
  "ort",
@@ -1292,6 +1292,26 @@ dependencies = [
  "utils-atomics",
  "whisper-rs",
  "wide",
+]
+
+[[package]]
+name = "lambiase-lmu"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "lambiase-sim",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
+name = "lambiase-sim"
+version = "0.1.0"
+dependencies = [
+ "bindgen 0.72.1",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

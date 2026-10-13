@@ -9,6 +9,7 @@
 
 include!(concat!(env!("OUT_DIR"), "/sim.rs"));
 
+use rusqlite::types::{ToSql, ToSqlOutput};
 use std::{
     fmt::{self, Debug, Formatter},
     mem::{ManuallyDrop, MaybeUninit},
@@ -70,6 +71,23 @@ macro_rules! copy_optional {
         impl Debug for $name {
             fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
                 Debug::fmt(&self.get(), f)
+            }
+        }
+
+        impl PartialEq for $name {
+            #[inline]
+            fn eq(&self, other: &Self) -> bool {
+                self.get() == other.get()
+            }
+        }
+
+        impl ToSql for $name {
+            #[inline]
+            fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+                Ok(match self.get() {
+                    Some(value) => value.into(),
+                    None => rusqlite::types::Null.into(),
+                })
             }
         }
     };
@@ -141,6 +159,23 @@ impl Debug for lambiase_opt_string {
     }
 }
 
+impl PartialEq for lambiase_opt_string {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_deref() == other.as_deref()
+    }
+}
+
+impl ToSql for lambiase_opt_string {
+    #[inline]
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(match self.as_deref() {
+            Some(value) => value.into(),
+            None => rusqlite::types::Null.into(),
+        })
+    }
+}
+
 impl Drop for lambiase_opt_string {
     fn drop(&mut self) {
         if self.present {
@@ -148,6 +183,10 @@ impl Drop for lambiase_opt_string {
         }
     }
 }
+
+// It owns its bytes like the `String` it's made from
+unsafe impl Send for lambiase_string {}
+unsafe impl Sync for lambiase_string {}
 
 impl Default for lambiase_string {
     #[inline]
@@ -215,4 +254,28 @@ impl Drop for lambiase_string {
     fn drop(&mut self) {
         drop(unsafe { String::from_raw_parts(self.data, self.len, self.cap) })
     }
+}
+
+/// Creates a string for C or C++ from the `len` bytes at `data`, replacing invalid UTF-8, since the
+/// strings are only ever freed here. Declared in lambiase.h.
+///
+/// # Safety
+/// `out` must be valid for writes, and `data` valid for reads of `len` bytes (or `len` zero).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lambiase_string_new(out: *mut lambiase_string, data: *const u8, len: usize) {
+    let bytes = match len {
+        0 => &[][..],
+        _ => unsafe { std::slice::from_raw_parts(data, len) },
+    };
+    let string = String::from_utf8_lossy(bytes).into_owned();
+    unsafe { out.write(string.into()) };
+}
+
+/// Frees a string made by `lambiase_string_new`. Declared in lambiase.h.
+///
+/// # Safety
+/// `string` must point to a string made by `lambiase_string_new`, which isn't used afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lambiase_string_drop(string: *mut lambiase_string) {
+    unsafe { std::ptr::drop_in_place(string) }
 }

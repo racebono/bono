@@ -1,0 +1,17 @@
+[package]
+name = "lambiase-sim"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The simulator data shared by the app and the simulator plugins: the C structs in `include/lambiase`,
+# the database schema they're stored in, and the recorder the plugins write it with.
+[dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde_json = "1.0.151"
+
+[build-dependencies]
+bindgen = "0.72.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"

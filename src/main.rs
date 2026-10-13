@@ -24,7 +24,6 @@ mod button;
 mod claude;
 mod config;
 mod engineer;
-mod sim;
 mod sqlite;
 mod synthesizer;
 mod task;

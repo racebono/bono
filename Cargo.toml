@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+lambiase-sim = { path = "sim" }
 pin-project = "1.1.13"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 tokio = { version = "1.53.2", features = [
@@ -69,12 +70,10 @@ openblas = ["whisper-rs/openblas"]
 vulkan = ["whisper-rs/vulkan"]
 
 [workspace]
-members = ["xtask"]
+members = ["xtask", "sim", "lmu"]
 
 # espeak-rs-sys links the debug CRT (`msvcrtd`) when its build script has debug assertions,
 # which clashes with the release CRT (`msvcrt`) Rust and the other native dependencies link
 [profile.dev.package.espeak-rs-sys]
 debug-assertions = false
 
-[build-dependencies]
-bindgen = "0.72.1"
