@@ -7,10 +7,11 @@
       "expected_output": "",
       "files": [],
       "assertions": [
-        "Gives the verdict that the pilot can make it to the end without stopping",
+        "Gives the verdict that the pilot can't make it to the end on energy and needs one more stop",
         "Uses the race length from the session data without asking the pilot for it",
         "Does not read back values shown on the game UI (virtual energy %, fuel litres, per-lap usage, lap times, time left)",
-        "At most 2 sentences"
+        "At most 2 sentences",
+        "Adds nothing the pilot didn't ask for: no advice on what to do, no reasons, no other topics or reassurance"
       ]
     },
     {
@@ -65,10 +66,11 @@
       "expected_output": "",
       "files": [],
       "assertions": [
-        "Names the car behind as Fischer (Lena Fischer)",
-        "Says she is slightly quicker / closing (not that she is slower)",
+        "Names the car behind as Ruiz (Sofia Ruiz)",
+        "Says she is not quicker / not closing",
         "Does not read back lap times or gaps the pilot can see",
-        "At most 2 sentences"
+        "At most 2 sentences",
+        "Adds nothing the pilot didn't ask for: no advice on what to do, no reasons, no other topics or reassurance"
       ]
     },
     {
@@ -78,7 +80,8 @@
       "files": [],
       "assertions": [
         "Says one more track limit point/warning will bring a penalty",
-        "At most 2 sentences"
+        "At most 2 sentences",
+        "Adds nothing the pilot didn't ask for: no advice on what to do, no reasons, no other topics or reassurance"
       ]
     },
     {
@@ -89,7 +92,8 @@
       "assertions": [
         "Gives the time left as about 15 minutes",
         "Says it is dry / no rain",
-        "At most 3 sentences"
+        "At most 3 sentences",
+        "Adds nothing beyond the time left and the weather (no strategy, tyres or energy)"
       ]
     },
     {
@@ -99,9 +103,9 @@
       "files": [],
       "assertions": [
         "Names T2 / Curva del Lago (the lake corner) as where most time is lost",
-        "Says the cause is braking too early into it (on the way in / entry)",
         "Does not claim big losses elsewhere (the other corners are close to the reference)",
-        "At most 3 sentences, no lap times read back"
+        "Does not volunteer how to fix it (no braking advice) or why, since the pilot only asked where",
+        "At most 2 sentences, no lap times read back"
       ]
     },
     {
@@ -110,10 +114,10 @@
       "expected_output": "",
       "files": [],
       "assertions": [
-        "Identifies the corner as T2 Curva del Lago",
         "Advises braking later, by roughly 30 to 40 metres compared with the last lap (or rounded equivalent)",
         "Phrases the advice relative to the pilot's own driving, without inventing marker boards",
-        "At most 2 sentences"
+        "Doesn't explain the reasoning or talk about other corners",
+        "At most 1 sentence"
       ]
     },
     {
@@ -134,8 +138,8 @@
       "files": [],
       "assertions": [
         "Says rain is likely / a good chance late in the race (around the last part / finish), not certain",
-        "Says it is dry now",
-        "At most 2 sentences"
+        "Doesn't add other topics (time left, tyres, energy, strategy)",
+        "At most 1 sentence"
       ]
     },
     {
@@ -145,8 +149,8 @@
       "files": [],
       "assertions": [
         "Says we cannot make it on energy as things are (short by about three laps) so a stop is needed",
-        "Brings in the late rain forecast as a factor for when to stop or which tyres (as a chance, not a certainty)",
-        "At most 3 sentences"
+        "Does not bring in the weather, tyres or other topics the pilot didn't ask about",
+        "At most 2 sentences"
       ]
     },
     {
@@ -155,8 +159,33 @@
       "expected_output": "",
       "files": [],
       "assertions": [
-        "Names T2 / Curva del Lago as the biggest difference on the last lap, due to braking early",
-        "Keeps the rest proportionate (small differences elsewhere, e.g. exits)",
+        "Names T2 / Curva del Lago as the biggest difference on the last lap",
+        "Names only the biggest difference (at most one more if it is similar in size), no rundown of every corner",
+        "At most 2 sentences"
+      ]
+    },
+    {
+      "id": 15,
+      "prompt": "talk me through the tyres, everything, temps pressures wear the lot",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Gives temperatures for the tyres (all four, or clearly summarised by corner)",
+        "Gives pressures",
+        "Gives wear, with the front left as the most worn",
+        "Goes beyond a one sentence verdict, since the pilot asked for everything",
+        "Stays on the tyres (no energy, gaps or weather)"
+      ]
+    },
+    {
+      "id": 16,
+      "prompt": "can we make it to the end on energy? if not tell me when to box and why",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Says we cannot make it to the end on energy",
+        "Says when to box (a lap or a number of laps from now)",
+        "Gives a reason for that timing, since the pilot asked why",
         "At most 3 sentences"
       ]
     }

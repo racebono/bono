@@ -3772,3 +3772,168 @@ mod tests {
         assert!(!instructions().starts_with("---"));
     }
 }
+
+/// Runs the skill's evals (`assets/skill/evals/evals.json`) with Claude against a race database,
+/// to compare versions of the skill. Needs `ANTHROPIC_API_KEY`, and spends tokens.
+///
+/// - `EVAL_DB`: the race's `telemetry.db` (kept looking fresh while the evals run)
+/// - `EVAL_SKILL`: the `SKILL.md` to use (defaults to the built-in one)
+/// - `EVAL_OUT`: where each eval's reply goes, as `eval-<id>/<EVAL_CONFIG>/`
+/// - `EVAL_CONFIG` (default `with_skill`), `EVAL_MODEL`, `EVAL_EFFORT`, `EVAL_IDS` (e.g. `1,5,9`)
+#[cfg(test)]
+mod evals {
+    use super::*;
+    use crate::{claude::ConversationBuilder, sqlite::Database};
+    use std::{num::NonZeroUsize, sync::Mutex as StdMutex, time::Instant};
+
+    /// The tool, recording every call and what it answered.
+    #[derive(Clone)]
+    struct Recording {
+        tool: Engineer,
+        calls: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl ToolHandler for Recording {
+        type Input = serde_json::Value;
+
+        fn handle(
+            &self,
+            input: serde_json::Value,
+        ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
+            let tool = self.tool.clone();
+            let calls = self.calls.clone();
+            async move {
+                let result = match EngineerInput::deserialize(&input) {
+                    Ok(parsed) => tool.run(parsed).await,
+                    Err(e) => Err(e.into()),
+                };
+                let answer = match &result {
+                    Ok(text) => text.clone(),
+                    Err(e) => format!("ERROR: {e:#}"),
+                };
+                calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("### Tool call: `{input}`\n\n```\n{answer}\n```\n"));
+                result
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn skill_evals() {
+        let var = |name: &str| std::env::var(name).ok();
+        let db = PathBuf::from(var("EVAL_DB").expect("EVAL_DB isn't set"));
+        let out = PathBuf::from(var("EVAL_OUT").expect("EVAL_OUT isn't set"));
+        let config = var("EVAL_CONFIG").unwrap_or_else(|| "with_skill".into());
+        let model = var("EVAL_MODEL").unwrap_or_else(|| "claude-sonnet-5-5".into());
+        let effort = var("EVAL_EFFORT").unwrap_or_else(|| "high".into());
+        let skill = match var("EVAL_SKILL") {
+            Some(path) => std::fs::read_to_string(path).unwrap(),
+            None => SKILL.to_owned(),
+        };
+        let system = skill
+            .strip_prefix("---")
+            .and_then(|rest| rest.split_once("\n---"))
+            .map_or(skill.as_str(), |(_, body)| body.trim_start())
+            .to_owned();
+        let ids = var("EVAL_IDS").map(|ids| {
+            ids.split(',')
+                .map(|id| id.trim().parse::<u64>().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        let evals: serde_json::Value =
+            serde_json::from_str(include_str!("../../assets/skill/evals/evals.json")).unwrap();
+        let evals = evals["evals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|eval| {
+                ids.as_ref()
+                    .is_none_or(|ids| ids.contains(&eval["id"].as_u64().unwrap()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // The tool calls a database last written over ten seconds ago stale
+            let fresh = db.clone();
+            let freshen = tokio::spawn(async move {
+                loop {
+                    if let Ok(file) = std::fs::File::options().write(true).open(&fresh) {
+                        let _ = file.set_modified(std::time::SystemTime::now());
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            });
+
+            let four = NonZeroUsize::new(4).unwrap();
+            let pool = Pool::new(Database::read_only(Arc::new(db.clone())), four, four);
+            let tool = Engineer::new(pool);
+            tool.warm().await.unwrap();
+
+            let runs = evals.iter().map(|eval| {
+                let (tool, system, model, effort) =
+                    (tool.clone(), system.clone(), model.clone(), effort.clone());
+                let dir = out.join(format!("eval-{}", eval["id"])).join(&config).join("run-1");
+                let prompt = eval["prompt"].as_str().unwrap().to_owned();
+                async move {
+                    let calls = Arc::new(StdMutex::new(Vec::new()));
+                    let mut builder = ConversationBuilder::new();
+                    builder.model(model).effort(effort).system(system).tool(
+                        Engineer::NAME,
+                        Some(Engineer::description()),
+                        Engineer::input_schema(),
+                        Recording {
+                            tool,
+                            calls: calls.clone(),
+                        },
+                    );
+                    let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+
+                    let start = Instant::now();
+                    let reply = conversation.send(prompt.clone()).await;
+                    let elapsed = start.elapsed();
+
+                    let outputs = dir.join("outputs");
+                    std::fs::create_dir_all(&outputs).unwrap();
+                    let (text, usage) = match &reply {
+                        Ok(reply) => (reply.text.clone(), format!("{:?} {:?}", reply.stop, reply.usage)),
+                        Err(e) => (format!("ERROR: {e:#}"), String::new()),
+                    };
+                    std::fs::write(outputs.join("reply.md"), format!("{text}\n")).unwrap();
+                    let calls = calls.lock().unwrap().join("\n");
+                    std::fs::write(
+                        dir.join("transcript.md"),
+                        format!("## Pilot\n\n{prompt}\n\n{calls}\n## Engineer\n\n{text}\n\n{usage}\n"),
+                    )
+                    .unwrap();
+
+                    let tokens = reply.as_ref().map_or(0, |reply| {
+                        reply.usage.input_tokens
+                            + reply.usage.cache_creation_input_tokens
+                            + reply.usage.cache_read_input_tokens
+                            + reply.usage.output_tokens
+                    });
+                    std::fs::write(
+                        dir.join("timing.json"),
+                        serde_json::json!({
+                            "total_tokens": tokens,
+                            "duration_ms": elapsed.as_millis() as u64,
+                            "total_duration_seconds": elapsed.as_secs_f64(),
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                    println!("eval {}: {text}", eval["id"]);
+                }
+            });
+
+            futures::future::join_all(runs).await;
+            freshen.abort();
+        });
+    }
+}
