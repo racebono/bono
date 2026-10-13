@@ -75,3 +75,6 @@ members = ["xtask"]
 # which clashes with the release CRT (`msvcrt`) Rust and the other native dependencies link
 [profile.dev.package.espeak-rs-sys]
 debug-assertions = false
+
+[build-dependencies]
+bindgen = "0.72.1"

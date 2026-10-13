@@ -11,6 +11,7 @@
 typedef struct lambiase_string {
     uint8_t* data;
     size_t len;
+    size_t cap;
 } lambiase_string_s;
 
 // A value a simulator may not provide, stored as NULL: `value` is only
@@ -22,6 +23,7 @@ typedef struct lambiase_opt_f64 {
     double value;
 
 #ifdef __cplusplus
+    lambiase_opt_f64() noexcept = default;
     lambiase_opt_f64(std::optional<double> x) noexcept :
         present(x.has_value()), value(x.has_value() ? x.value() : 0.0F) {}
 #endif
@@ -32,6 +34,7 @@ typedef struct lambiase_opt_i64 {
     int64_t value;
 
 #ifdef __cplusplus
+    lambiase_opt_i64() noexcept = default;
     lambiase_opt_i64(std::optional<int64_t> x) noexcept :
         present(x.has_value()), value(x.has_value() ? x.value() : 0) {}
 #endif
@@ -42,6 +45,7 @@ typedef struct lambiase_opt_boolean {
     bool value;
 
 #ifdef __cplusplus
+    lambiase_opt_boolean() noexcept = default;
     lambiase_opt_boolean(std::optional<bool> x) noexcept :
         present(x.has_value()), value(x.has_value() ? x.value() : false) {}
 #endif

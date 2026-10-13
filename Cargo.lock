@@ -1263,6 +1263,7 @@ name = "lambiase"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bindgen 0.72.1",
  "camino",
  "crossbeam",
  "egui",

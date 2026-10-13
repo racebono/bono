@@ -2,11 +2,11 @@ use crate::{
     app::topbar::Topbar,
     button::{Button, ButtonWatcher},
     config::{Config, RawConfig},
-    synthesizer::{Synthesizer, SynthesizerInner},
+    synthesizer::Synthesizer,
 };
 use anyhow::Context as AnyhowContext;
 use camino::{Utf8Path, Utf8PathBuf};
-use egui::{FontData, FontFamily, FontTweak};
+use egui::{FontFamily, FontTweak};
 use egui_sdl3::EguiCanvas;
 use sdl3::{
     AudioSubsystem, Error, EventSubsystem, JoystickSubsystem,
