@@ -23,6 +23,8 @@ mod settings;
 pub struct Topbar {
     settings: SettingsTopbar,
     pub audio: AudioTopbar,
+    /// "Clear data" was clicked: asking before clearing
+    confirm_clear: bool,
 }
 
 impl Topbar {
@@ -34,6 +36,7 @@ impl Topbar {
     ) -> Self {
         Self {
             settings: SettingsTopbar::default(),
+            confirm_clear: false,
             audio: AudioTopbar::new(pref_path, ss, config, client),
         }
     }
@@ -75,20 +78,54 @@ impl Topbar {
                         .on_hover_text("Delete everything recorded from the simulator so far")
                         .on_disabled_hover_text("No simulator is running");
 
-                    match simulator {
-                        Some(simulator) => {
-                            ui.label(simulator.name());
-                            // The simulator's plugin clears it within a few seconds
-                            if clear.clicked() {
-                                simulator.clear();
-                            }
-                        }
-                        None => {
-                            ui.label("No simulator running");
-                        }
+                    if clear.clicked() {
+                        self.confirm_clear = true;
                     }
+
+                    ui.label(
+                        simulator
+                            .as_deref()
+                            .map_or("No simulator running", |simulator| simulator.name()),
+                    );
                 });
             });
         });
+
+        if self.confirm_clear {
+            match simulator {
+                Some(simulator) => self.confirm_clear = confirm_clear(ui.ctx(), simulator),
+                // It stopped meanwhile: nothing to clear
+                None => self.confirm_clear = false,
+            }
+        }
     }
+}
+
+/// Asks before clearing the simulator's recorded data, and clears it if confirmed. Returns whether
+/// the dialog stays open.
+fn confirm_clear(ctx: &egui::Context, simulator: &mut dyn Simulator) -> bool {
+    let name = simulator.name();
+    let modal = egui::Modal::new(egui::Id::new("confirm clear")).show(ctx, |ui| {
+        ui.heading("Clear recorded data?");
+        ui.label(format!(
+            "Everything recorded from {name} so far will be deleted. This can't be undone."
+        ));
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            let clear = ui.button("Clear").clicked();
+            let cancel = ui.button("Cancel").clicked();
+            (clear, cancel)
+        })
+        .inner
+    });
+
+    let (clear, cancel) = modal.inner;
+    if clear {
+        // The simulator's plugin clears it within a few seconds
+        simulator.clear();
+    }
+
+    // Escape or a click outside cancels too
+    !(clear || cancel || modal.should_close())
 }
