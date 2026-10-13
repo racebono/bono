@@ -1,5 +1,5 @@
 use crate::{
-    app::topbar::Topbar,
+    app::{chat::Chat, topbar::Topbar},
     button::{Button, ButtonWatcher},
     config::{Config, RawConfig},
     engineer::Engineer,
@@ -30,6 +30,7 @@ use std::{
 };
 use tokio::{runtime::Handle, try_join};
 
+mod chat;
 mod topbar;
 
 pub struct App {
@@ -219,14 +220,26 @@ impl AppState {
             self.gui.topbar.audio.speaker.get(),
         );
         let simulator = self.simulators.current_mut();
-        self.gui.update(
+        let typed = self.gui.update(
             rt,
             &self.subsystems,
             ui,
             &mut self.config,
             &mut self.synth,
             simulator,
+            &self.engineer,
         );
+
+        // A question typed in the chat
+        if let Some(question) = typed {
+            self.engineer.ask_text(
+                rt,
+                self.simulators.current_mut(),
+                &self.config,
+                &mut self.synth,
+                question,
+            );
+        }
     }
 
     /// Passes the recording settings on to every simulator when they change (and at startup), and
@@ -294,6 +307,7 @@ impl Subsystems {
 
 pub struct Gui {
     pub topbar: Topbar,
+    chat: Chat,
     applied_text_scale: Option<f32>,
 }
 
@@ -306,6 +320,7 @@ impl Gui {
     ) -> Self {
         Self {
             topbar: Topbar::new(pref_path, ss, config, client),
+            chat: Chat::default(),
             applied_text_scale: None,
         }
     }
@@ -320,9 +335,10 @@ impl Gui {
         config: &mut Config,
         synth: &mut Synthesizer,
         simulator: Option<&mut Sim>,
-    ) {
+        engineer: &Engineer,
+    ) -> Option<String> {
         self.topbar.update(rt, ss, ui, config, synth, simulator);
-        egui::CentralPanel::default().show(ui, |_ui| {});
+        self.chat.update(ui, engineer)
     }
 
     fn event(&mut self, rt: &Handle, config: &Config, event: &Event) -> bool {

@@ -9,7 +9,6 @@ use crate::{
         engineer::{self, Engineer as EngineerTool},
     },
     config::{ArrayStr, Config},
-    error,
     sim::Sim,
     sqlite::pool::Pool,
     synthesizer::{Speech, Synthesizer},
@@ -27,8 +26,28 @@ const NO_TELEMETRY: &str = "No telemetry yet, get in the car.";
 /// Said when Claude declines to answer.
 const SAY_AGAIN: &str = "Say again?";
 
+/// One line of the conversation, as the chat shows it.
+pub struct ChatEntry {
+    pub speaker: Speaker,
+    pub text: String,
+    /// Small print under it (e.g. the tokens an answer took)
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Speaker {
+    Pilot,
+    Engineer,
+    /// The app: sessions starting, errors, cancelled questions
+    Notice,
+}
+
 pub struct Engineer {
     client: reqwest::Client,
+    /// Everything said, for the chat
+    chat: Vec<ChatEntry>,
+    /// The language the pilot last spoke on the radio: typed questions are answered in it
+    last_lang: ArrayStr<2>,
     /// The conversation for the database the tool reads. `None` until the first question, and
     /// again once the simulator stops, letting go of its database
     session: Option<Session>,
@@ -60,6 +79,8 @@ impl Engineer {
     pub fn new(client: reqwest::Client) -> Self {
         Self {
             client,
+            chat: Vec::new(),
+            last_lang: arrstr!("en"),
             session: None,
             new_session: false,
             turn: None,
@@ -68,15 +89,42 @@ impl Engineer {
         }
     }
 
-    /// Starts a new conversation with the next question: the engineer forgets what was said.
-    pub fn new_session(&mut self) {
-        log::info!("New engineer session");
-        self.stop();
-        self.new_session = true;
+    /// Everything said so far, oldest first.
+    #[inline]
+    pub fn chat(&self) -> &[ChatEntry] {
+        &self.chat
     }
 
-    /// The pilot asked something: it's sent to Claude, with the running simulator's telemetry.
-    /// An answer still on its way, or being spoken, is dropped: the pilot talked over it.
+    /// Whether a question is being answered.
+    #[inline]
+    pub fn is_thinking(&self) -> bool {
+        self.turn.is_some() || self.speech.is_some()
+    }
+
+    /// Starts a new conversation with the next question: the engineer forgets what was said.
+    pub fn new_session(&mut self) {
+        self.stop();
+        self.new_session = true;
+        self.notice("New session: the engineer starts over");
+    }
+
+    /// A question typed in the chat, answered like one asked on the radio (spoken in the
+    /// language last used on the radio).
+    pub fn ask_text(
+        &mut self,
+        rt: &Handle,
+        sim: Option<&mut Sim>,
+        config: &Config,
+        synth: &mut Synthesizer,
+        question: String,
+    ) {
+        let lang = self.last_lang;
+        self.ask(rt, sim, config, synth, question, lang);
+    }
+
+    /// The pilot asked something on the radio: it's sent to Claude, with the running simulator's
+    /// telemetry. An answer still on its way, or being spoken, is dropped: the pilot talked over
+    /// it.
     pub fn ask(
         &mut self,
         rt: &Handle,
@@ -87,8 +135,15 @@ impl Engineer {
         lang: ArrayStr<2>,
     ) {
         self.stop();
+        self.last_lang = lang;
+        self.chat.push(ChatEntry {
+            speaker: Speaker::Pilot,
+            text: question.clone(),
+            detail: None,
+        });
 
         let Some(pool) = sim.and_then(|sim| sim.database()).cloned() else {
+            self.reply(NO_TELEMETRY.into(), Some("no telemetry".into()));
             self.say(rt, config, synth, NO_TELEMETRY.into(), arrstr!("en"));
             return;
         };
@@ -98,7 +153,7 @@ impl Engineer {
             match self.start(config, pool) {
                 Ok(session) => self.session = Some(session),
                 Err(e) => {
-                    error("Error starting the race engineer", format!("{e:#}"));
+                    self.notice(format!("Error starting the race engineer: {e:#}"));
                     return;
                 }
             }
@@ -132,9 +187,9 @@ impl Engineer {
     ) {
         // The game stopped: the conversation lets go of the database, so the plugin can delete it
         if !sim_running && self.session.is_some() {
-            log::info!("Simulator stopped: ending the engineer session");
             self.turn = None;
             self.session = None;
+            self.notice("The simulator stopped: the session ended");
         }
 
         if let Some((turn, lang)) = &mut self.turn
@@ -144,7 +199,7 @@ impl Engineer {
             self.turn = None;
             match result {
                 Ok(reply) => self.answer(rt, config, synth, reply, lang),
-                Err(e) => error("Error asking the race engineer", format!("{e:#}")),
+                Err(e) => self.notice(format!("Error asking the race engineer: {e:#}")),
             }
         }
 
@@ -163,14 +218,14 @@ impl Engineer {
                     match speaker {
                         Some(speaker) => match speech.play(speaker) {
                             Ok(stream) => self.playback = Some(stream),
-                            Err(e) => error("Error playing the engineer's answer", e),
+                            Err(e) => self.notice(format!("Error playing the answer: {e}")),
                         },
-                        None => log::warn!("No speaker selected: the engineer's answer isn't played"),
+                        None => self.notice("No speaker selected: the answer isn't played"),
                     }
                 }
                 Ok(Err(e)) => {
                     self.speech = None;
-                    error("Error synthesizing the engineer's answer", format!("{e:#}"));
+                    self.notice(format!("Error synthesizing the answer: {e:#}"));
                 }
                 Err(oneshot::error::TryRecvError::Empty) => {}
                 Err(oneshot::error::TryRecvError::Closed) => self.speech = None,
@@ -207,7 +262,23 @@ impl Engineer {
             StopReason::EndTurn | StopReason::StopSequence | StopReason::MaxTokens => reply.text,
         };
 
+        let usage = &reply.usage;
+        let mut detail = format!(
+            "{} | {} in, {} cached, {} out",
+            reply.model,
+            usage.input_tokens + usage.cache_creation_input_tokens,
+            usage.cache_read_input_tokens,
+            usage.output_tokens
+        );
+        match reply.stop {
+            StopReason::Refusal => detail.push_str(" | declined"),
+            StopReason::MaxTokens => detail.push_str(" | cut off"),
+            StopReason::ContextWindowExceeded => detail.push_str(" | conversation full, starting over"),
+            StopReason::EndTurn | StopReason::StopSequence => {}
+        }
+
         if !text.trim().is_empty() {
+            self.reply(text.clone(), Some(detail));
             self.say(rt, config, synth, text, lang);
         }
     }
@@ -227,9 +298,29 @@ impl Engineer {
 
     /// Drops the answer on its way and stops the one being spoken.
     fn stop(&mut self) {
-        self.turn = None;
+        if self.turn.take().is_some() {
+            self.notice("Cancelled: the pilot talked over it");
+        }
         self.speech = None;
         self.playback = None;
+    }
+
+    fn reply(&mut self, text: String, detail: Option<String>) {
+        self.chat.push(ChatEntry {
+            speaker: Speaker::Engineer,
+            text,
+            detail,
+        });
+    }
+
+    fn notice(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        log::info!("{text}");
+        self.chat.push(ChatEntry {
+            speaker: Speaker::Notice,
+            text,
+            detail: None,
+        });
     }
 
     fn start(&self, config: &Config, pool: Pool) -> anyhow::Result<Session> {
