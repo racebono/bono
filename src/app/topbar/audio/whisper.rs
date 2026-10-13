@@ -715,3 +715,58 @@ impl Model {
         return Ok(models);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::synthesizer::{Effects, Voice};
+    use std::collections::BTreeMap;
+
+    /// Needs `LAMBIASE_WHISPER` (a whisper model) and `LAMBIASE_VOICE_EN`/`_ES` (Piper voices).
+    #[test]
+    #[ignore]
+    fn detects_the_language_spoken() {
+        let whisper = std::env::var("LAMBIASE_WHISPER").unwrap();
+        let threads = NonZeroUsize::new(4).unwrap();
+        let ctx = WhisperContext::new_with_params(&whisper, WhisperContextParameters::default())
+            .unwrap();
+
+        let voices = BTreeMap::from([
+            (arrstr!("en"), Utf8PathBuf::from(std::env::var("LAMBIASE_VOICE_EN").unwrap())),
+            (arrstr!("es"), Utf8PathBuf::from(std::env::var("LAMBIASE_VOICE_ES").unwrap())),
+        ]);
+        let effects = Effects {
+            radio: 0.0,
+            beep_volume: 0.0,
+        };
+
+        for (lang, text) in [
+            (arrstr!("es"), "¿Cuánto combustible me queda y cuándo tengo que parar?"),
+            (arrstr!("en"), "How much fuel do I have left, and when do I need to pit?"),
+        ] {
+            let mut voice = Voice::load(&voices[&lang], threads).unwrap();
+            let speech = voice.synthesize(text, effects).unwrap();
+            // Whisper hears at 16 kHz
+            let ratio = speech.sample_rate as f64 / 16000.0;
+            let samples = (0..(speech.samples.len() as f64 / ratio) as usize)
+                .map(|i| speech.samples[(i as f64 * ratio) as usize])
+                .collect::<Vec<_>>();
+
+            let mut session = WhisperSession {
+                state: ctx.create_state().unwrap(),
+                threads,
+                multilingual: ctx.is_multilingual(),
+            };
+            session.state.pcm_to_mel(&samples, threads.get()).unwrap();
+            let (_, probs) = session.state.lang_detect(0, threads.get()).unwrap();
+            for code in ["en", "es"] {
+                println!("{code}: {}", probs[get_lang_id(code).unwrap() as usize]);
+            }
+
+            let detected = session.detect_language(voices.keys(), 0.1).unwrap();
+            let heard = session.speech_to_text(detected.unwrap()).unwrap();
+            println!("{lang} -> {detected:?}: {heard}");
+            assert_eq!(detected, Some(lang));
+        }
+    }
+}

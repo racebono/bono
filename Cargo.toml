@@ -48,6 +48,20 @@ crossbeam = "0.8.5"
 utils-atomics = { version = "1.1.2", features = ["futures"] }
 futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
 steamlocate = "2.1.1"
+# Which language a typed question is in. Each language's model is built into the binary (a few
+# MB each), so only common ones are by default: `all-languages` adds the rest that have voices
+lingua = { version = "1.8.0", default-features = false, features = [
+    "chinese",
+    "dutch",
+    "english",
+    "french",
+    "german",
+    "italian",
+    "japanese",
+    "korean",
+    "portuguese",
+    "spanish",
+] }
 
 [target.'cfg(windows)'.dependencies]
 # Steam's per-game "Running" flag, and watching it change
@@ -78,6 +92,49 @@ intel-sycl = ["whisper-rs/intel-sycl"]
 openblas = ["whisper-rs/openblas"]
 # Windows, Linux. Needs the Vulkan SDK (`VULKAN_SDK`)
 vulkan = ["whisper-rs/vulkan"]
+# Detects typed questions in every language there are voices for (about 180 MB more)
+all-languages = [
+    "lingua/albanian",
+    "lingua/arabic",
+    "lingua/armenian",
+    "lingua/basque",
+    "lingua/bengali",
+    "lingua/bokmal",
+    "lingua/bulgarian",
+    "lingua/catalan",
+    "lingua/czech",
+    "lingua/danish",
+    "lingua/estonian",
+    "lingua/finnish",
+    "lingua/georgian",
+    "lingua/greek",
+    "lingua/hebrew",
+    "lingua/hindi",
+    "lingua/hungarian",
+    "lingua/icelandic",
+    "lingua/indonesian",
+    "lingua/kazakh",
+    "lingua/latvian",
+    "lingua/lithuanian",
+    "lingua/marathi",
+    "lingua/nynorsk",
+    "lingua/persian",
+    "lingua/polish",
+    "lingua/romanian",
+    "lingua/russian",
+    "lingua/serbian",
+    "lingua/slovak",
+    "lingua/slovene",
+    "lingua/swahili",
+    "lingua/swedish",
+    "lingua/telugu",
+    "lingua/thai",
+    "lingua/turkish",
+    "lingua/ukrainian",
+    "lingua/urdu",
+    "lingua/vietnamese",
+    "lingua/welsh",
+]
 
 [workspace]
 members = ["xtask", "sim", "lmu"]

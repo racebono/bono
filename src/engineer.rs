@@ -9,6 +9,7 @@ use crate::{
         engineer::{self, Engineer as EngineerTool},
     },
     config::{ArrayStr, Config},
+    language::LanguageDetector,
     sim::Sim,
     sqlite::pool::Pool,
     synthesizer::{SpeechInput, SpeechOutput, Synthesizer},
@@ -46,8 +47,11 @@ pub struct Engineer {
     client: reqwest::Client,
     /// Everything said, for the chat
     chat: Vec<ChatEntry>,
-    /// The language the pilot last spoke on the radio: typed questions are answered in it
+    /// The language the pilot last asked in: typed questions whose language is unclear are
+    /// answered in it
     last_lang: ArrayStr<2>,
+    /// Which language typed questions are in (Claude answers in the pilot's language)
+    languages: LanguageDetector,
     /// The conversation for the database the tool reads. `None` until the first question, and
     /// again once the simulator stops, letting go of its database
     session: Option<Session>,
@@ -99,6 +103,7 @@ impl Engineer {
             client,
             chat: Vec::new(),
             last_lang: arrstr!("en"),
+            languages: LanguageDetector::new(),
             session: None,
             new_session: false,
             turn: None,
@@ -125,8 +130,8 @@ impl Engineer {
         self.notice("New session: the engineer starts over");
     }
 
-    /// A question typed in the chat, answered like one asked on the radio (spoken in the
-    /// language last used on the radio).
+    /// A question typed in the chat, answered like one asked on the radio: spoken in the
+    /// question's language, or the last one the pilot used if that's unclear.
     pub fn ask_text(
         &mut self,
         rt: &Handle,
@@ -135,7 +140,10 @@ impl Engineer {
         synth: &mut Synthesizer,
         question: String,
     ) {
-        let lang = self.last_lang;
+        let lang = match self.languages.detect(&question) {
+            Some(lang) => lang,
+            None => self.last_lang,
+        };
         self.ask(rt, sim, config, synth, question, lang);
     }
 
@@ -219,6 +227,7 @@ impl Engineer {
         synth: &mut Synthesizer,
         speaker: Option<&AudioDevice>,
     ) {
+        self.languages.update(rt, config.get().voices());
         // The game stopped: the conversation lets go of the database, so the plugin can delete it
         if !sim_running && self.session.is_some() {
             self.turn = None;

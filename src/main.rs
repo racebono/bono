@@ -24,6 +24,7 @@ mod button;
 mod claude;
 mod config;
 mod engineer;
+mod language;
 mod sim;
 mod sqlite;
 mod steam;
