@@ -1328,6 +1328,7 @@ dependencies = [
  "utils-atomics",
  "whisper-rs",
  "wide",
+ "windows-sys 0.61.2",
  "winreg",
 ]
 

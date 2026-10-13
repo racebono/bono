@@ -6,7 +6,7 @@
 use crate::{
     sim::{Simulator, SimulatorSettings},
     sqlite::{Database, pool::Pool},
-    steam,
+    steam::{self, AppWatcher},
 };
 use lambiase_sim::recorder::{DATABASE, SETTINGS};
 use serde_json::{Map, Value};
@@ -15,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use tokio::sync::watch;
 
 const STEAM_APP_ID: u32 = 2399420;
 /// The plugin's folder, in the game's UserData folder.
@@ -23,18 +24,38 @@ const FOLDER: &str = "lambiase";
 const MAX_IDLE: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 const MAX_OPEN: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
-#[derive(Default)]
 pub struct LeMansUltimate {
     /// Found once; looked for again on every call while the game isn't installed
     install_dir: Option<PathBuf>,
     /// The database the plugin is writing right now, read-only
     live: Option<Pool>,
+    /// Whether Steam reports the game running
+    running: watch::Receiver<bool>,
+    /// Kept for its thread. Without Steam's key for the game (it's not installed), a sender kept
+    /// so `running` stays false instead of closing
+    _watcher: Result<AppWatcher, watch::Sender<bool>>,
 }
 
 impl LeMansUltimate {
-    #[inline]
     pub fn new() -> Self {
-        Self::default()
+        let (watcher, running) = match AppWatcher::new(STEAM_APP_ID) {
+            Ok(watcher) => {
+                let running = watcher.subscribe();
+                (Ok(watcher), running)
+            }
+            Err(e) => {
+                log::debug!("Not following Le Mans Ultimate starting and stopping: {e}");
+                let (send, running) = watch::channel(false);
+                (Err(send), running)
+            }
+        };
+
+        Self {
+            install_dir: None,
+            live: None,
+            running,
+            _watcher: watcher,
+        }
     }
 
     /// `UserData\lambiase`, if the game is installed.
@@ -81,13 +102,19 @@ impl Simulator for LeMansUltimate {
         "lmu"
     }
 
+    #[inline]
+    fn running(&self) -> watch::Receiver<bool> {
+        self.running.clone()
+    }
+
     /// The database the plugin is writing right now, or `None` when the game isn't installed, isn't
     /// running, or hasn't written one yet (the pilot hasn't loaded a session).
     fn database(&mut self) -> Option<&Pool> {
+        let running = *self.running.borrow();
         let path = self
             .folder()
             .map(|folder| folder.join(DATABASE))
-            .filter(|path| steam::is_app_running(STEAM_APP_ID) && path.is_file());
+            .filter(|path| running && path.is_file());
 
         let Some(path) = path else {
             // Closes the connections, so the plugin can delete the file
