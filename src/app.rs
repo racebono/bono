@@ -2,6 +2,7 @@ use crate::{
     app::topbar::Topbar,
     button::{Button, ButtonWatcher},
     config::{Config, RawConfig},
+    engineer::Engineer,
     sim::{ActiveSimulator, Sim, SimulatorSettings},
     synthesizer::Synthesizer,
     track::TrackSync,
@@ -100,6 +101,7 @@ impl App {
                 simulators: ActiveSimulator::default(),
                 applied_opponent_frequency: None,
                 tracks,
+                engineer: Engineer::new(client),
             },
             ui,
         });
@@ -133,6 +135,13 @@ impl App {
 
     pub fn event(&mut self, rt: &Handle, event: Event) -> AppResult {
         if self.ui.on_event(&event).consumed {
+            return AppResult::Continue;
+        }
+
+        let new_session = (self.state.config.get().session_button.as_ref())
+            .is_some_and(|button| button.pressed(&event));
+        if new_session {
+            self.state.engineer.new_session();
             return AppResult::Continue;
         }
 
@@ -183,12 +192,32 @@ pub struct AppState {
     applied_opponent_frequency: Option<NonZeroU32>,
     /// Keeps the running simulator's track description next to its database
     tracks: TrackSync,
+    engineer: Engineer,
 }
 
 impl AppState {
     fn update(&mut self, rt: &Handle, ui: &mut egui::Ui) {
         self.update_simulators();
         self.tracks.update(rt, self.simulators.current_mut());
+
+        // What the pilot says on the radio goes to the engineer, and its answers come back
+        if let Some((question, lang)) = self.gui.topbar.audio.transcription(rt) {
+            self.engineer.ask(
+                rt,
+                self.simulators.current_mut(),
+                &self.config,
+                &mut self.synth,
+                question,
+                lang,
+            );
+        }
+        self.engineer.update(
+            rt,
+            self.simulators.current().is_some(),
+            &self.config,
+            &mut self.synth,
+            self.gui.topbar.audio.speaker.get(),
+        );
         let simulator = self.simulators.current_mut();
         self.gui.update(
             rt,

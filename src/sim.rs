@@ -34,7 +34,7 @@ impl<T> Sim<T> {
                 (Ok(watcher), running)
             }
             Err(e) => {
-                log::debug!("Not following Le Mans Ultimate starting and stopping: {e}");
+                log::debug!("Not following {} starting and stopping: {e}", T::NAME);
                 let (send, running) = watch::channel(false);
                 (Err(send), running)
             }

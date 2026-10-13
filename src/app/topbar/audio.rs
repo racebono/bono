@@ -7,9 +7,10 @@ use crate::{
         },
     },
     arrstr,
-    config::{AudioDevice, Config, RawConfig},
+    config::{ArrayStr, AudioDevice, Config, RawConfig},
     error,
     synthesizer::{Speech, Synthesizer},
+    task::Task,
 };
 use camino::Utf8Path;
 use sdl3::{
@@ -42,6 +43,8 @@ pub struct AudioTopbar {
     pub test: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Speech>>>,
     /// The test speech's stream, kept until it's done playing (dropping it stops playback)
     test_playback: Option<AudioStreamOwner>,
+    /// What the pilot last said on the radio, being transcribed
+    transcription: Option<Task<anyhow::Result<Option<(String, ArrayStr<2>)>>>>,
 }
 
 impl AudioTopbar {
@@ -58,6 +61,27 @@ impl AudioTopbar {
             voices: Voices::new(pref_path, client.clone()),
             test: None,
             test_playback: None,
+            transcription: None,
+        }
+    }
+
+    /// What the pilot said on the radio, with its language, once it's transcribed.
+    pub fn transcription(&mut self, rt: &Handle) -> Option<(String, ArrayStr<2>)> {
+        let result = self.transcription.as_mut()?.update(rt)?;
+        self.transcription = None;
+        match result {
+            Ok(Some((text, lang))) => {
+                log::info!("Pilot ({lang}): {text}");
+                Some((text, lang))
+            }
+            Ok(None) => {
+                log::debug!("Nothing understood on the radio");
+                None
+            }
+            Err(e) => {
+                error("Failed speech to text", e);
+                None
+            }
         }
     }
 
@@ -121,17 +145,9 @@ impl AudioTopbar {
     pub fn event(&mut self, rt: &Handle, config: &Config, event: &Event) -> bool {
         if let Some(device) = self.microphone.get() {
             match self.whisper.event(rt, &event, config, device) {
-                Ok(handle) => {
-                    // FIXME(TODO): Save into AI session
-                    tokio::spawn(async move {
-                        log::debug!("TODO");
-                        match handle.await {
-                            Ok(Some((msg, lang))) => log::debug!("({lang}) {msg}"),
-                            Ok(None) => log::debug!("Didn't understand"),
-                            Err(e) => error("Failed speech to text", e),
-                        }
-                    });
-                }
+                // Picked up by `transcription`. One still being transcribed is dropped: the
+                // pilot already said something newer
+                Ok(handle) => self.transcription = Some(handle.into()),
                 Err(e) => return e,
             };
         }

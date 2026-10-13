@@ -38,6 +38,36 @@ pub enum ConfigButton {
     },
 }
 
+impl ConfigButton {
+    /// Whether `event` presses this button (key repeats aside).
+    pub fn pressed(&self, event: &Event) -> bool {
+        match (self, event) {
+            (
+                ConfigButton::Key(key),
+                Event::KeyDown {
+                    scancode: Some(scancode),
+                    repeat: false,
+                    ..
+                },
+            ) => key == scancode,
+            (
+                ConfigButton::Joystick { guid, button },
+                Event::JoyButtonDown {
+                    which, button_idx, ..
+                },
+            ) => {
+                button == button_idx
+                    && unsafe {
+                        sdl3::sys::joystick::SDL_GetJoystickGUIDForID(
+                            sdl3::sys::joystick::SDL_JoystickID(which.raw()),
+                        )
+                    } == *guid
+            }
+            _ => false,
+        }
+    }
+}
+
 pub struct ButtonWatcher {
     _watch: EventWatch<ButtonWatcherCallback>,
     recv: tokio::sync::mpsc::UnboundedReceiver<Button>,
