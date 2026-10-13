@@ -103,8 +103,13 @@ impl Simulator for LeMansUltimate {
     }
 
     #[inline]
-    fn running(&self) -> watch::Receiver<bool> {
-        self.running.clone()
+    fn running(&self) -> &watch::Receiver<bool> {
+        &self.running
+    }
+
+    #[inline]
+    fn running_mut(&mut self) -> &mut watch::Receiver<bool> {
+        &mut self.running
     }
 
     /// The database the plugin is writing right now, or `None` when the game isn't installed, isn't

@@ -52,6 +52,7 @@ impl Topbar {
         ui: &mut egui::Ui,
         config: &mut Config,
         synth: &mut Synthesizer,
+        simulator: Option<&str>,
     ) {
         egui::Panel::top("tobpar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -66,6 +67,10 @@ impl Topbar {
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
                     .ui(ui, |ui| self.audio.update(rt, ss, ui, config, synth));
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(simulator.unwrap_or("No simulator running"));
+                });
             });
         });
     }

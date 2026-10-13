@@ -2,12 +2,14 @@ use crate::{
     app::topbar::Topbar,
     button::{Button, ButtonWatcher},
     config::{Config, RawConfig},
+    sim::{ActiveSimulator, SimulatorSettings},
     synthesizer::Synthesizer,
 };
 use anyhow::Context as AnyhowContext;
 use camino::{Utf8Path, Utf8PathBuf};
 use egui::{FontFamily, FontTweak};
 use egui_sdl3::EguiCanvas;
+use futures::FutureExt;
 use sdl3::{
     AudioSubsystem, Error, EventSubsystem, JoystickSubsystem,
     event::{Event, WindowEvent},
@@ -19,6 +21,7 @@ use sdl3::{
 use sdl3_main::AppResult;
 use std::{
     ffi::c_int,
+    num::NonZeroU32,
     ops::{Deref, DerefMut},
     sync::Arc,
     time::Duration,
@@ -88,6 +91,8 @@ impl App {
                 config,
                 gui,
                 synth,
+                simulators: ActiveSimulator::default(),
+                applied_opponent_frequency: None,
             },
             ui,
         });
@@ -166,12 +171,44 @@ pub struct AppState {
     config: Config,
     subsystems: Subsystems,
     synth: Synthesizer,
+    simulators: ActiveSimulator,
+    /// The recording settings last passed to the simulators
+    applied_opponent_frequency: Option<NonZeroU32>,
 }
 
 impl AppState {
     fn update(&mut self, rt: &Handle, ui: &mut egui::Ui) {
-        self.gui
-            .update(rt, &self.subsystems, ui, &mut self.config, &mut self.synth);
+        self.update_simulators();
+        let simulator = self.simulators.current_mut().map(|sim| sim.name());
+        self.gui.update(
+            rt,
+            &self.subsystems,
+            ui,
+            &mut self.config,
+            &mut self.synth,
+            simulator,
+        );
+    }
+
+    /// Passes the recording settings on to every simulator when they change (and at startup), and
+    /// follows which simulator is running.
+    fn update_simulators(&mut self) {
+        let opponent_frequency = self.config.get().opponent_frequency;
+        if self.applied_opponent_frequency != Some(opponent_frequency) {
+            let settings = SimulatorSettings { opponent_frequency };
+            for simulator in self.simulators.simulators() {
+                simulator.apply(&settings);
+            }
+            self.applied_opponent_frequency = Some(opponent_frequency);
+        }
+
+        // Only looks: a change waiting is taken, otherwise it's looked for again next frame
+        if let Some(current) = self.simulators.changed().now_or_never() {
+            match current {
+                Some(simulator) => log::info!("{} is running", simulator.name()),
+                None => log::info!("No simulator is running"),
+            }
+        }
     }
 }
 
@@ -237,8 +274,9 @@ impl Gui {
         ui: &mut egui::Ui,
         config: &mut Config,
         synth: &mut Synthesizer,
+        simulator: Option<&str>,
     ) {
-        self.topbar.update(rt, ss, ui, config, synth);
+        self.topbar.update(rt, ss, ui, config, synth, simulator);
         egui::CentralPanel::default().show(ui, |_ui| {});
     }
 

@@ -11,7 +11,8 @@ pub trait Simulator: Send {
     fn name(&self) -> &'static str;
     fn track_data_id(&self) -> &'static str;
     /// Whether the simulator is running, changing as it starts and stops.
-    fn running(&self) -> watch::Receiver<bool>;
+    fn running(&self) -> &watch::Receiver<bool>;
+    fn running_mut(&mut self) -> &mut watch::Receiver<bool>;
     fn database(&mut self) -> Option<&Pool>;
     fn apply(&mut self, settings: &SimulatorSettings);
     fn clear(&mut self);
@@ -22,30 +23,18 @@ pub struct SimulatorSettings {
     pub opponent_frequency: NonZeroU32,
 }
 
-pub fn simulators() -> Vec<Box<dyn Simulator>> {
-    return [
-        #[cfg(windows)]
-        (Box::new(lmu::LeMansUltimate::new()) as Box<dyn Simulator>),
-    ]
-    .into_iter()
-    .collect::<Vec<_>>();
-}
-
 /// Follows which simulator is running. The first one found running stays current for as long as
 /// it runs, even if another starts meanwhile; when it stops, the next one running (if any) takes
 /// over.
 pub struct ActiveSimulator {
     simulators: Vec<Box<dyn Simulator>>,
-    running: Vec<watch::Receiver<bool>>,
     current: Option<usize>,
 }
 
 impl ActiveSimulator {
-    pub fn new(simulators: Vec<Box<dyn Simulator>>) -> Self {
-        let running = simulators.iter().map(|sim| sim.running()).collect();
+    fn new(simulators: Vec<Box<dyn Simulator>>) -> Self {
         let mut this = Self {
             simulators,
-            running,
             current: None,
         };
         this.current = this.pick();
@@ -54,8 +43,14 @@ impl ActiveSimulator {
 
     /// The simulator running now, if any.
     #[inline]
-    pub fn current(&mut self) -> Option<&mut dyn Simulator> {
-        Some(self.simulators[self.current?].as_mut())
+    pub fn current(&self) -> Option<&dyn Simulator> {
+        Some(self.simulators.get(self.current?)?.as_ref())
+    }
+
+    /// The simulator running now, if any.
+    #[inline]
+    pub fn current_mut(&mut self) -> Option<&mut dyn Simulator> {
+        Some(self.simulators.get_mut(self.current?)?.as_mut())
     }
 
     pub fn simulators(&mut self) -> impl Iterator<Item = &mut (dyn Simulator + 'static)> {
@@ -74,29 +69,54 @@ impl ActiveSimulator {
             }
 
             // Simulators that can't be followed any more (closed) stay as they last were
-            let waits = self
-                .running
-                .iter_mut()
-                .filter(|running| running.has_changed().is_ok())
-                .map(|running| Box::pin(running.changed()))
-                .collect::<Vec<_>>();
+            self.simulators.retain(|sim| {
+                let running = sim.running();
+                running.has_changed().is_ok()
+            });
 
-            if waits.is_empty() {
+            if self.simulators.is_empty() {
                 std::future::pending::<()>().await;
             }
+
+            let waits = self
+                .simulators
+                .iter_mut()
+                .map(|sim| Box::pin(sim.running_mut().changed()))
+                .collect::<Vec<_>>();
+
             let _ = select_all(waits).await;
         }
 
-        self.current()
+        self.current_mut()
     }
 
     /// The current simulator while it runs, otherwise the first one running.
     fn pick(&self) -> Option<usize> {
-        let is_running = |i: usize| *self.running[i].borrow();
+        let is_running = |i: usize| {
+            self.simulators
+                .get(i)
+                .is_some_and(|sim| *sim.running().borrow())
+        };
+
         self.current
             .filter(|&current| is_running(current))
-            .or_else(|| (0..self.running.len()).find(|&i| is_running(i)))
+            .or_else(|| (0..self.simulators.len()).find(|&i| is_running(i)))
     }
+}
+
+impl Default for ActiveSimulator {
+    fn default() -> Self {
+        Self::new(simulators())
+    }
+}
+
+fn simulators() -> Vec<Box<dyn Simulator>> {
+    return [
+        #[cfg(windows)]
+        (Box::new(lmu::LeMansUltimate::new()) as Box<dyn Simulator>),
+    ]
+    .into_iter()
+    .collect::<Vec<_>>();
 }
 
 #[cfg(test)]
@@ -117,8 +137,11 @@ mod tests {
         fn track_data_id(&self) -> &'static str {
             self.name
         }
-        fn running(&self) -> watch::Receiver<bool> {
-            self.running.clone()
+        fn running(&self) -> &watch::Receiver<bool> {
+            &self.running
+        }
+        fn running_mut(&mut self) -> &mut watch::Receiver<bool> {
+            &mut self.running
         }
         fn database(&mut self) -> Option<&Pool> {
             None
@@ -152,7 +175,7 @@ mod tests {
         let (a, a_running) = fake("a", false);
         let (b, b_running) = fake("b", true);
         let mut active = ActiveSimulator::new(vec![a, b]);
-        assert_eq!(active.current().map(|sim| sim.name()), Some("b"));
+        assert_eq!(active.current_mut().map(|sim| sim.name()), Some("b"));
 
         // Another starting doesn't take over
         a_running.send(true).unwrap();
