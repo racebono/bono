@@ -190,7 +190,9 @@ impl Drop for SynthesizerInner {
         let handle = unsafe { ManuallyDrop::take(&mut self.handle) };
         unsafe { ManuallyDrop::drop(&mut self.model) };
         unsafe { ManuallyDrop::drop(&mut self.synths) };
-        tokio::task::block_in_place(|| handle.join());
+        if tokio::task::block_in_place(|| handle.join()).is_err() {
+            log::error!("The speech synthesis thread panicked");
+        }
     }
 }
 

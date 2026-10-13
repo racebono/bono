@@ -83,6 +83,15 @@ where
         let running = self.is_running();
         self.simulator.database(running)
     }
+
+    /// Once the game stops, closes the database's connections (when nothing else still holds
+    /// the pool), so the plugin can delete the file as the game closes.
+    #[inline]
+    pub fn release_if_stopped(&mut self) {
+        if !self.is_running() {
+            self.simulator.database(false);
+        }
+    }
 }
 
 impl<T> Deref for Sim<T>
@@ -115,7 +124,7 @@ pub trait SimulatorInfo: Simulator {
 
 pub trait Simulator: Send {
     /// The database the simulator's plugin is writing right now, given whether the game is
-    /// running (`Sim::database` passes it).
+    /// running (`Sim::database` passes it). Not running, it lets go of the database.
     fn database(&mut self, running: bool) -> Option<&Pool>;
     fn apply(&mut self, settings: &SimulatorSettings);
     fn clear(&mut self);

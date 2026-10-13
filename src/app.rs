@@ -218,6 +218,11 @@ impl AppState {
                 Some(simulator) => log::info!("{} is running", simulator.name()),
                 None => log::info!("No simulator is running"),
             }
+
+            // The one that stopped lets go of its database
+            for simulator in self.simulators.simulators() {
+                simulator.release_if_stopped();
+            }
         }
     }
 }

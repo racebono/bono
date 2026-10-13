@@ -185,7 +185,7 @@ impl Whisper {
             ) if key_code == event_code => self.finish(config),
             (
                 Some(ConfigButton::Joystick { guid, ref button }),
-                Event::JoyButtonUp {
+                Event::JoyButtonDown {
                     which, button_idx, ..
                 },
             ) if button == button_idx
@@ -195,7 +195,7 @@ impl Whisper {
             }
             (
                 Some(ConfigButton::Joystick { guid, ref button }),
-                Event::JoyButtonDown {
+                Event::JoyButtonUp {
                     which, button_idx, ..
                 },
             ) if button == button_idx

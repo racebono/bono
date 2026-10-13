@@ -8,10 +8,7 @@ use std::{
     sync::{Arc, Weak},
     time::Duration,
 };
-use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
-    task::Id,
-};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use utils_atomics::TakeCell;
 
 #[derive(Clone)]
@@ -198,5 +195,37 @@ impl Drop for IdlePool {
         while let Some(idle) = self.0.pop_mut() {
             drop(idle.take());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The simulator's plugin deletes its database as the game closes: once the pool is gone,
+    /// nothing may hold the file open, even connections waiting idle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_the_pool_closes_idle_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.db");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+            .unwrap();
+
+        let one = NonZeroUsize::new(1).unwrap();
+        let pool = Pool::new(Database::read_only(Arc::new(path.clone())), one, one);
+        let conn = pool.get().await.unwrap();
+        let x = conn
+            .run(|conn| conn.query_row("SELECT x FROM t", [], |row| row.get::<_, i64>(0)))
+            .await
+            .unwrap();
+        assert_eq!(x, 1);
+        // Back to the pool, waiting idle
+        drop(conn);
+
+        drop(pool);
+        drop(writer);
+        std::fs::remove_file(&path).expect("the database is still open");
     }
 }
