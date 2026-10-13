@@ -1269,6 +1269,7 @@ dependencies = [
  "egui-sdl3",
  "egui_extras",
  "espeak-rs-sys",
+ "futures",
  "httpdate",
  "log",
  "oneshot",

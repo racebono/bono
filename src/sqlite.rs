@@ -16,6 +16,11 @@ pub struct Database {
 }
 
 impl Database {
+    #[inline]
+    pub fn new(path: Arc<TempPath>) -> Self {
+        Self { path }
+    }
+
     pub async fn open(&self) -> anyhow::Result<Connection> {
         let path = self.path.clone();
         let (send, recv) = tokio::sync::oneshot::channel();

@@ -3,17 +3,18 @@
 #include <map>
 #include <optional>
 #include <span>
-#include <sqlite/sqlite.hpp>
 #include <string>
 
-// Simulator-independent scoring: the state of the session and the standings of every car. Like telemetry,
-// each simulator converts its own data into these structs, fields it does not provide stay empty (NULL),
-// and units follow the conventions in telemetry.hpp. Times are seconds; a time that is not set yet (no lap
-// completed, no sector time) is NULL.
+// Simulator-independent scoring: the state of the session and the standings of
+// every car. Like telemetry, each simulator converts its own data into these
+// structs, fields it does not provide stay empty (NULL), and units follow the
+// conventions in telemetry.hpp. Times are seconds; a time that is not set yet
+// (no lap completed, no sector time) is NULL.
 //
-// Scoring is only written when it changes: each list entry is X(type, name, compared), and a new row is
-// written when any `compared` column differs from the last row written. The other columns change on every
-// update (clocks, gaps, distances), so they are stored with each row but never trigger one.
+// Scoring is only written when it changes: each list entry is X(type, name,
+// compared), and a new row is written when any `compared` column differs from
+// the last row written. The other columns change on every update (clocks, gaps,
+// distances), so they are stored with each row but never trigger one.
 
 // clang-format off
 #define SIM_SESSION_COLUMNS(X)                                                                            \
@@ -117,36 +118,38 @@
 // clang-format on
 
 namespace sim {
-#define SIM_DECLARE_SCORING_FIELD(type, name, compared) std::optional<type> name;
+#define SIM_DECLARE_SCORING_FIELD(type, name, compared)                        \
+  std::optional<type> name;
 
-    // The state of the session, in the `session` table.
-    struct SessionInfo {
-        SIM_SESSION_COLUMNS(SIM_DECLARE_SCORING_FIELD)
-    };
+// The state of the session, in the `session` table.
+struct SessionInfo {
+  SIM_SESSION_COLUMNS(SIM_DECLARE_SCORING_FIELD)
+};
 
-    // The standing of one car, in the `standings` table.
-    struct Standing {
-        SIM_STANDING_COLUMNS(SIM_DECLARE_SCORING_FIELD)
-    };
+// The standing of one car, in the `standings` table.
+struct Standing {
+  SIM_STANDING_COLUMNS(SIM_DECLARE_SCORING_FIELD)
+};
 
 #undef SIM_DECLARE_SCORING_FIELD
 
-    // Writes scoring updates, adding rows only for what changed since the last write. Creates its tables
-    // if needed.
-    class ScoringWriter {
-    public:
-        explicit ScoringWriter(sqlite::Connection& conn);
+// Writes scoring updates, adding rows only for what changed since the last
+// write. Creates its tables if needed.
+class ScoringWriter {
+public:
+  explicit ScoringWriter(sqlite::Connection &conn);
 
-        void write(const SessionInfo& session, std::span<const Standing> standings);
+  void write(const SessionInfo &session, std::span<const Standing> standings);
 
-        // Forgets what was written, after clear_tables(): the next write adds every row again.
-        void reset();
+  // Forgets what was written, after clear_tables(): the next write adds every
+  // row again.
+  void reset();
 
-    private:
-        sqlite::Statement _insert_session;
-        sqlite::Statement _insert_standing;
-        std::optional<SessionInfo> _last_session;
-        // The last standing written for each vehicle_id.
-        std::map<long long, Standing> _last_standings;
-    };
-}  // namespace sim
+private:
+  sqlite::Statement _insert_session;
+  sqlite::Statement _insert_standing;
+  std::optional<SessionInfo> _last_session;
+  // The last standing written for each vehicle_id.
+  std::map<long long, Standing> _last_standings;
+};
+} // namespace sim

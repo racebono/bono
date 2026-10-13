@@ -2,12 +2,12 @@
 
 #include <optional>
 #include <span>
-#include <sqlite/sqlite.hpp>
 #include <string>
 #include <vector>
 
-// The weather forecast for the event's sessions, as the simulator gives it (LMU only): a few points through each
-// session. Stored in the `forecast` table, a whole set of rows at a time, only when the forecast changes.
+// The weather forecast for the event's sessions, as the simulator gives it (LMU
+// only): a few points through each session. Stored in the `forecast` table, a
+// whole set of rows at a time, only when the forecast changes.
 namespace sim {
 // clang-format off
 #define SIM_FORECAST_COLUMNS(X)                                                                          \
@@ -25,27 +25,11 @@ namespace sim {
 
 #define SIM_DECLARE_FIELD(type, name) std::optional<type> name;
 
-    // One point of the forecast.
-    struct ForecastPoint {
-        SIM_FORECAST_COLUMNS(SIM_DECLARE_FIELD)
-    };
+// One point of the forecast.
+struct ForecastPoint {
+  SIM_FORECAST_COLUMNS(SIM_DECLARE_FIELD)
+};
 
 #undef SIM_DECLARE_FIELD
 
-    // Writes the forecast, a whole set of points with the same session_time, when it differs from the last one
-    // written. Creates its table if needed.
-    class ForecastWriter {
-    public:
-        explicit ForecastWriter(sqlite::Connection& conn);
-
-        // Returns whether it was written (it changed).
-        bool write(std::span<const ForecastPoint> points);
-
-        // Forgets what was written, after clear_tables(): the next forecast is written again.
-        void reset();
-
-    private:
-        sqlite::Statement _insert;
-        std::vector<ForecastPoint> _last;
-    };
-}  // namespace sim
+} // namespace sim

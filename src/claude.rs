@@ -1,4 +1,6 @@
+use crate::claude::tool_handler::{ToolHandler, Tools};
 use anyhow::bail;
+use futures::future::join_all;
 use reqwest::{
     RequestBuilder, StatusCode,
     header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue},
@@ -20,6 +22,7 @@ pub struct Conversation {
     timeout: Duration,
     max_retries: u32,
     max_requests: NonZeroU32,
+    tools: Tools,
 }
 
 impl Conversation {
@@ -37,17 +40,33 @@ impl Conversation {
 
             // Only client tool calls get results (server tools like code execution run on
             // Anthropic's side)
-            let results = response
-                .content
-                .iter()
-                .filter(|block| block["type"] == "tool_use")
-                .map(|block| ResultBody {
-                    r#type: "tool_result",
-                    tool_use_id: block["id"].clone(),
-                    content: "No handler for tool calls".into(),
-                    is_error: true,
-                })
-                .collect::<Vec<_>>();
+            let tools = &self.tools;
+            let results = join_all(
+                response
+                    .content
+                    .iter()
+                    .filter(|block| block["type"] == "tool_use")
+                    .map(|block| async move {
+                        let name = block.get("name").and_then(serde_json::Value::as_str);
+                        let input = block.get("input");
+
+                        let (content, is_error) = match name.zip(input) {
+                            Some((name, input)) => match tools.handle(name, input).await {
+                                Ok(x) => (x, false),
+                                Err(e) => (e.to_string(), true),
+                            },
+                            None => ("Invalid tool call request".into(), true),
+                        };
+
+                        ResultBody {
+                            r#type: "tool_result",
+                            tool_use_id: block["id"].clone(),
+                            content,
+                            is_error,
+                        }
+                    }),
+            )
+            .await;
 
             // The assistant's turn goes into the history exactly as received: tool results must
             // follow the turn with their `tool_use` blocks, a `pause_turn` resumes from it, and
@@ -119,7 +138,6 @@ impl Conversation {
     }
 }
 
-#[derive(Clone)]
 pub struct ConversationBuilder {
     api_key: Option<String>,
     workspace_id: Option<String>,
@@ -128,7 +146,8 @@ pub struct ConversationBuilder {
     effort: String,
     max_tokens: NonZeroU32,
     system: String,
-    tools: Vec<()>,
+    tools: Tools,
+    req_tools: Vec<RequestTool>,
     skills: Vec<()>,
     max_requests: NonZeroU32,
     max_retries: u32,
@@ -145,12 +164,34 @@ impl ConversationBuilder {
             effort: "high".into(),
             max_tokens: NonZeroU32::new(16000).unwrap(),
             system: "".into(),
-            tools: Vec::new(),
+            tools: Tools::default(),
+            req_tools: Vec::new(),
             skills: Vec::new(),
             max_requests: NonZeroU32::new(16).unwrap(),
             max_retries: 2,
             timeout: Duration::from_mins(10),
         }
+    }
+
+    #[inline]
+    pub fn tool<H>(
+        &mut self,
+        name: &'static str,
+        description: Option<String>,
+        input_schema: serde_json::Value,
+        handler: H,
+    ) -> &mut Self
+    where
+        H: ToolHandler + 'static,
+    {
+        self.req_tools.push(RequestTool {
+            r#type: None,
+            name,
+            description,
+            input_schema,
+        });
+        self.tools.insert(name, handler);
+        self
     }
 
     pub fn build(self, client: reqwest::Client) -> anyhow::Result<Conversation> {
@@ -215,7 +256,6 @@ impl ConversationBuilder {
         }
 
         headers.insert(ANTHROPIC_BETA, HeaderValue::from_str(&betas)?);
-
         return Ok(Conversation {
             client,
             base_url: self.base_url,
@@ -230,13 +270,14 @@ impl ConversationBuilder {
                     r#type: "ephemeral",
                 },
                 messages: Vec::new(),
-                tools: Vec::new(),
+                tools: self.req_tools,
                 container: None,
             },
             headers,
             timeout: self.timeout,
             max_retries: self.max_retries,
             max_requests: self.max_requests,
+            tools: self.tools,
         });
     }
 }
@@ -267,7 +308,7 @@ struct RequestMessage {
 struct RequestTool {
     #[serde(skip_serializing_if = "Option::is_none")]
     r#type: Option<&'static str>,
-    name: String,
+    name: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     #[serde(skip_serializing_if = "serde_json::Value::is_null")]
