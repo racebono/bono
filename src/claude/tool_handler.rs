@@ -1,8 +1,8 @@
 use anyhow::bail;
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use std::{collections::BTreeMap, pin::Pin};
 
-pub trait ToolHandler {
+pub trait ToolHandler: Send + Sync {
     type Input: DeserializeOwned;
 
     fn handle(
@@ -25,37 +25,34 @@ impl Tools {
         self.handlers.insert(tool, Box::new(handler));
     }
 
-    pub(super) async fn handle(
+    pub(super) fn handle(
         &self,
         name: &str,
         input: &serde_json::Value,
-    ) -> anyhow::Result<String> {
-        let Some(handler) = self.handlers.get(name) else {
-            bail!("No handler for this tool call");
+    ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
+        let call = match self.handlers.get(name) {
+            Some(handler) => handler.handle(input),
+            None => Box::pin(async { bail!("No handler for this tool call") }),
         };
-        return handler.handle(input).await;
+        return call;
     }
 }
 
-trait RawToolHandler {
-    fn handle<'a>(
-        &'a self,
-        input: &serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + 'a>>;
+type ToolFuture = Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'static>>;
+
+trait RawToolHandler: Send + Sync {
+    fn handle(&self, input: &serde_json::Value) -> ToolFuture;
 }
 
 impl<T> RawToolHandler for T
 where
     T: ToolHandler,
 {
-    fn handle<'a>(
-        &'a self,
-        input: &serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + 'a>> {
-        let input = input.clone();
-        return Box::pin(async move {
-            let input = serde_json::from_value::<T::Input>(input)?;
-            return <T as ToolHandler>::handle(self, input).await;
-        });
+    fn handle(&self, input: &serde_json::Value) -> ToolFuture {
+        // Parsed before the call, so the future doesn't borrow the handler or the input
+        match T::Input::deserialize(input) {
+            Ok(input) => Box::pin(<T as ToolHandler>::handle(self, input)),
+            Err(e) => Box::pin(std::future::ready(Err(e.into()))),
+        }
     }
 }
