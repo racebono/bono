@@ -2,7 +2,7 @@ use crate::{
     app::topbar::Topbar,
     button::{Button, ButtonWatcher},
     config::{Config, RawConfig},
-    sim::{ActiveSimulator, SimulatorSettings},
+    sim::{ActiveSimulator, Simulator, SimulatorSettings},
     synthesizer::Synthesizer,
 };
 use anyhow::Context as AnyhowContext;
@@ -179,7 +179,7 @@ pub struct AppState {
 impl AppState {
     fn update(&mut self, rt: &Handle, ui: &mut egui::Ui) {
         self.update_simulators();
-        let simulator = self.simulators.current_mut().map(|sim| sim.name());
+        let simulator = self.simulators.current_mut();
         self.gui.update(
             rt,
             &self.subsystems,
@@ -274,7 +274,7 @@ impl Gui {
         ui: &mut egui::Ui,
         config: &mut Config,
         synth: &mut Synthesizer,
-        simulator: Option<&str>,
+        simulator: Option<&mut dyn Simulator>,
     ) {
         self.topbar.update(rt, ss, ui, config, synth, simulator);
         egui::CentralPanel::default().show(ui, |_ui| {});

@@ -6,6 +6,7 @@ use crate::{
         topbar::{audio::AudioTopbar, settings::SettingsTopbar},
     },
     config::{Config, RawConfig},
+    sim::Simulator,
     synthesizer::Synthesizer,
 };
 use camino::Utf8Path;
@@ -52,7 +53,7 @@ impl Topbar {
         ui: &mut egui::Ui,
         config: &mut Config,
         synth: &mut Synthesizer,
-        simulator: Option<&str>,
+        simulator: Option<&mut dyn Simulator>,
     ) {
         egui::Panel::top("tobpar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -69,7 +70,23 @@ impl Topbar {
                     .ui(ui, |ui| self.audio.update(rt, ss, ui, config, synth));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(simulator.unwrap_or("No simulator running"));
+                    let clear = ui
+                        .add_enabled(simulator.is_some(), egui::Button::new("Clear data"))
+                        .on_hover_text("Delete everything recorded from the simulator so far")
+                        .on_disabled_hover_text("No simulator is running");
+
+                    match simulator {
+                        Some(simulator) => {
+                            ui.label(simulator.name());
+                            // The simulator's plugin clears it within a few seconds
+                            if clear.clicked() {
+                                simulator.clear();
+                            }
+                        }
+                        None => {
+                            ui.label("No simulator running");
+                        }
+                    }
                 });
             });
         });
