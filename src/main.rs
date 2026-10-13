@@ -21,7 +21,10 @@ pub extern crate std;
 
 mod app;
 mod button;
+mod claude;
 mod config;
+mod engineer;
+mod sqlite;
 mod synthesizer;
 mod task;
 

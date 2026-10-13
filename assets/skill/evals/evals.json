@@ -1,0 +1,164 @@
+{
+  "skill_name": "race-engineer",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "radio check, can I make it to the end on energy or do I need to box again?",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Gives the verdict that the pilot can make it to the end without stopping",
+        "Uses the race length from the session data without asking the pilot for it",
+        "Does not read back values shown on the game UI (virtual energy %, fuel litres, per-lap usage, lap times, time left)",
+        "At most 2 sentences"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "anyone around me?? feels like someone's on my right",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Confirms a car alongside on the right",
+        "Identifies it as a lapped car and/or a GT3 (or Hughes)",
+        "No distances in metres, speeds or other numbers the pilot didn't ask for",
+        "At most 2 sentences"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "front left feels like it's going off, and that hit a couple laps back - did it cost me pace? how are the tyres overall?",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Verdict that the hit cost little or no pace",
+        "Identifies the front-left as the problem tyre and that the others are fine",
+        "Does not read back tyre temperatures, wear percentages, pressures or lap times",
+        "Does not name another car as the contact partner",
+        "At most 3 sentences"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "CAR LEFT OR RIGHT??",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Says the car is on the RIGHT",
+        "Answer is at most ~12 words"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "give me the tyre temps and pressures, all four corners",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Gives a temperature for each of the four tyres",
+        "Gives a pressure for each of the four tyres",
+        "Stays brief: no unrequested extra topics (energy, gaps, contact)"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "who's that behind me and is he quicker than me?",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Names the car behind as Fischer (Lena Fischer)",
+        "Says she is slightly quicker / closing (not that she is slower)",
+        "Does not read back lap times or gaps the pilot can see",
+        "At most 2 sentences"
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "how many more track limits can I get away with?",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Says one more track limit point/warning will bring a penalty",
+        "At most 2 sentences"
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "how long's left and what's the weather doing?",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Gives the time left as about 15 minutes",
+        "Says it is dry / no rain",
+        "At most 3 sentences"
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "where am I losing time?",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Names T2 / Curva del Lago (the lake corner) as where most time is lost",
+        "Says the cause is braking too early into it (on the way in / entry)",
+        "Does not claim big losses elsewhere (the other corners are close to the reference)",
+        "At most 3 sentences, no lap times read back"
+      ]
+    },
+    {
+      "id": 10,
+      "prompt": "where should I be braking for the lake corner?",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Identifies the corner as T2 Curva del Lago",
+        "Advises braking later, by roughly 30 to 40 metres compared with the last lap (or rounded equivalent)",
+        "Phrases the advice relative to the pilot's own driving, without inventing marker boards",
+        "At most 2 sentences"
+      ]
+    },
+    {
+      "id": 11,
+      "prompt": "how did lap 7 go, where did that one go wrong?",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Names T3 / Esse as where lap 7 lost its time",
+        "Says it was the exit / too slow through the corner (low apex or exit speed), not the braking point",
+        "At most 3 sentences"
+      ]
+    },
+    {
+      "id": 12,
+      "prompt": "is it going to rain before the end?",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Says rain is likely / a good chance late in the race (around the last part / finish), not certain",
+        "Says it is dry now",
+        "At most 2 sentences"
+      ]
+    },
+    {
+      "id": 13,
+      "prompt": "can we make it to the end on energy or do we need to box?",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Says we cannot make it on energy as things are (short by about three laps) so a stop is needed",
+        "Brings in the late rain forecast as a factor for when to stop or which tyres (as a chance, not a certainty)",
+        "At most 3 sentences"
+      ]
+    },
+    {
+      "id": 14,
+      "prompt": "where is Fischer faster than me?",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Names T2 / Curva del Lago as the biggest difference on the last lap, due to braking early",
+        "Keeps the rest proportionate (small differences elsewhere, e.g. exits)",
+        "At most 3 sentences"
+      ]
+    }
+  ]
+}
