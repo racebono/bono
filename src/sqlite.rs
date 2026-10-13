@@ -3,37 +3,51 @@ use slab::Slab;
 use std::{
     mem::ManuallyDrop,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    path::Path,
     sync::Arc,
+    time::Duration,
 };
-use tempfile::TempPath;
 use tokio::sync::OwnedSemaphorePermit;
+
+type DatabasePath = Arc<dyn AsRef<Path> + Send + Sync>;
 
 pub mod pool;
 
 #[derive(Clone)]
 pub struct Database {
-    path: Arc<TempPath>,
+    path: DatabasePath,
+    flags: OpenFlags,
 }
 
 impl Database {
+    /// Read-write, created if missing, in WAL mode. `path` can be a `TempPath`, deleting the
+    /// database with the last clone.
     #[inline]
-    pub fn new(path: Arc<TempPath>) -> Self {
-        Self { path }
+    pub fn new(path: Arc<impl AsRef<Path> + Send + Sync + 'static>) -> Self {
+        Self {
+            path,
+            flags: OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE,
+        }
+    }
+
+    /// Read-only, for a database another process writes: it must exist, and is never changed.
+    #[inline]
+    pub fn read_only(path: Arc<impl AsRef<Path> + Send + Sync + 'static>) -> Self {
+        Self {
+            path,
+            flags: OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_READ_ONLY,
+        }
     }
 
     pub async fn open(&self) -> anyhow::Result<Connection> {
-        let path = self.path.clone();
+        let (path, flags) = (self.path.clone(), self.flags);
         let (send, recv) = tokio::sync::oneshot::channel();
         let handle = std::thread::Builder::new()
             .name("sqlite thread".into())
             .spawn(move || {
-                worker(
-                    path,
-                    OpenFlags::SQLITE_OPEN_NO_MUTEX
-                        | OpenFlags::SQLITE_OPEN_READ_WRITE
-                        | OpenFlags::SQLITE_OPEN_CREATE,
-                    send,
-                )
+                worker(path, flags, send)
             })?;
 
         let conn = recv.await??;
@@ -44,18 +58,12 @@ impl Database {
     }
 
     async fn open_permited(&self, permit: OwnedSemaphorePermit) -> anyhow::Result<Connection> {
-        let path = self.path.clone();
+        let (path, flags) = (self.path.clone(), self.flags);
         let (send, recv) = tokio::sync::oneshot::channel();
         let handle = std::thread::Builder::new()
             .name("sqlite thread".into())
             .spawn(move || {
-                worker(
-                    path,
-                    OpenFlags::SQLITE_OPEN_NO_MUTEX
-                        | OpenFlags::SQLITE_OPEN_READ_WRITE
-                        | OpenFlags::SQLITE_OPEN_CREATE,
-                    send,
-                );
+                worker(path, flags, send);
                 drop(permit);
             })?;
 
@@ -183,14 +191,19 @@ impl Drop for Statement<'_> {
 }
 
 fn worker(
-    path: Arc<TempPath>,
+    path: DatabasePath,
     flags: OpenFlags,
     start: tokio::sync::oneshot::Sender<rusqlite::Result<OpenConnection>>,
 ) {
     let conn = (|| {
-        let conn = rusqlite::Connection::open_with_flags(&*path, flags)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        let conn = rusqlite::Connection::open_with_flags((*path).as_ref(), flags)?;
+        if flags.contains(OpenFlags::SQLITE_OPEN_READ_WRITE) {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+        } else {
+            // The writer can briefly hold the database (a checkpoint, clearing it): wait for it
+            conn.busy_timeout(Duration::from_secs(1))?;
+        }
         Ok(conn)
     })();
 

@@ -8,14 +8,17 @@ use std::{
     sync::{Arc, Weak},
     time::Duration,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::Id,
+};
 use utils_atomics::TakeCell;
 
 #[derive(Clone)]
 pub struct Pool {
     db: Database,
     open: Arc<Semaphore>,
-    idle: Arc<ArrayQueue<Arc<Idle>>>,
+    idle: Arc<IdlePool>,
     idle_sem: Arc<Semaphore>,
     idle_timeout: Duration,
 }
@@ -25,7 +28,7 @@ impl Pool {
         Self {
             db,
             open: Arc::new(Semaphore::new(max_open.get())),
-            idle: Arc::new(ArrayQueue::new(max_idle.get())),
+            idle: Arc::new(IdlePool(ArrayQueue::new(max_idle.get()))),
             idle_sem: Arc::new(Semaphore::new(0)),
             idle_timeout: Duration::from_secs(30),
         }
@@ -89,7 +92,7 @@ impl Pool {
 
 pub struct PoolConnection {
     conn: ManuallyDrop<Connection>,
-    idle: Weak<ArrayQueue<Arc<Idle>>>,
+    idle: Weak<IdlePool>,
     permit: Result<OwnedSemaphorePermit, Weak<Semaphore>>,
     timeout: Duration,
 }
@@ -169,5 +172,25 @@ impl Idle {
 
     fn take(&self) -> Option<Connection> {
         return Some(self.inner.try_take()?.0);
+    }
+}
+
+#[repr(transparent)]
+struct IdlePool(ArrayQueue<Arc<Idle>>);
+
+impl Deref for IdlePool {
+    type Target = ArrayQueue<Arc<Idle>>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for IdlePool {
+    fn drop(&mut self) {
+        while let Some(idle) = self.0.pop_mut() {
+            drop(idle.take());
+        }
     }
 }

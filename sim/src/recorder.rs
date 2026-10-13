@@ -533,4 +533,33 @@ mod tests {
             .unwrap();
         assert_eq!(vehicles, [2]);
     }
+
+    #[test]
+    fn readers_see_what_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(lambiase_session_info::default(), vec![standing(1, true, 0.0)]);
+
+        // As the app opens it: read-only, once the file is there, while the recorder is writing
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let path = dir.path().join(DATABASE);
+        while !path.is_file() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let reader =
+            rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        reader.busy_timeout(Duration::from_secs(1)).unwrap();
+
+        loop {
+            let rows = reader.query_row("SELECT count(*) FROM standings", [], |row| row.get::<_, i64>(0));
+            if rows.as_ref().is_ok_and(|rows| *rows == 1) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{rows:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(recorder);
+    }
 }

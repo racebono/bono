@@ -482,8 +482,8 @@ namespace {
                 const std::filesystem::path user_data = std::filesystem::absolute(info.mPath[0], ec);
                 if (!ec) _user_data = user_data;
             }
-            // A database left from an earlier run (the game crashed) would look like a session to the app until
-            // the next one starts.
+            // A database left from an earlier run (the game crashed) would look like a session to the app
+            // until the next one starts.
             if (!_recorder) {
                 try {
                     const std::wstring dir = database_dir().native();
@@ -494,7 +494,7 @@ namespace {
         }
 
         // The database is created when the first session loads (while the pilot is still in the garage), not
-        // when the game starts. It lives in UserData\my_engineer, where the app and the skill's scripts look
+        // when the game starts. It lives in UserData\lambiase, where the app and the skill's scripts look
         // for it while the game runs, and is deleted when the game closes.
         void StartSession() override {
             start_recording();
@@ -550,7 +550,7 @@ namespace {
         std::filesystem::path database_dir() const {
             const std::filesystem::path user_data =
                     _user_data.empty() ? std::filesystem::absolute("UserData") : _user_data;
-            return user_data / "my_engineer";
+            return user_data / "lambiase";
         }
 
         void start_recording() {
