@@ -46,110 +46,32 @@ pub struct Radio {
 }
 
 impl Radio {
-    pub fn apply(&self, src: &[f32], sample_rate: f32, strength: f32, squelch: bool) -> Vec<f32> {
+    /// The effect on a transmission, applied a piece at a time as its voice is synthesized.
+    pub fn stream(&self, sample_rate: f32, strength: f32) -> RadioStream {
         let s = strength.clamp(0.0, 1.0);
-        if s <= 0.0 || src.is_empty() || sample_rate <= 0.0 {
-            return src.to_vec();
-        }
+        let link_hold = 1.0f32.max(sample_rate / self.link_rate);
 
-        let open = self.src_offset(sample_rate, strength, squelch);
-        let close = match squelch {
-            true => (self.squelch_close * sample_rate).ceil() as usize,
-            false => 0,
-        };
-
-        let dry = std::iter::repeat_n(0.0, open)
-            .chain(src.iter().copied())
-            .chain(std::iter::repeat_n(0.0, close))
-            .collect::<Vec<_>>();
-
-        let mut dry_rms = None;
-        let mut dry_rms = || *dry_rms.get_or_insert_with(|| rms(&dry));
-
-        let mut voice_band = Band::new(self.voice_low_cut, self.voice_high_cut, sample_rate);
-        let mut honk = Biquad::peak(self.honk_frequency, self.honk_gain_db, 1.2, sample_rate);
-        let mut receiver = Band::new(
-            0.8 * self.voice_low_cut,
-            1.2 * self.voice_high_cut,
+        RadioStream {
+            voice_band: Band::new(self.voice_low_cut, self.voice_high_cut, sample_rate),
+            honk: Biquad::peak(self.honk_frequency, self.honk_gain_db, 1.2, sample_rate),
+            receiver: Band::new(
+                0.8 * self.voice_low_cut,
+                1.2 * self.voice_high_cut,
+                sample_rate,
+            ),
+            noise_band: Band::new(self.hiss_low_cut, self.hiss_high_cut, sample_rate),
+            rng: Xoshiro128PlusPlus::from_rng(&mut ThreadRng::default()),
+            drive: 1.0 + (self.max_drive - 1.0) * s,
+            link_hold,
+            link_steps: 2.0f32.powf(self.link_bits - 1.0),
+            held: 0.0,
+            since_hold: link_hold,
+            position: 0,
+            on: s > 0.0 && sample_rate > 0.0,
+            radio: self.clone(),
             sample_rate,
-        );
-
-        let drive = 1.0 + (self.max_drive - 1.0) * s;
-        let hold = 1.0f32.max(sample_rate / self.link_rate);
-        let steps = 2.0f32.powf(self.link_bits - 1.0);
-
-        let mut held = 0.0;
-        let mut since_hold = hold;
-
-        let wet = dry
-            .iter()
-            .enumerate()
-            .map(|(i, &dry)| {
-                let shaped = honk.process(voice_band.process(dry));
-                let clipped = (drive * shaped).tanh() / drive.tanh();
-                since_hold += 1.0;
-                if since_hold >= hold {
-                    since_hold -= hold;
-                    held = (clipped * steps).round() / steps;
-                }
-
-                let i = i as f32;
-                let flutter = 1.0
-                    - self.flutter_depth
-                        * (0.5 + 0.5 * f32::sin(TAU * self.flutter_rate * i / sample_rate));
-
-                return receiver.process(held) * flutter;
-            })
-            .collect::<Vec<_>>();
-
-        let wet_rms = rms(&wet);
-        let wet_gain = if wet_rms > 0.0 {
-            dry_rms() / wet_rms
-        } else {
-            1.0
-        };
-
-        let voice = wet
-            .iter()
-            .zip(dry.iter())
-            .map(|(wet, &dry)| (1.0 - s) * dry + s * wet * wet_gain)
-            .collect::<Vec<_>>();
-
-        let voice_rms = rms(&voice);
-        let gain = if voice_rms > 0.0 {
-            dry_rms() / voice_rms
-        } else {
-            1.0
-        };
-
-        let mut noise_band = Band::new(self.hiss_low_cut, self.hiss_high_cut, sample_rate);
-        let mut rng = Xoshiro128PlusPlus::from_rng(&mut ThreadRng::default());
-        let uniform = Uniform::new_inclusive(-1.0, 1.0).unwrap();
-
-        let mut dest = Vec::with_capacity(dry.len());
-        for (i, &voice) in voice.iter().enumerate() {
-            let mut level = self.hiss_level;
-            if i < open {
-                level = self.squelch_level
-            }
-            if i >= (dry.len() - close) {
-                let left = (dry.len() - i) as f32 / (close as f32);
-                level = self.squelch_level * left;
-            }
-            let noise = noise_band.process(uniform.sample(&mut rng)) * level * 3.0;
-            dest.push(voice * gain + s * noise);
+            s,
         }
-
-        return dest;
-    }
-
-    /// Where [`Self::apply`] puts the first sample of `src` in its output: after the squelch
-    /// opening, if there is one.
-    pub fn src_offset(&self, sample_rate: f32, strength: f32, squelch: bool) -> usize {
-        if !squelch || strength.clamp(0.0, 1.0) <= 0.0 || sample_rate <= 0.0 {
-            return 0;
-        }
-        return (self.squelch_open * sample_rate).ceil() as usize;
     }
 
     pub fn beep(&self, sample_rate: f32) -> Vec<f32> {
@@ -208,6 +130,125 @@ impl Default for Radio {
             beep_level: 0.35,
             beep_fade: 0.005,
         }
+    }
+}
+
+/// [`Radio::stream`]: the filters carry on from one piece to the next, and each piece of voice
+/// keeps the level it was synthesized at.
+pub struct RadioStream {
+    radio: Radio,
+    sample_rate: f32,
+    /// The effect's strength
+    s: f32,
+    /// Off at no strength: the voice goes through as it is, with no hiss or squelch
+    on: bool,
+    voice_band: Band,
+    honk: Biquad,
+    receiver: Band,
+    noise_band: Band,
+    rng: Xoshiro128PlusPlus,
+    drive: f32,
+    /// The digital link: how many samples each of its own lasts, and its levels
+    link_hold: f32,
+    link_steps: f32,
+    held: f32,
+    since_hold: f32,
+    /// Samples so far, for the flutter's phase
+    position: usize,
+}
+
+impl RadioStream {
+    /// The squelch opening: the burst of noise before the voice.
+    pub fn open(&mut self) -> Vec<f32> {
+        if !self.on {
+            return Vec::new();
+        }
+
+        let len = (self.radio.squelch_open * self.sample_rate).ceil() as usize;
+        let level = self.radio.squelch_level;
+        return self.process(&vec![0.0; len], |_| level);
+    }
+
+    /// The next piece of voice, under the hiss.
+    pub fn voice(&mut self, src: &[f32]) -> Vec<f32> {
+        if !self.on {
+            return src.to_vec();
+        }
+
+        let level = self.radio.hiss_level;
+        return self.process(src, |_| level);
+    }
+
+    /// The squelch closing: the noise burst fading out.
+    pub fn close(&mut self) -> Vec<f32> {
+        if !self.on {
+            return Vec::new();
+        }
+
+        let len = (self.radio.squelch_close * self.sample_rate).ceil() as usize;
+        let level = self.radio.squelch_level;
+        return self.process(&vec![0.0; len], |i| level * (len - i) as f32 / len as f32);
+    }
+
+    /// The voice through the radio, at the dry voice's level, with noise at `level(i)` under
+    /// it.
+    fn process(&mut self, dry: &[f32], level: impl Fn(usize) -> f32) -> Vec<f32> {
+        let radio = &self.radio;
+        let s = self.s;
+
+        let mut dry_rms = None;
+        let mut dry_rms = || *dry_rms.get_or_insert_with(|| rms(dry));
+
+        let wet = dry
+            .iter()
+            .map(|&dry| {
+                let shaped = self.honk.process(self.voice_band.process(dry));
+                let clipped = (self.drive * shaped).tanh() / self.drive.tanh();
+                self.since_hold += 1.0;
+                if self.since_hold >= self.link_hold {
+                    self.since_hold -= self.link_hold;
+                    self.held = (clipped * self.link_steps).round() / self.link_steps;
+                }
+
+                let i = self.position as f32;
+                self.position += 1;
+                let flutter = 1.0
+                    - radio.flutter_depth
+                        * (0.5 + 0.5 * f32::sin(TAU * radio.flutter_rate * i / self.sample_rate));
+
+                return self.receiver.process(self.held) * flutter;
+            })
+            .collect::<Vec<_>>();
+
+        let wet_rms = rms(&wet);
+        let wet_gain = if wet_rms > 0.0 {
+            dry_rms() / wet_rms
+        } else {
+            1.0
+        };
+
+        let voice = wet
+            .iter()
+            .zip(dry.iter())
+            .map(|(wet, &dry)| (1.0 - s) * dry + s * wet * wet_gain)
+            .collect::<Vec<_>>();
+
+        let voice_rms = rms(&voice);
+        let gain = if voice_rms > 0.0 {
+            dry_rms() / voice_rms
+        } else {
+            1.0
+        };
+
+        let uniform = Uniform::new_inclusive(-1.0, 1.0).unwrap();
+        return voice
+            .iter()
+            .enumerate()
+            .map(|(i, &voice)| {
+                let noise = self.noise_band.process(uniform.sample(&mut self.rng)) * level(i) * 3.0;
+                voice * gain + s * noise
+            })
+            .collect();
     }
 }
 
@@ -430,4 +471,46 @@ fn sum_squares_4(samples: &[f32]) -> f32 {
         .fold(zero, |acc, &x| x.mul_add(x, acc))
         .reduce(zero, |lhs, rhs| lhs + rhs);
     return sum_squares_scalar(pre, post) + unsafe { reduce_add(sum) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streams_the_effect_a_piece_at_a_time() {
+        let sample_rate = 22050.0;
+        let radio = Radio::default();
+        let voice = (0..22050)
+            .map(|i| 0.5 * (i as f32 * 0.05).sin())
+            .collect::<Vec<_>>();
+
+        let mut stream = radio.stream(sample_rate, 0.65);
+        let open = stream.open();
+        let first = stream.voice(&voice[..10000]);
+        let second = stream.voice(&voice[10000..]);
+        let close = stream.close();
+
+        assert_eq!(
+            open.len(),
+            (radio.squelch_open * sample_rate).ceil() as usize
+        );
+        assert_eq!(first.len() + second.len(), voice.len());
+        assert_eq!(
+            close.len(),
+            (radio.squelch_close * sample_rate).ceil() as usize
+        );
+        assert!(
+            [open, first, second, close]
+                .iter()
+                .flatten()
+                .all(|s| s.is_finite())
+        );
+
+        // No effect: the voice as it is, without squelch
+        let mut off = radio.stream(sample_rate, 0.0);
+        assert!(off.open().is_empty());
+        assert_eq!(off.voice(&voice), voice);
+        assert!(off.close().is_empty());
+    }
 }

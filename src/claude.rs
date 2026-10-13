@@ -3,11 +3,11 @@ use anyhow::{Context, bail};
 use futures::future::join_all;
 use reqwest::{
     RequestBuilder, StatusCode,
-    header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue},
+    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     env::VarError,
     fmt::{self, Display, Formatter},
     num::NonZeroU32,
@@ -48,14 +48,23 @@ pub struct Reply {
 /// Tokens billed, by kind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 pub struct Usage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub cache_creation_input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub cache_read_input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub output_tokens: u64,
+}
+
+/// Streamed counts can be `null` (e.g. the cache's, before they're known).
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl AddAssign for Usage {
@@ -103,28 +112,43 @@ impl Conversation {
     /// Sends the user's message and runs Claude's turn to its end, tool calls included. On an
     /// error, or if the returned future is dropped before it finishes, the conversation is left
     /// as it was before the call.
+    #[inline]
     pub async fn send(&mut self, text: String) -> anyhow::Result<Reply> {
+        self.send_streaming(text, |_| {}).await
+    }
+
+    /// Like [`Self::send`], with the reply's text handed to `on_text` as Claude writes it: put
+    /// together, the pieces are [`Reply::text`]. Text already handed over stays said, even if
+    /// the turn then fails, or ends in a refusal.
+    pub async fn send_streaming(
+        &mut self,
+        text: String,
+        mut on_text: impl FnMut(&str) + Send,
+    ) -> anyhow::Result<Reply> {
         let mut turn = Turn {
             start: self.body.messages.len(),
             conversation: self,
             keep: false,
         };
 
-        let reply = turn.conversation.run_turn(text).await?;
+        let reply = turn
+            .conversation
+            .run_turn(text, &mut TextSink::new(&mut on_text))
+            .await?;
+
         turn.keep = reply.stop != StopReason::Refusal;
         return Ok(reply);
     }
 
-    async fn run_turn(&mut self, text: String) -> anyhow::Result<Reply> {
+    async fn run_turn(&mut self, text: String, sink: &mut TextSink<'_>) -> anyhow::Result<Reply> {
         self.body.messages.push(RequestMessage {
             role: "user",
             content: serde_json::Value::String(text),
         });
 
-        let mut texts = Vec::new();
         let mut turn_usage = Usage::default();
         for _ in 0..self.max_requests.get() {
-            let response = self.post().await?;
+            let mut response = self.post(sink).await?;
             if let Some(container_id) = response.container.and_then(|c| c.id) {
                 self.body.container.get_or_insert_default().id = Some(container_id);
             }
@@ -134,15 +158,7 @@ impl Conversation {
             turn_usage += usage;
             *self.usage.entry(model.clone()).or_default() += usage;
 
-            texts.extend(
-                response
-                    .content
-                    .iter()
-                    .filter(|block| block["type"] == "text")
-                    .filter_map(|block| block["text"].as_str())
-                    .filter(|text| !text.trim().is_empty())
-                    .map(str::to_owned),
-            );
+            drop_declined(&mut response.content);
 
             // Client tool calls, which this side answers (server tools like code execution run on
             // Anthropic's side)
@@ -185,7 +201,7 @@ impl Conversation {
 
             if let Some(stop) = stop {
                 return Ok(Reply {
-                    text: texts.join("\n\n"),
+                    text: std::mem::take(&mut sink.text),
                     stop,
                     usage: turn_usage,
                     model,
@@ -202,7 +218,9 @@ impl Conversation {
             let results = join_all(calls.iter().map(|call| {
                 let name = call.get("name").and_then(serde_json::Value::as_str);
                 let input = call.get("input");
-                let handled = name.zip(input).map(|(name, input)| tools.handle(name, input));
+                let handled = name
+                    .zip(input)
+                    .map(|(name, input)| tools.handle(name, input));
                 let tool_use_id = call["id"].clone();
 
                 async move {
@@ -236,12 +254,15 @@ impl Conversation {
         )
     }
 
-    async fn post(&self) -> anyhow::Result<ResponseBody> {
+    /// Sends the request and reads the response, streamed (handing its text to `sink` as it
+    /// comes) or whole.
+    async fn post(&self, sink: &mut TextSink<'_>) -> anyhow::Result<ResponseBody> {
         const RETRY_AFTER: HeaderName = HeaderName::from_static("retry-after");
         const SHOULD_RETRY: HeaderName = HeaderName::from_static("x-should-retry");
 
         let mut attempt = 0;
         loop {
+            sink.start_response();
             let resp = match self.request().send().await {
                 Ok(resp) => resp,
                 // The request may never have reached the API: worth another try
@@ -259,10 +280,23 @@ impl Conversation {
 
             let status = resp.status();
             if status.is_success() {
-                return resp
-                    .json()
-                    .await
-                    .context("Claude sent a response that couldn't be read");
+                let said = sink.text.len();
+                match read_response(resp, sink).await {
+                    Ok(body) => return Ok(body),
+                    // Failed midway (e.g. overloaded, or the connection dropped): a retry would
+                    // say again what's been said, so only before any text
+                    Err(e)
+                        if attempt < self.max_retries
+                            && sink.text.len() == said
+                            && retryable_stream_error(&e) =>
+                    {
+                        log::warn!("Claude's response failed midway, retrying: {e:#}");
+                        tokio::time::sleep(backoff(attempt)).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
 
             // The API says whether retrying can help; without it, overloaded and transient errors
@@ -362,6 +396,31 @@ impl ApiError {
             r#type,
             message,
             request_id,
+        }
+    }
+
+    /// An `error` event in a streamed response, which arrives after the 200: the status is the
+    /// one the error has when it's answered straight away.
+    fn from_event(error: &serde_json::Value) -> Self {
+        let r#type = error["type"].as_str().map(str::to_owned);
+        let status = match r#type.as_deref() {
+            Some("invalid_request_error") => StatusCode::BAD_REQUEST,
+            Some("authentication_error") => StatusCode::UNAUTHORIZED,
+            Some("billing_error") => StatusCode::PAYMENT_REQUIRED,
+            Some("permission_error") => StatusCode::FORBIDDEN,
+            Some("not_found_error") => StatusCode::NOT_FOUND,
+            Some("request_too_large") => StatusCode::PAYLOAD_TOO_LARGE,
+            Some("rate_limit_error") => StatusCode::TOO_MANY_REQUESTS,
+            Some("timeout_error") => StatusCode::GATEWAY_TIMEOUT,
+            Some("overloaded_error") => StatusCode::from_u16(529).unwrap(),
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+
+        Self {
+            status,
+            r#type,
+            message: error["message"].as_str().map(str::to_owned),
+            request_id: None,
         }
     }
 }
@@ -644,6 +703,7 @@ impl ConversationBuilder {
             body: RequestBody {
                 model: self.model,
                 max_tokens: self.max_tokens,
+                stream: true,
                 fallbacks: "default",
                 output_config: RequestOutputConfig {
                     effort: self.effort,
@@ -678,6 +738,8 @@ impl ConversationBuilder {
 struct RequestBody {
     model: String,
     max_tokens: NonZeroU32,
+    /// Always: answers are spoken as they're written, and long requests don't time out
+    stream: bool,
     /// Retries refusals on Anthropic's recommended model for the refusal's category (needs the
     /// `server-side-fallback-2026-07-01` beta)
     fallbacks: &'static str,
@@ -758,7 +820,7 @@ struct RequestCacheControl {
 struct ResponseBody {
     #[serde(default)]
     model: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     usage: ResponseUsage,
     #[serde(default)]
     container: Option<ResponseContainer>,
@@ -775,7 +837,7 @@ struct ResponseUsage {
     usage: Usage,
     /// Present when the request ran server-side steps (e.g. compaction), each billed apart: the
     /// top-level counts are then only part of it
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     iterations: Vec<Usage>,
 }
 
@@ -783,10 +845,13 @@ impl ResponseUsage {
     fn total(&self) -> Usage {
         match self.iterations.is_empty() {
             true => self.usage,
-            false => self.iterations.iter().fold(Usage::default(), |mut total, usage| {
-                total += *usage;
-                total
-            }),
+            false => self
+                .iterations
+                .iter()
+                .fold(Usage::default(), |mut total, usage| {
+                    total += *usage;
+                    total
+                }),
         }
     }
 }
@@ -803,6 +868,365 @@ struct ResultBody {
     tool_use_id: serde_json::Value,
     content: String,
     is_error: bool,
+}
+
+/// Puts a turn's text together and hands it out as it comes: blocks of text are separated by
+/// blank lines, and those with nothing to say are left out.
+struct TextSink<'a> {
+    on_text: &'a mut (dyn FnMut(&str) + Send),
+    /// Everything handed out
+    text: String,
+    /// Whitespace the current block started with, held until the block says something
+    pending: String,
+    /// The current block said something
+    started: bool,
+    /// The next block carries on from the last: a model declined midway through it, and the
+    /// fallback model continues where it left off
+    carry_on: bool,
+}
+
+impl<'a> TextSink<'a> {
+    fn new(on_text: &'a mut (dyn FnMut(&str) + Send)) -> Self {
+        Self {
+            on_text,
+            text: String::new(),
+            pending: String::new(),
+            started: false,
+            carry_on: false,
+        }
+    }
+
+    fn start_response(&mut self) {
+        self.end_block();
+        self.carry_on = false;
+    }
+
+    fn start_block(&mut self, block: &serde_json::Value) {
+        self.end_block();
+        if block["type"] == "fallback" {
+            self.carry_on = true;
+        }
+    }
+
+    /// More of the current text block.
+    fn push(&mut self, text: &str) {
+        if !self.started {
+            if text.trim().is_empty() {
+                self.pending.push_str(text);
+                return;
+            }
+
+            self.started = true;
+            if !std::mem::take(&mut self.carry_on) && !self.text.is_empty() {
+                self.emit("\n\n");
+            }
+            let pending = std::mem::take(&mut self.pending);
+            self.emit(&pending);
+        }
+        self.emit(text);
+    }
+
+    fn end_block(&mut self) {
+        self.pending.clear();
+        self.started = false;
+    }
+
+    fn emit(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.text.push_str(text);
+            (self.on_text)(text);
+        }
+    }
+}
+
+/// Reads a response, streamed or whole, handing its text to `sink`.
+async fn read_response(
+    mut resp: reqwest::Response,
+    sink: &mut TextSink<'_>,
+) -> anyhow::Result<ResponseBody> {
+    let streamed = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+
+    if !streamed {
+        let body = resp
+            .json::<ResponseBody>()
+            .await
+            .context("Claude sent a response that couldn't be read")?;
+        for block in &body.content {
+            sink.start_block(block);
+            if block["type"] == "text"
+                && let Some(text) = block["text"].as_str()
+            {
+                sink.push(text);
+            }
+            sink.end_block();
+        }
+        return Ok(body);
+    }
+
+    let mut events = ServerEvents::default();
+    let mut message = MessageStream::default();
+    let mut data = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .context("Claude's response stream failed")?
+    {
+        events.feed(&chunk, &mut data);
+        for data in data.drain(..) {
+            message.event(&data, sink)?;
+        }
+        if message.done {
+            break;
+        }
+    }
+
+    return message.finish();
+}
+
+/// Splits a server-sent event stream into each event's data.
+#[derive(Default)]
+struct ServerEvents {
+    /// The start of a line that's still coming
+    line: Vec<u8>,
+    /// The data of the event being read
+    data: String,
+}
+
+impl ServerEvents {
+    fn feed(&mut self, bytes: &[u8], events: &mut Vec<String>) {
+        self.line.extend_from_slice(bytes);
+
+        let mut start = 0;
+        while let Some(len) = self.line[start..].iter().position(|&b| b == b'\n') {
+            let line = &self.line[start..start + len];
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            start += len + 1;
+
+            // A blank line ends the event
+            if line.is_empty() {
+                if !self.data.is_empty() {
+                    events.push(std::mem::take(&mut self.data));
+                }
+                continue;
+            }
+
+            // The data says what the event is, so the `event:` lines aren't needed (nor
+            // comments, `id:` or `retry:`)
+            if let Some(value) = line.strip_prefix(b"data:") {
+                let value = value.strip_prefix(b" ").unwrap_or(value);
+                if !self.data.is_empty() {
+                    self.data.push('\n');
+                }
+                self.data.push_str(&String::from_utf8_lossy(value));
+            }
+        }
+
+        self.line.drain(..start);
+    }
+}
+
+/// A message put together from its stream of events.
+#[derive(Default)]
+struct MessageStream {
+    message: serde_json::Map<String, serde_json::Value>,
+    blocks: Vec<serde_json::Value>,
+    /// Each block's tool input so far, as JSON text
+    inputs: Vec<String>,
+    /// The message is complete
+    done: bool,
+}
+
+impl MessageStream {
+    fn event(&mut self, data: &str, sink: &mut TextSink<'_>) -> anyhow::Result<()> {
+        use serde_json::Value;
+
+        let mut event = serde_json::from_str::<Value>(data)
+            .context("Claude sent a stream event that couldn't be read")?;
+
+        match event["type"].as_str().unwrap_or_default() {
+            "message_start" => {
+                if let Value::Object(message) = event["message"].take() {
+                    self.message = message;
+                }
+            }
+            "content_block_start" => {
+                let index = block_index(&event)?;
+                let block = event["content_block"].take();
+                if self.blocks.len() <= index {
+                    self.blocks.resize(index + 1, Value::Null);
+                    self.inputs.resize(index + 1, String::new());
+                }
+
+                sink.start_block(&block);
+                if block["type"] == "text"
+                    && let Some(text) = block["text"].as_str()
+                {
+                    sink.push(text);
+                }
+                self.blocks[index] = block;
+            }
+            "content_block_delta" => {
+                let index = block_index(&event)?;
+                let Some(block) = self.blocks.get_mut(index).filter(|block| block.is_object())
+                else {
+                    bail!("Claude streamed a delta for a block it never started");
+                };
+                let Value::Object(delta) = event["delta"].take() else {
+                    return Ok(());
+                };
+
+                // Each delta's field goes onto the block's field of the same name: `text`,
+                // `thinking`, `signature`, a compaction's `content`... Tool inputs are JSON,
+                // complete only at the block's end
+                let is_text = block["type"] == "text";
+                for (key, value) in delta {
+                    match (key.as_str(), value) {
+                        ("type", _) => {}
+                        ("partial_json", Value::String(json)) => self.inputs[index].push_str(&json),
+                        ("citation", citation) => match &mut block["citations"] {
+                            Value::Array(citations) => citations.push(citation),
+                            other => *other = Value::Array(vec![citation]),
+                        },
+                        (key, Value::String(piece)) => {
+                            if is_text && key == "text" {
+                                sink.push(&piece);
+                            }
+                            match &mut block[key] {
+                                Value::String(field) => field.push_str(&piece),
+                                other => *other = Value::String(piece),
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "content_block_stop" => {
+                let index = block_index(&event)?;
+                if let Some(json) = self.inputs.get_mut(index).filter(|json| !json.is_empty()) {
+                    match serde_json::from_str::<Value>(json) {
+                        Ok(input) => self.blocks[index]["input"] = input,
+                        // Cut off (at `max_tokens`): the call won't run
+                        Err(e) => {
+                            log::warn!("Claude streamed a tool input that couldn't be read: {e}")
+                        }
+                    }
+                    json.clear();
+                }
+                sink.end_block();
+            }
+            "message_delta" => {
+                // The stop reason, and the like
+                if let Value::Object(delta) = event["delta"].take() {
+                    self.message.extend(delta);
+                }
+                // The counts so far, replacing the ones before
+                if let Value::Object(usage) = event["usage"].take() {
+                    let usage = usage.into_iter().filter(|(_, value)| !value.is_null());
+                    match self
+                        .message
+                        .entry("usage")
+                        .or_insert_with(|| Value::Object(Default::default()))
+                    {
+                        Value::Object(total) => total.extend(usage),
+                        other => *other = Value::Object(usage.collect()),
+                    }
+                }
+            }
+            "message_stop" => self.done = true,
+            "error" => return Err(ApiError::from_event(&event["error"]).into()),
+            // `ping`, and event types added later, which the API asks clients to ignore
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn finish(mut self) -> anyhow::Result<ResponseBody> {
+        if !self.done {
+            return Err(StreamEnded.into());
+        }
+
+        let blocks = self.blocks.into_iter().filter(|block| !block.is_null());
+        self.message
+            .insert("content".into(), serde_json::Value::Array(blocks.collect()));
+        serde_json::from_value(serde_json::Value::Object(self.message))
+            .context("Claude sent a response that couldn't be read")
+    }
+}
+
+fn block_index(event: &serde_json::Value) -> anyhow::Result<usize> {
+    event["index"]
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+        .context("Claude streamed a block event without an index")
+}
+
+#[derive(Debug)]
+struct StreamEnded;
+
+impl Display for StreamEnded {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("Claude's response stream ended before the message did")
+    }
+}
+
+impl std::error::Error for StreamEnded {}
+
+/// Whether a response that failed midway is worth asking for again.
+fn retryable_stream_error(error: &anyhow::Error) -> bool {
+    if let Some(error) = error.downcast_ref::<ApiError>() {
+        return error.status.is_server_error()
+            || matches!(
+                error.status,
+                StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+            );
+    }
+    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+        return error.is_body() || error.is_decode() || error.is_timeout();
+    }
+    return error.is::<StreamEnded>();
+}
+
+/// When a model declined midway and a fallback model carried on (a `fallback` block marks
+/// where), drops what the declined model started that can't go back in the history: its
+/// thinking, its tool calls (which never run) and server tool calls without their results. Its
+/// text stays: the fallback model carried on from it.
+fn drop_declined(content: &mut Vec<serde_json::Value>) {
+    let Some(boundary) = content
+        .iter()
+        .rposition(|block| block["type"] == "fallback")
+    else {
+        return;
+    };
+
+    let results = content
+        .iter()
+        .filter(|block| {
+            block["type"]
+                .as_str()
+                .is_some_and(|r#type| r#type.ends_with("_tool_result"))
+        })
+        .filter_map(|block| block["tool_use_id"].as_str())
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+
+    let mut index = 0;
+    content.retain(|block| {
+        let keep = index >= boundary
+            || match block["type"].as_str().unwrap_or_default() {
+                "text" | "fallback" | "compaction" => true,
+                "server_tool_use" | "mcp_tool_use" => {
+                    block["id"].as_str().is_some_and(|id| results.contains(id))
+                }
+                r#type => r#type.ends_with("_tool_result"),
+            };
+        index += 1;
+        keep
+    });
 }
 
 /// 0.5s, 1s, 2s, ... with up to half of it added or taken away at random, so clients that failed
@@ -832,6 +1256,7 @@ fn parse_retry_after(value: &HeaderValue) -> Option<Duration> {
 fn assert_send_is_send(conversation: &mut Conversation) {
     fn is_send<T: Send>(_: &T) {}
     is_send(&conversation.send(String::new()));
+    is_send(&conversation.send_streaming(String::new(), |_| {}));
 }
 
 #[cfg(test)]
@@ -888,9 +1313,13 @@ mod tests {
                     held.push(stream);
                     continue;
                 };
-                let body = body.to_string();
+                // A string is a stream of events (see `sse`)
+                let (content_type, body) = match body {
+                    Value::String(events) => ("text/event-stream", events),
+                    body => ("application/json", body.to_string()),
+                };
                 let response = format!(
-                    "HTTP/1.1 {status} Mock\r\ncontent-type: application/json\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Mock\r\ncontent-type: {content_type}\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
@@ -921,12 +1350,299 @@ mod tests {
             .base_url(url)
             .system("You are a race engineer.")
             .max_retries(2)
-            .tool("lookup", None, json!({"type": "object"}), Lookup(calls.clone()));
+            .tool(
+                "lookup",
+                None,
+                json!({"type": "object"}),
+                Lookup(calls.clone()),
+            );
         builder.build(reqwest::Client::new()).unwrap()
     }
 
     fn message(stop_reason: &str, content: Value) -> (u16, &'static str, Value) {
-        (200, "", json!({"stop_reason": stop_reason, "content": content}))
+        (
+            200,
+            "",
+            json!({"stop_reason": stop_reason, "content": content}),
+        )
+    }
+
+    /// A streamed response: each event as the API sends it, with CRLF line ends.
+    fn sse(events: Vec<Value>) -> (u16, &'static str, Value) {
+        let events = events
+            .into_iter()
+            .map(|event| {
+                format!(
+                    "event: {}\r\ndata: {event}\r\n\r\n",
+                    event["type"].as_str().unwrap()
+                )
+            })
+            .collect::<String>();
+        (200, "", Value::String(events))
+    }
+
+    fn text_delta(index: usize, text: &str) -> Value {
+        json!({"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": text}})
+    }
+
+    fn block_start(index: usize, block: Value) -> Value {
+        json!({"type": "content_block_start", "index": index, "content_block": block})
+    }
+
+    fn block_stop(index: usize) -> Value {
+        json!({"type": "content_block_stop", "index": index})
+    }
+
+    fn message_start(model: &str) -> Value {
+        json!({"type": "message_start", "message": {
+            "model": model, "role": "assistant", "content": [], "stop_reason": null,
+            "usage": {"input_tokens": 10, "cache_creation_input_tokens": null, "cache_read_input_tokens": null, "output_tokens": 1}
+        }})
+    }
+
+    fn message_end(stop_reason: &str, output_tokens: u64) -> [Value; 2] {
+        [
+            json!({"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": null}, "usage": {"output_tokens": output_tokens}}),
+            json!({"type": "message_stop"}),
+        ]
+    }
+
+    async fn send_streaming(
+        conversation: &mut Conversation,
+        text: &str,
+    ) -> (anyhow::Result<Reply>, Vec<String>) {
+        let mut pieces = Vec::new();
+        let reply = timeout(
+            Duration::from_secs(5),
+            conversation.send_streaming(text.into(), |piece| pieces.push(piece.to_owned())),
+        )
+        .await
+        .expect("timed out");
+        (reply, pieces)
+    }
+
+    #[tokio::test]
+    async fn streams_the_text_as_it_comes() {
+        let mut first = vec![
+            message_start("claude-sonnet-5-5"),
+            json!({"type": "ping"}),
+            block_start(
+                0,
+                json!({"type": "thinking", "thinking": "", "signature": ""}),
+            ),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "Need the "}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "gap."}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig"}}),
+            block_stop(0),
+            block_start(1, json!({"type": "text", "text": ""})),
+            text_delta(1, "Checking"),
+            text_delta(1, " the gap."),
+            block_stop(1),
+            block_start(
+                2,
+                json!({"type": "tool_use", "id": "t1", "name": "lookup", "input": {}}),
+            ),
+            json!({"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "{\"what\": "}}),
+            json!({"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "\"gap\"}"}}),
+            block_stop(2),
+        ];
+        first.extend(message_end("tool_use", 20));
+
+        let mut second = vec![
+            message_start("claude-sonnet-5-5"),
+            // Says nothing: left out
+            block_start(0, json!({"type": "text", "text": ""})),
+            text_delta(0, "\n"),
+            block_stop(0),
+            block_start(1, json!({"type": "text", "text": ""})),
+            text_delta(1, " "),
+            text_delta(1, "You are 2.1s"),
+            text_delta(1, " ahead."),
+            block_stop(1),
+        ];
+        second.extend(message_end("end_turn", 7));
+
+        let (url, requests) = mock(vec![sse(first), sse(second)]).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+
+        let (reply, pieces) = send_streaming(&mut conversation, "What is the gap?").await;
+        let reply = reply.unwrap();
+        assert_eq!(reply.stop, StopReason::EndTurn);
+        assert_eq!(reply.text, "Checking the gap.\n\n You are 2.1s ahead.");
+        assert_eq!(pieces.concat(), reply.text);
+        assert_eq!(pieces[0], "Checking");
+        assert_eq!(reply.usage.input_tokens, 20);
+        assert_eq!(reply.usage.output_tokens, 27);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0]["stream"], true);
+        // The streamed turn goes back whole: thinking with its signature, the tool input parsed
+        let turn = &requests[1]["messages"][1]["content"];
+        assert_eq!(turn[0]["thinking"], "Need the gap.");
+        assert_eq!(turn[0]["signature"], "sig");
+        assert_eq!(turn[1]["text"], "Checking the gap.");
+        assert_eq!(turn[2]["input"], json!({"what": "gap"}));
+        assert_eq!(
+            requests[1]["messages"][2]["content"][0]["content"],
+            "looked up \"gap\""
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_streams_that_fail_before_saying_anything() {
+        let (url, requests) = mock(vec![
+            sse(vec![
+                message_start("claude-sonnet-5-5"),
+                json!({"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}),
+            ]),
+            sse({
+                let mut events = vec![
+                    message_start("claude-sonnet-5-5"),
+                    block_start(0, json!({"type": "text", "text": ""})),
+                    text_delta(0, "Box this lap."),
+                    block_stop(0),
+                ];
+                events.extend(message_end("end_turn", 5));
+                events
+            }),
+        ])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+
+        let (reply, pieces) = send_streaming(&mut conversation, "Pit?").await;
+        assert_eq!(reply.unwrap().text, "Box this lap.");
+        assert_eq!(pieces, ["Box this lap."]);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn doesnt_retry_streams_that_fail_midway() {
+        let (url, requests) = mock(vec![sse(vec![
+            message_start("claude-sonnet-5-5"),
+            block_start(0, json!({"type": "text", "text": ""})),
+            text_delta(0, "Box"),
+            json!({"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}),
+        ])])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+
+        let (reply, pieces) = send_streaming(&mut conversation, "Pit?").await;
+        let error = reply.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ApiError>().unwrap().r#type.as_deref(),
+            Some("overloaded_error")
+        );
+        assert_eq!(pieces, ["Box"]);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(conversation.body.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fails_streams_that_end_early() {
+        let (url, _) = mock(vec![
+            sse(vec![message_start("claude-sonnet-5-5")]),
+            sse(vec![message_start("claude-sonnet-5-5")]),
+            sse(vec![message_start("claude-sonnet-5-5")]),
+        ])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+
+        let (reply, _) = send_streaming(&mut conversation, "Pit?").await;
+        assert!(reply.unwrap_err().is::<StreamEnded>());
+    }
+
+    /// Needs `ANTHROPIC_API_KEY`, and spends a few tokens.
+    #[tokio::test]
+    #[ignore]
+    async fn streams_from_the_api() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = ConversationBuilder::new();
+        builder
+            .model("claude-haiku-5-5")
+            .effort("low")
+            .max_tokens(NonZeroU32::new(1024).unwrap())
+            .system("You are a race engineer. Answer in one short sentence.")
+            .tool(
+                "lookup",
+                Some("Looks up live race data, e.g. the gap".into()),
+                json!({"type": "object", "properties": {"what": {"type": "string"}}, "required": ["what"]}),
+                Lookup(calls.clone()),
+            );
+        let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+
+        let mut pieces = Vec::new();
+        let reply = conversation
+            .send_streaming("Look up the gap, then tell me it.".into(), |piece| {
+                pieces.push(piece.to_owned())
+            })
+            .await
+            .unwrap();
+
+        println!("{reply:#?}\n{pieces:?}");
+        assert_eq!(reply.stop, StopReason::EndTurn);
+        assert!(!reply.text.trim().is_empty());
+        assert_eq!(pieces.concat(), reply.text);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(reply.usage.output_tokens > 0);
+    }
+
+    #[tokio::test]
+    async fn carries_on_after_a_midway_fallback() {
+        let mut events = vec![
+            message_start("claude-fable-5-1"),
+            block_start(
+                0,
+                json!({"type": "thinking", "thinking": "", "signature": ""}),
+            ),
+            block_stop(0),
+            block_start(1, json!({"type": "text", "text": ""})),
+            text_delta(1, "You are P3, the gap"),
+            block_stop(1),
+            block_start(
+                2,
+                json!({"type": "tool_use", "id": "t1", "name": "lookup", "input": {}}),
+            ),
+            block_stop(2),
+            block_start(
+                3,
+                json!({"type": "fallback", "from": {"model": "claude-fable-5-1"}, "to": {"model": "claude-opus-5-5"}}),
+            ),
+            block_stop(3),
+            block_start(4, json!({"type": "text", "text": ""})),
+            text_delta(4, " behind is 2s."),
+            block_stop(4),
+        ];
+        events.extend(message_end("end_turn", 9));
+
+        let (url, requests) = mock(vec![
+            sse(events),
+            message("end_turn", json!([{"type": "text", "text": "Copy."}])),
+        ])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+
+        let (reply, _) = send_streaming(&mut conversation, "Gap?").await;
+        let reply = reply.unwrap();
+        // The fallback model carried on mid-sentence
+        assert_eq!(reply.text, "You are P3, the gap behind is 2s.");
+        // The declined model's tool call never runs
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        send(&mut conversation, "Thanks").await.unwrap();
+        let requests = requests.lock().unwrap();
+        let types = requests[1]["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|block| block["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(types, ["text", "fallback", "text"]);
     }
 
     async fn send(conversation: &mut Conversation, text: &str) -> anyhow::Result<Reply> {
@@ -945,7 +1661,10 @@ mod tests {
                     {"type": "tool_use", "id": "t1", "name": "lookup", "input": {"what": "gap"}}
                 ]),
             ),
-            message("end_turn", json!([{"type": "text", "text": "You are 2.1s ahead."}])),
+            message(
+                "end_turn",
+                json!([{"type": "text", "text": "You are 2.1s ahead."}]),
+            ),
         ])
         .await;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -959,7 +1678,10 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests[0]["system"][0]["text"], "You are a race engineer.");
-        assert_eq!(requests[0]["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            requests[0]["system"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
         let result = &requests[1]["messages"][2]["content"][0];
         assert_eq!(result["type"], "tool_result");
         assert_eq!(result["tool_use_id"], "t1");
@@ -1027,7 +1749,10 @@ mod tests {
                 "retry-after: 0\r\n",
                 json!({"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}),
             ),
-            message("end_turn", json!([{"type": "text", "text": "Box this lap."}])),
+            message(
+                "end_turn",
+                json!([{"type": "text", "text": "Box this lap."}]),
+            ),
         ])
         .await;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1155,7 +1880,10 @@ mod tests {
                 "compaction",
                 json!([{"type": "compaction", "content": "Summary of the stint."}]),
             ),
-            message("end_turn", json!([{"type": "text", "text": "P3, holding."}])),
+            message(
+                "end_turn",
+                json!([{"type": "text", "text": "P3, holding."}]),
+            ),
         ])
         .await;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1165,6 +1893,9 @@ mod tests {
         assert_eq!(reply.text, "P3, holding.");
         // The compaction block goes back unchanged
         let requests = requests.lock().unwrap();
-        assert_eq!(requests[1]["messages"][1]["content"][0]["type"], "compaction");
+        assert_eq!(
+            requests[1]["messages"][1]["content"][0]["type"],
+            "compaction"
+        );
     }
 }

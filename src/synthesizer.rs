@@ -10,7 +10,7 @@
 use crate::{
     config::{ArrayStr, RawConfig},
     error,
-    synthesizer::radio::Radio,
+    synthesizer::radio::{Radio, RadioStream},
 };
 use anyhow::{Context, bail};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -23,15 +23,25 @@ use ort::{session::Session, value::Tensor};
 use sdl3::audio::{AudioFormat, AudioSpec, AudioStreamOwner};
 use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     ffi::{CStr, CString, c_int, c_void},
     mem::ManuallyDrop,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
+    task::Poll,
     time::SystemTime,
 };
-use tokio::{runtime::Handle, sync::mpsc::error::SendError};
+use tokio::{
+    runtime::Handle,
+    sync::{
+        mpsc::{
+            self,
+            error::{SendError, TryRecvError},
+        },
+        oneshot, watch,
+    },
+};
 use unicode_normalization::UnicodeNormalization;
 
 mod radio;
@@ -68,37 +78,113 @@ impl Synthesizer {
         lang: ArrayStr<2>,
         text: String,
         effects: Effects,
-    ) -> tokio::sync::oneshot::Receiver<anyhow::Result<Speech>> {
+    ) -> oneshot::Receiver<anyhow::Result<Speech>> {
+        let (output, recv) = oneshot::channel();
+        self.inner(rt, lang).send(Job::Speech {
+            text,
+            effects,
+            output,
+        });
+        return recv;
+    }
+
+    /// Speaks text as it comes in, a sentence at a time: each one is synthesized as soon as
+    /// it's complete, and comes out of the [`SpeechOutput`] while the next is still being
+    /// written. The transmission ends when the [`SpeechInput`] is dropped, and stops early when
+    /// the [`SpeechOutput`] is.
+    pub fn stream(
+        &mut self,
+        rt: &Handle,
+        lang: ArrayStr<2>,
+        effects: Effects,
+    ) -> (SpeechInput, SpeechOutput) {
+        let (input, text) = mpsc::unbounded_channel();
+        let (output, recv) = mpsc::unbounded_channel();
+        self.inner(rt, lang).send(Job::Stream {
+            text,
+            effects,
+            output,
+        });
+        return (SpeechInput(input), SpeechOutput(recv));
+    }
+
+    fn inner(&mut self, rt: &Handle, lang: ArrayStr<2>) -> &SynthesizerInner {
         self.inner
             .entry(lang)
             .or_insert_with(|| SynthesizerInner::new(rt.clone()))
-            .synthesize(text, effects)
+    }
+}
+
+/// The text of a [`Synthesizer::stream`]: dropping it ends the transmission.
+pub struct SpeechInput(mpsc::UnboundedSender<String>);
+
+impl SpeechInput {
+    #[inline]
+    pub fn push(&self, text: impl Into<String>) {
+        // Nobody's listening any more: nothing to do
+        let _ = self.0.send(text.into());
+    }
+}
+
+/// The speech of a [`Synthesizer::stream`], a sentence or so at a time: dropping it stops the
+/// synthesis.
+pub struct SpeechOutput(mpsc::UnboundedReceiver<anyhow::Result<Speech>>);
+
+impl SpeechOutput {
+    /// The next piece of speech if it's ready, or `Ready(None)` once the transmission is over
+    /// (an error ends it too).
+    pub fn try_next(&mut self) -> Poll<Option<anyhow::Result<Speech>>> {
+        match self.0.try_recv() {
+            Ok(speech) => Poll::Ready(Some(speech)),
+            Err(TryRecvError::Empty) => Poll::Pending,
+            Err(TryRecvError::Disconnected) => Poll::Ready(None),
+        }
+    }
+}
+
+enum Job {
+    Speech {
+        text: String,
+        effects: Effects,
+        output: oneshot::Sender<anyhow::Result<Speech>>,
+    },
+    Stream {
+        text: mpsc::UnboundedReceiver<String>,
+        effects: Effects,
+        output: mpsc::UnboundedSender<anyhow::Result<Speech>>,
+    },
+}
+
+impl Job {
+    fn fail(self, error: anyhow::Error) {
+        match self {
+            Job::Speech { output, .. } => {
+                let _ = output.send(Err(error));
+            }
+            Job::Stream { output, .. } => {
+                let _ = output.send(Err(error));
+            }
+        }
     }
 }
 
 pub struct SynthesizerInner {
     handle: ManuallyDrop<std::thread::JoinHandle<()>>,
-    model: ManuallyDrop<tokio::sync::watch::Sender<Option<Utf8PathBuf>>>,
-    synths: ManuallyDrop<
-        tokio::sync::mpsc::UnboundedSender<(
-            String,
-            Effects,
-            tokio::sync::oneshot::Sender<anyhow::Result<Speech>>,
-        )>,
-    >,
+    model: ManuallyDrop<watch::Sender<Option<Utf8PathBuf>>>,
+    jobs: ManuallyDrop<mpsc::UnboundedSender<Job>>,
 }
 
 impl SynthesizerInner {
     pub fn new(rt: Handle) -> Self {
         let threads = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
-        let (model_send, model_recv) = tokio::sync::watch::channel(None);
-        let (synths_send, synths_recv) = tokio::sync::mpsc::unbounded_channel();
-        let handle = std::thread::spawn(move || Self::worker(rt, model_recv, synths_recv, threads));
+        let (model_send, model_recv) = watch::channel(None);
+        let (jobs_send, jobs_recv) = mpsc::unbounded_channel();
+        let handle = std::thread::spawn(move || Self::worker(rt, model_recv, jobs_recv, threads));
 
         Self {
             handle: ManuallyDrop::new(handle),
             model: ManuallyDrop::new(model_send),
-            synths: ManuallyDrop::new(synths_send),
+            jobs: ManuallyDrop::new(jobs_send),
         }
     }
 
@@ -106,55 +192,78 @@ impl SynthesizerInner {
         let _ = self.model.send(model);
     }
 
-    fn synthesize(
-        &self,
-        text: String,
-        effects: Effects,
-    ) -> tokio::sync::oneshot::Receiver<anyhow::Result<Speech>> {
-        let (send, recv) = tokio::sync::oneshot::channel();
-        if let Err(SendError((_, _, send))) = self.synths.send((text, effects, send)) {
-            let _ = send.send(Err(anyhow::Error::msg("channel closed")));
+    fn send(&self, job: Job) {
+        if let Err(SendError(job)) = self.jobs.send(job) {
+            job.fail(anyhow::Error::msg("channel closed"));
         }
-        return recv;
     }
 
     fn worker(
         handle: Handle,
-        mut model: tokio::sync::watch::Receiver<Option<Utf8PathBuf>>,
-        mut synths: tokio::sync::mpsc::UnboundedReceiver<(
-            String,
-            Effects,
-            tokio::sync::oneshot::Sender<anyhow::Result<Speech>>,
-        )>,
+        mut model: watch::Receiver<Option<Utf8PathBuf>>,
+        mut jobs: mpsc::UnboundedReceiver<Job>,
         threads: NonZeroUsize,
     ) {
-        let mut voice = None;
+        let mut voice = None::<Voice>;
+        // The transmission being spoken: one at a time, the others wait their turn
+        let mut stream = None::<Stream>;
+        let mut waiting = VecDeque::<Job>::new();
 
-        enum Task {
+        enum Event {
             Model,
-            Speech {
-                text: String,
-                effects: Effects,
-                output: tokio::sync::oneshot::Sender<anyhow::Result<Speech>>,
-            },
+            Job(Job),
+            Text(Option<String>),
+            Stopped,
         }
 
         loop {
-            let task = handle.block_on(async {
+            match &mut stream {
+                Some(active) => match active.step(voice.as_mut()) {
+                    Step::Spoke => continue,
+                    Step::Done => {
+                        stream = None;
+                        continue;
+                    }
+                    Step::Waiting => {}
+                },
+                None => {
+                    if let Some(job) = waiting.pop_front() {
+                        stream = Stream::start(job, voice.as_ref());
+                        continue;
+                    }
+                }
+            }
+
+            // Waits for a voice, a job, or the transmission's text (or whoever plays it leaving)
+            let (text, output) = match &mut stream {
+                Some(Stream { text, output, .. }) => (Some(text), Some(&*output)),
+                None => (None, None),
+            };
+            let event = handle.block_on(async {
                 tokio::select! {
-                    res = model.changed() => return match res {
-                        Ok(()) => Some(Task::Model),
-                        Err(_) => None
-                    },
-                    res = synths.recv() => return match res {
-                        Some((text, effects, output)) => Some(Task::Speech { text, effects, output }),
-                        None => None
-                    },
+                    // A voice first, for the jobs sent after it
+                    biased;
+                    res = model.changed() => res.ok().map(|()| Event::Model),
+                    job = jobs.recv() => job.map(Event::Job),
+                    text = async {
+                        match text {
+                            Some(text) => text.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => Some(Event::Text(text)),
+                    () = async {
+                        match output {
+                            Some(output) => output.closed().await,
+                            None => std::future::pending().await,
+                        }
+                    } => Some(Event::Stopped),
                 }
             });
 
-            match task {
-                Some(Task::Model) => {
+            match event {
+                Some(Event::Model) => {
+                    // Its speech so far was in the old voice
+                    stream = None;
                     let model = model.borrow();
                     match &*model {
                         Some(model) => match Voice::load(model, threads) {
@@ -164,32 +273,179 @@ impl SynthesizerInner {
                         None => return,
                     }
                 }
-                Some(Task::Speech {
+                Some(Event::Job(Job::Speech {
                     text,
                     effects,
                     output,
-                }) => {
+                })) => {
                     if let Some(ref mut voice) = voice {
                         if !output.is_closed() {
                             let _ = output.send(voice.synthesize(&text, effects));
                         }
                     } else {
-                        let _ = output.send(Err(anyhow::Error::msg(
-                            "No text to speech model loaded yet",
-                        )));
+                        let _ = output.send(Err(no_model()));
                     };
                 }
+                Some(Event::Job(job @ Job::Stream { .. })) => waiting.push_back(job),
+                Some(Event::Text(text)) => {
+                    if let Some(active) = &mut stream {
+                        match text {
+                            Some(text) => active.pending.push_str(&text),
+                            None => active.ended = true,
+                        }
+                    }
+                }
+                Some(Event::Stopped) => stream = None,
                 None => return,
             }
         }
     }
 }
 
+fn no_model() -> anyhow::Error {
+    anyhow::Error::msg("No text to speech model loaded yet")
+}
+
+/// A [`Synthesizer::stream`] being spoken.
+struct Stream {
+    transmission: Transmission,
+    text: mpsc::UnboundedReceiver<String>,
+    output: mpsc::UnboundedSender<anyhow::Result<Speech>>,
+    /// Text that came in and hasn't been said: an unfinished sentence
+    pending: String,
+    /// All the text came in
+    ended: bool,
+}
+
+enum Step {
+    Spoke,
+    Waiting,
+    Done,
+}
+
+impl Stream {
+    fn start(job: Job, voice: Option<&Voice>) -> Option<Self> {
+        let Job::Stream {
+            text,
+            effects,
+            output,
+        } = job
+        else {
+            unreachable!("only streams wait their turn");
+        };
+
+        let Some(voice) = voice else {
+            let _ = output.send(Err(no_model()));
+            return None;
+        };
+
+        Some(Self {
+            transmission: voice.transmission(effects),
+            text,
+            output,
+            pending: String::new(),
+            ended: false,
+        })
+    }
+
+    /// Says the next complete sentence, or the end of the transmission once its text is over.
+    fn step(&mut self, voice: Option<&mut Voice>) -> Step {
+        if self.output.is_closed() {
+            return Step::Done;
+        }
+
+        loop {
+            match self.text.try_recv() {
+                Ok(text) => self.pending.push_str(&text),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.ended = true;
+                    break;
+                }
+            }
+        }
+
+        let Some(voice) = voice else {
+            let _ = self.output.send(Err(no_model()));
+            return Step::Done;
+        };
+
+        // A sentence at a time even once all the text is in, so the first is heard sooner
+        let len = match sentence_len(&self.pending) {
+            Some(len) => len,
+            None if self.ended => self.pending.len(),
+            None => 0,
+        };
+
+        let (samples, last) = match len {
+            0 if self.ended => (Ok(voice.end(&mut self.transmission)), true),
+            0 => return Step::Waiting,
+            len => {
+                let sentence = self.pending.drain(..len).collect::<String>();
+                (voice.speak(&mut self.transmission, &sentence), false)
+            }
+        };
+
+        let (result, last) = match samples {
+            Ok(samples) if samples.is_empty() => (None, last),
+            Ok(samples) => (
+                Some(Ok(Speech {
+                    samples,
+                    sample_rate: voice.sample_rate(),
+                })),
+                last,
+            ),
+            Err(e) => (Some(Err(e)), true),
+        };
+
+        if let Some(result) = result
+            && self.output.send(result).is_err()
+        {
+            return Step::Done;
+        }
+
+        return match last {
+            true => Step::Done,
+            false => Step::Spoke,
+        };
+    }
+}
+
+/// How much of `text` to say now: up to the end of its first sentence (its punctuation, then a
+/// space) or line. `None` while the first sentence is still being written.
+fn sentence_len(text: &str) -> Option<usize> {
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        let mut end = i + c.len_utf8();
+        match c {
+            // No space after these
+            '\n' | '。' | '？' | '！' => return Some(end),
+            '.' | '?' | '!' | '…' => {
+                // Past closing quotes and brackets
+                while let Some(&(j, q)) = chars.peek()
+                    && matches!(q, '"' | '\'' | ')' | ']' | '”' | '’' | '»')
+                {
+                    end = j + q.len_utf8();
+                    chars.next();
+                }
+
+                // Not "3.5", nor a sentence that may still be going
+                if chars.peek().is_some_and(|&(_, next)| next.is_whitespace()) {
+                    return Some(end);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    return None;
+}
+
 impl Drop for SynthesizerInner {
     fn drop(&mut self) {
         let handle = unsafe { ManuallyDrop::take(&mut self.handle) };
         unsafe { ManuallyDrop::drop(&mut self.model) };
-        unsafe { ManuallyDrop::drop(&mut self.synths) };
+        unsafe { ManuallyDrop::drop(&mut self.jobs) };
         if tokio::task::block_in_place(|| handle.join()).is_err() {
             log::error!("The speech synthesis thread panicked");
         }
@@ -291,14 +547,39 @@ impl Voice {
     /// the squelch opens, the voice plays through the radio effect, then the roger beep (mixed
     /// in clean) and the squelch closes.
     pub fn synthesize(&mut self, text: &str, effects: Effects) -> anyhow::Result<Speech> {
+        let mut transmission = self.transmission(effects);
+        let mut samples = self.speak(&mut transmission, text)?;
+        samples.extend(self.end(&mut transmission));
+        return Ok(Speech {
+            samples,
+            sample_rate: self.sample_rate,
+        });
+    }
+
+    /// A transmission to [`Self::speak`] on a piece at a time, as its text comes in.
+    pub fn transmission(&self, effects: Effects) -> Transmission {
+        Transmission {
+            radio: self.radio.stream(self.sample_rate as f32, effects.radio),
+            effects,
+            open: false,
+        }
+    }
+
+    /// The next of the transmission's sentences, as mono PCM at [`Self::sample_rate`]: the
+    /// first opens the squelch. Nothing if they say nothing.
+    pub fn speak(
+        &mut self,
+        transmission: &mut Transmission,
+        text: &str,
+    ) -> anyhow::Result<Vec<f32>> {
         let sentences = phonemize(text, &self.espeak_voice)?;
-        let sample_rate = self.sample_rate as f32;
-        let silence = (sample_rate * SENTENCE_SILENCE) as usize;
+        let silence = (self.sample_rate as f32 * SENTENCE_SILENCE) as usize;
         let mut voice = Vec::<f32>::new();
 
         for phonemes in sentences {
             let ids = self.phoneme_ids(&phonemes);
-            if !voice.is_empty() {
+            // After the sentence before, even if it was in an earlier piece
+            if transmission.open || !voice.is_empty() {
                 voice.resize(voice.len() + silence, 0.0);
             }
 
@@ -307,34 +588,43 @@ impl Voice {
             normalize(&mut voice[start..]);
         }
 
-        // Leave room after the voice for the beep, so it plays before the squelch closes
-        let beep_at = match effects.beep_volume > 0.0 && !voice.is_empty() {
-            true => {
-                let at = voice.len() + (sample_rate * BEEP_GAP) as usize;
-                voice.resize(at + self.beep.len(), 0.0);
-                Some(at)
-            }
-            false => None,
+        if voice.is_empty() {
+            return Ok(voice);
+        }
+
+        let mut samples = match std::mem::replace(&mut transmission.open, true) {
+            true => Vec::new(),
+            false => transmission.radio.open(),
+        };
+        samples.extend(transmission.radio.voice(&voice));
+        clip(&mut samples);
+        return Ok(samples);
+    }
+
+    /// The end of the transmission: the roger beep and the squelch closing. Nothing if it
+    /// never said anything.
+    pub fn end(&self, transmission: &mut Transmission) -> Vec<f32> {
+        if !std::mem::take(&mut transmission.open) {
+            return Vec::new();
+        }
+
+        let Effects { beep_volume, .. } = transmission.effects;
+        let beep_at = (self.sample_rate as f32 * BEEP_GAP) as usize;
+        let tail = match beep_volume > 0.0 {
+            true => beep_at + self.beep.len(),
+            false => 0,
         };
 
-        let mut samples = self.radio.apply(&voice, sample_rate, effects.radio, true);
-
-        if let Some(at) = beep_at {
-            let at = at + self.radio.src_offset(sample_rate, effects.radio, true);
-            for (sample, &beep) in samples[at..].iter_mut().zip(&self.beep) {
-                *sample += effects.beep_volume * beep;
+        // The beep is mixed in clean, over the radio's hiss, before the squelch closes
+        let mut samples = transmission.radio.voice(&vec![0.0; tail]);
+        if beep_volume > 0.0 {
+            for (sample, &beep) in samples[beep_at..].iter_mut().zip(&self.beep) {
+                *sample += beep_volume * beep;
             }
         }
-
-        // The radio's hiss and the beep can push peaks past full scale
-        for sample in &mut samples {
-            *sample = sample.clamp(-1.0, 1.0);
-        }
-
-        return Ok(Speech {
-            samples,
-            sample_rate: self.sample_rate,
-        });
+        samples.extend(transmission.radio.close());
+        clip(&mut samples);
+        return samples;
     }
 
     /// Converts phonemes to IDs the way piper-phonemize does: BOS, then every phoneme followed
@@ -379,6 +669,22 @@ impl Voice {
     }
 }
 
+/// Speech synthesized as its text comes in: the squelch opens with the first sentence and closes,
+/// with the roger beep, at the end.
+pub struct Transmission {
+    radio: RadioStream,
+    effects: Effects,
+    /// Something was said
+    open: bool,
+}
+
+/// The radio's hiss and the beep can push peaks past full scale.
+fn clip(samples: &mut [f32]) {
+    for sample in samples {
+        *sample = sample.clamp(-1.0, 1.0);
+    }
+}
+
 /// Synthesized mono audio.
 pub struct Speech {
     pub samples: Vec<f32>,
@@ -397,9 +703,19 @@ impl Speech {
 
     /// Starts playing on `device`. Dropping the returned stream stops playback.
     pub fn play(&self, device: &sdl3::audio::AudioDevice) -> Result<AudioStreamOwner, sdl3::Error> {
+        let stream = self.start(device)?;
+        stream.flush()?;
+        return Ok(stream);
+    }
+
+    /// Starts playing on `device`, with more to come: put it on the returned stream, and flush
+    /// it after the last. Dropping the stream stops playback.
+    pub fn start(
+        &self,
+        device: &sdl3::audio::AudioDevice,
+    ) -> Result<AudioStreamOwner, sdl3::Error> {
         let stream = device.clone().open_device_stream(Some(&self.spec()))?;
         stream.put_data_f32(&self.samples)?;
-        stream.flush()?;
         stream.resume()?;
         return Ok(stream);
     }
@@ -676,5 +992,79 @@ mod tests {
         assert!(sentences[0].contains(", ") && sentences[0].ends_with('.'));
         assert!(sentences[1].contains("; ") && sentences[1].ends_with('!'));
         assert!(sentences[2].ends_with('?'));
+    }
+
+    #[test]
+    fn says_sentences_once_theyre_complete() {
+        assert_eq!(sentence_len("You are P3"), None);
+        assert_eq!(sentence_len("It's 3.5 seconds"), None);
+        // Could still be going ("lap...")
+        assert_eq!(sentence_len("Box this lap."), None);
+        assert_eq!(sentence_len("Box this lap. Tyres"), Some(13));
+        assert_eq!(sentence_len("He said \"go!\" Then"), Some(13));
+        assert_eq!(sentence_len("Copy\nNext"), Some(5));
+        assert_eq!(sentence_len("好。下"), Some("好。".len()));
+    }
+
+    async fn next(output: &mut SpeechOutput) -> Option<anyhow::Result<Speech>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if let Poll::Ready(speech) = output.try_next() {
+                return speech;
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Needs a Piper voice: `LAMBIASE_VOICE` is the path to its `.onnx`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn speaks_a_sentence_at_a_time() {
+        let model = std::env::var("LAMBIASE_VOICE").expect("LAMBIASE_VOICE isn't set");
+        let rt = Handle::current();
+        let inner = SynthesizerInner::new(rt.clone());
+        inner.set_model(Some(model.into()));
+        let mut synth = Synthesizer {
+            inner: BTreeMap::from([(crate::arrstr!("en"), inner)]),
+        };
+
+        let effects = Effects {
+            radio: 0.65,
+            beep_volume: 1.0,
+        };
+        let (input, mut output) = synth.stream(&rt, crate::arrstr!("en"), effects);
+
+        // The first sentence is said while the next is still coming
+        input.push("Copy. You're P3, the gap");
+        let first = next(&mut output).await.unwrap().unwrap();
+        assert!(!first.samples.is_empty());
+
+        input.push(" behind is 2.1 seconds. Box");
+        input.push(" this lap.");
+        drop(input);
+
+        let mut pieces = vec![first];
+        while let Some(speech) = next(&mut output).await {
+            pieces.push(speech.unwrap());
+        }
+
+        // The other two sentences, then the beep and the squelch closing
+        assert_eq!(pieces.len(), 4);
+        let samples = pieces.iter().flat_map(|piece| &piece.samples);
+        assert!(samples.clone().all(|sample| sample.abs() <= 1.0));
+        let seconds = samples.count() as f32 / pieces[0].sample_rate as f32;
+        assert!((2.0..10.0).contains(&seconds), "{seconds}s");
+
+        // Stopping a transmission midway frees the voice for the next
+        let (input, output) = synth.stream(&rt, crate::arrstr!("en"), effects);
+        input.push("Box");
+        drop(output);
+        let speech = synth.synthesize(&rt, crate::arrstr!("en"), "Copy.".into(), effects);
+        let speech = tokio::time::timeout(std::time::Duration::from_secs(60), speech)
+            .await
+            .expect("timed out");
+        assert!(!speech.unwrap().unwrap().samples.is_empty());
+        drop(input);
     }
 }

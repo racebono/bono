@@ -1,6 +1,6 @@
 //! The race engineer: what the pilot says on the radio (transcribed) goes to Claude, which answers
 //! from the running simulator's telemetry with the `engineer` tool, and the answer is spoken back
-//! over the radio.
+//! over the radio as Claude writes it.
 
 use crate::{
     arrstr,
@@ -11,14 +11,14 @@ use crate::{
     config::{ArrayStr, Config},
     sim::Sim,
     sqlite::pool::Pool,
-    synthesizer::{Speech, Synthesizer},
+    synthesizer::{SpeechInput, SpeechOutput, Synthesizer},
     task::Task,
 };
 use sdl3::audio::{AudioDevice, AudioStreamOwner};
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, task::Poll};
 use tokio::{
     runtime::Handle,
-    sync::{Mutex, oneshot},
+    sync::{Mutex, mpsc},
 };
 
 /// Said when there's no telemetry to answer from.
@@ -53,12 +53,30 @@ pub struct Engineer {
     session: Option<Session>,
     /// A new session was asked for: the next question starts one
     new_session: bool,
-    /// The question being answered, and the language to answer in
-    turn: Option<(Task<anyhow::Result<Reply>>, ArrayStr<2>)>,
-    /// The answer being synthesized
-    speech: Option<oneshot::Receiver<anyhow::Result<Speech>>>,
-    /// The answer being played: dropping it stops it
-    playback: Option<AudioStreamOwner>,
+    /// The question being answered
+    turn: Option<Turn>,
+    /// The answer being spoken
+    playback: Option<Playback>,
+}
+
+/// A question being answered.
+struct Turn {
+    task: Task<anyhow::Result<Reply>>,
+    /// The language it's answered in
+    lang: ArrayStr<2>,
+    /// The answer as Claude writes it, for the chat
+    text: mpsc::UnboundedReceiver<String>,
+    /// The chat entry it's written into, once it says something
+    entry: Option<usize>,
+}
+
+/// Speech played as it's synthesized.
+struct Playback {
+    speech: SpeechOutput,
+    /// Opened with the first piece of speech. Dropping it stops playback
+    stream: Option<AudioStreamOwner>,
+    /// All the speech is on the stream
+    done: bool,
 }
 
 struct Session {
@@ -84,7 +102,6 @@ impl Engineer {
             session: None,
             new_session: false,
             turn: None,
-            speech: None,
             playback: None,
         }
     }
@@ -98,7 +115,7 @@ impl Engineer {
     /// Whether a question is being answered.
     #[inline]
     pub fn is_thinking(&self) -> bool {
-        self.turn.is_some() || self.speech.is_some()
+        self.turn.is_some()
     }
 
     /// Starts a new conversation with the next question: the engineer forgets what was said.
@@ -123,8 +140,8 @@ impl Engineer {
     }
 
     /// The pilot asked something on the radio: it's sent to Claude, with the running simulator's
-    /// telemetry. An answer still on its way, or being spoken, is dropped: the pilot talked over
-    /// it.
+    /// telemetry, and the answer is spoken as Claude writes it. An answer still on its way, or
+    /// being spoken, is dropped: the pilot talked over it.
     pub fn ask(
         &mut self,
         rt: &Handle,
@@ -144,7 +161,7 @@ impl Engineer {
 
         let Some(pool) = sim.and_then(|sim| sim.database()).cloned() else {
             self.reply(NO_TELEMETRY.into(), Some("no telemetry".into()));
-            self.say(rt, config, synth, NO_TELEMETRY.into(), arrstr!("en"));
+            self.say(rt, config, synth, NO_TELEMETRY, arrstr!("en"));
             return;
         };
 
@@ -165,14 +182,31 @@ impl Engineer {
         };
         let state = session.state.clone();
         let auto_session = config.get().auto_session;
-        let turn = Task::spawn(async move {
+
+        // What Claude writes goes straight to the synthesizer, and to the chat
+        let (lang, speech) = self.speak(rt, config, synth, lang);
+        let (chat, text) = mpsc::unbounded_channel();
+        let task = Task::spawn(async move {
             let mut state = state.lock().await;
             if auto_session {
                 state.follow_game_session().await;
             }
-            state.conversation.send(question).await
+            state
+                .conversation
+                .send_streaming(question, |text| {
+                    speech.push(text);
+                    let _ = chat.send(text.to_owned());
+                })
+                .await
+            // The speech's text ends here, with the turn
         });
-        self.turn = Some((turn, lang));
+
+        self.turn = Some(Turn {
+            task,
+            lang,
+            text,
+            entry: None,
+        });
     }
 
     /// Called every frame: answers come in, are synthesized and played. `sim_running`: whether a
@@ -192,55 +226,48 @@ impl Engineer {
             self.notice("The simulator stopped: the session ended");
         }
 
-        if let Some((turn, lang)) = &mut self.turn
-            && let Some(result) = turn.update(rt)
-        {
-            let lang = *lang;
-            self.turn = None;
-            match result {
-                Ok(reply) => self.answer(rt, config, synth, reply, lang),
-                Err(e) => self.notice(format!("Error asking the race engineer: {e:#}")),
+        if let Some(turn) = &mut self.turn {
+            // The answer so far
+            while let Ok(text) = turn.text.try_recv() {
+                match turn.entry {
+                    Some(entry) => self.chat[entry].text.push_str(&text),
+                    None => {
+                        turn.entry = Some(self.chat.len());
+                        self.chat.push(ChatEntry {
+                            speaker: Speaker::Engineer,
+                            text,
+                            detail: None,
+                        });
+                    }
+                }
+            }
+
+            if let Some(result) = turn.task.update(rt)
+                && let Some(turn) = self.turn.take()
+            {
+                match result {
+                    Ok(reply) => self.answer(rt, config, synth, reply, turn),
+                    Err(e) => {
+                        if let Some(entry) = turn.entry {
+                            self.chat[entry].detail = Some("cut off".into());
+                        }
+                        self.notice(format!("Error asking the race engineer: {e:#}"));
+                    }
+                }
             }
         }
 
-        if let Some(speech) = &mut self.speech {
-            match speech.try_recv() {
-                Ok(Ok(mut speech)) => {
-                    self.speech = None;
-                    let gain = {
-                        let config = config.get();
-                        config.master_volume * config.engineer_volume
-                    };
-                    for sample in &mut speech.samples {
-                        *sample *= gain;
-                    }
-
-                    match speaker {
-                        Some(speaker) => match speech.play(speaker) {
-                            Ok(stream) => self.playback = Some(stream),
-                            Err(e) => self.notice(format!("Error playing the answer: {e}")),
-                        },
-                        None => self.notice("No speaker selected: the answer isn't played"),
-                    }
-                }
-                Ok(Err(e)) => {
-                    self.speech = None;
-                    self.notice(format!("Error synthesizing the answer: {e:#}"));
-                }
-                Err(oneshot::error::TryRecvError::Empty) => {}
-                Err(oneshot::error::TryRecvError::Closed) => self.speech = None,
-            }
-        }
-
-        // Once SDL has played all of it, the stream can go
-        if let Some(stream) = &self.playback
-            && stream.queued_bytes().is_ok_and(|queued| queued == 0)
-        {
-            self.playback = None;
-        }
+        self.play(config, speaker);
     }
 
-    fn answer(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer, reply: Reply, lang: ArrayStr<2>) {
+    fn answer(
+        &mut self,
+        rt: &Handle,
+        config: &Config,
+        synth: &mut Synthesizer,
+        reply: Reply,
+        turn: Turn,
+    ) {
         log::info!(
             "Engineer ({}, {:?}; {} in, {} cached, {} out): {}",
             reply.model,
@@ -251,17 +278,6 @@ impl Engineer {
             reply.text
         );
 
-        let text = match reply.stop {
-            // The exchange was forgotten: the pilot can ask again
-            StopReason::Refusal => SAY_AGAIN.to_owned(),
-            // Every later question would end the same way: the next one starts over
-            StopReason::ContextWindowExceeded => {
-                self.new_session = true;
-                reply.text
-            }
-            StopReason::EndTurn | StopReason::StopSequence | StopReason::MaxTokens => reply.text,
-        };
-
         let usage = &reply.usage;
         let mut detail = format!(
             "{} | {} in, {} cached, {} out",
@@ -270,21 +286,59 @@ impl Engineer {
             usage.cache_read_input_tokens,
             usage.output_tokens
         );
-        match reply.stop {
-            StopReason::Refusal => detail.push_str(" | declined"),
-            StopReason::MaxTokens => detail.push_str(" | cut off"),
-            StopReason::ContextWindowExceeded => detail.push_str(" | conversation full, starting over"),
-            StopReason::EndTurn | StopReason::StopSequence => {}
-        }
 
-        if !text.trim().is_empty() {
-            self.reply(text.clone(), Some(detail));
-            self.say(rt, config, synth, text, lang);
+        let text = match reply.stop {
+            // The exchange was forgotten, and whatever was said with it: the pilot can ask again
+            StopReason::Refusal => {
+                detail.push_str(" | declined");
+                self.say(rt, config, synth, SAY_AGAIN, turn.lang);
+                SAY_AGAIN.to_owned()
+            }
+            StopReason::MaxTokens => {
+                detail.push_str(" | cut off");
+                reply.text
+            }
+            // Every later question would end the same way: the next one starts over
+            StopReason::ContextWindowExceeded => {
+                self.new_session = true;
+                detail.push_str(" | conversation full, starting over");
+                reply.text
+            }
+            StopReason::EndTurn | StopReason::StopSequence => reply.text,
+        };
+
+        match turn.entry {
+            Some(entry) => {
+                self.chat[entry].text = text;
+                self.chat[entry].detail = Some(detail);
+            }
+            None if !text.trim().is_empty() => self.reply(text, Some(detail)),
+            None => {}
         }
     }
 
     /// Speaks `text` in `lang`, or in English without a voice for it.
-    fn say(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer, text: String, lang: ArrayStr<2>) {
+    fn say(
+        &mut self,
+        rt: &Handle,
+        config: &Config,
+        synth: &mut Synthesizer,
+        text: &str,
+        lang: ArrayStr<2>,
+    ) {
+        let (_, speech) = self.speak(rt, config, synth, lang);
+        speech.push(text);
+    }
+
+    /// Starts speaking what's pushed on the returned input (in `lang`, or in English without a
+    /// voice for it, as returned), cutting off whatever was being said.
+    fn speak(
+        &mut self,
+        rt: &Handle,
+        config: &Config,
+        synth: &mut Synthesizer,
+        lang: ArrayStr<2>,
+    ) -> (ArrayStr<2>, SpeechInput) {
         let (lang, effects) = {
             let config = config.get();
             let lang = match config.voices().contains_key(&lang) {
@@ -293,15 +347,89 @@ impl Engineer {
             };
             (lang, config.synth_effects())
         };
-        self.speech = Some(synth.synthesize(rt, lang, text, effects));
+
+        let (input, speech) = synth.stream(rt, lang, effects);
+        self.playback = Some(Playback {
+            speech,
+            stream: None,
+            done: false,
+        });
+        (lang, input)
+    }
+
+    /// Plays the speech synthesized so far.
+    fn play(&mut self, config: &Config, speaker: Option<&AudioDevice>) {
+        let Some(playback) = &mut self.playback else {
+            return;
+        };
+
+        while !playback.done {
+            let mut speech = match playback.speech.try_next() {
+                Poll::Pending => break,
+                Poll::Ready(Some(Ok(speech))) => speech,
+                Poll::Ready(Some(Err(e))) => {
+                    self.playback = None;
+                    self.notice(format!("Error synthesizing the answer: {e:#}"));
+                    return;
+                }
+                // SDL plays what's left
+                Poll::Ready(None) => {
+                    playback.done = true;
+                    if let Some(stream) = &playback.stream
+                        && let Err(e) = stream.flush()
+                    {
+                        log::warn!("Error flushing the answer's audio: {e}");
+                    }
+                    break;
+                }
+            };
+
+            let gain = {
+                let config = config.get();
+                config.master_volume * config.engineer_volume
+            };
+            for sample in &mut speech.samples {
+                *sample *= gain;
+            }
+
+            let played = match (&playback.stream, speaker) {
+                (Some(stream), _) => stream.put_data_f32(&speech.samples),
+                (None, Some(speaker)) => speech.start(speaker).map(|stream| {
+                    playback.stream = Some(stream);
+                }),
+                (None, None) => {
+                    self.playback = None;
+                    self.notice("No speaker selected: the answer isn't played");
+                    return;
+                }
+            };
+
+            if let Err(e) = played {
+                self.playback = None;
+                self.notice(format!("Error playing the answer: {e}"));
+                return;
+            }
+        }
+
+        // Once SDL has played all of it, the stream can go
+        if playback.done
+            && playback
+                .stream
+                .as_ref()
+                .is_none_or(|stream| stream.queued_bytes().is_ok_and(|queued| queued == 0))
+        {
+            self.playback = None;
+        }
     }
 
     /// Drops the answer on its way and stops the one being spoken.
     fn stop(&mut self) {
-        if self.turn.take().is_some() {
+        if let Some(turn) = self.turn.take() {
+            if let Some(entry) = turn.entry {
+                self.chat[entry].detail = Some("cut off".into());
+            }
             self.notice("Cancelled: the pilot talked over it");
         }
-        self.speech = None;
         self.playback = None;
     }
 
@@ -448,11 +576,17 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             state.follow_game_session().await;
         }
-        assert_eq!(state.game_session.as_deref(), Some("Circuit de la Sarthe|practice|1"));
+        assert_eq!(
+            state.game_session.as_deref(),
+            Some("Circuit de la Sarthe|practice|1")
+        );
 
         recorder.push_scoring(session("race", 1), Vec::new());
         drop(recorder);
         state.follow_game_session().await;
-        assert_eq!(state.game_session.as_deref(), Some("Circuit de la Sarthe|race|1"));
+        assert_eq!(
+            state.game_session.as_deref(),
+            Some("Circuit de la Sarthe|race|1")
+        );
     }
 }
