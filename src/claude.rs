@@ -7,12 +7,15 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     env::VarError,
     fmt::{self, Display, Formatter},
     num::NonZeroU32,
+    ops::AddAssign,
     time::{Duration, SystemTime},
 };
 
+pub mod engineer;
 mod tool_handler;
 
 pub struct Conversation {
@@ -24,6 +27,8 @@ pub struct Conversation {
     max_retries: u32,
     max_requests: NonZeroU32,
     tools: Tools,
+    /// Every request's tokens, by the model that answered it
+    usage: BTreeMap<String, Usage>,
 }
 
 /// What Claude answered to one `Conversation::send`.
@@ -33,6 +38,33 @@ pub struct Reply {
     /// calls and the rest after), separated by blank lines.
     pub text: String,
     pub stop: StopReason,
+    /// The tokens of every request the turn took.
+    pub usage: Usage,
+    /// The model that wrote the turn's last response: with fallbacks, not always the one asked
+    /// for.
+    pub model: String,
+}
+
+/// Tokens billed, by kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+}
+
+impl AddAssign for Usage {
+    fn add_assign(&mut self, other: Self) {
+        self.input_tokens += other.input_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+        self.output_tokens += other.output_tokens;
+    }
 }
 
 /// Why Claude's turn ended.
@@ -53,6 +85,21 @@ pub enum StopReason {
 }
 
 impl Conversation {
+    /// Every request's tokens so far (resets included), by the model that answered it.
+    #[inline]
+    pub fn usage(&self) -> &BTreeMap<String, Usage> {
+        &self.usage
+    }
+
+    /// Starts the conversation over, e.g. for a new session: forgets every message, and the code
+    /// execution container. The settings, tools and skills stay.
+    pub fn reset(&mut self) {
+        self.body.messages.clear();
+        if let Some(container) = &mut self.body.container {
+            container.id = None;
+        }
+    }
+
     /// Sends the user's message and runs Claude's turn to its end, tool calls included. On an
     /// error, or if the returned future is dropped before it finishes, the conversation is left
     /// as it was before the call.
@@ -75,11 +122,17 @@ impl Conversation {
         });
 
         let mut texts = Vec::new();
+        let mut turn_usage = Usage::default();
         for _ in 0..self.max_requests.get() {
             let response = self.post().await?;
             if let Some(container_id) = response.container.and_then(|c| c.id) {
                 self.body.container.get_or_insert_default().id = Some(container_id);
             }
+
+            let model = response.model.unwrap_or_else(|| self.body.model.clone());
+            let usage = response.usage.total();
+            turn_usage += usage;
+            *self.usage.entry(model.clone()).or_default() += usage;
 
             texts.extend(
                 response
@@ -100,12 +153,16 @@ impl Conversation {
                 .cloned()
                 .collect::<Vec<_>>();
 
-            // The server stopped its own tool loop midway: the same request resumes it
-            let paused = response.stop_reason.as_deref() == Some("pause_turn");
+            // The server stopped its own tool loop midway, or paused after compacting the
+            // conversation: the same request carries on
+            let paused = matches!(
+                response.stop_reason.as_deref(),
+                Some("pause_turn" | "compaction")
+            );
             let stop = match response.stop_reason.as_deref() {
                 Some("tool_use") if !calls.is_empty() => None,
                 Some("tool_use") => bail!("Claude stopped for tool calls, but made none"),
-                Some("pause_turn") => None,
+                Some("pause_turn" | "compaction") => None,
                 Some("end_turn") => Some(StopReason::EndTurn),
                 Some("stop_sequence") => Some(StopReason::StopSequence),
                 Some("max_tokens") => Some(StopReason::MaxTokens),
@@ -130,6 +187,8 @@ impl Conversation {
                 return Ok(Reply {
                     text: texts.join("\n\n"),
                     stop,
+                    usage: turn_usage,
+                    model,
                 });
             }
 
@@ -335,7 +394,8 @@ pub struct ConversationBuilder {
     system: String,
     tools: Tools,
     req_tools: Vec<RequestTool>,
-    skills: Vec<()>,
+    skills: Vec<RequestSkill>,
+    compaction: bool,
     max_requests: NonZeroU32,
     max_retries: u32,
     timeout: Duration,
@@ -354,6 +414,7 @@ impl ConversationBuilder {
             tools: Tools::default(),
             req_tools: Vec::new(),
             skills: Vec::new(),
+            compaction: false,
             max_requests: NonZeroU32::new(16).unwrap(),
             max_retries: 2,
             timeout: Duration::from_mins(10),
@@ -433,6 +494,51 @@ impl ConversationBuilder {
         self
     }
 
+    /// Has the API summarize the earlier conversation when it grows near the context window, so
+    /// a long session never runs out of room. Only on models that support it (the Models API's
+    /// `capabilities.context_management.compact_20260112`): others answer with an error. Off by
+    /// default.
+    #[inline]
+    pub fn compaction(&mut self, compaction: bool) -> &mut Self {
+        self.compaction = compaction;
+        self
+    }
+
+    /// A tool that runs on Anthropic's side, e.g. `server_tool("web_search_20260209",
+    /// "web_search")`.
+    #[inline]
+    pub fn server_tool(&mut self, r#type: &'static str, name: &'static str) -> &mut Self {
+        self.req_tools.push(RequestTool {
+            r#type: Some(r#type),
+            name,
+            description: None,
+            input_schema: serde_json::Value::Null,
+        });
+        self
+    }
+
+    /// An Agent Skill, loaded into the code execution container when relevant: `r#type` is
+    /// `anthropic` (Anthropic's own, e.g. `xlsx`) or `custom` (uploaded with the Skills API). The
+    /// code execution tool is added with the first one. Skills run on Anthropic's side, so they
+    /// can't reach files on this PC (the telemetry database included: see `engineer::Engineer`).
+    #[inline]
+    pub fn skill(
+        &mut self,
+        r#type: impl Into<String>,
+        skill_id: impl Into<String>,
+        version: impl Into<String>,
+    ) -> &mut Self {
+        if self.skills.is_empty() {
+            self.server_tool("code_execution_20260521", "code_execution");
+        }
+        self.skills.push(RequestSkill {
+            r#type: r#type.into(),
+            skill_id: skill_id.into(),
+            version: version.into(),
+        });
+        self
+    }
+
     #[inline]
     pub fn tool<H>(
         &mut self,
@@ -488,6 +594,9 @@ impl ConversationBuilder {
         let mut betas = String::from("server-side-fallback-2026-07-01");
         if !self.skills.is_empty() {
             betas.push_str(",code-execution-2025-08-25");
+        }
+        if self.compaction {
+            betas.push_str(",compact-2026-01-12");
         }
 
         const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
@@ -545,13 +654,22 @@ impl ConversationBuilder {
                 system,
                 messages: Vec::new(),
                 tools: self.req_tools,
-                container: None,
+                container: (!self.skills.is_empty()).then(|| RequestContainer {
+                    id: None,
+                    skills: self.skills,
+                }),
+                context_management: self.compaction.then(|| RequestContextManagement {
+                    edits: vec![RequestContextEdit {
+                        r#type: "compact_20260112",
+                    }],
+                }),
             },
             headers,
             timeout: self.timeout,
             max_retries: self.max_retries,
             max_requests: self.max_requests,
             tools: self.tools,
+            usage: BTreeMap::new(),
         });
     }
 }
@@ -573,6 +691,18 @@ struct RequestBody {
     tools: Vec<RequestTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     container: Option<RequestContainer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_management: Option<RequestContextManagement>,
+}
+
+#[derive(Serialize)]
+struct RequestContextManagement {
+    edits: Vec<RequestContextEdit>,
+}
+
+#[derive(Serialize)]
+struct RequestContextEdit {
+    r#type: &'static str,
 }
 
 #[derive(Serialize)]
@@ -610,6 +740,7 @@ struct RequestSkill {
 struct RequestContainer {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     skills: Vec<RequestSkill>,
 }
 
@@ -626,6 +757,8 @@ struct RequestCacheControl {
 #[derive(Deserialize)]
 struct ResponseBody {
     #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
     usage: ResponseUsage,
     #[serde(default)]
     container: Option<ResponseContainer>,
@@ -638,14 +771,24 @@ struct ResponseBody {
 
 #[derive(Default, Deserialize)]
 struct ResponseUsage {
+    #[serde(flatten)]
+    usage: Usage,
+    /// Present when the request ran server-side steps (e.g. compaction), each billed apart: the
+    /// top-level counts are then only part of it
     #[serde(default)]
-    input_tokens: u64,
-    #[serde(default)]
-    cache_creation_input_tokens: u64,
-    #[serde(default)]
-    cache_read_input_tokens: u64,
-    #[serde(default)]
-    output_tokens: u64,
+    iterations: Vec<Usage>,
+}
+
+impl ResponseUsage {
+    fn total(&self) -> Usage {
+        match self.iterations.is_empty() {
+            true => self.usage,
+            false => self.iterations.iter().fold(Usage::default(), |mut total, usage| {
+                total += *usage;
+                total
+            }),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -905,5 +1048,123 @@ mod tests {
         let cancelled = timeout(Duration::from_millis(200), conversation.send("Hi".into())).await;
         assert!(cancelled.is_err());
         assert!(conversation.body.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn counts_usage_by_model() {
+        let (url, _) = mock(vec![
+            (
+                200,
+                "",
+                json!({
+                    "model": "claude-sonnet-5-5",
+                    "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "id": "t1", "name": "lookup", "input": {}}],
+                    "usage": {"input_tokens": 100, "cache_read_input_tokens": 50, "output_tokens": 10}
+                }),
+            ),
+            (
+                200,
+                "",
+                json!({
+                    "model": "claude-opus-5-5",
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "Done."}],
+                    // Billed as two steps (e.g. compaction, then the answer)
+                    "usage": {
+                        "input_tokens": 1, "output_tokens": 1,
+                        "iterations": [
+                            {"input_tokens": 200, "output_tokens": 30},
+                            {"input_tokens": 20, "cache_creation_input_tokens": 5, "output_tokens": 7}
+                        ]
+                    }
+                }),
+            ),
+        ])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+
+        let reply = send(&mut conversation, "Hi").await.unwrap();
+        assert_eq!(reply.model, "claude-opus-5-5");
+        assert_eq!(
+            reply.usage,
+            Usage {
+                input_tokens: 320,
+                cache_creation_input_tokens: 5,
+                cache_read_input_tokens: 50,
+                output_tokens: 47,
+            }
+        );
+        assert_eq!(conversation.usage()["claude-sonnet-5-5"].input_tokens, 100);
+        assert_eq!(conversation.usage()["claude-opus-5-5"].input_tokens, 220);
+    }
+
+    #[tokio::test]
+    async fn sends_skills_and_compaction() {
+        let (url, requests) = mock(vec![
+            (
+                200,
+                "",
+                json!({
+                    "stop_reason": "end_turn",
+                    "container": {"id": "container_1"},
+                    "content": [{"type": "text", "text": "Hi."}]
+                }),
+            ),
+            message("end_turn", json!([{"type": "text", "text": "Hi again."}])),
+        ])
+        .await;
+        let mut builder = ConversationBuilder::new();
+        builder
+            .api_key("test")
+            .base_url(&url)
+            .skill("anthropic", "xlsx", "latest")
+            .compaction(true);
+        let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+
+        let betas = conversation.headers["anthropic-beta"].to_str().unwrap();
+        assert!(betas.contains("code-execution-2025-08-25"), "{betas}");
+        assert!(betas.contains("compact-2026-01-12"), "{betas}");
+
+        send(&mut conversation, "Hi").await.unwrap();
+        // A new session: the container goes with the messages, the skills stay
+        conversation.reset();
+        assert!(conversation.body.messages.is_empty());
+        send(&mut conversation, "Hi").await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        let first = &requests[0];
+        assert_eq!(first["tools"][0]["type"], "code_execution_20260521");
+        assert_eq!(first["tools"][0]["name"], "code_execution");
+        assert_eq!(first["container"]["skills"][0]["skill_id"], "xlsx");
+        assert!(first["container"].get("id").is_none());
+        assert_eq!(
+            first["context_management"]["edits"][0]["type"],
+            "compact_20260112"
+        );
+        assert!(requests[1]["container"].get("id").is_none());
+        assert_eq!(requests[1]["container"]["skills"][0]["skill_id"], "xlsx");
+        assert_eq!(requests[1]["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn carries_on_after_a_compaction_pause() {
+        let (url, requests) = mock(vec![
+            message(
+                "compaction",
+                json!([{"type": "compaction", "content": "Summary of the stint."}]),
+            ),
+            message("end_turn", json!([{"type": "text", "text": "P3, holding."}])),
+        ])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+
+        let reply = send(&mut conversation, "Position?").await.unwrap();
+        assert_eq!(reply.text, "P3, holding.");
+        // The compaction block goes back unchanged
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[1]["messages"][1]["content"][0]["type"], "compaction");
     }
 }

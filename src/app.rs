@@ -2,8 +2,9 @@ use crate::{
     app::topbar::Topbar,
     button::{Button, ButtonWatcher},
     config::{Config, RawConfig},
-    sim::{ActiveSimulator, Simulator, SimulatorSettings},
+    sim::{ActiveSimulator, Sim, SimulatorSettings},
     synthesizer::Synthesizer,
+    track::TrackSync,
 };
 use anyhow::Context as AnyhowContext;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -78,8 +79,13 @@ impl App {
         };
 
         let pref_path = Arc::<Utf8Path>::from(pref_path);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?;
+        let tracks = TrackSync::new(client.clone(), pref_path.as_std_path()).await;
+
         let guard = config.get();
-        let gui = Gui::new(&pref_path, &subsystems, &guard)?;
+        let gui = Gui::new(&pref_path, &subsystems, &guard, &client);
         let synth = Synthesizer::new(rt, &guard);
         drop(guard);
 
@@ -93,6 +99,7 @@ impl App {
                 synth,
                 simulators: ActiveSimulator::default(),
                 applied_opponent_frequency: None,
+                tracks,
             },
             ui,
         });
@@ -174,11 +181,14 @@ pub struct AppState {
     simulators: ActiveSimulator,
     /// The recording settings last passed to the simulators
     applied_opponent_frequency: Option<NonZeroU32>,
+    /// Keeps the running simulator's track description next to its database
+    tracks: TrackSync,
 }
 
 impl AppState {
     fn update(&mut self, rt: &Handle, ui: &mut egui::Ui) {
         self.update_simulators();
+        self.tracks.update(rt, self.simulators.current_mut());
         let simulator = self.simulators.current_mut();
         self.gui.update(
             rt,
@@ -254,15 +264,16 @@ pub struct Gui {
 }
 
 impl Gui {
-    fn new(pref_path: &Arc<Utf8Path>, ss: &Subsystems, config: &RawConfig) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
-
-        return Ok(Self {
-            topbar: Topbar::new(pref_path, ss, config, &client),
+    fn new(
+        pref_path: &Arc<Utf8Path>,
+        ss: &Subsystems,
+        config: &RawConfig,
+        client: &reqwest::Client,
+    ) -> Self {
+        Self {
+            topbar: Topbar::new(pref_path, ss, config, client),
             applied_text_scale: None,
-        });
+        }
     }
 
     /// `ui` must be the root `Ui`: edge panels have to be added before the `CentralPanel`,
@@ -274,7 +285,7 @@ impl Gui {
         ui: &mut egui::Ui,
         config: &mut Config,
         synth: &mut Synthesizer,
-        simulator: Option<&mut dyn Simulator>,
+        simulator: Option<&mut Sim>,
     ) {
         self.topbar.update(rt, ss, ui, config, synth, simulator);
         egui::CentralPanel::default().show(ui, |_ui| {});

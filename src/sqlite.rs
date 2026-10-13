@@ -20,6 +20,11 @@ pub struct Database {
 }
 
 impl Database {
+    #[inline]
+    pub fn path(&self) -> &Path {
+        (*self.path).as_ref()
+    }
+
     /// Read-write, created if missing, in WAL mode. `path` can be a `TempPath`, deleting the
     /// database with the last clone.
     #[inline]

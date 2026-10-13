@@ -4,9 +4,9 @@
 //! the game running.
 
 use crate::{
-    sim::{Simulator, SimulatorSettings},
+    sim::{Simulator, SimulatorInfo, SimulatorSettings},
     sqlite::{Database, pool::Pool},
-    steam::{self, AppWatcher},
+    steam::{self},
 };
 use lambiase_sim::recorder::{DATABASE, SETTINGS};
 use serde_json::{Map, Value};
@@ -15,7 +15,6 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::sync::watch;
 
 const STEAM_APP_ID: u32 = 2399420;
 /// The plugin's folder, in the game's UserData folder.
@@ -29,32 +28,13 @@ pub struct LeMansUltimate {
     install_dir: Option<PathBuf>,
     /// The database the plugin is writing right now, read-only
     live: Option<Pool>,
-    /// Whether Steam reports the game running
-    running: watch::Receiver<bool>,
-    /// Kept for its thread. Without Steam's key for the game (it's not installed), a sender kept
-    /// so `running` stays false instead of closing
-    _watcher: Result<AppWatcher, watch::Sender<bool>>,
 }
 
 impl LeMansUltimate {
     pub fn new() -> Self {
-        let (watcher, running) = match AppWatcher::new(STEAM_APP_ID) {
-            Ok(watcher) => {
-                let running = watcher.subscribe();
-                (Ok(watcher), running)
-            }
-            Err(e) => {
-                log::debug!("Not following Le Mans Ultimate starting and stopping: {e}");
-                let (send, running) = watch::channel(false);
-                (Err(send), running)
-            }
-        };
-
         Self {
             install_dir: None,
             live: None,
-            running,
-            _watcher: watcher,
         }
     }
 
@@ -91,31 +71,16 @@ impl LeMansUltimate {
     }
 }
 
+impl SimulatorInfo for LeMansUltimate {
+    const NAME: &'static str = "Le Mans Ultimate";
+    const TRACK_DATA_ID: &'static str = "lmu";
+    const APP_ID: u32 = STEAM_APP_ID;
+}
+
 impl Simulator for LeMansUltimate {
-    #[inline]
-    fn name(&self) -> &'static str {
-        "Le Mans Ultimate"
-    }
-
-    #[inline]
-    fn track_data_id(&self) -> &'static str {
-        "lmu"
-    }
-
-    #[inline]
-    fn running(&self) -> &watch::Receiver<bool> {
-        &self.running
-    }
-
-    #[inline]
-    fn running_mut(&mut self) -> &mut watch::Receiver<bool> {
-        &mut self.running
-    }
-
     /// The database the plugin is writing right now, or `None` when the game isn't installed, isn't
     /// running, or hasn't written one yet (the pilot hasn't loaded a session).
-    fn database(&mut self) -> Option<&Pool> {
-        let running = *self.running.borrow();
+    fn database(&mut self, running: bool) -> Option<&Pool> {
         let path = self
             .folder()
             .map(|folder| folder.join(DATABASE))

@@ -6,7 +6,7 @@ use crate::{
         topbar::{audio::AudioTopbar, settings::SettingsTopbar},
     },
     config::{Config, RawConfig},
-    sim::Simulator,
+    sim::Sim,
     synthesizer::Synthesizer,
 };
 use camino::Utf8Path;
@@ -56,7 +56,7 @@ impl Topbar {
         ui: &mut egui::Ui,
         config: &mut Config,
         synth: &mut Synthesizer,
-        simulator: Option<&mut dyn Simulator>,
+        simulator: Option<&mut Sim>,
     ) {
         egui::Panel::top("tobpar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -103,7 +103,7 @@ impl Topbar {
 
 /// Asks before clearing the simulator's recorded data, and clears it if confirmed. Returns whether
 /// the dialog stays open.
-fn confirm_clear(ctx: &egui::Context, simulator: &mut dyn Simulator) -> bool {
+fn confirm_clear(ctx: &egui::Context, simulator: &mut Sim) -> bool {
     let name = simulator.name();
     let modal = egui::Modal::new(egui::Id::new("confirm clear")).show(ctx, |ui| {
         ui.heading("Clear recorded data?");

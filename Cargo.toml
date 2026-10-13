@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 lambiase-sim = { path = "sim" }
 pin-project = "1.1.13"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 tokio = { version = "1.53.2", features = [
     "rt-multi-thread",
     "sync",

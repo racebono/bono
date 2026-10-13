@@ -29,6 +29,7 @@ mod sqlite;
 mod steam;
 mod synthesizer;
 mod task;
+mod track;
 
 struct AppImpl {
     app: MainThreadData<RefCell<App>>,

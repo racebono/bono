@@ -24,6 +24,12 @@ pub struct Pool {
 }
 
 impl Pool {
+    /// The database it opens connections to.
+    #[inline]
+    pub fn database(&self) -> &Database {
+        &self.db
+    }
+
     pub fn new(db: Database, max_idle: NonZeroUsize, max_open: NonZeroUsize) -> Self {
         Self {
             db,
