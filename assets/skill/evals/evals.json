@@ -95,7 +95,8 @@
         "Gives the time left as about 15 minutes",
         "Says it is dry / no rain",
         "At most 3 sentences",
-        "Adds nothing beyond the time left and the weather (no strategy, tyres or energy)"
+        "Adds nothing beyond the time left and the weather (no strategy, tyres or energy)",
+        "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times"
       ]
     },
     {
@@ -141,7 +142,8 @@
       "assertions": [
         "Says rain is likely / a good chance late in the race (around the last part / finish), not certain",
         "Doesn't add other topics (time left, tyres, energy, strategy)",
-        "At most 1 sentence"
+        "At most 1 sentence",
+        "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times"
       ]
     },
     {
@@ -189,6 +191,62 @@
         "Says when to box (a lap or a number of laps from now)",
         "Gives a reason for that timing, since the pilot asked why",
         "At most 3 sentences"
+      ]
+    },
+    {
+      "id": 17,
+      "prompt": "when's the rain coming?",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Says rain is likely (a chance, not certain), building over the next few minutes and most likely by the end",
+        "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times",
+        "At most 2 sentences"
+      ]
+    },
+    {
+      "id": 18,
+      "prompt": "what's the weather going to do for the rest of the race?",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Dry now, rain chances rising to about 70 percent by the finish",
+        "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times",
+        "At most 2 sentences"
+      ]
+    },
+    {
+      "id": 19,
+      "prompt": "should we be thinking about wets?",
+      "expected_output": "",
+      "files": [],
+      "assertions": [
+        "Treats rain as a chance, not a certainty",
+        "Ties any tyre call to when the rain is likely, relative to now or to the stop",
+        "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times",
+        "At most 3 sentences"
+      ]
+    },
+    {
+      "id": 20,
+      "prompt": "is it going to rain in the race?",
+      "expected_output": "Practice fixture (EVAL_DB = the practice copy)",
+      "files": [],
+      "assertions": [
+        "Says rain is a good chance late in the race (around 70 percent towards the end), as a chance",
+        "Places it in the race with words like early, halfway, late or by the end, never as percent marks or clock times",
+        "At most 2 sentences"
+      ]
+    },
+    {
+      "id": 21,
+      "prompt": "weather for the rest of this session?",
+      "expected_output": "Practice fixture (EVAL_DB = the practice copy)",
+      "files": [],
+      "assertions": [
+        "Says it stays dry (rain chances only a few percent) for the rest of practice",
+        "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times",
+        "At most 2 sentences"
       ]
     }
   ]

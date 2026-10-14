@@ -53,7 +53,9 @@ only uses it while Steam reports the game running. It is in WAL mode.
   overcast with drizzle, 6 overcast with light rain; higher is wetter), `sky_text` (the game's own
   words, in the game's language), `rain_chance` (0-1), `temperature` (air, C), `humidity` (0-1),
   `wind_speed` (m/s), `wind_direction` (N, NE, ... NW). The newest forecast is the rows with the
-  newest `session_time`. A point's time is `session_fraction * session.session_end_time`.
+  newest `session_time`. A point's time is `session_fraction * session.session_end_time`; tell the
+  pilot when as time from now (that time minus the session's current `session_time`), never as the
+  fraction or the session clock.
 
 Next to the database the lambiase app may also leave `track.json`: the circuit's description from
 Lovely Sim Racing's lovely-track-data (CC BY-NC-SA 4.0), saved at the start of each session when the data

@@ -992,7 +992,9 @@ impl Scoring {
     }
 
     /// The forecast from now to the end of this session, plus the race's if this isn't it (LMU
-    /// only).
+    /// only). Every point is said as time from now, the way the pilot hears it, never as a mark of
+    /// the session: "in 41 min", "in 2 h 56 min (end of the session)". Without the session's clock
+    /// (or for a race still to come), as a part of it: "late in the race".
     fn forecast_line(
         &self,
         conn: &Connection,
@@ -1019,12 +1021,8 @@ impl Scoring {
             )
         }
 
-        fn mark(f: f64) -> String {
-            match f {
-                0.0 => "start".into(),
-                1.0 => "finish".into(),
-                f => format!("{:.0}% mark", f * 100.0),
-            }
+        fn end_of(f: f64) -> &'static str {
+            if f >= 1.0 { " (end of the session)" } else { "" }
         }
 
         let fraction = |r: &Row| r.f("session_fraction").unwrap_or(0.0);
@@ -1044,20 +1042,20 @@ impl Scoring {
                 (Some(progress), Some(end), Some(now)) => {
                     let done = rows.iter().filter(|r| fraction(r) <= progress).last();
                     if let Some(done) = done {
-                        parts.push(format!("now ({}) {}", mark(fraction(done)), point(done)));
+                        parts.push(format!("now: {}", point(done)));
                     }
                     for r in rows.iter().filter(|r| fraction(r) > progress) {
-                        let minutes = (fraction(r) * end - now) / 60.0;
                         parts.push(format!(
-                            "{} in {minutes:.0} min: {}",
-                            mark(fraction(r)),
+                            "in {}{}: {}",
+                            from_now(fraction(r) * end - now),
+                            end_of(fraction(r)),
                             point(r)
                         ));
                     }
                 }
                 _ => parts.extend(
                     rows.iter()
-                        .map(|r| format!("{} {}", mark(fraction(r)), point(r))),
+                        .map(|r| format!("{}: {}", part_of(fraction(r)), point(r))),
                 ),
             }
 
@@ -1065,20 +1063,27 @@ impl Scoring {
                 && chance(&wet) > 0.0
                 && progress.is_none_or(|progress| fraction(&wet) > progress)
             {
+                let when = match end.zip(now) {
+                    Some((end, now)) => format!(
+                        "in {}{}",
+                        from_now(fraction(&wet) * end - now),
+                        end_of(fraction(&wet))
+                    ),
+                    None => format!("{} in the session", part_of(fraction(&wet))),
+                };
                 parts.push(format!(
-                    "rain most likely at the {} ({:.0}%)",
-                    mark(fraction(&wet)),
+                    "rain most likely {when} ({:.0}%)",
                     chance(&wet) * 100.0
                 ));
             }
         }
 
         let mut line = (!parts.is_empty()).then(|| {
-            let through = end
+            let left = end
                 .zip(now)
-                .map(|(end, now)| format!(" ({:.0}% through)", now / end * 100.0))
+                .map(|(end, now)| format!(" ({} left)", from_now(end - now)))
                 .unwrap_or_default();
-            format!("{kind}{through}: {}", parts.join(" | "))
+            format!("{kind}{left}: {}", parts.join(" | "))
         });
 
         if kind != "race" {
@@ -1086,9 +1091,9 @@ impl Scoring {
             if let Some(wet) = wettest(&race) {
                 let mut summary = match chance(&wet) > 0.0 {
                     true => format!(
-                        "race: up to {:.0}% rain chance at the {}",
+                        "race: up to {:.0}% rain chance {} in the race",
                         chance(&wet) * 100.0,
-                        mark(fraction(&wet))
+                        part_of(fraction(&wet))
                     ),
                     false => "race: dry".into(),
                 };
@@ -1923,8 +1928,9 @@ fn cmd_stint(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
     if let Some((chance, minutes, rain_now)) = sc.rain_ahead(ctx.conn, p.f("session_time"))? {
         say!(
             out,
-            "weather ahead (game forecast): up to {:.0}% rain chance before the end of the session, peaking in about {minutes:.0} min; raining now: {}%  (a chance, not a promise: weigh it when the pit stop or the tyre choice is close)",
+            "weather ahead (game forecast): up to {:.0}% rain chance before the end of the session, peaking in about {}; raining now: {}%  (a chance, not a promise: weigh it when the pit stop or the tyre choice is close)",
             chance * 100.0,
+            from_now(minutes * 60.0),
             fmt(Some(rain_now.unwrap_or(0.0) * 100.0), 0, "")
         );
     }
@@ -1938,6 +1944,28 @@ fn cmd_stint(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
         p.b("in_pit_lane")
     );
     Ok(())
+}
+
+/// A time from now, as the forecast puts it: "7 min", "2 h", "2 h 56 min".
+fn from_now(seconds: f64) -> String {
+    let minutes = (seconds / 60.0).round().max(0.0) as i64;
+    match (minutes / 60, minutes % 60) {
+        (0, minutes) => format!("{minutes} min"),
+        (hours, 0) => format!("{hours} h"),
+        (hours, minutes) => format!("{hours} h {minutes} min"),
+    }
+}
+
+/// Where in a session a forecast point falls, when it can't be said as time from now (the
+/// session's clock isn't known, or it hasn't started).
+fn part_of(fraction: f64) -> &'static str {
+    match fraction {
+        f if f <= 0.0 => "at the start",
+        f if f < 0.4 => "early",
+        f if f < 0.6 => "halfway",
+        f if f < 1.0 => "late",
+        _ => "at the end",
+    }
 }
 
 // --------------------------------------------------------------------------- spotter
@@ -4162,6 +4190,13 @@ mod tests {
         assert_eq!(g4(0.000123456), "0.0001235");
         assert_eq!(g4(81.25), "81.25");
         assert_eq!(clock(905.0), "15:05");
+        assert_eq!(from_now(415.0), "7 min");
+        assert_eq!(from_now(7200.0), "2 h");
+        assert_eq!(from_now(10_560.0), "2 h 56 min");
+        assert_eq!(from_now(-5.0), "0 min");
+        assert_eq!(part_of(0.0), "at the start");
+        assert_eq!(part_of(0.75), "late");
+        assert_eq!(part_of(1.0), "at the end");
         let instructions = instructions(include_str!("../../assets/skill/SKILL.md").to_owned());
         assert!(!instructions.starts_with("---"));
         assert!(instructions.starts_with("# Race engineer"));
@@ -4174,8 +4209,9 @@ mod tests {
 /// - `EVAL_DB`: the race's `telemetry.db` (kept looking fresh while the evals run)
 /// - `EVAL_SKILL`, `EVAL_SCHEMA`: the `SKILL.md` and `schema.md` to use (default: the ones in
 ///   `assets/skill`)
-/// - `EVAL_OUT`: where each eval's reply goes, as `eval-<id>/<EVAL_CONFIG>/`
-/// - `EVAL_CONFIG` (default `with_skill`), `EVAL_MODEL`, `EVAL_EFFORT`, `EVAL_IDS` (e.g. `1,5,9`)
+/// - `EVAL_OUT`: where each eval's reply goes, as `eval-<id>/<EVAL_CONFIG>/<EVAL_RUN>/`
+/// - `EVAL_CONFIG` (default `with_skill`), `EVAL_RUN` (default `run-1`), `EVAL_MODEL`,
+///   `EVAL_EFFORT`, `EVAL_IDS` (e.g. `1,5,9`)
 #[cfg(test)]
 mod evals {
     use super::*;
@@ -4246,6 +4282,7 @@ mod evals {
         let db = PathBuf::from(var("EVAL_DB").expect("EVAL_DB isn't set"));
         let out = PathBuf::from(var("EVAL_OUT").expect("EVAL_OUT isn't set"));
         let config = var("EVAL_CONFIG").unwrap_or_else(|| "with_skill".into());
+        let run = var("EVAL_RUN").unwrap_or_else(|| "run-1".into());
         let model = var("EVAL_MODEL").unwrap_or_else(|| "claude-sonnet-5-5".into());
         let effort = var("EVAL_EFFORT").unwrap_or_else(|| "high".into());
         let skill = var("EVAL_SKILL").unwrap_or_else(|| "assets/skill/SKILL.md".into());
@@ -4296,7 +4333,7 @@ mod evals {
                 let dir = out
                     .join(format!("eval-{}", eval["id"]))
                     .join(&config)
-                    .join("run-1");
+                    .join(&run);
                 let prompt = eval["prompt"].as_str().unwrap().to_owned();
                 async move {
                     let calls = Arc::new(StdMutex::new(Vec::new()));
