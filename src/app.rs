@@ -56,6 +56,12 @@ impl App {
         let assets_path = base_path.join("assets");
         log::debug!("Assets Path: {assets_path}");
 
+        // The talk and session buttons are pressed while the game has focus: without this, SDL
+        // only reports joystick (wheel) buttons to a focused window
+        if !sdl3::hint::set("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1") {
+            log::warn!("Wheel buttons won't work while the game has focus");
+        }
+
         // Initialize audio here (before loading config) so that audio device finder works correctly
         let sdl = sdl3::init()?;
         let audio = sdl.audio()?;
