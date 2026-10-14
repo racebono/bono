@@ -4216,6 +4216,29 @@ mod evals {
         }
     }
 
+    /// How long each command takes on a recording (`EVAL_DB`), e.g. a live one.
+    #[test]
+    #[ignore]
+    fn times_the_commands() {
+        let db = PathBuf::from(std::env::var("EVAL_DB").expect("EVAL_DB isn't set"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let four = NonZeroUsize::new(4).unwrap();
+            let pool = Pool::new(Database::read_only(Arc::new(db)), four, four);
+            let tool = Engineer::new(pool, Arc::from(""));
+            for command in std::env::var("EVAL_COMMANDS").unwrap_or_else(|_| "quick,status".into()).split(",") {
+                let input = EngineerInput::deserialize(serde_json::json!({ "command": command.trim() })).unwrap();
+                let start = Instant::now();
+                let result = tool.run(input).await;
+                println!(
+                    "{command:>8}: {:>7.2?} {}",
+                    start.elapsed(),
+                    result.map_or_else(|e| format!("ERROR {e:#}"), |text| format!("{} chars", text.len()))
+                );
+            }
+        });
+    }
+
     #[test]
     #[ignore]
     fn skill_evals() {

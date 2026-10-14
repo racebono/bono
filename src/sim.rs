@@ -228,6 +228,29 @@ fn simulators() -> Vec<Box<Sim<dyn Simulator>>> {
     .collect::<Vec<_>>();
 }
 
+/// A running simulator whose recording is `pool`'s database, for tests.
+#[cfg(test)]
+pub(crate) fn recording(pool: Pool) -> Box<Sim> {
+    struct Recording(Pool);
+
+    impl Simulator for Recording {
+        fn database(&mut self, running: bool) -> Option<&Pool> {
+            running.then_some(&self.0)
+        }
+        fn apply(&mut self, _: &SimulatorSettings) {}
+        fn clear(&mut self) {}
+    }
+
+    let (send, running) = watch::channel(true);
+    Box::new(Sim {
+        name: "Test",
+        running,
+        track_data: Arc::new(Mutex::new(TrackData::new("test"))),
+        _watcher: Err(send),
+        simulator: Recording(pool),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

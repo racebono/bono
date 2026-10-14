@@ -570,6 +570,56 @@ mod tests {
     };
     use std::num::NonZeroUsize;
 
+    /// A typed question answered the way the app does it: `ask_text`, then `update` every frame
+    /// until the answer is in. Needs `ANTHROPIC_API_KEY` and `EVAL_DB` (a recorded race).
+    #[test]
+    #[ignore]
+    fn answers_like_the_app() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let rt = runtime.handle();
+
+        let db = PathBuf::from(std::env::var("EVAL_DB").expect("EVAL_DB isn't set"));
+        // As the LMU simulator opens it
+        let pool = Pool::new(
+            Database::read_only(Arc::new(db)),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+        );
+        let mut sim = crate::sim::recording(pool);
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = rt.block_on(Config::new(dir.path().join("config.json"))).unwrap();
+        let mut synth = Synthesizer::new(rt, &config.get());
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let mut engineer = rt
+            .block_on(Engineer::new(Path::new("assets"), &config.get(), client))
+            .unwrap();
+
+        let questions = std::env::var("EVAL_QUESTIONS")
+            .unwrap_or_else(|_| "how are the tyres?|where am I losing time?".into());
+        for question in questions.split('|') {
+            let start = std::time::Instant::now();
+            engineer.ask_text(rt, Some(&mut sim), &config, &mut synth, question.to_owned());
+            while engineer.is_thinking() {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(120),
+                    "stuck on {question:?}"
+                );
+                engineer.update(rt, true, &config, &mut synth, None);
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+            println!("{question:?} answered in {:.1?}", start.elapsed());
+        }
+
+        for entry in engineer.chat() {
+            println!("{:?}: {} {:?}", entry.speaker, entry.text, entry.detail);
+        }
+    }
+
     fn session(kind: &str, number: i64) -> lambiase_session_info {
         let mut session = lambiase_session_info::default();
         session.track = Some("Circuit de la Sarthe".to_owned()).into();
