@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     app::{
         Subsystems,
-        topbar::{audio::AudioTopbar, settings::SettingsTopbar},
+        topbar::{audio::AudioTopbar, settings::SettingsTopbar, volume::VolumeTopbar},
     },
     config::{Config, RawConfig},
     sim::Sim,
@@ -19,10 +19,12 @@ use tokio::runtime::Handle;
 
 mod audio;
 mod settings;
+mod volume;
 
 pub struct Topbar {
     settings: SettingsTopbar,
     pub audio: AudioTopbar,
+    volume: VolumeTopbar,
     /// "Clear data" was clicked: asking before clearing
     confirm_clear: bool,
 }
@@ -36,6 +38,7 @@ impl Topbar {
     ) -> Self {
         Self {
             settings: SettingsTopbar::default(),
+            volume: VolumeTopbar,
             confirm_clear: false,
             audio: AudioTopbar::new(pref_path, ss, config, client),
         }
@@ -71,6 +74,12 @@ impl Topbar {
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
                     .ui(ui, |ui| self.audio.update(rt, ss, ui, config, synth));
+
+                MenuButton::new("Volume")
+                    .config(
+                        MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
+                    )
+                    .ui(ui, |ui| self.volume.update(ui, config));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let clear = ui

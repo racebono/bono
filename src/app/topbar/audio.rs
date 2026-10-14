@@ -110,9 +110,17 @@ impl AudioTopbar {
 
         if let Some(ref mut test) = self.test {
             match test.try_recv() {
-                Ok(Ok(speech)) => {
+                Ok(Ok(mut speech)) => {
                     self.test = None;
                     log::debug!("Test synthesized");
+                    // Played like the engineer's answers, so it previews the volume
+                    let gain = {
+                        let config = config.get();
+                        config.master_volume * config.engineer_volume
+                    };
+                    for sample in &mut speech.samples {
+                        *sample *= gain;
+                    }
                     if let Some(device) = self.speaker.get() {
                         match speech.play(device) {
                             Ok(stream) => self.test_playback = Some(stream),
