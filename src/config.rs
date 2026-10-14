@@ -5,7 +5,7 @@ use crate::{
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use sdl3::audio::AudioDeviceID;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     collections::BTreeMap,
     fmt::{Debug, Display},
@@ -134,10 +134,8 @@ pub struct RawConfig {
     pub beep_volume: f32,
     #[serde(default = "default_true")]
     pub auto_session: bool,
-    #[serde(default = "default_true")]
-    pub spotter: bool,
-    #[serde(default)]
-    pub spotter_language: Option<ArrayStr<2>>,
+    #[serde(default, deserialize_with = "spotter_config")]
+    pub spotter: SpotterConfig,
     #[serde(default = "default_opponent_frequency")]
     pub opponent_frequency: NonZeroU32,
     #[serde(default)]
@@ -377,6 +375,109 @@ const fn default_height() -> NonZeroU32 {
     const { NonZeroU32::new(600).unwrap() }
 }
 
+/// The spotter: calls traffic and flags by itself, the moment they happen. The defaults are
+/// my-engineer's (`spotter.cpp`). Distances are in metres, times in seconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpotterConfig {
+    pub enabled: bool,
+    /// The language of its calls: the pilot's (the last one they asked in) when `None`
+    pub language: Option<ArrayStr<2>>,
+    /// How often it looks at the newest telemetry
+    pub poll_interval: f64,
+
+    // Cars alongside. A car overlaps when its centre is within `enter_along` of yours along the car,
+    // and `min_across` to `enter_across` to the side (beside you rather than in line with you). It
+    // stops overlapping past the exit distances, which are wider so a car at the edge doesn't make the
+    // spotter chatter
+    pub enter_along: f64,
+    pub exit_along: f64,
+    pub min_across: f64,
+    pub enter_across: f64,
+    pub exit_across: f64,
+    /// Cars further above or below (on a bridge, or under a crossover) are ignored
+    pub max_height_difference: f64,
+    /// How long a car must overlap before it's called
+    pub debounce: f64,
+    /// How long a side must have been taken before it's called clear
+    pub min_hold_for_clear: f64,
+    /// How often "still there" is called while a car stays alongside
+    pub still_there_every: f64,
+    /// Below this speed (m/s: the garage, the grid, a spin) it stays quiet
+    pub min_speed: f64,
+
+    /// A car this many seconds behind or closer is called...
+    pub gap_behind_on: f64,
+    /// ...again only once the gap has opened to at least this
+    pub gap_behind_off: f64,
+
+    // Weather, from 0 to 1 (about five updates a second). A call when the value moves into another
+    // band, by at least `band_margin` past its edge, so a value sitting on an edge stays quiet
+    /// Rain: none | light | moderate | heavy
+    pub rain_bands: [f64; 3],
+    /// Track wetness: dry | damp | wet | soaked
+    pub wet_bands: [f64; 3],
+    pub band_margin: f64,
+    /// Rain on the way: a forecast point at least this likely to bring rain...
+    pub forecast_rain_chance: f64,
+    /// ...this many minutes ahead or less, while it isn't raining yet
+    pub forecast_rain_lead_minutes: f64,
+    /// Between two rain calls, and between two track calls
+    pub weather_repeat: f64,
+    /// Between two "wet patch" calls
+    pub wet_patch_repeat: f64,
+}
+
+impl Default for SpotterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            language: None,
+            poll_interval: 0.033,
+            enter_along: 4.8,
+            exit_along: 5.8,
+            min_across: 0.8,
+            enter_across: 5.5,
+            exit_across: 6.5,
+            max_height_difference: 4.0,
+            debounce: 0.12,
+            min_hold_for_clear: 0.4,
+            still_there_every: 6.0,
+            min_speed: 8.0,
+            gap_behind_on: 1.0,
+            gap_behind_off: 1.5,
+            rain_bands: [0.05, 0.3, 0.6],
+            wet_bands: [0.05, 0.25, 0.6],
+            band_margin: 0.03,
+            forecast_rain_chance: 0.5,
+            forecast_rain_lead_minutes: 10.0,
+            weather_repeat: 60.0,
+            wet_patch_repeat: 30.0,
+        }
+    }
+}
+
+/// `spotter` used to be only whether it's on (`true` or `false`): still read, with the defaults.
+fn spotter_config<'de, D>(deserializer: D) -> Result<SpotterConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Enabled(bool),
+        Config(SpotterConfig),
+    }
+
+    Ok(match Stored::deserialize(deserializer)? {
+        Stored::Enabled(enabled) => SpotterConfig {
+            enabled,
+            ..SpotterConfig::default()
+        },
+        Stored::Config(config) => config,
+    })
+}
+
 #[inline(always)]
 const fn default_radio_effect() -> f32 {
     0.65
@@ -424,4 +525,51 @@ fn default_claude_effort() -> String {
 
 fn default_skill_path() -> Utf8PathBuf {
     Utf8PathBuf::from("skill")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_spotter_config() {
+        let defaults = serde_json::from_str::<RawConfig>("{}").unwrap();
+        assert_eq!(defaults.spotter, SpotterConfig::default());
+
+        // Older configs only said whether it's on
+        let off = serde_json::from_str::<RawConfig>(r#"{"spotter": false}"#).unwrap();
+        assert!(!off.spotter.enabled);
+        assert_eq!(off.spotter.debounce, SpotterConfig::default().debounce);
+
+        // A partial one keeps the defaults for the rest
+        let tuned = serde_json::from_str::<RawConfig>(
+            r#"{"spotter": {"debounce": 0.2, "language": "es"}}"#,
+        )
+        .unwrap();
+        assert!(tuned.spotter.enabled);
+        assert_eq!(tuned.spotter.debounce, 0.2);
+        assert_eq!(tuned.spotter.language, Some(crate::arrstr!("es")));
+        assert_eq!(tuned.spotter.enter_along, 4.8);
+
+        // And it's written back whole
+        let written = serde_json::to_value(&tuned).unwrap();
+        assert_eq!(written["spotter"]["debounce"], 0.2);
+        assert_eq!(written["spotter"]["rain_bands"][1], 0.3);
+    }
+
+    #[test]
+    fn keeps_the_spotter_config_while_disabled() {
+        let disabled = serde_json::from_str::<RawConfig>(
+            r#"{"spotter": {"enabled": false, "debounce": 0.2, "language": "es"}}"#,
+        )
+        .unwrap();
+
+        // Saved and loaded again (as the app does on every change), switched off but still tuned
+        let saved = serde_json::to_string(&disabled).unwrap();
+        let loaded = serde_json::from_str::<RawConfig>(&saved).unwrap();
+        assert!(!loaded.spotter.enabled);
+        assert_eq!(loaded.spotter.debounce, 0.2);
+        assert_eq!(loaded.spotter.language, Some(crate::arrstr!("es")));
+        assert_eq!(loaded.spotter, disabled.spotter);
+    }
 }
