@@ -36,6 +36,7 @@
         "Identifies the front-left as the problem tyre and that the others are fine",
         "Does not read back tyre temperatures, wear percentages, pressures or lap times",
         "Does not name another car as the contact partner",
+        "Doesn't blame the slow lap after the hit on the tyres or damage; if it gives a cause, it's the early braking into T2 Curva del Lago",
         "At most 3 sentences"
       ]
     },
@@ -46,7 +47,8 @@
       "files": [],
       "assertions": [
         "Says the car is on the RIGHT",
-        "Answer is at most ~12 words"
+        "Answer is at most ~12 words",
+        "Gives the side only: not who it is, nor the other side"
       ]
     },
     {
