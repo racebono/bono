@@ -4,6 +4,7 @@ use crate::{
     config::{Config, RawConfig},
     engineer::Engineer,
     sim::{ActiveSimulator, Sim, SimulatorSettings},
+    spotter::Spotter,
     synthesizer::Synthesizer,
     task::MaybeDone,
     track::TrackSync,
@@ -116,6 +117,7 @@ impl App {
                 applied_opponent_frequency: None,
                 tracks,
                 engineer,
+                spotter: Spotter::new(),
             },
             ui,
         });
@@ -206,6 +208,8 @@ pub struct AppState {
     tracks: TrackSync,
     // FIXME: Do we want this to be `MaybeDone`?
     engineer: Engineer,
+    /// Calls cars alongside and flags by itself, in the engineer's voice
+    spotter: Spotter,
 }
 
 impl AppState {
@@ -230,6 +234,14 @@ impl AppState {
             &self.config,
             &mut self.synth,
             self.gui.topbar.audio.speaker.get(),
+        );
+        self.spotter.update(
+            rt,
+            self.simulators.current_mut(),
+            &self.config,
+            &mut self.synth,
+            self.gui.topbar.audio.speaker.get(),
+            &mut self.engineer,
         );
         let simulator = self.simulators.current_mut();
         let typed = self.gui.update(

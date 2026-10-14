@@ -67,6 +67,8 @@ pub struct Engineer {
     turn: Option<Turn>,
     /// The answer being spoken
     playback: Option<Playback>,
+    /// The spotter is speaking: the answer waits, and carries on from there after
+    held: bool,
 }
 
 /// A question being answered.
@@ -125,6 +127,7 @@ impl Engineer {
             new_session: false,
             turn: None,
             playback: None,
+            held: false,
         })
     }
 
@@ -138,6 +141,36 @@ impl Engineer {
     #[inline]
     pub fn is_thinking(&self) -> bool {
         self.turn.is_some()
+    }
+
+    /// Whether an answer is being spoken, or is about to be.
+    #[inline]
+    pub fn is_speaking(&self) -> bool {
+        self.playback.is_some()
+    }
+
+    /// The language the pilot last asked in.
+    #[inline]
+    pub fn language(&self) -> ArrayStr<2> {
+        self.last_lang
+    }
+
+    /// Pauses the answer being spoken (and holds one about to start) while the spotter speaks;
+    /// releasing it carries on from where it stopped.
+    pub fn hold(&mut self, held: bool) {
+        if std::mem::replace(&mut self.held, held) == held {
+            return;
+        }
+
+        if let Some(stream) = self.playback.as_ref().and_then(|playback| playback.stream.as_ref()) {
+            let result = match held {
+                true => stream.pause(),
+                false => stream.resume(),
+            };
+            if let Err(e) = result {
+                log::warn!("Error holding the answer for the spotter: {e}");
+            }
+        }
     }
 
     /// Starts a new conversation with the next question: the engineer forgets what was said.
@@ -385,6 +418,7 @@ impl Engineer {
 
     /// Plays the speech synthesized so far.
     fn play(&mut self, config: &Config, speaker: Option<&AudioDevice>) {
+        let held = self.held;
         let Some(playback) = &mut self.playback else {
             return;
         };
@@ -420,8 +454,13 @@ impl Engineer {
 
             let played = match (&playback.stream, speaker) {
                 (Some(stream), _) => stream.put_data_f32(&speech.samples),
-                (None, Some(speaker)) => speech.start(speaker).map(|stream| {
+                (None, Some(speaker)) => speech.start(speaker).and_then(|stream| {
+                    // Starts held while the spotter speaks
+                    if held {
+                        stream.pause()?;
+                    }
                     playback.stream = Some(stream);
+                    Ok(())
                 }),
                 (None, None) => {
                     self.playback = None;

@@ -26,6 +26,7 @@ mod config;
 mod engineer;
 mod language;
 mod sim;
+mod spotter;
 mod sqlite;
 mod steam;
 mod synthesizer;
