@@ -491,7 +491,7 @@ dependencies = [
 [[package]]
 name = "egui-sdl3"
 version = "0.4.0"
-source = "git+https://github.com/Aandreba/egui-sdl3?branch=main#9a29319d42fae02e90ed9ea184b85a10260873cc"
+source = "git+https://github.com/Aandreba/egui-sdl3?branch=main#7442230dedeb018487c05876db3ad3578f8e9a10"
 dependencies = [
  "bytemuck",
  "egui",
