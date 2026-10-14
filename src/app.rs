@@ -390,44 +390,28 @@ async fn load_config(pref_path: &Utf8Path) -> anyhow::Result<Config> {
 
 async fn load_fonts(assets_path: &Utf8Path) -> anyhow::Result<egui::FontDefinitions> {
     let mut fonts = egui::FontDefinitions::default();
-    let (proggy, noto, ubuntu) = tokio::try_join!(
-        tokio::fs::read(assets_path.join_os("ProggyForever-Regular.ttf")),
-        tokio::fs::read(assets_path.join_os("NotoEmoji-Regular.ttf")),
-        tokio::fs::read(assets_path.join_os("Ubuntu-Light.ttf")),
-    )?;
+    let (proggy,) = tokio::try_join!(tokio::fs::read(
+        assets_path.join_os("ProggyForever-Regular.ttf")
+    ),)?;
 
     fonts.font_data.insert(
         "proggy-forever".into(),
         Arc::new(egui::FontData::from_owned(proggy)),
     );
-    fonts.font_data.insert(
-        "NotoEmoji-Regular".to_owned(),
-        Arc::new(egui::FontData::from_owned(noto).tweak(FontTweak {
-            scale: 0.81, // Make smaller
-            ..Default::default()
-        })),
-    );
-    fonts.font_data.insert(
-        "Ubuntu-Light".to_owned(),
-        Arc::new(egui::FontData::from_owned(ubuntu)),
-    );
 
-    fonts.families.insert(
-        FontFamily::Monospace,
-        vec![
-            "proggy-forever".into(),
-            // "Ubuntu-Light".to_owned(), // fallback for √ etc
-            // "NotoEmoji-Regular".to_owned(),
-        ],
-    );
-    fonts.families.insert(
-        FontFamily::Proportional,
-        vec![
-            "proggy-forever".into(),
-            // "Ubuntu-Light".to_owned(),
-            // "NotoEmoji-Regular".to_owned(),
-        ],
-    );
+    // Each character comes from the first font that has it: Proggy only covers Latin-1, Ubuntu adds
+    // the rest of the Latin, Greek and Cyrillic scripts and punctuation (dashes, √...), Noto the emoji
+    fonts
+        .families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .insert(0, "proggy-forever".into());
+
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "proggy-forever".into());
 
     Ok(fonts)
 }

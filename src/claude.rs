@@ -690,7 +690,7 @@ impl ConversationBuilder {
             true => Vec::new(),
             false => vec![RequestSystemBlock {
                 r#type: "text",
-                text: self.system.to_string(),
+                text: self.system.clone(),
                 cache_control: RequestCacheControl {
                     r#type: "ephemeral",
                 },
@@ -771,7 +771,7 @@ struct RequestContextEdit {
 #[derive(Serialize)]
 struct RequestSystemBlock {
     r#type: &'static str,
-    text: String,
+    text: Arc<str>,
     cache_control: RequestCacheControl,
 }
 

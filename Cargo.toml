@@ -17,12 +17,12 @@ tokio = { version = "1.53.2", features = [
 sdl3 = { version = "0.20.0", features = ["build-from-source-static", "main"] }
 sdl3-main = "0.7.0"
 anyhow = "1.0.104"
-serde = { version = "1.0.229", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.151"
 camino = { version = "1.2.6", features = ["serde1"] }
 log = "0.4.34"
 egui = { version = "0.36.2", features = [
-    "persistence",
+    "default_fonts",
 ], default-features = false }
 egui-sdl3 = { git = "https://github.com/Aandreba/egui-sdl3", branch = "main", features = [
     "canvas-backend",
@@ -46,7 +46,10 @@ httpdate = "1.0.3"
 slab = "0.4.12"
 crossbeam = "0.8.5"
 utils-atomics = { version = "1.1.2", features = ["futures"] }
-futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
+futures = { version = "0.3.34", default-features = false, features = [
+    "std",
+    "async-await",
+] }
 steamlocate = "2.1.1"
 # Which language a typed question is in. Each language's model is built into the binary (a few
 # MB each), so only common ones are by default: `all-languages` adds the rest that have voices
@@ -143,4 +146,3 @@ members = ["xtask", "sim", "lmu"]
 # which clashes with the release CRT (`msvcrt`) Rust and the other native dependencies link
 [profile.dev.package.espeak-rs-sys]
 debug-assertions = false
-
