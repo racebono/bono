@@ -154,6 +154,8 @@ pub struct RawConfig {
     pub text_scale: f32,
     #[serde(default = "default_min_confidence")]
     pub min_confidence: f32,
+    #[serde(default = "default_skill_path")]
+    pub skill_path: Utf8PathBuf,
 }
 
 impl RawConfig {
@@ -344,16 +346,18 @@ impl<'de, const RECORDING: bool> Deserialize<'de> for RawAudioDevice<RECORDING> 
             return Ok(RawAudioDevice(AudioDevice::Default));
         };
 
-        let devices = ((|| {
-            let audio = sdl3::init()?.audio()?;
-            match RECORDING {
-                true => audio.audio_recording_device_ids(),
-                false => audio.audio_playback_device_ids(),
-            }
-        })())
+        let audio = sdl3::init()
+            .and_then(|sdl| sdl.audio())
+            .map_err(<D::Error as serde::de::Error>::custom)?;
+
+        let devices = match RECORDING {
+            true => audio.audio_recording_device_ids(),
+            false => audio.audio_playback_device_ids(),
+        }
         .map_err(<D::Error as serde::de::Error>::custom)?;
 
         for device in devices {
+            log::debug!("{:?} == {name}", device.name());
             if device.name().is_ok_and(|device_name| name == device_name) {
                 return Ok(RawAudioDevice(AudioDevice::Device(device, name.into())));
             }
@@ -385,7 +389,7 @@ const fn default_volume() -> f32 {
 
 #[inline(always)]
 const fn default_text_scale() -> f32 {
-    1.2
+    1.3
 }
 
 #[inline(always)]
@@ -416,4 +420,8 @@ fn default_claude_model() -> String {
 #[inline(always)]
 fn default_claude_effort() -> String {
     String::from("high")
+}
+
+fn default_skill_path() -> Utf8PathBuf {
+    Utf8PathBuf::from("skill")
 }

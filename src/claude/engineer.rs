@@ -21,6 +21,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
     fmt::Write,
+    ops::Deref,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
@@ -30,9 +31,9 @@ use std::{
 };
 
 /// The race engineer's instructions (`assets/skill/SKILL.md`), for the system prompt.
-pub const SKILL: &str = include_str!("../../assets/skill/SKILL.md");
+pub const SKILL_PATH: &str = "SKILL.md";
 /// The database's schema and gotchas, for the `schema` command.
-pub const SCHEMA: &str = include_str!("../../assets/skill/references/schema.md");
+pub const SCHEMA_PATH: &str = "references/schema.md";
 
 const WHEELS: [&str; 4] = ["FL", "FR", "RL", "RR"];
 /// Max cars LMU maps (104) plus slack
@@ -43,17 +44,21 @@ const FRAME_SCAN: i64 = 1500;
 const SQL_TIME: Duration = Duration::from_secs(10);
 
 /// The race engineer's instructions without the skill's front matter.
-pub fn instructions() -> &'static str {
-    SKILL
+pub fn instructions(skill: String) -> String {
+    match skill
         .strip_prefix("---")
         .and_then(|rest| rest.split_once("\n---"))
-        .map_or(SKILL, |(_, body)| body.trim_start())
+    {
+        Some((_, body)) => body.trim_start().to_owned(),
+        None => skill,
+    }
 }
 
 /// The tool, for one database. Cheap to clone.
 #[derive(Clone)]
 pub struct Engineer {
     inner: Arc<Inner>,
+    schema: Arc<str>,
 }
 
 struct Inner {
@@ -66,9 +71,10 @@ struct Inner {
 impl Engineer {
     pub const NAME: &'static str = "engineer";
 
-    pub fn new(db: Pool) -> Self {
+    pub fn new(db: Pool, schema: Arc<str>) -> Self {
         let path = db.database().path().to_owned();
         Self {
+            schema,
             inner: Arc::new(Inner {
                 db,
                 path,
@@ -181,12 +187,13 @@ impl Engineer {
     /// The command's text, and whether the history cache should be warmed.
     async fn query(&self, input: EngineerInput) -> anyhow::Result<(String, bool)> {
         if input.command == Command::Schema {
-            return Ok((SCHEMA.into(), false));
+            return Ok((self.schema.deref().to_owned(), false));
         }
 
         let conn = self.inner.db.get().await?;
         let inner = self.inner.clone();
-        conn.run(move |conn| run(conn, &inner, &input))
+        let schema = self.schema.clone();
+        conn.run(move |conn| run(conn, &schema, &inner, &input))
             .await
             .map_err(|e| match e.downcast_ref::<rusqlite::Error>() {
                 Some(rusqlite::Error::SqliteFailure(failure, _))
@@ -291,7 +298,12 @@ fn text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D:
 }
 
 /// The command's text, and whether the history cache should be warmed in the background.
-fn run(conn: &Connection, inner: &Inner, args: &EngineerInput) -> anyhow::Result<(String, bool)> {
+fn run(
+    conn: &Connection,
+    schema: &str,
+    inner: &Inner,
+    args: &EngineerInput,
+) -> anyhow::Result<(String, bool)> {
     let ctx = Ctx::new(conn, inner, args.vehicle)?;
     let mut out = String::new();
     let mut warm = false;
@@ -309,7 +321,7 @@ fn run(conn: &Connection, inner: &Inner, args: &EngineerInput) -> anyhow::Result
         Command::Track => cmd_track(&ctx, &mut out)?,
         Command::Corners => cmd_corners(&ctx, args, &mut out)?,
         Command::Sql => cmd_sql(&ctx, args, &mut out)?,
-        Command::Schema => out.push_str(SCHEMA),
+        Command::Schema => out.push_str(schema),
     }
     Ok((out, warm))
 }
@@ -413,7 +425,11 @@ fn row(conn: &Connection, sql: &str, params: impl Params) -> rusqlite::Result<Op
 }
 
 /// The first column of the first row, `None` when there's no row or it's NULL.
-fn scalar<T: FromSql>(conn: &Connection, sql: &str, params: impl Params) -> rusqlite::Result<Option<T>> {
+fn scalar<T: FromSql>(
+    conn: &Connection,
+    sql: &str,
+    params: impl Params,
+) -> rusqlite::Result<Option<T>> {
     let mut stmt = conn.prepare_cached(sql)?;
     let mut rows = stmt.query(params)?;
     match rows.next()? {
@@ -596,7 +612,10 @@ fn pit_window(ctx: &Ctx) -> anyhow::Result<(Option<String>, bool)> {
     }
 
     let me = sc.player.as_ref();
-    if let Some(owed) = me.and_then(|me| me.text("mandatory_pit_stop")).filter(|owed| *owed != "none") {
+    if let Some(owed) = me
+        .and_then(|me| me.text("mandatory_pit_stop"))
+        .filter(|owed| *owed != "none")
+    {
         parts.push(format!("mandatory stop {}", owed.replace('_', " ")));
         if owed.starts_with("unserved") && matches!(status, Some("open" | "closed")) {
             let lap_time = me
@@ -637,10 +656,13 @@ impl<'a> Ctx<'a> {
                     [],
                 )?
                 else {
-                    bail!("no rows flagged is_player = 1 (spectating, or the player isn't in a car yet)");
+                    bail!(
+                        "no rows flagged is_player = 1 (spectating, or the player isn't in a car yet)"
+                    );
                 };
                 (
-                    row.i("vehicle_id").context("the player's row has no vehicle_id")?,
+                    row.i("vehicle_id")
+                        .context("the player's row has no vehicle_id")?,
                     row.i("id").unwrap_or(0),
                     "is_player = 1".to_owned(),
                 )
@@ -708,15 +730,16 @@ impl<'a> Ctx<'a> {
         let mut best = BTreeMap::<i64, ((f64, i64), Row)>::new();
         // Per car, the row closest in time (then in id) to the player's row
         for r in rows {
-            let (Some(rt), Some(vehicle), Some(id)) = (r.f("session_time"), r.i("vehicle_id"), r.i("id"))
+            let (Some(rt), Some(vehicle), Some(id)) =
+                (r.f("session_time"), r.i("vehicle_id"), r.i("id"))
             else {
                 continue;
             };
             let key = ((rt - t).abs(), (id - self.last_id).abs());
             if key.0 < 1.0
-                && best.get(&vehicle).is_none_or(|(old, _)| {
-                    key.0 < old.0 || (key.0 == old.0 && key.1 < old.1)
-                })
+                && best
+                    .get(&vehicle)
+                    .is_none_or(|(old, _)| key.0 < old.0 || (key.0 == old.0 && key.1 < old.1))
             {
                 best.insert(vehicle, (key, r));
             }
@@ -881,10 +904,14 @@ impl Scoring {
         ];
 
         if let Some(max_laps) = s.i("max_laps").filter(|n| *n != 0) {
-            let done = self.order().first().and_then(|leader| leader.i("laps_completed"));
+            let done = self
+                .order()
+                .first()
+                .and_then(|leader| leader.i("laps_completed"));
             parts.push(format!(
                 "{max_laps} laps{}",
-                done.map(|done| format!(", leader has done {done}")).unwrap_or_default()
+                done.map(|done| format!(", leader has done {done}"))
+                    .unwrap_or_default()
             ));
         }
         if let Some(left) = self.time_left(now) {
@@ -966,7 +993,11 @@ impl Scoring {
 
     /// The forecast from now to the end of this session, plus the race's if this isn't it (LMU
     /// only).
-    fn forecast_line(&self, conn: &Connection, now: Option<f64>) -> rusqlite::Result<Option<String>> {
+    fn forecast_line(
+        &self,
+        conn: &Connection,
+        now: Option<f64>,
+    ) -> rusqlite::Result<Option<String>> {
         let Some(s) = &self.session else {
             return Ok(None);
         };
@@ -1017,10 +1048,17 @@ impl Scoring {
                     }
                     for r in rows.iter().filter(|r| fraction(r) > progress) {
                         let minutes = (fraction(r) * end - now) / 60.0;
-                        parts.push(format!("{} in {minutes:.0} min: {}", mark(fraction(r)), point(r)));
+                        parts.push(format!(
+                            "{} in {minutes:.0} min: {}",
+                            mark(fraction(r)),
+                            point(r)
+                        ));
                     }
                 }
-                _ => parts.extend(rows.iter().map(|r| format!("{} {}", mark(fraction(r)), point(r)))),
+                _ => parts.extend(
+                    rows.iter()
+                        .map(|r| format!("{} {}", mark(fraction(r)), point(r))),
+                ),
             }
 
             if let Some(wet) = wettest(&rows)
@@ -1054,7 +1092,10 @@ impl Scoring {
                     ),
                     false => "race: dry".into(),
                 };
-                let temps = race.iter().filter_map(|r| r.f("temperature")).collect::<Vec<_>>();
+                let temps = race
+                    .iter()
+                    .filter_map(|r| r.f("temperature"))
+                    .collect::<Vec<_>>();
                 if !temps.is_empty() {
                     let min = temps.iter().copied().fold(f64::INFINITY, f64::min);
                     let max = temps.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -1071,7 +1112,11 @@ impl Scoring {
 
     /// The highest rain chance from now to the end of this session, minutes until that point, and
     /// rain on track now, from the forecast (no forecast, or a session without an end time: `None`).
-    fn rain_ahead(&self, conn: &Connection, now: Option<f64>) -> rusqlite::Result<Option<(f64, f64, Option<f64>)>> {
+    fn rain_ahead(
+        &self,
+        conn: &Connection,
+        now: Option<f64>,
+    ) -> rusqlite::Result<Option<(f64, f64, Option<f64>)>> {
         let Some(s) = &self.session else {
             return Ok(None);
         };
@@ -1098,7 +1143,10 @@ impl Scoring {
         let s = self.session.as_ref()?;
         let steps = steps?;
         let per_penalty = s.i("track_limits_steps_per_penalty").filter(|n| *n != 0)?;
-        let per_point = s.i("track_limits_steps_per_point").filter(|n| *n != 0).unwrap_or(1);
+        let per_point = s
+            .i("track_limits_steps_per_point")
+            .filter(|n| *n != 0)
+            .unwrap_or(1);
         let left = (per_penalty - steps).max(0);
         Some((steps, per_penalty, (left + per_point - 1) / per_point))
     }
@@ -1115,7 +1163,10 @@ fn resolve_vehicle(ctx: &Ctx, text: &str) -> anyhow::Result<i64> {
     let hits = sc
         .cars
         .values()
-        .filter(|r| r.text("driver").is_some_and(|d| d.to_lowercase().contains(&needle)))
+        .filter(|r| {
+            r.text("driver")
+                .is_some_and(|d| d.to_lowercase().contains(&needle))
+        })
         .collect::<Vec<_>>();
     if let [hit] = hits[..]
         && let Some(id) = hit.i("vehicle_id")
@@ -1126,7 +1177,13 @@ fn resolve_vehicle(ctx: &Ctx, text: &str) -> anyhow::Result<i64> {
     let drivers = sc
         .order()
         .iter()
-        .map(|r| format!("{} = {}", r.text("driver").unwrap_or("-"), int(r.i("vehicle_id"))))
+        .map(|r| {
+            format!(
+                "{} = {}",
+                r.text("driver").unwrap_or("-"),
+                int(r.i("vehicle_id"))
+            )
+        })
         .collect::<Vec<_>>();
     bail!("no single driver matches '{text}': {}", drivers.join(", "))
 }
@@ -1255,9 +1312,12 @@ impl History {
                  FROM telemetry WHERE id BETWEEN ? AND ? GROUP BY vehicle_id, lap",
                 params![from, hi],
             )? {
-                let (Some(vehicle), Some(lap), Some(first_id), Some(last_id)) =
-                    (r.i("vehicle_id"), r.i("lap"), r.i("first_id"), r.i("last_id"))
-                else {
+                let (Some(vehicle), Some(lap), Some(first_id), Some(last_id)) = (
+                    r.i("vehicle_id"),
+                    r.i("lap"),
+                    r.i("first_id"),
+                    r.i("last_id"),
+                ) else {
                     continue;
                 };
                 let state = car_state(conn, vehicle, last_id)?;
@@ -1435,7 +1495,8 @@ fn lap_table(ctx: &Ctx, vehicle: i64) -> anyhow::Result<Vec<Lap>> {
         let ve_1 = next.as_ref().map_or(lap.ve_end, |next| next.ve_start);
         lap.fuel_used = lap.fuel_start.zip(fuel_1).map(|(a, b)| a - b);
         lap.ve_used = lap.ve_start.zip(ve_1).map(|(a, b)| a - b);
-        lap.refuelled = lap.fuel_used.is_some_and(|f| f < -0.5) || lap.ve_used.is_some_and(|v| v < -0.01);
+        lap.refuelled =
+            lap.fuel_used.is_some_and(|f| f < -0.5) || lap.ve_used.is_some_and(|v| v < -0.01);
         lap.contact = lap.impact.is_some_and(|impact| impact > 0.0) && lap.impact != prev_impact;
         if lap.impact.is_some_and(|impact| impact != 0.0) {
             prev_impact = lap.impact;
@@ -1477,10 +1538,17 @@ fn cmd_laps(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Result
         out,
         "LAPS {}{} - current session; best valid green lap: {}",
         sc.label(vehicle),
-        if vehicle == ctx.vehicle { " (player)" } else { "" },
+        if vehicle == ctx.vehicle {
+            " (player)"
+        } else {
+            ""
+        },
         best.map_or("-".into(), |b| format!("L{} {}", b.lap, fmt_lap(b.time)))
     );
-    say!(out, "lap  time       flags              fuelL  VE%   gapAhead gapBehind  wear-remaining FL/FR/RL/RR");
+    say!(
+        out,
+        "lap  time       flags              fuelL  VE%   gapAhead gapBehind  wear-remaining FL/FR/RL/RR"
+    );
 
     let shown = match args.last {
         Some(last) if last > 0 => &laps[laps.len().saturating_sub(last)..],
@@ -1533,7 +1601,10 @@ fn cmd_laps(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Result
             (0..4).map(rem).collect::<Vec<_>>().join("/")
         );
     }
-    say!(out, "(fuel/VE = used during that lap; gaps = standings gaps in seconds at the end of the lap)");
+    say!(
+        out,
+        "(fuel/VE = used during that lap; gaps = standings gaps in seconds at the end of the lap)"
+    );
     Ok(())
 }
 
@@ -1566,7 +1637,8 @@ fn race_need(
     if s.is_none() && args.race_time_left.is_none() {
         return Ok((
             None,
-            "unknown (no session data): ask the pilot or pass race_laps_left / race_time_left".into(),
+            "unknown (no session data): ask the pilot or pass race_laps_left / race_time_left"
+                .into(),
         ));
     }
 
@@ -1576,8 +1648,10 @@ fn race_need(
         .map(|kind| format!("this is {kind}, not a race"));
 
     let mut needs = Vec::<(f64, String)>::new();
-    if let (Some(max_laps), Some(me)) = (s.and_then(|s| s.i("max_laps")).filter(|n| *n != 0), &sc.player)
-        && let Some(completed) = me.i("laps_completed")
+    if let (Some(max_laps), Some(me)) = (
+        s.and_then(|s| s.i("max_laps")).filter(|n| *n != 0),
+        &sc.player,
+    ) && let Some(completed) = me.i("laps_completed")
     {
         // A lapped car finishes when it crosses the line after the leader has done max_laps
         let n = (max_laps - me.i("laps_behind_leader").unwrap_or(0) - completed) as f64 - frac;
@@ -1622,10 +1696,17 @@ fn race_need(
             mine += avg;
             n += 1.0;
         }
-        let source = if args.race_time_left.is_none() { " (from the session)" } else { " (pilot)" };
+        let source = if args.race_time_left.is_none() {
+            " (from the session)"
+        } else {
+            " (pilot)"
+        };
         needs.push((
             n,
-            format!("{} on the clock{source}, plus the lap to the flag", clock(time_left)),
+            format!(
+                "{} on the clock{source}, plus the lap to the flag",
+                clock(time_left)
+            ),
         ));
     }
 
@@ -1635,10 +1716,14 @@ fn race_need(
     else {
         return Ok((
             None,
-            note.unwrap_or_else(|| "unknown: ask the pilot or pass race_laps_left / race_time_left".into()),
+            note.unwrap_or_else(|| {
+                "unknown: ask the pilot or pass race_laps_left / race_time_left".into()
+            }),
         ));
     };
-    let note = note.map(|note| format!("; NOTE {note}")).unwrap_or_default();
+    let note = note
+        .map(|note| format!("; NOTE {note}"))
+        .unwrap_or_default();
     Ok((Some(need), format!("{source}{note}")))
 }
 
@@ -1651,7 +1736,11 @@ fn cmd_stint(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
         .map_or(0, |i| i + 1);
     let stint = &laps[start..];
     let last_green = |laps: &[Lap]| -> Vec<Lap> {
-        let green = laps.iter().filter(|lap| lap.green).cloned().collect::<Vec<_>>();
+        let green = laps
+            .iter()
+            .filter(|lap| lap.green)
+            .cloned()
+            .collect::<Vec<_>>();
         green[green.len().saturating_sub(5)..].to_vec()
     };
     let mut green = last_green(stint);
@@ -1662,7 +1751,10 @@ fn cmd_stint(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
 
     let p = &ctx.player;
     let lap_now = p.i("lap");
-    let lap_elapsed = p.f("session_time").zip(p.f("lap_start_time")).map(|(t, s)| t - s);
+    let lap_elapsed = p
+        .f("session_time")
+        .zip(p.f("lap_start_time"))
+        .map(|(t, s)| t - s);
     let times = green.iter().filter_map(|lap| lap.time).collect::<Vec<_>>();
     let avg_time = (!times.is_empty()).then(|| times.iter().sum::<f64>() / times.len() as f64);
     let frac = match (avg_time, lap_elapsed) {
@@ -1677,15 +1769,30 @@ fn cmd_stint(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
         int(lap_now),
         frac * 100.0
     );
-    let trend = match (green.first().and_then(|l| l.time), green.last().and_then(|l| l.time)) {
+    let trend = match (
+        green.first().and_then(|l| l.time),
+        green.last().and_then(|l| l.time),
+    ) {
         (Some(first), Some(last)) if green.len() > 1 => {
-            format!(", trend {:+.2}s/lap", (last - first) / (green.len() - 1).max(1) as f64)
+            format!(
+                ", trend {:+.2}s/lap",
+                (last - first) / (green.len() - 1).max(1) as f64
+            )
         }
         _ => String::new(),
     };
-    say!(out, "pace (last {} green laps): avg {}{trend}", green.len(), fmt_lap(avg_time));
+    say!(
+        out,
+        "pace (last {} green laps): avg {}{trend}",
+        green.len(),
+        fmt_lap(avg_time)
+    );
 
-    let mut project = |name: &str, now: Option<f64>, per_lap: Option<f64>, as_pct: bool| -> Option<f64> {
+    let mut project = |name: &str,
+                       now: Option<f64>,
+                       per_lap: Option<f64>,
+                       as_pct: bool|
+     -> Option<f64> {
         let (Some(now), Some(per_lap)) = (now, per_lap.filter(|p| *p != 0.0)) else {
             say!(out, "{name}: no data");
             return None;
@@ -1705,9 +1812,23 @@ fn cmd_stint(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
         Some(laps_left)
     };
 
-    let average = |values: Vec<f64>| (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64);
-    let ve_use = average(green.iter().filter_map(|l| l.ve_used).filter(|v| *v > 0.0).collect());
-    let fuel_use = average(green.iter().filter_map(|l| l.fuel_used).filter(|v| *v > 0.0).collect());
+    let average = |values: Vec<f64>| {
+        (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+    };
+    let ve_use = average(
+        green
+            .iter()
+            .filter_map(|l| l.ve_used)
+            .filter(|v| *v > 0.0)
+            .collect(),
+    );
+    let fuel_use = average(
+        green
+            .iter()
+            .filter_map(|l| l.fuel_used)
+            .filter(|v| *v > 0.0)
+            .collect(),
+    );
     let ve = p.f("virtual_energy");
     let ve_laps = match ve {
         Some(ve) if ve != 0.0 => project("virtual energy", Some(ve), ve_use, ve <= 1.0),
@@ -1783,10 +1904,19 @@ fn cmd_stint(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
                 }
                 let left = if remaining { now } else { 1.0 - now };
                 let rate = (first - now).abs() / n;
-                Some(format!("{} {:.0}% left, -{:.2}%/lap", WHEELS[w], left * 100.0, rate * 100.0))
+                Some(format!(
+                    "{} {:.0}% left, -{:.2}%/lap",
+                    WHEELS[w],
+                    left * 100.0,
+                    rate * 100.0
+                ))
             })
             .collect::<Vec<_>>();
-        say!(out, "tyres this stint ({n:.1} laps on them): {}", parts.join("; "));
+        say!(
+            out,
+            "tyres this stint ({n:.1} laps on them): {}",
+            parts.join("; ")
+        );
     }
 
     let sc = ctx.scoring()?;
@@ -1826,10 +1956,19 @@ fn rel(player: &Row, other: &Row) -> Option<(f64, f64)> {
 /// Vehicle ids in running order, each one's place, and whether that's the official order (from
 /// the standings) or an estimate from telemetry: more laps first, then whoever started the
 /// current lap earlier, exact at the line but possibly wrong mid-lap.
-fn positions(ctx: &Ctx, frame: &BTreeMap<i64, Row>) -> anyhow::Result<(Vec<i64>, HashMap<i64, usize>, bool)> {
+fn positions(
+    ctx: &Ctx,
+    frame: &BTreeMap<i64, Row>,
+) -> anyhow::Result<(Vec<i64>, HashMap<i64, usize>, bool)> {
     let sc = ctx.scoring()?;
     let (ids, exact) = match sc.cars.is_empty() {
-        false => (sc.order().iter().filter_map(|r| r.i("vehicle_id")).collect::<Vec<_>>(), true),
+        false => (
+            sc.order()
+                .iter()
+                .filter_map(|r| r.i("vehicle_id"))
+                .collect::<Vec<_>>(),
+            true,
+        ),
         true => {
             let mut order = frame.values().collect::<Vec<_>>();
             order.sort_by(|a, b| {
@@ -1842,7 +1981,10 @@ fn positions(ctx: &Ctx, frame: &BTreeMap<i64, Row>) -> anyhow::Result<(Vec<i64>,
                             .unwrap_or(Ordering::Equal),
                     )
             });
-            (order.iter().filter_map(|r| r.i("vehicle_id")).collect(), false)
+            (
+                order.iter().filter_map(|r| r.i("vehicle_id")).collect(),
+                false,
+            )
         }
     };
     let place = ids.iter().enumerate().map(|(i, v)| (*v, i + 1)).collect();
@@ -1912,11 +2054,23 @@ fn cmd_nearby(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resu
     for (_, vehicle, forward, right, r) in near {
         let side = if right > 0.0 { "RIGHT" } else { "LEFT" };
         let place_desc = if forward.abs() < 5.5 && 1.0 < right.abs() && right.abs() < 6.0 {
-            format!("ALONGSIDE {side} ({:.1} m across, {forward:+.1} m)", right.abs())
+            format!(
+                "ALONGSIDE {side} ({:.1} m across, {forward:+.1} m)",
+                right.abs()
+            )
         } else if forward > 0.0 {
-            format!("ahead {forward:.0} m ({:.1} m {})", right.abs(), side.to_lowercase())
+            format!(
+                "ahead {forward:.0} m ({:.1} m {})",
+                right.abs(),
+                side.to_lowercase()
+            )
         } else {
-            format!("behind {:.0} m ({:.1} m {})", -forward, right.abs(), side.to_lowercase())
+            format!(
+                "behind {:.0} m ({:.1} m {})",
+                -forward,
+                right.abs(),
+                side.to_lowercase()
+            )
         };
         let laps_diff = r.i("lap").unwrap_or(0) - p.i("lap").unwrap_or(0);
         let lap_info = match laps_diff.cmp(&0) {
@@ -1940,9 +2094,17 @@ fn cmd_nearby(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resu
             sc.label(vehicle),
             place_text(sc, vehicle, &place, exact),
             kmh(r.f("speed")),
-            if closing > 0.0 { "you are faster" } else { "they are faster" },
+            if closing > 0.0 {
+                "you are faster"
+            } else {
+                "they are faster"
+            },
             closing.abs() * 3.6,
-            if r.b("in_pit_lane") { "; IN PIT LANE" } else { "" }
+            if r.b("in_pit_lane") {
+                "; IN PIT LANE"
+            } else {
+                ""
+            }
         );
     }
 
@@ -1999,8 +2161,14 @@ fn cmd_field(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     let sc = ctx.scoring()?;
     let frame = ctx.frame()?;
     if !sc.cars.is_empty() {
-        say!(out, "FIELD (official standings; gaps are from each car's last scoring row, up to a sector old)");
-        say!(out, " P  cls  car  driver               class        laps  last lap   best lap   gap->next  pits pen  status");
+        say!(
+            out,
+            "FIELD (official standings; gaps are from each car's last scoring row, up to a sector old)"
+        );
+        say!(
+            out,
+            " P  cls  car  driver               class        laps  last lap   best lap   gap->next  pits pen  status"
+        );
         for r in sc.order() {
             let vehicle = r.i("vehicle_id").unwrap_or(-1);
             let tel = frame.get(&vehicle);
@@ -2027,7 +2195,11 @@ fn cmd_field(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
                 (_, Some(laps)) => format!("{laps} lap"),
                 _ => fmt(r.f("time_behind_next"), 1, "s"),
             };
-            let tag = if vehicle == ctx.vehicle { " <- YOU" } else { "" };
+            let tag = if vehicle == ctx.vehicle {
+                " <- YOU"
+            } else {
+                ""
+            };
             let status = match status.is_empty() {
                 true => "on track".into(),
                 false => status.join(", "),
@@ -2052,15 +2224,20 @@ fn cmd_field(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     // No standings yet (the first seconds of a session): estimated from telemetry
     let mut order = frame.values().collect::<Vec<_>>();
     order.sort_by(|a, b| {
-        (-a.i("lap").unwrap_or(0)).cmp(&-b.i("lap").unwrap_or(0)).then(
-            a.f("lap_start_time")
-                .unwrap_or(0.0)
-                .partial_cmp(&b.f("lap_start_time").unwrap_or(0.0))
-                .unwrap_or(Ordering::Equal),
-        )
+        (-a.i("lap").unwrap_or(0))
+            .cmp(&-b.i("lap").unwrap_or(0))
+            .then(
+                a.f("lap_start_time")
+                    .unwrap_or(0.0)
+                    .partial_cmp(&b.f("lap_start_time").unwrap_or(0.0))
+                    .unwrap_or(Ordering::Equal),
+            )
     });
     let history = ctx.history()?;
-    say!(out, "FIELD (approx order by laps + time of last line crossing; no standings yet)");
+    say!(
+        out,
+        "FIELD (approx order by laps + time of last line crossing; no standings yet)"
+    );
     say!(out, " P  car  lap  last lap   best lap   pits  status");
     for (i, r) in order.iter().enumerate() {
         let vehicle = r.i("vehicle_id").unwrap_or(-1);
@@ -2069,7 +2246,11 @@ fn cmd_field(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
             .windows(2)
             .filter_map(|w| {
                 let (a, b) = (&w[0].1, &w[1].1);
-                Some((b.start? - a.start?, a.invalid.unwrap_or(0) != 0, a.pit.unwrap_or(0) != 0))
+                Some((
+                    b.start? - a.start?,
+                    a.invalid.unwrap_or(0) != 0,
+                    a.pit.unwrap_or(0) != 0,
+                ))
             })
             .collect::<Vec<_>>();
         let last = times.last().map(|t| t.0);
@@ -2077,12 +2258,25 @@ fn cmd_field(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
             .iter()
             .filter(|(_, invalid, pit)| !invalid && !pit)
             .map(|t| t.0)
-            .fold(None, |best: Option<f64>, t| Some(best.map_or(t, |b| b.min(t))));
+            .fold(None, |best: Option<f64>, t| {
+                Some(best.map_or(t, |b| b.min(t)))
+            });
         let in_pit = |agg: &LapAggregate| agg.pit.unwrap_or(0) != 0;
-        let pits = laps.windows(2).filter(|w| in_pit(&w[0].1) && !in_pit(&w[1].1)).count()
+        let pits = laps
+            .windows(2)
+            .filter(|w| in_pit(&w[0].1) && !in_pit(&w[1].1))
+            .count()
             + usize::from(laps.last().is_some_and(|l| in_pit(&l.1)));
-        let tag = if vehicle == ctx.vehicle { " <- YOU" } else { "" };
-        let status = if r.b("in_pit_lane") { "PIT LANE" } else { "on track" };
+        let tag = if vehicle == ctx.vehicle {
+            " <- YOU"
+        } else {
+            ""
+        };
+        let status = if r.b("in_pit_lane") {
+            "PIT LANE"
+        } else {
+            "on track"
+        };
         say!(
             out,
             "{:>2}  {vehicle:>3}  {:>3}  {:>9}  {:>9}  {pits:>4}  {status}{tag}",
@@ -2148,7 +2342,9 @@ fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
         Some(_) => {}
         None => {
             if let Some(steps) = steps.filter(|s| *s != 0) {
-                info.push(format!("track-limit steps {steps} (penalty threshold unknown)"));
+                info.push(format!(
+                    "track-limit steps {steps} (penalty threshold unknown)"
+                ));
             }
         }
     }
@@ -2176,7 +2372,11 @@ fn cmd_status(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         .map(|age| {
             format!(
                 " | db last written {age:.0}s ago{}",
-                if age > 10.0 { " (STALE: game paused or logger stopped?)" } else { "" }
+                if age > 10.0 {
+                    " (STALE: game paused or logger stopped?)"
+                } else {
+                    ""
+                }
             )
         })
         .unwrap_or_default();
@@ -2249,13 +2449,18 @@ fn cmd_status(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
 
     let laps = lap_table(ctx, ctx.vehicle)?;
     let remaining = wear_remaining(&laps);
-    say!(out, "tyres        wear-left  surface L/C/R C   core C  carcass C  press kPa  brake C  flat");
+    say!(
+        out,
+        "tyres        wear-left  surface L/C/R C   core C  carcass C  press kPa  brake C  flat"
+    );
     let mut optimal = None;
     for w in 0..4 {
         let Some(r) = wheels.get(&w) else {
             continue;
         };
-        let left = r.f("tire_wear").map(|wear| if remaining { wear } else { 1.0 - wear });
+        let left = r
+            .f("tire_wear")
+            .map(|wear| if remaining { wear } else { 1.0 - wear });
         optimal = r.f("tire_optimal_temperature");
         say!(
             out,
@@ -2273,7 +2478,11 @@ fn cmd_status(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         );
     }
     if let Some(optimal) = optimal.filter(|o| *o != 0.0) {
-        let celsius = if optimal > 200.0 { optimal - 273.15 } else { optimal };
+        let celsius = if optimal > 200.0 {
+            optimal - 273.15
+        } else {
+            optimal
+        };
         say!(
             out,
             "  optimal tyre temp reported: {celsius:.0} C  (L/C/R = left/centre/right tread edge seen from behind the car; inside edge = R on left tyres, L on right tyres; core = inner rubber layer, not the inside edge)"
@@ -2284,11 +2493,18 @@ fn cmd_status(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         "engine water {}, oil {}, overheating {}",
         fmt(p.f("engine_water_temperature"), 0, " C"),
         fmt(p.f("engine_oil_temperature"), 0, " C"),
-        if p.b("engine_overheating") { "YES" } else { "no" }
+        if p.b("engine_overheating") {
+            "YES"
+        } else {
+            "no"
+        }
     );
 
-    let dents = (0..8).map(|i| p.i(&format!("dent_severity_{i}"))).collect::<Vec<_>>();
-    let mut damage = match dents.iter().any(|d| d.is_some_and(|d| d != 0)) || p.b("parts_detached") {
+    let dents = (0..8)
+        .map(|i| p.i(&format!("dent_severity_{i}")))
+        .collect::<Vec<_>>();
+    let mut damage = match dents.iter().any(|d| d.is_some_and(|d| d != 0)) || p.b("parts_detached")
+    {
         false => "none".to_owned(),
         true => format!(
             "dents [{}] (0 none,1 some,2 more), parts detached: {}",
@@ -2423,10 +2639,16 @@ fn num(value: &Json, key: &str) -> Option<f64> {
 
 fn turn_text(turn: &Json) -> String {
     let label = [
-        turn.get("number")
-            .filter(|n| !n.is_null())
-            .map(|n| format!("T{}", n.as_str().map_or_else(|| n.to_string(), str::to_owned))),
-        turn.get("name").and_then(Json::as_str).filter(|n| !n.is_empty()).map(str::to_owned),
+        turn.get("number").filter(|n| !n.is_null()).map(|n| {
+            format!(
+                "T{}",
+                n.as_str().map_or_else(|| n.to_string(), str::to_owned)
+            )
+        }),
+        turn.get("name")
+            .and_then(Json::as_str)
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned),
     ]
     .into_iter()
     .flatten()
@@ -2438,11 +2660,14 @@ fn turn_text(turn: &Json) -> String {
         Some(1) => Some("right"),
         _ => None,
     };
-    let how = [direction, turn.get("scale").and_then(Json::as_i64).and_then(tightness)]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(", ");
+    let how = [
+        direction,
+        turn.get("scale").and_then(Json::as_i64).and_then(tightness),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ");
     match how.is_empty() {
         true => label,
         false => format!("{label} ({how})"),
@@ -2470,7 +2695,11 @@ fn on_part(fraction: f64, part: &Json) -> bool {
 
 /// Where a lap fraction is: the turn or straight it's on, and the next turn and the pit entry
 /// (when it's within a kilometre) with the metres to them.
-fn track_position(track: &Json, fraction: f64, length: f64) -> (Option<String>, Vec<(String, f64)>) {
+fn track_position(
+    track: &Json,
+    fraction: f64,
+    length: f64,
+) -> (Option<String>, Vec<(String, f64)>) {
     let turns = json_list(track, "turn")
         .into_iter()
         .filter(|t| num(t, "start").is_some())
@@ -2491,7 +2720,12 @@ fn track_position(track: &Json, fraction: f64, length: f64) -> (Option<String>, 
     let next = turns
         .iter()
         .filter(|t| !on_part(fraction, t))
-        .map(|t| ((num(t, "start").unwrap_or(0.0) - fraction).rem_euclid(1.0), t))
+        .map(|t| {
+            (
+                (num(t, "start").unwrap_or(0.0) - fraction).rem_euclid(1.0),
+                t,
+            )
+        })
         .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
     if let Some((gap, turn)) = next {
         ahead.push((turn_text(turn), gap * length));
@@ -2533,7 +2767,11 @@ fn track_line(ctx: &Ctx, sc: &Scoring) -> Option<String> {
             .map(|p| format!(", {} {p}", if p.contains('(') { "in" } else { "on" }))
             .unwrap_or_default()
     )];
-    parts.extend(ahead.into_iter().map(|(text, metres)| format!("{text} in {metres:.0} m")));
+    parts.extend(
+        ahead
+            .into_iter()
+            .map(|(text, metres)| format!("{text} in {metres:.0} m")),
+    );
     Some(parts.join(" | "))
 }
 
@@ -2630,8 +2868,11 @@ fn cmd_track(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         say!(
             out,
             "PIT LANE{}{}",
-            entry.map(|e| format!(" entry {}", at(e))).unwrap_or_default(),
-            exit.map(|e| format!(", exit {}", at(e))).unwrap_or_default()
+            entry
+                .map(|e| format!(" entry {}", at(e)))
+                .unwrap_or_default(),
+            exit.map(|e| format!(", exit {}", at(e)))
+                .unwrap_or_default()
         );
     }
 
@@ -2660,7 +2901,11 @@ fn cmd_track(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
                             .join(", ")
                     })
                     .unwrap_or_default();
-                let yours = if Some(class.as_str()) == mine { " (your class)" } else { "" };
+                let yours = if Some(class.as_str()) == mine {
+                    " (your class)"
+                } else {
+                    ""
+                };
                 format!("{class}{yours}: {losses}")
             })
             .collect::<Vec<_>>();
@@ -2782,8 +3027,13 @@ impl Trace {
         if trace.v[n - 1].is_none() && n > 1 {
             trace.v[n - 1] = trace.v[n - 2];
         }
-        let inner = if n > 2 { &trace.brake[1..n - 1] } else { &[][..] };
-        trace.has_pedals = inner.iter().any(Option::is_some) && inner.iter().any(|b| b.unwrap_or(0.0) > 0.0);
+        let inner = if n > 2 {
+            &trace.brake[1..n - 1]
+        } else {
+            &[][..]
+        };
+        trace.has_pedals =
+            inner.iter().any(Option::is_some) && inner.iter().any(|b| b.unwrap_or(0.0) > 0.0);
         trace.ok = trace.d.len() > 50 && *trace.d.last().unwrap() >= length * 0.98;
         Ok(trace)
     }
@@ -2807,7 +3057,10 @@ impl Trace {
     fn span(&self, a: f64, b: f64) -> f64 {
         match b >= a {
             true => self.time_at(b) - self.time_at(a),
-            false => (self.time_at(self.length) - self.time_at(a)) + (self.time_at(b) - self.time_at(0.0)),
+            false => {
+                (self.time_at(self.length) - self.time_at(a))
+                    + (self.time_at(b) - self.time_at(0.0))
+            }
         }
     }
 
@@ -2819,7 +3072,9 @@ impl Trace {
     /// Sample indices from distance a to b (wrapping).
     fn indices(&self, a: f64, b: f64) -> Vec<usize> {
         match b >= a {
-            true => (self.index(a)..=self.index(b)).filter(|i| *i < self.d.len()).collect(),
+            true => (self.index(a)..=self.index(b))
+                .filter(|i| *i < self.d.len())
+                .collect(),
             false => {
                 let mut indices = self.indices(a, self.length);
                 indices.extend(self.indices(0.0, b));
@@ -2832,7 +3087,9 @@ impl Trace {
         match self.has_pedals {
             true => self.brake[i].unwrap_or(0.0) >= BRAKE_ON,
             false => previous.is_some_and(|j| match (self.v[i], self.v[j]) {
-                (Some(vi), Some(vj)) if self.t[i] > self.t[j] => (vi - vj) / (self.t[i] - self.t[j]) <= DECEL_ON,
+                (Some(vi), Some(vj)) if self.t[i] > self.t[j] => {
+                    (vi - vj) / (self.t[i] - self.t[j]) <= DECEL_ON
+                }
                 _ => false,
             }),
         }
@@ -2955,7 +3212,11 @@ fn lap_turns(ctx: &Ctx, sc: &Scoring, reference: &Trace) -> (Vec<Turn>, &'static
             .indices(b, next.min(length))
             .into_iter()
             .filter(|&i| reference.v[i].is_some())
-            .min_by(|&a, &b| reference.v[a].partial_cmp(&reference.v[b]).unwrap_or(Ordering::Equal))
+            .min_by(|&a, &b| {
+                reference.v[a]
+                    .partial_cmp(&reference.v[b])
+                    .unwrap_or(Ordering::Equal)
+            })
         else {
             continue;
         };
@@ -2974,7 +3235,11 @@ fn pick_lap<'a>(laps: &'a [Lap], which: &str) -> Option<&'a Lap> {
         "best" => best_lap(laps),
         "last" => laps.iter().filter(|lap| lap.complete).last(),
         number => {
-            let number = number.trim().trim_start_matches(['l', 'L']).parse::<i64>().ok()?;
+            let number = number
+                .trim()
+                .trim_start_matches(['l', 'L'])
+                .parse::<i64>()
+                .ok()?;
             laps.iter().find(|lap| lap.lap == number)
         }
     }
@@ -3020,7 +3285,10 @@ fn cmd_corners(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Res
     };
     let reference = Trace::new(ctx, ref_vehicle, ref_lap, length)?;
     if !reference.ok {
-        bail!("the reference lap {} has no usable lap_distance trace", ref_lap.lap);
+        bail!(
+            "the reference lap {} has no usable lap_distance trace",
+            ref_lap.lap
+        );
     }
 
     let (turns, source) = lap_turns(ctx, sc, &reference);
@@ -3029,7 +3297,11 @@ fn cmd_corners(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Res
     }
     let ref_name = format!(
         "{}lap {} ({})",
-        if ref_vehicle != me { format!("{} ", sc.label(ref_vehicle)) } else { String::new() },
+        if ref_vehicle != me {
+            format!("{} ", sc.label(ref_vehicle))
+        } else {
+            String::new()
+        },
         ref_lap.lap,
         fmt_lap(ref_lap.time)
     );
@@ -3057,10 +3329,13 @@ fn cmd_corners(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Res
     let ref_m = measure(&reference);
 
     if let Some(turn) = &args.turn {
-        return corner_detail(ctx, turn, &laps, &turns, &bounds, &ref_name, length, source, out);
+        return corner_detail(
+            ctx, turn, &laps, &turns, &bounds, &ref_name, length, source, out,
+        );
     }
 
-    let Some(lap) = pick_lap(&laps, args.lap.as_deref().unwrap_or("last")).filter(|lap| lap.time.is_some())
+    let Some(lap) =
+        pick_lap(&laps, args.lap.as_deref().unwrap_or("last")).filter(|lap| lap.time.is_some())
     else {
         bail!("no complete lap to analyse yet");
     };
@@ -3082,7 +3357,10 @@ fn cmd_corners(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Res
         fmt_lap(lap.time),
         lap.time.unwrap_or(0.0) - ref_lap.time.unwrap_or(0.0)
     );
-    say!(out, "turn                           entry   exit   total | brake (m before apex) lap/ref | min km/h lap/ref | exit km/h lap/ref | full throttle (m after apex) lap/ref");
+    say!(
+        out,
+        "turn                           entry   exit   total | brake (m before apex) lap/ref | min km/h lap/ref | exit km/h lap/ref | full throttle (m after apex) lap/ref"
+    );
 
     let mut totals = Vec::new();
     for ((a, b), t) in m.iter().zip(&ref_m).zip(&turns) {
@@ -3118,13 +3396,24 @@ fn cmd_corners(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Res
         .take(3)
         .filter(|(total, ..)| *total > 0.02)
         .map(|(total, label, de, dx)| {
-            format!("{label}: {total:+.2}s ({})", if de.abs() >= dx.abs() { "entry" } else { "exit" })
+            format!(
+                "{label}: {total:+.2}s ({})",
+                if de.abs() >= dx.abs() {
+                    "entry"
+                } else {
+                    "exit"
+                }
+            )
         })
         .collect::<Vec<_>>();
     say!(
         out,
         "BIGGEST LOSSES {}",
-        if losses.is_empty() { "none".into() } else { losses.join(" | ") }
+        if losses.is_empty() {
+            "none".into()
+        } else {
+            losses.join(" | ")
+        }
     );
     let gains = totals
         .iter()
@@ -3174,14 +3463,26 @@ fn corner_detail(
     }) else {
         bail!(
             "no such turn; turns are: {}",
-            turns.iter().map(|t| t.label.as_str()).collect::<Vec<_>>().join("; ")
+            turns
+                .iter()
+                .map(|t| t.label.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
         );
     };
 
     let t = &turns[k];
     let next = bounds[(k + 1) % turns.len()];
-    say!(out, "CORNER {}: apex at {:.0} m, reference {ref_name} | corners from {source}", t.label, t.apex);
-    say!(out, "lap   time     entry   exit  | brake (m before apex) | min km/h (m before apex) gear | exit km/h | full throttle (m after apex) | flags");
+    say!(
+        out,
+        "CORNER {}: apex at {:.0} m, reference {ref_name} | corners from {source}",
+        t.label,
+        t.apex
+    );
+    say!(
+        out,
+        "lap   time     entry   exit  | brake (m before apex) | min km/h (m before apex) gear | exit km/h | full throttle (m after apex) | flags"
+    );
 
     let mut results = Vec::new();
     for lap in laps.iter().filter(|lap| lap.complete && lap.time.is_some()) {
@@ -3212,15 +3513,17 @@ fn corner_detail(
             kmh(c.vmin),
             int(c.gear),
             kmh(c.vexit),
-            c.throttle.map_or("-".into(), |x| format!("{:.0}", signed(x, t.apex, length)))
+            c.throttle
+                .map_or("-".into(), |x| format!("{:.0}", signed(x, t.apex, length)))
         );
         results.push((lap, c, entry, exit, flags.is_empty()));
     }
 
-    let best = results
-        .iter()
-        .filter(|r| r.4)
-        .min_by(|a, b| (a.2 + a.3).partial_cmp(&(b.2 + b.3)).unwrap_or(Ordering::Equal));
+    let best = results.iter().filter(|r| r.4).min_by(|a, b| {
+        (a.2 + a.3)
+            .partial_cmp(&(b.2 + b.3))
+            .unwrap_or(Ordering::Equal)
+    });
     if let Some(&(lap, c, e, x, _)) = best {
         say!(
             out,
@@ -3234,7 +3537,9 @@ fn corner_detail(
         if let Some(&(last, cl, el, xl, _)) = results.last()
             && last.lap != lap.lap
         {
-            let diff = before(t.apex, cl.brake, length).zip(before(t.apex, c.brake, length)).map(|(a, b)| a - b);
+            let diff = before(t.apex, cl.brake, length)
+                .zip(before(t.apex, c.brake, length))
+                .map(|(a, b)| a - b);
             let braking = match diff {
                 Some(diff) if diff.abs() >= 3.0 => format!(
                     ", braked {:.0} m {}",
@@ -3280,15 +3585,22 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         int(p.i("lap")),
         p.i("sector").unwrap_or(0) + 1,
         fmt(p.f("delta_best"), 2, "s"),
-        if p.b("lap_invalidated") { " | LAP INVALID" } else { "" },
+        if p.b("lap_invalidated") {
+            " | LAP INVALID"
+        } else {
+            ""
+        },
         place_text(sc, ctx.vehicle, &place, exact),
         ids.len(),
         fmt(p.f("gap_to_place_ahead"), 1, ""),
         ahead.map_or("nobody".into(), |v| sc.label(v)),
         fmt(p.f("gap_to_place_behind"), 1, ""),
         behind.map_or("nobody".into(), |v| sc.label(v)),
-        age.map(|age| format!(" | data {age:.0}s old{}", if age > 10.0 { " STALE" } else { "" }))
-            .unwrap_or_default()
+        age.map(|age| format!(
+            " | data {age:.0}s old{}",
+            if age > 10.0 { " STALE" } else { "" }
+        ))
+        .unwrap_or_default()
     );
     if let Some(line) = sc.session_line(now) {
         say!(out, "SESSION {line}");
@@ -3297,7 +3609,11 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     let wheels = ctx.wheels(ctx.player_id())?;
     let weather = sc.weather_line();
     let wet = (0..4)
-        .filter(|w| wheels.get(w).is_some_and(|r| r.i("surface_type") == Some(1)))
+        .filter(|w| {
+            wheels
+                .get(w)
+                .is_some_and(|r| r.i("surface_type") == Some(1))
+        })
         .map(|w| WHEELS[w])
         .collect::<Vec<_>>();
     if weather.is_some() || !wet.is_empty() {
@@ -3305,7 +3621,11 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
             out,
             "WEATHER {}{}",
             weather.as_deref().unwrap_or("-"),
-            if wet.is_empty() { String::new() } else { format!(" | on a wet patch now: {}", wet.join(" ")) }
+            if wet.is_empty() {
+                String::new()
+            } else {
+                format!(" | on a wet patch now: {}", wet.join(" "))
+            }
         );
     }
     if let Some(line) = sc.forecast_line(ctx.conn, now)? {
@@ -3332,7 +3652,11 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
             Ordering::Less => format!(", {} lap down", -laps_diff),
             Ordering::Greater => format!(", {laps_diff} lap up"),
         };
-        if sc.cars.get(vehicle).is_some_and(|st| st.s("flag") == Some("blue")) {
+        if sc
+            .cars
+            .get(vehicle)
+            .is_some_and(|st| st.s("flag") == Some("blue"))
+        {
             tag.push_str(", has blue flag");
         }
         if forward.abs() < 5.5 && 1.0 < across.abs() && across.abs() < 6.0 {
@@ -3364,7 +3688,12 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
             true => " | nobody within 60 m".into(),
             false => format!(
                 " | {}",
-                others.iter().take(3).map(|(_, text)| text.as_str()).collect::<Vec<_>>().join("; ")
+                others
+                    .iter()
+                    .take(3)
+                    .map(|(_, text)| text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ),
         }
     );
@@ -3402,7 +3731,9 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     say!(
         out,
         "TYRES centre temp C: {temps}{} | pressure kPa FL/FR/RL/RR {pressures}",
-        optimal.map(|o| format!(" (optimal {o:.0})")).unwrap_or_default()
+        optimal
+            .map(|o| format!(" (optimal {o:.0})"))
+            .unwrap_or_default()
     );
 
     let mut alerts = Vec::new();
@@ -3452,7 +3783,11 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
             0,
             format!(
                 "dents [{}]",
-                dents.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")
+                dents
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         );
     }
@@ -3471,12 +3806,20 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     say!(
         out,
         "ALERTS (act now) {}",
-        if alerts.is_empty() { "none".into() } else { alerts.join("; ") }
+        if alerts.is_empty() {
+            "none".into()
+        } else {
+            alerts.join("; ")
+        }
     );
     say!(
         out,
         "INFO (only if it bears on the question) {}",
-        if info.is_empty() { "none".into() } else { info.join("; ") }
+        if info.is_empty() {
+            "none".into()
+        } else {
+            info.join("; ")
+        }
     );
     Ok(())
 }
@@ -3506,7 +3849,10 @@ fn cmd_sql(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Result<
     };
     let query = query.trim().trim_end_matches(';');
     let lower = query.to_lowercase();
-    if !["select", "with", "pragma"].iter().any(|p| lower.starts_with(p)) {
+    if !["select", "with", "pragma"]
+        .iter()
+        .any(|p| lower.starts_with(p))
+    {
         bail!("only SELECT / WITH / PRAGMA queries are allowed");
     }
     let limit = args.limit.unwrap_or(60);
@@ -3540,7 +3886,11 @@ fn cmd_sql(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Result<
     ctx.conn
         .progress_handler(10_000, Some(move || Instant::now() > deadline))?;
     let result = (|| -> rusqlite::Result<()> {
-        let names = stmt.column_names().into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let names = stmt
+            .column_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         say!(out, "{}", names.join(" | "));
         let columns = names.len();
         let mut rows = stmt.query([])?;
@@ -3569,7 +3919,9 @@ fn cmd_sql(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Result<
     ctx.conn.progress_handler(0, None::<fn() -> bool>)?;
 
     match result {
-        Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::OperationInterrupted => {
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::OperationInterrupted =>
+        {
             bail!(
                 "the query took longer than {} seconds and was stopped: scope it to the session and a vehicle",
                 SQL_TIME.as_secs()
@@ -3594,23 +3946,28 @@ mod tests {
     fn race() -> (tempfile::TempDir, Engineer) {
         let dir = tempfile::tempdir().unwrap();
         // Every opponent update recorded, so they're in the player's latest frame
-        std::fs::write(dir.path().join("settings.json"), r#"{"opponent_frequency": 1}"#).unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"opponent_frequency": 1}"#,
+        )
+        .unwrap();
         let recorder = Recorder::new(dir.path(), None).unwrap();
 
-        let standing = |vehicle: i64, driver: &str, position: i64, laps: i64, t: f64, last: Option<f64>| {
-            let mut s = lambiase_standing::default();
-            s.session_time = Some(t).into();
-            s.vehicle_id = Some(vehicle).into();
-            s.is_player = Some(vehicle == 1).into();
-            s.driver = Some(driver.to_owned()).into();
-            s.vehicle_class = Some("Hypercar".to_owned()).into();
-            s.position = Some(position).into();
-            s.laps_completed = Some(laps).into();
-            s.last_lap_time = last.into();
-            s.best_lap_time = last.into();
-            s.lap_distance = Some(0.0).into();
-            s
-        };
+        let standing =
+            |vehicle: i64, driver: &str, position: i64, laps: i64, t: f64, last: Option<f64>| {
+                let mut s = lambiase_standing::default();
+                s.session_time = Some(t).into();
+                s.vehicle_id = Some(vehicle).into();
+                s.is_player = Some(vehicle == 1).into();
+                s.driver = Some(driver.to_owned()).into();
+                s.vehicle_class = Some("Hypercar".to_owned()).into();
+                s.position = Some(position).into();
+                s.laps_completed = Some(laps).into();
+                s.last_lap_time = last.into();
+                s.best_lap_time = last.into();
+                s.lap_distance = Some(0.0).into();
+                s
+            };
         let session = |t: f64| {
             let mut s = lambiase_session_info::default();
             s.session_time = Some(t).into();
@@ -3650,9 +4007,20 @@ mod tests {
                 telemetry.heading = Some(0.0).into();
                 // Forward is -z, right is -x
                 telemetry.position_x = Some(if vehicle == 2 { -3.0 } else { 0.0 }).into();
-                telemetry.position_z = Some(-distance + if vehicle == 2 { 3.0 } else { 0.0 }).into();
-                telemetry.brake = Some(if (400.0..450.0).contains(&distance) { 1.0 } else { 0.0 }).into();
-                telemetry.throttle = Some(if (400.0..500.0).contains(&distance) { 0.0 } else { 1.0 }).into();
+                telemetry.position_z =
+                    Some(-distance + if vehicle == 2 { 3.0 } else { 0.0 }).into();
+                telemetry.brake = Some(if (400.0..450.0).contains(&distance) {
+                    1.0
+                } else {
+                    0.0
+                })
+                .into();
+                telemetry.throttle = Some(if (400.0..500.0).contains(&distance) {
+                    0.0
+                } else {
+                    1.0
+                })
+                .into();
                 telemetry.fuel = Some(60.0 - t * 0.02).into();
                 telemetry.virtual_energy = Some(1.0 - t * 0.0005).into();
                 for wheel in &mut telemetry.wheels {
@@ -3683,7 +4051,12 @@ mod tests {
             one,
             one,
         );
-        (dir, Engineer::new(pool))
+        (dir, Engineer::new(pool, schema()))
+    }
+
+    /// The skill's own schema reference, as the app reads it from the assets.
+    fn schema() -> Arc<str> {
+        include_str!("../../assets/skill/references/schema.md").into()
     }
 
     async fn run(engineer: &Engineer, input: serde_json::Value) -> String {
@@ -3699,7 +4072,10 @@ mod tests {
         let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
         assert!(out.starts_with("QUICK lap 3 S1"), "{out}");
         assert!(out.contains("| P1/2 |"), "{out}");
-        assert!(out.contains("right: Lena Fischer (Hypercar, car 2) ALONGSIDE"), "{out}");
+        assert!(
+            out.contains("right: Lena Fischer (Hypercar, car 2) ALONGSIDE"),
+            "{out}"
+        );
         assert!(out.contains("SESSION race | green"), "{out}");
         assert!(out.contains("ALERTS (act now) none"), "{out}");
     }
@@ -3719,7 +4095,11 @@ mod tests {
         assert!(stint.contains("LIMIT:"), "{stint}");
         assert!(stint.contains("race:"), "{stint}");
 
-        let fischer = run(&engineer, serde_json::json!({"command": "laps", "of": "fischer"})).await;
+        let fischer = run(
+            &engineer,
+            serde_json::json!({"command": "laps", "of": "fischer"}),
+        )
+        .await;
         assert!(fischer.starts_with("LAPS Lena Fischer"), "{fischer}");
     }
 
@@ -3730,7 +4110,11 @@ mod tests {
         assert!(out.contains("braking zone 1"), "{out}");
         assert!(out.contains("BIGGEST LOSSES none"), "{out}");
 
-        let turn = run(&engineer, serde_json::json!({"command": "corners", "turn": "braking zone 1"})).await;
+        let turn = run(
+            &engineer,
+            serde_json::json!({"command": "corners", "turn": "braking zone 1"}),
+        )
+        .await;
         assert!(turn.starts_with("CORNER braking zone 1"), "{turn}");
     }
 
@@ -3738,7 +4122,11 @@ mod tests {
     async fn other_commands_answer() {
         let (_dir, engineer) = race();
         for command in ["status", "nearby", "field", "track"] {
-            let out = run(&engineer, serde_json::json!({"command": command, "trend": true})).await;
+            let out = run(
+                &engineer,
+                serde_json::json!({"command": command, "trend": true}),
+            )
+            .await;
             assert!(!out.is_empty(), "{command}");
         }
         let field = run(&engineer, serde_json::json!({"command": "field"})).await;
@@ -3752,7 +4140,12 @@ mod tests {
         assert!(sql.contains("\nn\n"), "{sql}");
 
         let error = engineer
-            .run(serde_json::from_value(serde_json::json!({"command": "sql", "query": "DELETE FROM session"})).unwrap())
+            .run(
+                serde_json::from_value(
+                    serde_json::json!({"command": "sql", "query": "DELETE FROM session"}),
+                )
+                .unwrap(),
+            )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("only SELECT"), "{error}");
@@ -3769,7 +4162,9 @@ mod tests {
         assert_eq!(g4(0.000123456), "0.0001235");
         assert_eq!(g4(81.25), "81.25");
         assert_eq!(clock(905.0), "15:05");
-        assert!(!instructions().starts_with("---"));
+        let instructions = instructions(include_str!("../../assets/skill/SKILL.md").to_owned());
+        assert!(!instructions.starts_with("---"));
+        assert!(instructions.starts_with("# Race engineer"));
     }
 }
 
@@ -3777,7 +4172,8 @@ mod tests {
 /// to compare versions of the skill. Needs `ANTHROPIC_API_KEY`, and spends tokens.
 ///
 /// - `EVAL_DB`: the race's `telemetry.db` (kept looking fresh while the evals run)
-/// - `EVAL_SKILL`: the `SKILL.md` to use (defaults to the built-in one)
+/// - `EVAL_SKILL`, `EVAL_SCHEMA`: the `SKILL.md` and `schema.md` to use (default: the ones in
+///   `assets/skill`)
 /// - `EVAL_OUT`: where each eval's reply goes, as `eval-<id>/<EVAL_CONFIG>/`
 /// - `EVAL_CONFIG` (default `with_skill`), `EVAL_MODEL`, `EVAL_EFFORT`, `EVAL_IDS` (e.g. `1,5,9`)
 #[cfg(test)]
@@ -3829,15 +4225,11 @@ mod evals {
         let config = var("EVAL_CONFIG").unwrap_or_else(|| "with_skill".into());
         let model = var("EVAL_MODEL").unwrap_or_else(|| "claude-sonnet-5-5".into());
         let effort = var("EVAL_EFFORT").unwrap_or_else(|| "high".into());
-        let skill = match var("EVAL_SKILL") {
-            Some(path) => std::fs::read_to_string(path).unwrap(),
-            None => SKILL.to_owned(),
-        };
-        let system = skill
-            .strip_prefix("---")
-            .and_then(|rest| rest.split_once("\n---"))
-            .map_or(skill.as_str(), |(_, body)| body.trim_start())
-            .to_owned();
+        let skill = var("EVAL_SKILL").unwrap_or_else(|| "assets/skill/SKILL.md".into());
+        let system = instructions(std::fs::read_to_string(skill).unwrap());
+        let schema =
+            var("EVAL_SCHEMA").unwrap_or_else(|| "assets/skill/references/schema.md".into());
+        let schema: Arc<str> = std::fs::read_to_string(schema).unwrap().into();
         let ids = var("EVAL_IDS").map(|ids| {
             ids.split(',')
                 .map(|id| id.trim().parse::<u64>().unwrap())
@@ -3872,13 +4264,16 @@ mod evals {
 
             let four = NonZeroUsize::new(4).unwrap();
             let pool = Pool::new(Database::read_only(Arc::new(db.clone())), four, four);
-            let tool = Engineer::new(pool);
+            let tool = Engineer::new(pool, schema);
             tool.warm().await.unwrap();
 
             let runs = evals.iter().map(|eval| {
                 let (tool, system, model, effort) =
                     (tool.clone(), system.clone(), model.clone(), effort.clone());
-                let dir = out.join(format!("eval-{}", eval["id"])).join(&config).join("run-1");
+                let dir = out
+                    .join(format!("eval-{}", eval["id"]))
+                    .join(&config)
+                    .join("run-1");
                 let prompt = eval["prompt"].as_str().unwrap().to_owned();
                 async move {
                     let calls = Arc::new(StdMutex::new(Vec::new()));
@@ -3901,14 +4296,19 @@ mod evals {
                     let outputs = dir.join("outputs");
                     std::fs::create_dir_all(&outputs).unwrap();
                     let (text, usage) = match &reply {
-                        Ok(reply) => (reply.text.clone(), format!("{:?} {:?}", reply.stop, reply.usage)),
+                        Ok(reply) => (
+                            reply.text.clone(),
+                            format!("{:?} {:?}", reply.stop, reply.usage),
+                        ),
                         Err(e) => (format!("ERROR: {e:#}"), String::new()),
                     };
                     std::fs::write(outputs.join("reply.md"), format!("{text}\n")).unwrap();
                     let calls = calls.lock().unwrap().join("\n");
                     std::fs::write(
                         dir.join("transcript.md"),
-                        format!("## Pilot\n\n{prompt}\n\n{calls}\n## Engineer\n\n{text}\n\n{usage}\n"),
+                        format!(
+                            "## Pilot\n\n{prompt}\n\n{calls}\n## Engineer\n\n{text}\n\n{usage}\n"
+                        ),
                     )
                     .unwrap();
 

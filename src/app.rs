@@ -5,6 +5,7 @@ use crate::{
     engineer::Engineer,
     sim::{ActiveSimulator, Sim, SimulatorSettings},
     synthesizer::Synthesizer,
+    task::MaybeDone,
     track::TrackSync,
 };
 use anyhow::Context as AnyhowContext;
@@ -52,13 +53,17 @@ impl App {
         )?)?;
         log::debug!("Prefered Path: {pref_path}");
 
-        let (config, fonts) = try_join!(load_config(&pref_path), load_fonts(&base_path))?;
+        let assets_path = base_path.join("assets");
+        log::debug!("Assets Path: {assets_path}");
+
+        // Initialize audio here (before loading config) so that audio device finder works correctly
         let sdl = sdl3::init()?;
         let audio = sdl.audio()?;
         let video = sdl.video()?;
         let joystick = sdl.joystick()?;
         let event = sdl.event()?;
 
+        let (config, fonts) = try_join!(load_config(&pref_path), load_fonts(&assets_path))?;
         let (width, height) = {
             let config = config.get();
             (config.width, config.height)
@@ -84,25 +89,27 @@ impl App {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?;
-        let tracks = TrackSync::new(client.clone(), pref_path.as_std_path()).await;
+        let tracks = TrackSync::new(client.clone(), pref_path.as_std_path());
 
         let guard = config.get();
         let gui = Gui::new(&pref_path, &subsystems, &guard, &client);
         let synth = Synthesizer::new(rt, &guard);
+        let (tracks, engineer) = tokio::try_join!(
+            async move { Ok(tracks.await) },
+            Engineer::new(assets_path.as_std_path(), &guard, client)
+        )?;
         drop(guard);
 
         return Ok(Self {
             state: AppState {
                 subsystems,
-                base_path,
-                pref_path,
                 config,
                 gui,
                 synth,
                 simulators: ActiveSimulator::default(),
                 applied_opponent_frequency: None,
                 tracks,
-                engineer: Engineer::new(client),
+                engineer,
             },
             ui,
         });
@@ -182,8 +189,6 @@ impl DerefMut for App {
 }
 
 pub struct AppState {
-    base_path: &'static Utf8Path,
-    pref_path: Arc<Utf8Path>,
     gui: Gui,
     config: Config,
     subsystems: Subsystems,
@@ -193,6 +198,7 @@ pub struct AppState {
     applied_opponent_frequency: Option<NonZeroU32>,
     /// Keeps the running simulator's track description next to its database
     tracks: TrackSync,
+    // FIXME: Do we want this to be `MaybeDone`?
     engineer: Engineer,
 }
 
@@ -376,12 +382,12 @@ async fn load_config(pref_path: &Utf8Path) -> anyhow::Result<Config> {
     Config::new(pref_path.join_os("config.json")).await
 }
 
-async fn load_fonts(base_path: &Utf8Path) -> anyhow::Result<egui::FontDefinitions> {
+async fn load_fonts(assets_path: &Utf8Path) -> anyhow::Result<egui::FontDefinitions> {
     let mut fonts = egui::FontDefinitions::default();
     let (proggy, noto, ubuntu) = tokio::try_join!(
-        tokio::fs::read(base_path.join_os("assets/ProggyForever-Regular.ttf")),
-        tokio::fs::read(base_path.join_os("assets/NotoEmoji-Regular.ttf")),
-        tokio::fs::read(base_path.join_os("assets/Ubuntu-Light.ttf")),
+        tokio::fs::read(assets_path.join_os("ProggyForever-Regular.ttf")),
+        tokio::fs::read(assets_path.join_os("NotoEmoji-Regular.ttf")),
+        tokio::fs::read(assets_path.join_os("Ubuntu-Light.ttf")),
     )?;
 
     fonts.font_data.insert(

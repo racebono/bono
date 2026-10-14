@@ -274,6 +274,7 @@ impl Kind {
         audio: &AudioSubsystem,
         device: &AudioDevice,
     ) -> Option<sdl3::audio::AudioDevice> {
+        log::debug!("{device:#?}");
         let device = match device {
             AudioDevice::Default => None,
             AudioDevice::Device(id, _) => Some(id),

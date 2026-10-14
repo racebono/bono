@@ -6,9 +6,9 @@ use crate::{
     arrstr,
     claude::{
         Conversation, ConversationBuilder, Reply, StopReason,
-        engineer::{self, Engineer as EngineerTool},
+        engineer::{self, Engineer as EngineerTool, SCHEMA_PATH, SKILL_PATH, instructions},
     },
-    config::{ArrayStr, Config},
+    config::{ArrayStr, Config, RawConfig},
     language::LanguageDetector,
     sim::Sim,
     sqlite::pool::Pool,
@@ -16,7 +16,11 @@ use crate::{
     task::Task,
 };
 use sdl3::audio::{AudioDevice, AudioStreamOwner};
-use std::{path::PathBuf, sync::Arc, task::Poll};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    task::Poll,
+};
 use tokio::{
     runtime::Handle,
     sync::{Mutex, mpsc},
@@ -45,6 +49,8 @@ pub enum Speaker {
 
 pub struct Engineer {
     client: reqwest::Client,
+    skill: Arc<str>,
+    schema: Arc<str>,
     /// Everything said, for the chat
     chat: Vec<ChatEntry>,
     /// The language the pilot last asked in: typed questions whose language is unclear are
@@ -98,9 +104,20 @@ struct SessionState {
 }
 
 impl Engineer {
-    pub fn new(client: reqwest::Client) -> Self {
-        Self {
+    pub async fn new(
+        assets_path: &Path,
+        config: &RawConfig,
+        client: reqwest::Client,
+    ) -> anyhow::Result<Self> {
+        let (skill, schema) = tokio::try_join!(
+            tokio::fs::read_to_string(assets_path.join(&config.skill_path).join(SKILL_PATH)),
+            tokio::fs::read_to_string(assets_path.join(&config.skill_path).join(SCHEMA_PATH))
+        )?;
+
+        Ok(Self {
             client,
+            skill: instructions(skill).into(),
+            schema: schema.into(),
             chat: Vec::new(),
             last_lang: arrstr!("en"),
             languages: LanguageDetector::new(),
@@ -108,7 +125,7 @@ impl Engineer {
             new_session: false,
             turn: None,
             playback: None,
-        }
+        })
     }
 
     /// Everything said so far, oldest first.
@@ -461,14 +478,14 @@ impl Engineer {
     }
 
     fn start(&self, config: &Config, pool: Pool) -> anyhow::Result<Session> {
-        let tool = EngineerTool::new(pool.clone());
+        let tool = EngineerTool::new(pool.clone(), self.schema.clone());
         let mut builder = ConversationBuilder::new();
         {
             let config = config.get();
             builder
                 .model(&config.claude_model)
                 .effort(&config.claude_effort)
-                .system(engineer::instructions())
+                .system(self.skill.clone())
                 .tool(
                     EngineerTool::NAME,
                     Some(EngineerTool::description()),

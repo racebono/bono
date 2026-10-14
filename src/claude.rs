@@ -12,6 +12,7 @@ use std::{
     fmt::{self, Display, Formatter},
     num::NonZeroU32,
     ops::AddAssign,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -450,7 +451,7 @@ pub struct ConversationBuilder {
     model: String,
     effort: String,
     max_tokens: NonZeroU32,
-    system: String,
+    system: Arc<str>,
     tools: Tools,
     req_tools: Vec<RequestTool>,
     skills: Vec<RequestSkill>,
@@ -469,7 +470,7 @@ impl ConversationBuilder {
             model: "claude-sonnet-5-5".into(),
             effort: "high".into(),
             max_tokens: NonZeroU32::new(16000).unwrap(),
-            system: "".into(),
+            system: Arc::default(),
             tools: Tools::default(),
             req_tools: Vec::new(),
             skills: Vec::new(),
@@ -526,7 +527,7 @@ impl ConversationBuilder {
     /// The system prompt. Cached apart from the conversation, so it's only paid in full when it
     /// changes. Defaults to none.
     #[inline]
-    pub fn system(&mut self, system: impl Into<String>) -> &mut Self {
+    pub fn system(&mut self, system: impl Into<Arc<str>>) -> &mut Self {
         self.system = system.into();
         self
     }
@@ -689,7 +690,7 @@ impl ConversationBuilder {
             true => Vec::new(),
             false => vec![RequestSystemBlock {
                 r#type: "text",
-                text: self.system,
+                text: self.system.to_string(),
                 cache_control: RequestCacheControl {
                     r#type: "ephemeral",
                 },
