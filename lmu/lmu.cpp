@@ -495,9 +495,15 @@ namespace {
 
         // The database is created when the first session loads (while the pilot is still in the garage), not
         // when the game starts. It lives in UserData\lambiase, where the app and the skill's scripts look
-        // for it while the game runs, and is deleted when the game closes.
+        // for it while the game runs, holds a whole weekend, and is deleted when the game closes.
         void StartSession() override {
             start_recording();
+        }
+
+        // A track loading is a new weekend (its sessions come and go without loading it again): the last
+        // weekend's data goes, while the practice, qualifying and race of this one stay together.
+        void Load() override {
+            if (_recorder) lambiase_lmu_clear(_recorder);
         }
 
         // In case the plugin missed the session starting.
@@ -507,12 +513,6 @@ namespace {
 
         void Shutdown() override {
             close();
-        }
-
-        // The pilot left the session (it ended, they retired or quit to the menu): its data goes, so the next
-        // session starts from an empty database.
-        void EndSession() override {
-            if (_recorder) lambiase_lmu_clear(_recorder);
         }
 
         // Called on the game's simulation thread for every car, so only the updates the recorder keeps are
@@ -563,8 +563,9 @@ namespace {
             }
         }
 
-        // Stops recording and deletes the database. If a reader still has it open, it stays until the next
-        // time the pilot drives; readers only use it while the game runs.
+        // Stops recording and deletes the database. A reader that still has it open (the app only lets go once
+        // Steam reports the game closed, which is after this) keeps it from being deleted: the app deletes it
+        // once it has let go, and failing that the next run empties it.
         void close() {
             if (_recorder) lambiase_lmu_close(std::exchange(_recorder, nullptr));
         }

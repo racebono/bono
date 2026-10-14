@@ -41,11 +41,33 @@ const SETTINGS_CHECK: Duration = Duration::from_secs(2);
 /// `None` when it can't be read this time.
 pub type ForecastSource = Box<dyn FnMut(f64) -> Option<Vec<lambiase_forecast_point>> + Send>;
 
-/// Deletes the database in `dir`, with its WAL companions.
+/// Deletes the database in `dir`, with its WAL companions, if it can.
 pub fn remove_database(dir: &Path) {
+    let _ = try_remove_database(dir);
+}
+
+/// Deletes the database in `dir`, with its WAL companions. Fails while anything still has it open:
+/// Windows doesn't delete open files, and SQLite doesn't let others delete the files it opens. A
+/// database that's missing already counts as deleted.
+///
+/// The database goes first, and its WAL only once it's gone: a WAL left without its database is
+/// fine (a new database replaces it, see `Recorder::new`), but a database left without its WAL
+/// would lose whatever wasn't checkpointed yet.
+pub fn try_remove_database(dir: &Path) -> std::io::Result<()> {
+    let mut result = Ok(());
     for suffix in ["", "-wal", "-shm"] {
-        let _ = fs::remove_file(dir.join(format!("{DATABASE}{suffix}")));
+        match fs::remove_file(dir.join(format!("{DATABASE}{suffix}"))) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if suffix.is_empty() => return Err(e),
+            Err(e) => {
+                if result.is_ok() {
+                    result = Err(e);
+                }
+            }
+        }
     }
+    result
 }
 
 pub struct Recorder {
@@ -60,8 +82,9 @@ impl Recorder {
     pub fn new(dir: impl Into<PathBuf>, forecast: Option<ForecastSource>) -> std::io::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
-        // A database left behind by a crash would mix two runs
-        remove_database(&dir);
+        // A database left behind (the game crashed, or something still had it open when it closed)
+        // would mix two runs. If it's still open, it's emptied instead, once the writer has it
+        let left_over = try_remove_database(&dir).is_err();
 
         let settings = Settings::read(&dir.join(SETTINGS));
         let shared = Arc::new(Shared {
@@ -77,6 +100,7 @@ impl Recorder {
             let shared = shared.clone();
             let mut writer = Writer {
                 database: dir.join(DATABASE),
+                left_over,
                 settings_path: dir.join(SETTINGS),
                 clear_requests: settings.clear,
                 settings_modified: None,
@@ -313,6 +337,8 @@ impl Settings {
 /// The writer thread's state.
 struct Writer {
     database: PathBuf,
+    /// The database is an earlier run's that couldn't be deleted: it's emptied first
+    left_over: bool,
     settings_path: PathBuf,
     /// The app's last clear request seen in settings.json
     clear_requests: i64,
@@ -331,6 +357,9 @@ impl Writer {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         sql::create_tables(&conn)?;
+        if self.left_over {
+            sql::clear_tables(&conn)?;
+        }
 
         let mut telemetry_writer = TelemetryWriter::new(&conn)?;
         let mut scoring_writer = ScoringWriter::new(&conn)?;
@@ -532,6 +561,54 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(vehicles, [2]);
+    }
+
+    #[test]
+    fn replaces_a_database_still_open_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DATABASE);
+        let count = |conn: &rusqlite::Connection| {
+            conn.query_row("SELECT count(*) FROM standings", [], |row| row.get::<_, i64>(0))
+        };
+
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(lambiase_session_info::default(), vec![standing(1, true, 0.0)]);
+        drop(recorder);
+
+        // A reader still has the last run's database open, so it can't be deleted (on Windows)
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(count(&reader).unwrap(), 1);
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+
+        // The new run starts empty all the same
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            if count(&conn).is_ok_and(|rows| rows == 0) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the last run's rows are still there");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop((reader, recorder));
+    }
+
+    #[test]
+    fn removing_reports_open_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing to delete
+        try_remove_database(dir.path()).unwrap();
+
+        let reader = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        reader.execute_batch("CREATE TABLE t (x)").unwrap();
+        if cfg!(windows) {
+            assert!(try_remove_database(dir.path()).is_err());
+            assert!(dir.path().join(DATABASE).is_file());
+        }
+
+        drop(reader);
+        try_remove_database(dir.path()).unwrap();
+        assert!(!dir.path().join(DATABASE).exists());
     }
 
     #[test]

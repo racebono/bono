@@ -1,19 +1,22 @@
 //! Le Mans Ultimate, through Steam. Its plugin (`lmu/`) writes `UserData\lambiase\telemetry.db`
-//! in the game's folder while the game runs, and deletes it when the game closes. A file left behind
-//! by a crash is only replaced the next time the pilot drives, so it only counts while Steam reports
-//! the game running.
+//! in the game's folder while the game runs, a weekend at a time, and deletes it when the game
+//! closes. It can't while this app still has it open (Windows doesn't delete open files), and the app
+//! only lets go once Steam reports the game closed, which is after: so the app deletes it then. A
+//! file left behind anyway (a crash, or another program had it open) only counts while Steam reports
+//! the game running, and the plugin replaces it the next time the pilot drives.
 
 use crate::{
     sim::{Simulator, SimulatorInfo, SimulatorSettings},
     sqlite::{Database, pool::Pool},
     steam::{self},
 };
-use lambiase_sim::recorder::{DATABASE, SETTINGS};
+use lambiase_sim::recorder::{DATABASE, SETTINGS, try_remove_database};
 use serde_json::{Map, Value};
 use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 const STEAM_APP_ID: u32 = 2399420;
@@ -22,6 +25,11 @@ const FOLDER: &str = "lambiase";
 
 const MAX_IDLE: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 const MAX_OPEN: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+
+/// Once the game closes, how long the database is left for the connections still reading it to
+/// finish (an answer being written, say) before giving up on deleting it.
+const REMOVE_FOR: Duration = Duration::from_secs(60);
+const REMOVE_EVERY: Duration = Duration::from_secs(1);
 
 pub struct LeMansUltimate {
     /// Found once; looked for again on every call while the game isn't installed
@@ -87,8 +95,14 @@ impl Simulator for LeMansUltimate {
             .filter(|path| running && path.is_file());
 
         let Some(path) = path else {
-            // Closes the connections, so the plugin can delete the file
-            self.live = None;
+            // The game closed: our connections close, and the file the plugin couldn't delete while
+            // they were open goes
+            if let Some(pool) = self.live.take()
+                && !running
+                && let Some(dir) = pool.database().path().parent()
+            {
+                tokio::spawn(remove_when_closed(dir.to_owned(), pool));
+            }
             return None;
         };
 
@@ -114,6 +128,38 @@ impl Simulator for LeMansUltimate {
             json.insert("clear".into(), (clear + 1).into());
         }) {
             log::error!("Error asking Le Mans Ultimate to clear its data: {e}");
+        }
+    }
+}
+
+/// Deletes the database in `dir` once nothing has it open: the pool's connections close as the ones
+/// in use are returned (the engineer's last answer, say). Stops if the game starts again, since its
+/// plugin replaces the file itself.
+async fn remove_when_closed(dir: PathBuf, pool: Pool) {
+    drop(pool);
+
+    let mut waited = Duration::ZERO;
+    loop {
+        tokio::time::sleep(REMOVE_EVERY).await;
+        waited += REMOVE_EVERY;
+        if steam::is_app_running(STEAM_APP_ID) {
+            return;
+        }
+
+        match try_remove_database(&dir) {
+            Ok(()) => {
+                log::debug!("Removed the recording Le Mans Ultimate left in {}", dir.display());
+                return;
+            }
+            Err(e) if waited >= REMOVE_FOR => {
+                log::warn!(
+                    "Couldn't remove the recording Le Mans Ultimate left in {} (is another program \
+                     reading it?): {e}. The game replaces it the next time it records",
+                    dir.display()
+                );
+                return;
+            }
+            Err(_) => {}
         }
     }
 }
