@@ -149,7 +149,7 @@ all-languages = [
     "lingua/vietnamese",
     "lingua/welsh",
 ]
-ollama = ["dep:ollama-rs"]
+ollama = []
 
 [workspace]
 members = ["xtask", "sim", "lmu"]
