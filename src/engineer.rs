@@ -6,7 +6,7 @@ use crate::{
     arrstr,
     config::{ArrayStr, Config, RawConfig},
     language::LanguageDetector,
-    model::{Model, Reply, Settings, StopReason, Tools, claude},
+    model::{self, Model, Reply, StopReason, Tools},
     sim::Sim,
     sqlite::pool::Pool,
     synthesizer::{SpeechInput, SpeechOutput, Synthesizer},
@@ -530,16 +530,12 @@ impl Engineer {
             EngineerTool::input_schema(),
             tool.clone(),
         );
-        let settings = {
-            let config = config.get();
-            Settings {
-                model: config.claude_model.clone(),
-                effort: config.claude_effort.clone(),
-                system: self.skill.clone(),
-                tools,
-            }
-        };
-        let conversation = Box::new(claude::Conversation::new(settings, self.client.clone())?);
+        let conversation = model::conversation(
+            &config.get().model,
+            self.skill.clone(),
+            tools,
+            self.client.clone(),
+        )?;
 
         // The history cache is built now, so the first history question doesn't wait for it
         tokio::spawn(async move {
@@ -686,7 +682,7 @@ mod tests {
         let one = NonZeroUsize::new(1).unwrap();
         let pool = Pool::new(Database::read_only(Arc::new(path)), one, one);
 
-        let mut builder = claude::ConversationBuilder::new();
+        let mut builder = model::claude::ConversationBuilder::new();
         builder.api_key("test");
         let mut state = SessionState {
             conversation: Box::new(builder.build(reqwest::Client::new()).unwrap()),

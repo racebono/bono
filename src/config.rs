@@ -144,10 +144,8 @@ pub struct RawConfig {
     pub silence_level: f32,
     #[serde(default)]
     pub whisper_model: Option<Arc<Utf8Path>>,
-    #[serde(default = "default_claude_model")]
-    pub claude_model: String,
-    #[serde(default = "default_claude_effort")]
-    pub claude_effort: String,
+    #[serde(default)]
+    pub model: ModelConfig,
     #[serde(default = "default_text_scale")]
     pub text_scale: f32,
     #[serde(default = "default_min_confidence")]
@@ -457,6 +455,87 @@ impl Default for SpotterConfig {
     }
 }
 
+/// The language model the engineer talks through. Each provider's settings are kept while
+/// another one is in use.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelConfig {
+    pub provider: ModelProvider,
+    pub claude: ClaudeConfig,
+    pub ollama: OllamaConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelProvider {
+    /// Claude, through the Claude API: needs `ANTHROPIC_API_KEY`
+    #[default]
+    Claude,
+    /// A model Ollama runs, on this PC or another
+    Ollama,
+}
+
+/// Claude, through the Claude API.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClaudeConfig {
+    /// e.g. `claude-sonnet-5-5`
+    pub model: String,
+    /// `low`, `medium`, `high`, `xhigh` or `max` (the levels depend on the model)
+    pub effort: String,
+    /// The most tokens in one response, thinking included
+    pub max_tokens: NonZeroU32,
+    /// Has the API summarize the earlier conversation when it grows near the context window, so
+    /// a long session never runs out of room. Only on models that support it
+    pub compaction: bool,
+}
+
+impl Default for ClaudeConfig {
+    fn default() -> Self {
+        Self {
+            model: "claude-sonnet-5-5".into(),
+            effort: "high".into(),
+            max_tokens: NonZeroU32::new(16000).unwrap(),
+            compaction: false,
+        }
+    }
+}
+
+/// A model Ollama runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OllamaConfig {
+    /// Where Ollama listens, as `OLLAMA_HOST` says it (e.g. `192.168.1.5` or
+    /// `http://pc:11434`): `OLLAMA_HOST`, or this PC, when `None`
+    pub host: Option<String>,
+    /// A model that's been pulled (`ollama pull`), e.g. `qwen3.5:9b`
+    pub model: String,
+    /// How much it thinks, on models that can: `none`, `low`, `medium` or `high`. Thinking on
+    /// this PC's GPU, while the game uses it, makes answers slow to come
+    pub effort: String,
+    /// The context window it's loaded with, in tokens: Ollama silently drops the start of a
+    /// conversation that doesn't fit. More takes more memory
+    pub context_length: NonZeroU32,
+    /// The most tokens in one response, thinking included
+    pub max_tokens: NonZeroU32,
+    /// How long Ollama keeps the model loaded after an answer, in seconds (negative: until it
+    /// stops). Ollama's own when `None`: 5 minutes, unless `OLLAMA_KEEP_ALIVE` says otherwise
+    pub keep_alive: Option<f64>,
+}
+
+impl Default for OllamaConfig {
+    fn default() -> Self {
+        Self {
+            host: None,
+            model: "qwen3.5:9b".into(),
+            effort: "none".into(),
+            context_length: NonZeroU32::new(32768).unwrap(),
+            max_tokens: NonZeroU32::new(16000).unwrap(),
+            keep_alive: None,
+        }
+    }
+}
+
 /// `spotter` used to be only whether it's on (`true` or `false`): still read, with the defaults.
 fn spotter_config<'de, D>(deserializer: D) -> Result<SpotterConfig, D::Error>
 where
@@ -513,16 +592,6 @@ const fn default_min_confidence() -> f32 {
     0.1
 }
 
-#[inline(always)]
-fn default_claude_model() -> String {
-    String::from("claude-sonnet-5-5")
-}
-
-#[inline(always)]
-fn default_claude_effort() -> String {
-    String::from("high")
-}
-
 fn default_skill_path() -> Utf8PathBuf {
     Utf8PathBuf::from("skill")
 }
@@ -555,6 +624,42 @@ mod tests {
         let written = serde_json::to_value(&tuned).unwrap();
         assert_eq!(written["spotter"]["debounce"], 0.2);
         assert_eq!(written["spotter"]["rain_bands"][1], 0.3);
+    }
+
+    #[test]
+    fn reads_the_model_config() {
+        let defaults = serde_json::from_slice::<RawConfig>(b"{}").unwrap();
+        assert_eq!(defaults.model, ModelConfig::default());
+        assert_eq!(defaults.model.provider, ModelProvider::Claude);
+
+        // Older configs had Claude's model and effort at the top
+        let old = serde_json::from_slice::<RawConfig>(
+            br#"{"claude_model": "claude-opus-5-5", "claude_effort": "max"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.model.claude.model, "claude-opus-5-5");
+        assert_eq!(old.model.claude.effort, "max");
+        let written = serde_json::to_value(&old).unwrap();
+        assert!(written.get("claude_model").is_none());
+        assert_eq!(written["model"]["claude"]["model"], "claude-opus-5-5");
+
+        // Switching provider keeps the other's settings
+        let ollama = serde_json::from_slice::<RawConfig>(
+            br#"{"model": {"provider": "ollama", "ollama": {"model": "gemma4:12b", "keep_alive": -1}, "claude": {"effort": "low"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(ollama.model.provider, ModelProvider::Ollama);
+        assert_eq!(ollama.model.ollama.model, "gemma4:12b");
+        assert_eq!(ollama.model.ollama.keep_alive, Some(-1.0));
+        assert_eq!(ollama.model.ollama.context_length.get(), 32768);
+        assert_eq!(ollama.model.claude.effort, "low");
+        assert_eq!(ollama.model.claude.model, "claude-sonnet-5-5");
+
+        let saved = serde_json::to_vec(&ollama).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<RawConfig>(&saved).unwrap().model,
+            ollama.model
+        );
     }
 
     #[test]

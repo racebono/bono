@@ -2,12 +2,11 @@
 //! conversation with one, tool calls included. [`claude`] is Claude's (the Claude API), and
 //! [`ollama`] any model Ollama runs; others (e.g. OpenAI's) implement the same trait.
 
+use crate::config::{ModelConfig, ModelProvider};
 use futures::future::BoxFuture;
 use std::{collections::BTreeMap, ops::AddAssign, sync::Arc};
 
 pub mod claude;
-// Not selectable in the config yet
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod ollama;
 mod text;
 mod tool;
@@ -42,16 +41,27 @@ pub trait Model: Send {
     fn usage(&self) -> &BTreeMap<String, Usage>;
 }
 
-/// What a conversation is set up with, whichever model has it.
-pub struct Settings {
-    /// The model's name, e.g. `claude-sonnet-5-5`
-    pub model: String,
-    /// How much it thinks before answering, e.g. `low`, `medium` or `high` (the levels depend on
-    /// the model)
-    pub effort: String,
-    /// The system prompt
-    pub system: Arc<str>,
-    pub tools: Tools,
+/// A conversation with the model `config` picks, with the `system` prompt and `tools`.
+pub fn conversation(
+    config: &ModelConfig,
+    system: Arc<str>,
+    tools: Tools,
+    client: reqwest::Client,
+) -> anyhow::Result<Box<dyn Model>> {
+    Ok(match config.provider {
+        ModelProvider::Claude => Box::new(claude::Conversation::new(
+            &config.claude,
+            system,
+            tools,
+            client,
+        )?),
+        ModelProvider::Ollama => Box::new(ollama::Conversation::new(
+            &config.ollama,
+            system,
+            tools,
+            client,
+        )?),
+    })
 }
 
 /// What the model answered to one [`Model::send`].

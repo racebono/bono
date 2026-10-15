@@ -1,6 +1,7 @@
 //! Claude, through the Claude API.
 
-use super::{Model, Reply, Settings, StopReason, ToolHandler, Tools, Usage, text::TextSink};
+use super::{Model, Reply, StopReason, ToolHandler, Tools, Usage, text::TextSink};
+use crate::config::ClaudeConfig;
 use anyhow::{Context, bail};
 use futures::future::{BoxFuture, join_all};
 use reqwest::{
@@ -102,14 +103,21 @@ impl Model for Conversation {
 }
 
 impl Conversation {
-    /// A conversation with Claude, with the defaults for everything `settings` doesn't say.
-    pub fn new(settings: Settings, client: reqwest::Client) -> anyhow::Result<Self> {
+    /// A conversation with Claude as `config` says, with the defaults for the rest.
+    pub fn new(
+        config: &ClaudeConfig,
+        system: Arc<str>,
+        tools: Tools,
+        client: reqwest::Client,
+    ) -> anyhow::Result<Self> {
         let mut builder = ConversationBuilder::new();
         builder
-            .model(settings.model)
-            .effort(settings.effort)
-            .system(settings.system)
-            .tools(settings.tools);
+            .model(&config.model)
+            .effort(&config.effort)
+            .max_tokens(config.max_tokens)
+            .compaction(config.compaction)
+            .system(system)
+            .tools(tools);
         builder.build(client)
     }
 

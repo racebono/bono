@@ -1,6 +1,7 @@
 //! Models run by Ollama (<https://ollama.com>), on this PC or another, through its chat API.
 
-use super::{Model, Reply, Settings, StopReason, ToolHandler, Tools, Usage, text::TextSink};
+use super::{Model, Reply, StopReason, ToolHandler, Tools, Usage, text::TextSink};
+use crate::config::OllamaConfig;
 use anyhow::{Context, bail};
 use futures::future::{BoxFuture, join_all};
 use reqwest::{
@@ -73,15 +74,27 @@ impl Model for Conversation {
 }
 
 impl Conversation {
-    /// A conversation with a model on Ollama, with the defaults for everything `settings`
-    /// doesn't say.
-    pub fn new(settings: Settings, client: reqwest::Client) -> anyhow::Result<Self> {
+    /// A conversation with a model on Ollama as `config` says, with the defaults for the rest.
+    pub fn new(
+        config: &OllamaConfig,
+        system: Arc<str>,
+        tools: Tools,
+        client: reqwest::Client,
+    ) -> anyhow::Result<Self> {
         let mut builder = ConversationBuilder::new();
+        if let Some(host) = &config.host {
+            builder.base_url(host_url(host));
+        }
+        if let Some(keep_alive) = config.keep_alive {
+            builder.keep_alive(keep_alive);
+        }
         builder
-            .model(settings.model)
-            .effort(settings.effort)
-            .system(settings.system)
-            .tools(settings.tools);
+            .model(&config.model)
+            .effort(&config.effort)
+            .context_length(config.context_length)
+            .max_tokens(config.max_tokens)
+            .system(system)
+            .tools(tools);
         builder.build(client)
     }
 
@@ -433,7 +446,7 @@ pub struct ConversationBuilder {
     tools: Tools,
     context_length: NonZeroU32,
     max_tokens: NonZeroU32,
-    keep_alive: Option<Duration>,
+    keep_alive: Option<f64>,
     max_requests: NonZeroU32,
     timeout: Duration,
 }
@@ -531,10 +544,10 @@ impl ConversationBuilder {
         self
     }
 
-    /// How long Ollama keeps the model loaded after a request. Defaults to Ollama's own (5
-    /// minutes, unless `OLLAMA_KEEP_ALIVE` says otherwise).
+    /// How long Ollama keeps the model loaded after a request, in seconds (negative: until it
+    /// stops). Defaults to Ollama's own (5 minutes, unless `OLLAMA_KEEP_ALIVE` says otherwise).
     #[inline]
-    pub fn keep_alive(&mut self, keep_alive: Duration) -> &mut Self {
+    pub fn keep_alive(&mut self, keep_alive: f64) -> &mut Self {
         self.keep_alive = Some(keep_alive);
         self
     }
@@ -617,9 +630,7 @@ impl ConversationBuilder {
                     num_ctx: self.context_length,
                     num_predict: self.max_tokens,
                 },
-                keep_alive: self
-                    .keep_alive
-                    .map(|keep_alive| format!("{}s", keep_alive.as_secs())),
+                keep_alive: self.keep_alive,
             },
             think,
             can_think: None,
@@ -683,8 +694,9 @@ struct RequestBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     think: Option<serde_json::Value>,
     options: RequestOptions,
+    /// Seconds
     #[serde(skip_serializing_if = "Option::is_none")]
-    keep_alive: Option<String>,
+    keep_alive: Option<f64>,
 }
 
 #[derive(Serialize)]
