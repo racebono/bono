@@ -1,11 +1,12 @@
 //! The spotter: follows the running simulator's telemetry about thirty times a second and calls
-//! cars alongside and flags the moment they happen, without anyone asking. A port of my-engineer's
-//! `spotter.cpp` (proximity and flags so far; its own alerts and the weather are still to come).
+//! cars alongside, flags, the car's own alerts and the weather the moment they happen, without
+//! anyone asking. A port of my-engineer's `spotter.cpp`.
 //!
 //! It reads the database on a thread of its own, with a read-only connection of its own (closed as
 //! soon as the game stops, so the plugin can delete the file), and turns what changed into calls.
-//! They're said in the engineer's voice: urgent ones (traffic, full course yellows, red flags) cut
-//! in over the engineer, which carries on afterwards; the rest wait for it to finish.
+//! They're said in the engineer's voice: urgent ones (traffic, the pit limiter, full course
+//! yellows, red flags) cut in over the engineer, which carries on afterwards; the rest wait for it
+//! to finish.
 
 use crate::{
     arrstr,
@@ -17,7 +18,7 @@ use crate::{
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
 use sdl3::audio::{AudioDevice, AudioStreamOwner};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -38,6 +39,10 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(200);
 /// How long a call is still worth saying.
 const URGENT_FOR: Duration = Duration::from_millis(1500);
 const OTHER_FOR: Duration = Duration::from_secs(10);
+/// A gap behind called this close is "close behind" rather than "within a second".
+const CLOSE_BEHIND: f64 = 0.15;
+/// The gap behind isn't called in the session's first seconds (the start, the field nose to tail).
+const GAP_BEHIND_AFTER: f64 = 20.0;
 /// Calls synthesized ahead, so the first of each is said without waiting for the voice.
 const WARM: [&str; 6] = [
     "car left",
@@ -48,15 +53,28 @@ const WARM: [&str; 6] = [
     "clear all round",
 ];
 
-/// Something the spotter says. `text` is English; [`translate`] gives the pilot's language.
+/// Something the spotter says. `text` is English (a `{}` in it takes `number`); [`Raised::words`]
+/// gives it in the pilot's language.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Raised {
     pub text: &'static str,
-    /// Traffic and flags that change what the pilot does right now: stale within a second or two,
-    /// so they interrupt the engineer
+    pub number: Option<i64>,
+    /// Traffic, the limiter and flags that change what the pilot does right now: stale within a
+    /// second or two, so they interrupt the engineer
     pub urgent: bool,
     /// When it happened, from the player's car
     pub session_time: f64,
+}
+
+impl Raised {
+    /// What's said, in `lang` (or in English when there's no translation).
+    pub fn words(&self, lang: ArrayStr<2>) -> String {
+        let text = translate(self.text, lang);
+        match self.number {
+            Some(number) => text.replacen("{}", &number.to_string(), 1),
+            None => text.to_owned(),
+        }
+    }
 }
 
 pub struct Spotter {
@@ -66,13 +84,13 @@ pub struct Spotter {
     queue: VecDeque<(Raised, Instant)>,
     /// The call being said
     saying: Option<Saying>,
-    /// Calls already synthesized, by (language, voice, radio effect, text)
+    /// Calls already synthesized, by (language, voice, radio effect, words)
     cache: HashMap<CacheKey, Arc<Speech>>,
     /// Calls being synthesized ahead
     warming: Vec<(CacheKey, oneshot::Receiver<anyhow::Result<Speech>>)>,
 }
 
-type CacheKey = (ArrayStr<2>, PathBuf, u32, &'static str);
+type CacheKey = (ArrayStr<2>, PathBuf, u32, String);
 
 struct Running {
     db: PathBuf,
@@ -145,7 +163,7 @@ impl Spotter {
         let lang = self.language(config, &settings, engineer);
         if let Some(running) = &self.running {
             while let Ok(call) = running.calls.try_recv() {
-                // A newer traffic call replaces one still waiting: "car left" is stale once it's
+                // A newer urgent call replaces one still waiting: "car left" is stale once it's
                 // "clear left"
                 if call.urgent {
                     self.queue.retain(|(queued, _)| !queued.urgent);
@@ -167,10 +185,10 @@ impl Spotter {
         }
     }
 
-    fn key(config: &Config, lang: ArrayStr<2>, text: &'static str) -> CacheKey {
+    fn key(config: &Config, lang: ArrayStr<2>, words: String) -> CacheKey {
         let config = config.get();
         let voice = config.voices().get(&lang).map(|path| path.as_std_path().to_owned());
-        (lang, voice.unwrap_or_default(), config.radio_effect.to_bits(), text)
+        (lang, voice.unwrap_or_default(), config.radio_effect.to_bits(), words)
     }
 
     fn effects(config: &Config) -> Effects {
@@ -193,11 +211,12 @@ impl Spotter {
         });
 
         for text in WARM {
-            let key = Self::key(config, lang, text);
+            let words = translate(text, lang).to_owned();
+            let key = Self::key(config, lang, words.clone());
             if self.cache.contains_key(&key) || self.warming.iter().any(|(k, _)| *k == key) {
                 continue;
             }
-            let recv = synth.synthesize(rt, lang, translate(text, lang).into(), Self::effects(config));
+            let recv = synth.synthesize(rt, lang, words, Self::effects(config));
             self.warming.push((key, recv));
         }
     }
@@ -248,12 +267,12 @@ impl Spotter {
             };
 
             if let Some((call, _)) = next.and_then(|next| self.queue.remove(next)) {
-                let key = Self::key(config, lang, call.text);
+                let words = call.words(lang);
+                let key = Self::key(config, lang, words.clone());
                 self.saying = match self.cache.get(&key).cloned() {
                     Some(speech) => self.play(config, speaker, &speech),
                     None => {
-                        let text = translate(call.text, lang).to_owned();
-                        let recv = synth.synthesize(rt, lang, text, Self::effects(config));
+                        let recv = synth.synthesize(rt, lang, words, Self::effects(config));
                         Some(Saying::Synthesizing(key, recv))
                     }
                 };
@@ -369,36 +388,42 @@ fn poll(
     config: &SpotterConfig,
     last_id: &mut Option<i64>,
 ) -> rusqlite::Result<Vec<Raised>> {
-    let Some(player) = latest(conn)? else {
+    let Some(car) = latest(conn)? else {
         return Ok(Vec::new());
     };
-    if Some(player.id) == *last_id {
+    if Some(car.id) == *last_id {
         return Ok(Vec::new());
     }
-    *last_id = Some(player.id);
+    *last_id = Some(car.id);
 
-    let others = frame(conn, &player)?;
+    let player = player(conn, car)?;
+    let others = frame(conn, &player.car)?;
+    let wheels = wheels(conn, player.car.id)?;
     let scoring = scoring(conn, None)?;
-    Ok(logic.update(config, &player, &others, scoring.as_ref()))
+    Ok(logic.update(config, &player, &others, &wheels, scoring.as_ref()))
 }
 
 /// Runs the spotter over a recording, as fast as it can, from the player's first row to the last:
 /// every call it would have made, for testing without the game.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn replay(db: &Path, config: &SpotterConfig) -> rusqlite::Result<Vec<Raised>> {
     let conn = open(db)?;
     let mut statement = conn.prepare(&format!(
         "SELECT {CAR_COLUMNS} FROM telemetry WHERE is_player = 1 ORDER BY id"
     ))?;
-    let players = statement
+    let cars = statement
         .query_map([], car)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut logic = Logic::default();
     let mut calls = Vec::new();
-    for player in players.iter().filter(|player| player.time.is_some()) {
-        let others = frame(&conn, player)?;
-        let scoring = scoring(&conn, player.time)?;
-        calls.extend(logic.update(config, player, &others, scoring.as_ref()));
+    for car in cars.into_iter().filter(|car| car.time.is_some()) {
+        let time = car.time;
+        let player = player(&conn, car)?;
+        let others = frame(&conn, &player.car)?;
+        let wheels = wheels(&conn, player.car.id)?;
+        let scoring = scoring(&conn, time)?;
+        calls.extend(logic.update(config, &player, &others, &wheels, scoring.as_ref()));
     }
     Ok(calls)
 }
@@ -419,6 +444,26 @@ struct Car {
     y: Option<f64>,
     z: Option<f64>,
     heading: Option<f64>,
+}
+
+/// The player's car, with what only the player's own alerts need.
+#[derive(Debug, Clone, Default)]
+struct Player {
+    car: Car,
+    lap_invalidated: bool,
+    engine_overheating: bool,
+    gap_behind: Option<f64>,
+    /// Unknown isn't off: some simulators only report the limiter while the pilot drives
+    limiter: Option<bool>,
+    parts_detached: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Wheels {
+    /// Wheel (0 front left .. 3 rear right) -> flat
+    flat: [Option<bool>; 4],
+    /// How many tyres are on a wet surface
+    wet: usize,
 }
 
 fn car(row: &Row) -> rusqlite::Result<Car> {
@@ -444,6 +489,15 @@ struct Scoring {
     /// The flag shown to the player
     flag: Option<String>,
     penalties: Option<i64>,
+    /// 0-1
+    rain: Option<f64>,
+    /// 0-1
+    wetness: Option<f64>,
+    session_type: Option<String>,
+    session_end_time: Option<f64>,
+    /// The newest forecast for this session: (how far through it, 0-1; chance of rain, 0-1), in
+    /// order
+    forecast: Vec<(f64, f64)>,
 }
 
 /// The player's newest row.
@@ -453,6 +507,65 @@ fn latest(conn: &Connection) -> rusqlite::Result<Option<Car>> {
     ))?
     .query_row([], car)
     .optional()
+}
+
+/// The player's row with its own alerts, and the car's state in force at it.
+fn player(conn: &Connection, car: Car) -> rusqlite::Result<Player> {
+    let (lap_invalidated, engine_overheating, gap_behind) = conn
+        .prepare_cached(
+            "SELECT lap_invalidated, engine_overheating, gap_to_place_behind FROM telemetry \
+             WHERE id = ?1",
+        )?
+        .query_row([car.id], |row| {
+            Ok((
+                row.get::<_, Option<bool>>(0)?.unwrap_or(false),
+                row.get::<_, Option<bool>>(1)?.unwrap_or(false),
+                row.get(2)?,
+            ))
+        })?;
+
+    let state = conn
+        .prepare_cached(
+            "SELECT speed_limiter_on, parts_detached FROM car_state \
+             WHERE vehicle_id = ?1 AND telemetry_id <= ?2 ORDER BY telemetry_id DESC LIMIT 1",
+        )?
+        .query_row([car.vehicle, car.id], |row| {
+            Ok((row.get::<_, Option<bool>>(0)?, row.get::<_, Option<bool>>(1)?))
+        })
+        .optional()?;
+    let (limiter, parts_detached) = state.unwrap_or_default();
+
+    Ok(Player {
+        car,
+        lap_invalidated,
+        engine_overheating,
+        gap_behind,
+        limiter,
+        parts_detached: parts_detached.unwrap_or(false),
+    })
+}
+
+/// The player's tyres at their row.
+fn wheels(conn: &Connection, telemetry_id: i64) -> rusqlite::Result<Wheels> {
+    let mut statement = conn.prepare_cached(
+        "SELECT wheel, tire_flat, surface_type FROM telemetry_wheel WHERE telemetry_id = ?1",
+    )?;
+    let mut rows = statement.query([telemetry_id])?;
+    let mut wheels = Wheels::default();
+    while let Some(row) = rows.next()? {
+        let wheel = row.get::<_, Option<i64>>(0)?;
+        if let Some(flat) = wheel
+            .and_then(|wheel| usize::try_from(wheel).ok())
+            .and_then(|wheel| wheels.flat.get_mut(wheel))
+        {
+            *flat = Some(row.get::<_, Option<bool>>(1)?.unwrap_or(false));
+        }
+        // 1 is a wet surface
+        if row.get::<_, Option<i64>>(2)? == Some(1) {
+            wheels.wet += 1;
+        }
+    }
+    Ok(wheels)
 }
 
 /// Every other car near the player's row, moved to the player's time.
@@ -488,11 +601,13 @@ fn frame(conn: &Connection, player: &Car) -> rusqlite::Result<Vec<Car>> {
     Ok(best.into_values().map(|(_, car)| at_time(car, time)).collect())
 }
 
-/// The newest session row and the player's newest standing (at or before `upto`, when replaying).
+/// The newest session row, the player's newest standing and the session's newest forecast (at or
+/// before `upto`, when replaying).
 fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scoring>> {
     let session = conn
         .prepare_cached(
-            "SELECT full_course_yellow, phase, local_yellow_1, local_yellow_2, local_yellow_3 \
+            "SELECT full_course_yellow, phase, local_yellow_1, local_yellow_2, local_yellow_3, \
+             rain, track_wetness_average, session_type, session_end_time \
              FROM session WHERE ?1 IS NULL OR session_time <= ?1 ORDER BY id DESC LIMIT 1",
         )?
         .query_row([upto], |row| {
@@ -501,8 +616,11 @@ fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scor
                 full_course_yellow: row.get(0)?,
                 phase: row.get(1)?,
                 yellow: yellow(2)? || yellow(3)? || yellow(4)?,
-                flag: None,
-                penalties: None,
+                rain: row.get(5)?,
+                wetness: row.get(6)?,
+                session_type: row.get(7)?,
+                session_end_time: row.get(8)?,
+                ..Scoring::default()
             })
         })
         .optional()?;
@@ -532,6 +650,25 @@ fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scor
         scoring.flag = flag;
         scoring.penalties = penalties;
     }
+
+    // The forecast is LMU's only, written as a whole set of rows (same `session_time`) when it
+    // changes
+    if let Some(kind) = &scoring.session_type {
+        let mut statement = conn.prepare_cached(
+            "SELECT session_fraction, rain_chance FROM forecast WHERE session_type = ?1 \
+             AND session_time = (SELECT session_time FROM forecast \
+             WHERE ?2 IS NULL OR session_time <= ?2 ORDER BY id DESC LIMIT 1) \
+             ORDER BY session_fraction",
+        )?;
+        let points = statement.query_map(rusqlite::params![kind, upto], |row| {
+            Ok((row.get::<_, Option<f64>>(0)?, row.get::<_, Option<f64>>(1)?))
+        })?;
+        for point in points {
+            if let (Some(fraction), Some(chance)) = point? {
+                scoring.forecast.push((fraction, chance));
+            }
+        }
+    }
     Ok(Some(scoring))
 }
 
@@ -557,6 +694,24 @@ fn at_time(mut car: Car, t: f64) -> Car {
     car
 }
 
+/// The band `value` is in, moving from `current` one band at a time and only `margin` past an
+/// edge, so a value sitting on an edge stays put.
+fn band(value: Option<f64>, edges: &[f64], current: Option<usize>, margin: f64) -> Option<usize> {
+    let Some(value) = value else {
+        return current;
+    };
+    let Some(mut band) = current else {
+        return Some(edges.iter().filter(|edge| value >= **edge).count());
+    };
+    while band < edges.len() && value >= edges[band] + margin {
+        band += 1;
+    }
+    while band > 0 && value < edges[band - 1] - margin {
+        band -= 1;
+    }
+    Some(band)
+}
+
 // --------------------------------------------------------------------------- logic
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -573,7 +728,6 @@ impl Side {
     }
 }
 
-#[derive(Default)]
 struct Logic {
     /// Cars beside the player, not yet for long enough: vehicle -> (side, since)
     pending: HashMap<i64, (Side, f64)>,
@@ -582,8 +736,63 @@ struct Logic {
     /// Since when each side has been taken, and when "still there" was last said for it
     side_since: [Option<f64>; 2],
     last_still: [Option<f64>; 2],
-    prev_time: Option<f64>,
+    prev: Option<Player>,
+    prev_flat: [Option<bool>; 4],
+    /// The gap behind opened up since it was last called
+    gap_armed: bool,
     prev_scoring: Option<Scoring>,
+    /// The last bands called
+    rain_band: Option<usize>,
+    track_band: Option<usize>,
+    last_rain_call: f64,
+    last_track_call: f64,
+    last_patch_call: f64,
+    prev_wet: usize,
+    /// Forecast points already called: (session type, how far through it)
+    forecast_called: HashSet<(String, u64)>,
+}
+
+impl Default for Logic {
+    fn default() -> Self {
+        Self {
+            pending: HashMap::new(),
+            overlap: HashMap::new(),
+            side_since: [None; 2],
+            last_still: [None; 2],
+            prev: None,
+            prev_flat: [None; 4],
+            gap_armed: true,
+            prev_scoring: None,
+            rain_band: None,
+            track_band: None,
+            last_rain_call: f64::NEG_INFINITY,
+            last_track_call: f64::NEG_INFINITY,
+            last_patch_call: f64::NEG_INFINITY,
+            prev_wet: 0,
+            forecast_called: HashSet::new(),
+        }
+    }
+}
+
+/// The calls of one update.
+struct Calls {
+    t: f64,
+    calls: Vec<Raised>,
+}
+
+impl Calls {
+    fn raise(&mut self, text: &'static str, urgent: bool) {
+        self.raise_number(text, None, urgent);
+    }
+
+    fn raise_number(&mut self, text: &'static str, number: Option<i64>, urgent: bool) {
+        self.calls.push(Raised {
+            text,
+            number,
+            urgent,
+            session_time: self.t,
+        });
+    }
 }
 
 impl Logic {
@@ -591,42 +800,63 @@ impl Logic {
     fn update(
         &mut self,
         config: &SpotterConfig,
-        player: &Car,
+        player: &Player,
         others: &[Car],
+        wheels: &Wheels,
         scoring: Option<&Scoring>,
     ) -> Vec<Raised> {
-        let Some(t) = player.time else {
+        let p = &player.car;
+        let Some(t) = p.time else {
             return Vec::new();
         };
-        let mut calls = Vec::new();
-        let mut raise = |text, urgent| {
-            calls.push(Raised {
-                text,
-                urgent,
-                session_time: t,
-            })
+        let mut calls = Calls {
+            t,
+            calls: Vec::new(),
         };
 
         // A new session
-        if self.prev_time.is_some_and(|prev| t < prev - 1.0) {
+        if self.prev.as_ref().and_then(|prev| prev.car.time).is_some_and(|prev| t < prev - 1.0) {
             *self = Logic::default();
         }
-        self.prev_time = Some(t);
 
-        let stopped = player.speed.unwrap_or(0.0) < config.min_speed
-            || player.in_pit_lane
-            || player.x.is_none()
-            || player.z.is_none()
-            || player.heading.is_none();
+        let stopped = p.speed.unwrap_or(0.0) < config.min_speed
+            || p.in_pit_lane
+            || p.x.is_none()
+            || p.z.is_none()
+            || p.heading.is_none();
         // On the formation lap cars weave and run side by side on purpose
         let formation_lap = scoring.is_some_and(|s| s.phase.as_deref() == Some("formation_lap"));
         let quiet = stopped || formation_lap;
 
+        self.traffic(config, p, others, t, quiet, &mut calls);
+        if let Some(prev) = self.prev.take() {
+            self.alerts(config, player, &prev, wheels, t, formation_lap, &mut calls);
+        }
+        if let Some(scoring) = scoring {
+            self.flags(scoring, &mut calls);
+            self.weather(config, scoring, wheels.wet, t, stopped, &mut calls);
+        }
+
+        self.prev_flat = wheels.flat;
+        self.prev = Some(player.clone());
+        calls.calls
+    }
+
+    /// Cars alongside: who came, who went, and who's still there.
+    fn traffic(
+        &mut self,
+        config: &SpotterConfig,
+        p: &Car,
+        others: &[Car],
+        t: f64,
+        quiet: bool,
+        calls: &mut Calls,
+    ) {
         let before = self.sides();
         if quiet {
             self.reset_traffic();
         } else {
-            self.track(config, player, others, t);
+            self.track(config, p, others, t);
         }
         let after = self.sides();
 
@@ -645,9 +875,9 @@ impl Logic {
         }
         if let Some(first) = became.first() {
             match (after[0] > 0 && after[1] > 0, first) {
-                (true, _) => raise("three wide", true),
-                (false, Side::Left) => raise("car left", true),
-                (false, Side::Right) => raise("car right", true),
+                (true, _) => calls.raise("three wide", true),
+                (false, Side::Left) => calls.raise("car left", true),
+                (false, Side::Right) => calls.raise("car right", true),
             }
         }
 
@@ -661,9 +891,9 @@ impl Logic {
             }
         }
         match clears.as_slice() {
-            [_, _] => raise("clear all round", true),
-            [Side::Left] => raise("clear left", true),
-            [Side::Right] => raise("clear right", true),
+            [_, _] => calls.raise("clear all round", true),
+            [Side::Left] => calls.raise("clear left", true),
+            [Side::Right] => calls.raise("clear right", true),
             _ => {}
         }
 
@@ -673,7 +903,7 @@ impl Logic {
                 && t - last >= config.still_there_every
             {
                 self.last_still[side.index()] = Some(t);
-                raise(
+                calls.raise(
                     match side {
                         Side::Left => "still there left",
                         Side::Right => "still there right",
@@ -682,11 +912,6 @@ impl Logic {
                 );
             }
         }
-
-        if let Some(scoring) = scoring {
-            self.flags(scoring, &mut raise);
-        }
-        calls
     }
 
     /// Follows the cars beside the player: they count once they've been there `debounce`, and
@@ -740,30 +965,189 @@ impl Logic {
         self.overlap.retain(|vehicle, _| seen.contains(vehicle));
     }
 
+    /// Rising edges of the player's own alerts.
+    #[allow(clippy::too_many_arguments)]
+    fn alerts(
+        &mut self,
+        config: &SpotterConfig,
+        p: &Player,
+        prev: &Player,
+        wheels: &Wheels,
+        t: f64,
+        formation_lap: bool,
+        calls: &mut Calls,
+    ) {
+        let rose = |now: bool, before: bool| now && !before;
+
+        for (wheel, flat) in wheels.flat.iter().enumerate() {
+            if flat.unwrap_or(false) && !self.prev_flat[wheel].unwrap_or(false) {
+                calls.raise(PUNCTURES[wheel], false);
+            }
+        }
+        if rose(p.parts_detached, prev.parts_detached) {
+            calls.raise("parts off the car", false);
+        }
+        if rose(p.engine_overheating, prev.engine_overheating) {
+            calls.raise("engine overheating", false);
+        }
+        // In the pit lane with the limiter off: on the way in, or switched off on the way through
+        if p.car.in_pit_lane
+            && p.limiter == Some(false)
+            && (rose(p.car.in_pit_lane, prev.car.in_pit_lane) || prev.limiter.unwrap_or(false))
+        {
+            calls.raise("limiter, limiter", true);
+        }
+        if rose(p.lap_invalidated, prev.lap_invalidated) {
+            calls.raise("lap invalidated", false);
+        }
+
+        // A car closing to within a second, called again only once it's dropped back. Not on the
+        // formation lap, where the field runs nose to tail
+        let gap = p.gap_behind.unwrap_or(0.0);
+        if gap != 0.0 && gap >= config.gap_behind_off {
+            self.gap_armed = true;
+        } else if gap > 0.0
+            && gap <= config.gap_behind_on
+            && self.gap_armed
+            && !p.car.in_pit_lane
+            && t > GAP_BEHIND_AFTER
+            && !formation_lap
+        {
+            self.gap_armed = false;
+            calls.raise(
+                match gap < CLOSE_BEHIND {
+                    true => "car close behind",
+                    false => "car within a second behind",
+                },
+                false,
+            );
+        }
+    }
+
     /// Rising edges of flags and penalties.
-    fn flags(&mut self, now: &Scoring, raise: &mut impl FnMut(&'static str, bool)) {
+    fn flags(&mut self, now: &Scoring, calls: &mut Calls) {
         let Some(last) = self.prev_scoring.replace(now.clone()) else {
             return;
         };
         let caution = |fcy: &Option<String>| fcy.as_deref().is_some_and(|fcy| fcy != "none");
 
         if caution(&now.full_course_yellow) && !caution(&last.full_course_yellow) {
-            raise("full course yellow", true);
+            calls.raise("full course yellow", true);
         } else if caution(&last.full_course_yellow) && now.full_course_yellow.as_deref() == Some("none")
         {
-            raise("green flag, green flag", true);
+            calls.raise("green flag, green flag", true);
         }
         if now.phase.as_deref() == Some("stopped") && last.phase.as_deref() != Some("stopped") {
-            raise("red flag", true);
+            calls.raise("red flag", true);
         }
         if now.yellow && !last.yellow {
-            raise("yellow flag on track", false);
+            calls.raise("yellow flag on track", false);
         }
         if now.flag.as_deref() == Some("blue") && last.flag.as_deref() != Some("blue") {
-            raise("blue flag", false);
+            calls.raise("blue flag", false);
         }
         if now.penalties.unwrap_or(0) > last.penalties.unwrap_or(0) {
-            raise("penalty", false);
+            calls.raise("penalty", false);
+        }
+    }
+
+    /// Rain and track wetness changing band, and running onto a wet patch while the track is dry.
+    /// A change within `weather_repeat` of the last call is called once that's passed, if it still
+    /// holds.
+    fn weather(
+        &mut self,
+        config: &SpotterConfig,
+        scoring: &Scoring,
+        wet_wheels: usize,
+        t: f64,
+        stopped: bool,
+        calls: &mut Calls,
+    ) {
+        let rain = band(scoring.rain, &config.rain_bands, self.rain_band, config.band_margin);
+        match (self.rain_band, rain) {
+            (None, _) => self.rain_band = rain,
+            (Some(was), Some(now)) if now != was && t - self.last_rain_call >= config.weather_repeat => {
+                calls.raise(
+                    match () {
+                        _ if was == 0 => "rain starting",
+                        _ if now == 0 => "rain stopped",
+                        _ if now > was => "rain getting heavier",
+                        _ => "rain easing",
+                    },
+                    false,
+                );
+                self.rain_band = rain;
+                self.last_rain_call = t;
+            }
+            _ => {}
+        }
+
+        let track = band(scoring.wetness, &config.wet_bands, self.track_band, config.band_margin);
+        match (self.track_band, track) {
+            (None, _) => self.track_band = track,
+            (Some(was), Some(now))
+                if now != was && t - self.last_track_call >= config.weather_repeat =>
+            {
+                calls.raise(
+                    match () {
+                        _ if was == 0 => "track getting wet",
+                        _ if now == 0 => "track dry",
+                        _ if now > was => "track getting wetter",
+                        _ => "track drying",
+                    },
+                    false,
+                );
+                self.track_band = track;
+                self.last_track_call = t;
+            }
+            _ => {}
+        }
+
+        // On a wet track every tyre is on a wet surface: only news while it's dry or damp
+        if wet_wheels >= 2
+            && self.prev_wet < 2
+            && !stopped
+            && self.track_band.unwrap_or(0) <= 1
+            && t - self.last_patch_call >= config.wet_patch_repeat
+        {
+            calls.raise("wet patch", false);
+            self.last_patch_call = t;
+        }
+        self.prev_wet = wet_wheels;
+
+        self.forecast(config, scoring, t, calls);
+    }
+
+    /// Rain on the way: the first forecast point ahead likely to bring rain, once it's a few
+    /// minutes away, while it's still dry. Each point is called once.
+    fn forecast(&mut self, config: &SpotterConfig, scoring: &Scoring, t: f64, calls: &mut Calls) {
+        let Some(end) = scoring.session_end_time.filter(|end| *end > 0.0) else {
+            return;
+        };
+        // Raining already
+        if self.rain_band.unwrap_or(0) > 0 {
+            return;
+        }
+
+        for &(fraction, chance) in &scoring.forecast {
+            let at = fraction * end;
+            if at <= t || chance < config.forecast_rain_chance {
+                continue;
+            }
+            let minutes = (at - t) / 60.0;
+            // The next wet point is still far off
+            if minutes > config.forecast_rain_lead_minutes {
+                return;
+            }
+            let point = (scoring.session_type.clone().unwrap_or_default(), fraction.to_bits());
+            if !self.forecast_called.insert(point) {
+                return;
+            }
+            match minutes.round() as i64 {
+                ..=1 => calls.raise("rain likely in about a minute", false),
+                minutes => calls.raise_number("rain likely in about {} minutes", Some(minutes), false),
+            }
+            return;
         }
     }
 
@@ -784,11 +1168,18 @@ impl Logic {
     }
 }
 
+const PUNCTURES: [&str; 4] = [
+    "puncture front left",
+    "puncture front right",
+    "puncture rear left",
+    "puncture rear right",
+];
+
 // --------------------------------------------------------------------------- words
 
 /// A call in `lang`, or in English when there's no translation for it.
 pub fn translate(text: &'static str, lang: ArrayStr<2>) -> &'static str {
-    let spanish = match &*lang {
+    match &*lang {
         "es" => match text {
             "car left" => "coche a la izquierda",
             "car right" => "coche a la derecha",
@@ -798,17 +1189,37 @@ pub fn translate(text: &'static str, lang: ArrayStr<2>) -> &'static str {
             "clear all round" => "libre",
             "still there left" => "sigue a la izquierda",
             "still there right" => "sigue a la derecha",
+            "puncture front left" => "pinchazo delantera izquierda",
+            "puncture front right" => "pinchazo delantera derecha",
+            "puncture rear left" => "pinchazo trasera izquierda",
+            "puncture rear right" => "pinchazo trasera derecha",
+            "parts off the car" => "piezas sueltas",
+            "engine overheating" => "motor sobrecalentado",
+            "limiter, limiter" => "limitador, limitador",
+            "lap invalidated" => "vuelta invalidada",
+            "car close behind" => "coche pegado detrás",
+            "car within a second behind" => "coche a menos de un segundo detrás",
             "full course yellow" => "amarilla en todo el circuito",
             "green flag, green flag" => "bandera verde, bandera verde",
             "red flag" => "bandera roja",
             "yellow flag on track" => "bandera amarilla en pista",
             "blue flag" => "bandera azul",
             "penalty" => "penalización",
+            "rain starting" => "empieza a llover",
+            "rain getting heavier" => "llueve más fuerte",
+            "rain easing" => "la lluvia afloja",
+            "rain stopped" => "ha dejado de llover",
+            "track getting wet" => "la pista se está mojando",
+            "track getting wetter" => "la pista está cada vez más mojada",
+            "track drying" => "la pista se está secando",
+            "track dry" => "pista seca",
+            "wet patch" => "zona mojada",
+            "rain likely in about {} minutes" => "probable lluvia en unos {} minutos",
+            "rain likely in about a minute" => "probable lluvia en un minuto",
             _ => text,
         },
         _ => text,
-    };
-    spanish
+    }
 }
 
 #[cfg(test)]
@@ -816,17 +1227,21 @@ mod tests {
     use super::*;
 
     /// The player at `t`, heading along -z (heading 0) at 50 m/s.
-    fn player(t: f64) -> Car {
-        Car {
-            id: 1,
-            vehicle: 1,
-            time: Some(t),
-            speed: Some(50.0),
-            x: Some(0.0),
-            y: Some(0.0),
-            z: Some(0.0),
-            heading: Some(0.0),
-            ..Car::default()
+    fn player(t: f64) -> Player {
+        Player {
+            car: Car {
+                id: 1,
+                vehicle: 1,
+                time: Some(t),
+                speed: Some(50.0),
+                x: Some(0.0),
+                y: Some(0.0),
+                z: Some(0.0),
+                heading: Some(0.0),
+                ..Car::default()
+            },
+            limiter: Some(false),
+            ..Player::default()
         }
     }
 
@@ -845,13 +1260,17 @@ mod tests {
         }
     }
 
+    fn texts(calls: Vec<Raised>) -> Vec<&'static str> {
+        calls.into_iter().map(|call| call.text).collect()
+    }
+
     /// Runs the logic at 30 Hz from `from` to `to` with the same cars, returning the calls.
     fn run(logic: &mut Logic, from: f64, to: f64, others: &[Car]) -> Vec<&'static str> {
         let config = SpotterConfig::default();
         let mut calls = Vec::new();
         let mut t = from;
         while t < to {
-            calls.extend(logic.update(&config, &player(t), others, None).into_iter().map(|c| c.text));
+            calls.extend(texts(logic.update(&config, &player(t), others, &Wheels::default(), None)));
             t += 1.0 / 30.0;
         }
         calls
@@ -909,12 +1328,11 @@ mod tests {
     fn stays_quiet_when_slow_or_on_the_formation_lap() {
         let config = SpotterConfig::default();
         let mut logic = Logic::default();
-        let mut slow = player(0.0);
-        slow.speed = Some(2.0);
         for i in 0..30 {
-            let mut p = slow.clone();
-            p.time = Some(i as f64 / 30.0);
-            assert!(logic.update(&config, &p, &[other(2, 0.0, 3.0)], None).is_empty());
+            let mut p = player(i as f64 / 30.0);
+            p.car.speed = Some(2.0);
+            let calls = logic.update(&config, &p, &[other(2, 0.0, 3.0)], &Wheels::default(), None);
+            assert!(calls.is_empty());
         }
 
         let formation = Scoring {
@@ -923,7 +1341,9 @@ mod tests {
         };
         let mut logic = Logic::default();
         for i in 0..30 {
-            let calls = logic.update(&config, &player(i as f64 / 30.0), &[other(2, 0.0, 3.0)], Some(&formation));
+            let p = player(i as f64 / 30.0);
+            let calls =
+                logic.update(&config, &p, &[other(2, 0.0, 3.0)], &Wheels::default(), Some(&formation));
             assert!(calls.is_empty());
         }
     }
@@ -941,7 +1361,7 @@ mod tests {
         };
         let mut step = |t: f64, scoring: &Scoring| {
             logic
-                .update(&config, &player(t), &[], Some(scoring))
+                .update(&config, &player(t), &[], &Wheels::default(), Some(scoring))
                 .into_iter()
                 .map(|call| (call.text, call.urgent))
                 .collect::<Vec<_>>()
@@ -965,6 +1385,121 @@ mod tests {
     }
 
     #[test]
+    fn calls_the_cars_own_alerts() {
+        let config = SpotterConfig::default();
+        let mut logic = Logic::default();
+        let mut step = |p: &Player, wheels: &Wheels| {
+            texts(logic.update(&config, p, &[], wheels, None))
+        };
+
+        let mut p = player(30.0);
+        assert!(step(&p, &Wheels::default()).is_empty());
+
+        // A flat front right, parts off, the engine overheating and the lap invalidated
+        p.car.time = Some(30.1);
+        p.parts_detached = true;
+        p.engine_overheating = true;
+        p.lap_invalidated = true;
+        let flat = Wheels {
+            flat: [Some(false), Some(true), Some(false), Some(false)],
+            wet: 0,
+        };
+        assert_eq!(
+            step(&p, &flat),
+            [
+                "puncture front right",
+                "parts off the car",
+                "engine overheating",
+                "lap invalidated"
+            ]
+        );
+        // Called once, while they last
+        p.car.time = Some(30.2);
+        assert!(step(&p, &flat).is_empty());
+
+        // Into the pit lane with the limiter off
+        p.car.time = Some(30.3);
+        p.car.in_pit_lane = true;
+        assert_eq!(step(&p, &flat), ["limiter, limiter"]);
+    }
+
+    #[test]
+    fn calls_a_car_closing_behind_once() {
+        let config = SpotterConfig::default();
+        let mut logic = Logic::default();
+        let mut at = |t: f64, gap: f64| {
+            let mut p = player(t);
+            p.gap_behind = Some(gap);
+            texts(logic.update(&config, &p, &[], &Wheels::default(), None))
+        };
+
+        assert!(at(30.0, 2.0).is_empty());
+        assert_eq!(at(30.1, 0.8), ["car within a second behind"]);
+        // Still there: not again
+        assert!(at(30.2, 0.5).is_empty());
+        // Dropped back and closed again
+        assert!(at(30.3, 1.6).is_empty());
+        assert_eq!(at(30.4, 0.1), ["car close behind"]);
+    }
+
+    #[test]
+    fn calls_the_weather_changing() {
+        let config = SpotterConfig::default();
+        let mut logic = Logic::default();
+        let mut at = |t: f64, rain: f64, wetness: f64, wet_wheels: usize| {
+            let scoring = Scoring {
+                rain: Some(rain),
+                wetness: Some(wetness),
+                ..Scoring::default()
+            };
+            let wheels = Wheels {
+                wet: wet_wheels,
+                ..Wheels::default()
+            };
+            texts(logic.update(&config, &player(t), &[], &wheels, Some(&scoring)))
+        };
+
+        assert!(at(0.0, 0.0, 0.0, 0).is_empty());
+        // On an edge (0.05), within the margin: nothing
+        assert!(at(1.0, 0.06, 0.0, 0).is_empty());
+        assert_eq!(at(2.0, 0.1, 0.0, 0), ["rain starting"]);
+        // Heavier within a minute of the last call: waits
+        assert!(at(30.0, 0.4, 0.0, 0).is_empty());
+        assert_eq!(at(62.0, 0.4, 0.0, 0), ["rain getting heavier"]);
+        assert_eq!(at(63.0, 0.4, 0.1, 0), ["track getting wet"]);
+        // Two tyres on a wet surface while the track's only damp
+        assert_eq!(at(64.0, 0.4, 0.1, 2), ["wet patch"]);
+        assert_eq!(at(130.0, 0.0, 0.1, 0), ["rain stopped"]);
+    }
+
+    #[test]
+    fn calls_rain_on_the_way() {
+        let config = SpotterConfig::default();
+        let mut logic = Logic::default();
+        let scoring = Scoring {
+            rain: Some(0.0),
+            session_type: Some("race".into()),
+            session_end_time: Some(3600.0),
+            // Rain likely at the end, an hour in
+            forecast: vec![(0.0, 0.0), (0.5, 0.1), (1.0, 0.8)],
+            ..Scoring::default()
+        };
+        let mut at = |t: f64| {
+            logic
+                .update(&config, &player(t), &[], &Wheels::default(), Some(&scoring))
+                .into_iter()
+                .map(|call| call.words(arrstr!("en")))
+                .collect::<Vec<_>>()
+        };
+
+        // Too far off
+        assert!(at(2000.0).is_empty());
+        assert_eq!(at(3060.0), ["rain likely in about 9 minutes"]);
+        // Once
+        assert!(at(3100.0).is_empty());
+    }
+
+    #[test]
     fn moves_cars_to_the_players_time() {
         // Recorded 0.1 s earlier at 50 m/s along -z: 5 m further on by now
         let car = at_time(other(2, 0.0, 3.0), 0.1);
@@ -972,21 +1507,32 @@ mod tests {
     }
 
     #[test]
-    fn translates_to_spanish() {
+    fn says_calls_in_the_pilots_language() {
+        let call = Raised {
+            text: "rain likely in about {} minutes",
+            number: Some(4),
+            urgent: false,
+            session_time: 0.0,
+        };
+        assert_eq!(call.words(arrstr!("es")), "probable lluvia en unos 4 minutos");
+        assert_eq!(call.words(arrstr!("fr")), "rain likely in about 4 minutes");
         assert_eq!(translate("car left", arrstr!("es")), "coche a la izquierda");
-        assert_eq!(translate("car left", arrstr!("fr")), "car left");
     }
 
-    /// Needs `EVAL_DB`: a recording, e.g. my-engineer's race fixture, whose last frame has a lapped
-    /// car alongside on the right.
+    /// Prints every call the spotter makes over a recording (`EVAL_DB`), e.g. my-engineer's race
+    /// fixture, which ends with a lapped car alongside on the right.
     #[test]
     #[ignore]
     fn replays_a_recording() {
         let db = PathBuf::from(std::env::var("EVAL_DB").expect("EVAL_DB isn't set"));
         let calls = replay(&db, &SpotterConfig::default()).unwrap();
         for call in &calls {
-            println!("{:>8.1} {}{}", call.session_time, call.text, if call.urgent { " (urgent)" } else { "" });
+            println!(
+                "{:>8.1} {}{}",
+                call.session_time,
+                call.words(arrstr!("en")),
+                if call.urgent { " (urgent)" } else { "" }
+            );
         }
-        assert!(calls.iter().any(|call| call.text == "car right"));
     }
 }
