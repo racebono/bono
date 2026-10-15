@@ -1,15 +1,12 @@
-//! The race engineer: what the pilot says on the radio (transcribed) goes to Claude, which answers
-//! from the running simulator's telemetry with the `engineer` tool, and the answer is spoken back
-//! over the radio as Claude writes it.
+//! The race engineer: what the pilot says on the radio (transcribed) goes to the language model,
+//! which answers from the running simulator's telemetry with the `engineer` tool, and the answer
+//! is spoken back over the radio as the model writes it.
 
 use crate::{
     arrstr,
-    claude::{
-        Conversation, ConversationBuilder, Reply, StopReason,
-        engineer::{self, Engineer as EngineerTool, SCHEMA_PATH, SKILL_PATH, instructions},
-    },
     config::{ArrayStr, Config, RawConfig},
     language::LanguageDetector,
+    model::{Model, Reply, Settings, StopReason, Tools, claude},
     sim::Sim,
     sqlite::pool::Pool,
     synthesizer::{SpeechInput, SpeechOutput, Synthesizer},
@@ -25,10 +22,13 @@ use tokio::{
     runtime::Handle,
     sync::{Mutex, mpsc},
 };
+use tool::{Engineer as EngineerTool, SCHEMA_PATH, SKILL_PATH, instructions};
+
+mod tool;
 
 /// Said when there's no telemetry to answer from.
 const NO_TELEMETRY: &str = "No telemetry yet, get in the car.";
-/// Said when Claude declines to answer.
+/// Said when the model declines to answer.
 const SAY_AGAIN: &str = "Say again?";
 
 /// One line of the conversation, as the chat shows it.
@@ -56,7 +56,7 @@ pub struct Engineer {
     /// The language the pilot last asked in: typed questions whose language is unclear are
     /// answered in it
     last_lang: ArrayStr<2>,
-    /// Which language typed questions are in (Claude answers in the pilot's language)
+    /// Which language typed questions are in (the model answers in the pilot's language)
     languages: LanguageDetector,
     /// The conversation for the database the tool reads. `None` until the first question, and
     /// again once the simulator stops, letting go of its database
@@ -76,7 +76,7 @@ struct Turn {
     task: Task<anyhow::Result<Reply>>,
     /// The language it's answered in
     lang: ArrayStr<2>,
-    /// The answer as Claude writes it, for the chat
+    /// The answer as the model writes it, for the chat
     text: mpsc::UnboundedReceiver<String>,
     /// The chat entry it's written into, once it says something
     entry: Option<usize>,
@@ -98,7 +98,7 @@ struct Session {
 }
 
 struct SessionState {
-    conversation: Conversation,
+    conversation: Box<dyn Model>,
     pool: Pool,
     /// The game session the conversation is about (track, session type and number), for
     /// `auto_session`
@@ -162,7 +162,11 @@ impl Engineer {
             return;
         }
 
-        if let Some(stream) = self.playback.as_ref().and_then(|playback| playback.stream.as_ref()) {
+        if let Some(stream) = self
+            .playback
+            .as_ref()
+            .and_then(|playback| playback.stream.as_ref())
+        {
             let result = match held {
                 true => stream.pause(),
                 false => stream.resume(),
@@ -197,8 +201,8 @@ impl Engineer {
         self.ask(rt, sim, config, synth, question, lang);
     }
 
-    /// The pilot asked something on the radio: it's sent to Claude, with the running simulator's
-    /// telemetry, and the answer is spoken as Claude writes it. An answer still on its way, or
+    /// The pilot asked something on the radio: it's sent to the model, with the running
+    /// simulator's telemetry, and the answer is spoken as the model writes it. An answer still on its way, or
     /// being spoken, is dropped: the pilot talked over it.
     pub fn ask(
         &mut self,
@@ -241,7 +245,7 @@ impl Engineer {
         let state = session.state.clone();
         let auto_session = config.get().auto_session;
 
-        // What Claude writes goes straight to the synthesizer, and to the chat
+        // What the model writes goes straight to the synthesizer, and to the chat
         let (lang, speech) = self.speak(rt, config, synth, lang);
         let (chat, text) = mpsc::unbounded_channel();
         let task = Task::spawn(async move {
@@ -249,12 +253,13 @@ impl Engineer {
             if auto_session {
                 state.follow_game_session().await;
             }
+            let mut on_text = |text: &str| {
+                speech.push(text);
+                let _ = chat.send(text.to_owned());
+            };
             state
                 .conversation
-                .send_streaming(question, |text| {
-                    speech.push(text);
-                    let _ = chat.send(text.to_owned());
-                })
+                .send_streaming(question, &mut on_text)
                 .await
             // The speech's text ends here, with the turn
         });
@@ -331,8 +336,8 @@ impl Engineer {
             "Engineer ({}, {:?}; {} in, {} cached, {} out): {}",
             reply.model,
             reply.stop,
-            reply.usage.input_tokens + reply.usage.cache_creation_input_tokens,
-            reply.usage.cache_read_input_tokens,
+            reply.usage.input_tokens + reply.usage.cache_write_tokens,
+            reply.usage.cache_read_tokens,
             reply.usage.output_tokens,
             reply.text
         );
@@ -341,8 +346,8 @@ impl Engineer {
         let mut detail = format!(
             "{} | {} in, {} cached, {} out",
             reply.model,
-            usage.input_tokens + usage.cache_creation_input_tokens,
-            usage.cache_read_input_tokens,
+            usage.input_tokens + usage.cache_write_tokens,
+            usage.cache_read_tokens,
             usage.output_tokens
         );
 
@@ -518,21 +523,23 @@ impl Engineer {
 
     fn start(&self, config: &Config, pool: Pool) -> anyhow::Result<Session> {
         let tool = EngineerTool::new(pool.clone(), self.schema.clone());
-        let mut builder = ConversationBuilder::new();
-        {
+        let mut tools = Tools::default();
+        tools.insert(
+            EngineerTool::NAME,
+            Some(EngineerTool::description()),
+            EngineerTool::input_schema(),
+            tool.clone(),
+        );
+        let settings = {
             let config = config.get();
-            builder
-                .model(&config.claude_model)
-                .effort(&config.claude_effort)
-                .system(self.skill.clone())
-                .tool(
-                    EngineerTool::NAME,
-                    Some(EngineerTool::description()),
-                    EngineerTool::input_schema(),
-                    tool.clone(),
-                );
-        }
-        let conversation = builder.build(self.client.clone())?;
+            Settings {
+                model: config.claude_model.clone(),
+                effort: config.claude_effort.clone(),
+                system: self.skill.clone(),
+                tools,
+            }
+        };
+        let conversation = Box::new(claude::Conversation::new(settings, self.client.clone())?);
 
         // The history cache is built now, so the first history question doesn't wait for it
         tokio::spawn(async move {
@@ -628,7 +635,9 @@ mod tests {
         let mut sim = crate::sim::recording(pool);
 
         let dir = tempfile::tempdir().unwrap();
-        let config = rt.block_on(Config::new(dir.path().join("config.json"))).unwrap();
+        let config = rt
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
         let mut synth = Synthesizer::new(rt, &config.get());
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -677,10 +686,10 @@ mod tests {
         let one = NonZeroUsize::new(1).unwrap();
         let pool = Pool::new(Database::read_only(Arc::new(path)), one, one);
 
-        let mut builder = ConversationBuilder::new();
+        let mut builder = claude::ConversationBuilder::new();
         builder.api_key("test");
         let mut state = SessionState {
-            conversation: builder.build(reqwest::Client::new()).unwrap(),
+            conversation: Box::new(builder.build(reqwest::Client::new()).unwrap()),
             pool,
             game_session: None,
         };

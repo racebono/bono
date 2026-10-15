@@ -9,7 +9,7 @@
 //! official positions, driver names, classes, lap and sector times, pit stops, penalties) is read
 //! from the newest rows only.
 
-use crate::{claude::tool_handler::ToolHandler, sqlite::pool::Pool};
+use crate::{model::ToolHandler, sqlite::pool::Pool};
 use anyhow::{Context as _, bail};
 use rusqlite::{
     Connection, Params, params,
@@ -4215,7 +4215,10 @@ mod tests {
 #[cfg(test)]
 mod evals {
     use super::*;
-    use crate::{claude::ConversationBuilder, sqlite::Database};
+    use crate::{
+        model::{Model, claude::ConversationBuilder},
+        sqlite::Database,
+    };
     use std::{num::NonZeroUsize, sync::Mutex as StdMutex, time::Instant};
 
     /// The tool, recording every call and what it answered.
@@ -4373,10 +4376,7 @@ mod evals {
                     .unwrap();
 
                     let tokens = reply.as_ref().map_or(0, |reply| {
-                        reply.usage.input_tokens
-                            + reply.usage.cache_creation_input_tokens
-                            + reply.usage.cache_read_input_tokens
-                            + reply.usage.output_tokens
+                        reply.usage.total_input_tokens() + reply.usage.output_tokens
                     });
                     std::fs::write(
                         dir.join("timing.json"),

@@ -65,7 +65,13 @@ lingua = { version = "1.8.0", default-features = false, features = [
     "portuguese",
     "spanish",
 ] }
-mistralrs = { version = "0.8.1", optional = true }
+# Unreleased master: 0.8.1 refuses CUDA toolkits newer than 13.2
+mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs", branch = "master", optional = true }
+hf-hub = { version = "1.0.0", optional = true }
+ollama-rs = { version = "0.3.6", features = [
+    "stream",
+    "rustls",
+], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # Steam's per-game "Running" flag, and watching it change
@@ -82,25 +88,20 @@ windows-sys = { version = "0.61.2", features = [
 whisper-rs = { git = "https://github.com/Aandreba/whisper-rs", branch = "master", features = [
     "metal",
 ] }
-mistralrs = { version = "0.8.1", features = [
+mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs", branch = "master", features = [
     "accelerate",
     "metal",
 ], optional = true }
 
 # Opt-in whisper backends. Each needs its SDK installed at build time.
 [features]
-default = ["cuda", "vulkan"]
+default = ["ollama", "cuda", "vulkan"]
 # Windows, Linux. Needs the CUDA toolkit (`CUDA_PATH` on Windows)
-cuda = [
-    "whisper-rs/cuda",
-    "mistralrs?/cuda",
-    "mistralrs?/cudnn",
-    "mistralrs?/nccl",
-]
+cuda = ["whisper-rs/cuda"]
 # Linux only: whisper-rs-sys refuses to build it on Windows (broken ROCm 5.7). Needs ROCm (`HIP_PATH`)
 hipblas = ["whisper-rs/hipblas"]
 # Windows, Linux. Needs Intel oneAPI (`icx`/`icpx` compilers)
-intel-sycl = ["whisper-rs/intel-sycl", "mistralrs?/mkl"]
+intel-sycl = ["whisper-rs/intel-sycl"]
 # Windows, Linux. Needs OpenBLAS (`BLAS_INCLUDE_DIRS`, optionally `OPENBLAS_PATH`)
 openblas = ["whisper-rs/openblas"]
 # Windows, Linux. Needs the Vulkan SDK (`VULKAN_SDK`)
@@ -148,7 +149,7 @@ all-languages = [
     "lingua/vietnamese",
     "lingua/welsh",
 ]
-offline = ["dep:mistralrs"]
+ollama = ["dep:ollama-rs"]
 
 [workspace]
 members = ["xtask", "sim", "lmu"]

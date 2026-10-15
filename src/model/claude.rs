@@ -1,6 +1,8 @@
-use crate::claude::tool_handler::{ToolHandler, Tools};
+//! Claude, through the Claude API.
+
+use super::{Model, Reply, Settings, StopReason, ToolHandler, Tools, Usage, text::TextSink};
 use anyhow::{Context, bail};
-use futures::future::join_all;
+use futures::future::{BoxFuture, join_all};
 use reqwest::{
     RequestBuilder, StatusCode,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
@@ -11,14 +13,11 @@ use std::{
     env::VarError,
     fmt::{self, Display, Formatter},
     num::NonZeroU32,
-    ops::AddAssign,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
-pub mod engineer;
-mod tool_handler;
-
+/// A conversation with Claude.
 pub struct Conversation {
     client: reqwest::Client,
     base_url: String,
@@ -32,31 +31,28 @@ pub struct Conversation {
     usage: BTreeMap<String, Usage>,
 }
 
-/// What Claude answered to one `Conversation::send`.
-#[derive(Debug, Clone)]
-pub struct Reply {
-    /// Every text block of the turn, in order (with tool calls, Claude may write some before the
-    /// calls and the rest after), separated by blank lines.
-    pub text: String,
-    pub stop: StopReason,
-    /// The tokens of every request the turn took.
-    pub usage: Usage,
-    /// The model that wrote the turn's last response: with fallbacks, not always the one asked
-    /// for.
-    pub model: String,
+/// Tokens billed, by kind, as the API counts them.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+struct Tokens {
+    #[serde(default, deserialize_with = "null_as_default")]
+    input_tokens: u64,
+    #[serde(default, deserialize_with = "null_as_default")]
+    cache_creation_input_tokens: u64,
+    #[serde(default, deserialize_with = "null_as_default")]
+    cache_read_input_tokens: u64,
+    #[serde(default, deserialize_with = "null_as_default")]
+    output_tokens: u64,
 }
 
-/// Tokens billed, by kind.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-pub struct Usage {
-    #[serde(default, deserialize_with = "null_as_default")]
-    pub input_tokens: u64,
-    #[serde(default, deserialize_with = "null_as_default")]
-    pub cache_creation_input_tokens: u64,
-    #[serde(default, deserialize_with = "null_as_default")]
-    pub cache_read_input_tokens: u64,
-    #[serde(default, deserialize_with = "null_as_default")]
-    pub output_tokens: u64,
+impl From<Tokens> for Usage {
+    fn from(tokens: Tokens) -> Self {
+        Self {
+            input_tokens: tokens.input_tokens,
+            cache_write_tokens: tokens.cache_creation_input_tokens,
+            cache_read_tokens: tokens.cache_read_input_tokens,
+            output_tokens: tokens.output_tokens,
+        }
+    }
 }
 
 /// Streamed counts can be `null` (e.g. the cache's, before they're known).
@@ -68,77 +64,53 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
-impl AddAssign for Usage {
-    fn add_assign(&mut self, other: Self) {
-        self.input_tokens += other.input_tokens;
-        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
-        self.cache_read_input_tokens += other.cache_read_input_tokens;
-        self.output_tokens += other.output_tokens;
-    }
-}
+impl Model for Conversation {
+    fn send_streaming<'a>(
+        &'a mut self,
+        text: String,
+        on_text: &'a mut (dyn FnMut(&str) + Send),
+    ) -> BoxFuture<'a, anyhow::Result<Reply>> {
+        Box::pin(async move {
+            let mut turn = Turn {
+                start: self.body.messages.len(),
+                conversation: self,
+                keep: false,
+            };
 
-/// Why Claude's turn ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StopReason {
-    /// It finished its answer.
-    EndTurn,
-    /// It wrote one of the request's stop sequences.
-    StopSequence,
-    /// The answer was cut off at `ConversationBuilder::max_tokens`: `text` is incomplete.
-    MaxTokens,
-    /// The conversation no longer fits in the model's context window: `text` is incomplete, and
-    /// every later request would end the same way, so it needs to start over.
-    ContextWindowExceeded,
-    /// The model (and every fallback model) declined. The exchange isn't kept in the
-    /// conversation, as if it never happened.
-    Refusal,
-}
+            let reply = turn
+                .conversation
+                .run_turn(text, &mut TextSink::new(on_text))
+                .await?;
 
-impl Conversation {
-    /// Every request's tokens so far (resets included), by the model that answered it.
-    #[inline]
-    pub fn usage(&self) -> &BTreeMap<String, Usage> {
-        &self.usage
+            turn.keep = reply.stop != StopReason::Refusal;
+            return Ok(reply);
+        })
     }
 
-    /// Starts the conversation over, e.g. for a new session: forgets every message, and the code
-    /// execution container. The settings, tools and skills stay.
-    pub fn reset(&mut self) {
+    /// Also forgets the code execution container.
+    fn reset(&mut self) {
         self.body.messages.clear();
         if let Some(container) = &mut self.body.container {
             container.id = None;
         }
     }
 
-    /// Sends the user's message and runs Claude's turn to its end, tool calls included. On an
-    /// error, or if the returned future is dropped before it finishes, the conversation is left
-    /// as it was before the call.
     #[inline]
-    pub async fn send(&mut self, text: String) -> anyhow::Result<Reply> {
-        self.send_streaming(text, |_| {}).await
+    fn usage(&self) -> &BTreeMap<String, Usage> {
+        &self.usage
     }
+}
 
-    /// Like [`Self::send`], with the reply's text handed to `on_text` as Claude writes it: put
-    /// together, the pieces are [`Reply::text`]. Text already handed over stays said, even if
-    /// the turn then fails, or ends in a refusal.
-    pub async fn send_streaming(
-        &mut self,
-        text: String,
-        mut on_text: impl FnMut(&str) + Send,
-    ) -> anyhow::Result<Reply> {
-        let mut turn = Turn {
-            start: self.body.messages.len(),
-            conversation: self,
-            keep: false,
-        };
-
-        let reply = turn
-            .conversation
-            .run_turn(text, &mut TextSink::new(&mut on_text))
-            .await?;
-
-        turn.keep = reply.stop != StopReason::Refusal;
-        return Ok(reply);
+impl Conversation {
+    /// A conversation with Claude, with the defaults for everything `settings` doesn't say.
+    pub fn new(settings: Settings, client: reqwest::Client) -> anyhow::Result<Self> {
+        let mut builder = ConversationBuilder::new();
+        builder
+            .model(settings.model)
+            .effort(settings.effort)
+            .system(settings.system)
+            .tools(settings.tools);
+        builder.build(client)
     }
 
     async fn run_turn(&mut self, text: String, sink: &mut TextSink<'_>) -> anyhow::Result<Reply> {
@@ -453,7 +425,8 @@ pub struct ConversationBuilder {
     max_tokens: NonZeroU32,
     system: Arc<str>,
     tools: Tools,
-    req_tools: Vec<RequestTool>,
+    /// The tools that run on Anthropic's side
+    server_tools: Vec<RequestTool>,
     skills: Vec<RequestSkill>,
     compaction: bool,
     max_requests: NonZeroU32,
@@ -472,7 +445,7 @@ impl ConversationBuilder {
             max_tokens: NonZeroU32::new(16000).unwrap(),
             system: Arc::default(),
             tools: Tools::default(),
-            req_tools: Vec::new(),
+            server_tools: Vec::new(),
             skills: Vec::new(),
             compaction: false,
             max_requests: NonZeroU32::new(16).unwrap(),
@@ -568,7 +541,7 @@ impl ConversationBuilder {
     /// "web_search")`.
     #[inline]
     pub fn server_tool(&mut self, r#type: &'static str, name: &'static str) -> &mut Self {
-        self.req_tools.push(RequestTool {
+        self.server_tools.push(RequestTool {
             r#type: Some(r#type),
             name,
             description: None,
@@ -580,7 +553,7 @@ impl ConversationBuilder {
     /// An Agent Skill, loaded into the code execution container when relevant: `r#type` is
     /// `anthropic` (Anthropic's own, e.g. `xlsx`) or `custom` (uploaded with the Skills API). The
     /// code execution tool is added with the first one. Skills run on Anthropic's side, so they
-    /// can't reach files on this PC (the telemetry database included: see `engineer::Engineer`).
+    /// can't reach files on this PC (the telemetry database included: see the engineer's tool).
     #[inline]
     pub fn skill(
         &mut self,
@@ -599,6 +572,7 @@ impl ConversationBuilder {
         self
     }
 
+    /// A tool that runs on this side: see [`Tools::insert`].
     #[inline]
     pub fn tool<H>(
         &mut self,
@@ -610,13 +584,14 @@ impl ConversationBuilder {
     where
         H: ToolHandler + 'static,
     {
-        self.req_tools.push(RequestTool {
-            r#type: None,
-            name,
-            description,
-            input_schema,
-        });
-        self.tools.insert(name, handler);
+        self.tools.insert(name, description, input_schema, handler);
+        self
+    }
+
+    /// The tools that run on this side, replacing any added before.
+    #[inline]
+    pub fn tools(&mut self, tools: Tools) -> &mut Self {
+        self.tools = tools;
         self
     }
 
@@ -697,6 +672,14 @@ impl ConversationBuilder {
             }],
         };
 
+        let mut tools = self.server_tools;
+        tools.extend(self.tools.definitions().map(|tool| RequestTool {
+            r#type: None,
+            name: tool.name,
+            description: tool.description.map(str::to_owned),
+            input_schema: tool.input_schema.clone(),
+        }));
+
         headers.insert(ANTHROPIC_BETA, HeaderValue::from_str(&betas)?);
         return Ok(Conversation {
             client,
@@ -714,7 +697,7 @@ impl ConversationBuilder {
                 },
                 system,
                 messages: Vec::new(),
-                tools: self.req_tools,
+                tools,
                 container: (!self.skills.is_empty()).then(|| RequestContainer {
                     id: None,
                     skills: self.skills,
@@ -835,22 +818,22 @@ struct ResponseBody {
 #[derive(Default, Deserialize)]
 struct ResponseUsage {
     #[serde(flatten)]
-    usage: Usage,
+    usage: Tokens,
     /// Present when the request ran server-side steps (e.g. compaction), each billed apart: the
     /// top-level counts are then only part of it
     #[serde(default, deserialize_with = "null_as_default")]
-    iterations: Vec<Usage>,
+    iterations: Vec<Tokens>,
 }
 
 impl ResponseUsage {
     fn total(&self) -> Usage {
         match self.iterations.is_empty() {
-            true => self.usage,
+            true => self.usage.into(),
             false => self
                 .iterations
                 .iter()
                 .fold(Usage::default(), |mut total, usage| {
-                    total += *usage;
+                    total += Usage::from(*usage);
                     total
                 }),
         }
@@ -871,72 +854,12 @@ struct ResultBody {
     is_error: bool,
 }
 
-/// Puts a turn's text together and hands it out as it comes: blocks of text are separated by
-/// blank lines, and those with nothing to say are left out.
-struct TextSink<'a> {
-    on_text: &'a mut (dyn FnMut(&str) + Send),
-    /// Everything handed out
-    text: String,
-    /// Whitespace the current block started with, held until the block says something
-    pending: String,
-    /// The current block said something
-    started: bool,
-    /// The next block carries on from the last: a model declined midway through it, and the
-    /// fallback model continues where it left off
-    carry_on: bool,
-}
-
-impl<'a> TextSink<'a> {
-    fn new(on_text: &'a mut (dyn FnMut(&str) + Send)) -> Self {
-        Self {
-            on_text,
-            text: String::new(),
-            pending: String::new(),
-            started: false,
-            carry_on: false,
-        }
-    }
-
-    fn start_response(&mut self) {
-        self.end_block();
-        self.carry_on = false;
-    }
-
-    fn start_block(&mut self, block: &serde_json::Value) {
-        self.end_block();
-        if block["type"] == "fallback" {
-            self.carry_on = true;
-        }
-    }
-
-    /// More of the current text block.
-    fn push(&mut self, text: &str) {
-        if !self.started {
-            if text.trim().is_empty() {
-                self.pending.push_str(text);
-                return;
-            }
-
-            self.started = true;
-            if !std::mem::take(&mut self.carry_on) && !self.text.is_empty() {
-                self.emit("\n\n");
-            }
-            let pending = std::mem::take(&mut self.pending);
-            self.emit(&pending);
-        }
-        self.emit(text);
-    }
-
-    fn end_block(&mut self) {
-        self.pending.clear();
-        self.started = false;
-    }
-
-    fn emit(&mut self, text: &str) {
-        if !text.is_empty() {
-            self.text.push_str(text);
-            (self.on_text)(text);
-        }
+/// A content block starts: a `fallback` block marks where a model declined midway, and the
+/// fallback model's text carries on from the declined one's.
+fn start_block(sink: &mut TextSink<'_>, block: &serde_json::Value) {
+    sink.end_block();
+    if block["type"] == "fallback" {
+        sink.carry_on();
     }
 }
 
@@ -957,7 +880,7 @@ async fn read_response(
             .await
             .context("Claude sent a response that couldn't be read")?;
         for block in &body.content {
-            sink.start_block(block);
+            start_block(sink, block);
             if block["type"] == "text"
                 && let Some(text) = block["text"].as_str()
             {
@@ -1062,7 +985,7 @@ impl MessageStream {
                     self.inputs.resize(index + 1, String::new());
                 }
 
-                sink.start_block(&block);
+                start_block(sink, &block);
                 if block["type"] == "text"
                     && let Some(text) = block["text"].as_str()
                 {
@@ -1252,14 +1175,6 @@ fn parse_retry_after(value: &HeaderValue) -> Option<Duration> {
     );
 }
 
-/// `Conversation::send` can run on any of the runtime's threads (e.g. in `tokio::spawn`).
-#[allow(dead_code)]
-fn assert_send_is_send(conversation: &mut Conversation) {
-    fn is_send<T: Send>(_: &T) {}
-    is_send(&conversation.send(String::new()));
-    is_send(&conversation.send_streaming(String::new(), |_| {}));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1415,7 +1330,7 @@ mod tests {
         let mut pieces = Vec::new();
         let reply = timeout(
             Duration::from_secs(5),
-            conversation.send_streaming(text.into(), |piece| pieces.push(piece.to_owned())),
+            conversation.send_streaming(text.into(), &mut |piece| pieces.push(piece.to_owned())),
         )
         .await
         .expect("timed out");
@@ -1470,7 +1385,7 @@ mod tests {
         let (reply, pieces) = send_streaming(&mut conversation, "What is the gap?").await;
         let reply = reply.unwrap();
         assert_eq!(reply.stop, StopReason::EndTurn);
-        assert_eq!(reply.text, "Checking the gap.\n\n You are 2.1s ahead.");
+        assert_eq!(reply.text, "Checking the gap.\n\nYou are 2.1s ahead.");
         assert_eq!(pieces.concat(), reply.text);
         assert_eq!(pieces[0], "Checking");
         assert_eq!(reply.usage.input_tokens, 20);
@@ -1578,7 +1493,7 @@ mod tests {
 
         let mut pieces = Vec::new();
         let reply = conversation
-            .send_streaming("Look up the gap, then tell me it.".into(), |piece| {
+            .send_streaming("Look up the gap, then tell me it.".into(), &mut |piece| {
                 pieces.push(piece.to_owned())
             })
             .await
@@ -1817,8 +1732,8 @@ mod tests {
             reply.usage,
             Usage {
                 input_tokens: 320,
-                cache_creation_input_tokens: 5,
-                cache_read_input_tokens: 50,
+                cache_write_tokens: 5,
+                cache_read_tokens: 50,
                 output_tokens: 47,
             }
         );

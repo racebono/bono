@@ -21,10 +21,10 @@ pub extern crate std;
 
 mod app;
 mod button;
-mod claude;
 mod config;
 mod engineer;
 mod language;
+mod model;
 mod sim;
 mod spotter;
 mod sqlite;
