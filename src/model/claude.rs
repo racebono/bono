@@ -112,10 +112,10 @@ impl Conversation {
     ) -> anyhow::Result<Self> {
         let mut builder = ConversationBuilder::new();
         builder
-            .model(&config.model)
-            .effort(&config.effort)
-            .max_tokens(config.max_tokens)
-            .compaction(config.compaction)
+            .model(config.model())
+            .effort(config.effort())
+            .max_tokens(*config.max_tokens())
+            .compaction(*config.compaction())
             .system(system)
             .tools(tools);
         builder.build(client)

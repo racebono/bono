@@ -24,7 +24,7 @@ use sdl3::{
     },
 };
 use std::{
-    ops::{Deref, DerefMut},
+    ops::Deref,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -116,7 +116,7 @@ impl AudioTopbar {
                     // Played like the engineer's answers, so it previews the volume
                     let gain = {
                         let config = config.get();
-                        config.master_volume * config.engineer_volume
+                        config.master_volume() * config.engineer_volume()
                     };
                     for sample in &mut speech.samples {
                         *sample *= gain;
@@ -202,22 +202,22 @@ impl DeviceSelector {
 
         let mut test = false;
         config.maybe_update(|raw| {
-            let config = kind.config_mut(raw);
+            let mut device = kind.config(raw).clone();
 
             // A sub-menu rather than a `ComboBox`: egui only tracks one open popup per viewport,
             // so opening a `ComboBox` popup would close the menu it lives in.
-            let label = format!("{}: {}", kind.label(), config.name());
-            return ui
+            let label = format!("{}: {}", kind.label(), device.name());
+            let updated = ui
                 .menu_button(label, |ui| {
                     let mut updated = ui
-                        .selectable_value(config, AudioDevice::Default, "System default")
+                        .selectable_value(&mut device, AudioDevice::Default, "System default")
                         .clicked();
 
-                    for (device, name) in &self.devices {
+                    for (id, name) in &self.devices {
                         updated |= ui
                             .selectable_value(
-                                config,
-                                AudioDevice::Device(*device, name.clone()),
+                                &mut device,
+                                AudioDevice::Device(*id, name.clone()),
                                 name.deref(),
                             )
                             .clicked();
@@ -229,13 +229,18 @@ impl DeviceSelector {
                     }
 
                     if updated {
-                        self.open = kind.open(&ss.audio, config);
+                        self.open = kind.open(&ss.audio, &device);
                     }
 
                     return updated;
                 })
                 .inner
                 .unwrap_or(false);
+
+            if updated {
+                kind.set(raw, device);
+            }
+            return updated;
         });
 
         return test;
@@ -265,15 +270,15 @@ impl Kind {
 
     pub fn config<'a>(self, raw: &'a RawConfig) -> &'a AudioDevice {
         match self {
-            Kind::Playback => raw.speaker.deref(),
-            Kind::Recording => raw.microphone.deref(),
+            Kind::Playback => raw.speaker().deref(),
+            Kind::Recording => raw.microphone().deref(),
         }
     }
 
-    pub fn config_mut<'a>(self, raw: &'a mut RawConfig) -> &'a mut AudioDevice {
+    pub fn set(self, raw: &mut RawConfig, device: AudioDevice) {
         match self {
-            Kind::Playback => raw.speaker.deref_mut(),
-            Kind::Recording => raw.microphone.deref_mut(),
+            Kind::Playback => raw.speaker.set(device.into()),
+            Kind::Recording => raw.microphone.set(device.into()),
         }
     }
 

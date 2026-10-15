@@ -82,17 +82,17 @@ impl Conversation {
         client: reqwest::Client,
     ) -> anyhow::Result<Self> {
         let mut builder = ConversationBuilder::new();
-        if let Some(host) = &config.host {
+        if let Some(host) = config.host() {
             builder.base_url(host_url(host));
         }
-        if let Some(keep_alive) = config.keep_alive {
+        if let Some(keep_alive) = *config.keep_alive() {
             builder.keep_alive(keep_alive);
         }
         builder
-            .model(&config.model)
-            .effort(&config.effort)
-            .context_length(config.context_length)
-            .max_tokens(config.max_tokens)
+            .model(config.model())
+            .effort(config.effort())
+            .context_length(*config.context_length())
+            .max_tokens(*config.max_tokens())
             .system(system)
             .tools(tools);
         builder.build(client)

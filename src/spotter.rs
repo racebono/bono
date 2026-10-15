@@ -136,7 +136,7 @@ impl Spotter {
     ) {
         let settings = config.get().spotter.clone();
         let db = sim
-            .filter(|_| settings.enabled)
+            .filter(|_| *settings.enabled())
             .and_then(|sim| sim.database())
             .map(|pool| pool.database().path().to_owned());
 
@@ -178,7 +178,7 @@ impl Spotter {
 
     /// The calls' language: the configured one, or the pilot's; English without a voice for it.
     fn language(&self, config: &Config, settings: &SpotterConfig, engineer: &Engineer) -> ArrayStr<2> {
-        let lang = settings.language.unwrap_or(engineer.language());
+        let lang = settings.language().unwrap_or(engineer.language());
         match config.get().voices().contains_key(&lang) {
             true => lang,
             false => arrstr!("en"),
@@ -188,7 +188,7 @@ impl Spotter {
     fn key(config: &Config, lang: ArrayStr<2>, words: String) -> CacheKey {
         let config = config.get();
         let voice = config.voices().get(&lang).map(|path| path.as_std_path().to_owned());
-        (lang, voice.unwrap_or_default(), config.radio_effect.to_bits(), words)
+        (lang, voice.unwrap_or_default(), config.radio_effect().to_bits(), words)
     }
 
     fn effects(config: &Config) -> Effects {
@@ -287,7 +287,7 @@ impl Spotter {
         let speaker = speaker?;
         let gain = {
             let config = config.get();
-            config.master_volume * config.spotter_volume
+            *config.master_volume() * *config.spotter_volume()
         };
         let speech = Speech {
             samples: speech.samples.iter().map(|sample| sample * gain).collect(),
@@ -367,7 +367,7 @@ fn follow(
             }
         }
 
-        let period = Duration::from_secs_f64(config.poll_interval.clamp(0.005, 1.0));
+        let period = Duration::from_secs_f64(config.poll_interval().clamp(0.005, 1.0));
         std::thread::sleep(period.saturating_sub(start.elapsed()));
     }
 }
@@ -819,7 +819,7 @@ impl Logic {
             *self = Logic::default();
         }
 
-        let stopped = p.speed.unwrap_or(0.0) < config.min_speed
+        let stopped = p.speed.unwrap_or(0.0) < *config.min_speed()
             || p.in_pit_lane
             || p.x.is_none()
             || p.z.is_none()
@@ -886,7 +886,7 @@ impl Logic {
             let held = self.side_since[side.index()].map_or(0.0, |since| t - since);
             self.side_since[side.index()] = None;
             self.last_still[side.index()] = None;
-            if held >= config.min_hold_for_clear && !quiet {
+            if held >= *config.min_hold_for_clear() && !quiet {
                 clears.push(side);
             }
         }
@@ -900,7 +900,7 @@ impl Logic {
         for side in Side::BOTH {
             if after[side.index()] > 0
                 && let Some(last) = self.last_still[side.index()]
-                && t - last >= config.still_there_every
+                && t - last >= *config.still_there_every()
             {
                 self.last_still[side.index()] = Some(t);
                 calls.raise(
@@ -923,7 +923,7 @@ impl Logic {
                 continue;
             }
             if (other.y.unwrap_or(0.0) - player.y.unwrap_or(0.0)).abs()
-                > config.max_height_difference
+                > *config.max_height_difference()
             {
                 continue;
             }
@@ -934,8 +934,8 @@ impl Logic {
             let (along, across) = (along.abs(), across.abs());
 
             if let Some(overlap) = self.overlap.get(&other.vehicle) {
-                if along <= config.exit_along
-                    && (config.min_across..=config.exit_across).contains(&across)
+                if along <= *config.exit_along()
+                    && (*config.min_across()..=*config.exit_across()).contains(&across)
                     && side == *overlap
                 {
                     seen.push(other.vehicle);
@@ -943,12 +943,12 @@ impl Logic {
                 continue;
             }
 
-            if along <= config.enter_along
-                && (config.min_across..=config.enter_across).contains(&across)
+            if along <= *config.enter_along()
+                && (*config.min_across()..=*config.enter_across()).contains(&across)
             {
                 match self.pending.get(&other.vehicle) {
                     Some(&(pending, since)) if pending == side => {
-                        if t - since >= config.debounce {
+                        if t - since >= *config.debounce() {
                             self.overlap.insert(other.vehicle, side);
                             self.pending.remove(&other.vehicle);
                             seen.push(other.vehicle);
@@ -1004,10 +1004,10 @@ impl Logic {
         // A car closing to within a second, called again only once it's dropped back. Not on the
         // formation lap, where the field runs nose to tail
         let gap = p.gap_behind.unwrap_or(0.0);
-        if gap != 0.0 && gap >= config.gap_behind_off {
+        if gap != 0.0 && gap >= *config.gap_behind_off() {
             self.gap_armed = true;
         } else if gap > 0.0
-            && gap <= config.gap_behind_on
+            && gap <= *config.gap_behind_on()
             && self.gap_armed
             && !p.car.in_pit_lane
             && t > GAP_BEHIND_AFTER
@@ -1063,10 +1063,10 @@ impl Logic {
         stopped: bool,
         calls: &mut Calls,
     ) {
-        let rain = band(scoring.rain, &config.rain_bands, self.rain_band, config.band_margin);
+        let rain = band(scoring.rain, &*config.rain_bands(), self.rain_band, *config.band_margin());
         match (self.rain_band, rain) {
             (None, _) => self.rain_band = rain,
-            (Some(was), Some(now)) if now != was && t - self.last_rain_call >= config.weather_repeat => {
+            (Some(was), Some(now)) if now != was && t - self.last_rain_call >= *config.weather_repeat() => {
                 calls.raise(
                     match () {
                         _ if was == 0 => "rain starting",
@@ -1082,11 +1082,11 @@ impl Logic {
             _ => {}
         }
 
-        let track = band(scoring.wetness, &config.wet_bands, self.track_band, config.band_margin);
+        let track = band(scoring.wetness, &*config.wet_bands(), self.track_band, *config.band_margin());
         match (self.track_band, track) {
             (None, _) => self.track_band = track,
             (Some(was), Some(now))
-                if now != was && t - self.last_track_call >= config.weather_repeat =>
+                if now != was && t - self.last_track_call >= *config.weather_repeat() =>
             {
                 calls.raise(
                     match () {
@@ -1108,7 +1108,7 @@ impl Logic {
             && self.prev_wet < 2
             && !stopped
             && self.track_band.unwrap_or(0) <= 1
-            && t - self.last_patch_call >= config.wet_patch_repeat
+            && t - self.last_patch_call >= *config.wet_patch_repeat()
         {
             calls.raise("wet patch", false);
             self.last_patch_call = t;
@@ -1131,12 +1131,12 @@ impl Logic {
 
         for &(fraction, chance) in &scoring.forecast {
             let at = fraction * end;
-            if at <= t || chance < config.forecast_rain_chance {
+            if at <= t || chance < *config.forecast_rain_chance() {
                 continue;
             }
             let minutes = (at - t) / 60.0;
             // The next wet point is still far off
-            if minutes > config.forecast_rain_lead_minutes {
+            if minutes > *config.forecast_rain_lead_minutes() {
                 return;
             }
             let point = (scoring.session_type.clone().unwrap_or_default(), fraction.to_bits());

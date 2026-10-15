@@ -14,7 +14,10 @@ impl SettingsTopbar {
     pub fn update(&mut self, rt: &Handle, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
         let (talk, session) = {
             let config = config.get();
-            (config.talk_button.clone(), config.session_button.clone())
+            (
+                config.talk_button().clone(),
+                config.session_button().clone(),
+            )
         };
 
         let button = |pre: &str, val: Option<ConfigButton>| match val {
@@ -43,17 +46,19 @@ impl SettingsTopbar {
 
         ui.separator();
         config.maybe_update(|raw| {
-            ui.add(egui::Slider::new(&mut raw.text_scale, 0.25..=4.0).text("Text scale"))
-                .changed()
+            raw.text_scale.edit(*raw.text_scale(), |text_scale| {
+                ui.add(egui::Slider::new(text_scale, 0.25..=4.0).text("Text scale"))
+                    .changed()
+            })
         });
 
         if next_talk.is_some() || next_session.is_some() {
             config.update(|raw| {
                 if let Some(talk) = next_talk {
-                    raw.talk_button = Some(talk);
+                    raw.talk_button.set(Some(talk));
                 }
                 if let Some(session) = next_session {
-                    raw.session_button = Some(session);
+                    raw.session_button.set(Some(session));
                 }
             });
         }

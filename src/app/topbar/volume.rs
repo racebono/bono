@@ -1,6 +1,6 @@
 //! The volumes: of everything the app plays, and of each voice on the radio.
 
-use crate::config::Config;
+use crate::config::{Config, Setting};
 
 #[derive(Default)]
 pub struct VolumeTopbar;
@@ -10,6 +10,7 @@ impl VolumeTopbar {
         config.maybe_update(|raw| {
             let mut changed = volume(
                 ui,
+                *raw.master_volume(),
                 &mut raw.master_volume,
                 "Master",
                 "Everything the app plays",
@@ -19,18 +20,21 @@ impl VolumeTopbar {
             // `|` rather than `||`: every slider is drawn, whichever changed
             changed |= volume(
                 ui,
+                *raw.engineer_volume(),
                 &mut raw.engineer_volume,
                 "Engineer",
                 "The engineer's answers on the radio",
             );
             changed |= volume(
                 ui,
+                *raw.spotter_volume(),
                 &mut raw.spotter_volume,
                 "Spotter",
                 "The automatic spotter's calls (the spotter isn't built yet)",
             );
             changed |= volume(
                 ui,
+                *raw.beep_volume(),
                 &mut raw.beep_volume,
                 "Radio beep",
                 "The roger beep that ends each transmission, from the next one on",
@@ -40,17 +44,25 @@ impl VolumeTopbar {
     }
 }
 
-/// A volume from 0 to 100%. Returns whether it changed.
-fn volume(ui: &mut egui::Ui, value: &mut f32, name: &str, hover: &str) -> bool {
-    ui.add(
-        egui::Slider::new(value, 0.0..=1.0)
-            .text(name)
-            .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
-            .custom_parser(|text| {
-                let text = text.trim().trim_end_matches('%').trim();
-                text.parse::<f64>().ok().map(|percent| percent / 100.0)
-            }),
-    )
-    .on_hover_text(hover)
-    .changed()
+/// A volume from 0 to 100%, `current` until it's set. Returns whether it changed.
+fn volume(
+    ui: &mut egui::Ui,
+    current: f32,
+    setting: &mut Setting<f32>,
+    name: &str,
+    hover: &str,
+) -> bool {
+    setting.edit(current, |value| {
+        ui.add(
+            egui::Slider::new(value, 0.0..=1.0)
+                .text(name)
+                .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
+                .custom_parser(|text| {
+                    let text = text.trim().trim_end_matches('%').trim();
+                    text.parse::<f64>().ok().map(|percent| percent / 100.0)
+                }),
+        )
+        .on_hover_text(hover)
+        .changed()
+    })
 }

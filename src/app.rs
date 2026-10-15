@@ -73,7 +73,7 @@ impl App {
         let (config, fonts) = try_join!(load_config(&pref_path), load_fonts(&assets_path))?;
         let (width, height) = {
             let config = config.get();
-            (config.width, config.height)
+            (*config.width(), *config.height())
         };
 
         let mut ui = EguiCanvas::new(
@@ -126,7 +126,7 @@ impl App {
     pub fn iterate(&mut self, rt: &Handle) -> AppResult {
         self.ui.run(|ctx| {
             // Must happen before the root `Ui` is built, since it copies the style on creation
-            let text_scale = self.state.config.get().text_scale;
+            let text_scale = *self.state.config.get().text_scale();
             if self.state.gui.applied_text_scale != Some(text_scale) {
                 set_text_scale(ctx, text_scale);
                 self.state.gui.applied_text_scale = Some(text_scale);
@@ -154,7 +154,7 @@ impl App {
             return AppResult::Continue;
         }
 
-        let new_session = (self.state.config.get().session_button.as_ref())
+        let new_session = (self.state.config.get().session_button().as_ref())
             .is_some_and(|button| button.pressed(&event));
         if new_session {
             self.state.engineer.new_session();
@@ -269,7 +269,7 @@ impl AppState {
     /// Passes the recording settings on to every simulator when they change (and at startup), and
     /// follows which simulator is running.
     fn update_simulators(&mut self) {
-        let opponent_frequency = self.config.get().opponent_frequency;
+        let opponent_frequency = *self.config.get().opponent_frequency();
         if self.applied_opponent_frequency != Some(opponent_frequency) {
             let settings = SimulatorSettings { opponent_frequency };
             for simulator in self.simulators.simulators() {

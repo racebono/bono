@@ -48,7 +48,7 @@ pub fn conversation(
     tools: Tools,
     client: reqwest::Client,
 ) -> anyhow::Result<Box<dyn Model>> {
-    Ok(match config.provider {
+    Ok(match config.provider() {
         ModelProvider::Claude => Box::new(claude::Conversation::new(
             &config.claude,
             system,

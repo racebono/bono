@@ -112,8 +112,8 @@ impl Engineer {
         client: reqwest::Client,
     ) -> anyhow::Result<Self> {
         let (skill, schema) = tokio::try_join!(
-            tokio::fs::read_to_string(assets_path.join(&config.skill_path).join(SKILL_PATH)),
-            tokio::fs::read_to_string(assets_path.join(&config.skill_path).join(SCHEMA_PATH))
+            tokio::fs::read_to_string(assets_path.join(config.skill_path()).join(SKILL_PATH)),
+            tokio::fs::read_to_string(assets_path.join(config.skill_path()).join(SCHEMA_PATH))
         )?;
 
         Ok(Self {
@@ -243,7 +243,7 @@ impl Engineer {
             return;
         };
         let state = session.state.clone();
-        let auto_session = config.get().auto_session;
+        let auto_session = *config.get().auto_session();
 
         // What the model writes goes straight to the synthesizer, and to the chat
         let (lang, speech) = self.speak(rt, config, synth, lang);
@@ -451,7 +451,7 @@ impl Engineer {
 
             let gain = {
                 let config = config.get();
-                config.master_volume * config.engineer_volume
+                config.master_volume() * config.engineer_volume()
             };
             for sample in &mut speech.samples {
                 *sample *= gain;

@@ -5,7 +5,7 @@ use crate::{
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use sdl3::audio::AudioDeviceID;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     collections::BTreeMap,
     fmt::{Debug, Display},
@@ -102,70 +102,176 @@ impl Config {
         };
 
         self.send.send_modify(|raw| {
-            raw.width = w;
-            raw.height = h;
+            raw.width.set(w);
+            raw.height.set(h);
         });
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RawConfig {
-    #[serde(default = "default_width")]
-    pub width: NonZeroU32,
-    #[serde(default = "default_height")]
-    pub height: NonZeroU32,
-    #[serde(default)]
-    pub talk_button: Option<ConfigButton>,
-    #[serde(default)]
-    pub session_button: Option<ConfigButton>,
-    #[serde(default)]
-    pub microphone: RawAudioDevice<true>,
-    #[serde(default)]
-    pub speaker: RawAudioDevice<false>,
-    #[serde(default = "default_radio_effect")]
-    pub radio_effect: f32,
-    #[serde(default = "default_volume")]
-    pub master_volume: f32,
-    #[serde(default = "default_volume")]
-    pub engineer_volume: f32,
-    #[serde(default = "default_volume")]
-    pub spotter_volume: f32,
-    #[serde(default = "default_volume")]
-    pub beep_volume: f32,
-    #[serde(default = "default_true")]
-    pub auto_session: bool,
-    #[serde(default, deserialize_with = "spotter_config")]
-    pub spotter: SpotterConfig,
-    #[serde(default = "default_opponent_frequency")]
-    pub opponent_frequency: NonZeroU32,
-    #[serde(default)]
-    voices: BTreeMap<ArrayStr<2>, Utf8PathBuf>,
-    #[serde(default = "default_silence_level")]
-    pub silence_level: f32,
-    #[serde(default)]
-    pub whisper_model: Option<Arc<Utf8Path>>,
-    #[serde(default)]
-    pub model: ModelConfig,
-    #[serde(default = "default_text_scale")]
-    pub text_scale: f32,
-    #[serde(default = "default_min_confidence")]
-    pub min_confidence: f32,
-    #[serde(default = "default_skill_path")]
-    pub skill_path: Utf8PathBuf,
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum Setting<T> {
+    #[default]
+    Default,
+    Set(T),
+}
+
+impl<T> Setting<T> {
+    pub fn is_default(&self) -> bool {
+        matches!(self, Setting::Default)
+    }
+
+    pub fn get_or<'a>(&'a self, default: &'a T) -> &'a T {
+        match self {
+            Setting::Default => default,
+            Setting::Set(v) => v,
+        }
+    }
+
+    #[inline]
+    pub fn set(&mut self, value: T) {
+        *self = Setting::Set(value);
+    }
+
+    /// Edits a copy of the `current` value (e.g. with a widget), which is set only if `edit`
+    /// says it changed. Returns whether it did.
+    pub fn edit(&mut self, mut current: T, edit: impl FnOnce(&mut T) -> bool) -> bool {
+        let changed = edit(&mut current);
+        if changed {
+            self.set(current);
+        }
+        changed
+    }
+}
+
+/// Whether nothing in it has been set: what isn't, isn't saved.
+pub trait IsDefault {
+    fn is_default(&self) -> bool;
+}
+
+impl<T> IsDefault for Setting<T> {
+    #[inline]
+    fn is_default(&self) -> bool {
+        Setting::is_default(self)
+    }
+}
+
+/// A group of settings. Each is a [`Setting`], saved only once it's been set, and read with the
+/// method of the same name, which gives its default until then: a default changed here reaches
+/// everyone who never set it. Its `groups` of settings are saved only once one of theirs has
+/// been set.
+macro_rules! settings {
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident {
+            $(
+                $(#[$field_meta:meta])*
+                $field_vis:vis $field:ident: $ty:ty = $default:expr,
+            )*
+        }
+        $(
+            groups {
+                $(
+                    $(#[$group_meta:meta])*
+                    $group:ident: $group_ty:ty,
+                )*
+            }
+        )?
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Default, Serialize, Deserialize)]
+        $vis struct $name {
+            $(
+                $(#[$field_meta])*
+                #[serde(default, skip_serializing_if = "Setting::is_default")]
+                $field_vis $field: Setting<$ty>,
+            )*
+            $($(
+                $(#[$group_meta])*
+                #[serde(default, skip_serializing_if = "IsDefault::is_default")]
+                pub $group: $group_ty,
+            )*)?
+        }
+
+        impl $name {
+            $(
+                $(#[$field_meta])*
+                pub fn $field(&self) -> &$ty {
+                    static DEFAULT: std::sync::LazyLock<$ty> = std::sync::LazyLock::new(|| $default);
+                    self.$field.get_or(&DEFAULT)
+                }
+            )*
+        }
+
+        impl IsDefault for $name {
+            fn is_default(&self) -> bool {
+                true $(&& self.$field.is_default())* $($(&& self.$group.is_default())*)?
+            }
+        }
+    };
+}
+
+impl<T> Serialize for Setting<T>
+where
+    T: Serialize,
+{
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Setting::Set(v) => v.serialize(s),
+            // Only reached if someone forgets skip_serializing_if
+            Setting::Default => Err(<S::Error as serde::ser::Error>::custom(
+                "tried to serialize default value",
+            )),
+        }
+    }
+}
+
+impl<'de, T> Deserialize<'de> for Setting<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Only called when the field is present; absence goes through #[serde(default)]
+        T::deserialize(d).map(Setting::Set)
+    }
+}
+
+settings! {
+    #[derive(Debug)]
+    pub struct RawConfig {
+        pub width: NonZeroU32 = NonZeroU32::new(900).unwrap(),
+        pub height: NonZeroU32 = NonZeroU32::new(600).unwrap(),
+        pub talk_button: Option<ConfigButton> = None,
+        pub session_button: Option<ConfigButton> = None,
+        pub microphone: RawAudioDevice<true> = RawAudioDevice::default(),
+        pub speaker: RawAudioDevice<false> = RawAudioDevice::default(),
+        pub radio_effect: f32 = 0.65,
+        pub master_volume: f32 = 1.0,
+        pub engineer_volume: f32 = 1.0,
+        pub spotter_volume: f32 = 1.0,
+        pub beep_volume: f32 = 1.0,
+        pub auto_session: bool = true,
+        pub opponent_frequency: NonZeroU32 = NonZeroU32::new(5).unwrap(),
+        /// Changed with `set_voice`, which loads the voice too
+        voices: BTreeMap<ArrayStr<2>, Utf8PathBuf> = BTreeMap::new(),
+        pub silence_level: f32 = 0.003,
+        pub whisper_model: Option<Arc<Utf8Path>> = None,
+        pub text_scale: f32 = 1.3,
+        pub min_confidence: f32 = 0.1,
+        pub skill_path: Utf8PathBuf = Utf8PathBuf::from("skill"),
+    }
+    groups {
+        spotter: SpotterConfig,
+        model: ModelConfig,
+    }
 }
 
 impl RawConfig {
     #[inline]
     pub fn synth_effects(&self) -> Effects {
         Effects {
-            radio: self.radio_effect,
-            beep_volume: self.beep_volume,
+            radio: *self.radio_effect(),
+            beep_volume: *self.beep_volume(),
         }
-    }
-
-    #[inline]
-    pub fn voices(&self) -> &BTreeMap<ArrayStr<2>, Utf8PathBuf> {
-        &self.voices
     }
 
     pub fn set_voice(
@@ -175,14 +281,16 @@ impl RawConfig {
         model: Option<Utf8PathBuf>,
         synth: &mut Synthesizer,
     ) {
+        let mut voices = self.voices().clone();
         match model.clone() {
             Some(model) => {
-                self.voices.entry(lang).insert_entry(model);
+                voices.insert(lang, model);
             }
             None => {
-                self.voices.remove(&lang);
+                voices.remove(&lang);
             }
         }
+        self.voices.set(voices);
 
         synth
             .inner
@@ -312,6 +420,13 @@ impl<const RECORDING: bool> Deref for RawAudioDevice<RECORDING> {
     }
 }
 
+impl<const RECORDING: bool> From<AudioDevice> for RawAudioDevice<RECORDING> {
+    #[inline]
+    fn from(device: AudioDevice) -> Self {
+        Self(device)
+    }
+}
+
 impl<const RECORDING: bool> DerefMut for RawAudioDevice<RECORDING> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
@@ -363,237 +478,121 @@ impl<'de, const RECORDING: bool> Deserialize<'de> for RawAudioDevice<RECORDING> 
     }
 }
 
-#[inline(always)]
-const fn default_width() -> NonZeroU32 {
-    const { NonZeroU32::new(900).unwrap() }
-}
+settings! {
+    /// The spotter: calls traffic and flags by itself, the moment they happen. The defaults are
+    /// my-engineer's (`spotter.cpp`). Distances are in metres, times in seconds.
+    #[derive(Debug, PartialEq)]
+    pub struct SpotterConfig {
+        pub enabled: bool = true,
+        /// The language of its calls: the pilot's (the last one they asked in) when `None`
+        pub language: Option<ArrayStr<2>> = None,
+        /// How often it looks at the newest telemetry
+        pub poll_interval: f64 = 0.033,
 
-#[inline(always)]
-const fn default_height() -> NonZeroU32 {
-    const { NonZeroU32::new(600).unwrap() }
-}
+        // Cars alongside. A car overlaps when its centre is within `enter_along` of yours along
+        // the car, and `min_across` to `enter_across` to the side (beside you rather than in line
+        // with you). It stops overlapping past the exit distances, which are wider so a car at the
+        // edge doesn't make the spotter chatter
+        pub enter_along: f64 = 4.8,
+        pub exit_along: f64 = 5.8,
+        pub min_across: f64 = 0.8,
+        pub enter_across: f64 = 5.5,
+        pub exit_across: f64 = 6.5,
+        /// Cars further above or below (on a bridge, or under a crossover) are ignored
+        pub max_height_difference: f64 = 4.0,
+        /// How long a car must overlap before it's called
+        pub debounce: f64 = 0.12,
+        /// How long a side must have been taken before it's called clear
+        pub min_hold_for_clear: f64 = 0.4,
+        /// How often "still there" is called while a car stays alongside
+        pub still_there_every: f64 = 6.0,
+        /// Below this speed (m/s: the garage, the grid, a spin) it stays quiet
+        pub min_speed: f64 = 8.0,
 
-/// The spotter: calls traffic and flags by itself, the moment they happen. The defaults are
-/// my-engineer's (`spotter.cpp`). Distances are in metres, times in seconds.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SpotterConfig {
-    pub enabled: bool,
-    /// The language of its calls: the pilot's (the last one they asked in) when `None`
-    pub language: Option<ArrayStr<2>>,
-    /// How often it looks at the newest telemetry
-    pub poll_interval: f64,
+        /// A car this many seconds behind or closer is called...
+        pub gap_behind_on: f64 = 1.0,
+        /// ...again only once the gap has opened to at least this
+        pub gap_behind_off: f64 = 1.5,
 
-    // Cars alongside. A car overlaps when its centre is within `enter_along` of yours along the car,
-    // and `min_across` to `enter_across` to the side (beside you rather than in line with you). It
-    // stops overlapping past the exit distances, which are wider so a car at the edge doesn't make the
-    // spotter chatter
-    pub enter_along: f64,
-    pub exit_along: f64,
-    pub min_across: f64,
-    pub enter_across: f64,
-    pub exit_across: f64,
-    /// Cars further above or below (on a bridge, or under a crossover) are ignored
-    pub max_height_difference: f64,
-    /// How long a car must overlap before it's called
-    pub debounce: f64,
-    /// How long a side must have been taken before it's called clear
-    pub min_hold_for_clear: f64,
-    /// How often "still there" is called while a car stays alongside
-    pub still_there_every: f64,
-    /// Below this speed (m/s: the garage, the grid, a spin) it stays quiet
-    pub min_speed: f64,
-
-    /// A car this many seconds behind or closer is called...
-    pub gap_behind_on: f64,
-    /// ...again only once the gap has opened to at least this
-    pub gap_behind_off: f64,
-
-    // Weather, from 0 to 1 (about five updates a second). A call when the value moves into another
-    // band, by at least `band_margin` past its edge, so a value sitting on an edge stays quiet
-    /// Rain: none | light | moderate | heavy
-    pub rain_bands: [f64; 3],
-    /// Track wetness: dry | damp | wet | soaked
-    pub wet_bands: [f64; 3],
-    pub band_margin: f64,
-    /// Rain on the way: a forecast point at least this likely to bring rain...
-    pub forecast_rain_chance: f64,
-    /// ...this many minutes ahead or less, while it isn't raining yet
-    pub forecast_rain_lead_minutes: f64,
-    /// Between two rain calls, and between two track calls
-    pub weather_repeat: f64,
-    /// Between two "wet patch" calls
-    pub wet_patch_repeat: f64,
-}
-
-impl Default for SpotterConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            language: None,
-            poll_interval: 0.033,
-            enter_along: 4.8,
-            exit_along: 5.8,
-            min_across: 0.8,
-            enter_across: 5.5,
-            exit_across: 6.5,
-            max_height_difference: 4.0,
-            debounce: 0.12,
-            min_hold_for_clear: 0.4,
-            still_there_every: 6.0,
-            min_speed: 8.0,
-            gap_behind_on: 1.0,
-            gap_behind_off: 1.5,
-            rain_bands: [0.05, 0.3, 0.6],
-            wet_bands: [0.05, 0.25, 0.6],
-            band_margin: 0.03,
-            forecast_rain_chance: 0.5,
-            forecast_rain_lead_minutes: 10.0,
-            weather_repeat: 60.0,
-            wet_patch_repeat: 30.0,
-        }
+        // Weather, from 0 to 1 (about five updates a second). A call when the value moves into
+        // another band, by at least `band_margin` past its edge, so a value sitting on an edge
+        // stays quiet
+        /// Rain: none | light | moderate | heavy
+        pub rain_bands: [f64; 3] = [0.05, 0.3, 0.6],
+        /// Track wetness: dry | damp | wet | soaked
+        pub wet_bands: [f64; 3] = [0.05, 0.25, 0.6],
+        pub band_margin: f64 = 0.03,
+        /// Rain on the way: a forecast point at least this likely to bring rain...
+        pub forecast_rain_chance: f64 = 0.5,
+        /// ...this many minutes ahead or less, while it isn't raining yet
+        pub forecast_rain_lead_minutes: f64 = 10.0,
+        /// Between two rain calls, and between two track calls
+        pub weather_repeat: f64 = 60.0,
+        /// Between two "wet patch" calls
+        pub wet_patch_repeat: f64 = 30.0,
     }
 }
 
-/// The language model the engineer talks through. Each provider's settings are kept while
-/// another one is in use.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ModelConfig {
-    pub provider: ModelProvider,
-    pub claude: ClaudeConfig,
-    pub ollama: OllamaConfig,
+settings! {
+    /// The language model the engineer talks through. Each provider's settings are kept while
+    /// another one is in use.
+    #[derive(Debug, PartialEq)]
+    pub struct ModelConfig {
+        pub provider: ModelProvider = ModelProvider::Claude,
+    }
+    groups {
+        claude: ClaudeConfig,
+        ollama: OllamaConfig,
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelProvider {
     /// Claude, through the Claude API: needs `ANTHROPIC_API_KEY`
-    #[default]
     Claude,
     /// A model Ollama runs, on this PC or another
     Ollama,
 }
 
-/// Claude, through the Claude API.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ClaudeConfig {
-    /// e.g. `claude-sonnet-5-5`
-    pub model: String,
-    /// `low`, `medium`, `high`, `xhigh` or `max` (the levels depend on the model)
-    pub effort: String,
-    /// The most tokens in one response, thinking included
-    pub max_tokens: NonZeroU32,
-    /// Has the API summarize the earlier conversation when it grows near the context window, so
-    /// a long session never runs out of room. Only on models that support it
-    pub compaction: bool,
-}
-
-impl Default for ClaudeConfig {
-    fn default() -> Self {
-        Self {
-            model: "claude-sonnet-5-5".into(),
-            effort: "high".into(),
-            max_tokens: NonZeroU32::new(16000).unwrap(),
-            compaction: false,
-        }
+settings! {
+    /// Claude, through the Claude API.
+    #[derive(Debug, PartialEq)]
+    pub struct ClaudeConfig {
+        /// e.g. `claude-sonnet-5-5`
+        pub model: String = "claude-sonnet-5-5".into(),
+        /// `low`, `medium`, `high`, `xhigh` or `max` (the levels depend on the model)
+        pub effort: String = "high".into(),
+        /// The most tokens in one response, thinking included
+        pub max_tokens: NonZeroU32 = NonZeroU32::new(16000).unwrap(),
+        /// Has the API summarize the earlier conversation when it grows near the context window,
+        /// so a long session never runs out of room. Only on models that support it
+        pub compaction: bool = false,
     }
 }
 
-/// A model Ollama runs.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct OllamaConfig {
-    /// Where Ollama listens, as `OLLAMA_HOST` says it (e.g. `192.168.1.5` or
-    /// `http://pc:11434`): `OLLAMA_HOST`, or this PC, when `None`
-    pub host: Option<String>,
-    /// A model that's been pulled (`ollama pull`), e.g. `qwen3.5:9b`
-    pub model: String,
-    /// How much it thinks, on models that can: `none`, `low`, `medium` or `high`. Thinking on
-    /// this PC's GPU, while the game uses it, makes answers slow to come
-    pub effort: String,
-    /// The context window it's loaded with, in tokens: Ollama silently drops the start of a
-    /// conversation that doesn't fit. More takes more memory
-    pub context_length: NonZeroU32,
-    /// The most tokens in one response, thinking included
-    pub max_tokens: NonZeroU32,
-    /// How long Ollama keeps the model loaded after an answer, in seconds (negative: until it
-    /// stops). Ollama's own when `None`: 5 minutes, unless `OLLAMA_KEEP_ALIVE` says otherwise
-    pub keep_alive: Option<f64>,
-}
-
-impl Default for OllamaConfig {
-    fn default() -> Self {
-        Self {
-            host: None,
-            model: "qwen3.5:9b".into(),
-            effort: "none".into(),
-            context_length: NonZeroU32::new(32768).unwrap(),
-            max_tokens: NonZeroU32::new(16000).unwrap(),
-            keep_alive: None,
-        }
+settings! {
+    /// A model Ollama runs.
+    #[derive(Debug, PartialEq)]
+    pub struct OllamaConfig {
+        /// Where Ollama listens, as `OLLAMA_HOST` says it (e.g. `192.168.1.5` or
+        /// `http://pc:11434`): `OLLAMA_HOST`, or this PC, when `None`
+        pub host: Option<String> = None,
+        /// A model that's been pulled (`ollama pull`), e.g. `qwen3.5:9b`
+        pub model: String = "qwen3.5:9b".into(),
+        /// How much it thinks, on models that can: `none`, `low`, `medium` or `high`. Thinking on
+        /// this PC's GPU, while the game uses it, makes answers slow to come
+        pub effort: String = "none".into(),
+        /// The context window it's loaded with, in tokens: Ollama silently drops the start of a
+        /// conversation that doesn't fit. More takes more memory
+        pub context_length: NonZeroU32 = NonZeroU32::new(32768).unwrap(),
+        /// The most tokens in one response, thinking included
+        pub max_tokens: NonZeroU32 = NonZeroU32::new(16000).unwrap(),
+        /// How long Ollama keeps the model loaded after an answer, in seconds (negative: until
+        /// it stops). Ollama's own when `None`: 5 minutes, unless `OLLAMA_KEEP_ALIVE` says
+        /// otherwise
+        pub keep_alive: Option<f64> = None,
     }
-}
-
-/// `spotter` used to be only whether it's on (`true` or `false`): still read, with the defaults.
-fn spotter_config<'de, D>(deserializer: D) -> Result<SpotterConfig, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Stored {
-        Enabled(bool),
-        Config(SpotterConfig),
-    }
-
-    Ok(match Stored::deserialize(deserializer)? {
-        Stored::Enabled(enabled) => SpotterConfig {
-            enabled,
-            ..SpotterConfig::default()
-        },
-        Stored::Config(config) => config,
-    })
-}
-
-#[inline(always)]
-const fn default_radio_effect() -> f32 {
-    0.65
-}
-
-#[inline(always)]
-const fn default_volume() -> f32 {
-    1.0
-}
-
-#[inline(always)]
-const fn default_text_scale() -> f32 {
-    1.3
-}
-
-#[inline(always)]
-const fn default_true() -> bool {
-    true
-}
-
-#[inline(always)]
-const fn default_opponent_frequency() -> NonZeroU32 {
-    const { NonZeroU32::new(5).unwrap() }
-}
-
-#[inline(always)]
-const fn default_silence_level() -> f32 {
-    0.003
-}
-
-#[inline(always)]
-const fn default_min_confidence() -> f32 {
-    0.1
-}
-
-fn default_skill_path() -> Utf8PathBuf {
-    Utf8PathBuf::from("skill")
 }
 
 #[cfg(test)]
@@ -601,65 +600,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_the_spotter_config() {
+    fn saves_only_what_was_set() {
         let defaults = serde_json::from_str::<RawConfig>("{}").unwrap();
-        assert_eq!(defaults.spotter, SpotterConfig::default());
+        assert!(defaults.is_default());
+        assert_eq!(*defaults.master_volume(), 1.0);
+        assert_eq!(*defaults.spotter.debounce(), 0.12);
+        assert_eq!(*defaults.model.provider(), ModelProvider::Claude);
+        assert_eq!(defaults.model.claude.model(), "claude-sonnet-5-5");
+        assert_eq!(serde_json::to_string(&defaults).unwrap(), "{}");
 
-        // Older configs only said whether it's on
-        let off = serde_json::from_str::<RawConfig>(r#"{"spotter": false}"#).unwrap();
-        assert!(!off.spotter.enabled);
-        assert_eq!(off.spotter.debounce, SpotterConfig::default().debounce);
+        let mut config = defaults;
+        config.master_volume.set(0.5);
+        config.spotter.debounce.set(0.2);
+        config.model.ollama.keep_alive.set(Some(-1.0));
+        // Set to what the default is, it's still kept: the default may change
+        config.auto_session.set(true);
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::json!({
+                "master_volume": 0.5,
+                "auto_session": true,
+                "spotter": {"debounce": 0.2},
+                "model": {"ollama": {"keep_alive": -1.0}},
+            })
+        );
 
-        // A partial one keeps the defaults for the rest
-        let tuned = serde_json::from_str::<RawConfig>(
-            r#"{"spotter": {"debounce": 0.2, "language": "es"}}"#,
-        )
-        .unwrap();
-        assert!(tuned.spotter.enabled);
-        assert_eq!(tuned.spotter.debounce, 0.2);
-        assert_eq!(tuned.spotter.language, Some(crate::arrstr!("es")));
-        assert_eq!(tuned.spotter.enter_along, 4.8);
-
-        // And it's written back whole
-        let written = serde_json::to_value(&tuned).unwrap();
-        assert_eq!(written["spotter"]["debounce"], 0.2);
-        assert_eq!(written["spotter"]["rain_bands"][1], 0.3);
+        let saved = serde_json::to_string(&config).unwrap();
+        let loaded = serde_json::from_str::<RawConfig>(&saved).unwrap();
+        assert_eq!(*loaded.master_volume(), 0.5);
+        assert_eq!(*loaded.engineer_volume(), 1.0);
+        assert_eq!(loaded.spotter, config.spotter);
+        assert_eq!(loaded.model, config.model);
+        assert_eq!(*loaded.model.ollama.keep_alive(), Some(-1.0));
+        assert_eq!(
+            *loaded.model.ollama.context_length(),
+            NonZeroU32::new(32768).unwrap()
+        );
     }
 
     #[test]
-    fn reads_the_model_config() {
-        let defaults = serde_json::from_slice::<RawConfig>(b"{}").unwrap();
-        assert_eq!(defaults.model, ModelConfig::default());
-        assert_eq!(defaults.model.provider, ModelProvider::Claude);
-
-        // Older configs had Claude's model and effort at the top
-        let old = serde_json::from_slice::<RawConfig>(
-            br#"{"claude_model": "claude-opus-5-5", "claude_effort": "max"}"#,
-        )
-        .unwrap();
-        assert_eq!(old.model.claude.model, "claude-opus-5-5");
-        assert_eq!(old.model.claude.effort, "max");
-        let written = serde_json::to_value(&old).unwrap();
-        assert!(written.get("claude_model").is_none());
-        assert_eq!(written["model"]["claude"]["model"], "claude-opus-5-5");
-
-        // Switching provider keeps the other's settings
-        let ollama = serde_json::from_slice::<RawConfig>(
-            br#"{"model": {"provider": "ollama", "ollama": {"model": "gemma4:12b", "keep_alive": -1}, "claude": {"effort": "low"}}}"#,
-        )
-        .unwrap();
-        assert_eq!(ollama.model.provider, ModelProvider::Ollama);
-        assert_eq!(ollama.model.ollama.model, "gemma4:12b");
-        assert_eq!(ollama.model.ollama.keep_alive, Some(-1.0));
-        assert_eq!(ollama.model.ollama.context_length.get(), 32768);
-        assert_eq!(ollama.model.claude.effort, "low");
-        assert_eq!(ollama.model.claude.model, "claude-sonnet-5-5");
-
-        let saved = serde_json::to_vec(&ollama).unwrap();
-        assert_eq!(
-            serde_json::from_slice::<RawConfig>(&saved).unwrap().model,
-            ollama.model
+    fn edits_only_what_changed() {
+        let mut config = serde_json::from_str::<RawConfig>("{}").unwrap();
+        assert!(
+            !config
+                .master_volume
+                .edit(*config.master_volume(), |_| false)
         );
+        assert!(config.master_volume.is_default());
+
+        assert!(
+            config
+                .master_volume
+                .edit(*config.master_volume(), |volume| {
+                    *volume /= 2.0;
+                    true
+                })
+        );
+        assert_eq!(*config.master_volume(), 0.5);
     }
 
     #[test]
@@ -672,9 +669,9 @@ mod tests {
         // Saved and loaded again (as the app does on every change), switched off but still tuned
         let saved = serde_json::to_string(&disabled).unwrap();
         let loaded = serde_json::from_str::<RawConfig>(&saved).unwrap();
-        assert!(!loaded.spotter.enabled);
-        assert_eq!(loaded.spotter.debounce, 0.2);
-        assert_eq!(loaded.spotter.language, Some(crate::arrstr!("es")));
+        assert!(!*loaded.spotter.enabled());
+        assert_eq!(*loaded.spotter.debounce(), 0.2);
+        assert_eq!(*loaded.spotter.language(), Some(crate::arrstr!("es")));
         assert_eq!(loaded.spotter, disabled.spotter);
     }
 }

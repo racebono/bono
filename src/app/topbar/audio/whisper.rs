@@ -77,7 +77,7 @@ impl Whisper {
             threads,
         };
 
-        if let Some(model) = config.whisper_model.clone() {
+        if let Some(model) = config.whisper_model().clone() {
             this.set_model(model);
         }
 
@@ -133,12 +133,13 @@ impl Whisper {
                                         row.col(|ui| {
                                             if on_disk {
                                                 ui.add_enabled_ui(
-                                                    config.whisper_model.as_ref()
+                                                    config.whisper_model().as_ref()
                                                         != Some(&model.path),
                                                     |ui| {
                                                         if ui.button("Use").clicked() {
-                                                            config.whisper_model =
-                                                                Some(model.path.clone());
+                                                            config
+                                                                .whisper_model
+                                                                .set(Some(model.path.clone()));
                                                             updated = true;
                                                         }
                                                     },
@@ -168,7 +169,7 @@ impl Whisper {
         config: &Config,
         device: &sdl3::audio::AudioDevice,
     ) -> Result<JoinHandle<anyhow::Result<Option<(String, ArrayStr<2>)>>>, bool> {
-        return match (config.get().talk_button.clone(), event) {
+        return match (config.get().talk_button().clone(), event) {
             (
                 Some(ConfigButton::Key(ref key_code)),
                 Event::KeyDown {
@@ -354,7 +355,7 @@ impl WhisperSession {
             drop(samples);
 
             if let Some(lang) =
-                self.detect_language(config.voices().keys(), config.min_confidence)?
+                self.detect_language(config.voices().keys(), *config.min_confidence())?
             {
                 drop(config);
                 return Ok(Some((self.speech_to_text(lang)?, lang)));
