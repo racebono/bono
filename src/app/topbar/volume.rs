@@ -1,4 +1,5 @@
-//! The volumes: of everything the app plays, and of each voice on the radio.
+//! The volumes: of everything the app plays, and of each voice on the radio. And how much it
+//! sounds like a radio.
 
 use crate::config::{Config, Setting};
 
@@ -30,7 +31,7 @@ impl VolumeTopbar {
                 *raw.spotter_volume(),
                 &mut raw.spotter_volume,
                 "Spotter",
-                "The automatic spotter's calls (the spotter isn't built yet)",
+                "The spotter's calls",
             );
             changed |= volume(
                 ui,
@@ -39,12 +40,21 @@ impl VolumeTopbar {
                 "Radio beep",
                 "The roger beep that ends each transmission, from the next one on",
             );
+            ui.separator();
+            changed |= volume(
+                ui,
+                *raw.radio_effect(),
+                &mut raw.radio_effect,
+                "Radio effect",
+                "How much the voices sound like a radio: none is a clean voice, without the \
+                 squelch. From the next transmission on",
+            );
             changed
         });
     }
 }
 
-/// A volume from 0 to 100%, `current` until it's set. Returns whether it changed.
+/// A volume (or effect) from 0 to 100%, `current` until it's set. Returns whether it changed.
 fn volume(
     ui: &mut egui::Ui,
     current: f32,

@@ -2,6 +2,7 @@ use crate::{
     app::Subsystems, button::ConfigButton, config::Config, error, guid_to_str, task::LocalTask,
 };
 use egui::IntoAtoms;
+use std::num::NonZeroU32;
 use tokio::runtime::Handle;
 
 #[derive(Default)]
@@ -50,6 +51,32 @@ impl SettingsTopbar {
                 ui.add(egui::Slider::new(text_scale, 0.25..=4.0).text("Text scale"))
                     .changed()
             })
+        });
+
+        ui.separator();
+        config.maybe_update(|raw| {
+            raw.opponent_frequency
+                .edit(*raw.opponent_frequency(), |frequency| {
+                    let mut updates = frequency.get();
+                    let field = ui
+                        .add(
+                            egui::DragValue::new(&mut updates)
+                                .range(1..=60)
+                                .prefix("Record other cars every ")
+                                .suffix(" updates"),
+                        )
+                        .on_hover_text(
+                            "Every update of your car is recorded, and one in this many of each \
+                             other car's. Fewer keep the recording smaller, more make the \
+                             spotter's calls and the engineer's answers about other cars more \
+                             precise",
+                        );
+                    let changed = field.changed() && updates != frequency.get();
+                    if let Some(updates) = NonZeroU32::new(updates) {
+                        *frequency = updates;
+                    }
+                    changed
+                })
         });
 
         if next_talk.is_some() || next_session.is_some() {

@@ -90,6 +90,28 @@ impl Whisper {
 
         ui.add_enabled_ui(catalog.is_some(), move |ui| {
             ui.menu_button("Speech To Text", move |ui| {
+                config.maybe_update(|raw| {
+                    raw.min_confidence
+                        .edit(*raw.min_confidence(), |confidence| {
+                            ui.add(
+                                egui::Slider::new(confidence, 0.0..=1.0)
+                                    .text("Language confidence")
+                                    .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
+                                    .custom_parser(|text| {
+                                        let text = text.trim().trim_end_matches('%').trim();
+                                        text.parse::<f64>().ok().map(|percent| percent / 100.0)
+                                    }),
+                            )
+                            .on_hover_text(
+                                "How sure it must be of the language you spoke in, among those with \
+                                 a voice. Less sure of every one, what you said is ignored (e.g. \
+                                 noise)",
+                            )
+                            .changed()
+                        })
+                });
+                ui.separator();
+
                 egui_extras::TableBuilder::new(ui)
                     .id_salt("whisper-models")
                     .striped(true)

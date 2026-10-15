@@ -24,7 +24,7 @@ mod button;
 mod config;
 mod engineer;
 mod language;
-mod model;
+mod provider;
 mod sim;
 mod spotter;
 mod sqlite;

@@ -13,6 +13,27 @@ mod tool;
 
 pub use tool::{ToolHandler, Tools};
 
+/// A model a provider offers.
+#[derive(Debug, Clone)]
+pub struct ModelOption {
+    /// What it's asked for by, e.g. `claude-sonnet-5-5` or `qwen3.5:9b`
+    pub name: String,
+    /// Its size on disk, in bytes, for one run on this PC (or another)
+    pub size: Option<u64>,
+}
+
+/// The models `provider` offers (for Ollama, the ones pulled at `ollama_host`).
+pub async fn models(
+    provider: ModelProvider,
+    ollama_host: Option<&str>,
+    client: &reqwest::Client,
+) -> anyhow::Result<Vec<ModelOption>> {
+    match provider {
+        ModelProvider::Claude => claude::models(client).await,
+        ModelProvider::Ollama => ollama::models(ollama_host, client).await,
+    }
+}
+
 /// A conversation with a language model.
 pub trait Model: Send {
     /// Sends the user's message and runs the model's turn to its end, tool calls included, with

@@ -1,6 +1,6 @@
 //! Claude, through the Claude API.
 
-use super::{Model, Reply, StopReason, ToolHandler, Tools, Usage, text::TextSink};
+use super::{Model, ModelOption, Reply, StopReason, ToolHandler, Tools, Usage, text::TextSink};
 use crate::config::ClaudeConfig;
 use anyhow::{Context, bail};
 use futures::future::{BoxFuture, join_all};
@@ -17,6 +17,133 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
+
+/// Where the Claude API is, unless `ConversationBuilder::base_url` says otherwise.
+const BASE_URL: &str = "https://api.anthropic.com";
+
+/// The models the Claude API offers, newest first. The credentials are a conversation's
+/// defaults (`ANTHROPIC_API_KEY`...).
+pub async fn models(client: &reqwest::Client) -> anyhow::Result<Vec<ModelOption>> {
+    #[derive(Deserialize)]
+    struct Page {
+        data: Vec<Entry>,
+        #[serde(default)]
+        has_more: bool,
+        #[serde(default)]
+        last_id: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct Entry {
+        id: String,
+    }
+
+    let headers = headers(None, None, String::new())?;
+    let mut models = Vec::new();
+    let mut after = None::<String>;
+    loop {
+        let mut url = format!("{BASE_URL}/v1/models?limit=1000");
+        if let Some(after) = &after {
+            url.push_str("&after_id=");
+            url.push_str(after);
+        }
+
+        let resp = client
+            .get(url)
+            .headers(headers.clone())
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .context("Couldn't reach the Claude API")?;
+        if !resp.status().is_success() {
+            return Err(ApiError::read(resp).await.into());
+        }
+
+        let page = resp
+            .json::<Page>()
+            .await
+            .context("Claude sent a list of models that couldn't be read")?;
+        models.extend(page.data.into_iter().map(|entry| ModelOption {
+            name: entry.id,
+            size: None,
+        }));
+        match (page.has_more, page.last_id) {
+            (true, Some(last)) => after = Some(last),
+            _ => return Ok(models),
+        }
+    }
+}
+
+/// The API's headers: the credentials (`api_key`, or else `ANTHROPIC_API_KEY`, then
+/// `ANTHROPIC_AUTH_TOKEN` as a bearer token), the workspace (or `ANTHROPIC_WORKSPACE_ID`), and
+/// the `betas` (comma-separated).
+fn headers(
+    api_key: Option<String>,
+    workspace_id: Option<String>,
+    mut betas: String,
+) -> anyhow::Result<HeaderMap> {
+    let (api_key, use_bearer) = match api_key {
+        Some(api_key) => (api_key, false),
+        None => match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(api_key) => (api_key, false),
+            Err(VarError::NotPresent) => match std::env::var("ANTHROPIC_AUTH_TOKEN") {
+                Ok(auth_token) => (auth_token, true),
+                Err(VarError::NotPresent) => bail!(
+                    "No Claude credentials: set ANTHROPIC_API_KEY or ConversationBuilder::api_key"
+                ),
+                Err(VarError::NotUnicode(s)) => {
+                    bail!("environment variable was not valid unicode: {:?}", s)
+                }
+            },
+            Err(VarError::NotUnicode(s)) => {
+                bail!("environment variable was not valid unicode: {:?}", s)
+            }
+        },
+    };
+
+    let workspace_id = match workspace_id {
+        Some(workspace_id) => Some(workspace_id),
+        None => match std::env::var("ANTHROPIC_WORKSPACE_ID") {
+            Ok(workspace_id) => Some(workspace_id),
+            Err(VarError::NotPresent) => None,
+            Err(VarError::NotUnicode(s)) => {
+                bail!("environment variable was not valid unicode: {:?}", s)
+            }
+        },
+    };
+
+    const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
+    const ANTHROPIC_BETA: HeaderName = HeaderName::from_static("anthropic-beta");
+    const ANTHROPIC_WORKSPACE_ID: HeaderName = HeaderName::from_static("anthropic-workspace-id");
+    const ANTHROPIC_VERSION: HeaderName = HeaderName::from_static("anthropic-version");
+    const ANTHROPIC_VERSION_VALUE: HeaderValue = HeaderValue::from_static("2023-06-01");
+
+    let mut headers = HeaderMap::new();
+    headers.insert(ANTHROPIC_VERSION, ANTHROPIC_VERSION_VALUE);
+
+    if use_bearer {
+        let bearer = format!("Bearer {api_key}");
+        headers.insert(AUTHORIZATION, HeaderValue::from_str(&bearer)?);
+        if !betas.is_empty() {
+            betas.push(',');
+        }
+        betas.push_str("oauth-2025-04-20");
+    } else {
+        headers.insert(X_API_KEY, HeaderValue::from_str(&api_key)?);
+    }
+
+    if let Some(workspace_id) = workspace_id {
+        headers.insert(
+            ANTHROPIC_WORKSPACE_ID,
+            HeaderValue::from_str(&workspace_id)?,
+        );
+    }
+
+    if !betas.is_empty() {
+        headers.insert(ANTHROPIC_BETA, HeaderValue::from_str(&betas)?);
+    }
+    Ok(headers)
+}
 
 /// A conversation with Claude.
 pub struct Conversation {
@@ -447,7 +574,7 @@ impl ConversationBuilder {
         Self {
             api_key: Default::default(),
             workspace_id: Default::default(),
-            base_url: "https://api.anthropic.com".into(),
+            base_url: BASE_URL.into(),
             model: "claude-sonnet-5-5".into(),
             effort: "high".into(),
             max_tokens: NonZeroU32::new(16000).unwrap(),
@@ -604,36 +731,6 @@ impl ConversationBuilder {
     }
 
     pub fn build(self, client: reqwest::Client) -> anyhow::Result<Conversation> {
-        let (api_key, use_bearer) = match self.api_key {
-            Some(api_key) => (api_key, false),
-            None => match std::env::var("ANTHROPIC_API_KEY") {
-                Ok(api_key) => (api_key, false),
-                Err(VarError::NotPresent) => match std::env::var("ANTHROPIC_AUTH_TOKEN") {
-                    Ok(auth_token) => (auth_token, true),
-                    Err(VarError::NotPresent) => bail!(
-                        "No Claude credentials: set ANTHROPIC_API_KEY or ConversationBuilder::api_key"
-                    ),
-                    Err(VarError::NotUnicode(s)) => {
-                        bail!("environment variable was not valid unicode: {:?}", s)
-                    }
-                },
-                Err(VarError::NotUnicode(s)) => {
-                    bail!("environment variable was not valid unicode: {:?}", s)
-                }
-            },
-        };
-
-        let workspace_id = match self.workspace_id {
-            Some(workspace_id) => Some(workspace_id),
-            None => match std::env::var("ANTHROPIC_WORKSPACE_ID") {
-                Ok(workspace_id) => Some(workspace_id),
-                Err(VarError::NotPresent) => None,
-                Err(VarError::NotUnicode(s)) => {
-                    bail!("environment variable was not valid unicode: {:?}", s)
-                }
-            },
-        };
-
         let mut betas = String::from("server-side-fallback-2026-07-01");
         if !self.skills.is_empty() {
             betas.push_str(",code-execution-2025-08-25");
@@ -642,30 +739,7 @@ impl ConversationBuilder {
             betas.push_str(",compact-2026-01-12");
         }
 
-        const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
-        const ANTHROPIC_BETA: HeaderName = HeaderName::from_static("anthropic-beta");
-        const ANTHROPIC_WORKSPACE_ID: HeaderName =
-            HeaderName::from_static("anthropic-workspace-id");
-        const ANTHROPIC_VERSION: HeaderName = HeaderName::from_static("anthropic-version");
-        const ANTHROPIC_VERSION_VALUE: HeaderValue = HeaderValue::from_static("2023-06-01");
-
-        let mut headers = HeaderMap::new();
-        headers.insert(ANTHROPIC_VERSION, ANTHROPIC_VERSION_VALUE);
-
-        if use_bearer {
-            let bearer = format!("Bearer {api_key}");
-            headers.insert(AUTHORIZATION, HeaderValue::from_str(&bearer)?);
-            betas.push_str(",oauth-2025-04-20");
-        } else {
-            headers.insert(X_API_KEY, HeaderValue::from_str(&api_key)?);
-        }
-
-        if let Some(workspace_id) = workspace_id {
-            headers.insert(
-                ANTHROPIC_WORKSPACE_ID,
-                HeaderValue::from_str(&workspace_id)?,
-            );
-        }
+        let headers = headers(self.api_key, self.workspace_id, betas)?;
 
         // The system prompt gets its own cache breakpoint, so it's read from the cache even when
         // the conversation's (the top-level `cache_control`) misses
@@ -688,7 +762,6 @@ impl ConversationBuilder {
             input_schema: tool.input_schema.clone(),
         }));
 
-        headers.insert(ANTHROPIC_BETA, HeaderValue::from_str(&betas)?);
         return Ok(Conversation {
             client,
             base_url: self.base_url,
@@ -1478,6 +1551,15 @@ mod tests {
 
         let (reply, _) = send_streaming(&mut conversation, "Pit?").await;
         assert!(reply.unwrap_err().is::<StreamEnded>());
+    }
+
+    /// Against the real API: needs `ANTHROPIC_API_KEY`.
+    #[tokio::test]
+    #[ignore]
+    async fn lists_the_models() {
+        let models = super::models(&reqwest::Client::new()).await.unwrap();
+        println!("{models:#?}");
+        assert!(models.iter().any(|model| model.name.starts_with("claude-")));
     }
 
     /// Needs `ANTHROPIC_API_KEY`, and spends a few tokens.

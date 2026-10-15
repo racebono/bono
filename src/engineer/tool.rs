@@ -9,7 +9,7 @@
 //! official positions, driver names, classes, lap and sector times, pit stops, penalties) is read
 //! from the newest rows only.
 
-use crate::{model::ToolHandler, sqlite::pool::Pool};
+use crate::{provider::ToolHandler, sqlite::pool::Pool};
 use anyhow::{Context as _, bail};
 use rusqlite::{
     Connection, Params, params,
@@ -1022,7 +1022,11 @@ impl Scoring {
         }
 
         fn end_of(f: f64) -> &'static str {
-            if f >= 1.0 { " (end of the session)" } else { "" }
+            if f >= 1.0 {
+                " (end of the session)"
+            } else {
+                ""
+            }
         }
 
         let fraction = |r: &Row| r.f("session_fraction").unwrap_or(0.0);
@@ -4216,7 +4220,7 @@ mod tests {
 mod evals {
     use super::*;
     use crate::{
-        model::{Model, claude::ConversationBuilder},
+        provider::{Model, claude::ConversationBuilder},
         sqlite::Database,
     };
     use std::{num::NonZeroUsize, sync::Mutex as StdMutex, time::Instant};
@@ -4265,14 +4269,22 @@ mod evals {
             let four = NonZeroUsize::new(4).unwrap();
             let pool = Pool::new(Database::read_only(Arc::new(db)), four, four);
             let tool = Engineer::new(pool, Arc::from(""));
-            for command in std::env::var("EVAL_COMMANDS").unwrap_or_else(|_| "quick,status".into()).split(",") {
-                let input = EngineerInput::deserialize(serde_json::json!({ "command": command.trim() })).unwrap();
+            for command in std::env::var("EVAL_COMMANDS")
+                .unwrap_or_else(|_| "quick,status".into())
+                .split(",")
+            {
+                let input =
+                    EngineerInput::deserialize(serde_json::json!({ "command": command.trim() }))
+                        .unwrap();
                 let start = Instant::now();
                 let result = tool.run(input).await;
                 println!(
                     "{command:>8}: {:>7.2?} {}",
                     start.elapsed(),
-                    result.map_or_else(|e| format!("ERROR {e:#}"), |text| format!("{} chars", text.len()))
+                    result.map_or_else(
+                        |e| format!("ERROR {e:#}"),
+                        |text| format!("{} chars", text.len())
+                    )
                 );
             }
         });

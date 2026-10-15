@@ -4,9 +4,9 @@
 
 use crate::{
     arrstr,
-    config::{ArrayStr, Config, RawConfig},
+    config::{ArrayStr, Config, ModelConfig, RawConfig},
     language::LanguageDetector,
-    model::{self, Model, Reply, StopReason, Tools},
+    provider::{self, Model, Reply, StopReason, Tools},
     sim::Sim,
     sqlite::pool::Pool,
     synthesizer::{SpeechInput, SpeechOutput, Synthesizer},
@@ -94,6 +94,8 @@ struct Playback {
 struct Session {
     /// The database the tool reads
     db: PathBuf,
+    /// The model settings it was started with: changing them starts over
+    model: ModelConfig,
     state: Arc<Mutex<SessionState>>,
 }
 
@@ -228,7 +230,14 @@ impl Engineer {
         };
 
         let db = pool.database().path().to_owned();
-        if self.new_session || self.session.as_ref().is_none_or(|s| s.db != db) {
+        let model_changed = self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.model != config.get().model);
+        if model_changed {
+            self.notice("New model settings: the engineer starts over");
+        }
+        if self.new_session || model_changed || self.session.as_ref().is_none_or(|s| s.db != db) {
             match self.start(config, pool) {
                 Ok(session) => self.session = Some(session),
                 Err(e) => {
@@ -530,12 +539,9 @@ impl Engineer {
             EngineerTool::input_schema(),
             tool.clone(),
         );
-        let conversation = model::conversation(
-            &config.get().model,
-            self.skill.clone(),
-            tools,
-            self.client.clone(),
-        )?;
+        let model = config.get().model.clone();
+        let conversation =
+            provider::conversation(&model, self.skill.clone(), tools, self.client.clone())?;
 
         // The history cache is built now, so the first history question doesn't wait for it
         tokio::spawn(async move {
@@ -548,6 +554,7 @@ impl Engineer {
         log::info!("Engineer session started on {}", db.display());
         Ok(Session {
             db,
+            model,
             state: Arc::new(Mutex::new(SessionState {
                 conversation,
                 pool,
@@ -682,7 +689,7 @@ mod tests {
         let one = NonZeroUsize::new(1).unwrap();
         let pool = Pool::new(Database::read_only(Arc::new(path)), one, one);
 
-        let mut builder = model::claude::ConversationBuilder::new();
+        let mut builder = provider::claude::ConversationBuilder::new();
         builder.api_key("test");
         let mut state = SessionState {
             conversation: Box::new(builder.build(reqwest::Client::new()).unwrap()),

@@ -1,6 +1,6 @@
 //! Models run by Ollama (<https://ollama.com>), on this PC or another, through its chat API.
 
-use super::{Model, Reply, StopReason, ToolHandler, Tools, Usage, text::TextSink};
+use super::{Model, ModelOption, Reply, StopReason, ToolHandler, Tools, Usage, text::TextSink};
 use crate::config::OllamaConfig;
 use anyhow::{Context, bail};
 use futures::future::{BoxFuture, join_all};
@@ -20,6 +20,60 @@ use std::{
 
 /// Where Ollama listens unless `OLLAMA_HOST` says otherwise.
 const DEFAULT_HOST: &str = "http://127.0.0.1:11434";
+
+/// The models pulled on Ollama at `host` (as `OLLAMA_HOST` says it: when `None`, `OLLAMA_HOST`,
+/// or this PC), by name.
+pub async fn models(
+    host: Option<&str>,
+    client: &reqwest::Client,
+) -> anyhow::Result<Vec<ModelOption>> {
+    #[derive(Deserialize)]
+    struct Tags {
+        #[serde(default)]
+        models: Vec<Tag>,
+    }
+
+    #[derive(Deserialize)]
+    struct Tag {
+        name: String,
+        #[serde(default)]
+        size: Option<u64>,
+    }
+
+    let base_url = match host {
+        Some(host) => host_url(host),
+        None => default_base_url()?,
+    };
+    let mut request = client
+        .get(format!("{base_url}/api/tags"))
+        .timeout(Duration::from_secs(10));
+    if let Some(api_key) = env("OLLAMA_API_KEY")? {
+        request = request.bearer_auth(api_key);
+    }
+
+    let resp = request
+        .send()
+        .await
+        .with_context(|| format!("Couldn't reach Ollama at {base_url} (is it running?)"))?;
+    if !resp.status().is_success() {
+        return Err(ApiError::read(resp).await.into());
+    }
+
+    let tags = resp
+        .json::<Tags>()
+        .await
+        .context("Ollama sent a list of models that couldn't be read")?;
+    let mut models = tags
+        .models
+        .into_iter()
+        .map(|tag| ModelOption {
+            name: tag.name,
+            size: tag.size,
+        })
+        .collect::<Vec<_>>();
+    models.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(models)
+}
 
 /// A conversation with a model on Ollama.
 pub struct Conversation {
@@ -569,10 +623,7 @@ impl ConversationBuilder {
     pub fn build(self, client: reqwest::Client) -> anyhow::Result<Conversation> {
         let base_url = match self.base_url {
             Some(base_url) => base_url.trim_end_matches('/').to_owned(),
-            None => match env("OLLAMA_HOST")? {
-                Some(host) => host_url(&host),
-                None => DEFAULT_HOST.to_owned(),
-            },
+            None => default_base_url()?,
         };
 
         let mut headers = HeaderMap::new();
@@ -650,6 +701,14 @@ fn env(name: &str) -> anyhow::Result<Option<String>> {
             bail!("environment variable was not valid unicode: {:?}", s)
         }
     }
+}
+
+/// Where Ollama is without a host given: `OLLAMA_HOST`, or this PC.
+fn default_base_url() -> anyhow::Result<String> {
+    Ok(match env("OLLAMA_HOST")? {
+        Some(host) => host_url(&host),
+        None => DEFAULT_HOST.to_owned(),
+    })
 }
 
 /// `OLLAMA_HOST` as the `ollama` command reads it: a host, with or without a scheme or port
@@ -1032,6 +1091,15 @@ mod tests {
         assert_eq!(host_url("https://ollama.com"), "https://ollama.com:443");
         assert_eq!(host_url("http://[::1]"), "http://[::1]:11434");
         assert_eq!(host_url("http://[::1]:9000/"), "http://[::1]:9000");
+    }
+
+    /// The models pulled on the Ollama running on this PC.
+    #[tokio::test]
+    #[ignore]
+    async fn lists_the_pulled_models() {
+        let models = models(None, &reqwest::Client::new()).await.unwrap();
+        println!("{models:#?}");
+        assert!(models.iter().all(|model| model.size.is_some()));
     }
 
     /// Against the Ollama running on this PC, with a model that's been pulled (`OLLAMA_MODEL`,

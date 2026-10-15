@@ -76,6 +76,18 @@ impl LanguageDetector {
     }
 }
 
+/// The English name of the language with `code` (as the voices have it), if it's one of those
+/// built in (see the `all-languages` feature).
+pub fn name(code: ArrayStr<2>) -> Option<String> {
+    let code = match &*code {
+        // Norwegian's voices are Bokmål's
+        "no" => "nb",
+        code => code,
+    };
+    let iso = code.parse::<lingua::IsoCode639_1>().ok()?;
+    Some(Language::from_iso_code_639_1(&iso).to_string())
+}
+
 /// The language's code as the voices have it: whisper's two-letter codes, which make
 /// Norwegian's two written forms one.
 fn voice_language(language: Language) -> Option<ArrayStr<2>> {
@@ -120,5 +132,13 @@ mod tests {
         let one = BTreeMap::from([(arrstr!("en"), Utf8PathBuf::from("en.onnx"))]);
         detector.update(rt, &one);
         assert_eq!(detector.detect("¿Cuánto combustible me queda?"), None);
+    }
+
+    #[test]
+    fn names_the_languages() {
+        assert_eq!(name(arrstr!("es")).as_deref(), Some("Spanish"));
+        assert_eq!(name(arrstr!("en")).as_deref(), Some("English"));
+        // Not built in
+        assert_eq!(name(arrstr!("xx")), None);
     }
 }

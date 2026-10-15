@@ -3,9 +3,12 @@ use std::sync::Arc;
 use crate::{
     app::{
         Subsystems,
-        topbar::{audio::AudioTopbar, settings::SettingsTopbar, volume::VolumeTopbar},
+        topbar::{
+            audio::AudioTopbar, provider::ProviderTopbar, settings::SettingsTopbar,
+            spotter::SpotterTopbar, volume::VolumeTopbar,
+        },
     },
-    config::{Config, RawConfig},
+    config::{Config, RawConfig, Setting},
     sim::Sim,
     synthesizer::Synthesizer,
 };
@@ -18,13 +21,17 @@ use sdl3::event::Event;
 use tokio::runtime::Handle;
 
 mod audio;
+mod provider;
 mod settings;
+mod spotter;
 mod volume;
 
 pub struct Topbar {
     settings: SettingsTopbar,
     pub audio: AudioTopbar,
     volume: VolumeTopbar,
+    provider: ProviderTopbar,
+    spotter: SpotterTopbar,
     /// "Clear data" was clicked: asking before clearing
     confirm_clear: bool,
 }
@@ -39,6 +46,8 @@ impl Topbar {
         Self {
             settings: SettingsTopbar::default(),
             volume: VolumeTopbar,
+            provider: ProviderTopbar::new(client),
+            spotter: SpotterTopbar,
             confirm_clear: false,
             audio: AudioTopbar::new(pref_path, ss, config, client),
         }
@@ -81,6 +90,18 @@ impl Topbar {
                     )
                     .ui(ui, |ui| self.volume.update(ui, config));
 
+                MenuButton::new("Provider")
+                    .config(
+                        MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
+                    )
+                    .ui(ui, |ui| self.provider.update(rt, ui, config));
+
+                MenuButton::new("Spotter")
+                    .config(
+                        MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
+                    )
+                    .ui(ui, |ui| self.spotter.update(ui, config));
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let clear = ui
                         .add_enabled(simulator.is_some(), egui::Button::new("Clear data"))
@@ -108,6 +129,49 @@ impl Topbar {
             }
         }
     }
+}
+
+/// A sub-menu picking one of `options` (a `ComboBox` would close the menu it's in), with
+/// `other` naming a value that isn't one of them (set in the config file). Returns the sub-menu's
+/// button, changed if the pick did.
+fn pick<T, S>(
+    ui: &mut egui::Ui,
+    label: &str,
+    current: T,
+    setting: &mut Setting<T>,
+    options: impl IntoIterator<Item = (T, S)>,
+    other: impl FnOnce(&T) -> String,
+) -> egui::Response
+where
+    T: Clone + PartialEq,
+    S: Into<String>,
+{
+    let options = options
+        .into_iter()
+        .map(|(value, text)| (value, text.into()))
+        .collect::<Vec<(T, String)>>();
+    let text = match options.iter().find(|(value, _)| *value == current) {
+        Some((_, text)) => text.clone(),
+        None => other(&current),
+    };
+
+    let mut response = None;
+    setting.edit(current, |value| {
+        let before = value.clone();
+        let menu = ui.menu_button(format!("{label}: {text}"), |ui| {
+            for (option, text) in options {
+                ui.selectable_value(value, option, text);
+            }
+        });
+        let changed = *value != before;
+        let mut button = menu.response;
+        if changed {
+            button.mark_changed();
+        }
+        response = Some(button);
+        changed
+    });
+    response.unwrap()
 }
 
 /// Asks before clearing the simulator's recorded data, and clears it if confirmed. Returns whether
