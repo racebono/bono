@@ -65,6 +65,8 @@ struct Inner {
     db: Pool,
     path: PathBuf,
     history: Mutex<History>,
+    /// The track description's calibration, until the player completes another lap
+    calibration: Mutex<Option<(CalibrationKey, Option<Calibration>)>>,
     warming: AtomicBool,
 }
 
@@ -79,6 +81,7 @@ impl Engineer {
                 db,
                 path,
                 history: Mutex::new(History::default()),
+                calibration: Mutex::new(None),
                 warming: AtomicBool::new(false),
             }),
         }
@@ -2641,18 +2644,233 @@ fn pit_loss(name: &str) -> &str {
 
 type Json = serde_json::Value;
 
-/// The track description saved next to the database, if there's one for this session's track.
+/// The track description saved next to the database, if there's one for this session's track:
+/// its positions moved to line up with the car's laps (see `calibrate`).
 fn load_track(ctx: &Ctx, sc: &Scoring) -> Option<Json> {
     let path = ctx.inner.path.parent()?.join(crate::track::TRACK_FILE);
-    let track = serde_json::from_slice::<Json>(&std::fs::read(path).ok()?).ok()?;
+    let mut track = serde_json::from_slice::<Json>(&std::fs::read(path).ok()?).ok()?;
     if !track.is_object() {
         return None;
     }
     let name = sc.session.as_ref().and_then(|s| s.text("track"));
     match (track.get("source_track").and_then(Json::as_str), name) {
         // Left from another track
-        (Some(source), Some(name)) if !source.is_empty() && source != name => None,
-        _ => Some(track),
+        (Some(source), Some(name)) if !source.is_empty() && source != name => return None,
+        _ => {}
+    }
+
+    if let Some(length) = track_length(&track, sc).filter(|l| *l > 0.0)
+        && let Some(calibration) = calibration(ctx, sc, &track, length)
+    {
+        shift_track(&mut track, calibration.shift / length);
+        track["calibration"] = serde_json::json!({
+            "shift": calibration.shift,
+            "matched": calibration.matched,
+            "turns": calibration.turns,
+            "vehicle": calibration.vehicle,
+            "lap": calibration.lap,
+        });
+    }
+    Some(track)
+}
+
+/// Where the description's lap starts can differ from the simulator's: another start/finish
+/// line, or the data measured differently (iRacing's Silverstone is about 130 m off LMU's lap,
+/// its Spa 150 m), which puts every turn that far off. Found by lining its turns up with the
+/// corners of a lap: the slowest point after each braking zone.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Calibration {
+    /// Metres added to every position in the description
+    shift: f64,
+    /// The description's turns lined up with a corner of the lap, of all of them
+    matched: usize,
+    turns: usize,
+    /// The lap it was lined up with
+    vehicle: i64,
+    lap: i64,
+}
+
+/// What a calibration holds for: the track, the session, and how many laps the player has done.
+type CalibrationKey = (String, i64, usize);
+
+/// Further than this from every corner, a turn counts as this far: flat-out turns have no corner
+const SHIFT_CAP: f64 = 100.0;
+/// A turn this close to a corner (once shifted) is lined up with it
+const SHIFT_MATCH: f64 = 50.0;
+/// Fewer turns lined up, and there's no telling
+const SHIFT_MIN_MATCHED: usize = 4;
+/// Less is left alone: a car's slowest point isn't exactly where the data puts the apex
+const SHIFT_MIN: f64 = 20.0;
+/// The most a description is moved, and the step it's searched in
+const SHIFT_MAX: f64 = 400.0;
+const SHIFT_STEP: f64 = 2.0;
+
+/// The description's calibration, worked out again once the player has completed another lap.
+fn calibration(ctx: &Ctx, sc: &Scoring, track: &Json, length: f64) -> Option<Calibration> {
+    let name = track
+        .get("source_track")
+        .or_else(|| track.get("name"))
+        .and_then(Json::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let laps = ctx.history().ok()?.laps(ctx.vehicle).len();
+    let key = (name, ctx.session_start_id().ok()?, laps);
+
+    if let Some((cached, calibration)) = &*lock(&ctx.inner.calibration)
+        && *cached == key
+    {
+        return *calibration;
+    }
+    let calibration = calibrate(ctx, sc, track, length);
+    if let Some(calibration) = calibration {
+        log::info!(
+            "Track description moved {:+.0} m to line up with lap {} ({} of {} turns)",
+            calibration.shift,
+            calibration.lap,
+            calibration.matched,
+            calibration.turns
+        );
+    }
+    *lock(&ctx.inner.calibration) = Some((key, calibration));
+    calibration
+}
+
+/// Lines the description's turns up with the corners of the player's best lap (or, before the
+/// player has one, the quickest cars'). `None` when it's lined up already, or there's no telling.
+fn calibrate(ctx: &Ctx, sc: &Scoring, track: &Json, length: f64) -> Option<Calibration> {
+    let apexes = json_list(track, "turn")
+        .into_iter()
+        .filter_map(|t| {
+            let (start, end) = (num(t, "start")?, num(t, "end")?);
+            Some(num(t, "marker").unwrap_or((start + end) / 2.0) * length)
+        })
+        .collect::<Vec<_>>();
+    if apexes.len() < SHIFT_MIN_MATCHED {
+        return None;
+    }
+
+    let mut others = sc
+        .cars
+        .iter()
+        .filter(|(vehicle, _)| **vehicle != ctx.vehicle)
+        .filter_map(|(vehicle, car)| Some((car.f("best_lap_time").filter(|t| *t > 0.0)?, *vehicle)))
+        .collect::<Vec<_>>();
+    others.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    let vehicles = std::iter::once(ctx.vehicle).chain(others.into_iter().take(3).map(|(_, v)| v));
+
+    for vehicle in vehicles {
+        let Ok(laps) = lap_table(ctx, vehicle) else {
+            continue;
+        };
+        let Some(lap) = best_lap(&laps) else {
+            continue;
+        };
+        let Ok(trace) = Trace::new(ctx, vehicle, lap, length) else {
+            continue;
+        };
+        if !trace.ok {
+            continue;
+        }
+
+        let corners = trace
+            .braking_zones()
+            .into_iter()
+            .map(|(_, apex)| apex)
+            .collect::<Vec<_>>();
+        return fit_shift(&apexes, &corners, length).map(|(shift, matched)| Calibration {
+            shift,
+            matched,
+            turns: apexes.len(),
+            vehicle,
+            lap: lap.lap,
+        });
+    }
+    None
+}
+
+/// The shift (metres, added to every apex) lining `apexes` up with a lap's `corners`, and how many
+/// apexes it lines up: each apex counts its distance to the nearest corner, up to `SHIFT_CAP`, and
+/// the shift with the least in all wins, refined to the median of the lined up ones' distances.
+/// `None` when it's under `SHIFT_MIN`, lines up too few, or another shift does about as well (the
+/// corners are evenly spaced, say).
+fn fit_shift(apexes: &[f64], corners: &[f64], length: f64) -> Option<(f64, usize)> {
+    if corners.is_empty() || length <= 0.0 {
+        return None;
+    }
+    // The way from x to the nearest corner, signed
+    let nearest = |x: f64| {
+        corners
+            .iter()
+            .map(|c| signed(*c, x, length))
+            .min_by(|a, b| a.abs().partial_cmp(&b.abs()).unwrap_or(Ordering::Equal))
+            .unwrap_or(f64::INFINITY)
+    };
+    let cost = |shift: f64| {
+        apexes
+            .iter()
+            .map(|a| nearest(a + shift).abs().min(SHIFT_CAP))
+            .sum::<f64>()
+    };
+
+    let max = SHIFT_MAX.min(length * 0.1);
+    let steps = (max / SHIFT_STEP) as i64;
+    let costs = (-steps..=steps)
+        .map(|k| {
+            let shift = k as f64 * SHIFT_STEP;
+            (shift, cost(shift))
+        })
+        .collect::<Vec<_>>();
+    let (best, best_cost) = costs
+        .iter()
+        .copied()
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))?;
+
+    // Another shift about as good: no telling which
+    let runner_up = costs
+        .iter()
+        .filter(|(shift, _)| (shift - best).abs() > SHIFT_MATCH + 10.0)
+        .map(|(_, cost)| *cost)
+        .fold(f64::INFINITY, f64::min);
+    if runner_up - best_cost < SHIFT_CAP {
+        return None;
+    }
+
+    let mut lined_up = apexes
+        .iter()
+        .map(|a| nearest(a + best))
+        .filter(|d| d.abs() <= SHIFT_MATCH)
+        .collect::<Vec<_>>();
+    if lined_up.len() < SHIFT_MIN_MATCHED {
+        return None;
+    }
+    lined_up.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let shift = best + lined_up[lined_up.len() / 2];
+    (shift.abs() >= SHIFT_MIN).then_some((shift, lined_up.len()))
+}
+
+/// Moves every position in the description (fractions of the lap) by `fraction`, round the line.
+fn shift_track(track: &mut Json, fraction: f64) {
+    let mut shift = |value: &mut Json| {
+        if let Some(x) = value.as_f64() {
+            *value = (x + fraction).rem_euclid(1.0).into();
+        }
+    };
+
+    for key in ["pitentry", "pitexit"] {
+        if let Some(value) = track.get_mut(key) {
+            shift(value);
+        }
+    }
+    for list in ["turn", "straight", "sector"] {
+        if let Some(Json::Array(parts)) = track.get_mut(list) {
+            for part in parts {
+                for key in ["start", "marker", "end"] {
+                    if let Some(value) = part.get_mut(key) {
+                        shift(value);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2817,7 +3035,7 @@ fn cmd_track(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
             .unwrap_or("this track");
         say!(
             out,
-            "TRACK no description for {name} (there is one only when lovely-track-data has the track and the app saved it for this session)"
+            "TRACK no description for {name} (there is one only when lovely-track-data has the track, or the same layout in another simulator, and the app saved it for this session)"
         );
         return Ok(());
     };
@@ -2943,7 +3161,46 @@ fn cmd_track(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
             .collect::<Vec<_>>();
         say!(out, "TIME LOST (estimates, s) {}", classes.join(" | "));
     }
-    say!(out, "SOURCE {TRACK_SOURCE}");
+    if let Some(calibration) = track.get("calibration") {
+        say!(
+            out,
+            "CALIBRATED positions moved {:+.0} m to line up with the corners of {}lap {} ({} of {} turns lined up)",
+            num(calibration, "shift").unwrap_or(0.0),
+            calibration
+                .get("vehicle")
+                .and_then(Json::as_i64)
+                .filter(|v| *v != ctx.vehicle)
+                .map(|v| format!("{}'s ", sc.label(v)))
+                .unwrap_or_default(),
+            calibration.get("lap").and_then(Json::as_i64).unwrap_or(0),
+            calibration
+                .get("matched")
+                .and_then(Json::as_u64)
+                .unwrap_or(0),
+            calibration.get("turns").and_then(Json::as_u64).unwrap_or(0)
+        );
+    }
+    match track.get("borrowed") {
+        // Another simulator's data for the same layout (see `track::BORROWED`)
+        Some(borrowed) => {
+            say!(
+                out,
+                "SOURCE {TRACK_SOURCE}: {}'s data for {} ({} m), rescaled to this lap (positions may be off by up to about 100 m)",
+                borrowed
+                    .get("sim")
+                    .and_then(Json::as_str)
+                    .unwrap_or("another simulator"),
+                borrowed
+                    .get("layout")
+                    .and_then(Json::as_str)
+                    .unwrap_or("the same layout"),
+                num(borrowed, "length").map_or("?".into(), |l| format!("{l:.0}"))
+            );
+        }
+        None => {
+            say!(out, "SOURCE {TRACK_SOURCE}");
+        }
+    }
     Ok(())
 }
 
@@ -3127,6 +3384,40 @@ impl Trace {
         }
     }
 
+    /// Every braking zone of the lap: where braking starts, and the slowest point after it (before
+    /// the next one).
+    fn braking_zones(&self) -> Vec<(f64, f64)> {
+        let mut starts = Vec::new();
+        let mut on = None;
+        for i in 1..self.d.len().saturating_sub(1) {
+            let braking = self.braking(i, Some(i - 1));
+            match on {
+                None if braking => on = Some(self.d[i]),
+                Some(start) if !braking => {
+                    if self.d[i] - start > 15.0 {
+                        starts.push(start);
+                    }
+                    on = None;
+                }
+                _ => {}
+            }
+        }
+
+        let mut zones = Vec::new();
+        for (k, &start) in starts.iter().enumerate() {
+            let next = starts.get(k + 1).copied().unwrap_or(start + self.length);
+            let slowest = self
+                .indices(start, next.min(self.length))
+                .into_iter()
+                .filter(|&i| self.v[i].is_some())
+                .min_by(|&a, &b| self.v[a].partial_cmp(&self.v[b]).unwrap_or(Ordering::Equal));
+            if let Some(i) = slowest {
+                zones.push((start, self.d[i]));
+            }
+        }
+        zones
+    }
+
     /// Where braking for the corner at `apex` starts: the start of the last continuous braking
     /// run before it.
     fn braking_point(&self, apex: f64) -> Option<f64> {
@@ -3221,44 +3512,17 @@ fn lap_turns(ctx: &Ctx, sc: &Scoring, reference: &Trace) -> (Vec<Turn>, &'static
 
     // No track data: every braking zone of the reference lap is a corner, its apex the slowest
     // point after it
-    let mut zones = Vec::new();
-    let mut on = None;
-    for i in 1..reference.d.len().saturating_sub(1) {
-        let braking = reference.braking(i, Some(i - 1));
-        match on {
-            None if braking => on = Some(reference.d[i]),
-            Some(start) if !braking => {
-                if reference.d[i] - start > 15.0 {
-                    zones.push(start);
-                }
-                on = None;
-            }
-            _ => {}
-        }
-    }
-
-    let mut turns = Vec::new();
-    for (k, &b) in zones.iter().enumerate() {
-        let next = zones.get(k + 1).copied().unwrap_or(b + length);
-        let Some(i) = reference
-            .indices(b, next.min(length))
-            .into_iter()
-            .filter(|&i| reference.v[i].is_some())
-            .min_by(|&a, &b| {
-                reference.v[a]
-                    .partial_cmp(&reference.v[b])
-                    .unwrap_or(Ordering::Equal)
-            })
-        else {
-            continue;
-        };
-        turns.push(Turn {
-            label: format!("braking zone {}", turns.len() + 1),
-            start: b,
-            apex: reference.d[i],
-            end: (reference.d[i] + 60.0).min(length),
-        });
-    }
+    let turns = reference
+        .braking_zones()
+        .into_iter()
+        .enumerate()
+        .map(|(k, (start, apex))| Turn {
+            label: format!("braking zone {}", k + 1),
+            start,
+            apex,
+            end: (apex + 60.0).min(length),
+        })
+        .collect();
     (turns, "braking zones of the reference lap (no track data)")
 }
 
@@ -4086,6 +4350,126 @@ mod tests {
         (dir, Engineer::new(pool, schema()))
     }
 
+    /// A lap of a 2000 m track with five corners (braking hard into each, slowest at the apex),
+    /// driven three times, and a description of it putting every turn 150 m late.
+    fn shifted_ring() -> (tempfile::TempDir, Engineer) {
+        const LENGTH: f64 = 2000.0;
+        const APEXES: [f64; 5] = [300.0, 700.0, 1100.0, 1500.0, 1850.0];
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+
+        let session = |t: f64| {
+            let mut s = lambiase_session_info::default();
+            s.session_time = Some(t).into();
+            s.track = Some("Shifted Ring".to_owned()).into();
+            s.track_length = Some(LENGTH).into();
+            s.session_type = Some("practice".to_owned()).into();
+            s.phase = Some("green".to_owned()).into();
+            s
+        };
+        let standing = |laps: i64, t: f64, best: Option<f64>| {
+            let mut s = lambiase_standing::default();
+            s.session_time = Some(t).into();
+            s.vehicle_id = Some(1).into();
+            s.is_player = Some(true).into();
+            s.driver = Some("Ana Lopes".to_owned()).into();
+            s.laps_completed = Some(laps).into();
+            s.best_lap_time = best.into();
+            s
+        };
+        recorder.push_scoring(session(0.0), vec![standing(0, 0.0, None)]);
+
+        // 60 m/s, slowing to 20 m/s at each apex over the 100 m before it, braking all the way
+        let speed = |d: f64| {
+            APEXES
+                .iter()
+                .map(|apex| match apex - d {
+                    before if (0.0..100.0).contains(&before) => 20.0 + before * 0.4,
+                    after if (-60.0..0.0).contains(&after) => 20.0 - after * 0.4,
+                    _ => 60.0,
+                })
+                .fold(60.0, f64::min)
+        };
+        let mut t = 0.0;
+        let mut lap_start = 0.0;
+        for lap in 0..3i64 {
+            let mut d = 0.0;
+            while d < LENGTH {
+                let v = speed(d);
+                let mut telemetry = lambiase_telemetry::default();
+                telemetry.vehicle_id = Some(1).into();
+                telemetry.session_time = Some(t).into();
+                telemetry.lap = Some(lap).into();
+                telemetry.lap_start_time = Some(lap_start).into();
+                telemetry.lap_distance = Some(d).into();
+                telemetry.speed = Some(v).into();
+                let braking = APEXES.iter().any(|apex| (0.0..100.0).contains(&(apex - d)));
+                telemetry.brake = Some(if braking { 1.0 } else { 0.0 }).into();
+                telemetry.throttle = Some(if braking { 0.0 } else { 1.0 }).into();
+                if recorder.wants_telemetry(1, t, v) {
+                    recorder.push_telemetry(&telemetry);
+                }
+                d += 5.0;
+                t += 5.0 / v;
+            }
+            let lap_time = t - lap_start;
+            lap_start = t;
+            recorder.push_scoring(session(t), vec![standing(lap + 1, t, Some(lap_time))]);
+        }
+        drop(recorder);
+
+        // Every turn 150 m late
+        let turns = APEXES
+            .iter()
+            .enumerate()
+            .map(|(k, apex)| {
+                let at = |x: f64| ((apex + 150.0 + x) / LENGTH).rem_euclid(1.0);
+                serde_json::json!({
+                    "number": k + 1, "start": at(-40.0), "marker": at(0.0), "end": at(40.0)
+                })
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(
+            dir.path().join(crate::track::TRACK_FILE),
+            serde_json::json!({
+                "name": "Shifted Ring",
+                "length": LENGTH,
+                "source_track": "Shifted Ring",
+                "pitentry": 0.95,
+                "turn": turns,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let two = NonZeroUsize::new(2).unwrap();
+        let pool = Pool::new(
+            Database::read_only(Arc::new(dir.path().join(DATABASE))),
+            two,
+            two,
+        );
+        (dir, Engineer::new(pool, schema()))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lines_the_track_up_with_the_laps() {
+        let (_dir, engineer) = shifted_ring();
+        let track = run(&engineer, serde_json::json!({"command": "track"})).await;
+        assert!(
+            track.contains("CALIBRATED positions moved -150 m to line up with the corners of lap"),
+            "{track}"
+        );
+        // Where the car slows
+        assert!(track.contains("T1 260 m-340 m, apex 300 m"), "{track}");
+        assert!(track.contains("T5 1810 m-1890 m, apex 1850 m"), "{track}");
+        assert!(track.contains("PIT LANE entry 1750 m"), "{track}");
+
+        // The corners are the same ones
+        let corners = run(&engineer, serde_json::json!({"command": "corners"})).await;
+        assert!(corners.contains("track data"), "{corners}");
+        assert!(corners.contains("T1"), "{corners}");
+    }
+
     /// The skill's own schema reference, as the app reads it from the assets.
     fn schema() -> Arc<str> {
         include_str!("../../assets/skill/references/schema.md").into()
@@ -4184,6 +4568,93 @@ mod tests {
 
         let schema = run(&engineer, serde_json::json!({"command": "schema"})).await;
         assert!(schema.contains("car_state"));
+    }
+
+    /// The slowest points of a lap in LMU (from its own telemetry recordings), against a
+    /// description's turn apexes, as lap fractions.
+    const SILVERSTONE: (f64, [f64; 13], [f64; 15]) = (
+        5868.6,
+        [
+            290.0, 799.0, 936.0, 936.0, 1885.0, 2041.0, 2973.0, 3732.0, 3840.0, 3913.0, 4915.0,
+            5505.0, 5525.0,
+        ],
+        // iRacing's Silverstone
+        [
+            0.0695, 0.1075, 0.154, 0.1795, 0.2135, 0.3325, 0.375, 0.431, 0.5295, 0.6235, 0.6575,
+            0.6975, 0.862, 0.9355, 0.974,
+        ],
+    );
+    const IMOLA: (f64, [f64; 10], [f64; 19]) = (
+        4899.1,
+        [
+            703.0, 1418.0, 1418.0, 1715.0, 2332.0, 2857.0, 2857.0, 3380.0, 4137.0, 4258.0,
+        ],
+        // LMU's Imola
+        [
+            0.01, 0.14, 0.15, 0.18, 0.27, 0.29, 0.34, 0.43, 0.47, 0.51, 0.55, 0.58, 0.59, 0.68,
+            0.69, 0.81, 0.84, 0.87, 0.94,
+        ],
+    );
+
+    #[test]
+    fn lines_shifted_tracks_up() {
+        let (length, corners, fractions) = SILVERSTONE;
+        let apexes = fractions.map(|f| f * length);
+        let (shift, matched) = fit_shift(&apexes, &corners, length).expect("shifted");
+        assert!((-140.0..=-115.0).contains(&shift), "{shift}");
+        assert!(matched >= 6, "{matched}");
+
+        // Already lined up: left alone
+        let (length, corners, fractions) = IMOLA;
+        assert_eq!(
+            fit_shift(&fractions.map(|f| f * length), &corners, length),
+            None
+        );
+        // And lined up once shifted back
+        let shifted = apexes.map(|a| a + shift);
+        let (length, corners, _) = SILVERSTONE;
+        assert_eq!(fit_shift(&shifted, &corners, length), None);
+    }
+
+    #[test]
+    fn doesnt_guess_between_shifts() {
+        // Evenly spaced: 100 m forward is as good as 100 m back
+        let apexes = (0..10).map(|k| k as f64 * 200.0).collect::<Vec<_>>();
+        let corners = apexes.iter().map(|a| a + 100.0).collect::<Vec<_>>();
+        assert_eq!(fit_shift(&apexes, &corners, 2000.0), None);
+
+        // Too few corners to tell
+        assert_eq!(fit_shift(&[100.0, 900.0], &[200.0, 1000.0], 3000.0), None);
+        assert_eq!(
+            fit_shift(&[100.0, 900.0, 1500.0, 2200.0], &[], 3000.0),
+            None
+        );
+    }
+
+    #[test]
+    fn shifts_every_position_round_the_line() {
+        let mut track = serde_json::json!({
+            "pitentry": 0.95,
+            "pitexit": 0.05,
+            "turn": [{"start": 0.98, "marker": 0.99, "end": 0.02, "name": "Last"}],
+            "straight": [{"start": 0.1, "end": 0.3}],
+            "sector": [{"marker": 0.5}],
+        });
+        shift_track(&mut track, 0.03);
+        let close = |value: &Json, expected: f64| {
+            assert!(
+                (value.as_f64().unwrap() - expected).abs() < 1e-9,
+                "{value} {expected}"
+            )
+        };
+        close(&track["pitentry"], 0.98);
+        close(&track["pitexit"], 0.08);
+        close(&track["turn"][0]["start"], 0.01);
+        close(&track["turn"][0]["marker"], 0.02);
+        close(&track["turn"][0]["end"], 0.05);
+        assert_eq!(track["turn"][0]["name"], "Last");
+        close(&track["straight"][0]["end"], 0.33);
+        close(&track["sector"][0]["marker"], 0.53);
     }
 
     #[test]

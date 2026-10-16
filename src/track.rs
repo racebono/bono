@@ -2,6 +2,9 @@
 //! time lost in the pits) from Lovely Sim Racing's lovely-track-data
 //! (https://github.com/Lovely-Sim-Racing/lovely-track-data, CC BY-NC-SA 4.0). Each track is
 //! downloaded once and kept in a cache folder; the list of tracks at most once a day.
+//!
+//! A track the simulator's data hasn't got can be borrowed from another simulator's data for the
+//! same layout (see `BORROWED`).
 
 use crate::{error, sim::Sim, sqlite::pool::Pool, task::Task};
 use anyhow::Context;
@@ -33,6 +36,65 @@ const MANIFEST_MAX_AGE: Duration = Duration::from_hours(24);
 /// Where the engineer tool reads the session's track description: next to the database.
 pub const TRACK_FILE: &str = "track.json";
 
+/// A track a simulator's data hasn't got, and the same layout in another simulator's data.
+struct Borrowed {
+    /// The simulator, and its track as it names it
+    sim: &'static str,
+    track: &'static str,
+    /// The other simulator, and the layout's name or id in its data
+    from: &'static str,
+    from_name: &'static str,
+    layout: &'static str,
+}
+
+/// Tracks borrowed from another simulator's data. Each pair is the same layout, checked by hand
+/// (turns, pit lane and length): a venue's other layouts are left out. Left out too: Daytona's and
+/// Long Beach's iRacing data (turn markers only, without where the turns start and end), and
+/// Paul Ricard (no other simulator's data).
+const BORROWED: &[Borrowed] = &[
+    // Today's layout, without the chicane before the last corner: iRacing's "historic" one
+    Borrowed {
+        sim: "lmu",
+        track: "Circuit de Barcelona",
+        from: "iracing",
+        from_name: "iRacing",
+        layout: "barcelona historic",
+    },
+    Borrowed {
+        sim: "lmu",
+        track: "WeatherTech Raceway Laguna Seca",
+        from: "iracing",
+        from_name: "iRacing",
+        layout: "lagunaseca",
+    },
+    Borrowed {
+        sim: "lmu",
+        track: "Michelin Raceway Road Atlanta",
+        from: "iracing",
+        from_name: "iRacing",
+        layout: "roadatlanta full",
+    },
+    // WEC's and ELMS's are both the Arena Grand Prix circuit
+    Borrowed {
+        sim: "lmu",
+        track: "Silverstone Grand Prix Circuit - WEC",
+        from: "iracing",
+        from_name: "iRacing",
+        layout: "silverstone 2019 gp",
+    },
+    Borrowed {
+        sim: "lmu",
+        track: "Silverstone Grand Prix Circuit - ELMS",
+        from: "iracing",
+        from_name: "iRacing",
+        layout: "silverstone 2019 gp",
+    },
+];
+
+/// How much a borrowed layout's length may differ from the simulator's lap: more, and it's taken
+/// for another layout (the data's lengths are measured differently, and are a little off).
+const SAME_LAYOUT: f64 = 0.03;
+
 /// One simulator's track descriptions: the last one asked for is kept, so a session asking again
 /// costs nothing.
 pub struct TrackData {
@@ -51,11 +113,13 @@ impl TrackData {
     /// The description of the simulator's track, downloaded first if it isn't cached yet; `None`
     /// when the data hasn't got the track. `sim` is the simulator's id in the data (SimHub's game
     /// id, e.g. "lmu"); `name` the track as the simulator gives it, matched ignoring case, accents
-    /// and punctuation. The description carries `source_track`: the `name` it was found for.
+    /// and punctuation, and `length` its lap in metres (for a borrowed track). The description
+    /// carries `source_track`: the `name` it was found for.
     pub async fn get(
         &mut self,
         manifest: &mut Manifest,
         name: &str,
+        length: Option<f64>,
     ) -> anyhow::Result<Option<Arc<serde_json::Value>>> {
         if let Some((last, track)) = &self.last
             && last == name
@@ -64,7 +128,11 @@ impl TrackData {
         }
 
         // A failure isn't kept: the next session tries again
-        let track = manifest.track(self.sim, name).await?.map(|mut track| {
+        let track = match manifest.track(self.sim, name).await? {
+            Some(track) => Some(track),
+            None => borrow(manifest, self.sim, name, length).await?,
+        };
+        let track = track.map(|mut track| {
             if let Some(track) = track.as_object_mut() {
                 track.insert("source_track".into(), name.into());
             }
@@ -88,6 +156,73 @@ impl TrackData {
             },
         }
     }
+}
+
+/// The same layout from another simulator's data (see `BORROWED`), if it has it and its length
+/// agrees with the simulator's lap. Positions in the data are fractions of the lap from the
+/// start/finish line, so they carry over: rescaled to this lap's length, a turn is as far along it
+/// as along the other's. The description says where it's from (`borrowed`), and takes the
+/// simulator's `length`. Where the other's lap starts somewhere else, every turn is that far off:
+/// the engineer tool lines the turns up with the car's laps (its `calibrate`).
+async fn borrow(
+    manifest: &mut Manifest,
+    sim: &str,
+    name: &str,
+    length: Option<f64>,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let normalized = normalize(name);
+    let Some(borrowed) = BORROWED
+        .iter()
+        .find(|borrowed| borrowed.sim == sim && normalize(borrowed.track) == normalized)
+    else {
+        return Ok(None);
+    };
+
+    let Some(mut track) = manifest.track(borrowed.from, borrowed.layout).await? else {
+        log::warn!(
+            "{}'s track data no longer has {} for {name}",
+            borrowed.from_name,
+            borrowed.layout
+        );
+        return Ok(None);
+    };
+
+    let theirs = track.get("length").and_then(serde_json::Value::as_f64);
+    let (Some(length), Some(theirs)) = (
+        length.filter(|length| *length > 0.0),
+        theirs.filter(|theirs| *theirs > 0.0),
+    ) else {
+        log::info!("Not borrowing {name}'s description: its length isn't known");
+        return Ok(None);
+    };
+    if (theirs - length).abs() / length > SAME_LAYOUT {
+        log::warn!(
+            "Not borrowing {name}'s description: {}'s {} is {theirs:.0} m, the lap {length:.0} m \
+             (another layout?)",
+            borrowed.from_name,
+            borrowed.layout
+        );
+        return Ok(None);
+    }
+
+    let Some(object) = track.as_object_mut() else {
+        return Ok(None);
+    };
+    let layout = object
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(borrowed.layout)
+        .to_owned();
+    object.insert(
+        "borrowed".into(),
+        serde_json::json!({
+            "sim": borrowed.from_name,
+            "layout": layout,
+            "length": theirs,
+        }),
+    );
+    object.insert("length".into(), length.into());
+    return Ok(Some(track));
 }
 
 /// Keeps `track.json` next to the running simulator's database describing its session's track,
@@ -184,12 +319,13 @@ async fn sync(
         .to_owned();
 
     let conn = db.get().await?;
-    let name = conn
+    let session = conn
         .run(|conn| {
             conn.query_row(
-                "SELECT track FROM session WHERE track IS NOT NULL ORDER BY id DESC LIMIT 1",
+                "SELECT track, track_length FROM session WHERE track IS NOT NULL ORDER BY id DESC \
+                 LIMIT 1",
                 [],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<f64>>(1)?)),
             )
             .optional()
         })
@@ -197,7 +333,7 @@ async fn sync(
     drop(conn);
 
     // No session yet
-    let Some(name) = name else {
+    let Some((name, length)) = session else {
         return Ok(None);
     };
     let key = (dir, name);
@@ -208,7 +344,7 @@ async fn sync(
     let track = {
         let mut track_data = track_data.lock().await;
         let mut manifest = manifest.lock().await;
-        track_data.get(&mut manifest, &key.1).await?
+        track_data.get(&mut manifest, &key.1, length).await?
     };
     TrackData::save(track.as_deref(), &key.0).await?;
     if track.is_none() {
@@ -550,6 +686,172 @@ mod tests {
         assert_eq!(safe_relative(""), None);
     }
 
+    /// A cache folder (in `prefs`) holding `manifest` and `files`, as if just downloaded.
+    async fn cached(
+        prefs: &Path,
+        manifest: serde_json::Value,
+        files: &[(&str, serde_json::Value)],
+    ) -> Manifest {
+        let dir = prefs.join("track");
+        for (path, file) in files {
+            write_whole(&dir.join(path), file.to_string().as_bytes())
+                .await
+                .unwrap();
+        }
+        write_whole(&dir.join("manifest.json"), manifest.to_string().as_bytes())
+            .await
+            .unwrap();
+        Manifest::new(reqwest::Client::new(), prefs).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn borrows_the_same_layout_from_another_simulator() {
+        let prefs = tempfile::tempdir().unwrap();
+        let turn = |start: f64, end: f64, name: &str| serde_json::json!({"start": start, "end": end, "name": name});
+        let mut manifest = cached(
+            prefs.path(),
+            serde_json::json!({
+                "tracks": {
+                    "lmu": [{"trackName": "Circuit de la Sarthe", "path": "lmu/sarthe.json"}],
+                    "iracing": [
+                        {
+                            "trackName": "Barcelona Historic",
+                            "trackId": "barcelona historic",
+                            "path": "iracing/barcelona-historic.json"
+                        },
+                        {
+                            "trackName": "Silverstone Circuit - Arena Grand Prix",
+                            "trackId": "silverstone 2019 gp",
+                            "path": "iracing/silverstone-2019-gp.json"
+                        }
+                    ]
+                }
+            }),
+            &[
+                (
+                    "lmu/sarthe.json",
+                    serde_json::json!({"name": "Circuit de la Sarthe", "length": 13623}),
+                ),
+                (
+                    "iracing/barcelona-historic.json",
+                    serde_json::json!({
+                        "name": "Barcelona Historic",
+                        "length": 4680,
+                        "pitentry": 0.922,
+                        "turn": [turn(0.05, 0.08, "Elf"), turn(0.9, 0.95, "New Holland")]
+                    }),
+                ),
+                (
+                    "iracing/silverstone-2019-gp.json",
+                    serde_json::json!({"name": "Silverstone Circuit - Arena Grand Prix", "length": 5800}),
+                ),
+            ],
+        )
+        .await;
+
+        // The same layout: its lap fractions, on this lap
+        let track = TrackData::new("lmu")
+            .get(&mut manifest, "Circuit de Barcelona", Some(4655.1))
+            .await
+            .unwrap()
+            .expect("borrowed from iRacing");
+        assert_eq!(track["source_track"], "Circuit de Barcelona");
+        assert_eq!(track["length"], 4655.1);
+        assert_eq!(track["turn"][0]["start"], 0.05);
+        assert_eq!(track["turn"][1]["name"], "New Holland");
+        assert_eq!(track["pitentry"], 0.922);
+        assert_eq!(
+            track["borrowed"],
+            serde_json::json!({"sim": "iRacing", "layout": "Barcelona Historic", "length": 4680.0})
+        );
+
+        // Silverstone's National circuit isn't the Grand Prix one, whatever the name says
+        assert!(
+            TrackData::new("lmu")
+                .get(
+                    &mut manifest,
+                    "Silverstone Grand Prix Circuit - WEC",
+                    Some(2638.0)
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Without the lap's length, there's no telling
+        assert!(
+            TrackData::new("lmu")
+                .get(&mut manifest, "Circuit de Barcelona", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Not one of the borrowed tracks
+        assert!(
+            TrackData::new("lmu")
+                .get(&mut manifest, "Circuit Paul Ricard", Some(5800.0))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Nor for another simulator
+        assert!(
+            TrackData::new("iracing")
+                .get(&mut manifest, "Circuit de Barcelona", Some(4655.1))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // The simulator's own data comes first
+        let track = TrackData::new("lmu")
+            .get(&mut manifest, "Circuit de la Sarthe", Some(13624.0))
+            .await
+            .unwrap()
+            .expect("in LMU's data");
+        assert_eq!(track["length"], 13623);
+        assert!(track.get("borrowed").is_none());
+    }
+
+    /// Every borrowed layout is in the real data, as long as LMU's lap (from its results files).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "downloads from GitHub"]
+    async fn borrows_every_layout_from_the_real_data() {
+        let lmu_lengths = [
+            ("Circuit de Barcelona", 4655.1),
+            ("WeatherTech Raceway Laguna Seca", 3590.4),
+            ("Michelin Raceway Road Atlanta", 4083.5),
+            ("Silverstone Grand Prix Circuit - WEC", 5869.2),
+            ("Silverstone Grand Prix Circuit - ELMS", 5869.2),
+        ];
+        assert_eq!(BORROWED.len(), lmu_lengths.len());
+
+        let prefs = tempfile::tempdir().unwrap();
+        let mut manifest = Manifest::new(reqwest::Client::new(), prefs.path())
+            .await
+            .unwrap();
+        for (name, length) in lmu_lengths {
+            assert!(
+                manifest.track("lmu", name).await.unwrap().is_none(),
+                "LMU's data has {name} now: no need to borrow it"
+            );
+            let track = TrackData::new("lmu")
+                .get(&mut manifest, name, Some(length))
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name} wasn't borrowed"));
+            println!(
+                "{name} ({length} m): {} turns from {}",
+                track["turn"].as_array().map_or(0, Vec::len),
+                track["borrowed"]
+            );
+            assert!(
+                track["turn"]
+                    .as_array()
+                    .is_some_and(|turns| turns.iter().all(|t| t["start"].is_number()))
+            );
+        }
+    }
+
     /// Downloads the real list and a real track, into a temporary folder.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "downloads from GitHub"]
@@ -561,7 +863,7 @@ mod tests {
         let mut data = TrackData::new("lmu");
 
         let track = data
-            .get(&mut manifest, "Autodromo Jose Carlos Pace")
+            .get(&mut manifest, "Autodromo Jose Carlos Pace", None)
             .await
             .unwrap()
             .expect("Interlagos is in the data");
@@ -578,7 +880,7 @@ mod tests {
         );
 
         assert!(
-            data.get(&mut manifest, "Not A Track")
+            data.get(&mut manifest, "Not A Track", None)
                 .await
                 .unwrap()
                 .is_none()
