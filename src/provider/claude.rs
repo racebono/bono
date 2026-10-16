@@ -4,6 +4,7 @@ use super::{Model, ModelOption, Reply, StopReason, ToolHandler, Tools, Usage, te
 use crate::config::ClaudeConfig;
 use anyhow::{Context, bail};
 use futures::future::{BoxFuture, join_all};
+use lambiase_i18n::t;
 use reqwest::{
     RequestBuilder, StatusCode,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
@@ -54,7 +55,7 @@ pub async fn models(client: &reqwest::Client) -> anyhow::Result<Vec<ModelOption>
             .timeout(Duration::from_secs(30))
             .send()
             .await
-            .context("Couldn't reach the Claude API")?;
+            .context(t!("provider.claude_unreachable"))?;
         if !resp.status().is_success() {
             return Err(ApiError::read(resp).await.into());
         }
@@ -88,9 +89,7 @@ fn headers(
             Ok(api_key) => (api_key, false),
             Err(VarError::NotPresent) => match std::env::var("ANTHROPIC_AUTH_TOKEN") {
                 Ok(auth_token) => (auth_token, true),
-                Err(VarError::NotPresent) => bail!(
-                    "No Claude credentials: set ANTHROPIC_API_KEY or ConversationBuilder::api_key"
-                ),
+                Err(VarError::NotPresent) => bail!(t!("provider.no_claude_credentials")),
                 Err(VarError::NotUnicode(s)) => {
                     bail!("environment variable was not valid unicode: {:?}", s)
                 }

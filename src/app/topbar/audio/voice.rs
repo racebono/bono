@@ -12,6 +12,7 @@ use crate::{
 use camino::{Utf8Component, Utf8Path};
 use egui::{RichText, Widget};
 use egui_extras::Column;
+use lambiase_i18n::t;
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -39,7 +40,7 @@ impl Voices {
                 match Catalog::fetch(&pref_path, &fetch_client).await {
                     Ok(catalog) => Some(catalog),
                     Err(e) => {
-                        error("Error fetching text to speech catalog", e);
+                        error(t!("error.tts_catalog"), e);
                         None
                     }
                 }
@@ -61,7 +62,7 @@ impl Voices {
         };
 
         ui.add_enabled_ui(catalog.is_some(), |ui| {
-            ui.menu_button("Text To Speech", |ui| {
+            ui.menu_button(t!("audio.text_to_speech"), |ui| {
                 let Some(catalog) = catalog else {
                     return;
                 };
@@ -239,7 +240,13 @@ impl Language {
             .columns(Column::auto(), 5)
             .column(Column::remainder())
             .header(20.0, |mut header| {
-                for title in ["Voice", "Region", "Quality", "Speakers", "Size"] {
+                for title in [
+                    t!("audio.voice"),
+                    t!("audio.region"),
+                    t!("audio.quality"),
+                    t!("audio.speakers"),
+                    t!("audio.size"),
+                ] {
                     header.col(|ui| {
                         ui.strong(title);
                     });
@@ -285,7 +292,7 @@ impl Language {
                                         config.voices().get(&code).map(|path| path.as_path())
                                             == Some(&*voice.path);
                                     ui.add_enabled_ui(!used, |ui| {
-                                        if ui.button("Use").clicked() {
+                                        if ui.button(t!("audio.use")).clicked() {
                                             config.set_voice(
                                                 rt,
                                                 code,
@@ -299,7 +306,7 @@ impl Language {
                                     egui::ProgressBar::new(progress as f32)
                                         .show_percentage()
                                         .ui(ui);
-                                } else if ui.button("Download").clicked() {
+                                } else if ui.button(t!("audio.download")).clicked() {
                                     voice.start_download(client);
                                 }
                             });
@@ -369,11 +376,11 @@ enum Quality {
 impl Quality {
     fn label(self) -> &'static str {
         match self {
-            Quality::ExtraLow => "Extra low",
-            Quality::Low => "Low",
-            Quality::Medium => "Medium",
-            Quality::High => "High",
-            Quality::Unknown => "Unknown",
+            Quality::ExtraLow => t!("quality.extra_low"),
+            Quality::Low => t!("quality.low"),
+            Quality::Medium => t!("quality.medium"),
+            Quality::High => t!("quality.high"),
+            Quality::Unknown => t!("quality.unknown"),
         }
     }
 }

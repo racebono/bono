@@ -2,6 +2,7 @@
 
 use crate::engineer::{Engineer, Speaker};
 use egui::RichText;
+use lambiase_i18n::t;
 
 #[derive(Default)]
 pub struct Chat {
@@ -22,13 +23,16 @@ impl Chat {
                 let send_width = 60.0;
                 let input = ui.add(
                     egui::TextEdit::singleline(&mut self.draft)
-                        .hint_text("Ask the engineer")
+                        .hint_text(t!("chat.ask_hint"))
                         .desired_width(ui.available_width() - send_width),
                 );
                 let entered = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let has_text = !self.draft.trim().is_empty();
                 let clicked = ui
-                    .add_enabled(has_text, egui::Button::new("Send").min_size([send_width, 0.0].into()))
+                    .add_enabled(
+                        has_text,
+                        egui::Button::new(t!("chat.send")).min_size([send_width, 0.0].into()),
+                    )
                     .clicked();
 
                 if (entered || clicked) && has_text {
@@ -46,13 +50,13 @@ impl Chat {
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                     if engineer.chat().is_empty() {
-                        ui.weak("Hold the talk button, or type below, to ask the engineer.");
+                        ui.weak(t!("chat.empty"));
                     }
 
                     for entry in engineer.chat() {
                         let (name, color) = match entry.speaker {
-                            Speaker::Pilot => ("Pilot", ui.visuals().hyperlink_color),
-                            Speaker::Engineer => ("Engineer", ui.visuals().warn_fg_color),
+                            Speaker::Pilot => (t!("chat.pilot"), ui.visuals().hyperlink_color),
+                            Speaker::Engineer => (t!("chat.engineer"), ui.visuals().warn_fg_color),
                             Speaker::Notice => {
                                 ui.vertical_centered(|ui| {
                                     ui.label(RichText::new(&entry.text).italics().weak());
@@ -76,7 +80,7 @@ impl Chat {
                     if engineer.is_thinking() {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.weak("The engineer is on it");
+                            ui.weak(t!("chat.thinking"));
                         });
                     }
                 });

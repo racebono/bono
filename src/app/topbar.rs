@@ -57,7 +57,6 @@ impl Topbar {
         if self.audio.event(rt, config, event) {
             return true;
         }
-
         return false;
     }
 
@@ -78,25 +77,25 @@ impl Topbar {
                     )
                     .ui(ui, |ui| self.settings.update(rt, ss, ui, config));
 
-                MenuButton::new("Audio")
+                MenuButton::new(t!("audio"))
                     .config(
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
                     .ui(ui, |ui| self.audio.update(rt, ss, ui, config, synth));
 
-                MenuButton::new("Volume")
+                MenuButton::new(t!("volume"))
                     .config(
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
                     .ui(ui, |ui| self.volume.update(ui, config));
 
-                MenuButton::new("Provider")
+                MenuButton::new(t!("provider"))
                     .config(
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
                     .ui(ui, |ui| self.provider.update(rt, ui, config));
 
-                MenuButton::new("Spotter")
+                MenuButton::new(t!("spotter"))
                     .config(
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
@@ -104,9 +103,12 @@ impl Topbar {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let clear = ui
-                        .add_enabled(simulator.is_some(), egui::Button::new("Clear data"))
-                        .on_hover_text("Delete everything recorded from the simulator so far")
-                        .on_disabled_hover_text("No simulator is running");
+                        .add_enabled(
+                            simulator.is_some(),
+                            egui::Button::new(t!("topbar.clear_data")),
+                        )
+                        .on_hover_text(t!("topbar.clear_data_hover"))
+                        .on_disabled_hover_text(t!("topbar.no_simulator_hover"));
 
                     if clear.clicked() {
                         self.confirm_clear = true;
@@ -115,7 +117,7 @@ impl Topbar {
                     ui.label(
                         simulator
                             .as_deref()
-                            .map_or("No simulator running", |simulator| simulator.name()),
+                            .map_or(t!("topbar.no_simulator"), |simulator| simulator.name()),
                     );
                 });
             });
@@ -179,15 +181,13 @@ where
 fn confirm_clear(ctx: &egui::Context, simulator: &mut Sim) -> bool {
     let name = simulator.name();
     let modal = egui::Modal::new(egui::Id::new("confirm clear")).show(ctx, |ui| {
-        ui.heading("Clear recorded data?");
-        ui.label(format!(
-            "Everything recorded from {name} so far will be deleted. This can't be undone."
-        ));
+        ui.heading(t!("clear.title"));
+        ui.label(t!("clear.body", name = name));
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            let clear = ui.button("Clear").clicked();
-            let cancel = ui.button("Cancel").clicked();
+            let clear = ui.button(t!("clear.confirm")).clicked();
+            let cancel = ui.button(t!("cancel")).clicked();
             (clear, cancel)
         })
         .inner

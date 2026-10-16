@@ -5,6 +5,7 @@ use crate::{
     synthesizer::{Effects, Synthesizer, SynthesizerInner},
 };
 use camino::{Utf8Path, Utf8PathBuf};
+use lambiase_i18n::t;
 use sdl3::audio::AudioDeviceID;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
@@ -75,7 +76,7 @@ impl Config {
                 };
 
                 if let Err(e) = fut.await {
-                    error("Error saving config changes", e);
+                    error(t!("error.saving_config"), e);
                 }
             }
         });
@@ -347,11 +348,6 @@ impl<const N: usize> ArrayStr<N> {
     pub const unsafe fn from_utf8_unchecked(buf: [u8; N]) -> Self {
         Self(buf)
     }
-
-    #[inline]
-    pub const fn into_bytes(self) -> [u8; N] {
-        self.0
-    }
 }
 
 impl<const N: usize> Debug for ArrayStr<N> {
@@ -423,7 +419,7 @@ impl AudioDevice {
         match self {
             AudioDevice::Device(_, name) => name.deref(),
             AudioDevice::Unknown(name) => name.deref(),
-            AudioDevice::Default => "System default",
+            AudioDevice::Default => t!("audio.system_default"),
         }
     }
 }

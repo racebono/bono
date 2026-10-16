@@ -8,6 +8,7 @@
 
 use crate::{error, sim::Sim, sqlite::pool::Pool, task::Task};
 use anyhow::Context;
+use lambiase_i18n::t;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Deserializer};
 use std::{
@@ -498,7 +499,7 @@ impl Manifest {
             };
 
             if let Err(e) = write.await {
-                error("Error saving the list of tracks", e);
+                error(t!("error.saving_tracks"), e);
             }
 
             let _ = send.send(file);

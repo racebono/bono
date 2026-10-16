@@ -13,6 +13,7 @@ use crate::{
     task::Task,
 };
 use camino::Utf8Path;
+use lambiase_i18n::t;
 use sdl3::{
     AudioSubsystem,
     audio::{AudioDeviceID, AudioSpec, AudioStreamOwner},
@@ -79,7 +80,7 @@ impl AudioTopbar {
                 None
             }
             Err(e) => {
-                error("Failed speech to text", e);
+                error(t!("error.speech_to_text"), e);
                 None
             }
         }
@@ -124,7 +125,7 @@ impl AudioTopbar {
                     if let Some(device) = self.speaker.get() {
                         match speech.play(device) {
                             Ok(stream) => self.test_playback = Some(stream),
-                            Err(e) => error("Error playing test speech", e),
+                            Err(e) => error(t!("error.test_speech_playing"), e),
                         }
                     } else {
                         log::warn!("No speaker selected (audio will not be played)");
@@ -132,7 +133,7 @@ impl AudioTopbar {
                 }
                 Ok(Err(e)) => {
                     self.test = None;
-                    error("Error synthesizing speech", e);
+                    error(t!("error.synthesizing"), e);
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Closed) => {
@@ -210,7 +211,11 @@ impl DeviceSelector {
             let updated = ui
                 .menu_button(label, |ui| {
                     let mut updated = ui
-                        .selectable_value(&mut device, AudioDevice::Default, "System default")
+                        .selectable_value(
+                            &mut device,
+                            AudioDevice::Default,
+                            t!("audio.system_default"),
+                        )
                         .clicked();
 
                     for (id, name) in &self.devices {
@@ -225,7 +230,7 @@ impl DeviceSelector {
 
                     if kind == Kind::Playback {
                         ui.separator();
-                        test = ui.button("Test").clicked();
+                        test = ui.button(t!("audio.test")).clicked();
                     }
 
                     if updated {
@@ -261,10 +266,10 @@ enum Kind {
 }
 
 impl Kind {
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Kind::Playback => "Speaker",
-            Kind::Recording => "Microphone",
+            Kind::Playback => t!("audio.speaker"),
+            Kind::Recording => t!("audio.microphone"),
         }
     }
 
@@ -308,8 +313,8 @@ impl Kind {
             Err(e) => {
                 error(
                     match self {
-                        Kind::Playback => "Failed to open speaker device",
-                        Kind::Recording => "Failed to open microphone device",
+                        Kind::Playback => t!("error.open_speaker"),
+                        Kind::Recording => t!("error.open_microphone"),
                     },
                     e,
                 );

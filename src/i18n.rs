@@ -89,6 +89,35 @@ pub fn t(
     return t_impl(values, target_lang, target_country);
 }
 
+/// `template` with each `{name}` replaced by its value.
+#[doc(hidden)]
+pub fn fill(template: &str, values: &[(&str, &dyn std::fmt::Display)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let value = after.find('}').and_then(|end| {
+            let name = &after[..end];
+            let (_, value) = values.iter().find(|(n, _)| *n == name)?;
+            Some((value, end))
+        });
+        match value {
+            Some((value, end)) => {
+                use std::fmt::Write;
+                let _ = write!(out, "{value}");
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('{');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 #[doc(hidden)]
 fn t_impl(
     values: &'static phf::Map<&'static str, phf::Map<&'static str, &'static str>>,
@@ -138,8 +167,16 @@ mod tests {
     use lambiase_i18n::{locales, t};
 
     #[test]
+    fn fills_the_placeholders() {
+        let values: [(&str, &dyn std::fmt::Display); 2] = [("name", &"Spa"), ("n", &3)];
+        assert_eq!(fill("{name}: {n} laps", &values), "Spa: 3 laps");
+        // Not a placeholder: left as it is
+        assert_eq!(fill("{other} {", &values), "{other} {");
+    }
+
+    #[test]
     fn translates_into_every_locale() {
-        assert_eq!(locales!(), ["en", "es"]);
+        assert_eq!(locales!(), ["en-GB", "en-US", "es-ES"]);
         assert_eq!(t!("settings": "es"), "Ajustes");
         assert_eq!(t!("settings": "es-MX"), "Ajustes");
         assert_eq!(t!("settings": "en-US"), "Settings");
@@ -153,7 +190,7 @@ mod tests {
             let name = t!("language_name": locale);
             assert!(!name.is_empty(), "{locale}");
         }
-        assert_eq!(t!("language_name": "es"), "Español");
+        assert_eq!(t!("language_name": "es-ES"), "Español (España)");
     }
 
     #[test]

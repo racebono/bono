@@ -4,7 +4,8 @@
         "es": "Ajustes"
     },
     "audio": {
-        "en": "Audio"
+        "en": "Audio",
+        "es": "Audio"
     },
     "volume": {
         "en": "Volume",
@@ -15,14 +16,732 @@
         "es": "Proveedor"
     },
     "spotter": {
-        "en": "Spotter"
+        "en": "Spotter",
+        "es": "Spotter"
     },
     "language": {
         "en": "Language",
         "es": "Idioma"
     },
     "language_name": {
+        "en-US": "English (United States)",
+        "en-GB": "English (United Kingdom)",
+        "es-ES": "Español (España)"
+    },
+    "chat.ask_hint": {
+        "en": "Ask the engineer",
+        "es": "Pregunta al ingeniero"
+    },
+    "chat.send": {
+        "en": "Send",
+        "es": "Enviar"
+    },
+    "chat.empty": {
+        "en": "Hold the talk button, or type below, to ask the engineer.",
+        "es": "Mantén pulsado el botón de hablar, o escribe abajo, para preguntar al ingeniero."
+    },
+    "chat.pilot": {
+        "en": "Pilot",
+        "es": "Piloto"
+    },
+    "chat.engineer": {
+        "en": "Engineer",
+        "es": "Ingeniero"
+    },
+    "chat.thinking": {
+        "en": "The engineer is on it",
+        "es": "El ingeniero está en ello"
+    },
+    "topbar.clear_data": {
+        "en": "Clear data",
+        "es": "Borrar datos"
+    },
+    "topbar.clear_data_hover": {
+        "en": "Delete everything recorded from the simulator so far",
+        "es": "Borra todo lo grabado del simulador hasta ahora"
+    },
+    "topbar.no_simulator_hover": {
+        "en": "No simulator is running",
+        "es": "No hay ningún simulador en marcha"
+    },
+    "topbar.no_simulator": {
+        "en": "No simulator running",
+        "es": "Ningún simulador en marcha"
+    },
+    "clear.title": {
+        "en": "Clear recorded data?",
+        "es": "¿Borrar los datos grabados?"
+    },
+    "clear.body": {
+        "en": "Everything recorded from {name} so far will be deleted. This can't be undone.",
+        "es": "Se borrará todo lo grabado de {name} hasta ahora. No se puede deshacer."
+    },
+    "clear.confirm": {
+        "en": "Clear",
+        "es": "Borrar"
+    },
+    "cancel": {
+        "en": "Cancel",
+        "es": "Cancelar"
+    },
+    "settings.change_talk": {
+        "en": "Change talk button",
+        "es": "Cambiar botón de hablar"
+    },
+    "settings.change_session": {
+        "en": "Change session button",
+        "es": "Cambiar botón de sesión"
+    },
+    "settings.key": {
+        "en": "Key '{key}'",
+        "es": "Tecla '{key}'"
+    },
+    "settings.joystick_button": {
+        "en": "Button {button} (device '{device}')",
+        "es": "Botón {button} (dispositivo '{device}')"
+    },
+    "settings.disabled": {
+        "en": "Disabled",
+        "es": "Desactivado"
+    },
+    "settings.press_button": {
+        "en": "Press a button",
+        "es": "Pulsa un botón"
+    },
+    "settings.text_scale": {
+        "en": "Text scale",
+        "es": "Tamaño del texto"
+    },
+    "settings.opponents_prefix": {
+        "en": "Record other cars every ",
+        "es": "Grabar los demás coches cada "
+    },
+    "settings.opponents_suffix": {
+        "en": " updates",
+        "es": " actualizaciones"
+    },
+    "settings.opponents_hover": {
+        "en": "Every update of your car is recorded, and one in this many of each other car's. Fewer keep the recording smaller, more make the spotter's calls and the engineer's answers about other cars more precise",
+        "es": "Se graba cada actualización de tu coche, y una de cada tantas de los demás. Menos hacen la grabación más pequeña; más hacen más precisos los avisos del spotter y las respuestas del ingeniero sobre los demás coches"
+    },
+    "volume.master": {
+        "en": "Master",
+        "es": "General"
+    },
+    "volume.master_hover": {
+        "en": "Everything the app plays",
+        "es": "Todo lo que suena en la aplicación"
+    },
+    "volume.engineer": {
+        "en": "Engineer",
+        "es": "Ingeniero"
+    },
+    "volume.engineer_hover": {
+        "en": "The engineer's answers on the radio",
+        "es": "Las respuestas del ingeniero por radio"
+    },
+    "volume.spotter": {
+        "en": "Spotter",
+        "es": "Spotter"
+    },
+    "volume.spotter_hover": {
+        "en": "The spotter's calls",
+        "es": "Los avisos del spotter"
+    },
+    "volume.beep": {
+        "en": "Radio beep",
+        "es": "Pitido de radio"
+    },
+    "volume.beep_hover": {
+        "en": "The roger beep that ends each transmission, from the next one on",
+        "es": "El pitido que cierra cada transmisión, a partir de la siguiente"
+    },
+    "volume.radio_effect": {
+        "en": "Radio effect",
+        "es": "Efecto de radio"
+    },
+    "volume.radio_effect_hover": {
+        "en": "How much the voices sound like a radio: none is a clean voice, without the squelch. From the next transmission on",
+        "es": "Cuánto suenan las voces a radio: nada es una voz limpia, sin el ruido de apertura. A partir de la siguiente transmisión"
+    },
+    "spotter.enabled": {
+        "en": "Enabled",
+        "es": "Activado"
+    },
+    "spotter.enabled_hover": {
+        "en": "Calls cars alongside, flags, the car's own alerts and the weather by itself, the moment they happen",
+        "es": "Avisa por sí solo de los coches a tu lado, las banderas, las alertas del coche y el tiempo, en cuanto ocurren"
+    },
+    "spotter.pilots_language": {
+        "en": "The pilot's",
+        "es": "La del piloto"
+    },
+    "spotter.no_voice": {
+        "en": "{language} (no voice)",
+        "es": "{language} (sin voz)"
+    },
+    "spotter.language_hover": {
+        "en": "The language of its calls: the pilot's is the last one they asked the engineer in. Calls are said in Spanish or English; other languages' voices say them in English",
+        "es": "El idioma de sus avisos: el del piloto es el último en el que preguntó al ingeniero. Los avisos se dicen en español o en inglés; con las voces de otros idiomas, se dicen en inglés"
+    },
+    "lang.en": {
         "en": "English",
+        "es": "Inglés"
+    },
+    "lang.es": {
+        "en": "Spanish",
         "es": "Español"
+    },
+    "lang.fr": {
+        "en": "French",
+        "es": "Francés"
+    },
+    "lang.de": {
+        "en": "German",
+        "es": "Alemán"
+    },
+    "lang.it": {
+        "en": "Italian",
+        "es": "Italiano"
+    },
+    "lang.pt": {
+        "en": "Portuguese",
+        "es": "Portugués"
+    },
+    "lang.nl": {
+        "en": "Dutch",
+        "es": "Neerlandés"
+    },
+    "lang.zh": {
+        "en": "Chinese",
+        "es": "Chino"
+    },
+    "lang.ja": {
+        "en": "Japanese",
+        "es": "Japonés"
+    },
+    "lang.ko": {
+        "en": "Korean",
+        "es": "Coreano"
+    },
+    "provider.label": {
+        "en": "Provider:",
+        "es": "Proveedor:"
+    },
+    "provider.claude_hover": {
+        "en": "Through the Claude API: needs ANTHROPIC_API_KEY",
+        "es": "A través de la API de Claude: necesita ANTHROPIC_API_KEY"
+    },
+    "provider.ollama_hover": {
+        "en": "A model Ollama runs, on this PC or another",
+        "es": "Un modelo que ejecuta Ollama, en este PC o en otro"
+    },
+    "provider.applies_next": {
+        "en": "Changes apply from the next question: the engineer starts over",
+        "es": "Los cambios se aplican a partir de la siguiente pregunta: el ingeniero empieza de nuevo"
+    },
+    "provider.effort": {
+        "en": "Effort",
+        "es": "Esfuerzo"
+    },
+    "provider.claude_effort_hover": {
+        "en": "How much it thinks before answering (the levels depend on the model)",
+        "es": "Cuánto piensa antes de responder (los niveles dependen del modelo)"
+    },
+    "provider.ollama_effort_hover": {
+        "en": "Thinking on this PC's GPU, while the game uses it, makes answers slow",
+        "es": "Pensar en la GPU de este PC, mientras la usa el juego, hace que las respuestas tarden"
+    },
+    "provider.max_tokens": {
+        "en": "Max tokens: ",
+        "es": "Tokens máximos: "
+    },
+    "provider.max_tokens_hover": {
+        "en": "The most it writes in one response, thinking included",
+        "es": "Lo máximo que escribe en una respuesta, incluido lo que piensa"
+    },
+    "provider.compaction": {
+        "en": "Compaction",
+        "es": "Compactación"
+    },
+    "provider.compaction_hover": {
+        "en": "Summarizes the earlier conversation when it grows near the context window, so a long session never runs out of room. Only on models that support it",
+        "es": "Resume la conversación anterior cuando se acerca al límite de contexto, para que una sesión larga nunca se quede sin espacio. Solo en los modelos que lo admiten"
+    },
+    "provider.context": {
+        "en": "Context: ",
+        "es": "Contexto: "
+    },
+    "provider.context_hover": {
+        "en": "The context window it's loaded with: Ollama silently drops the start of a conversation that doesn't fit. More takes more memory",
+        "es": "La ventana de contexto con la que se carga: Ollama descarta sin avisar el principio de una conversación que no quepa. Más ocupa más memoria"
+    },
+    "provider.keep_loaded": {
+        "en": "Keep loaded",
+        "es": "Mantener cargado"
+    },
+    "provider.keep_loaded_hover": {
+        "en": "How long Ollama keeps the model loaded after an answer",
+        "es": "Cuánto tiempo mantiene Ollama el modelo cargado después de una respuesta"
+    },
+    "provider.keep_default": {
+        "en": "Ollama's default",
+        "es": "El de Ollama"
+    },
+    "provider.keep_5_minutes": {
+        "en": "5 minutes",
+        "es": "5 minutos"
+    },
+    "provider.keep_30_minutes": {
+        "en": "30 minutes",
+        "es": "30 minutos"
+    },
+    "provider.keep_1_hour": {
+        "en": "1 hour",
+        "es": "1 hora"
+    },
+    "provider.keep_forever": {
+        "en": "Until Ollama stops",
+        "es": "Hasta que Ollama se detenga"
+    },
+    "provider.keep_seconds": {
+        "en": "{seconds} s",
+        "es": "{seconds} s"
+    },
+    "provider.host": {
+        "en": "Host:",
+        "es": "Servidor:"
+    },
+    "provider.host_hint": {
+        "en": "this PC",
+        "es": "este PC"
+    },
+    "provider.host_hover": {
+        "en": "Where Ollama listens, e.g. 192.168.1.5 or http://pc:11434",
+        "es": "Dónde escucha Ollama, p. ej. 192.168.1.5 o http://pc:11434"
+    },
+    "provider.model": {
+        "en": "Model: {model}",
+        "es": "Modelo: {model}"
+    },
+    "provider.looking_for_models": {
+        "en": "Looking for models",
+        "es": "Buscando modelos"
+    },
+    "provider.no_models": {
+        "en": "No models: pull one with `ollama pull`",
+        "es": "No hay modelos: descarga uno con `ollama pull`"
+    },
+    "provider.refresh": {
+        "en": "Refresh",
+        "es": "Actualizar"
+    },
+    "effort.none": {
+        "en": "none",
+        "es": "ninguno"
+    },
+    "effort.low": {
+        "en": "low",
+        "es": "bajo"
+    },
+    "effort.medium": {
+        "en": "medium",
+        "es": "medio"
+    },
+    "effort.high": {
+        "en": "high",
+        "es": "alto"
+    },
+    "effort.xhigh": {
+        "en": "extra high",
+        "es": "muy alto"
+    },
+    "effort.max": {
+        "en": "max",
+        "es": "máximo"
+    },
+    "audio.system_default": {
+        "en": "System default",
+        "es": "Predeterminado del sistema"
+    },
+    "audio.test": {
+        "en": "Test",
+        "es": "Probar"
+    },
+    "audio.speaker": {
+        "en": "Speaker",
+        "es": "Altavoz"
+    },
+    "audio.microphone": {
+        "en": "Microphone",
+        "es": "Micrófono"
+    },
+    "audio.speech_to_text": {
+        "en": "Speech To Text",
+        "es": "Voz a texto"
+    },
+    "audio.text_to_speech": {
+        "en": "Text To Speech",
+        "es": "Texto a voz"
+    },
+    "audio.language_confidence": {
+        "en": "Language confidence",
+        "es": "Confianza en el idioma"
+    },
+    "audio.language_confidence_hover": {
+        "en": "How sure it must be of the language you spoke in, among those with a voice. Less sure of every one, what you said is ignored (e.g. noise)",
+        "es": "Cuánta seguridad necesita sobre el idioma en el que hablaste, entre los que tienen voz. Con menos seguridad en todos, lo que dijiste se ignora (p. ej. ruido)"
+    },
+    "audio.model": {
+        "en": "Model",
+        "es": "Modelo"
+    },
+    "audio.quantization": {
+        "en": "Quantization",
+        "es": "Cuantización"
+    },
+    "audio.languages": {
+        "en": "Languages",
+        "es": "Idiomas"
+    },
+    "audio.english_only": {
+        "en": "English",
+        "es": "Inglés"
+    },
+    "audio.all_languages": {
+        "en": "All",
+        "es": "Todos"
+    },
+    "audio.use": {
+        "en": "Use",
+        "es": "Usar"
+    },
+    "audio.download": {
+        "en": "Download",
+        "es": "Descargar"
+    },
+    "audio.voice": {
+        "en": "Voice",
+        "es": "Voz"
+    },
+    "audio.region": {
+        "en": "Region",
+        "es": "Región"
+    },
+    "audio.quality": {
+        "en": "Quality",
+        "es": "Calidad"
+    },
+    "audio.speakers": {
+        "en": "Speakers",
+        "es": "Hablantes"
+    },
+    "audio.size": {
+        "en": "Size",
+        "es": "Tamaño"
+    },
+    "quality.extra_low": {
+        "en": "Extra low",
+        "es": "Muy baja"
+    },
+    "quality.low": {
+        "en": "Low",
+        "es": "Baja"
+    },
+    "quality.medium": {
+        "en": "Medium",
+        "es": "Media"
+    },
+    "quality.high": {
+        "en": "High",
+        "es": "Alta"
+    },
+    "quality.unknown": {
+        "en": "Unknown",
+        "es": "Desconocida"
+    },
+    "error.speech_to_text": {
+        "en": "Failed speech to text",
+        "es": "Error al pasar la voz a texto"
+    },
+    "error.test_speech_playing": {
+        "en": "Error playing test speech",
+        "es": "Error al reproducir la voz de prueba"
+    },
+    "error.synthesizing": {
+        "en": "Error synthesizing speech",
+        "es": "Error al sintetizar la voz"
+    },
+    "error.open_speaker": {
+        "en": "Failed to open speaker device",
+        "es": "No se pudo abrir el altavoz"
+    },
+    "error.open_microphone": {
+        "en": "Failed to open microphone device",
+        "es": "No se pudo abrir el micrófono"
+    },
+    "error.tts_catalog": {
+        "en": "Error fetching text to speech catalog",
+        "es": "Error al obtener el catálogo de texto a voz"
+    },
+    "error.stt_catalog": {
+        "en": "Error fetching speech to text catalog",
+        "es": "Error al obtener el catálogo de voz a texto"
+    },
+    "error.recording": {
+        "en": "Error beginning microphone recording",
+        "es": "Error al empezar a grabar el micrófono"
+    },
+    "error.stt_model": {
+        "en": "Error loading speech to text model",
+        "es": "Error al cargar el modelo de voz a texto"
+    },
+    "error.tts_model": {
+        "en": "Error loading text to speech model",
+        "es": "Error al cargar el modelo de texto a voz"
+    },
+    "error.title": {
+        "en": "Error",
+        "es": "Error"
+    },
+    "error.saving_config": {
+        "en": "Error saving config changes",
+        "es": "Error al guardar los cambios de la configuración"
+    },
+    "error.initializing": {
+        "en": "Error initializing application",
+        "es": "Error al iniciar la aplicación"
+    },
+    "error.handling_event": {
+        "en": "Unexpected error handling event",
+        "es": "Error inesperado al gestionar un evento"
+    },
+    "error.removing_temporary": {
+        "en": "Error removing temporary file",
+        "es": "Error al borrar un archivo temporal"
+    },
+    "error.saving_tracks": {
+        "en": "Error saving the list of tracks",
+        "es": "Error al guardar la lista de circuitos"
+    },
+    "call.car_left": {
+        "en": "car left",
+        "es": "coche a la izquierda"
+    },
+    "call.car_right": {
+        "en": "car right",
+        "es": "coche a la derecha"
+    },
+    "call.three_wide": {
+        "en": "three wide",
+        "es": "tres en paralelo"
+    },
+    "call.clear_left": {
+        "en": "clear left",
+        "es": "libre izquierda"
+    },
+    "call.clear_right": {
+        "en": "clear right",
+        "es": "libre derecha"
+    },
+    "call.clear_all_round": {
+        "en": "clear all round",
+        "es": "libre"
+    },
+    "call.still_there_left": {
+        "en": "still there left",
+        "es": "sigue a la izquierda"
+    },
+    "call.still_there_right": {
+        "en": "still there right",
+        "es": "sigue a la derecha"
+    },
+    "call.puncture_front_left": {
+        "en": "puncture front left",
+        "es": "pinchazo delantera izquierda"
+    },
+    "call.puncture_front_right": {
+        "en": "puncture front right",
+        "es": "pinchazo delantera derecha"
+    },
+    "call.puncture_rear_left": {
+        "en": "puncture rear left",
+        "es": "pinchazo trasera izquierda"
+    },
+    "call.puncture_rear_right": {
+        "en": "puncture rear right",
+        "es": "pinchazo trasera derecha"
+    },
+    "call.parts_off": {
+        "en": "parts off the car",
+        "es": "piezas sueltas"
+    },
+    "call.engine_overheating": {
+        "en": "engine overheating",
+        "es": "motor sobrecalentado"
+    },
+    "call.limiter": {
+        "en": "limiter, limiter",
+        "es": "limitador, limitador"
+    },
+    "call.lap_invalidated": {
+        "en": "lap invalidated",
+        "es": "vuelta invalidada"
+    },
+    "call.car_close_behind": {
+        "en": "car close behind",
+        "es": "coche pegado detrás"
+    },
+    "call.car_within_a_second": {
+        "en": "car within a second behind",
+        "es": "coche a menos de un segundo detrás"
+    },
+    "call.full_course_yellow": {
+        "en": "full course yellow",
+        "es": "amarilla en todo el circuito"
+    },
+    "call.green_flag": {
+        "en": "green flag, green flag",
+        "es": "bandera verde, bandera verde"
+    },
+    "call.red_flag": {
+        "en": "red flag",
+        "es": "bandera roja"
+    },
+    "call.yellow_flag": {
+        "en": "yellow flag on track",
+        "es": "bandera amarilla en pista"
+    },
+    "call.blue_flag": {
+        "en": "blue flag",
+        "es": "bandera azul"
+    },
+    "call.penalty": {
+        "en": "penalty",
+        "es": "penalización"
+    },
+    "call.rain_starting": {
+        "en": "rain starting",
+        "es": "empieza a llover"
+    },
+    "call.rain_heavier": {
+        "en": "rain getting heavier",
+        "es": "llueve más fuerte"
+    },
+    "call.rain_easing": {
+        "en": "rain easing",
+        "es": "la lluvia afloja"
+    },
+    "call.rain_stopped": {
+        "en": "rain stopped",
+        "es": "ha dejado de llover"
+    },
+    "call.track_wet": {
+        "en": "track getting wet",
+        "es": "la pista se está mojando"
+    },
+    "call.track_wetter": {
+        "en": "track getting wetter",
+        "es": "la pista está cada vez más mojada"
+    },
+    "call.track_drying": {
+        "en": "track drying",
+        "es": "la pista se está secando"
+    },
+    "call.track_dry": {
+        "en": "track dry",
+        "es": "pista seca"
+    },
+    "call.wet_patch": {
+        "en": "wet patch",
+        "es": "zona mojada"
+    },
+    "call.rain_in_minutes": {
+        "en": "rain likely in about {} minutes",
+        "es": "probable lluvia en unos {} minutos"
+    },
+    "call.rain_in_a_minute": {
+        "en": "rain likely in about a minute",
+        "es": "probable lluvia en un minuto"
+    },
+    "engineer.no_telemetry": {
+        "en": "No telemetry yet, get in the car.",
+        "es": "Todavía no hay telemetría, súbete al coche."
+    },
+    "engineer.say_again": {
+        "en": "Say again?",
+        "es": "¿Puedes repetir?"
+    },
+    "engineer.detail_no_telemetry": {
+        "en": "no telemetry",
+        "es": "sin telemetría"
+    },
+    "engineer.detail_cut_off": {
+        "en": "cut off",
+        "es": "cortada"
+    },
+    "engineer.detail_declined": {
+        "en": "declined",
+        "es": "rechazada"
+    },
+    "engineer.detail_full": {
+        "en": "conversation full, starting over",
+        "es": "conversación llena, empezando de nuevo"
+    },
+    "engineer.detail_tokens": {
+        "en": "{model} | {input} in, {cached} cached, {output} out",
+        "es": "{model} | {input} de entrada, {cached} en caché, {output} de salida"
+    },
+    "engineer.new_session": {
+        "en": "New session: the engineer starts over",
+        "es": "Nueva sesión: el ingeniero empieza de nuevo"
+    },
+    "engineer.new_model": {
+        "en": "New model settings: the engineer starts over",
+        "es": "Nuevos ajustes del modelo: el ingeniero empieza de nuevo"
+    },
+    "engineer.error_starting": {
+        "en": "Error starting the race engineer: {error}",
+        "es": "Error al iniciar el ingeniero de carrera: {error}"
+    },
+    "engineer.sim_stopped": {
+        "en": "The simulator stopped: the session ended",
+        "es": "El simulador se ha detenido: la sesión ha terminado"
+    },
+    "engineer.error_asking": {
+        "en": "Error asking the race engineer: {error}",
+        "es": "Error al preguntar al ingeniero de carrera: {error}"
+    },
+    "engineer.error_synthesizing": {
+        "en": "Error synthesizing the answer: {error}",
+        "es": "Error al sintetizar la respuesta: {error}"
+    },
+    "engineer.no_speaker": {
+        "en": "No speaker selected: the answer isn't played",
+        "es": "No hay altavoz seleccionado: la respuesta no se reproduce"
+    },
+    "engineer.error_playing": {
+        "en": "Error playing the answer: {error}",
+        "es": "Error al reproducir la respuesta: {error}"
+    },
+    "engineer.cancelled": {
+        "en": "Cancelled: the pilot talked over it",
+        "es": "Cancelada: el piloto habló por encima"
+    },
+    "provider.claude_unreachable": {
+        "en": "Couldn't reach the Claude API",
+        "es": "No se pudo conectar con la API de Claude"
+    },
+    "provider.no_claude_credentials": {
+        "en": "No Claude credentials: set ANTHROPIC_API_KEY",
+        "es": "No hay credenciales de Claude: define ANTHROPIC_API_KEY"
+    },
+    "provider.ollama_unreachable": {
+        "en": "Couldn't reach Ollama at {url} (is it running?)",
+        "es": "No se pudo conectar con Ollama en {url} (¿está en marcha?)"
+    },
+    "provider.ollama_pull_hint": {
+        "en": " (pull it with `ollama pull`)",
+        "es": " (descárgalo con `ollama pull`)"
     }
 }

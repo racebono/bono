@@ -1,4 +1,5 @@
 use crate::{app::App, config::ArrayStr};
+use lambiase_i18n::t;
 use sdl3::{
     event::Event,
     messagebox::{MessageBoxFlag, show_simple_message_box},
@@ -46,7 +47,7 @@ impl AppImpl {
         match init(MainThreadToken::get()?) {
             Ok(app) => Some(Box::new(app)),
             Err(e) => {
-                error_blocking("Error initializing application", e);
+                error_blocking(t!("error.initializing"), e);
                 None
             }
         }
@@ -70,7 +71,7 @@ impl AppImpl {
             let _guard = handle.enter();
             result = app.borrow_mut().event(&handle, event);
         }) {
-            error_blocking("Error", "Unexpected error handling event");
+            error_blocking(t!("error.title"), t!("error.handling_event"));
             return AppResult::Failure;
         }
 
@@ -168,7 +169,7 @@ impl Download {
                 if let Some(path) = self.temp_path.take() {
                     if let Err(e) = tokio::task::block_in_place(move || std::fs::remove_file(path))
                     {
-                        error("Error removing temporary file", e);
+                        error(t!("error.removing_temporary"), e);
                     }
                 }
             }

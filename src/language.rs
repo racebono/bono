@@ -88,6 +88,27 @@ pub fn name(code: ArrayStr<2>) -> Option<String> {
     Some(Language::from_iso_code_639_1(&iso).to_string())
 }
 
+/// The name of the language with `code` (as the voices have it), in the app's language: in
+/// English for those the app hasn't translated, or its code if it isn't built in either.
+pub fn ui_name(code: ArrayStr<2>) -> String {
+    use lambiase_i18n::t;
+
+    let name = match &*code {
+        "en" => t!("lang.en"),
+        "es" => t!("lang.es"),
+        "fr" => t!("lang.fr"),
+        "de" => t!("lang.de"),
+        "it" => t!("lang.it"),
+        "pt" => t!("lang.pt"),
+        "nl" => t!("lang.nl"),
+        "zh" => t!("lang.zh"),
+        "ja" => t!("lang.ja"),
+        "ko" => t!("lang.ko"),
+        _ => return name(code).unwrap_or_else(|| code.to_string()),
+    };
+    name.to_owned()
+}
+
 /// The language's code as the voices have it: whisper's two-letter codes, which make
 /// Norwegian's two written forms one.
 fn voice_language(language: Language) -> Option<ArrayStr<2>> {

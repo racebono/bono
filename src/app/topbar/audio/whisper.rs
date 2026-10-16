@@ -10,6 +10,7 @@ use anyhow::Context;
 use camino::{Utf8Path, Utf8PathBuf};
 use egui::Widget;
 use egui_extras::Column;
+use lambiase_i18n::t;
 use sdl3::{
     audio::{AudioFormat, AudioRecordingCallback, AudioSpec, AudioStream, AudioStreamWithCallback},
     event::Event,
@@ -69,7 +70,7 @@ impl Whisper {
                 match Model::fetch_catalog(&pref_path, &client).await {
                     Ok(catalog) => Some(catalog),
                     Err(e) => {
-                        error("Error fetching speech to text catalog", e);
+                        error(t!("error.stt_catalog"), e);
                         None
                     }
                 }
@@ -89,24 +90,20 @@ impl Whisper {
         let catalog = self.catalog_mut(rt);
 
         ui.add_enabled_ui(catalog.is_some(), move |ui| {
-            ui.menu_button("Speech To Text", move |ui| {
+            ui.menu_button(t!("audio.speech_to_text"), move |ui| {
                 config.maybe_update(|raw| {
                     raw.min_confidence
                         .edit(*raw.min_confidence(), |confidence| {
                             ui.add(
                                 egui::Slider::new(confidence, 0.0..=1.0)
-                                    .text("Language confidence")
+                                    .text(t!("audio.language_confidence"))
                                     .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
                                     .custom_parser(|text| {
                                         let text = text.trim().trim_end_matches('%').trim();
                                         text.parse::<f64>().ok().map(|percent| percent / 100.0)
                                     }),
                             )
-                            .on_hover_text(
-                                "How sure it must be of the language you spoke in, among those with \
-                                 a voice. Less sure of every one, what you said is ignored (e.g. \
-                                 noise)",
-                            )
+                            .on_hover_text(t!("audio.language_confidence_hover"))
                             .changed()
                         })
                 });
@@ -119,13 +116,13 @@ impl Whisper {
                     .column(Column::remainder())
                     .header(20.0, |mut header| {
                         header.col(|ui| {
-                            ui.strong("Model");
+                            ui.strong(t!("audio.model"));
                         });
                         header.col(|ui| {
-                            ui.strong("Quantization");
+                            ui.strong(t!("audio.quantization"));
                         });
                         header.col(|ui| {
-                            ui.strong("Languages");
+                            ui.strong(t!("audio.languages"));
                         });
                     })
                     .body(|mut body| {
@@ -145,9 +142,9 @@ impl Whisper {
 
                                     row.col(|ui| {
                                         ui.label(if model.english_only {
-                                            "English"
+                                            t!("audio.english_only")
                                         } else {
-                                            "All"
+                                            t!("audio.all_languages")
                                         });
                                     });
 
@@ -158,7 +155,7 @@ impl Whisper {
                                                     config.whisper_model().as_ref()
                                                         != Some(&model.path),
                                                     |ui| {
-                                                        if ui.button("Use").clicked() {
+                                                        if ui.button(t!("audio.use")).clicked() {
                                                             config
                                                                 .whisper_model
                                                                 .set(Some(model.path.clone()));
@@ -170,7 +167,7 @@ impl Whisper {
                                                 egui::ProgressBar::new(download.progress() as f32)
                                                     .show_percentage()
                                                     .ui(ui);
-                                            } else if ui.button("Download").clicked() {
+                                            } else if ui.button(t!("audio.download")).clicked() {
                                                 model.start_download(&client);
                                             }
                                         });
@@ -276,7 +273,7 @@ impl Whisper {
         self.stream = match f() {
             Ok(stream) => Some(stream),
             Err(e) => {
-                error("Error begining microphone recording", e);
+                error(t!("error.recording"), e);
                 None
             }
         };
@@ -319,7 +316,7 @@ impl Whisper {
             ) {
                 Ok(ctx) => Some(ctx),
                 Err(e) => {
-                    error("Error loading speech to text model", e);
+                    error(t!("error.stt_model"), e);
                     None
                 }
             },

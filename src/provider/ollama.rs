@@ -4,6 +4,7 @@ use super::{Model, ModelOption, Reply, StopReason, ToolHandler, Tools, Usage, te
 use crate::config::OllamaConfig;
 use anyhow::{Context, bail};
 use futures::future::{BoxFuture, join_all};
+use lambiase_i18n::t;
 use reqwest::{
     StatusCode,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
@@ -54,7 +55,7 @@ pub async fn models(
     let resp = request
         .send()
         .await
-        .with_context(|| format!("Couldn't reach Ollama at {base_url} (is it running?)"))?;
+        .with_context(|| t!("provider.ollama_unreachable", url = base_url))?;
     if !resp.status().is_success() {
         return Err(ApiError::read(resp).await.into());
     }
@@ -352,10 +353,7 @@ impl Conversation {
     }
 
     fn unreachable(&self) -> String {
-        format!(
-            "Couldn't reach Ollama at {} (is it running?)",
-            self.base_url
-        )
+        t!("provider.ollama_unreachable", url = self.base_url)
     }
 }
 
@@ -483,7 +481,7 @@ impl Display for ApiError {
             write!(f, ": {message}")?;
         }
         if self.status == StatusCode::NOT_FOUND {
-            f.write_str(" (pull it with `ollama pull`)")?;
+            f.write_str(t!("provider.ollama_pull_hint"))?;
         }
         Ok(())
     }

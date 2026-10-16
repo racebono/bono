@@ -12,6 +12,7 @@ use crate::{
     synthesizer::{SpeechInput, SpeechOutput, Synthesizer},
     task::Task,
 };
+use lambiase_i18n::t;
 use sdl3::audio::{AudioDevice, AudioStreamOwner};
 use std::{
     path::{Path, PathBuf},
@@ -25,11 +26,6 @@ use tokio::{
 use tool::{Engineer as EngineerTool, SCHEMA_PATH, SKILL_PATH, instructions};
 
 mod tool;
-
-/// Said when there's no telemetry to answer from.
-const NO_TELEMETRY: &str = "No telemetry yet, get in the car.";
-/// Said when the model declines to answer.
-const SAY_AGAIN: &str = "Say again?";
 
 /// One line of the conversation, as the chat shows it.
 pub struct ChatEntry {
@@ -183,7 +179,7 @@ impl Engineer {
     pub fn new_session(&mut self) {
         self.stop();
         self.new_session = true;
-        self.notice("New session: the engineer starts over");
+        self.notice(t!("engineer.new_session"));
     }
 
     /// A question typed in the chat, answered like one asked on the radio: spoken in the
@@ -224,8 +220,11 @@ impl Engineer {
         });
 
         let Some(pool) = sim.and_then(|sim| sim.database()).cloned() else {
-            self.reply(NO_TELEMETRY.into(), Some("no telemetry".into()));
-            self.say(rt, config, synth, NO_TELEMETRY, arrstr!("en"));
+            // Said in the pilot's language, when there's a voice for it
+            let lang = Self::voice(config, lang);
+            let text = t!("engineer.no_telemetry": &lang);
+            self.reply(text.into(), Some(t!("engineer.detail_no_telemetry").into()));
+            self.say(rt, config, synth, text, lang);
             return;
         };
 
@@ -235,13 +234,13 @@ impl Engineer {
             .as_ref()
             .is_some_and(|s| s.model != config.get().model);
         if model_changed {
-            self.notice("New model settings: the engineer starts over");
+            self.notice(t!("engineer.new_model"));
         }
         if self.new_session || model_changed || self.session.as_ref().is_none_or(|s| s.db != db) {
             match self.start(config, pool) {
                 Ok(session) => self.session = Some(session),
                 Err(e) => {
-                    self.notice(format!("Error starting the race engineer: {e:#}"));
+                    self.notice(t!("engineer.error_starting", error = format!("{e:#}")));
                     return;
                 }
             }
@@ -296,7 +295,7 @@ impl Engineer {
         if !sim_running && self.session.is_some() {
             self.turn = None;
             self.session = None;
-            self.notice("The simulator stopped: the session ended");
+            self.notice(t!("engineer.sim_stopped"));
         }
 
         if let Some(turn) = &mut self.turn {
@@ -322,9 +321,9 @@ impl Engineer {
                     Ok(reply) => self.answer(rt, config, synth, reply, turn),
                     Err(e) => {
                         if let Some(entry) = turn.entry {
-                            self.chat[entry].detail = Some("cut off".into());
+                            self.chat[entry].detail = Some(t!("engineer.detail_cut_off").into());
                         }
-                        self.notice(format!("Error asking the race engineer: {e:#}"));
+                        self.notice(t!("engineer.error_asking", error = format!("{e:#}")));
                     }
                 }
             }
@@ -352,29 +351,30 @@ impl Engineer {
         );
 
         let usage = &reply.usage;
-        let mut detail = format!(
-            "{} | {} in, {} cached, {} out",
-            reply.model,
-            usage.input_tokens + usage.cache_write_tokens,
-            usage.cache_read_tokens,
-            usage.output_tokens
+        let mut detail = t!(
+            "engineer.detail_tokens",
+            model = reply.model,
+            input = usage.input_tokens + usage.cache_write_tokens,
+            cached = usage.cache_read_tokens,
+            output = usage.output_tokens
         );
 
         let text = match reply.stop {
             // The exchange was forgotten, and whatever was said with it: the pilot can ask again
             StopReason::Refusal => {
-                detail.push_str(" | declined");
-                self.say(rt, config, synth, SAY_AGAIN, turn.lang);
-                SAY_AGAIN.to_owned()
+                detail = format!("{detail} | {}", t!("engineer.detail_declined"));
+                let say_again = t!("engineer.say_again": &turn.lang);
+                self.say(rt, config, synth, say_again, turn.lang);
+                say_again.to_owned()
             }
             StopReason::MaxTokens => {
-                detail.push_str(" | cut off");
+                detail = format!("{detail} | {}", t!("engineer.detail_cut_off"));
                 reply.text
             }
             // Every later question would end the same way: the next one starts over
             StopReason::ContextWindowExceeded => {
                 self.new_session = true;
-                detail.push_str(" | conversation full, starting over");
+                detail = format!("{detail} | {}", t!("engineer.detail_full"));
                 reply.text
             }
             StopReason::EndTurn | StopReason::StopSequence => reply.text,
@@ -405,6 +405,14 @@ impl Engineer {
 
     /// Starts speaking what's pushed on the returned input (in `lang`, or in English without a
     /// voice for it, as returned), cutting off whatever was being said.
+    /// The language `lang` is spoken in: English without a voice for it.
+    fn voice(config: &Config, lang: ArrayStr<2>) -> ArrayStr<2> {
+        match config.get().voices().contains_key(&lang) {
+            true => lang,
+            false => arrstr!("en"),
+        }
+    }
+
     fn speak(
         &mut self,
         rt: &Handle,
@@ -412,14 +420,8 @@ impl Engineer {
         synth: &mut Synthesizer,
         lang: ArrayStr<2>,
     ) -> (ArrayStr<2>, SpeechInput) {
-        let (lang, effects) = {
-            let config = config.get();
-            let lang = match config.voices().contains_key(&lang) {
-                true => lang,
-                false => arrstr!("en"),
-            };
-            (lang, config.synth_effects())
-        };
+        let lang = Self::voice(config, lang);
+        let effects = config.get().synth_effects();
 
         let (input, speech) = synth.stream(rt, lang, effects);
         self.playback = Some(Playback {
@@ -443,7 +445,7 @@ impl Engineer {
                 Poll::Ready(Some(Ok(speech))) => speech,
                 Poll::Ready(Some(Err(e))) => {
                     self.playback = None;
-                    self.notice(format!("Error synthesizing the answer: {e:#}"));
+                    self.notice(t!("engineer.error_synthesizing", error = format!("{e:#}")));
                     return;
                 }
                 // SDL plays what's left
@@ -478,14 +480,14 @@ impl Engineer {
                 }),
                 (None, None) => {
                     self.playback = None;
-                    self.notice("No speaker selected: the answer isn't played");
+                    self.notice(t!("engineer.no_speaker"));
                     return;
                 }
             };
 
             if let Err(e) = played {
                 self.playback = None;
-                self.notice(format!("Error playing the answer: {e}"));
+                self.notice(t!("engineer.error_playing", error = e));
                 return;
             }
         }
@@ -505,9 +507,9 @@ impl Engineer {
     fn stop(&mut self) {
         if let Some(turn) = self.turn.take() {
             if let Some(entry) = turn.entry {
-                self.chat[entry].detail = Some("cut off".into());
+                self.chat[entry].detail = Some(t!("engineer.detail_cut_off").into());
             }
-            self.notice("Cancelled: the pilot talked over it");
+            self.notice(t!("engineer.cancelled"));
         }
         self.playback = None;
     }

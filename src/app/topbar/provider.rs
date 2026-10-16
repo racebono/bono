@@ -6,19 +6,37 @@ use crate::{
     provider::{self, ModelOption},
     task::MaybeDone,
 };
+use lambiase_i18n::t;
 use std::num::NonZeroU32;
 use tokio::runtime::Handle;
 
 const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 const OLLAMA_EFFORTS: [&str; 4] = ["none", "low", "medium", "high"];
+
 /// How long Ollama keeps the model loaded, in seconds (`None`: Ollama's own)
-const KEEP_ALIVE: [(Option<f64>, &str); 5] = [
-    (None, "Ollama's default"),
-    (Some(300.0), "5 minutes"),
-    (Some(1800.0), "30 minutes"),
-    (Some(3600.0), "1 hour"),
-    (Some(-1.0), "Until Ollama stops"),
-];
+fn keep_alive_options() -> [(Option<f64>, &'static str); 5] {
+    [
+        (None, t!("provider.keep_default")),
+        (Some(300.0), t!("provider.keep_5_minutes")),
+        (Some(1800.0), t!("provider.keep_30_minutes")),
+        (Some(3600.0), t!("provider.keep_1_hour")),
+        (Some(-1.0), t!("provider.keep_forever")),
+    ]
+}
+
+/// An effort level as the pilot reads it: the API's own name for one it doesn't know.
+fn effort_name(effort: &str) -> String {
+    match effort {
+        "none" => t!("effort.none"),
+        "low" => t!("effort.low"),
+        "medium" => t!("effort.medium"),
+        "high" => t!("effort.high"),
+        "xhigh" => t!("effort.xhigh"),
+        "max" => t!("effort.max"),
+        other => return other.to_owned(),
+    }
+    .to_owned()
+}
 
 pub struct ProviderTopbar {
     client: reqwest::Client,
@@ -63,13 +81,13 @@ impl ProviderTopbar {
         config.maybe_update(|raw| {
             let mut changed = raw.model.provider.edit(provider, |provider| {
                 ui.horizontal(|ui| {
-                    ui.label("Provider:");
+                    ui.label(t!("provider.label"));
                     let claude = ui
                         .selectable_value(provider, ModelProvider::Claude, "Claude")
-                        .on_hover_text("Through the Claude API: needs ANTHROPIC_API_KEY");
+                        .on_hover_text(t!("provider.claude_hover"));
                     let ollama = ui
                         .selectable_value(provider, ModelProvider::Ollama, "Ollama")
-                        .on_hover_text("A model Ollama runs, on this PC or another");
+                        .on_hover_text(t!("provider.ollama_hover"));
                     claude.clicked() || ollama.clicked()
                 })
                 .inner
@@ -84,37 +102,33 @@ impl ProviderTopbar {
         });
 
         ui.separator();
-        ui.weak("Changes apply from the next question: the engineer starts over");
+        ui.weak(t!("provider.applies_next"));
     }
 
     fn claude(&mut self, rt: &Handle, ui: &mut egui::Ui, config: &mut ClaudeConfig) -> bool {
         let mut changed = self.model(rt, ui, config.model().clone(), &mut config.model);
         changed |= pick(
             ui,
-            "Effort",
+            t!("provider.effort"),
             config.effort().clone(),
             &mut config.effort,
-            CLAUDE_EFFORTS.map(|effort| (effort.to_owned(), effort)),
-            String::clone,
+            CLAUDE_EFFORTS.map(|effort| (effort.to_owned(), effort_name(effort))),
+            |effort| effort_name(effort),
         )
-        .on_hover_text("How much it thinks before answering (the levels depend on the model)")
+        .on_hover_text(t!("provider.claude_effort_hover"))
         .changed();
         changed |= tokens(
             ui,
-            "Max tokens: ",
+            t!("provider.max_tokens"),
             *config.max_tokens(),
             &mut config.max_tokens,
             128_000,
         )
-        .on_hover_text("The most it writes in one response, thinking included")
+        .on_hover_text(t!("provider.max_tokens_hover"))
         .changed();
         changed |= config.compaction.edit(*config.compaction(), |compaction| {
-            ui.checkbox(compaction, "Compaction")
-                .on_hover_text(
-                    "Summarizes the earlier conversation when it grows near the context \
-                         window, so a long session never runs out of room. Only on models that \
-                         support it",
-                )
+            ui.checkbox(compaction, t!("provider.compaction"))
+                .on_hover_text(t!("provider.compaction_hover"))
                 .changed()
         });
         changed
@@ -125,48 +139,45 @@ impl ProviderTopbar {
         changed |= self.model(rt, ui, config.model().clone(), &mut config.model);
         changed |= pick(
             ui,
-            "Effort",
+            t!("provider.effort"),
             config.effort().clone(),
             &mut config.effort,
-            OLLAMA_EFFORTS.map(|effort| (effort.to_owned(), effort)),
-            String::clone,
+            OLLAMA_EFFORTS.map(|effort| (effort.to_owned(), effort_name(effort))),
+            |effort| effort_name(effort),
         )
-        .on_hover_text("Thinking on this PC's GPU, while the game uses it, makes answers slow")
+        .on_hover_text(t!("provider.ollama_effort_hover"))
         .changed();
         changed |= tokens(
             ui,
-            "Context: ",
+            t!("provider.context"),
             *config.context_length(),
             &mut config.context_length,
             1_048_576,
         )
-        .on_hover_text(
-            "The context window it's loaded with: Ollama silently drops the start of a \
-             conversation that doesn't fit. More takes more memory",
-        )
+        .on_hover_text(t!("provider.context_hover"))
         .changed();
         changed |= tokens(
             ui,
-            "Max tokens: ",
+            t!("provider.max_tokens"),
             *config.max_tokens(),
             &mut config.max_tokens,
             1_048_576,
         )
-        .on_hover_text("The most it writes in one response, thinking included")
+        .on_hover_text(t!("provider.max_tokens_hover"))
         .changed();
         changed |= pick(
             ui,
-            "Keep loaded",
+            t!("provider.keep_loaded"),
             *config.keep_alive(),
             &mut config.keep_alive,
-            KEEP_ALIVE,
+            keep_alive_options(),
             |keep_alive| match keep_alive {
-                Some(seconds) if *seconds < 0.0 => "Until Ollama stops".into(),
-                Some(seconds) => format!("{seconds} s"),
-                None => "Ollama's default".into(),
+                Some(seconds) if *seconds < 0.0 => t!("provider.keep_forever").into(),
+                Some(seconds) => t!("provider.keep_seconds", seconds = seconds),
+                None => t!("provider.keep_default").into(),
             },
         )
-        .on_hover_text("How long Ollama keeps the model loaded after an answer")
+        .on_hover_text(t!("provider.keep_loaded_hover"))
         .changed();
         changed
     }
@@ -181,15 +192,15 @@ impl ProviderTopbar {
 
         let edit = ui
             .horizontal(|ui| {
-                ui.label("Host:");
+                ui.label(t!("provider.host"));
                 ui.add(
                     egui::TextEdit::singleline(&mut text)
-                        .hint_text("this PC")
+                        .hint_text(t!("provider.host_hint"))
                         .desired_width(160.0),
                 )
             })
             .inner
-            .on_hover_text("Where Ollama listens, e.g. 192.168.1.5 or http://pc:11434");
+            .on_hover_text(t!("provider.host_hover"));
 
         if edit.has_focus() {
             self.host = Some(text);
@@ -215,7 +226,7 @@ impl ProviderTopbar {
     ) -> bool {
         let mut refresh = false;
         let changed = setting.edit(current, |model| {
-            ui.menu_button(format!("Model: {model}"), |ui| {
+            ui.menu_button(t!("provider.model", model = model), |ui| {
                 let before = model.clone();
                 match self
                     .models
@@ -225,14 +236,14 @@ impl ProviderTopbar {
                     None => {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label("Looking for models");
+                            ui.label(t!("provider.looking_for_models"));
                         });
                     }
                     Some(Err(e)) => {
                         ui.colored_label(ui.visuals().error_fg_color, format!("{e:#}"));
                     }
                     Some(Ok(models)) if models.is_empty() => {
-                        ui.label("No models: pull one with `ollama pull`");
+                        ui.label(t!("provider.no_models"));
                     }
                     Some(Ok(models)) => {
                         for option in models.iter() {
@@ -246,7 +257,7 @@ impl ProviderTopbar {
                 }
 
                 ui.separator();
-                refresh = ui.button("Refresh").clicked();
+                refresh = ui.button(t!("provider.refresh")).clicked();
                 *model != before
             })
             .inner

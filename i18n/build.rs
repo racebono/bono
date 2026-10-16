@@ -17,19 +17,45 @@ fn main() -> std::io::Result<()> {
     let out_dir = PathBuf::from(var_os("OUT_DIR").unwrap());
     let mut dest = BufWriter::new(File::create(out_dir.join("codegen.rs"))?);
 
-    // Every locale is picked by its own name
+    // The locales to pick from, each by its own name. Every language translated into must have
+    // one, or its translations could never be shown
     let locales = data
-        .values()
-        .flat_map(HashMap::keys)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    for locale in &locales {
-        if !data
-            .get("language_name")
-            .is_some_and(|names| names.contains_key(locale))
-        {
-            panic!("Locale \"{locale}\" has no \"language_name\" entry");
+        .get("language_name")
+        .map(|names| names.keys().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let language = |locale: &str| locale.split('-').next().unwrap_or_default().to_owned();
+    let languages = locales.iter().map(|l| language(l)).collect::<BTreeSet<_>>();
+    for (key, translations) in &data {
+        for locale in translations.keys() {
+            if !languages.contains(&language(locale)) {
+                panic!(
+                    "\"{key}\" is translated into \"{locale}\", but no \"language_name\" locale \
+                     is in its language"
+                );
+            }
         }
+    }
+
+    // `{name}` placeholders: every translation of a key has the same ones
+    let mut placeholders = phf_codegen::Map::new();
+    for (key, translations) in &data {
+        let mut names = None::<(&String, BTreeSet<String>)>;
+        for (locale, value) in translations {
+            let these = placeholder_names(value);
+            match &names {
+                Some((first, names)) if *names != these => panic!(
+                    "\"{key}\" has placeholders {names:?} in \"{first}\", but {these:?} in \
+                     \"{locale}\""
+                ),
+                Some(_) => {}
+                None => names = Some((locale, these)),
+            }
+        }
+        let names = names.map(|(_, names)| names).unwrap_or_default();
+        placeholders.entry(
+            key.clone(),
+            format!("&{:?}", names.iter().collect::<Vec<_>>()),
+        );
     }
 
     let mut outer_map = phf_codegen::Map::new();
@@ -77,7 +103,30 @@ fn main() -> std::io::Result<()> {
         "static LOCALES: &[&str] = &{:?};",
         locales.iter().collect::<Vec<_>>()
     )?;
+    writeln!(
+        &mut dest,
+        "static PLACEHOLDERS: phf::Map<&'static str, &'static [&'static str]> = {};",
+        placeholders.build()
+    )?;
 
     dest.flush()?;
     return Ok(());
+}
+
+/// The names of a translation's `{name}` placeholders.
+fn placeholder_names(value: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut rest = value;
+    while let Some(start) = rest.find('{') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('}') else {
+            break;
+        };
+        let name = &rest[..end];
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            names.insert(name.to_owned());
+        }
+        rest = &rest[end + 1..];
+    }
+    names
 }

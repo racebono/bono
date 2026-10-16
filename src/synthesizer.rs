@@ -19,6 +19,7 @@ use espeak_rs_sys::{
     espeak_SetVoiceByName, espeak_TextToPhonemes, espeakCHARS_UTF8, espeakINITIALIZE_DONT_EXIT,
     espeakPHONEMES_IPA,
 };
+use lambiase_i18n::t;
 use ort::{session::Session, value::Tensor};
 use sdl3::audio::{AudioFormat, AudioSpec, AudioStreamOwner};
 use serde::Deserialize;
@@ -268,7 +269,7 @@ impl SynthesizerInner {
                     match &*model {
                         Some(model) => match Voice::load(model, threads) {
                             Ok(next_voice) => voice = Some(next_voice),
-                            Err(e) => error("Error loading text to speech model", e),
+                            Err(e) => error(t!("error.tts_model"), e),
                         },
                         None => return,
                     }

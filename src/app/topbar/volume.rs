@@ -2,6 +2,7 @@
 //! sounds like a radio.
 
 use crate::config::{Config, Setting};
+use lambiase_i18n::t;
 
 #[derive(Default)]
 pub struct VolumeTopbar;
@@ -13,8 +14,8 @@ impl VolumeTopbar {
                 ui,
                 *raw.master_volume(),
                 &mut raw.master_volume,
-                "Master",
-                "Everything the app plays",
+                t!("volume.master"),
+                t!("volume.master_hover"),
             );
             ui.separator();
 
@@ -23,31 +24,30 @@ impl VolumeTopbar {
                 ui,
                 *raw.engineer_volume(),
                 &mut raw.engineer_volume,
-                "Engineer",
-                "The engineer's answers on the radio",
+                t!("volume.engineer"),
+                t!("volume.engineer_hover"),
             );
             changed |= volume(
                 ui,
                 *raw.spotter_volume(),
                 &mut raw.spotter_volume,
-                "Spotter",
-                "The spotter's calls",
+                t!("volume.spotter"),
+                t!("volume.spotter_hover"),
             );
             changed |= volume(
                 ui,
                 *raw.beep_volume(),
                 &mut raw.beep_volume,
-                "Radio beep",
-                "The roger beep that ends each transmission, from the next one on",
+                t!("volume.beep"),
+                t!("volume.beep_hover"),
             );
             ui.separator();
             changed |= volume(
                 ui,
                 *raw.radio_effect(),
                 &mut raw.radio_effect,
-                "Radio effect",
-                "How much the voices sound like a radio: none is a clean voice, without the \
-                 squelch. From the next transmission on",
+                t!("volume.radio_effect"),
+                t!("volume.radio_effect_hover"),
             );
             changed
         });

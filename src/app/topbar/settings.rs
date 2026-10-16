@@ -22,28 +22,33 @@ impl SettingsTopbar {
             )
         };
 
-        let button = |pre: &str, val: Option<ConfigButton>| match val {
-            Some(ConfigButton::Key(key)) => format!("{pre}: Key '{}'", key.name()),
-            Some(ConfigButton::Joystick { guid, button }) => {
-                format!("{pre}: Button {button} (Device '{}')", guid_to_str(&guid))
-            }
-            None => format!("{pre}: Disabled"),
+        let button = |pre: &str, val: Option<ConfigButton>| {
+            let value = match val {
+                Some(ConfigButton::Key(key)) => t!("settings.key", key = key.name()),
+                Some(ConfigButton::Joystick { guid, button }) => t!(
+                    "settings.joystick_button",
+                    button = button,
+                    device = guid_to_str(&guid)
+                ),
+                None => t!("settings.disabled").to_owned(),
+            };
+            format!("{pre}: {value}")
         };
 
         let next_talk = self.talk_button.update(
             rt,
             ss,
             ui,
-            button("Change talk button", talk),
-            "Press a button",
+            button(t!("settings.change_talk"), talk),
+            t!("settings.press_button"),
         );
 
         let next_session = self.session_button.update(
             rt,
             ss,
             ui,
-            button("Change session button", session),
-            "Press a button",
+            button(t!("settings.change_session"), session),
+            t!("settings.press_button"),
         );
 
         ui.separator();
@@ -77,7 +82,7 @@ impl SettingsTopbar {
 
         config.maybe_update(|raw| {
             raw.text_scale.edit(*raw.text_scale(), |text_scale| {
-                ui.add(egui::Slider::new(text_scale, 0.25..=4.0).text("Text scale"))
+                ui.add(egui::Slider::new(text_scale, 0.25..=4.0).text(t!("settings.text_scale")))
                     .changed()
             })
         });
@@ -91,15 +96,10 @@ impl SettingsTopbar {
                         .add(
                             egui::DragValue::new(&mut updates)
                                 .range(1..=60)
-                                .prefix("Record other cars every ")
-                                .suffix(" updates"),
+                                .prefix(t!("settings.opponents_prefix"))
+                                .suffix(t!("settings.opponents_suffix")),
                         )
-                        .on_hover_text(
-                            "Every update of your car is recorded, and one in this many of each \
-                             other car's. Fewer keep the recording smaller, more make the \
-                             spotter's calls and the engineer's answers about other cars more \
-                             precise",
-                        );
+                        .on_hover_text(t!("settings.opponents_hover"));
                     let changed = field.changed() && updates != frequency.get();
                     if let Some(updates) = NonZeroU32::new(updates) {
                         *frequency = updates;
@@ -145,7 +145,7 @@ impl ChangeButton {
             self.waiting = None;
             match result {
                 Ok(button) => return Some(button),
-                Err(e) => error("Error", e),
+                Err(e) => error(t!("error.title"), e),
             }
         }
 
