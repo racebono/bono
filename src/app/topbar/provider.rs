@@ -2,7 +2,9 @@
 
 use crate::{
     app::topbar::pick,
-    config::{ClaudeConfig, Config, ModelProvider, OllamaConfig, Setting},
+    config::{
+        ClaudeConfig, Config, ModelConfig, ModelProvider, OllamaConfig, OpenAiConfig, Setting,
+    },
     provider::{self, ModelOption},
     task::MaybeDone,
 };
@@ -12,6 +14,8 @@ use tokio::runtime::Handle;
 
 const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 const OLLAMA_EFFORTS: [&str; 4] = ["none", "low", "medium", "high"];
+/// Empty: `reasoning_effort` left out, the model's default
+const OPENAI_EFFORTS: [&str; 5] = ["", "none", "low", "medium", "high"];
 
 /// How long Ollama keeps the model loaded, in seconds (`None`: Ollama's own)
 fn keep_alive_options() -> [(Option<f64>, &'static str); 5] {
@@ -27,6 +31,7 @@ fn keep_alive_options() -> [(Option<f64>, &'static str); 5] {
 /// An effort level as the pilot reads it: the API's own name for one it doesn't know.
 fn effort_name(effort: &str) -> String {
     match effort {
+        "" => t!("effort.default"),
         "none" => t!("effort.none"),
         "low" => t!("effort.low"),
         "medium" => t!("effort.medium"),
@@ -42,14 +47,15 @@ pub struct ProviderTopbar {
     client: reqwest::Client,
     /// The provider's models, fetched when the tab first shows them
     models: Option<Models>,
-    /// The Ollama host being typed: set once it's done (Enter, or clicking away)
+    /// The address being typed (Ollama's host, or the API's URL): set once it's done (Enter, or
+    /// clicking away)
     host: Option<String>,
 }
 
 /// The models one provider offers.
 struct Models {
     provider: ModelProvider,
-    /// Ollama's host they were asked of
+    /// Where they were asked: Ollama's host, or the API's URL
     host: Option<String>,
     list: MaybeDone<anyhow::Result<Vec<ModelOption>>>,
 }
@@ -64,18 +70,17 @@ impl ProviderTopbar {
     }
 
     pub fn update(&mut self, rt: &Handle, ui: &mut egui::Ui, config: &mut Config) {
-        let (provider, host) = {
-            let config = config.get();
-            (*config.model.provider(), config.model.ollama.host().clone())
-        };
+        let model = config.get().model.clone();
+        let provider = *model.provider();
+        let host = location(&model);
 
-        // Asked again for another provider, or another Ollama
-        let stale = self.models.as_ref().is_none_or(|models| {
-            models.provider != provider
-                || (provider == ModelProvider::Ollama && models.host != host)
-        });
+        // Asked again for another provider, or another address
+        let stale = self
+            .models
+            .as_ref()
+            .is_none_or(|models| models.provider != provider || models.host != host);
         if stale {
-            self.fetch(provider, host.clone());
+            self.fetch(model);
         }
 
         config.maybe_update(|raw| {
@@ -88,7 +93,10 @@ impl ProviderTopbar {
                     let ollama = ui
                         .selectable_value(provider, ModelProvider::Ollama, "Ollama")
                         .on_hover_text(t!("provider.ollama_hover"));
-                    claude.clicked() || ollama.clicked()
+                    let openai = ui
+                        .selectable_value(provider, ModelProvider::OpenAi, "OpenAI")
+                        .on_hover_text(t!("provider.openai_hover"));
+                    claude.clicked() || ollama.clicked() || openai.clicked()
                 })
                 .inner
             });
@@ -97,6 +105,7 @@ impl ProviderTopbar {
             changed |= match provider {
                 ModelProvider::Claude => self.claude(rt, ui, &mut raw.model.claude),
                 ModelProvider::Ollama => self.ollama(rt, ui, &mut raw.model.ollama),
+                ModelProvider::OpenAi => self.openai(rt, ui, &mut raw.model.openai),
             };
             changed
         });
@@ -134,8 +143,53 @@ impl ProviderTopbar {
         changed
     }
 
+    fn openai(&mut self, rt: &Handle, ui: &mut egui::Ui, config: &mut OpenAiConfig) -> bool {
+        let mut changed = false;
+        if let Some(base_url) = self.address(
+            ui,
+            config.base_url().clone(),
+            t!("provider.base_url"),
+            provider::OPENAI_DEFAULT_BASE_URL,
+            t!("provider.base_url_hover"),
+        ) {
+            config.base_url.set(base_url);
+            changed = true;
+        }
+        changed |= self.model(rt, ui, config.model().clone(), &mut config.model);
+        changed |= pick(
+            ui,
+            t!("provider.effort"),
+            config.effort().clone(),
+            &mut config.effort,
+            OPENAI_EFFORTS.map(|effort| (effort.to_owned(), effort_name(effort))),
+            |effort| effort_name(effort),
+        )
+        .on_hover_text(t!("provider.openai_effort_hover"))
+        .changed();
+        changed |= tokens(
+            ui,
+            t!("provider.max_tokens"),
+            *config.max_tokens(),
+            &mut config.max_tokens,
+            1_048_576,
+        )
+        .on_hover_text(t!("provider.max_tokens_hover"))
+        .changed();
+        changed
+    }
+
     fn ollama(&mut self, rt: &Handle, ui: &mut egui::Ui, config: &mut OllamaConfig) -> bool {
-        let mut changed = self.host(ui, config);
+        let mut changed = false;
+        if let Some(host) = self.address(
+            ui,
+            config.host().clone(),
+            t!("provider.host"),
+            t!("provider.host_hint"),
+            t!("provider.host_hover"),
+        ) {
+            config.host.set(host);
+            changed = true;
+        }
         changed |= self.model(rt, ui, config.model().clone(), &mut config.model);
         changed |= pick(
             ui,
@@ -182,9 +236,16 @@ impl ProviderTopbar {
         changed
     }
 
-    /// Where Ollama is: empty for `OLLAMA_HOST`, or this PC.
-    fn host(&mut self, ui: &mut egui::Ui, config: &mut OllamaConfig) -> bool {
-        let current = config.host().clone();
+    /// Where the provider is (Ollama's host, the API's URL): empty for its default. The new one
+    /// once it's been typed (Enter, or clicking away), if it changed.
+    fn address(
+        &mut self,
+        ui: &mut egui::Ui,
+        current: Option<String>,
+        label: &str,
+        hint: &str,
+        hover: &str,
+    ) -> Option<Option<String>> {
         let mut text = match &self.host {
             Some(text) => text.clone(),
             None => current.clone().unwrap_or_default(),
@@ -192,28 +253,24 @@ impl ProviderTopbar {
 
         let edit = ui
             .horizontal(|ui| {
-                ui.label(t!("provider.host"));
+                ui.label(label);
                 ui.add(
                     egui::TextEdit::singleline(&mut text)
-                        .hint_text(t!("provider.host_hint"))
-                        .desired_width(160.0),
+                        .hint_text(hint)
+                        .desired_width(200.0),
                 )
             })
             .inner
-            .on_hover_text(t!("provider.host_hover"));
+            .on_hover_text(hover);
 
         if edit.has_focus() {
             self.host = Some(text);
-            return false;
+            return None;
         }
         self.host = None;
 
-        let host = Some(text.trim().to_owned()).filter(|host| !host.is_empty());
-        if edit.lost_focus() && host != current {
-            config.host.set(host);
-            return true;
-        }
-        false
+        let address = Some(text.trim().to_owned()).filter(|address| !address.is_empty());
+        (edit.lost_focus() && address != current).then_some(address)
     }
 
     /// The model, picked from the provider's.
@@ -264,22 +321,29 @@ impl ProviderTopbar {
             .unwrap_or(false)
         });
 
-        if refresh && let Some(models) = &self.models {
-            self.fetch(models.provider, models.host.clone());
+        // Asked again next frame
+        if refresh {
+            self.models = None;
         }
         changed
     }
 
-    fn fetch(&mut self, provider: ModelProvider, host: Option<String>) {
+    fn fetch(&mut self, model: ModelConfig) {
         let client = self.client.clone();
-        let asked = host.clone();
         self.models = Some(Models {
-            provider,
-            host,
-            list: MaybeDone::spawn(async move {
-                provider::models(provider, asked.as_deref(), &client).await
-            }),
+            provider: *model.provider(),
+            host: location(&model),
+            list: MaybeDone::spawn(async move { provider::models(&model, &client).await }),
         });
+    }
+}
+
+/// Where the provider's models are listed from: Ollama's host, or the API's URL.
+fn location(model: &ModelConfig) -> Option<String> {
+    match model.provider() {
+        ModelProvider::Claude => None,
+        ModelProvider::Ollama => model.ollama.host().clone(),
+        ModelProvider::OpenAi => model.openai.base_url().clone(),
     }
 }
 

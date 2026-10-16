@@ -739,5 +739,29 @@
     "provider.ollama_pull_hint": {
         "en": " (pull it with `ollama pull`)",
         "es": " (descárgalo con `ollama pull`)"
+    },
+    "provider.openai_hover": {
+        "en": "Any OpenAI-compatible API: llama.cpp's llama-server (started with --jinja), LM Studio, vLLM, OpenRouter, OpenAI...",
+        "es": "Cualquier API compatible con OpenAI: llama-server de llama.cpp (iniciado con --jinja), LM Studio, vLLM, OpenRouter, OpenAI..."
+    },
+    "provider.base_url": {
+        "en": "URL:",
+        "es": "URL:"
+    },
+    "provider.base_url_hover": {
+        "en": "The API's base, with its version, e.g. http://127.0.0.1:8080/v1. The API key comes from OPENAI_API_KEY",
+        "es": "La base de la API, con su versión, p. ej. http://127.0.0.1:8080/v1. La clave de la API se toma de OPENAI_API_KEY"
+    },
+    "provider.openai_effort_hover": {
+        "en": "reasoning_effort: the model's default when unset. None also turns thinking off in llama.cpp's thinking models",
+        "es": "reasoning_effort: el predeterminado del modelo si no se fija. Ninguno también desactiva el razonamiento en los modelos de llama.cpp que piensan"
+    },
+    "effort.default": {
+        "en": "model's default",
+        "es": "el del modelo"
+    },
+    "provider.openai_unreachable": {
+        "en": "Couldn't reach {url} (is the server running?)",
+        "es": "No se pudo conectar con {url} (¿está en marcha el servidor?)"
     }
 }

@@ -4,10 +4,12 @@
 
 use crate::config::{ModelConfig, ModelProvider};
 use futures::future::BoxFuture;
+pub use openai::DEFAULT_BASE_URL as OPENAI_DEFAULT_BASE_URL;
 use std::{collections::BTreeMap, ops::AddAssign, sync::Arc};
 
 pub mod claude;
 pub mod ollama;
+pub mod openai;
 mod text;
 mod tool;
 
@@ -22,15 +24,24 @@ pub struct ModelOption {
     pub size: Option<u64>,
 }
 
-/// The models `provider` offers (for Ollama, the ones pulled at `ollama_host`).
+/// The models the provider `config` picks offers (for Ollama, the ones pulled at its host; for
+/// an OpenAI-compatible API, the ones at its URL).
 pub async fn models(
-    provider: ModelProvider,
-    ollama_host: Option<&str>,
+    config: &ModelConfig,
     client: &reqwest::Client,
 ) -> anyhow::Result<Vec<ModelOption>> {
-    match provider {
+    match config.provider() {
         ModelProvider::Claude => claude::models(client).await,
-        ModelProvider::Ollama => ollama::models(ollama_host, client).await,
+        ModelProvider::Ollama => ollama::models(config.ollama.host().as_deref(), client).await,
+        ModelProvider::OpenAi => {
+            let openai = &config.openai;
+            openai::models(
+                openai.base_url().as_deref(),
+                openai.api_key().as_deref(),
+                client,
+            )
+            .await
+        }
     }
 }
 
@@ -78,6 +89,12 @@ pub fn conversation(
         )?),
         ModelProvider::Ollama => Box::new(ollama::Conversation::new(
             &config.ollama,
+            system,
+            tools,
+            client,
+        )?),
+        ModelProvider::OpenAi => Box::new(openai::Conversation::new(
+            &config.openai,
             system,
             tools,
             client,

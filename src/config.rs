@@ -560,6 +560,7 @@ settings! {
     groups {
         claude: ClaudeConfig,
         ollama: OllamaConfig,
+        openai: OpenAiConfig,
     }
 }
 
@@ -570,6 +571,26 @@ pub enum ModelProvider {
     Claude,
     /// A model Ollama runs, on this PC or another
     Ollama,
+    /// Any OpenAI-compatible API: llama.cpp's `llama-server`, LM Studio, vLLM, OpenAI...
+    OpenAi,
+}
+
+settings! {
+    /// A model behind an OpenAI-compatible API.
+    #[derive(Debug, PartialEq)]
+    pub struct OpenAiConfig {
+        /// The API's base, with its version, e.g. `http://127.0.0.1:8080/v1`: llama.cpp's
+        /// `llama-server` on this PC when `None`
+        pub base_url: Option<String> = None,
+        /// Sent as a bearer token: `OPENAI_API_KEY` when `None` (local servers need none)
+        pub api_key: Option<String> = None,
+        /// As the server names it (one serving a single model takes any)
+        pub model: String = String::new(),
+        /// `reasoning_effort`: `none`, `low`, `medium` or `high`, or empty for the model's default
+        pub effort: String = String::new(),
+        /// The most tokens in one response, thinking included
+        pub max_tokens: NonZeroU32 = NonZeroU32::new(16000).unwrap(),
+    }
 }
 
 settings! {
