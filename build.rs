@@ -8,7 +8,7 @@ pub fn main() -> Result<(), ureq::Error> {
     // Without it, any change to the package reruns this, downloading the header again
     println!("cargo::rerun-if-changed=build.rs");
 
-    if var_os("CARGO_FEATURE_RRRE").is_some() {
+    if var_os("CARGO_CFG_WINDOWS").is_some() {
         race_room(&out_dir)?;
     }
 
