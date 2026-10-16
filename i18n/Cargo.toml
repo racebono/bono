@@ -1,0 +1,23 @@
+[package]
+name = "lambiase-i18n"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+proc-macro = true
+
+[build-dependencies]
+phf = { version = "0.14.0", default-features = false }
+phf_codegen = "0.14.0"
+proc-macro2 = "1.0.107"
+quote = "1.0.47"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+syn = "3.0.9"
+
+[dependencies]
+phf = "0.14.0"
+proc-macro2 = "1.0.107"
+quote = "1.0.47"
+syn = { version = "3.0.9", features = ["parsing", "proc-macro"] }

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crate::{
     app::{
         Subsystems,
@@ -17,7 +15,9 @@ use egui::{
     PopupCloseBehavior,
     menu::{MenuButton, MenuConfig},
 };
+use lambiase_i18n::t;
 use sdl3::event::Event;
+use std::sync::Arc;
 use tokio::runtime::Handle;
 
 mod audio;
@@ -72,7 +72,7 @@ impl Topbar {
     ) {
         egui::Panel::top("tobpar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                MenuButton::new("Settings")
+                MenuButton::new(t!("settings"))
                     .config(
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )

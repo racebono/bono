@@ -1,6 +1,7 @@
 use crate::{
     button::ConfigButton,
     error,
+    i18n::{self, set_locale},
     synthesizer::{Effects, Synthesizer, SynthesizerInner},
 };
 use camino::{Utf8Path, Utf8PathBuf};
@@ -45,8 +46,18 @@ impl Config {
             }
         }
 
-        let (send, mut recv) =
-            tokio::sync::watch::channel(serde_json::from_slice::<RawConfig>(&contents)?);
+        let mut data = serde_json::from_slice::<RawConfig>(&contents)?;
+        let changed = !set_locale(data.locale());
+
+        if changed {
+            log::warn!("Invalid config locale.");
+            data.locale.set("en-US".into());
+        }
+
+        let (send, mut recv) = tokio::sync::watch::channel(data);
+        if changed {
+            recv.mark_changed();
+        }
 
         tokio::spawn(async move {
             while recv.changed().await.is_ok() {
@@ -85,11 +96,6 @@ impl Config {
     #[inline]
     pub fn maybe_update(&self, f: impl FnOnce(&mut RawConfig) -> bool) {
         self.send.send_if_modified(f);
-    }
-
-    #[inline]
-    pub fn watch(&self) -> tokio::sync::watch::Receiver<RawConfig> {
-        self.send.subscribe()
     }
 
     pub(super) fn on_resize(&mut self, width: i32, height: i32) {
@@ -238,6 +244,7 @@ where
 settings! {
     #[derive(Debug)]
     pub struct RawConfig {
+        locale: String = "en-US".into(),
         pub width: NonZeroU32 = NonZeroU32::new(900).unwrap(),
         pub height: NonZeroU32 = NonZeroU32::new(600).unwrap(),
         pub talk_button: Option<ConfigButton> = None,
@@ -253,7 +260,6 @@ settings! {
         pub opponent_frequency: NonZeroU32 = NonZeroU32::new(5).unwrap(),
         /// Changed with `set_voice`, which loads the voice too
         voices: BTreeMap<ArrayStr<2>, Utf8PathBuf> = BTreeMap::new(),
-        pub silence_level: f32 = 0.003,
         pub whisper_model: Option<Arc<Utf8Path>> = None,
         pub text_scale: f32 = 1.3,
         pub min_confidence: f32 = 0.1,
@@ -266,6 +272,16 @@ settings! {
 }
 
 impl RawConfig {
+    /// Changes the app's language (e.g. `es`, or `en-US`). Returns whether it did: not for a
+    /// locale that isn't valid.
+    pub fn set_locale(&mut self, locale: &str) -> bool {
+        if !i18n::set_locale(locale) {
+            return false;
+        }
+        self.locale.set(locale.to_owned());
+        true
+    }
+
     #[inline]
     pub fn synth_effects(&self) -> Effects {
         Effects {
@@ -330,6 +346,11 @@ impl<const N: usize> ArrayStr<N> {
     #[inline]
     pub const unsafe fn from_utf8_unchecked(buf: [u8; N]) -> Self {
         Self(buf)
+    }
+
+    #[inline]
+    pub const fn into_bytes(self) -> [u8; N] {
+        self.0
     }
 }
 

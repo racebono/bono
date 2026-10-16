@@ -2,6 +2,7 @@ use crate::{
     app::Subsystems, button::ConfigButton, config::Config, error, guid_to_str, task::LocalTask,
 };
 use egui::IntoAtoms;
+use lambiase_i18n::{locales, t};
 use std::num::NonZeroU32;
 use tokio::runtime::Handle;
 
@@ -46,6 +47,34 @@ impl SettingsTopbar {
         );
 
         ui.separator();
+        config.maybe_update(|raw| {
+            let current = raw.locale().clone();
+            let locales = locales!();
+            // `en-US` is English's when there's only `en`
+            let picked = |locale: &str| {
+                current == locale
+                    || (!locales.contains(&current.as_str())
+                        && current.split('-').next() == Some(locale))
+            };
+            let name = locales
+                .iter()
+                .find(|locale| picked(locale))
+                .map_or(current.as_str(), |locale| t!("language_name": locale));
+
+            ui.menu_button(format!("{}: {name}", t!("language")), |ui| {
+                let mut changed = false;
+                for locale in locales {
+                    let option = ui.selectable_label(picked(locale), t!("language_name": locale));
+                    if option.clicked() && !picked(locale) {
+                        changed |= raw.set_locale(locale);
+                    }
+                }
+                changed
+            })
+            .inner
+            .unwrap_or(false)
+        });
+
         config.maybe_update(|raw| {
             raw.text_scale.edit(*raw.text_scale(), |text_scale| {
                 ui.add(egui::Slider::new(text_scale, 0.25..=4.0).text("Text scale"))

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 lambiase-sim = { path = "sim" }
+lambiase-i18n = { path = "i18n" }
 pin-project = "1.1.13"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 tokio = { version = "1.53.2", features = [
@@ -72,6 +73,7 @@ ollama-rs = { version = "0.3.6", features = [
     "stream",
     "rustls",
 ], optional = true }
+phf = { version = "0.14.0", features = ["macros"] }
 
 [target.'cfg(windows)'.dependencies]
 # Steam's per-game "Running" flag, and watching it change
@@ -152,7 +154,7 @@ all-languages = [
 ollama = []
 
 [workspace]
-members = ["xtask", "sim", "lmu"]
+members = ["xtask", "sim", "lmu", "i18n"]
 
 # espeak-rs-sys links the debug CRT (`msvcrtd`) when its build script has debug assertions,
 # which clashes with the release CRT (`msvcrt`) Rust and the other native dependencies link

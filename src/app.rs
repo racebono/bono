@@ -6,12 +6,11 @@ use crate::{
     sim::{ActiveSimulator, Sim, SimulatorSettings},
     spotter::Spotter,
     synthesizer::Synthesizer,
-    task::MaybeDone,
     track::TrackSync,
 };
 use anyhow::Context as AnyhowContext;
 use camino::{Utf8Path, Utf8PathBuf};
-use egui::{FontFamily, FontTweak};
+use egui::FontFamily;
 use egui_sdl3::EguiCanvas;
 use futures::FutureExt;
 use sdl3::{

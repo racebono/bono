@@ -352,6 +352,7 @@ impl Band {
 fn reduce_add(x: f32x4) -> f32 {
     cfg_select! {
         target_feature = "sse" => {
+            #[allow(dead_code)]
             #[allow(non_snake_case)]
             const fn MM_SHUFFLE(z: u32, y: u32, x: u32, w: u32) -> i32 {
                 ((z << 6) | (y << 4) | (x << 2) | w) as i32

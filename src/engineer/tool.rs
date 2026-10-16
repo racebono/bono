@@ -2850,7 +2850,7 @@ fn fit_shift(apexes: &[f64], corners: &[f64], length: f64) -> Option<(f64, usize
 
 /// Moves every position in the description (fractions of the lap) by `fraction`, round the line.
 fn shift_track(track: &mut Json, fraction: f64) {
-    let mut shift = |value: &mut Json| {
+    let shift = |value: &mut Json| {
         if let Some(x) = value.as_f64() {
             *value = (x + fraction).rem_euclid(1.0).into();
         }

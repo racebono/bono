@@ -23,6 +23,7 @@ mod app;
 mod button;
 mod config;
 mod engineer;
+mod i18n;
 mod language;
 mod provider;
 mod sim;
@@ -224,37 +225,6 @@ impl Drop for Download {
     #[inline]
     fn drop(&mut self) {
         self.aborter.abort();
-    }
-}
-
-#[repr(transparent)]
-pub(crate) struct Defer<F>(ManuallyDrop<F>)
-where
-    F: FnOnce();
-
-impl<F> Defer<F>
-where
-    F: FnOnce(),
-{
-    #[inline]
-    pub const fn new(f: F) -> Self {
-        Self(ManuallyDrop::new(f))
-    }
-
-    #[inline]
-    pub fn forget(self) {
-        let mut this = ManuallyDrop::new(self);
-        unsafe { ManuallyDrop::drop(&mut this.0) };
-    }
-}
-
-impl<F> Drop for Defer<F>
-where
-    F: FnOnce(),
-{
-    #[inline]
-    fn drop(&mut self) {
-        (unsafe { ManuallyDrop::take(&mut self.0) })()
     }
 }
 

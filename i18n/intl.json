@@ -1,0 +1,28 @@
+{
+    "settings": {
+        "en": "Settings",
+        "es": "Ajustes"
+    },
+    "audio": {
+        "en": "Audio"
+    },
+    "volume": {
+        "en": "Volume",
+        "es": "Volumen"
+    },
+    "provider": {
+        "en": "Provider",
+        "es": "Proveedor"
+    },
+    "spotter": {
+        "en": "Spotter"
+    },
+    "language": {
+        "en": "Language",
+        "es": "Idioma"
+    },
+    "language_name": {
+        "en": "English",
+        "es": "Español"
+    }
+}
