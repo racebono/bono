@@ -161,8 +161,8 @@
         "es": "Efecto de radio"
     },
     "volume.radio_effect_hover": {
-        "en": "How much the voices sound like a radio: none is a clean voice, without the squelch. From the next transmission on",
-        "es": "Cuánto suenan las voces a radio: nada es una voz limpia, sin el ruido de apertura. A partir de la siguiente transmisión"
+        "en": "How much the voices sound like a radio: 0% is a clean voice, without the squelch. From the next transmission on",
+        "es": "Cuánto suenan las voces a radio: 0% es una voz limpia, sin el ruido de apertura. A partir de la siguiente transmisión"
     },
     "spotter.enabled": {
         "en": "Enabled",
@@ -249,8 +249,8 @@
         "es": "Cuánto piensa antes de responder (los niveles dependen del modelo)"
     },
     "provider.ollama_effort_hover": {
-        "en": "Thinking on this PC's GPU, while the game uses it, makes answers slow",
-        "es": "Pensar en la GPU de este PC, mientras la usa el juego, hace que las respuestas tarden"
+        "en": "Thinking on this PC's GPU while the game uses it may make answers slow",
+        "es": "Pensar en la GPU del ordenador mientras la usa el juego puede hacer que las respuestas tarden"
     },
     "provider.max_tokens": {
         "en": "Max tokens: ",
@@ -415,10 +415,6 @@
     "audio.use": {
         "en": "Use",
         "es": "Usar"
-    },
-    "audio.download": {
-        "en": "Download",
-        "es": "Descargar"
     },
     "audio.voice": {
         "en": "Voice",

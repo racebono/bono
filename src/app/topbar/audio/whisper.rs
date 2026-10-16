@@ -167,7 +167,10 @@ impl Whisper {
                                                 egui::ProgressBar::new(download.progress() as f32)
                                                     .show_percentage()
                                                     .ui(ui);
-                                            } else if ui.button(t!("audio.download")).clicked() {
+                                            } else if ui
+                                                .button(egui_phosphor::bold::CLOUD_ARROW_DOWN)
+                                                .clicked()
+                                            {
                                                 model.start_download(&client);
                                             }
                                         });
@@ -748,12 +751,18 @@ mod tests {
     fn detects_the_language_spoken() {
         let whisper = std::env::var("LAMBIASE_WHISPER").unwrap();
         let threads = NonZeroUsize::new(4).unwrap();
-        let ctx = WhisperContext::new_with_params(&whisper, WhisperContextParameters::default())
-            .unwrap();
+        let ctx =
+            WhisperContext::new_with_params(&whisper, WhisperContextParameters::default()).unwrap();
 
         let voices = BTreeMap::from([
-            (arrstr!("en"), Utf8PathBuf::from(std::env::var("LAMBIASE_VOICE_EN").unwrap())),
-            (arrstr!("es"), Utf8PathBuf::from(std::env::var("LAMBIASE_VOICE_ES").unwrap())),
+            (
+                arrstr!("en"),
+                Utf8PathBuf::from(std::env::var("LAMBIASE_VOICE_EN").unwrap()),
+            ),
+            (
+                arrstr!("es"),
+                Utf8PathBuf::from(std::env::var("LAMBIASE_VOICE_ES").unwrap()),
+            ),
         ]);
         let effects = Effects {
             radio: 0.0,
@@ -761,8 +770,14 @@ mod tests {
         };
 
         for (lang, text) in [
-            (arrstr!("es"), "¿Cuánto combustible me queda y cuándo tengo que parar?"),
-            (arrstr!("en"), "How much fuel do I have left, and when do I need to pit?"),
+            (
+                arrstr!("es"),
+                "¿Cuánto combustible me queda y cuándo tengo que parar?",
+            ),
+            (
+                arrstr!("en"),
+                "How much fuel do I have left, and when do I need to pit?",
+            ),
         ] {
             let mut voice = Voice::load(&voices[&lang], threads).unwrap();
             let speech = voice.synthesize(text, effects).unwrap();

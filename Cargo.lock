@@ -1692,6 +1692,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-phosphor"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f4299551488dddaa8f757727e1eb4ffdaf277ffe6e30b413403468f5ecf4634"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "egui-sdl3"
 version = "0.4.0"
 source = "git+https://github.com/Aandreba/egui-sdl3?branch=main#7442230dedeb018487c05876db3ad3578f8e9a10"
@@ -3377,6 +3386,7 @@ dependencies = [
  "camino",
  "crossbeam",
  "egui",
+ "egui-phosphor",
  "egui-sdl3",
  "egui_extras",
  "espeak-rs-sys",

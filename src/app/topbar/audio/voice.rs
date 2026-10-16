@@ -306,7 +306,8 @@ impl Language {
                                     egui::ProgressBar::new(progress as f32)
                                         .show_percentage()
                                         .ui(ui);
-                                } else if ui.button(t!("audio.download")).clicked() {
+                                } else if ui.button(egui_phosphor::bold::CLOUD_ARROW_DOWN).clicked()
+                                {
                                     voice.start_download(client);
                                 }
                             });

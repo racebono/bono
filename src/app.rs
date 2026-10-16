@@ -29,7 +29,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{runtime::Handle, try_join};
+use tokio::runtime::Handle;
 
 mod chat;
 mod topbar;
@@ -68,8 +68,9 @@ impl App {
         let video = sdl.video()?;
         let joystick = sdl.joystick()?;
         let event = sdl.event()?;
+        let fonts = load_fonts()?;
 
-        let (config, fonts) = try_join!(load_config(&pref_path), load_fonts(&assets_path))?;
+        let config = load_config(&pref_path).await?;
         let (width, height) = {
             let config = config.get();
             (*config.width(), *config.height())
@@ -399,15 +400,13 @@ async fn load_config(pref_path: &Utf8Path) -> anyhow::Result<Config> {
     Config::new(pref_path.join_os("config.json")).await
 }
 
-async fn load_fonts(assets_path: &Utf8Path) -> anyhow::Result<egui::FontDefinitions> {
+fn load_fonts() -> anyhow::Result<egui::FontDefinitions> {
     let mut fonts = egui::FontDefinitions::default();
-    let (proggy,) = tokio::try_join!(tokio::fs::read(
-        assets_path.join_os("ProggyForever-Regular.ttf")
-    ),)?;
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Bold);
 
     fonts.font_data.insert(
         "proggy-forever".into(),
-        Arc::new(egui::FontData::from_owned(proggy)),
+        Arc::new(egui::FontData::from_static(include_bytes!("../font.ttf"))),
     );
 
     // Each character comes from the first font that has it: Proggy only covers Latin-1, Ubuntu adds

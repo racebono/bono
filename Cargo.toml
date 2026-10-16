@@ -74,6 +74,7 @@ ollama-rs = { version = "0.3.6", features = [
     "rustls",
 ], optional = true }
 phf = { version = "0.14.0", features = ["macros"] }
+egui-phosphor = { version = "0.14.0", default-features = false, features = ["bold"] }
 
 [target.'cfg(windows)'.dependencies]
 # Steam's per-game "Running" flag, and watching it change
