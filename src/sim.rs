@@ -10,6 +10,8 @@ use tokio::sync::{Mutex, watch};
 
 #[cfg(windows)]
 mod lmu;
+#[cfg(windows)]
+mod rrre;
 
 pub struct Sim<T: ?Sized = dyn Simulator> {
     name: &'static str,
@@ -223,6 +225,8 @@ fn simulators() -> Vec<Box<Sim<dyn Simulator>>> {
     return [
         #[cfg(windows)]
         (Box::new(Sim::new(lmu::LeMansUltimate::new())) as Box<Sim<dyn Simulator>>),
+        #[cfg(windows)]
+        (Box::new(Sim::new(rrre::RaceRoom::new())) as Box<Sim<dyn Simulator>>),
     ]
     .into_iter()
     .collect::<Vec<_>>();
@@ -245,7 +249,7 @@ pub(crate) fn recording(pool: Pool) -> Box<Sim> {
     Box::new(Sim {
         name: "Test",
         running,
-        track_data: Arc::new(Mutex::new(TrackData::new("test"))),
+        track_data: Arc::new(Mutex::new(TrackData::new("test".into()))),
         _watcher: Err(send),
         simulator: Recording(pool),
     })
@@ -273,7 +277,7 @@ mod tests {
         let sim = Box::new(Sim {
             name,
             running,
-            track_data: Arc::new(Mutex::new(TrackData::new(name))),
+            track_data: Arc::new(Mutex::new(TrackData::new(name.into()))),
             // Not the test's sender, so the test can close the channel
             _watcher: Err(watch::channel(false).0),
             simulator: Fake,

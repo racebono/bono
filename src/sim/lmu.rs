@@ -148,7 +148,10 @@ async fn remove_when_closed(dir: PathBuf, pool: Pool) {
 
         match try_remove_database(&dir) {
             Ok(()) => {
-                log::debug!("Removed the recording Le Mans Ultimate left in {}", dir.display());
+                log::debug!(
+                    "Removed the recording Le Mans Ultimate left in {}",
+                    dir.display()
+                );
                 return;
             }
             Err(e) if waited >= REMOVE_FOR => {

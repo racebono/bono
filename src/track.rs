@@ -910,7 +910,10 @@ mod tests {
     #[ignore = "downloads from GitHub"]
     async fn saves_the_session_track_next_to_the_database() {
         use crate::sqlite::Database;
-        use lambiase_sim::{recorder::{DATABASE, Recorder}, sys::lambiase_session_info};
+        use lambiase_sim::{
+            recorder::{DATABASE, Recorder},
+            sys::lambiase_session_info,
+        };
 
         let prefs = tempfile::tempdir().unwrap();
         let game = tempfile::tempdir().unwrap();
@@ -927,7 +930,9 @@ mod tests {
             one,
         );
         let manifest = Arc::new(Mutex::new(
-            Manifest::new(reqwest::Client::new(), prefs.path()).await.unwrap(),
+            Manifest::new(reqwest::Client::new(), prefs.path())
+                .await
+                .unwrap(),
         ));
         let track_data = Arc::new(Mutex::new(TrackData::new("lmu")));
 
@@ -940,9 +945,18 @@ mod tests {
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(game.path().join(TRACK_FILE)).unwrap()).unwrap();
         assert_eq!(saved["source_track"], "Autódromo José Carlos Pace");
-        assert!(saved["turn"].as_array().is_some_and(|turns| !turns.is_empty()));
+        assert!(
+            saved["turn"]
+                .as_array()
+                .is_some_and(|turns| !turns.is_empty())
+        );
 
         // Already saved there: nothing to do
-        assert!(sync(db, track_data, manifest, Some(synced)).await.unwrap().is_none());
+        assert!(
+            sync(db, track_data, manifest, Some(synced))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
