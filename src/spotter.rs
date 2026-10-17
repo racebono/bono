@@ -1516,6 +1516,7 @@ mod tests {
         assert_eq!(call.words(arrstr!("es")), "probable lluvia en unos 4 minutos");
         assert_eq!(call.words(arrstr!("fr")), "rain likely in about 4 minutes");
         assert_eq!(translate("car left", arrstr!("es")), "coche a la izquierda");
+        assert_eq!(translate("car left", arrstr!("ca")), "cotxe a l'esquerra");
     }
 
     /// Prints every call the spotter makes over a recording (`EVAL_DB`), e.g. my-engineer's race

@@ -55,6 +55,7 @@ steamlocate = "2.1.1"
 # Which language a typed question is in. Each language's model is built into the binary (a few
 # MB each), so only common ones are by default: `all-languages` adds the rest that have voices
 lingua = { version = "1.8.0", default-features = false, features = [
+    "catalan",
     "chinese",
     "dutch",
     "english",

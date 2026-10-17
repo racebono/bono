@@ -176,21 +176,22 @@ mod tests {
 
     #[test]
     fn translates_into_every_locale() {
-        assert_eq!(locales!(), ["en-GB", "en-US", "es-ES"]);
+        assert_eq!(locales!(), ["ca-ES", "en-GB", "en-US", "es-ES"]);
         assert_eq!(t!("settings": "es"), "Ajustes");
         assert_eq!(t!("settings": "es-MX"), "Ajustes");
         assert_eq!(t!("settings": "en-US"), "Settings");
         // Not translated yet: English
         assert_eq!(t!("audio": "es"), "Audio");
         assert_eq!(t!("settings": "de"), "Settings");
-        // Catalan falls back to Spanish
-        assert_eq!(t!("settings": "ca"), "Ajustes");
+        assert_eq!(t!("settings": "ca"), "Configuració");
+        assert_eq!(t!("settings": "ca-ES"), "Configuració");
 
         for locale in locales!() {
             let name = t!("language_name": locale);
             assert!(!name.is_empty(), "{locale}");
         }
         assert_eq!(t!("language_name": "es-ES"), "Español (España)");
+        assert_eq!(t!("language_name": "ca-ES"), "Català (Espanya)");
     }
 
     #[test]

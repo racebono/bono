@@ -96,6 +96,7 @@ pub fn ui_name(code: ArrayStr<2>) -> String {
     let name = match &*code {
         "en" => t!("lang.en"),
         "es" => t!("lang.es"),
+        "ca" => t!("lang.ca"),
         "fr" => t!("lang.fr"),
         "de" => t!("lang.de"),
         "it" => t!("lang.it"),

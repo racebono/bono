@@ -1,767 +1,963 @@
 {
     "settings": {
         "en": "Settings",
-        "es": "Ajustes"
+        "es": "Ajustes",
+        "ca": "Configuració"
     },
     "audio": {
         "en": "Audio",
-        "es": "Audio"
+        "es": "Audio",
+        "ca": "Àudio"
     },
     "volume": {
         "en": "Volume",
-        "es": "Volumen"
+        "es": "Volumen",
+        "ca": "Volum"
     },
     "provider": {
         "en": "Provider",
-        "es": "Proveedor"
+        "es": "Proveedor",
+        "ca": "Proveïdor"
     },
     "spotter": {
         "en": "Spotter",
-        "es": "Spotter"
+        "es": "Spotter",
+        "ca": "Spotter"
     },
     "language": {
         "en": "Language",
-        "es": "Idioma"
+        "es": "Idioma",
+        "ca": "Idioma"
     },
     "language_name": {
         "en-US": "English (United States)",
         "en-GB": "English (United Kingdom)",
-        "es-ES": "Español (España)"
+        "es-ES": "Español (España)",
+        "ca-ES": "Català (Espanya)"
     },
     "chat.ask_hint": {
         "en": "Ask the engineer",
-        "es": "Pregunta al ingeniero"
+        "es": "Pregunta al ingeniero",
+        "ca": "Pregunta a l'enginyer"
     },
     "chat.send": {
         "en": "Send",
-        "es": "Enviar"
+        "es": "Enviar",
+        "ca": "Envia"
     },
     "chat.empty": {
         "en": "Hold the talk button, or type below, to ask the engineer.",
-        "es": "Mantén pulsado el botón de hablar, o escribe abajo, para preguntar al ingeniero."
+        "es": "Mantén pulsado el botón de hablar, o escribe abajo, para preguntar al ingeniero.",
+        "ca": "Mantén premut el botó de parlar, o escriu a sota, per preguntar a l'enginyer."
     },
     "chat.pilot": {
         "en": "Pilot",
-        "es": "Piloto"
+        "es": "Piloto",
+        "ca": "Pilot"
     },
     "chat.engineer": {
         "en": "Engineer",
-        "es": "Ingeniero"
+        "es": "Ingeniero",
+        "ca": "Enginyer"
     },
     "chat.thinking": {
         "en": "The engineer is on it",
-        "es": "El ingeniero está en ello"
+        "es": "El ingeniero está en ello",
+        "ca": "L'enginyer s'hi posa"
     },
     "topbar.clear_data": {
         "en": "Clear data",
-        "es": "Borrar datos"
+        "es": "Borrar datos",
+        "ca": "Esborra les dades"
     },
     "topbar.clear_data_hover": {
         "en": "Delete everything recorded from the simulator so far",
-        "es": "Borra todo lo grabado del simulador hasta ahora"
+        "es": "Borra todo lo grabado del simulador hasta ahora",
+        "ca": "Esborra tot el que s'ha gravat del simulador fins ara"
     },
     "topbar.no_simulator_hover": {
         "en": "No simulator is running",
-        "es": "No hay ningún simulador en marcha"
+        "es": "No hay ningún simulador en marcha",
+        "ca": "No hi ha cap simulador en marxa"
     },
     "topbar.no_simulator": {
         "en": "No simulator running",
-        "es": "Ningún simulador en marcha"
+        "es": "Ningún simulador en marcha",
+        "ca": "Cap simulador en marxa"
     },
     "clear.title": {
         "en": "Clear recorded data?",
-        "es": "¿Borrar los datos grabados?"
+        "es": "¿Borrar los datos grabados?",
+        "ca": "Vols esborrar les dades gravades?"
     },
     "clear.body": {
         "en": "Everything recorded from {name} so far will be deleted. This can't be undone.",
-        "es": "Se borrará todo lo grabado de {name} hasta ahora. No se puede deshacer."
+        "es": "Se borrará todo lo grabado de {name} hasta ahora. No se puede deshacer.",
+        "ca": "S'esborrarà tot el que s'ha gravat de {name} fins ara. No es pot desfer."
     },
     "clear.confirm": {
         "en": "Clear",
-        "es": "Borrar"
+        "es": "Borrar",
+        "ca": "Esborra"
     },
     "cancel": {
         "en": "Cancel",
-        "es": "Cancelar"
+        "es": "Cancelar",
+        "ca": "Cancel·la"
     },
     "settings.change_talk": {
         "en": "Change talk button",
-        "es": "Cambiar botón de hablar"
+        "es": "Cambiar botón de hablar",
+        "ca": "Canvia el botó de parlar"
     },
     "settings.change_session": {
         "en": "Change session button",
-        "es": "Cambiar botón de sesión"
+        "es": "Cambiar botón de sesión",
+        "ca": "Canvia el botó de sessió"
     },
     "settings.key": {
         "en": "Key '{key}'",
-        "es": "Tecla '{key}'"
+        "es": "Tecla '{key}'",
+        "ca": "Tecla '{key}'"
     },
     "settings.joystick_button": {
         "en": "Button {button} (device '{device}')",
-        "es": "Botón {button} (dispositivo '{device}')"
+        "es": "Botón {button} (dispositivo '{device}')",
+        "ca": "Botó {button} (dispositiu '{device}')"
     },
     "settings.disabled": {
         "en": "Disabled",
-        "es": "Desactivado"
+        "es": "Desactivado",
+        "ca": "Desactivat"
     },
     "settings.press_button": {
         "en": "Press a button",
-        "es": "Pulsa un botón"
+        "es": "Pulsa un botón",
+        "ca": "Prem un botó"
     },
     "settings.text_scale": {
         "en": "Text scale",
-        "es": "Tamaño del texto"
+        "es": "Tamaño del texto",
+        "ca": "Mida del text"
     },
     "settings.opponents_prefix": {
         "en": "Record other cars every ",
-        "es": "Grabar los demás coches cada "
+        "es": "Grabar los demás coches cada ",
+        "ca": "Grava els altres cotxes cada "
     },
     "settings.opponents_suffix": {
         "en": " updates",
-        "es": " actualizaciones"
+        "es": " actualizaciones",
+        "ca": " actualitzacions"
     },
     "settings.opponents_hover": {
         "en": "Every update of your car is recorded, and one in this many of each other car's. Fewer keep the recording smaller, more make the spotter's calls and the engineer's answers about other cars more precise",
-        "es": "Se graba cada actualización de tu coche, y una de cada tantas de los demás. Menos hacen la grabación más pequeña; más hacen más precisos los avisos del spotter y las respuestas del ingeniero sobre los demás coches"
+        "es": "Se graba cada actualización de tu coche, y una de cada tantas de los demás. Menos hacen la grabación más pequeña; más hacen más precisos los avisos del spotter y las respuestas del ingeniero sobre los demás coches",
+        "ca": "Es grava cada actualització del teu cotxe, i una de cada tantes de cadascun dels altres. Menys fan la gravació més petita; més fan més precisos els avisos de l'spotter i les respostes de l'enginyer sobre els altres cotxes"
     },
     "volume.master": {
         "en": "Master",
-        "es": "General"
+        "es": "General",
+        "ca": "General"
     },
     "volume.master_hover": {
         "en": "Everything the app plays",
-        "es": "Todo lo que suena en la aplicación"
+        "es": "Todo lo que suena en la aplicación",
+        "ca": "Tot el que sona a l'aplicació"
     },
     "volume.engineer": {
         "en": "Engineer",
-        "es": "Ingeniero"
+        "es": "Ingeniero",
+        "ca": "Enginyer"
     },
     "volume.engineer_hover": {
         "en": "The engineer's answers on the radio",
-        "es": "Las respuestas del ingeniero por radio"
+        "es": "Las respuestas del ingeniero por radio",
+        "ca": "Les respostes de l'enginyer per ràdio"
     },
     "volume.spotter": {
         "en": "Spotter",
-        "es": "Spotter"
+        "es": "Spotter",
+        "ca": "Spotter"
     },
     "volume.spotter_hover": {
         "en": "The spotter's calls",
-        "es": "Los avisos del spotter"
+        "es": "Los avisos del spotter",
+        "ca": "Els avisos de l'spotter"
     },
     "volume.beep": {
         "en": "Radio beep",
-        "es": "Pitido de radio"
+        "es": "Pitido de radio",
+        "ca": "Xiulet de ràdio"
     },
     "volume.beep_hover": {
         "en": "The roger beep that ends each transmission, from the next one on",
-        "es": "El pitido que cierra cada transmisión, a partir de la siguiente"
+        "es": "El pitido que cierra cada transmisión, a partir de la siguiente",
+        "ca": "El xiulet que tanca cada transmissió, a partir de la següent"
     },
     "volume.radio_effect": {
         "en": "Radio effect",
-        "es": "Efecto de radio"
+        "es": "Efecto de radio",
+        "ca": "Efecte de ràdio"
     },
     "volume.radio_effect_hover": {
         "en": "How much the voices sound like a radio: 0% is a clean voice, without the squelch. From the next transmission on",
-        "es": "Cuánto suenan las voces a radio: 0% es una voz limpia, sin el ruido de apertura. A partir de la siguiente transmisión"
+        "es": "Cuánto suenan las voces a radio: 0% es una voz limpia, sin el ruido de apertura. A partir de la siguiente transmisión",
+        "ca": "Com sonen de ràdio les veus: 0% és una veu neta, sense el soroll d'obertura. A partir de la següent transmissió"
     },
     "spotter.enabled": {
         "en": "Enabled",
-        "es": "Activado"
+        "es": "Activado",
+        "ca": "Activat"
     },
     "spotter.enabled_hover": {
         "en": "Calls cars alongside, flags, the car's own alerts and the weather by itself, the moment they happen",
-        "es": "Avisa por sí solo de los coches a tu lado, las banderas, las alertas del coche y el tiempo, en cuanto ocurren"
+        "es": "Avisa por sí solo de los coches a tu lado, las banderas, las alertas del coche y el tiempo, en cuanto ocurren",
+        "ca": "Avisa tot sol dels cotxes al teu costat, les banderes, les alertes del cotxe i el temps, tan bon punt passen"
     },
     "spotter.pilots_language": {
         "en": "The pilot's",
-        "es": "La del piloto"
+        "es": "La del piloto",
+        "ca": "La del pilot"
     },
     "spotter.no_voice": {
         "en": "{language} (no voice)",
-        "es": "{language} (sin voz)"
+        "es": "{language} (sin voz)",
+        "ca": "{language} (sense veu)"
     },
     "spotter.language_hover": {
-        "en": "The language of its calls: the pilot's is the last one they asked the engineer in. Calls are said in Spanish or English; other languages' voices say them in English",
-        "es": "El idioma de sus avisos: el del piloto es el último en el que preguntó al ingeniero. Los avisos se dicen en español o en inglés; con las voces de otros idiomas, se dicen en inglés"
+        "en": "The language of its calls: the pilot's is the last one they asked the engineer in. Calls are said in Catalan, Spanish or English; other languages' voices say them in English",
+        "es": "El idioma de sus avisos: el del piloto es el último en el que preguntó al ingeniero. Los avisos se dicen en catalán, español o inglés; con las voces de otros idiomas, se dicen en inglés",
+        "ca": "L'idioma dels seus avisos: el del pilot és l'últim en què va preguntar a l'enginyer. Els avisos es diuen en català, castellà o anglès; amb les veus d'altres idiomes, es diuen en anglès"
     },
     "lang.en": {
         "en": "English",
-        "es": "Inglés"
+        "es": "Inglés",
+        "ca": "Anglès"
     },
     "lang.es": {
         "en": "Spanish",
-        "es": "Español"
+        "es": "Español",
+        "ca": "Castellà"
+    },
+    "lang.ca": {
+        "en": "Catalan",
+        "es": "Catalán",
+        "ca": "Català"
     },
     "lang.fr": {
         "en": "French",
-        "es": "Francés"
+        "es": "Francés",
+        "ca": "Francès"
     },
     "lang.de": {
         "en": "German",
-        "es": "Alemán"
+        "es": "Alemán",
+        "ca": "Alemany"
     },
     "lang.it": {
         "en": "Italian",
-        "es": "Italiano"
+        "es": "Italiano",
+        "ca": "Italià"
     },
     "lang.pt": {
         "en": "Portuguese",
-        "es": "Portugués"
+        "es": "Portugués",
+        "ca": "Portuguès"
     },
     "lang.nl": {
         "en": "Dutch",
-        "es": "Neerlandés"
+        "es": "Neerlandés",
+        "ca": "Neerlandès"
     },
     "lang.zh": {
         "en": "Chinese",
-        "es": "Chino"
+        "es": "Chino",
+        "ca": "Xinès"
     },
     "lang.ja": {
         "en": "Japanese",
-        "es": "Japonés"
+        "es": "Japonés",
+        "ca": "Japonès"
     },
     "lang.ko": {
         "en": "Korean",
-        "es": "Coreano"
+        "es": "Coreano",
+        "ca": "Coreà"
     },
     "provider.label": {
         "en": "Provider:",
-        "es": "Proveedor:"
+        "es": "Proveedor:",
+        "ca": "Proveïdor:"
     },
     "provider.claude_hover": {
         "en": "Through the Claude API: needs ANTHROPIC_API_KEY",
-        "es": "A través de la API de Claude: necesita ANTHROPIC_API_KEY"
+        "es": "A través de la API de Claude: necesita ANTHROPIC_API_KEY",
+        "ca": "A través de l'API de Claude: necessita ANTHROPIC_API_KEY"
     },
     "provider.ollama_hover": {
         "en": "A model Ollama runs, on this PC or another",
-        "es": "Un modelo que ejecuta Ollama, en este PC o en otro"
+        "es": "Un modelo que ejecuta Ollama, en este PC o en otro",
+        "ca": "Un model que executa Ollama, en aquest PC o en un altre"
     },
     "provider.applies_next": {
         "en": "Changes apply from the next question: the engineer starts over",
-        "es": "Los cambios se aplican a partir de la siguiente pregunta: el ingeniero empieza de nuevo"
+        "es": "Los cambios se aplican a partir de la siguiente pregunta: el ingeniero empieza de nuevo",
+        "ca": "Els canvis s'apliquen a partir de la pregunta següent: l'enginyer torna a començar"
     },
     "provider.effort": {
         "en": "Effort",
-        "es": "Esfuerzo"
+        "es": "Esfuerzo",
+        "ca": "Esforç"
     },
     "provider.claude_effort_hover": {
         "en": "How much it thinks before answering (the levels depend on the model)",
-        "es": "Cuánto piensa antes de responder (los niveles dependen del modelo)"
+        "es": "Cuánto piensa antes de responder (los niveles dependen del modelo)",
+        "ca": "Quant pensa abans de respondre (els nivells depenen del model)"
     },
     "provider.ollama_effort_hover": {
         "en": "Thinking on this PC's GPU while the game uses it may make answers slow",
-        "es": "Pensar en la GPU del ordenador mientras la usa el juego puede hacer que las respuestas tarden"
+        "es": "Pensar en la GPU del ordenador mientras la usa el juego puede hacer que las respuestas tarden",
+        "ca": "Pensar amb la GPU de l'ordinador mentre la fa servir el joc pot fer que les respostes triguin"
     },
     "provider.max_tokens": {
         "en": "Max tokens: ",
-        "es": "Tokens máximos: "
+        "es": "Tokens máximos: ",
+        "ca": "Tokens màxims: "
     },
     "provider.max_tokens_hover": {
         "en": "The most it writes in one response, thinking included",
-        "es": "Lo máximo que escribe en una respuesta, incluido lo que piensa"
+        "es": "Lo máximo que escribe en una respuesta, incluido lo que piensa",
+        "ca": "El màxim que escriu en una resposta, incloent-hi el que pensa"
     },
     "provider.compaction": {
         "en": "Compaction",
-        "es": "Compactación"
+        "es": "Compactación",
+        "ca": "Compactació"
     },
     "provider.compaction_hover": {
         "en": "Summarizes the earlier conversation when it grows near the context window, so a long session never runs out of room. Only on models that support it",
-        "es": "Resume la conversación anterior cuando se acerca al límite de contexto, para que una sesión larga nunca se quede sin espacio. Solo en los modelos que lo admiten"
+        "es": "Resume la conversación anterior cuando se acerca al límite de contexto, para que una sesión larga nunca se quede sin espacio. Solo en los modelos que lo admiten",
+        "ca": "Resumeix la conversa anterior quan s'acosta al límit de context, perquè una sessió llarga no es quedi mai sense espai. Només en els models que ho admeten"
     },
     "provider.context": {
         "en": "Context: ",
-        "es": "Contexto: "
+        "es": "Contexto: ",
+        "ca": "Context: "
     },
     "provider.context_hover": {
         "en": "The context window it's loaded with: Ollama silently drops the start of a conversation that doesn't fit. More takes more memory",
-        "es": "La ventana de contexto con la que se carga: Ollama descarta sin avisar el principio de una conversación que no quepa. Más ocupa más memoria"
+        "es": "La ventana de contexto con la que se carga: Ollama descarta sin avisar el principio de una conversación que no quepa. Más ocupa más memoria",
+        "ca": "La finestra de context amb què es carrega: Ollama descarta sense avisar el principi d'una conversa que no hi càpiga. Més ocupa més memòria"
     },
     "provider.keep_loaded": {
         "en": "Keep loaded",
-        "es": "Mantener cargado"
+        "es": "Mantener cargado",
+        "ca": "Mantén carregat"
     },
     "provider.keep_loaded_hover": {
         "en": "How long Ollama keeps the model loaded after an answer",
-        "es": "Cuánto tiempo mantiene Ollama el modelo cargado después de una respuesta"
+        "es": "Cuánto tiempo mantiene Ollama el modelo cargado después de una respuesta",
+        "ca": "Quant de temps manté Ollama el model carregat després d'una resposta"
     },
     "provider.keep_default": {
         "en": "Ollama's default",
-        "es": "El de Ollama"
+        "es": "El de Ollama",
+        "ca": "El d'Ollama"
     },
     "provider.keep_5_minutes": {
         "en": "5 minutes",
-        "es": "5 minutos"
+        "es": "5 minutos",
+        "ca": "5 minuts"
     },
     "provider.keep_30_minutes": {
         "en": "30 minutes",
-        "es": "30 minutos"
+        "es": "30 minutos",
+        "ca": "30 minuts"
     },
     "provider.keep_1_hour": {
         "en": "1 hour",
-        "es": "1 hora"
+        "es": "1 hora",
+        "ca": "1 hora"
     },
     "provider.keep_forever": {
         "en": "Until Ollama stops",
-        "es": "Hasta que Ollama se detenga"
+        "es": "Hasta que Ollama se detenga",
+        "ca": "Fins que Ollama s'aturi"
     },
     "provider.keep_seconds": {
         "en": "{seconds} s",
-        "es": "{seconds} s"
+        "es": "{seconds} s",
+        "ca": "{seconds} s"
     },
     "provider.host": {
         "en": "Host:",
-        "es": "Servidor:"
+        "es": "Servidor:",
+        "ca": "Servidor:"
     },
     "provider.host_hint": {
         "en": "this PC",
-        "es": "este PC"
+        "es": "este PC",
+        "ca": "aquest PC"
     },
     "provider.host_hover": {
         "en": "Where Ollama listens, e.g. 192.168.1.5 or http://pc:11434",
-        "es": "Dónde escucha Ollama, p. ej. 192.168.1.5 o http://pc:11434"
+        "es": "Dónde escucha Ollama, p. ej. 192.168.1.5 o http://pc:11434",
+        "ca": "On escolta Ollama, p. ex. 192.168.1.5 o http://pc:11434"
     },
     "provider.model": {
         "en": "Model: {model}",
-        "es": "Modelo: {model}"
+        "es": "Modelo: {model}",
+        "ca": "Model: {model}"
     },
     "provider.looking_for_models": {
         "en": "Looking for models",
-        "es": "Buscando modelos"
+        "es": "Buscando modelos",
+        "ca": "Cercant models"
     },
     "provider.no_models": {
         "en": "No models: pull one with `ollama pull`",
-        "es": "No hay modelos: descarga uno con `ollama pull`"
+        "es": "No hay modelos: descarga uno con `ollama pull`",
+        "ca": "No hi ha models: baixa'n un amb `ollama pull`"
     },
     "provider.refresh": {
         "en": "Refresh",
-        "es": "Actualizar"
+        "es": "Actualizar",
+        "ca": "Actualitza"
     },
     "effort.none": {
         "en": "none",
-        "es": "ninguno"
+        "es": "ninguno",
+        "ca": "cap"
     },
     "effort.low": {
         "en": "low",
-        "es": "bajo"
+        "es": "bajo",
+        "ca": "baix"
     },
     "effort.medium": {
         "en": "medium",
-        "es": "medio"
+        "es": "medio",
+        "ca": "mitjà"
     },
     "effort.high": {
         "en": "high",
-        "es": "alto"
+        "es": "alto",
+        "ca": "alt"
     },
     "effort.xhigh": {
         "en": "extra high",
-        "es": "muy alto"
+        "es": "muy alto",
+        "ca": "molt alt"
     },
     "effort.max": {
         "en": "max",
-        "es": "máximo"
+        "es": "máximo",
+        "ca": "màxim"
     },
     "audio.system_default": {
         "en": "System default",
-        "es": "Predeterminado del sistema"
+        "es": "Predeterminado del sistema",
+        "ca": "Predeterminat del sistema"
     },
     "audio.test": {
         "en": "Test",
-        "es": "Probar"
+        "es": "Probar",
+        "ca": "Prova"
     },
     "audio.speaker": {
         "en": "Speaker",
-        "es": "Altavoz"
+        "es": "Altavoz",
+        "ca": "Altaveu"
     },
     "audio.microphone": {
         "en": "Microphone",
-        "es": "Micrófono"
+        "es": "Micrófono",
+        "ca": "Micròfon"
     },
     "audio.speech_to_text": {
         "en": "Speech To Text",
-        "es": "Voz a texto"
+        "es": "Voz a texto",
+        "ca": "Veu a text"
     },
     "audio.text_to_speech": {
         "en": "Text To Speech",
-        "es": "Texto a voz"
+        "es": "Texto a voz",
+        "ca": "Text a veu"
     },
     "audio.language_confidence": {
         "en": "Language confidence",
-        "es": "Confianza en el idioma"
+        "es": "Confianza en el idioma",
+        "ca": "Confiança en l'idioma"
     },
     "audio.language_confidence_hover": {
         "en": "How sure it must be of the language you spoke in, among those with a voice. Less sure of every one, what you said is ignored (e.g. noise)",
-        "es": "Cuánta seguridad necesita sobre el idioma en el que hablaste, entre los que tienen voz. Con menos seguridad en todos, lo que dijiste se ignora (p. ej. ruido)"
+        "es": "Cuánta seguridad necesita sobre el idioma en el que hablaste, entre los que tienen voz. Con menos seguridad en todos, lo que dijiste se ignora (p. ej. ruido)",
+        "ca": "Quanta seguretat necessita sobre l'idioma en què has parlat, entre els que tenen veu. Amb menys seguretat en tots, el que has dit s'ignora (p. ex. soroll)"
     },
     "audio.model": {
         "en": "Model",
-        "es": "Modelo"
+        "es": "Modelo",
+        "ca": "Model"
     },
     "audio.quantization": {
         "en": "Quantization",
-        "es": "Cuantización"
+        "es": "Cuantización",
+        "ca": "Quantització"
     },
     "audio.languages": {
         "en": "Languages",
-        "es": "Idiomas"
+        "es": "Idiomas",
+        "ca": "Idiomes"
     },
     "audio.english_only": {
         "en": "English",
-        "es": "Inglés"
+        "es": "Inglés",
+        "ca": "Anglès"
     },
     "audio.all_languages": {
         "en": "All",
-        "es": "Todos"
+        "es": "Todos",
+        "ca": "Tots"
     },
     "audio.use": {
         "en": "Use",
-        "es": "Usar"
+        "es": "Usar",
+        "ca": "Fes servir"
     },
     "audio.voice": {
         "en": "Voice",
-        "es": "Voz"
+        "es": "Voz",
+        "ca": "Veu"
     },
     "audio.region": {
         "en": "Region",
-        "es": "Región"
+        "es": "Región",
+        "ca": "Regió"
     },
     "audio.quality": {
         "en": "Quality",
-        "es": "Calidad"
+        "es": "Calidad",
+        "ca": "Qualitat"
     },
     "audio.speakers": {
         "en": "Speakers",
-        "es": "Hablantes"
+        "es": "Hablantes",
+        "ca": "Parlants"
     },
     "audio.size": {
         "en": "Size",
-        "es": "Tamaño"
+        "es": "Tamaño",
+        "ca": "Mida"
     },
     "quality.extra_low": {
         "en": "Extra low",
-        "es": "Muy baja"
+        "es": "Muy baja",
+        "ca": "Molt baixa"
     },
     "quality.low": {
         "en": "Low",
-        "es": "Baja"
+        "es": "Baja",
+        "ca": "Baixa"
     },
     "quality.medium": {
         "en": "Medium",
-        "es": "Media"
+        "es": "Media",
+        "ca": "Mitjana"
     },
     "quality.high": {
         "en": "High",
-        "es": "Alta"
+        "es": "Alta",
+        "ca": "Alta"
     },
     "quality.unknown": {
         "en": "Unknown",
-        "es": "Desconocida"
+        "es": "Desconocida",
+        "ca": "Desconeguda"
     },
     "error.speech_to_text": {
         "en": "Failed speech to text",
-        "es": "Error al pasar la voz a texto"
+        "es": "Error al pasar la voz a texto",
+        "ca": "Error en passar la veu a text"
     },
     "error.test_speech_playing": {
         "en": "Error playing test speech",
-        "es": "Error al reproducir la voz de prueba"
+        "es": "Error al reproducir la voz de prueba",
+        "ca": "Error en reproduir la veu de prova"
     },
     "error.synthesizing": {
         "en": "Error synthesizing speech",
-        "es": "Error al sintetizar la voz"
+        "es": "Error al sintetizar la voz",
+        "ca": "Error en sintetitzar la veu"
     },
     "error.open_speaker": {
         "en": "Failed to open speaker device",
-        "es": "No se pudo abrir el altavoz"
+        "es": "No se pudo abrir el altavoz",
+        "ca": "No s'ha pogut obrir l'altaveu"
     },
     "error.open_microphone": {
         "en": "Failed to open microphone device",
-        "es": "No se pudo abrir el micrófono"
+        "es": "No se pudo abrir el micrófono",
+        "ca": "No s'ha pogut obrir el micròfon"
     },
     "error.tts_catalog": {
         "en": "Error fetching text to speech catalog",
-        "es": "Error al obtener el catálogo de texto a voz"
+        "es": "Error al obtener el catálogo de texto a voz",
+        "ca": "Error en obtenir el catàleg de text a veu"
     },
     "error.stt_catalog": {
         "en": "Error fetching speech to text catalog",
-        "es": "Error al obtener el catálogo de voz a texto"
+        "es": "Error al obtener el catálogo de voz a texto",
+        "ca": "Error en obtenir el catàleg de veu a text"
     },
     "error.recording": {
         "en": "Error beginning microphone recording",
-        "es": "Error al empezar a grabar el micrófono"
+        "es": "Error al empezar a grabar el micrófono",
+        "ca": "Error en començar a gravar el micròfon"
     },
     "error.stt_model": {
         "en": "Error loading speech to text model",
-        "es": "Error al cargar el modelo de voz a texto"
+        "es": "Error al cargar el modelo de voz a texto",
+        "ca": "Error en carregar el model de veu a text"
     },
     "error.tts_model": {
         "en": "Error loading text to speech model",
-        "es": "Error al cargar el modelo de texto a voz"
+        "es": "Error al cargar el modelo de texto a voz",
+        "ca": "Error en carregar el model de text a veu"
     },
     "error.title": {
         "en": "Error",
-        "es": "Error"
+        "es": "Error",
+        "ca": "Error"
     },
     "error.saving_config": {
         "en": "Error saving config changes",
-        "es": "Error al guardar los cambios de la configuración"
+        "es": "Error al guardar los cambios de la configuración",
+        "ca": "Error en desar els canvis de la configuració"
     },
     "error.initializing": {
         "en": "Error initializing application",
-        "es": "Error al iniciar la aplicación"
+        "es": "Error al iniciar la aplicación",
+        "ca": "Error en iniciar l'aplicació"
     },
     "error.handling_event": {
         "en": "Unexpected error handling event",
-        "es": "Error inesperado al gestionar un evento"
+        "es": "Error inesperado al gestionar un evento",
+        "ca": "Error inesperat en gestionar un esdeveniment"
     },
     "error.removing_temporary": {
         "en": "Error removing temporary file",
-        "es": "Error al borrar un archivo temporal"
+        "es": "Error al borrar un archivo temporal",
+        "ca": "Error en esborrar un fitxer temporal"
     },
     "error.saving_tracks": {
         "en": "Error saving the list of tracks",
-        "es": "Error al guardar la lista de circuitos"
+        "es": "Error al guardar la lista de circuitos",
+        "ca": "Error en desar la llista de circuits"
     },
     "call.car_left": {
         "en": "car left",
-        "es": "coche a la izquierda"
+        "es": "coche a la izquierda",
+        "ca": "cotxe a l'esquerra"
     },
     "call.car_right": {
         "en": "car right",
-        "es": "coche a la derecha"
+        "es": "coche a la derecha",
+        "ca": "cotxe a la dreta"
     },
     "call.three_wide": {
         "en": "three wide",
-        "es": "tres en paralelo"
+        "es": "tres en paralelo",
+        "ca": "tres en paral·lel"
     },
     "call.clear_left": {
         "en": "clear left",
-        "es": "libre izquierda"
+        "es": "libre izquierda",
+        "ca": "lliure esquerra"
     },
     "call.clear_right": {
         "en": "clear right",
-        "es": "libre derecha"
+        "es": "libre derecha",
+        "ca": "lliure dreta"
     },
     "call.clear_all_round": {
         "en": "clear all round",
-        "es": "libre"
+        "es": "libre",
+        "ca": "lliure"
     },
     "call.still_there_left": {
         "en": "still there left",
-        "es": "sigue a la izquierda"
+        "es": "sigue a la izquierda",
+        "ca": "segueix a l'esquerra"
     },
     "call.still_there_right": {
         "en": "still there right",
-        "es": "sigue a la derecha"
+        "es": "sigue a la derecha",
+        "ca": "segueix a la dreta"
     },
     "call.puncture_front_left": {
         "en": "puncture front left",
-        "es": "pinchazo delantera izquierda"
+        "es": "pinchazo delantera izquierda",
+        "ca": "punxada davantera esquerra"
     },
     "call.puncture_front_right": {
         "en": "puncture front right",
-        "es": "pinchazo delantera derecha"
+        "es": "pinchazo delantera derecha",
+        "ca": "punxada davantera dreta"
     },
     "call.puncture_rear_left": {
         "en": "puncture rear left",
-        "es": "pinchazo trasera izquierda"
+        "es": "pinchazo trasera izquierda",
+        "ca": "punxada posterior esquerra"
     },
     "call.puncture_rear_right": {
         "en": "puncture rear right",
-        "es": "pinchazo trasera derecha"
+        "es": "pinchazo trasera derecha",
+        "ca": "punxada posterior dreta"
     },
     "call.parts_off": {
         "en": "parts off the car",
-        "es": "piezas sueltas"
+        "es": "piezas sueltas",
+        "ca": "peces soltes"
     },
     "call.engine_overheating": {
         "en": "engine overheating",
-        "es": "motor sobrecalentado"
+        "es": "motor sobrecalentado",
+        "ca": "motor sobreescalfat"
     },
     "call.limiter": {
         "en": "limiter, limiter",
-        "es": "limitador, limitador"
+        "es": "limitador, limitador",
+        "ca": "limitador, limitador"
     },
     "call.lap_invalidated": {
         "en": "lap invalidated",
-        "es": "vuelta invalidada"
+        "es": "vuelta invalidada",
+        "ca": "volta invalidada"
     },
     "call.car_close_behind": {
         "en": "car close behind",
-        "es": "coche pegado detrás"
+        "es": "coche pegado detrás",
+        "ca": "cotxe enganxat al darrere"
     },
     "call.car_within_a_second": {
         "en": "car within a second behind",
-        "es": "coche a menos de un segundo detrás"
+        "es": "coche a menos de un segundo detrás",
+        "ca": "cotxe a menys d'un segon al darrere"
     },
     "call.full_course_yellow": {
         "en": "full course yellow",
-        "es": "amarilla en todo el circuito"
+        "es": "amarilla en todo el circuito",
+        "ca": "groga a tot el circuit"
     },
     "call.green_flag": {
         "en": "green flag, green flag",
-        "es": "bandera verde, bandera verde"
+        "es": "bandera verde, bandera verde",
+        "ca": "bandera verda, bandera verda"
     },
     "call.red_flag": {
         "en": "red flag",
-        "es": "bandera roja"
+        "es": "bandera roja",
+        "ca": "bandera vermella"
     },
     "call.yellow_flag": {
         "en": "yellow flag on track",
-        "es": "bandera amarilla en pista"
+        "es": "bandera amarilla en pista",
+        "ca": "bandera groga a pista"
     },
     "call.blue_flag": {
         "en": "blue flag",
-        "es": "bandera azul"
+        "es": "bandera azul",
+        "ca": "bandera blava"
     },
     "call.penalty": {
         "en": "penalty",
-        "es": "penalización"
+        "es": "penalización",
+        "ca": "penalització"
     },
     "call.rain_starting": {
         "en": "rain starting",
-        "es": "empieza a llover"
+        "es": "empieza a llover",
+        "ca": "comença a ploure"
     },
     "call.rain_heavier": {
         "en": "rain getting heavier",
-        "es": "llueve más fuerte"
+        "es": "llueve más fuerte",
+        "ca": "plou més fort"
     },
     "call.rain_easing": {
         "en": "rain easing",
-        "es": "la lluvia afloja"
+        "es": "la lluvia afloja",
+        "ca": "la pluja minva"
     },
     "call.rain_stopped": {
         "en": "rain stopped",
-        "es": "ha dejado de llover"
+        "es": "ha dejado de llover",
+        "ca": "ha parat de ploure"
     },
     "call.track_wet": {
         "en": "track getting wet",
-        "es": "la pista se está mojando"
+        "es": "la pista se está mojando",
+        "ca": "la pista s'està mullant"
     },
     "call.track_wetter": {
         "en": "track getting wetter",
-        "es": "la pista está cada vez más mojada"
+        "es": "la pista está cada vez más mojada",
+        "ca": "la pista està cada cop més mullada"
     },
     "call.track_drying": {
         "en": "track drying",
-        "es": "la pista se está secando"
+        "es": "la pista se está secando",
+        "ca": "la pista s'està assecant"
     },
     "call.track_dry": {
         "en": "track dry",
-        "es": "pista seca"
+        "es": "pista seca",
+        "ca": "pista seca"
     },
     "call.wet_patch": {
         "en": "wet patch",
-        "es": "zona mojada"
+        "es": "zona mojada",
+        "ca": "zona mullada"
     },
     "call.rain_in_minutes": {
         "en": "rain likely in about {} minutes",
-        "es": "probable lluvia en unos {} minutos"
+        "es": "probable lluvia en unos {} minutos",
+        "ca": "probable pluja d'aquí a uns {} minuts"
     },
     "call.rain_in_a_minute": {
         "en": "rain likely in about a minute",
-        "es": "probable lluvia en un minuto"
+        "es": "probable lluvia en un minuto",
+        "ca": "probable pluja d'aquí a un minut"
     },
     "engineer.no_telemetry": {
         "en": "No telemetry yet, get in the car.",
-        "es": "Todavía no hay telemetría, súbete al coche."
+        "es": "Todavía no hay telemetría, súbete al coche.",
+        "ca": "Encara no hi ha telemetria, puja al cotxe."
     },
     "engineer.say_again": {
         "en": "Say again?",
-        "es": "¿Puedes repetir?"
+        "es": "¿Puedes repetir?",
+        "ca": "Pots repetir?"
     },
     "engineer.detail_no_telemetry": {
         "en": "no telemetry",
-        "es": "sin telemetría"
+        "es": "sin telemetría",
+        "ca": "sense telemetria"
     },
     "engineer.detail_cut_off": {
         "en": "cut off",
-        "es": "cortada"
+        "es": "cortada",
+        "ca": "tallada"
     },
     "engineer.detail_declined": {
         "en": "declined",
-        "es": "rechazada"
+        "es": "rechazada",
+        "ca": "rebutjada"
     },
     "engineer.detail_full": {
         "en": "conversation full, starting over",
-        "es": "conversación llena, empezando de nuevo"
+        "es": "conversación llena, empezando de nuevo",
+        "ca": "conversa plena, tornant a començar"
     },
     "engineer.detail_tokens": {
         "en": "{model} | {input} in, {cached} cached, {output} out",
-        "es": "{model} | {input} de entrada, {cached} en caché, {output} de salida"
+        "es": "{model} | {input} de entrada, {cached} en caché, {output} de salida",
+        "ca": "{model} | {input} d'entrada, {cached} a la memòria cau, {output} de sortida"
     },
     "engineer.new_session": {
         "en": "New session: the engineer starts over",
-        "es": "Nueva sesión: el ingeniero empieza de nuevo"
+        "es": "Nueva sesión: el ingeniero empieza de nuevo",
+        "ca": "Nova sessió: l'enginyer torna a començar"
     },
     "engineer.new_model": {
         "en": "New model settings: the engineer starts over",
-        "es": "Nuevos ajustes del modelo: el ingeniero empieza de nuevo"
+        "es": "Nuevos ajustes del modelo: el ingeniero empieza de nuevo",
+        "ca": "Nova configuració del model: l'enginyer torna a començar"
     },
     "engineer.error_starting": {
         "en": "Error starting the race engineer: {error}",
-        "es": "Error al iniciar el ingeniero de carrera: {error}"
+        "es": "Error al iniciar el ingeniero de carrera: {error}",
+        "ca": "Error en iniciar l'enginyer de cursa: {error}"
     },
     "engineer.sim_stopped": {
         "en": "The simulator stopped: the session ended",
-        "es": "El simulador se ha detenido: la sesión ha terminado"
+        "es": "El simulador se ha detenido: la sesión ha terminado",
+        "ca": "El simulador s'ha aturat: la sessió s'ha acabat"
     },
     "engineer.error_asking": {
         "en": "Error asking the race engineer: {error}",
-        "es": "Error al preguntar al ingeniero de carrera: {error}"
+        "es": "Error al preguntar al ingeniero de carrera: {error}",
+        "ca": "Error en preguntar a l'enginyer de cursa: {error}"
     },
     "engineer.error_synthesizing": {
         "en": "Error synthesizing the answer: {error}",
-        "es": "Error al sintetizar la respuesta: {error}"
+        "es": "Error al sintetizar la respuesta: {error}",
+        "ca": "Error en sintetitzar la resposta: {error}"
     },
     "engineer.no_speaker": {
         "en": "No speaker selected: the answer isn't played",
-        "es": "No hay altavoz seleccionado: la respuesta no se reproduce"
+        "es": "No hay altavoz seleccionado: la respuesta no se reproduce",
+        "ca": "No hi ha cap altaveu seleccionat: la resposta no es reprodueix"
     },
     "engineer.error_playing": {
         "en": "Error playing the answer: {error}",
-        "es": "Error al reproducir la respuesta: {error}"
+        "es": "Error al reproducir la respuesta: {error}",
+        "ca": "Error en reproduir la resposta: {error}"
     },
     "engineer.cancelled": {
         "en": "Cancelled: the pilot talked over it",
-        "es": "Cancelada: el piloto habló por encima"
+        "es": "Cancelada: el piloto habló por encima",
+        "ca": "Cancel·lada: el pilot hi ha parlat per sobre"
     },
     "provider.claude_unreachable": {
         "en": "Couldn't reach the Claude API",
-        "es": "No se pudo conectar con la API de Claude"
+        "es": "No se pudo conectar con la API de Claude",
+        "ca": "No s'ha pogut connectar amb l'API de Claude"
     },
     "provider.no_claude_credentials": {
         "en": "No Claude credentials: set ANTHROPIC_API_KEY",
-        "es": "No hay credenciales de Claude: define ANTHROPIC_API_KEY"
+        "es": "No hay credenciales de Claude: define ANTHROPIC_API_KEY",
+        "ca": "No hi ha credencials de Claude: defineix ANTHROPIC_API_KEY"
     },
     "provider.ollama_unreachable": {
         "en": "Couldn't reach Ollama at {url} (is it running?)",
-        "es": "No se pudo conectar con Ollama en {url} (¿está en marcha?)"
+        "es": "No se pudo conectar con Ollama en {url} (¿está en marcha?)",
+        "ca": "No s'ha pogut connectar amb Ollama a {url} (està en marxa?)"
     },
     "provider.ollama_pull_hint": {
         "en": " (pull it with `ollama pull`)",
-        "es": " (descárgalo con `ollama pull`)"
+        "es": " (descárgalo con `ollama pull`)",
+        "ca": " (baixa'l amb `ollama pull`)"
     },
     "provider.openai_hover": {
         "en": "Any OpenAI-compatible API: llama.cpp's llama-server (started with --jinja), LM Studio, vLLM, OpenRouter, OpenAI...",
-        "es": "Cualquier API compatible con OpenAI: llama-server de llama.cpp (iniciado con --jinja), LM Studio, vLLM, OpenRouter, OpenAI..."
+        "es": "Cualquier API compatible con OpenAI: llama-server de llama.cpp (iniciado con --jinja), LM Studio, vLLM, OpenRouter, OpenAI...",
+        "ca": "Qualsevol API compatible amb OpenAI: llama-server de llama.cpp (iniciat amb --jinja), LM Studio, vLLM, OpenRouter, OpenAI..."
     },
     "provider.base_url": {
         "en": "URL:",
-        "es": "URL:"
+        "es": "URL:",
+        "ca": "URL:"
     },
     "provider.base_url_hover": {
         "en": "The API's base, with its version, e.g. http://127.0.0.1:8080/v1. The API key comes from OPENAI_API_KEY",
-        "es": "La base de la API, con su versión, p. ej. http://127.0.0.1:8080/v1. La clave de la API se toma de OPENAI_API_KEY"
+        "es": "La base de la API, con su versión, p. ej. http://127.0.0.1:8080/v1. La clave de la API se toma de OPENAI_API_KEY",
+        "ca": "La base de l'API, amb la seva versió, p. ex. http://127.0.0.1:8080/v1. La clau de l'API s'agafa d'OPENAI_API_KEY"
     },
     "provider.openai_effort_hover": {
         "en": "reasoning_effort: the model's default when unset. None also turns thinking off in llama.cpp's thinking models",
-        "es": "reasoning_effort: el predeterminado del modelo si no se fija. Ninguno también desactiva el razonamiento en los modelos de llama.cpp que piensan"
+        "es": "reasoning_effort: el predeterminado del modelo si no se fija. Ninguno también desactiva el razonamiento en los modelos de llama.cpp que piensan",
+        "ca": "reasoning_effort: el predeterminat del model si no es fixa. Cap també desactiva el raonament en els models de llama.cpp que pensen"
     },
     "effort.default": {
         "en": "model's default",
-        "es": "el del modelo"
+        "es": "el del modelo",
+        "ca": "el del model"
     },
     "provider.openai_unreachable": {
         "en": "Couldn't reach {url} (is the server running?)",
-        "es": "No se pudo conectar con {url} (¿está en marcha el servidor?)"
+        "es": "No se pudo conectar con {url} (¿está en marcha el servidor?)",
+        "ca": "No s'ha pogut connectar amb {url} (està en marxa el servidor?)"
     }
 }
