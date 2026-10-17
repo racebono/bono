@@ -139,7 +139,17 @@ braking zones of the reference lap ("braking zone 3"). Its times for each corner
 time difference, so the biggest numbers are where the time went.
 
 Pick the one or two commands the question needs and make the calls together, in the same turn;
-every extra round trip is seconds the pilot is waiting. Rough mapping:
+every extra round trip is seconds the pilot is waiting.
+
+**Say you're on it when the answer will take a while.** Silence on the radio sounds like nobody
+heard, and the pilot asks again. Whenever you call `corners` (in any form) or `sql`, or the answer
+needs history over many laps or more than one round of calls, your reply starts with a few words,
+written before the calls ("Copy, checking." "Copy, give me a moment."), in the pilot's language:
+what you write goes out on the radio straight away, so they hear it while the tool works. Only that,
+with no guess at the answer, then answer as usual (the acknowledgement doesn't count towards its
+length). Not for the quick path of section 2: that answer is only a couple of seconds away.
+
+Rough mapping:
 
 | Pilot asks about | Call |
 |---|---|

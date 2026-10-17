@@ -10,7 +10,7 @@
         "Gives the verdict that the pilot can't make it to the end on energy and needs one more stop",
         "Uses the race length from the session data without asking the pilot for it",
         "Does not read back values shown on the game UI (virtual energy %, fuel litres, per-lap usage, lap times, time left)",
-        "At most 2 sentences",
+        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
         "Adds nothing the pilot didn't ask for: no advice on what to do, no reasons, no other topics or reassurance"
       ]
     },
@@ -23,7 +23,8 @@
         "Confirms a car alongside on the right",
         "Identifies it as a lapped car and/or a GT3 (or Hughes)",
         "No distances in metres, speeds or other numbers the pilot didn't ask for",
-        "At most 2 sentences"
+        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
+        "Answers straight away, with no acknowledgement like \"Copy, checking.\" first"
       ]
     },
     {
@@ -37,7 +38,8 @@
         "Does not read back tyre temperatures, wear percentages, pressures or lap times",
         "Does not name another car as the contact partner",
         "Doesn't blame the slow lap after the hit on the tyres or damage; if it gives a cause, it's the early braking into T2 Curva del Lago",
-        "At most 3 sentences"
+        "At most 3 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
+        "Starts with a brief acknowledgement of a few words (like \"Copy, checking.\") before the answer, without guessing at the answer in it"
       ]
     },
     {
@@ -48,7 +50,8 @@
       "assertions": [
         "Says the car is on the RIGHT",
         "Answer is at most ~12 words",
-        "Gives the side only: not who it is, nor the other side"
+        "Gives the side only: not who it is, nor the other side",
+        "Answers straight away, with no acknowledgement like \"Copy, checking.\" first"
       ]
     },
     {
@@ -71,7 +74,7 @@
         "Names the car behind as Ruiz (Sofia Ruiz)",
         "Says she is not quicker / not closing",
         "Does not read back lap times or gaps the pilot can see",
-        "At most 2 sentences",
+        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
         "Adds nothing the pilot didn't ask for: no advice on what to do, no reasons, no other topics or reassurance"
       ]
     },
@@ -82,8 +85,9 @@
       "files": [],
       "assertions": [
         "Says one more track limit point/warning will bring a penalty",
-        "At most 2 sentences",
-        "Adds nothing the pilot didn't ask for: no advice on what to do, no reasons, no other topics or reassurance"
+        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
+        "Adds nothing the pilot didn't ask for: no advice on what to do, no reasons, no other topics or reassurance",
+        "Answers straight away, with no acknowledgement like \"Copy, checking.\" first"
       ]
     },
     {
@@ -94,7 +98,7 @@
       "assertions": [
         "Gives the time left as about 15 minutes",
         "Says it is dry / no rain",
-        "At most 3 sentences",
+        "At most 3 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
         "Adds nothing beyond the time left and the weather (no strategy, tyres or energy)",
         "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times"
       ]
@@ -108,7 +112,8 @@
         "Names T2 / Curva del Lago (the lake corner) as where most time is lost",
         "Does not claim big losses elsewhere (the other corners are close to the reference)",
         "Does not volunteer how to fix it (no braking advice) or why, since the pilot only asked where",
-        "At most 2 sentences, no lap times read back"
+        "At most 2 sentences, no lap times read back, not counting a brief acknowledgement like \"Copy, checking.\" before it",
+        "Starts with a brief acknowledgement of a few words (like \"Copy, checking.\") before the answer, without guessing at the answer in it"
       ]
     },
     {
@@ -120,7 +125,8 @@
         "Advises braking later, by roughly 30 to 40 metres compared with the last lap (or rounded equivalent)",
         "Phrases the advice relative to the pilot's own driving, without inventing marker boards",
         "Doesn't explain the reasoning or talk about other corners",
-        "At most 1 sentence"
+        "At most 1 sentence, not counting a brief acknowledgement like \"Copy, checking.\" before it",
+        "Starts with a brief acknowledgement of a few words (like \"Copy, checking.\") before the answer, without guessing at the answer in it"
       ]
     },
     {
@@ -131,7 +137,8 @@
       "assertions": [
         "Names T3 / Esse as where lap 7 lost its time",
         "Says it was the exit / too slow through the corner (low apex or exit speed), not the braking point",
-        "At most 3 sentences"
+        "At most 3 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
+        "Starts with a brief acknowledgement of a few words (like \"Copy, checking.\") before the answer, without guessing at the answer in it"
       ]
     },
     {
@@ -142,7 +149,7 @@
       "assertions": [
         "Says rain is likely / a good chance late in the race (around the last part / finish), not certain",
         "Doesn't add other topics (time left, tyres, energy, strategy)",
-        "At most 1 sentence",
+        "At most 1 sentence, not counting a brief acknowledgement like \"Copy, checking.\" before it",
         "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times"
       ]
     },
@@ -154,7 +161,7 @@
       "assertions": [
         "Says we cannot make it on energy as things are (short by about three laps) so a stop is needed",
         "Does not bring in the weather, tyres or other topics the pilot didn't ask about",
-        "At most 2 sentences"
+        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it"
       ]
     },
     {
@@ -165,7 +172,8 @@
       "assertions": [
         "Names T2 / Curva del Lago as the biggest difference on the last lap",
         "Names only the biggest difference (at most one more if it is similar in size), no rundown of every corner",
-        "At most 2 sentences"
+        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
+        "Starts with a brief acknowledgement of a few words (like \"Copy, checking.\") before the answer, without guessing at the answer in it"
       ]
     },
     {
@@ -190,7 +198,7 @@
         "Says we cannot make it to the end on energy",
         "Says when to box (a lap or a number of laps from now)",
         "Gives a reason for that timing, since the pilot asked why",
-        "At most 3 sentences"
+        "At most 3 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it"
       ]
     },
     {
@@ -201,7 +209,7 @@
       "assertions": [
         "Says rain is likely (a chance, not certain), building over the next few minutes and most likely by the end",
         "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times",
-        "At most 2 sentences"
+        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it"
       ]
     },
     {
@@ -212,7 +220,7 @@
       "assertions": [
         "Dry now, rain chances rising to about 70 percent by the finish",
         "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times",
-        "At most 2 sentences"
+        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it"
       ]
     },
     {
@@ -224,7 +232,7 @@
         "Treats rain as a chance, not a certainty",
         "Ties any tyre call to when the rain is likely, relative to now or to the stop",
         "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times",
-        "At most 3 sentences"
+        "At most 3 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it"
       ]
     },
     {
@@ -235,7 +243,7 @@
       "assertions": [
         "Says rain is a good chance late in the race (around 70 percent towards the end), as a chance",
         "Places it in the race with words like early, halfway, late or by the end, never as percent marks or clock times",
-        "At most 2 sentences"
+        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it"
       ]
     },
     {
@@ -246,7 +254,7 @@
       "assertions": [
         "Says it stays dry (rain chances only a few percent) for the rest of practice",
         "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times",
-        "At most 2 sentences"
+        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it"
       ]
     }
   ]
