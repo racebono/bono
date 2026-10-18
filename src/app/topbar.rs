@@ -71,11 +71,14 @@ impl Topbar {
     ) {
         egui::Panel::top("tobpar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                MenuButton::new(t!("settings"))
+                let (_, settings) = MenuButton::new(t!("settings"))
                     .config(
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
                     .ui(ui, |ui| self.settings.update(rt, ss, ui, config));
+                if settings.is_none() {
+                    self.settings.closed();
+                }
 
                 MenuButton::new(t!("audio"))
                     .config(

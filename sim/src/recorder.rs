@@ -209,11 +209,14 @@ impl Recorder {
             }
         }
 
-        if let Some(player) = standings
-            .iter()
-            .find(|standing| standing.is_player.get() == Some(true))
-            .and_then(|standing| standing.vehicle_id.get())
-        {
+        // No car is the player's (spectating, a replay): no telemetry is flagged as theirs, rather
+        // than the car that has the player's last id
+        if !standings.is_empty() {
+            let player = standings
+                .iter()
+                .find(|standing| standing.is_player.get() == Some(true))
+                .and_then(|standing| standing.vehicle_id.get())
+                .unwrap_or(-1);
             self.shared.player_id.store(player, Ordering::Relaxed);
         }
 
@@ -227,8 +230,12 @@ impl Recorder {
     }
 
     /// Deletes everything recorded so far (on the writer thread, soon after), e.g. when a session
-    /// ends.
+    /// ends. What's known about the cars goes too: until the next scoring update, the new
+    /// session's cars aren't taken for the old one's (the player's id, where each car was).
     pub fn clear(&self) {
+        *lock(&self.tracking) = Tracking::default();
+        self.shared.player_id.store(-1, Ordering::Relaxed);
+
         let mut queue = lock(&self.shared.queue);
         queue.telemetry.clear();
         queue.scoring.clear();
@@ -543,16 +550,71 @@ mod tests {
         assert_eq!(sky, "Clear");
     }
 
+    /// Waits for the writer to have written everything queued so far.
+    fn written(recorder: &Recorder) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !lock(&recorder.shared.queue).is_empty() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn forgets_the_player_when_cleared_or_spectating() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        let telemetry = |vehicle: i64| {
+            let mut telemetry = lambiase_telemetry::default();
+            telemetry.vehicle_id = Some(vehicle).into();
+            telemetry
+        };
+
+        recorder.push_scoring(lambiase_session_info::default(), vec![standing(1, true, 0.0)]);
+        recorder.push_telemetry(&telemetry(1));
+        written(&recorder);
+
+        // A new weekend: car 1 is someone else's until scoring says otherwise
+        recorder.clear();
+        recorder.push_telemetry(&telemetry(1));
+        written(&recorder);
+
+        // Spectating: nobody is the player
+        recorder.push_scoring(lambiase_session_info::default(), vec![standing(1, false, 0.0)]);
+        recorder.push_telemetry(&telemetry(1));
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        let flags = conn
+            .prepare("SELECT is_player FROM telemetry ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, bool>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(flags, [false, false]);
+    }
+
     #[test]
     fn clears_what_was_recorded() {
         let dir = tempfile::tempdir().unwrap();
         let recorder = Recorder::new(dir.path(), None).unwrap();
         recorder.push_scoring(lambiase_session_info::default(), vec![standing(1, true, 0.0)]);
+        // Telemetry too, which the wheel and car state rows reference
+        assert!(recorder.wants_telemetry(1, 10.0, 0.0));
+        let mut telemetry = lambiase_telemetry::default();
+        telemetry.vehicle_id = Some(1).into();
+        recorder.push_telemetry(&telemetry);
+        written(&recorder);
+
         recorder.clear();
         recorder.push_scoring(lambiase_session_info::default(), vec![standing(2, true, 0.0)]);
         drop(recorder);
 
         let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        let telemetry = conn
+            .query_row("SELECT count(*) FROM telemetry", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(telemetry, 0);
         let vehicles = conn
             .prepare("SELECT vehicle_id FROM standings")
             .unwrap()

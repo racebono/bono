@@ -35,10 +35,11 @@ impl Chat {
                     )
                     .clicked();
 
+                // The box lets go of the keyboard once a question is sent: while it has it, egui
+                // takes every key, a talk or session button bound to one included
                 if (entered || clicked) && has_text {
                     sent = Some(std::mem::take(&mut self.draft).trim().to_owned());
-                    // Ready for the next one
-                    input.request_focus();
+                    input.surrender_focus();
                 }
             });
             ui.add_space(4.0);

@@ -1,0 +1,2 @@
+- LMU Plugin Install Button
+- Beep when talk button is pressed

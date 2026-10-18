@@ -13,6 +13,13 @@ pub struct SettingsTopbar {
 }
 
 impl SettingsTopbar {
+    /// The menu isn't showing: a button still waiting for a press stops waiting, or the next key
+    /// pressed anywhere (typing in the chat, say) would be bound once the menu opens again.
+    pub fn closed(&mut self) {
+        self.talk_button.waiting = None;
+        self.session_button.waiting = None;
+    }
+
     pub fn update(&mut self, rt: &Handle, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
         let (talk, session) = {
             let config = config.get();

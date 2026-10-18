@@ -1,6 +1,6 @@
 use crate::{
     app::{chat::Chat, topbar::Topbar},
-    button::{Button, ButtonWatcher},
+    button::{Button, ButtonWatcher, Joysticks},
     config::{Config, RawConfig},
     engineer::Engineer,
     sim::{ActiveSimulator, Sim, SimulatorSettings},
@@ -67,6 +67,7 @@ impl App {
         let audio = sdl.audio()?;
         let video = sdl.video()?;
         let joystick = sdl.joystick()?;
+        let joysticks = Joysticks::new(&joystick);
         let event = sdl.event()?;
         let fonts = load_fonts()?;
 
@@ -110,6 +111,7 @@ impl App {
         return Ok(Self {
             state: AppState {
                 subsystems,
+                joysticks,
                 config,
                 gui,
                 synth,
@@ -150,6 +152,7 @@ impl App {
     }
 
     pub fn event(&mut self, rt: &Handle, event: Event) -> AppResult {
+        self.state.joysticks.event(&event);
         if self.ui.on_event(&event).consumed {
             return AppResult::Continue;
         }
@@ -200,6 +203,8 @@ pub struct AppState {
     gui: Gui,
     config: Config,
     subsystems: Subsystems,
+    /// Kept open so their buttons can be bound and pressed
+    joysticks: Joysticks,
     synth: Synthesizer,
     simulators: ActiveSimulator,
     /// The recording settings last passed to the simulators

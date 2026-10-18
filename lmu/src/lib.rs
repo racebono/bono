@@ -111,6 +111,14 @@ pub unsafe extern "C" fn lambiase_lmu_clear(recorder: *const LmuRecorder) {
     guard((), || recorder.clear())
 }
 
+/// # Safety
+/// `recorder` must come from `lambiase_lmu_open`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lambiase_lmu_failed(recorder: *const LmuRecorder) -> bool {
+    let recorder = unsafe { &(*recorder).0 };
+    recorder.failed()
+}
+
 unsafe fn path(dir: *const u16, len: usize) -> PathBuf {
     let dir = match len {
         0 => &[][..],

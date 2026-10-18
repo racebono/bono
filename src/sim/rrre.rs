@@ -220,6 +220,13 @@ fn read(dir: &Path, stop: &AtomicBool) {
             continue;
         };
 
+        // Stopped on an error: a new one starts over, rather than nothing being recorded until the
+        // game closes
+        if recorder.as_ref().is_some_and(Recorder::failed) {
+            log::error!("Recording RaceRoom stopped on an error, starting over");
+            recorder = None;
+        }
+
         // Only once there's something to record, so menus leave no empty database
         if recorder.is_none() {
             match Recorder::new(dir, None) {
@@ -463,17 +470,17 @@ fn player_telemetry(shared: &r3e_shared, out: &mut lambiase_telemetry) {
     out.delta_best = Some(shared.time_delta_best_self as f64)
         .filter(|delta| *delta > -1000.0)
         .into();
-    // Local axes: +x left, +y up, +z back, like LMU's
+    // Local axes: +x left, +y up, +z back, like LMU's, so lateral (+ right) is -x
     let (velocity, acceleration, rotation) = (
         player.local_velocity,
         player.local_acceleration,
         player.local_angular_velocity,
     );
     out.velocity_longitudinal = Some(-velocity.z).into();
-    out.velocity_lateral = Some(velocity.x).into();
+    out.velocity_lateral = Some(-velocity.x).into();
     out.velocity_vertical = Some(velocity.y).into();
     out.acceleration_longitudinal = Some(-acceleration.z).into();
-    out.acceleration_lateral = Some(acceleration.x).into();
+    out.acceleration_lateral = Some(-acceleration.x).into();
     out.acceleration_vertical = Some(acceleration.y).into();
     out.pitch_rate = Some(rotation.x).into();
     out.yaw_rate = Some(rotation.y).into();
@@ -925,6 +932,17 @@ mod tests {
             y: 0.0,
             z: -50.0,
         };
+        // Sliding a little to its left (+x), and turning right (pulled to the right, -x)
+        player.local_velocity = r3e_vec3_f64 {
+            x: 2.0,
+            y: 0.0,
+            z: -50.0,
+        };
+        player.local_acceleration = r3e_vec3_f64 {
+            x: -9.0,
+            y: 0.0,
+            z: 0.0,
+        };
         shared.player = player;
 
         let mut info = shared.vehicle_info;
@@ -1034,6 +1052,10 @@ mod tests {
         assert_eq!(mine.lap_invalidated.get(), Some(false));
         assert_eq!(mine.heading.get(), Some(0.0));
         assert_eq!(mine.speed.get(), Some(50.0));
+        // Lateral is + right, as LMU's plugin has it
+        assert_eq!(mine.velocity_longitudinal.get(), Some(50.0));
+        assert_eq!(mine.velocity_lateral.get(), Some(-2.0));
+        assert_eq!(mine.acceleration_lateral.get(), Some(9.0));
         assert_eq!(mine.gear.get(), Some(4));
         assert!((mine.engine_rpm.get().unwrap() - 5729.58).abs() < 0.01);
         assert_eq!(mine.fuel.get(), Some(42.0));

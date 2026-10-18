@@ -1,11 +1,63 @@
 use sdl3::{
     EventSubsystem, IntegerOrSdlError, JoystickSubsystem,
     event::{Event, EventWatch, EventWatchCallback},
-    joystick::JoystickId,
+    joystick::{Joystick, JoystickId},
     keyboard::Scancode,
     sys::guid::SDL_GUID,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// Every joystick plugged in (wheels, button boxes, pedals), kept open: SDL only reports the
+/// buttons of the joysticks that are open.
+pub struct Joysticks {
+    subsystem: JoystickSubsystem,
+    open: HashMap<JoystickId, Joystick>,
+}
+
+impl Joysticks {
+    pub fn new(subsystem: &JoystickSubsystem) -> Self {
+        let mut this = Self {
+            subsystem: subsystem.clone(),
+            open: HashMap::new(),
+        };
+        match subsystem.joysticks() {
+            Ok(ids) => ids.into_iter().for_each(|id| this.open(id)),
+            Err(e) => log::error!("Couldn't list the joysticks: {e}"),
+        }
+        return this;
+    }
+
+    /// Opens the joysticks plugged in later, and lets go of the ones unplugged.
+    pub fn event(&mut self, event: &Event) {
+        match *event {
+            Event::JoyDeviceAdded { which, .. } => self.open(which),
+            Event::JoyDeviceRemoved { which, .. } => {
+                if let Some(joystick) = self.open.remove(&which) {
+                    log::info!("Joystick unplugged: {}", joystick.name());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn open(&mut self, id: JoystickId) {
+        if self.open.contains_key(&id) {
+            return;
+        }
+        match self.subsystem.open(id) {
+            Ok(joystick) => {
+                log::info!(
+                    "Joystick: {} ({} buttons)",
+                    joystick.name(),
+                    joystick.num_buttons()
+                );
+                self.open.insert(id, joystick);
+            }
+            Err(e) => log::error!("Couldn't open joystick {}: {e}", id.raw()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Button {

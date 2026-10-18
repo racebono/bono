@@ -553,7 +553,10 @@ namespace {
             return user_data / "lambiase";
         }
 
+        // A recorder that stopped on an error is replaced, so a failure costs a session rather than the rest of
+        // the run.
         void start_recording() {
+            if (_recorder && lambiase_lmu_failed(_recorder)) close();
             if (_recorder) return;
             try {
                 const std::wstring dir = database_dir().native();

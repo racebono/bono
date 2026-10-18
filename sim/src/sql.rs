@@ -107,6 +107,9 @@ pub fn clear_tables(conn: &Connection) -> rusqlite::Result<()> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let tx = conn.unchecked_transaction()?;
+    // Foreign keys are on (rusqlite's bundled SQLite), and `telemetry` comes before the tables
+    // referencing it: checked at the commit instead, once they're all empty. Ends with it
+    tx.pragma_update(None, "defer_foreign_keys", true)?;
     for table in tables {
         tx.execute(&format!("DELETE FROM \"{}\"", table.replace('"', "\"\"")), [])?;
     }

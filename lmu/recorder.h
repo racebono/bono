@@ -36,6 +36,8 @@ void lambiase_lmu_push_scoring(lambiase_lmu_recorder* recorder, lambiase_session
                                lambiase_standing_s* standings, size_t count);
 // Deletes everything recorded so far, e.g. when a session ends.
 void lambiase_lmu_clear(lambiase_lmu_recorder* recorder);
+// Whether recording stopped on an error: nothing more is recorded until it's closed and opened again.
+bool lambiase_lmu_failed(lambiase_lmu_recorder* recorder);
 
 #ifdef __cplusplus
 }
