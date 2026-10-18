@@ -101,14 +101,20 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
 
 /// Deletes every row of every table.
 pub fn clear_tables(conn: &Connection) -> rusqlite::Result<()> {
+    // Newest first: the tables referencing `telemetry` (`telemetry_wheel`, `car_state`) are made
+    // after it, so they're emptied before it. Foreign keys are on (rusqlite's bundled SQLite), and
+    // each `telemetry` row deleted while `car_state` still has rows is looked up in it, which has
+    // no index by `telemetry_id`: a whole scan per row, minutes for a weekend
     let tables = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")?
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+             ORDER BY rowid DESC",
+        )?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let tx = conn.unchecked_transaction()?;
-    // Foreign keys are on (rusqlite's bundled SQLite), and `telemetry` comes before the tables
-    // referencing it: checked at the commit instead, once they're all empty. Ends with it
+    // Checked at the commit instead, once they're all empty, whatever order they're in. Ends with it
     tx.pragma_update(None, "defer_foreign_keys", true)?;
     for table in tables {
         tx.execute(&format!("DELETE FROM \"{}\"", table.replace('"', "\"\"")), [])?;
@@ -306,4 +312,39 @@ fn same_forecast(a: &[lambiase_forecast_point], b: &[lambiase_forecast_point]) -
             a.session_time = b.session_time;
             !a.changed(b)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A weekend's worth of rows, cut down: with `telemetry` emptied first, every row of it
+    /// scanned `car_state`, taking seconds here and minutes for a real weekend.
+    #[test]
+    fn clears_a_big_recording_quickly() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        conn.execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40000)
+             INSERT INTO telemetry (id) SELECT i FROM n;
+             INSERT INTO telemetry_wheel (telemetry_id, wheel)
+                 SELECT id, wheel FROM telemetry, (SELECT 0 AS wheel UNION ALL SELECT 1
+                     UNION ALL SELECT 2 UNION ALL SELECT 3);
+             INSERT INTO car_state (telemetry_id, vehicle_id) SELECT id, id % 20 FROM telemetry
+                 WHERE id % 10 = 0;",
+        )
+        .unwrap();
+
+        let start = Instant::now();
+        clear_tables(&conn).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2), "took {:?}", start.elapsed());
+
+        for table in ["telemetry", "telemetry_wheel", "car_state"] {
+            let count = conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get::<_, i64>(0))
+                .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+    }
 }
