@@ -1,5 +1,5 @@
 use crate::{
-    app::{chat::Chat, topbar::Topbar},
+    app::{chat::Chat, onboarding::Onboarding, topbar::Topbar},
     button::{Button, ButtonWatcher, Joysticks},
     config::{Config, RawConfig},
     engineer::Engineer,
@@ -32,6 +32,7 @@ use std::{
 use tokio::runtime::Handle;
 
 mod chat;
+mod onboarding;
 mod topbar;
 
 pub struct App {
@@ -336,6 +337,7 @@ impl Subsystems {
 pub struct Gui {
     pub topbar: Topbar,
     chat: Chat,
+    onboarding: Onboarding,
     applied_text_scale: Option<f32>,
 }
 
@@ -349,6 +351,7 @@ impl Gui {
         Self {
             topbar: Topbar::new(pref_path, ss, config, client),
             chat: Chat::default(),
+            onboarding: Onboarding::new(config),
             applied_text_scale: None,
         }
     }
@@ -365,8 +368,13 @@ impl Gui {
         simulators: &mut ActiveSimulator,
         engineer: &Engineer,
     ) -> Option<String> {
-        self.topbar.update(rt, ss, ui, config, synth, simulators);
-        self.chat.update(ui, engineer)
+        if self.topbar.update(rt, ss, ui, config, synth, simulators) {
+            self.onboarding.open();
+        }
+        let question = self.chat.update(ui, engineer);
+        self.onboarding
+            .update(rt, ui.ctx(), config, &mut self.topbar.audio, simulators);
+        question
     }
 
     fn event(&mut self, rt: &Handle, config: &Config, event: &Event) -> bool {

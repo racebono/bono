@@ -57,6 +57,13 @@ impl SimulatorsTopbar {
             .is_some_and(|(_, found)| found.iter().any(Found::needs_setup))
     }
 
+    /// Whether any of the games is installed, as last looked up.
+    pub fn any_installed(&self) -> bool {
+        self.found
+            .as_ref()
+            .is_some_and(|(_, found)| found.iter().any(|found| found.install_dir.is_some()))
+    }
+
     /// Looks at the disk again, if it's been a while.
     fn refresh(&mut self, simulators: &mut ActiveSimulator) {
         if self

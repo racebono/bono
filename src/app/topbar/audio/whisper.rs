@@ -1,6 +1,9 @@
 use crate::{
     Download,
-    app::topbar::setup_label,
+    app::topbar::{
+        audio::{SetupItem, SetupState},
+        setup_label,
+    },
     arrstr,
     button::ConfigButton,
     config::{ArrayStr, Config, RawConfig},
@@ -44,8 +47,19 @@ pub const RECORDING_SPEC: AudioSpec = AudioSpec {
     format: Some(AudioFormat::f32_sys()),
 };
 
+/// The model the setup guide downloads: it understands every language, and is quick on a GPU
+const RECOMMENDED: &str = "ggml-large-v3-turbo-q5_0.bin";
+
 pub struct Whisper {
     ctx: Option<MaybeDone<Option<WhisperContext>>>,
+    /// The model `ctx` is loaded from
+    loaded: Option<Arc<Utf8Path>>,
+    /// The setup guide asked for the recommended model: it's downloaded, then used once it's on
+    /// disk (unless another was picked meanwhile)
+    setup: bool,
+    /// The setup's download was started: one that fails isn't started again until it's asked
+    /// for again
+    setup_started: bool,
     stream: Option<WhisperStream>,
     catalog: MaybeDone<Option<Vec<Model>>>,
     threads: NonZeroUsize,
@@ -67,6 +81,9 @@ impl Whisper {
         let mut this = Self {
             client: client.clone(),
             ctx: None,
+            loaded: None,
+            setup: false,
+            setup_started: false,
             stream: None,
             catalog: MaybeDone::spawn(async move {
                 match Model::fetch_catalog(&pref_path, &client).await {
@@ -323,7 +340,90 @@ impl Whisper {
         }
     }
 
+    /// Called every frame: loads the model picked once it changes, and sets up the recommended
+    /// one if the setup guide asked for it.
+    pub fn poll(&mut self, rt: &Handle, config: &Config) {
+        let picked = config.get().whisper_model().clone();
+        if picked != self.loaded {
+            match picked {
+                Some(path) => self.set_model(path),
+                None => {
+                    self.ctx = None;
+                    self.loaded = None;
+                }
+            }
+        }
+
+        if !self.setup {
+            return;
+        }
+        if config.get().whisper_model().is_some() {
+            self.setup = false;
+            return;
+        }
+
+        let client = self.client.clone();
+        let started = self.setup_started;
+        let Some(model) = self.recommended(rt) else {
+            return;
+        };
+        match model.on_disk() {
+            Some(true) => {
+                let path = model.path.clone();
+                config.update(|raw| raw.whisper_model.set(Some(path)));
+                self.setup = false;
+            }
+            Some(false) if !started => {
+                model.start_download(&client);
+                self.setup_started = true;
+            }
+            Some(false) => {}
+            // Not looked for yet
+            None => {}
+        }
+    }
+
+    /// Downloads the recommended model (again, if it failed), and uses it once it's on disk, if
+    /// none is picked by then.
+    pub fn setup(&mut self) {
+        self.setup = true;
+        self.setup_started = false;
+    }
+
+    /// The recommended model, as the setup guide shows it: `None` if another is picked.
+    pub fn setup_item(&mut self, rt: &Handle, config: &Config) -> Option<SetupItem> {
+        let picked = config.get().whisper_model().clone();
+        let setup = self.setup;
+        let model = match self.catalog.update(rt) {
+            None => return picked.is_none().then_some(SetupItem::Loading),
+            Some(None) => return picked.is_none().then_some(SetupItem::Unavailable),
+            Some(Some(catalog)) => catalog.iter().find(|model| model.file == RECOMMENDED)?,
+        };
+        if !setup && picked.as_ref().is_some_and(|picked| *picked != model.path) {
+            return None;
+        }
+
+        let state = match (model.on_disk(), model.download()) {
+            (Some(true), _) => SetupState::Ready,
+            (_, Some(download)) => SetupState::Downloading(download.progress()),
+            _ if model.failed() => SetupState::Failed,
+            _ => SetupState::Missing,
+        };
+        Some(SetupItem::Found {
+            name: model.name.clone(),
+            size: model.size,
+            state,
+        })
+    }
+
+    fn recommended(&mut self, rt: &Handle) -> Option<&mut Model> {
+        self.catalog_mut(rt)?
+            .iter_mut()
+            .find(|model| model.file == RECOMMENDED)
+    }
+
     pub fn set_model(&mut self, path: Arc<Utf8Path>) {
+        self.loaded = Some(path.clone());
         self.ctx = Some(MaybeDone::spawn_blocking(
             move || match WhisperContext::new_with_params(
                 path.as_os_str(),
@@ -636,11 +736,21 @@ impl Model {
         *self.on_disk.borrow()
     }
 
+    /// The download under way, or done: `None` if there's none, or it failed.
     pub fn download(&self) -> Option<&Download> {
-        self.download.as_ref()
+        self.download.as_ref().filter(|download| !download.failed())
+    }
+
+    /// Whether the last download failed.
+    pub fn failed(&self) -> bool {
+        self.download.as_ref().is_some_and(Download::failed)
     }
 
     pub fn start_download(&mut self, client: &reqwest::Client) -> &mut Download {
+        // One that failed starts over
+        if self.failed() {
+            self.download = None;
+        }
         self.download.get_or_insert_with(|| {
             let path = Arc::into_raw(self.path.clone());
             let path = unsafe { Arc::<Path>::from_raw(path as *const Path) };

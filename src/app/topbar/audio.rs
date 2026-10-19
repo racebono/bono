@@ -39,6 +39,30 @@ mod whisper;
 
 const DELAY: Duration = Duration::from_secs(1);
 
+/// Something the setup guide downloads, as it shows it.
+pub enum SetupItem {
+    /// Its catalog is still being fetched
+    Loading,
+    /// Its catalog couldn't be fetched
+    Unavailable,
+    Found {
+        name: String,
+        /// In bytes
+        size: Option<u64>,
+        state: SetupState,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SetupState {
+    Missing,
+    /// How far along, from 0 to 1
+    Downloading(f64),
+    /// The download stopped before it was done
+    Failed,
+    Ready,
+}
+
 pub struct AudioTopbar {
     pub microphone: DeviceSelector,
     pub speaker: DeviceSelector,
@@ -81,6 +105,35 @@ impl AudioTopbar {
             || self.speaker.get().is_none()
             || config.whisper_model().is_none()
             || config.voices().is_empty()
+    }
+
+    /// Called every frame, open or not: loads the speech to text model picked, and sets up what
+    /// the setup guide asked for.
+    pub fn poll(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer) {
+        self.whisper.poll(rt, config);
+        self.voices.poll(rt, config, synth);
+    }
+
+    /// Downloads the recommended speech to text model, and voice for the app's language (again,
+    /// those that failed), and uses them once they're on disk (each, if none is picked by then).
+    pub fn setup(&mut self, config: &Config) {
+        let locale = config.get().locale().clone();
+        self.whisper.setup();
+        self.voices.setup(&locale);
+    }
+
+    /// What `setup` downloads, as the setup guide shows it: each with what it's for.
+    pub fn setup_items(&mut self, rt: &Handle, config: &Config) -> Vec<(&'static str, SetupItem)> {
+        let locale = config.get().locale().clone();
+        let whisper = self.whisper.setup_item(rt, config);
+        let voice = self.voices.setup_item(rt, config, &locale);
+        [
+            (t!("audio.speech_to_text"), whisper),
+            (t!("audio.voice"), voice),
+        ]
+        .into_iter()
+        .filter_map(|(what, item)| Some((what, item?)))
+        .collect()
     }
 
     /// What the pilot said on the radio, with its language, once it's transcribed.

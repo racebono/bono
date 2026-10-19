@@ -20,10 +20,10 @@ use sdl3::event::Event;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 
-mod audio;
+pub(super) mod audio;
 mod provider;
-mod settings;
-mod simulators;
+pub(super) mod settings;
+pub(super) mod simulators;
 mod spotter;
 mod volume;
 
@@ -63,6 +63,7 @@ impl Topbar {
         return false;
     }
 
+    /// Returns whether the setup guide was asked for.
     pub fn update(
         &mut self,
         rt: &Handle,
@@ -71,13 +72,16 @@ impl Topbar {
         config: &mut Config,
         synth: &mut Synthesizer,
         simulators: &mut ActiveSimulator,
-    ) {
+    ) -> bool {
+        self.audio.poll(rt, config, synth);
+
         // Every menu with something in it that isn't set up yet
         let settings_setup = config.get().talk_button().is_none();
         let audio_setup = self.audio.needs_setup(config);
         let provider_setup = provider::needs_setup(config);
         let simulators_setup = self.simulators.needs_setup(simulators);
 
+        let mut guide = false;
         egui::Panel::top("tobpar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 let (_, settings) = MenuButton::new(setup_label(settings_setup, t!("settings")))
@@ -85,6 +89,7 @@ impl Topbar {
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
                     .ui(ui, |ui| self.settings.update(rt, ss, ui, config));
+                guide = settings.as_ref().is_some_and(|settings| settings.inner);
                 if settings.is_none() {
                     self.settings.closed();
                 }
@@ -150,6 +155,7 @@ impl Topbar {
                 None => self.confirm_clear = false,
             }
         }
+        guide
     }
 }
 

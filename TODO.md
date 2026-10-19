@@ -1,2 +1,3 @@
 - Initial Startup Guide with helpers for what to install
 - Website
+- Add Model size column on Speech To Text

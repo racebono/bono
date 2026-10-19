@@ -3,7 +3,10 @@
 
 use crate::{
     Download,
-    app::topbar::setup_label,
+    app::topbar::{
+        audio::{SetupItem, SetupState},
+        setup_label,
+    },
     config::{ArrayStr, Config},
     error,
     synthesizer::Synthesizer,
@@ -25,9 +28,28 @@ use tokio::runtime::Handle;
 const CATALOG_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/voices.json";
 const FILE_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/";
 
+/// The voice the setup guide downloads for the app's language (`locale`, e.g. `en-US`): its
+/// language, and its name in the catalog.
+fn recommended(locale: &str) -> Option<(ArrayStr<2>, &'static str)> {
+    let lang = locale.split('-').next()?;
+    let voice = match lang {
+        "en" => "en_US-mike-medium",
+        "es" => "es_ES-davefx-medium",
+        "ca" => "ca_ES-upc_ona-medium",
+        _ => return None,
+    };
+    Some((ArrayStr::from_str(lang)?, voice))
+}
+
 pub struct Voices {
     catalog: MaybeDone<Option<Catalog>>,
     client: reqwest::Client,
+    /// The setup guide asked for the recommended voice of a language (and which it is): it's
+    /// downloaded, then used once it's on disk (unless another was picked meanwhile)
+    setup: Option<(ArrayStr<2>, &'static str)>,
+    /// The setup's download was started: one that fails isn't started again until it's asked
+    /// for again
+    setup_started: bool,
 }
 
 impl Voices {
@@ -37,6 +59,8 @@ impl Voices {
 
         return Self {
             client,
+            setup: None,
+            setup_started: false,
             catalog: MaybeDone::spawn(async move {
                 match Catalog::fetch(&pref_path, &fetch_client).await {
                     Ok(catalog) => Some(catalog),
@@ -47,6 +71,80 @@ impl Voices {
                 }
             }),
         };
+    }
+
+    /// Called every frame: sets up the recommended voice if the setup guide asked for it.
+    pub fn poll(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer) {
+        let Some((lang, name)) = self.setup else {
+            return;
+        };
+        if config.get().voices().contains_key(&lang) {
+            self.setup = None;
+            return;
+        }
+
+        let Some(Some(catalog)) = self.catalog.update(rt) else {
+            return;
+        };
+        let Some(voice) = find(&mut catalog.languages, lang, name) else {
+            log::warn!("The recommended voice '{name}' isn't in the catalog");
+            self.setup = None;
+            return;
+        };
+
+        let on_disk = (catalog.on_disk.borrow().as_ref())
+            .and_then(|on_disk| on_disk.get(voice.index).copied());
+        match on_disk {
+            Some(true) => {
+                let path = voice.path.to_path_buf();
+                config.update(|raw| raw.set_voice(rt, lang, Some(path), synth));
+                self.setup = None;
+            }
+            Some(false) if !self.setup_started => {
+                voice.start_download(&self.client);
+                self.setup_started = true;
+            }
+            Some(false) => {}
+            // Not looked for yet
+            None => {}
+        }
+    }
+
+    /// Downloads the recommended voice for the app's language (`locale`) (again, if it failed),
+    /// and uses it once it's on disk, if that language has none by then.
+    pub fn setup(&mut self, locale: &str) {
+        self.setup = recommended(locale);
+        self.setup_started = false;
+    }
+
+    /// The recommended voice for the app's language (`locale`), as the setup guide shows it:
+    /// `None` if there's none, or another is picked.
+    pub fn setup_item(&mut self, rt: &Handle, config: &Config, locale: &str) -> Option<SetupItem> {
+        let (lang, name) = self.setup.or_else(|| recommended(locale))?;
+        let picked = config.get().voices().get(&lang).cloned();
+        let catalog = match self.catalog.update(rt) {
+            None => return picked.is_none().then_some(SetupItem::Loading),
+            Some(None) => return picked.is_none().then_some(SetupItem::Unavailable),
+            Some(Some(catalog)) => catalog,
+        };
+        let voice = find(&mut catalog.languages, lang, name)?;
+        if self.setup.is_none() && picked.is_some_and(|picked| picked != *voice.path) {
+            return None;
+        }
+
+        let on_disk = (catalog.on_disk.borrow().as_ref())
+            .and_then(|on_disk| on_disk.get(voice.index).copied());
+        let state = match (on_disk, voice.progress()) {
+            (Some(true), _) => SetupState::Ready,
+            (_, Some(progress)) => SetupState::Downloading(progress),
+            _ if voice.failed() => SetupState::Failed,
+            _ => SetupState::Missing,
+        };
+        Some(SetupItem::Found {
+            name: format!("{} ({})", voice.name, voice.country),
+            size: Some(voice.model_size + voice.config_size),
+            state,
+        })
     }
 
     pub fn update(
@@ -99,6 +197,17 @@ impl Voices {
             });
         });
     }
+}
+
+/// The voice of language `lang` named `name` in the catalog (e.g. `en_US-mike-medium`).
+fn find<'a>(languages: &'a mut [Language], lang: ArrayStr<2>, name: &str) -> Option<&'a mut Voice> {
+    let file = format!("/{name}.onnx");
+    languages
+        .iter_mut()
+        .find(|language| language.code == lang)?
+        .voices
+        .iter_mut()
+        .find(|voice| voice.model_file.ends_with(&file))
 }
 
 struct Catalog {
@@ -346,15 +455,28 @@ struct Voice {
 }
 
 impl Voice {
-    /// Download progress of both files, weighted by size.
+    /// Download progress of both files, weighted by size: `None` if they aren't downloading, or
+    /// either failed.
     fn progress(&self) -> Option<f64> {
+        if self.failed() {
+            return None;
+        }
         let [model, config] = self.downloads.as_ref()?;
         let (model_size, config_size) = (self.model_size as f64, self.config_size as f64);
         let total = (model_size + config_size).max(1.0);
         return Some((model.progress() * model_size + config.progress() * config_size) / total);
     }
 
+    /// Whether the last download of either file failed.
+    fn failed(&self) -> bool {
+        (self.downloads.iter().flatten()).any(Download::failed)
+    }
+
     fn start_download(&mut self, client: &reqwest::Client) {
+        // Both start over if either failed
+        if self.failed() {
+            self.downloads = None;
+        }
         self.downloads.get_or_insert_with(|| {
             let path = self.path.as_std_path();
             [

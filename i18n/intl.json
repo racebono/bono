@@ -1089,5 +1089,105 @@
         "en": "Couldn't reach {url} (is the server running?)",
         "es": "No se pudo conectar con {url} (¿está en marcha el servidor?)",
         "ca": "No s'ha pogut connectar amb {url} (està en marxa el servidor?)"
+    },
+    "settings.setup_guide": {
+        "en": "Setup guide",
+        "es": "Guía de configuración",
+        "ca": "Guia de configuració"
+    },
+    "onboarding.step": {
+        "en": "Step {step} of {steps}",
+        "es": "Paso {step} de {steps}",
+        "ca": "Pas {step} de {steps}"
+    },
+    "onboarding.skip": {
+        "en": "Skip setup",
+        "es": "Saltar la configuración",
+        "ca": "Omet la configuració"
+    },
+    "onboarding.back": {
+        "en": "Back",
+        "es": "Atrás",
+        "ca": "Enrere"
+    },
+    "onboarding.next": {
+        "en": "Next",
+        "es": "Siguiente",
+        "ca": "Següent"
+    },
+    "onboarding.finish": {
+        "en": "Finish",
+        "es": "Terminar",
+        "ca": "Acaba"
+    },
+    "onboarding.welcome_title": {
+        "en": "Welcome to Bono",
+        "es": "Bienvenido a Bono",
+        "ca": "Benvingut a Bono"
+    },
+    "onboarding.welcome_body": {
+        "en": "Bono is your race engineer: ask it about your race, by voice or typing, and hear the answers on the radio. This guide sets up what it needs.",
+        "es": "Bono es tu ingeniero de carrera: pregúntale por tu carrera, hablando o escribiendo, y escucha las respuestas por radio. Esta guía configura lo que necesita.",
+        "ca": "Bono és el teu enginyer de cursa: pregunta-li per la cursa, parlant o escrivint, i escolta les respostes per ràdio. Aquesta guia configura el que necessita."
+    },
+    "onboarding.downloads_title": {
+        "en": "Downloads",
+        "es": "Descargas",
+        "ca": "Baixades"
+    },
+    "onboarding.downloads_body": {
+        "en": "To understand you and talk back, Bono needs a speech recognition model and a voice in your language. They start downloading when you continue.",
+        "es": "Para entenderte y responderte, Bono necesita un modelo de reconocimiento de voz y una voz en tu idioma. Empiezan a descargarse cuando continúes.",
+        "ca": "Per entendre't i respondre't, Bono necessita un model de reconeixement de veu i una veu en el teu idioma. Es comencen a baixar quan continuïs."
+    },
+    "onboarding.downloads_continue": {
+        "en": "They keep downloading after you close the guide, and are used once they're done.",
+        "es": "Siguen descargándose al cerrar la guía, y se usan en cuanto terminan.",
+        "ca": "Es continuen baixant quan tanquis la guia, i es fan servir tan bon punt acaben."
+    },
+    "onboarding.looking_up": {
+        "en": "Looking it up…",
+        "es": "Buscándolo…",
+        "ca": "Cercant-lo…"
+    },
+    "onboarding.unavailable": {
+        "en": "Couldn't look it up: download it later from the Audio menu",
+        "es": "No se pudo encontrar: descárgalo más tarde desde el menú Audio",
+        "ca": "No s'ha pogut trobar: baixa'l més tard des del menú Àudio"
+    },
+    "onboarding.ready": {
+        "en": "Ready",
+        "es": "Listo",
+        "ca": "A punt"
+    },
+    "onboarding.simulator_title": {
+        "en": "Your simulator",
+        "es": "Tu simulador",
+        "ca": "El teu simulador"
+    },
+    "onboarding.simulator_body": {
+        "en": "Bono follows the race from the game. Some games need a plugin for that: install it here, with the game closed.",
+        "es": "Bono sigue la carrera desde el juego. Algunos juegos necesitan un plugin para ello: instálalo aquí, con el juego cerrado.",
+        "ca": "Bono segueix la cursa des del joc. Alguns jocs necessiten un plugin per fer-ho: instal·la'l aquí, amb el joc tancat."
+    },
+    "onboarding.no_simulator": {
+        "en": "None of these games is installed. You can still continue: the Simulators menu shows them once one is.",
+        "es": "Ninguno de estos juegos está instalado. Puedes continuar igualmente: el menú Simuladores los muestra en cuanto haya uno.",
+        "ca": "Cap d'aquests jocs no està instal·lat. Pots continuar igualment: el menú Simuladors els mostra quan n'hi hagi un."
+    },
+    "error.download": {
+        "en": "Error downloading",
+        "es": "Error al descargar",
+        "ca": "Error en baixar"
+    },
+    "onboarding.failed": {
+        "en": "Download failed",
+        "es": "Falló la descarga",
+        "ca": "Ha fallat la baixada"
+    },
+    "onboarding.retry": {
+        "en": "Retry",
+        "es": "Reintentar",
+        "ca": "Torna-ho a provar"
     }
 }

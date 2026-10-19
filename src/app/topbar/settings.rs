@@ -1,7 +1,7 @@
 use crate::{
     app::{Subsystems, topbar::setup_label},
     button::ConfigButton,
-    config::Config,
+    config::{Config, RawConfig},
     error, guid_to_str,
     task::LocalTask,
 };
@@ -24,7 +24,14 @@ impl SettingsTopbar {
         self.session_button.waiting = None;
     }
 
-    pub fn update(&mut self, rt: &Handle, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
+    /// Returns whether the setup guide was asked for.
+    pub fn update(
+        &mut self,
+        rt: &Handle,
+        ss: &Subsystems,
+        ui: &mut egui::Ui,
+        config: &mut Config,
+    ) -> bool {
         let (talk, session) = {
             let config = config.get();
             (
@@ -68,27 +75,13 @@ impl SettingsTopbar {
         ui.separator();
         config.maybe_update(|raw| {
             let current = raw.locale().clone();
-            let locales = locales!();
-            // `en-US` is English's when there's only `en`
-            let picked = |locale: &str| {
-                current == locale
-                    || (!locales.contains(&current.as_str())
-                        && current.split('-').next() == Some(locale))
-            };
-            let name = locales
-                .iter()
-                .find(|locale| picked(locale))
+            let name = locales!()
+                .into_iter()
+                .find(|locale| picked(&current, locale))
                 .map_or(current.as_str(), |locale| t!("language_name": locale));
 
             ui.menu_button(format!("{}: {name}", t!("language")), |ui| {
-                let mut changed = false;
-                for locale in locales {
-                    let option = ui.selectable_label(picked(locale), t!("language_name": locale));
-                    if option.clicked() && !picked(locale) {
-                        changed |= raw.set_locale(locale);
-                    }
-                }
-                changed
+                languages(ui, raw)
             })
             .inner
             .unwrap_or(false)
@@ -122,6 +115,12 @@ impl SettingsTopbar {
                 })
         });
 
+        ui.separator();
+        let guide = ui.button(t!("settings.setup_guide")).clicked();
+        if guide {
+            ui.close();
+        }
+
         if next_talk.is_some() || next_session.is_some() {
             config.update(|raw| {
                 if let Some(talk) = next_talk {
@@ -132,7 +131,27 @@ impl SettingsTopbar {
                 }
             });
         }
+        guide
     }
+}
+
+/// Whether `locale` is the one picked, `current`: `en-US` is English's when there's only `en`.
+fn picked(current: &str, locale: &str) -> bool {
+    current == locale
+        || (!locales!().contains(&current) && current.split('-').next() == Some(locale))
+}
+
+/// Every language the app is in, to pick one. Returns whether the pick changed.
+pub fn languages(ui: &mut egui::Ui, raw: &mut RawConfig) -> bool {
+    let current = raw.locale().clone();
+    let mut changed = false;
+    for locale in locales!() {
+        let option = ui.selectable_label(picked(&current, locale), t!("language_name": locale));
+        if option.clicked() && !picked(&current, locale) {
+            changed |= raw.set_locale(locale);
+        }
+    }
+    changed
 }
 
 #[derive(Default)]

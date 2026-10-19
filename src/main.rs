@@ -13,9 +13,13 @@ use std::{
     mem::ManuallyDrop,
     path::{Path, PathBuf},
     pin::pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
-use tokio::{io::AsyncWriteExt, runtime::Runtime, task::AbortHandle, time::MissedTickBehavior};
+use tokio::{io::AsyncWriteExt, runtime::Runtime, time::MissedTickBehavior};
 
 #[doc(hidden)]
 pub extern crate std;
@@ -121,9 +125,17 @@ pub(crate) fn guid_to_str(guid: &SDL_GUID) -> ArrayStr<32> {
     return unsafe { ArrayStr::from_utf8_unchecked(inner) };
 }
 
+/// How long a download may go without receiving anything before it's given up on.
+const DOWNLOAD_STALL: Duration = Duration::from_secs(30);
+/// How long a download may take in all, overriding the client's (much shorter) timeout: a big
+/// model on a slow connection takes long, so it's `DOWNLOAD_STALL` that catches a dead one
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_hours(24);
+
 pub(crate) struct Download {
-    aborter: AbortHandle,
+    task: tokio::task::JoinHandle<()>,
     progress: tokio::sync::watch::Receiver<f64>,
+    /// Set once the file is in place
+    done: Arc<AtomicBool>,
 }
 
 impl Download {
@@ -175,11 +187,20 @@ impl Download {
             }
         }
 
-        let req = src.send();
+        let req = src.timeout(DOWNLOAD_TIMEOUT).send();
         let (send, recv) = tokio::sync::watch::channel(0.0);
+        let done = Arc::new(AtomicBool::new(false));
+        let file = dst.as_ref().to_path_buf();
 
-        let handle = tokio::task::spawn(async move {
+        let set_done = done.clone();
+        let download = async move {
             let path = dst.as_ref();
+            let req = async move {
+                let resp = tokio::time::timeout(DOWNLOAD_STALL, req)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("No answer in {DOWNLOAD_STALL:?}"))??;
+                resp.error_for_status().map_err(anyhow::Error::from)
+            };
             let parent = async {
                 if let Some(parent) = path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
@@ -187,16 +208,17 @@ impl Download {
                 Ok::<_, anyhow::Error>(())
             };
 
-            let (mut resp, ()) = tokio::try_join!(
-                async move { req.await?.error_for_status().map_err(anyhow::Error::from) },
-                parent
-            )?;
+            let (mut resp, ()) = tokio::try_join!(req, parent)?;
 
             let mut temp_file = TempFile::new(path).await?;
             let size_hint = resp.content_length().or(size_hint).map(|s| s as f64);
             let mut downloaded = 0u64;
 
-            while let Some(mut chunk) = resp.chunk().await? {
+            while let Some(mut chunk) =
+                tokio::time::timeout(DOWNLOAD_STALL, resp.chunk())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Nothing received in {DOWNLOAD_STALL:?}"))??
+            {
                 let chunk_size = chunk.len();
                 temp_file.file.write_all_buf(&mut chunk).await?;
                 downloaded = downloaded.saturating_add(chunk_size as u64);
@@ -206,13 +228,21 @@ impl Download {
             }
 
             temp_file.permanent().await?;
+            set_done.store(true, Ordering::Release);
             let _ = send.send(1.0);
             Ok::<_, anyhow::Error>(())
+        };
+
+        let task = tokio::task::spawn(async move {
+            if let Err(e) = download.await {
+                error(t!("error.download"), format!("{}: {e:#}", file.display()));
+            }
         });
 
         return Self {
-            aborter: handle.abort_handle(),
+            task,
             progress: recv,
+            done,
         };
     }
 
@@ -220,12 +250,17 @@ impl Download {
     pub fn progress(&self) -> f64 {
         *self.progress.borrow()
     }
+
+    /// Whether it stopped before it was done (the error was already shown).
+    pub fn failed(&self) -> bool {
+        self.task.is_finished() && !self.done.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for Download {
     #[inline]
     fn drop(&mut self) {
-        self.aborter.abort();
+        self.task.abort();
     }
 }
 
