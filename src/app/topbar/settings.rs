@@ -2,7 +2,7 @@ use crate::{
     app::Subsystems, button::ConfigButton, config::Config, error, guid_to_str, task::LocalTask,
 };
 use egui::IntoAtoms;
-use lambiase_i18n::{locales, t};
+use bono_i18n::{locales, t};
 use std::num::NonZeroU32;
 use tokio::runtime::Handle;
 

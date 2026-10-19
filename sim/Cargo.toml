@@ -1,10 +1,10 @@
 [package]
-name = "lambiase-sim"
+name = "bono-sim"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
-# The simulator data shared by the app and the simulator plugins: the C structs in `include/lambiase`,
+# The simulator data shared by the app and the simulator plugins: the C structs in `include/bono`,
 # the database schema they're stored in, and the recorder the plugins write it with.
 [dependencies]
 rusqlite = { version = "0.40.2", features = ["bundled"] }

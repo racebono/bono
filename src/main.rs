@@ -1,5 +1,5 @@
 use crate::{app::App, config::ArrayStr};
-use lambiase_i18n::t;
+use bono_i18n::t;
 use sdl3::{
     event::Event,
     messagebox::{MessageBoxFlag, show_simple_message_box},

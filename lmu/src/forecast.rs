@@ -1,7 +1,7 @@
 //! The weather forecast from LMU's own local web API (the one its UI uses), which has it for every
 //! session of the event.
 
-use lambiase_sim::sys::lambiase_forecast_point;
+use bono_sim::sys::bono_forecast_point;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -23,7 +23,7 @@ const NODES: [(&str, f64); 5] = [
 const DIRECTIONS: [&str; 8] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
 
 /// The forecast as of `session_time`, or `None` if the web API doesn't answer (in time) with 200.
-pub fn fetch(session_time: f64) -> Option<Vec<lambiase_forecast_point>> {
+pub fn fetch(session_time: f64) -> Option<Vec<bono_forecast_point>> {
     // It's on this PC: anything slow means it isn't answering
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(1)))
@@ -43,7 +43,7 @@ pub fn fetch(session_time: f64) -> Option<Vec<lambiase_forecast_point>> {
 
 /// `{"RACE": {"START": {"WNV_RAIN_CHANCE": {"currentValue": 40, "stringValue": "40%"}, ...},
 /// "NODE_25": ..., "FINISH": ...}, "PRACTICE": ..., "QUALIFY": ...}`.
-fn parse(body: &str, session_time: f64) -> Vec<lambiase_forecast_point> {
+fn parse(body: &str, session_time: f64) -> Vec<bono_forecast_point> {
     let mut points = Vec::new();
     let Ok(json @ Value::Object(_)) = serde_json::from_str::<Value>(body) else {
         return points;
@@ -64,7 +64,7 @@ fn parse(body: &str, session_time: f64) -> Vec<lambiase_forecast_point> {
             let number = |key: &str| value(key)?.get("currentValue")?.as_f64();
             let text = |key: &str| value(key)?.get("stringValue")?.as_str();
 
-            let mut point = lambiase_forecast_point::default();
+            let mut point = bono_forecast_point::default();
             point.session_time = Some(session_time).into();
             point.session_type = Some(session_type.to_owned()).into();
             point.session_fraction = Some(fraction).into();

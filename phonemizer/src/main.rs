@@ -1,11 +1,11 @@
 //! Text to IPA phonemes with espeak-ng, the way Piper voices are trained on.
 //!
-//! espeak-ng is GPL, so it lives in this separate program, and Lambiase talks to it through
+//! espeak-ng is GPL, so it lives in this separate program, and Bono talks to it through
 //! its stdin and stdout:
 //!
-//! - `lambiase-phonemizer --voice <voice> <text>...` prints the text's phonemes, one sentence
+//! - `bono-phonemizer --voice <voice> <text>...` prints the text's phonemes, one sentence
 //!   per line.
-//! - `lambiase-phonemizer --serve` answers requests, one JSON object per line, until stdin
+//! - `bono-phonemizer --serve` answers requests, one JSON object per line, until stdin
 //!   closes: `{"voice": "en-us", "text": "Hello."}` gets `{"sentences": ["həlˈoʊ."]}`, or
 //!   `{"error": "..."}` if it couldn't.
 
@@ -24,8 +24,8 @@ use std::{
     time::SystemTime,
 };
 
-const USAGE: &str = "usage: lambiase-phonemizer --voice <voice> <text>...\n       \
-                     lambiase-phonemizer --serve";
+const USAGE: &str = "usage: bono-phonemizer --voice <voice> <text>...\n       \
+                     bono-phonemizer --serve";
 
 #[derive(Deserialize)]
 struct Request {
@@ -54,7 +54,7 @@ fn main() -> ExitCode {
     match res {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("lambiase-phonemizer: {e:#}");
+            eprintln!("bono-phonemizer: {e:#}");
             ExitCode::FAILURE
         }
     }
@@ -89,7 +89,7 @@ fn serve() -> anyhow::Result<()> {
         };
 
         serde_json::to_writer(&mut stdout, &response)?;
-        // Lambiase waits for the whole line, so it can't sit in a buffer
+        // Bono waits for the whole line, so it can't sit in a buffer
         stdout.write_all(b"\n")?;
         stdout.flush()?;
     }

@@ -25,9 +25,9 @@ async fn dist() -> anyhow::Result<()> {
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
 
     // 1. Build the game and its phonemizer in release, and on Windows the Le Mans Ultimate plugin
-    let mut packages = vec!["--package", "lambiase", "--package", "lambiase-phonemizer"];
+    let mut packages = vec!["--package", "bono", "--package", "bono-phonemizer"];
     if cfg!(windows) {
-        packages.extend(["--package", "lambiase-lmu"]);
+        packages.extend(["--package", "bono-lmu"]);
     }
 
     let status = tokio::process::Command::new(&cargo)
@@ -47,7 +47,7 @@ async fn dist() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&dist).await?;
 
     // 3. Copy the binary (handles .exe on Windows)
-    let exe = format!("lambiase{}", env::consts::EXE_SUFFIX);
+    let exe = format!("bono{}", env::consts::EXE_SUFFIX);
     tokio::fs::copy(root.join("target/release").join(&exe), dist.join(&exe)).await?;
 
     // 4. Copy assets
@@ -57,7 +57,7 @@ async fn dist() -> anyhow::Result<()> {
     // separate program with its license, next to the espeak-ng data it loads
     let phonemizer = dist.join("phonemizer");
     tokio::fs::create_dir_all(&phonemizer).await?;
-    let exe = format!("lambiase-phonemizer{}", env::consts::EXE_SUFFIX);
+    let exe = format!("bono-phonemizer{}", env::consts::EXE_SUFFIX);
     tokio::fs::copy(root.join("target/release").join(&exe), phonemizer.join(&exe)).await?;
     tokio::fs::copy(root.join("phonemizer/COPYING"), phonemizer.join("COPYING")).await?;
 
@@ -70,8 +70,8 @@ async fn dist() -> anyhow::Result<()> {
     if cfg!(windows) {
         tokio::fs::create_dir_all(dist.join("plugins")).await?;
         tokio::fs::copy(
-            root.join("target/release/lambiase_lmu.dll"),
-            dist.join("plugins/lambiase_lmu.dll"),
+            root.join("target/release/bono_lmu.dll"),
+            dist.join("plugins/bono_lmu.dll"),
         )
         .await?;
     }

@@ -2,7 +2,7 @@
 //! sounds like a radio.
 
 use crate::config::{Config, Setting};
-use lambiase_i18n::t;
+use bono_i18n::t;
 
 #[derive(Default)]
 pub struct VolumeTopbar;

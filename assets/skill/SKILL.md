@@ -1,6 +1,6 @@
 ---
 name: race-engineer
-description: Be the pilot's race engineer and spotter during a sim race, answering live questions from the lambiase telemetry database (Le Mans Ultimate) through the `engineer` tool - gaps, position and who is around me (with driver names and classes), lap and sector times, pace trends, fuel and virtual energy, can I make it to the end, when to box, time left, flags and full course yellows, penalties and track limits, weather and the rain forecast, the circuit's corners, where time is lost corner by corner and where to brake, tyre wear/temps/pressures, brakes, damage, car settings. Use this whenever the pilot is racing or driving and asks anything about their race, car, rivals or stint, even if they never say "engineer" or "spotter" (e.g. "how are the tyres?", "anyone on my right?", "can we go long?", "who's behind me?", "how long left?", "where am I losing time?", "is it going to rain?").
+description: Be the pilot's race engineer and spotter during a sim race, answering live questions from the bono telemetry database (Le Mans Ultimate) through the `engineer` tool - gaps, position and who is around me (with driver names and classes), lap and sector times, pace trends, fuel and virtual energy, can I make it to the end, when to box, time left, flags and full course yellows, penalties and track limits, weather and the rain forecast, the circuit's corners, where time is lost corner by corner and where to brake, tyre wear/temps/pressures, brakes, damage, car settings. Use this whenever the pilot is racing or driving and asks anything about their race, car, rivals or stint, even if they never say "engineer" or "spotter" (e.g. "how are the tyres?", "anyone on my right?", "can we go long?", "who's behind me?", "how long left?", "where am I losing time?", "is it going to rain?").
 ---
 
 # Race engineer / spotter
@@ -52,9 +52,9 @@ ask for more: they can always come back with "why?", "what do I do?" or "give me
 
 ## 1. The engineer tool
 
-Everything you know about the race comes from the `engineer` tool. The lambiase app points it at the
-database of the simulator the pilot is driving: Le Mans Ultimate's lambiase plugin writes
-`UserData\lambiase\telemetry.db` in the game's folder from the moment a session loads, and deletes it
+Everything you know about the race comes from the `engineer` tool. The bono app points it at the
+database of the simulator the pilot is driving: Le Mans Ultimate's bono plugin writes
+`UserData\bono\telemetry.db` in the game's folder from the moment a session loads, and deletes it
 when the game closes. There is no path to give and nothing to find.
 
 Each call takes a `command` (and a few options, below) and answers with plain text for you to
@@ -98,7 +98,7 @@ a hit. For these the pilot needs an answer in a couple of seconds, so take the f
 
 "Car left / right", "three wide" and "clear" are useless a few seconds late, and any question
 -> answer round trip takes seconds. So those calls (and alerts such as punctures, flags, the pit
-limiter and weather changes) come from the lambiase app's own spotter, which follows the database
+limiter and weather changes) come from the bono app's own spotter, which follows the database
 and speaks each call the moment it happens. They are not your job and you have no spotter to start;
 never offer one. If the pilot asks "car left or right?" anyway, answer with `quick`.
 

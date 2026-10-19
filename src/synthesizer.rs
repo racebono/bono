@@ -17,7 +17,7 @@ use crate::{
 };
 use anyhow::{Context, bail};
 use camino::{Utf8Path, Utf8PathBuf};
-use lambiase_i18n::t;
+use bono_i18n::t;
 use ort::{session::Session, value::Tensor};
 use sdl3::audio::{AudioFormat, AudioSpec, AudioStreamOwner};
 use serde::Deserialize;
@@ -830,11 +830,11 @@ mod tests {
         }
     }
 
-    /// Needs a Piper voice: `LAMBIASE_VOICE` is the path to its `.onnx`.
+    /// Needs a Piper voice: `BONO_VOICE` is the path to its `.onnx`.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn speaks_a_sentence_at_a_time() {
-        let model = std::env::var("LAMBIASE_VOICE").expect("LAMBIASE_VOICE isn't set");
+        let model = std::env::var("BONO_VOICE").expect("BONO_VOICE isn't set");
         let rt = Handle::current();
         let inner = SynthesizerInner::new(rt.clone());
         inner.set_model(Some(model.into()));

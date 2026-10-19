@@ -164,7 +164,7 @@ fn t_by_lang(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lambiase_i18n::{locales, t};
+    use bono_i18n::{locales, t};
 
     #[test]
     fn fills_the_placeholders() {

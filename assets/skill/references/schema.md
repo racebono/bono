@@ -1,6 +1,6 @@
-# lambiase telemetry database - schema and gotchas
+# bono telemetry database - schema and gotchas
 
-Source of truth: lambiase's `include/lambiase/telemetry.h`, `scoring.h` and `forecast.h` (column
+Source of truth: bono's `include/bono/telemetry.h`, `scoring.h` and `forecast.h` (column
 lists) and `lmu/lmu.cpp` (the Le Mans Ultimate plugin: how the game's values are converted). Every
 simulator writes the same schema; fields a simulator does not provide are NULL.
 
@@ -15,7 +15,7 @@ simulator writes the same schema; fields a simulator does not provide are NULL.
 
 ## 1. Tables and how rows are written
 
-Where the file is: the LMU plugin creates `UserData\lambiase\telemetry.db` in the game's folder
+Where the file is: the LMU plugin creates `UserData\bono\telemetry.db` in the game's folder
 when the first session loads, and deletes it when the game closes (a database left by a crash, or
 still open in a reader when the game closed, is deleted the next time the pilot drives). The app
 only uses it while Steam reports the game running. It is in WAL mode.
@@ -57,7 +57,7 @@ only uses it while Steam reports the game running. It is in WAL mode.
   pilot when as time from now (that time minus the session's current `session_time`), never as the
   fraction or the session clock.
 
-Next to the database the lambiase app may also leave `track.json`: the circuit's description from
+Next to the database the bono app may also leave `track.json`: the circuit's description from
 Lovely Sim Racing's lovely-track-data (CC BY-NC-SA 4.0), saved at the start of each session when the data
 has the track. `source_track` is the session's `track` it was saved for (ignore the file if it differs).
 Positions (`turn[].start/marker/end`, `straight[].start/end`, `sector[].marker`, `pitentry`, `pitexit`) are

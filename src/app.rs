@@ -79,7 +79,7 @@ impl App {
 
         let mut ui = EguiCanvas::new(
             video
-                .window("Lambiase", width.get(), height.get())
+                .window("Bono", width.get(), height.get())
                 .resizable()
                 .high_pixel_density()
                 .build()?,

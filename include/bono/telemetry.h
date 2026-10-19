@@ -1,6 +1,6 @@
 #pragma once
 
-#include "lambiase.h"
+#include "bono.h"
 
 // Simulator-independent telemetry. Each simulator converts its own data into
 // these structs, so every simulator shares the same database schema. Fields a
@@ -19,7 +19,7 @@
 //
 // Each list entry is X(type, name); the name is both the struct field and the
 // database column, and type is f64, i64, boolean or string (the
-// lambiase_opt_* types in lambiase.h).
+// bono_opt_* types in bono.h).
 
 // clang-format off
 #define SIM_TELEMETRY_COLUMNS(X)                                                                         \
@@ -196,26 +196,26 @@
     X(boolean, wheel_detached)
 // clang-format on
 
-#define SIM_DECLARE_FIELD(type, name) lambiase_opt_##type##_s name;
+#define SIM_DECLARE_FIELD(type, name) bono_opt_##type##_s name;
 
-typedef struct lambiase_wheel_telemetry {
+typedef struct bono_wheel_telemetry {
   SIM_WHEEL_TELEMETRY_COLUMNS(SIM_DECLARE_FIELD)
-} lambiase_wheel_telemetry_s;
+} bono_wheel_telemetry_s;
 
 // The columns of one car that change only now and then.
-typedef struct lambiase_car_state {
+typedef struct bono_car_state {
   SIM_CAR_STATE_COLUMNS(SIM_DECLARE_FIELD)
-} lambiase_car_state_s;
+} bono_car_state_s;
 
 // One update of one car.
-typedef struct lambiase_telemetry {
+typedef struct bono_telemetry {
   SIM_TELEMETRY_COLUMNS(SIM_DECLARE_FIELD)
 
   // Written to car_state only when it changes.
-  lambiase_car_state_s state;
+  bono_car_state_s state;
 
   // Front left, front right, rear left, rear right.
-  lambiase_wheel_telemetry_s wheels[4];
-} lambiase_telemetry_s;
+  bono_wheel_telemetry_s wheels[4];
+} bono_telemetry_s;
 
 #undef SIM_DECLARE_FIELD

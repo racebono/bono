@@ -1,4 +1,4 @@
-//! Le Mans Ultimate, through Steam. Its plugin (`lmu/`) writes `UserData\lambiase\telemetry.db`
+//! Le Mans Ultimate, through Steam. Its plugin (`lmu/`) writes `UserData\bono\telemetry.db`
 //! in the game's folder while the game runs, a weekend at a time, and deletes it when the game
 //! closes. It can't while this app still has it open (Windows doesn't delete open files), and the app
 //! only lets go once Steam reports the game closed, which is after: so the app deletes it then. A
@@ -10,7 +10,7 @@ use crate::{
     sqlite::{Database, pool::Pool},
     steam::{self},
 };
-use lambiase_sim::recorder::{DATABASE, SETTINGS, try_remove_database};
+use bono_sim::recorder::{DATABASE, SETTINGS, try_remove_database};
 use serde_json::{Map, Value};
 use std::{
     num::NonZeroUsize,
@@ -23,7 +23,7 @@ mod plugin;
 
 const STEAM_APP_ID: u32 = 2399420;
 /// The plugin's folder, in the game's UserData folder.
-const FOLDER: &str = "lambiase";
+const FOLDER: &str = "bono";
 
 const MAX_IDLE: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 const MAX_OPEN: NonZeroUsize = NonZeroUsize::new(4).unwrap();
@@ -56,7 +56,7 @@ impl LeMansUltimate {
         self.install_dir.as_deref()
     }
 
-    /// `UserData\lambiase`, if the game is installed.
+    /// `UserData\bono`, if the game is installed.
     fn folder(&mut self) -> Option<PathBuf> {
         Some(self.install_dir()?.join("UserData").join(FOLDER))
     }

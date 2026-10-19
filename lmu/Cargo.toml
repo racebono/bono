@@ -1,19 +1,19 @@
 [package]
-name = "lambiase-lmu"
+name = "bono-lmu"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
 # The Le Mans Ultimate plugin: a DLL the game loads from its Plugins folder. `lmu.cpp` implements the
-# game's plugin interface and converts its data into the structs in `include/lambiase`, which the
-# recorder from `lambiase-sim` writes into the database.
+# game's plugin interface and converts its data into the structs in `include/bono`, which the
+# recorder from `bono-sim` writes into the database.
 [lib]
-name = "lambiase_lmu"
+name = "bono_lmu"
 crate-type = ["cdylib"]
 
 # LMU only runs on Windows
 [target.'cfg(windows)'.dependencies]
-lambiase-sim = { path = "../sim" }
+bono-sim = { path = "../sim" }
 serde_json = "1.0.151"
 ureq = { version = "3", default-features = false }
 

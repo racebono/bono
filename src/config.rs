@@ -5,7 +5,7 @@ use crate::{
     synthesizer::{Effects, Synthesizer, SynthesizerInner},
 };
 use camino::{Utf8Path, Utf8PathBuf};
-use lambiase_i18n::t;
+use bono_i18n::t;
 use sdl3::audio::AudioDeviceID;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{

@@ -15,7 +15,7 @@ use egui::{
     PopupCloseBehavior,
     menu::{MenuButton, MenuConfig},
 };
-use lambiase_i18n::t;
+use bono_i18n::t;
 use sdl3::event::Event;
 use std::sync::Arc;
 use tokio::runtime::Handle;

@@ -1,9 +1,9 @@
-//! The simulators lambiase supports, as they are on this computer: whether they're installed and
+//! The simulators bono supports, as they are on this computer: whether they're installed and
 //! running, and for those that need a plugin, which version is installed, with a button installing
 //! the one that comes with the app.
 
 use crate::sim::{ActiveSimulator, PluginStatus};
-use lambiase_i18n::t;
+use bono_i18n::t;
 use std::{
     path::PathBuf,
     time::{Duration, Instant},

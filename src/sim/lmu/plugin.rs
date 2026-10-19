@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
 /// The DLL's name, in the app's `plugins` folder and the game's `Plugins` folder.
-const DLL: &str = "lambiase_lmu.dll";
+const DLL: &str = "bono_lmu.dll";
 /// The game's settings for every plugin, by DLL name, in its install folder.
 const PLUGIN_SETTINGS: &[&str] = &["UserData", "player", "CustomPluginVariables.JSON"];
 /// The setting the game loads a plugin by (the space is the game's).

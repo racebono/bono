@@ -12,7 +12,7 @@ use crate::{
     synthesizer::{SpeechInput, SpeechOutput, Synthesizer},
     task::Task,
 };
-use lambiase_i18n::t;
+use bono_i18n::t;
 use sdl3::audio::{AudioDevice, AudioStreamOwner};
 use std::{
     path::{Path, PathBuf},
@@ -615,9 +615,9 @@ async fn game_session(pool: &Pool) -> anyhow::Result<Option<String>> {
 mod tests {
     use super::*;
     use crate::sqlite::Database;
-    use lambiase_sim::{
+    use bono_sim::{
         recorder::{DATABASE, Recorder},
-        sys::lambiase_session_info,
+        sys::bono_session_info,
     };
     use std::num::NonZeroUsize;
 
@@ -673,8 +673,8 @@ mod tests {
         }
     }
 
-    fn session(kind: &str, number: i64) -> lambiase_session_info {
-        let mut session = lambiase_session_info::default();
+    fn session(kind: &str, number: i64) -> bono_session_info {
+        let mut session = bono_session_info::default();
         session.track = Some("Circuit de la Sarthe".to_owned()).into();
         session.session_type = Some(kind.to_owned()).into();
         session.session_number = Some(number).into();

@@ -8,7 +8,7 @@ use crate::{
     provider::{self, ModelOption},
     task::MaybeDone,
 };
-use lambiase_i18n::t;
+use bono_i18n::t;
 use std::num::NonZeroU32;
 use tokio::runtime::Handle;
 

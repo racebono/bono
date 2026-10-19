@@ -10,7 +10,7 @@ use anyhow::Context;
 use camino::{Utf8Path, Utf8PathBuf};
 use egui::Widget;
 use egui_extras::Column;
-use lambiase_i18n::t;
+use bono_i18n::t;
 use sdl3::{
     audio::{AudioFormat, AudioRecordingCallback, AudioSpec, AudioStream, AudioStreamWithCallback},
     event::Event,
@@ -751,11 +751,11 @@ mod tests {
     use crate::synthesizer::{Effects, Voice};
     use std::collections::BTreeMap;
 
-    /// Needs `LAMBIASE_WHISPER` (a whisper model) and `LAMBIASE_VOICE_EN`/`_ES` (Piper voices).
+    /// Needs `BONO_WHISPER` (a whisper model) and `BONO_VOICE_EN`/`_ES` (Piper voices).
     #[test]
     #[ignore]
     fn detects_the_language_spoken() {
-        let whisper = std::env::var("LAMBIASE_WHISPER").unwrap();
+        let whisper = std::env::var("BONO_WHISPER").unwrap();
         let threads = NonZeroUsize::new(4).unwrap();
         let ctx =
             WhisperContext::new_with_params(&whisper, WhisperContextParameters::default()).unwrap();
@@ -763,11 +763,11 @@ mod tests {
         let voices = BTreeMap::from([
             (
                 arrstr!("en"),
-                Utf8PathBuf::from(std::env::var("LAMBIASE_VOICE_EN").unwrap()),
+                Utf8PathBuf::from(std::env::var("BONO_VOICE_EN").unwrap()),
             ),
             (
                 arrstr!("es"),
-                Utf8PathBuf::from(std::env::var("LAMBIASE_VOICE_ES").unwrap()),
+                Utf8PathBuf::from(std::env::var("BONO_VOICE_ES").unwrap()),
             ),
         ]);
         let effects = Effects {

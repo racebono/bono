@@ -1,15 +1,15 @@
 //! RaceRoom Racing Experience, through Steam. It has no plugins: it publishes its state in a
 //! shared memory block (`$R3E`, see `r3e.h`), which a thread of ours reads while the game runs and
-//! records like LMU's plugin does (`lambiase_sim::recorder`), into a folder of the app's own. The
+//! records like LMU's plugin does (`bono_sim::recorder`), into a folder of the app's own. The
 //! recording is deleted once the game closes.
 
 use crate::{
     sim::{Simulator, SimulatorInfo, SimulatorSettings},
     sqlite::{Database, pool::Pool},
 };
-use lambiase_sim::{
+use bono_sim::{
     recorder::{DATABASE, Recorder, SETTINGS, try_remove_database},
-    sys::{lambiase_session_info, lambiase_standing, lambiase_telemetry},
+    sys::{bono_session_info, bono_standing, bono_telemetry},
 };
 use serde_json::{Map, Value};
 use std::{
@@ -53,7 +53,7 @@ pub struct RaceRoom {
 impl RaceRoom {
     pub fn new() -> Self {
         Self {
-            dir: std::env::temp_dir().join("lambiase").join("raceroom"),
+            dir: std::env::temp_dir().join("bono").join("raceroom"),
             reader: None,
             live: None,
         }
@@ -164,7 +164,7 @@ impl Reader {
     fn start(dir: PathBuf) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread = std::thread::Builder::new()
-            .name("lambiase raceroom".into())
+            .name("bono raceroom".into())
             .spawn({
                 let stop = stop.clone();
                 move || read(&dir, &stop)
@@ -326,9 +326,9 @@ impl Drop for SharedMemory {
 
 /// One read of the game, for the recorder.
 struct Update {
-    telemetry: Vec<lambiase_telemetry>,
+    telemetry: Vec<bono_telemetry>,
     /// Every `SCORING_EVERY`
-    scoring: Option<(lambiase_session_info, Vec<lambiase_standing>)>,
+    scoring: Option<(bono_session_info, Vec<bono_standing>)>,
     /// The track or layout changed since the last update
     new_event: bool,
 }
@@ -390,7 +390,7 @@ impl Converter {
         for driver in drivers {
             let info = driver.driver_info;
             let slot = info.slot_id;
-            let mut out = lambiase_telemetry::default();
+            let mut out = bono_telemetry::default();
             out.vehicle_id = Some(slot as i64).into();
             out.session_time = Some(time).into();
             out.time_since_last_update = dt.into();
@@ -451,7 +451,7 @@ impl Converter {
 }
 
 /// What only the player's car has: its physics, inputs, engine, tires and settings.
-fn player_telemetry(shared: &r3e_shared, out: &mut lambiase_telemetry) {
+fn player_telemetry(shared: &r3e_shared, out: &mut bono_telemetry) {
     let player = shared.player;
 
     // The player's own position and heading are exact
@@ -575,8 +575,8 @@ fn scoring(
     shared: &r3e_shared,
     drivers: &[r3e_driver_data],
     time: f64,
-) -> (lambiase_session_info, Vec<lambiase_standing>) {
-    let mut session = lambiase_session_info::default();
+) -> (bono_session_info, Vec<bono_standing>) {
+    let mut session = bono_session_info::default();
     session.session_time = Some(time).into();
 
     let (track, layout) = (text(&shared.track_name), text(&shared.layout_name));
@@ -683,9 +683,9 @@ fn standing(
     driver: &r3e_driver_data,
     time: f64,
     is_player: bool,
-) -> lambiase_standing {
+) -> bono_standing {
     let info = driver.driver_info;
-    let mut out = lambiase_standing::default();
+    let mut out = bono_standing::default();
     out.session_time = Some(time).into();
     out.vehicle_id = Some(info.slot_id as i64).into();
     out.is_player = Some(is_player).into();

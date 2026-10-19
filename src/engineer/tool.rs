@@ -4231,9 +4231,9 @@ fn cmd_sql(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Result<
 mod tests {
     use super::*;
     use crate::sqlite::Database;
-    use lambiase_sim::{
+    use bono_sim::{
         recorder::{DATABASE, Recorder},
-        sys::{lambiase_session_info, lambiase_standing, lambiase_telemetry},
+        sys::{bono_session_info, bono_standing, bono_telemetry},
     };
     use std::num::NonZeroUsize;
 
@@ -4251,7 +4251,7 @@ mod tests {
 
         let standing =
             |vehicle: i64, driver: &str, position: i64, laps: i64, t: f64, last: Option<f64>| {
-                let mut s = lambiase_standing::default();
+                let mut s = bono_standing::default();
                 s.session_time = Some(t).into();
                 s.vehicle_id = Some(vehicle).into();
                 s.is_player = Some(vehicle == 1).into();
@@ -4265,7 +4265,7 @@ mod tests {
                 s
             };
         let session = |t: f64| {
-            let mut s = lambiase_session_info::default();
+            let mut s = bono_session_info::default();
             s.session_time = Some(t).into();
             s.track = Some("Test Ring".to_owned()).into();
             s.track_length = Some(1000.0).into();
@@ -4292,7 +4292,7 @@ mod tests {
             let lap = (t / lap_time).floor() as i64;
             let distance = t * 10.0 - lap as f64 * 1000.0;
             for vehicle in [1i64, 2] {
-                let mut telemetry = lambiase_telemetry::default();
+                let mut telemetry = bono_telemetry::default();
                 telemetry.vehicle_id = Some(vehicle).into();
                 telemetry.session_time = Some(t).into();
                 telemetry.lap = Some(lap).into();
@@ -4359,7 +4359,7 @@ mod tests {
         let recorder = Recorder::new(dir.path(), None).unwrap();
 
         let session = |t: f64| {
-            let mut s = lambiase_session_info::default();
+            let mut s = bono_session_info::default();
             s.session_time = Some(t).into();
             s.track = Some("Shifted Ring".to_owned()).into();
             s.track_length = Some(LENGTH).into();
@@ -4368,7 +4368,7 @@ mod tests {
             s
         };
         let standing = |laps: i64, t: f64, best: Option<f64>| {
-            let mut s = lambiase_standing::default();
+            let mut s = bono_standing::default();
             s.session_time = Some(t).into();
             s.vehicle_id = Some(1).into();
             s.is_player = Some(true).into();
@@ -4396,7 +4396,7 @@ mod tests {
             let mut d = 0.0;
             while d < LENGTH {
                 let v = speed(d);
-                let mut telemetry = lambiase_telemetry::default();
+                let mut telemetry = bono_telemetry::default();
                 telemetry.vehicle_id = Some(1).into();
                 telemetry.session_time = Some(t).into();
                 telemetry.lap = Some(lap).into();

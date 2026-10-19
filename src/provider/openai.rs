@@ -6,7 +6,7 @@ use super::{Model, ModelOption, Reply, StopReason, ToolHandler, Tools, Usage, te
 use crate::config::OpenAiConfig;
 use anyhow::{Context, bail};
 use futures::future::{BoxFuture, join_all};
-use lambiase_i18n::t;
+use bono_i18n::t;
 use reqwest::{
     StatusCode,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},

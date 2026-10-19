@@ -2,7 +2,7 @@
 
 use crate::engineer::{Engineer, Speaker};
 use egui::RichText;
-use lambiase_i18n::t;
+use bono_i18n::t;
 
 #[derive(Default)]
 pub struct Chat {

@@ -1,11 +1,11 @@
 [package]
-name = "lambiase"
+name = "bono"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-lambiase-sim = { path = "sim" }
-lambiase-i18n = { path = "i18n" }
+bono-sim = { path = "sim" }
+bono-i18n = { path = "i18n" }
 pin-project = "1.1.13"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 tokio = { version = "1.53.2", features = [

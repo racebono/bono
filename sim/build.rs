@@ -19,35 +19,35 @@ fn main() {
     sim_columns(&include, &out);
 }
 
-/// Generates Rust types for the simulator data structures in `include/lambiase`, which the
+/// Generates Rust types for the simulator data structures in `include/bono`, which the
 /// simulator plugins fill in from C or C++.
 fn sim_bindings(include: &Path, out: &Path) {
     let mut builder = bindgen::Builder::default()
-        // Parsed as C: the C++-only helpers in lambiase.h are behind `__cplusplus`
+        // Parsed as C: the C++-only helpers in bono.h are behind `__cplusplus`
         .clang_args(["-x", "c", "-std=c11"])
         .clang_arg(format!("-I{}", include.display()))
-        .allowlist_type("lambiase_.*")
+        .allowlist_type("bono_.*")
         // Written by hand in `src/sim/sys.rs`, so their `value` can be a `MaybeUninit`
-        .blocklist_type("lambiase_opt_.*")
+        .blocklist_type("bono_opt_.*")
         .derive_default(true)
-        .no_copy("lambiase_string")
-        .no_debug("lambiase_string")
-        .no_default("lambiase_string")
-        .no_hash("lambiase_string")
-        .no_partialeq("lambiase_string")
+        .no_copy("bono_string")
+        .no_debug("bono_string")
+        .no_default("bono_string")
+        .no_hash("bono_string")
+        .no_partialeq("bono_string")
         .parse_callbacks(Box::new(PrivateFields))
         .parse_callbacks(Box::new(OptionalDerives))
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
 
     for header in HEADERS {
-        builder = builder.header(include.join("lambiase").join(header).to_string_lossy());
+        builder = builder.header(include.join("bono").join(header).to_string_lossy());
     }
 
     builder
         .generate()
-        .expect("Error generating bindings for include/lambiase")
+        .expect("Error generating bindings for include/bono")
         .write_to_file(out.join("sim.rs"))
-        .expect("Error writing bindings for include/lambiase");
+        .expect("Error writing bindings for include/bono");
 }
 
 /// Turns each `SIM_*_COLUMNS(X)` list in the headers into a Rust macro of the same name in
@@ -57,7 +57,7 @@ fn sim_bindings(include: &Path, out: &Path) {
 fn sim_columns(include: &Path, out: &Path) {
     let mut code = String::new();
     for header in HEADERS {
-        let path = include.join("lambiase").join(header);
+        let path = include.join("bono").join(header);
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("Error reading {}: {e}", path.display()));
 
@@ -140,7 +140,7 @@ fn strip_comments(text: &str) -> String {
 
 /// Types whose fields are private, so outside `src/sim/sys.rs` (where the bindings are included)
 /// they're only reachable through the methods written there.
-const PRIVATE_FIELDS: &[&str] = &["lambiase_string"];
+const PRIVATE_FIELDS: &[&str] = &["bono_string"];
 
 #[derive(Debug)]
 struct PrivateFields;
@@ -153,14 +153,14 @@ impl ParseCallbacks for PrivateFields {
     }
 }
 
-/// Structs with no strings, which can be `Copy` (`lambiase_opt_string` owns its string).
+/// Structs with no strings, which can be `Copy` (`bono_opt_string` owns its string).
 const COPY_STRUCTS: &[&str] = &[
-    "lambiase_wheel_telemetry",
-    "lambiase_car_state",
-    "lambiase_telemetry",
+    "bono_wheel_telemetry",
+    "bono_car_state",
+    "bono_telemetry",
 ];
 
-/// bindgen can't see the traits of the hand-written `lambiase_opt_*` types (they're
+/// bindgen can't see the traits of the hand-written `bono_opt_*` types (they're
 /// blocklisted), so it derives nothing for the structs containing them: add the derives back.
 #[derive(Debug)]
 struct OptionalDerives;
@@ -168,7 +168,7 @@ struct OptionalDerives;
 impl ParseCallbacks for OptionalDerives {
     fn add_derives(&self, info: &DeriveInfo<'_>) -> Vec<String> {
         if info.kind != TypeKind::Struct
-            || !info.name.starts_with("lambiase_")
+            || !info.name.starts_with("bono_")
             || PRIVATE_FIELDS.contains(&info.name)
         {
             return Vec::new();

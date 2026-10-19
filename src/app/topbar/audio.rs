@@ -13,7 +13,7 @@ use crate::{
     task::Task,
 };
 use camino::Utf8Path;
-use lambiase_i18n::t;
+use bono_i18n::t;
 use sdl3::{
     AudioSubsystem,
     audio::{AudioDeviceID, AudioSpec, AudioStreamOwner},

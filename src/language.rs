@@ -91,7 +91,7 @@ pub fn name(code: ArrayStr<2>) -> Option<String> {
 /// The name of the language with `code` (as the voices have it), in the app's language: in
 /// English for those the app hasn't translated, or its code if it isn't built in either.
 pub fn ui_name(code: ArrayStr<2>) -> String {
-    use lambiase_i18n::t;
+    use bono_i18n::t;
 
     let name = match &*code {
         "en" => t!("lang.en"),

@@ -15,7 +15,7 @@ use crate::{
     sim::Sim,
     synthesizer::{Effects, Speech, Synthesizer},
 };
-use lambiase_i18n::t;
+use bono_i18n::t;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
 use sdl3::audio::{AudioDevice, AudioStreamOwner};
 use std::{

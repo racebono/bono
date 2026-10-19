@@ -7,7 +7,7 @@
 
 use crate::{
     sql::{self, ForecastWriter, ScoringWriter, TelemetryWriter},
-    sys::{lambiase_forecast_point, lambiase_session_info, lambiase_standing, lambiase_telemetry},
+    sys::{bono_forecast_point, bono_session_info, bono_standing, bono_telemetry},
 };
 use std::{
     collections::HashMap,
@@ -39,7 +39,7 @@ const SETTINGS_CHECK: Duration = Duration::from_secs(2);
 
 /// Reads the forecast on the writer thread, given the session time of the last scoring update.
 /// `None` when it can't be read this time.
-pub type ForecastSource = Box<dyn FnMut(f64) -> Option<Vec<lambiase_forecast_point>> + Send>;
+pub type ForecastSource = Box<dyn FnMut(f64) -> Option<Vec<bono_forecast_point>> + Send>;
 
 /// Deletes the database in `dir`, with its WAL companions, if it can.
 pub fn remove_database(dir: &Path) {
@@ -96,7 +96,7 @@ impl Recorder {
             failed: AtomicBool::new(false),
         });
 
-        let thread = std::thread::Builder::new().name("lambiase recorder".into()).spawn({
+        let thread = std::thread::Builder::new().name("bono recorder".into()).spawn({
             let shared = shared.clone();
             let mut writer = Writer {
                 database: dir.join(DATABASE),
@@ -157,7 +157,7 @@ impl Recorder {
 
     /// Queues a telemetry update `wants_telemetry` kept. Fills in `is_player`, and `lap_distance`
     /// when the simulator doesn't give it, estimated from the scoring updates.
-    pub fn push_telemetry(&self, telemetry: &lambiase_telemetry) {
+    pub fn push_telemetry(&self, telemetry: &bono_telemetry) {
         let mut telemetry = *telemetry;
         let vehicle = telemetry.vehicle_id.get();
         let player = self.shared.player_id.load(Ordering::Relaxed);
@@ -183,7 +183,7 @@ impl Recorder {
     }
 
     /// Queues a scoring update: the session and every car's standing.
-    pub fn push_scoring(&self, session: lambiase_session_info, standings: Vec<lambiase_standing>) {
+    pub fn push_scoring(&self, session: bono_session_info, standings: Vec<bono_standing>) {
         if self.failed() {
             return;
         }
@@ -269,8 +269,8 @@ struct Shared {
 
 #[derive(Default)]
 struct Queue {
-    telemetry: Vec<lambiase_telemetry>,
-    scoring: Vec<(lambiase_session_info, Vec<lambiase_standing>)>,
+    telemetry: Vec<bono_telemetry>,
+    scoring: Vec<(bono_session_info, Vec<bono_standing>)>,
     /// `clear` was called: the writer deletes what was recorded
     clear: bool,
     stop: bool,
@@ -471,10 +471,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sys::lambiase_forecast_point;
+    use crate::sys::bono_forecast_point;
 
-    fn standing(vehicle_id: i64, is_player: bool, lap_distance: f64) -> lambiase_standing {
-        let mut standing = lambiase_standing::default();
+    fn standing(vehicle_id: i64, is_player: bool, lap_distance: f64) -> bono_standing {
+        let mut standing = bono_standing::default();
         standing.session_time = Some(10.0).into();
         standing.vehicle_id = Some(vehicle_id).into();
         standing.is_player = Some(is_player).into();
@@ -487,14 +487,14 @@ mod tests {
     fn records_into_the_database() {
         let dir = tempfile::tempdir().unwrap();
         let forecast: ForecastSource = Box::new(|session_time| {
-            let mut point = lambiase_forecast_point::default();
+            let mut point = bono_forecast_point::default();
             point.session_time = Some(session_time).into();
             point.sky_text = Some("Clear".to_owned()).into();
             Some(vec![point])
         });
         let recorder = Recorder::new(dir.path(), Some(forecast)).unwrap();
 
-        let mut session = lambiase_session_info::default();
+        let mut session = bono_session_info::default();
         session.session_time = Some(10.0).into();
         session.track = Some("Circuit de la Sarthe".to_owned()).into();
         session.track_length = Some(1000.0).into();
@@ -508,7 +508,7 @@ mod tests {
 
         // The player's car, half a second after scoring at 40 m/s: past the line
         assert!(recorder.wants_telemetry(1, 10.5, 40.0));
-        let mut telemetry = lambiase_telemetry::default();
+        let mut telemetry = bono_telemetry::default();
         telemetry.vehicle_id = Some(1).into();
         telemetry.session_time = Some(10.5).into();
         recorder.push_telemetry(&telemetry);
@@ -564,12 +564,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let recorder = Recorder::new(dir.path(), None).unwrap();
         let telemetry = |vehicle: i64| {
-            let mut telemetry = lambiase_telemetry::default();
+            let mut telemetry = bono_telemetry::default();
             telemetry.vehicle_id = Some(vehicle).into();
             telemetry
         };
 
-        recorder.push_scoring(lambiase_session_info::default(), vec![standing(1, true, 0.0)]);
+        recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
         recorder.push_telemetry(&telemetry(1));
         written(&recorder);
 
@@ -579,7 +579,7 @@ mod tests {
         written(&recorder);
 
         // Spectating: nobody is the player
-        recorder.push_scoring(lambiase_session_info::default(), vec![standing(1, false, 0.0)]);
+        recorder.push_scoring(bono_session_info::default(), vec![standing(1, false, 0.0)]);
         recorder.push_telemetry(&telemetry(1));
         drop(recorder);
 
@@ -598,16 +598,16 @@ mod tests {
     fn clears_what_was_recorded() {
         let dir = tempfile::tempdir().unwrap();
         let recorder = Recorder::new(dir.path(), None).unwrap();
-        recorder.push_scoring(lambiase_session_info::default(), vec![standing(1, true, 0.0)]);
+        recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
         // Telemetry too, which the wheel and car state rows reference
         assert!(recorder.wants_telemetry(1, 10.0, 0.0));
-        let mut telemetry = lambiase_telemetry::default();
+        let mut telemetry = bono_telemetry::default();
         telemetry.vehicle_id = Some(1).into();
         recorder.push_telemetry(&telemetry);
         written(&recorder);
 
         recorder.clear();
-        recorder.push_scoring(lambiase_session_info::default(), vec![standing(2, true, 0.0)]);
+        recorder.push_scoring(bono_session_info::default(), vec![standing(2, true, 0.0)]);
         drop(recorder);
 
         let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
@@ -634,7 +634,7 @@ mod tests {
         };
 
         let recorder = Recorder::new(dir.path(), None).unwrap();
-        recorder.push_scoring(lambiase_session_info::default(), vec![standing(1, true, 0.0)]);
+        recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
         drop(recorder);
 
         // A reader still has the last run's database open, so it can't be deleted (on Windows)
@@ -677,7 +677,7 @@ mod tests {
     fn readers_see_what_is_recorded() {
         let dir = tempfile::tempdir().unwrap();
         let recorder = Recorder::new(dir.path(), None).unwrap();
-        recorder.push_scoring(lambiase_session_info::default(), vec![standing(1, true, 0.0)]);
+        recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
 
         // As the app opens it: read-only, once the file is there, while the recorder is writing
         let deadline = Instant::now() + Duration::from_secs(5);

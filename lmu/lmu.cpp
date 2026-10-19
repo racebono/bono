@@ -1,6 +1,6 @@
 // Le Mans Ultimate plugin: the game loads this DLL from its Plugins folder and calls it with telemetry and
 // scoring updates. This file implements the game's plugin interface and converts its data into the structs in
-// include/lambiase; the recorder in src/lib.rs (Rust, in the same DLL) writes them into the database.
+// include/bono; the recorder in src/lib.rs (Rust, in the same DLL) writes them into the database.
 //
 // Ported from my-engineer's sim/lmu/lmu.cpp.
 #define WIN32_LEAN_AND_MEAN
@@ -28,8 +28,8 @@ static double kelvin_to_celsius(double kelvin) {
     return kelvin - 273.15;
 }
 
-// LMU's car axes are +x left, +y up, +z back; lambiase_telemetry_s uses forward, right and up.
-static void convert(const TelemInfoV01& in, lambiase_telemetry_s& out) {
+// LMU's car axes are +x left, +y up, +z back; bono_telemetry_s uses forward, right and up.
+static void convert(const TelemInfoV01& in, bono_telemetry_s& out) {
     out.vehicle_id = in.mID;
     out.session_time = in.mElapsedTime;
     out.time_since_last_update = in.mDeltaTime;
@@ -151,7 +151,7 @@ static void convert(const TelemInfoV01& in, lambiase_telemetry_s& out) {
 
     for (std::size_t i = 0; i < std::size(out.wheels); ++i) {
         const TelemWheelV01& w = in.mWheel[i];
-        lambiase_wheel_telemetry_s& o = out.wheels[i];
+        bono_wheel_telemetry_s& o = out.wheels[i];
         o.suspension_deflection = w.mSuspensionDeflection;
         o.suspension_force = w.mSuspForce;
         o.ride_height = w.mRideHeight;
@@ -240,8 +240,8 @@ namespace {
         }
     }
 
-    lambiase_session_info_s convert(const ScoringInfoV01& in) {
-        lambiase_session_info_s out;
+    bono_session_info_s convert(const ScoringInfoV01& in) {
+        bono_session_info_s out;
         out.session_time = in.mCurrentET;
         out.time_remaining = in.mSessionTimeRemaining;
         out.time_of_day = in.mTimeOfDay;
@@ -336,8 +336,8 @@ namespace {
         return out;
     }
 
-    lambiase_standing_s convert(const VehicleScoringInfoV01& in, double session_time) {
-        lambiase_standing_s out;
+    bono_standing_s convert(const VehicleScoringInfoV01& in, double session_time) {
+        bono_standing_s out;
         out.session_time = session_time;
         out.vehicle_id = in.mID;
         out.is_player = in.mIsPlayer;
@@ -487,14 +487,14 @@ namespace {
             if (!_recorder) {
                 try {
                     const std::wstring dir = database_dir().native();
-                    lambiase_lmu_remove_database(dir.data(), dir.size());
+                    bono_lmu_remove_database(dir.data(), dir.size());
                 } catch (...) {
                 }
             }
         }
 
         // The database is created when the first session loads (while the pilot is still in the garage), not
-        // when the game starts. It lives in UserData\lambiase, where the app and the skill's scripts look
+        // when the game starts. It lives in UserData\bono, where the app and the skill's scripts look
         // for it while the game runs, holds a whole weekend, and is deleted when the game closes.
         void StartSession() override {
             start_recording();
@@ -503,7 +503,7 @@ namespace {
         // A track loading is a new weekend (its sessions come and go without loading it again): the last
         // weekend's data goes, while the practice, qualifying and race of this one stay together.
         void Load() override {
-            if (_recorder) lambiase_lmu_clear(_recorder);
+            if (_recorder) bono_lmu_clear(_recorder);
         }
 
         // In case the plugin missed the session starting.
@@ -520,16 +520,16 @@ namespace {
         void UpdateTelemetry(const TelemInfoV01& info) override {
             if (!_recorder) return;
             const double speed = std::hypot(info.mLocalVel.x, info.mLocalVel.y, info.mLocalVel.z);
-            if (!lambiase_lmu_wants_telemetry(_recorder, info.mID, info.mElapsedTime, speed)) return;
-            lambiase_telemetry_s telemetry;
+            if (!bono_lmu_wants_telemetry(_recorder, info.mID, info.mElapsedTime, speed)) return;
+            bono_telemetry_s telemetry;
             convert(info, telemetry);
-            lambiase_lmu_push_telemetry(_recorder, &telemetry);
+            bono_lmu_push_telemetry(_recorder, &telemetry);
         }
 
         // About five times a second.
         void UpdateScoring(const ScoringInfoV01& info) override {
             if (!_recorder || !info.mVehicle) return;
-            lambiase_session_info_s session = convert(info);
+            bono_session_info_s session = convert(info);
             {
                 std::lock_guard lock(_weather_mutex);
                 if (_weather) {
@@ -537,31 +537,31 @@ namespace {
                     session.wind_max_speed = _weather->wind_max_speed;
                 }
             }
-            std::vector<lambiase_standing_s> standings;
+            std::vector<bono_standing_s> standings;
             standings.reserve(static_cast<std::size_t>(std::max(info.mNumVehicles, 0L)));
             for (long i = 0; i < info.mNumVehicles; ++i) {
                 standings.push_back(convert(info.mVehicle[i], info.mCurrentET));
             }
             // Moves them out, leaving them empty.
-            lambiase_lmu_push_scoring(_recorder, &session, standings.data(), standings.size());
+            bono_lmu_push_scoring(_recorder, &session, standings.data(), standings.size());
         }
 
     private:
         std::filesystem::path database_dir() const {
             const std::filesystem::path user_data =
                     _user_data.empty() ? std::filesystem::absolute("UserData") : _user_data;
-            return user_data / "lambiase";
+            return user_data / "bono";
         }
 
         // A recorder that stopped on an error is replaced, so a failure costs a session rather than the rest of
         // the run.
         void start_recording() {
-            if (_recorder && lambiase_lmu_failed(_recorder)) close();
+            if (_recorder && bono_lmu_failed(_recorder)) close();
             if (_recorder) return;
             try {
                 const std::wstring dir = database_dir().native();
                 // Null if it can't: nothing is recorded this run, and the game carries on.
-                _recorder = lambiase_lmu_open(dir.data(), dir.size());
+                _recorder = bono_lmu_open(dir.data(), dir.size());
             } catch (...) {
             }
         }
@@ -570,11 +570,11 @@ namespace {
         // Steam reports the game closed, which is after this) keeps it from being deleted: the app deletes it
         // once it has let go, and failing that the next run empties it.
         void close() {
-            if (_recorder) lambiase_lmu_close(std::exchange(_recorder, nullptr));
+            if (_recorder) bono_lmu_close(std::exchange(_recorder, nullptr));
         }
 
         std::filesystem::path _user_data;
-        lambiase_lmu_recorder* _recorder = nullptr;
+        bono_lmu_recorder* _recorder = nullptr;
         std::mutex _weather_mutex;
         std::optional<Weather> _weather;
     };
@@ -583,7 +583,7 @@ namespace {
 // The functions LMU looks up when it loads a plugin DLL.
 extern "C" {
 __declspec(dllexport) const char* __cdecl GetPluginName() {
-    return "lambiase";
+    return "bono";
 }
 
 __declspec(dllexport) PluginObjectType __cdecl GetPluginType() {

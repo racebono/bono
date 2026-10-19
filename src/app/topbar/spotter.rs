@@ -1,7 +1,7 @@
 //! The spotter: whether it calls at all, and in which language.
 
 use crate::{app::topbar::pick, config::Config, language};
-use lambiase_i18n::t;
+use bono_i18n::t;
 
 #[derive(Default)]
 pub struct SpotterTopbar;

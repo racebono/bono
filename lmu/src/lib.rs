@@ -3,9 +3,9 @@
 //! this DLL by `build.rs`.
 #![cfg(windows)]
 
-use lambiase_sim::{
+use bono_sim::{
     recorder::{self, Recorder},
-    sys::{lambiase_session_info, lambiase_standing, lambiase_telemetry},
+    sys::{bono_session_info, bono_standing, bono_telemetry},
 };
 use std::{
     ffi::OsString,
@@ -16,13 +16,13 @@ use std::{
 
 mod forecast;
 
-/// What `lambiase_lmu_recorder*` points to.
+/// What `bono_lmu_recorder*` points to.
 pub struct LmuRecorder(Recorder);
 
 /// # Safety
 /// `dir` must be valid for reads of `len` UTF-16 units.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn lambiase_lmu_open(dir: *const u16, len: usize) -> *mut LmuRecorder {
+pub unsafe extern "C" fn bono_lmu_open(dir: *const u16, len: usize) -> *mut LmuRecorder {
     let dir = unsafe { path(dir, len) };
     guard(std::ptr::null_mut(), || {
         match Recorder::new(dir, Some(Box::new(forecast::fetch))) {
@@ -33,9 +33,9 @@ pub unsafe extern "C" fn lambiase_lmu_open(dir: *const u16, len: usize) -> *mut 
 }
 
 /// # Safety
-/// `recorder` must come from `lambiase_lmu_open`, and isn't used afterwards.
+/// `recorder` must come from `bono_lmu_open`, and isn't used afterwards.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn lambiase_lmu_close(recorder: *mut LmuRecorder) {
+pub unsafe extern "C" fn bono_lmu_close(recorder: *mut LmuRecorder) {
     let recorder = unsafe { Box::from_raw(recorder) };
     guard((), move || {
         let dir = recorder.0.dir().to_owned();
@@ -48,15 +48,15 @@ pub unsafe extern "C" fn lambiase_lmu_close(recorder: *mut LmuRecorder) {
 /// # Safety
 /// `dir` must be valid for reads of `len` UTF-16 units.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn lambiase_lmu_remove_database(dir: *const u16, len: usize) {
+pub unsafe extern "C" fn bono_lmu_remove_database(dir: *const u16, len: usize) {
     let dir = unsafe { path(dir, len) };
     guard((), || recorder::remove_database(&dir))
 }
 
 /// # Safety
-/// `recorder` must come from `lambiase_lmu_open`.
+/// `recorder` must come from `bono_lmu_open`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn lambiase_lmu_wants_telemetry(
+pub unsafe extern "C" fn bono_lmu_wants_telemetry(
     recorder: *const LmuRecorder,
     vehicle_id: i64,
     session_time: f64,
@@ -69,11 +69,11 @@ pub unsafe extern "C" fn lambiase_lmu_wants_telemetry(
 }
 
 /// # Safety
-/// `recorder` must come from `lambiase_lmu_open`, and `telemetry` be valid for reads.
+/// `recorder` must come from `bono_lmu_open`, and `telemetry` be valid for reads.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn lambiase_lmu_push_telemetry(
+pub unsafe extern "C" fn bono_lmu_push_telemetry(
     recorder: *const LmuRecorder,
-    telemetry: *const lambiase_telemetry,
+    telemetry: *const bono_telemetry,
 ) {
     let recorder = unsafe { &(*recorder).0 };
     let telemetry = unsafe { &*telemetry };
@@ -81,14 +81,14 @@ pub unsafe extern "C" fn lambiase_lmu_push_telemetry(
 }
 
 /// # Safety
-/// `recorder` must come from `lambiase_lmu_open`, `session` be valid for reads and writes and
+/// `recorder` must come from `bono_lmu_open`, `session` be valid for reads and writes and
 /// `standings` for reads and writes of `count` standings. They're moved out, leaving them empty
 /// (every field NULL), so C++'s destructors free nothing.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn lambiase_lmu_push_scoring(
+pub unsafe extern "C" fn bono_lmu_push_scoring(
     recorder: *const LmuRecorder,
-    session: *mut lambiase_session_info,
-    standings: *mut lambiase_standing,
+    session: *mut bono_session_info,
+    standings: *mut bono_standing,
     count: usize,
 ) {
     let recorder = unsafe { &(*recorder).0 };
@@ -104,17 +104,17 @@ pub unsafe extern "C" fn lambiase_lmu_push_scoring(
 }
 
 /// # Safety
-/// `recorder` must come from `lambiase_lmu_open`.
+/// `recorder` must come from `bono_lmu_open`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn lambiase_lmu_clear(recorder: *const LmuRecorder) {
+pub unsafe extern "C" fn bono_lmu_clear(recorder: *const LmuRecorder) {
     let recorder = unsafe { &(*recorder).0 };
     guard((), || recorder.clear())
 }
 
 /// # Safety
-/// `recorder` must come from `lambiase_lmu_open`.
+/// `recorder` must come from `bono_lmu_open`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn lambiase_lmu_failed(recorder: *const LmuRecorder) -> bool {
+pub unsafe extern "C" fn bono_lmu_failed(recorder: *const LmuRecorder) -> bool {
     let recorder = unsafe { &(*recorder).0 };
     recorder.failed()
 }

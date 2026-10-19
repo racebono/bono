@@ -1,6 +1,6 @@
 #pragma once
 
-#include "lambiase.h"
+#include "bono.h"
 
 // Simulator-independent scoring: the state of the session and the standings of
 // every car. Like telemetry, each simulator converts its own data into these
@@ -12,7 +12,7 @@
 // compared), and a new row is written when any `compared` column differs from
 // the last row written. The other columns change on every update (clocks, gaps,
 // distances), so they are stored with each row but never trigger one. `type` is
-// f64, i64, boolean or string (the lambiase_opt_* types in lambiase.h).
+// f64, i64, boolean or string (the bono_opt_* types in bono.h).
 
 // clang-format off
 #define SIM_SESSION_COLUMNS(X)                                                                            \
@@ -115,16 +115,16 @@
     X(f64, track_edge, false)                /* meters from the center line to the edge on the car's side */
 // clang-format on
 
-#define SIM_DECLARE_SCORING_FIELD(type, name, compared)                          lambiase_opt_##type##_s name;
+#define SIM_DECLARE_SCORING_FIELD(type, name, compared)                          bono_opt_##type##_s name;
 
 // The state of the session, in the `session` table.
-typedef struct lambiase_session_info {
+typedef struct bono_session_info {
   SIM_SESSION_COLUMNS(SIM_DECLARE_SCORING_FIELD)
-} lambiase_session_info_s;
+} bono_session_info_s;
 
 // The standing of one car, in the `standings` table.
-typedef struct lambiase_standing {
+typedef struct bono_standing {
   SIM_STANDING_COLUMNS(SIM_DECLARE_SCORING_FIELD)
-} lambiase_standing_s;
+} bono_standing_s;
 
 #undef SIM_DECLARE_SCORING_FIELD

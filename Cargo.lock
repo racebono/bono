@@ -268,6 +268,96 @@ dependencies = [
 ]
 
 [[package]]
+name = "bono"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bindgen 0.73.2",
+ "bono-i18n",
+ "bono-sim",
+ "camino",
+ "crossbeam",
+ "egui",
+ "egui-phosphor",
+ "egui-sdl3",
+ "egui_extras",
+ "futures",
+ "hf-hub",
+ "httpdate",
+ "lingua",
+ "log",
+ "ollama-rs",
+ "oneshot 0.2.1",
+ "ort",
+ "phf 0.14.0",
+ "pin-project",
+ "rand 0.10.3",
+ "rayon",
+ "reqwest 0.13.5",
+ "rusqlite",
+ "sdl3",
+ "sdl3-main",
+ "serde",
+ "serde_json",
+ "simple_logger",
+ "slab",
+ "steamlocate",
+ "tempfile",
+ "tokio",
+ "unicode-normalization",
+ "ureq",
+ "utils-atomics",
+ "whisper-rs",
+ "wide",
+ "windows-sys 0.61.2",
+ "winreg",
+]
+
+[[package]]
+name = "bono-i18n"
+version = "0.1.0"
+dependencies = [
+ "phf 0.14.0",
+ "phf_codegen",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "syn 3.0.9",
+]
+
+[[package]]
+name = "bono-lmu"
+version = "0.1.0"
+dependencies = [
+ "bono-sim",
+ "cc",
+ "embed-resource",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
+name = "bono-phonemizer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "espeak-rs-sys",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bono-sim"
+version = "0.1.0"
+dependencies = [
+ "bindgen 0.72.1",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "bstr"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1849,96 +1939,6 @@ dependencies = [
  "euclid",
  "polycool",
  "smallvec",
-]
-
-[[package]]
-name = "lambiase"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bindgen 0.73.2",
- "camino",
- "crossbeam",
- "egui",
- "egui-phosphor",
- "egui-sdl3",
- "egui_extras",
- "futures",
- "hf-hub",
- "httpdate",
- "lambiase-i18n",
- "lambiase-sim",
- "lingua",
- "log",
- "ollama-rs",
- "oneshot 0.2.1",
- "ort",
- "phf 0.14.0",
- "pin-project",
- "rand 0.10.3",
- "rayon",
- "reqwest 0.13.5",
- "rusqlite",
- "sdl3",
- "sdl3-main",
- "serde",
- "serde_json",
- "simple_logger",
- "slab",
- "steamlocate",
- "tempfile",
- "tokio",
- "unicode-normalization",
- "ureq",
- "utils-atomics",
- "whisper-rs",
- "wide",
- "windows-sys 0.61.2",
- "winreg",
-]
-
-[[package]]
-name = "lambiase-i18n"
-version = "0.1.0"
-dependencies = [
- "phf 0.14.0",
- "phf_codegen",
- "proc-macro2",
- "quote",
- "serde",
- "serde_json",
- "syn 3.0.9",
-]
-
-[[package]]
-name = "lambiase-lmu"
-version = "0.1.0"
-dependencies = [
- "cc",
- "embed-resource",
- "lambiase-sim",
- "serde_json",
- "ureq",
-]
-
-[[package]]
-name = "lambiase-phonemizer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "espeak-rs-sys",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "lambiase-sim"
-version = "0.1.0"
-dependencies = [
- "bindgen 0.72.1",
- "rusqlite",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]

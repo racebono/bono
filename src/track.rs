@@ -8,7 +8,7 @@
 
 use crate::{error, sim::Sim, sqlite::pool::Pool, task::Task};
 use anyhow::Context;
-use lambiase_i18n::t;
+use bono_i18n::t;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Deserializer};
 use std::{
@@ -910,15 +910,15 @@ mod tests {
     #[ignore = "downloads from GitHub"]
     async fn saves_the_session_track_next_to_the_database() {
         use crate::sqlite::Database;
-        use lambiase_sim::{
+        use bono_sim::{
             recorder::{DATABASE, Recorder},
-            sys::lambiase_session_info,
+            sys::bono_session_info,
         };
 
         let prefs = tempfile::tempdir().unwrap();
         let game = tempfile::tempdir().unwrap();
         let recorder = Recorder::new(game.path(), None).unwrap();
-        let mut session = lambiase_session_info::default();
+        let mut session = bono_session_info::default();
         session.track = Some("Autódromo José Carlos Pace".to_owned()).into();
         recorder.push_scoring(session, Vec::new());
         drop(recorder);

@@ -4,7 +4,7 @@ use super::{Model, ModelOption, Reply, StopReason, ToolHandler, Tools, Usage, te
 use crate::config::ClaudeConfig;
 use anyhow::{Context, bail};
 use futures::future::{BoxFuture, join_all};
-use lambiase_i18n::t;
+use bono_i18n::t;
 use reqwest::{
     RequestBuilder, StatusCode,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},

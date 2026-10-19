@@ -1,10 +1,10 @@
-//! The database the simulator plugins record into, with one table per struct in `include/lambiase`
+//! The database the simulator plugins record into, with one table per struct in `include/bono`
 //! and a column per field: `telemetry`, `telemetry_wheel`, `car_state`, `session`, `standings` and
 //! `forecast`. The columns come from the headers' column lists (see `build.rs`).
 
 use crate::sys::{
-    lambiase_car_state, lambiase_forecast_point, lambiase_session_info, lambiase_standing,
-    lambiase_telemetry, lambiase_wheel_telemetry,
+    bono_car_state, bono_forecast_point, bono_session_info, bono_standing,
+    bono_telemetry, bono_wheel_telemetry,
 };
 use rusqlite::{Connection, PrepFlags, Statement};
 use std::collections::HashMap;
@@ -63,12 +63,12 @@ macro_rules! columns {
     };
 }
 
-sim_forecast_columns!(columns!(lambiase_forecast_point));
-sim_session_columns!(columns!(lambiase_session_info));
-sim_standing_columns!(columns!(lambiase_standing));
-sim_telemetry_columns!(columns!(lambiase_telemetry));
-sim_car_state_columns!(columns!(lambiase_car_state));
-sim_wheel_telemetry_columns!(columns!(lambiase_wheel_telemetry));
+sim_forecast_columns!(columns!(bono_forecast_point));
+sim_session_columns!(columns!(bono_session_info));
+sim_standing_columns!(columns!(bono_standing));
+sim_telemetry_columns!(columns!(bono_telemetry));
+sim_car_state_columns!(columns!(bono_car_state));
+sim_wheel_telemetry_columns!(columns!(bono_wheel_telemetry));
 
 pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(&format!(
@@ -90,12 +90,12 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS session (id INTEGER PRIMARY KEY{session});
         CREATE TABLE IF NOT EXISTS standings (id INTEGER PRIMARY KEY{standing});
         CREATE TABLE IF NOT EXISTS forecast (id INTEGER PRIMARY KEY{forecast});",
-        telemetry = lambiase_telemetry::DEFINITIONS,
-        wheel = lambiase_wheel_telemetry::DEFINITIONS,
-        state = lambiase_car_state::DEFINITIONS,
-        session = lambiase_session_info::DEFINITIONS,
-        standing = lambiase_standing::DEFINITIONS,
-        forecast = lambiase_forecast_point::DEFINITIONS,
+        telemetry = bono_telemetry::DEFINITIONS,
+        wheel = bono_wheel_telemetry::DEFINITIONS,
+        state = bono_car_state::DEFINITIONS,
+        session = bono_session_info::DEFINITIONS,
+        standing = bono_standing::DEFINITIONS,
+        forecast = bono_forecast_point::DEFINITIONS,
     ))
 }
 
@@ -150,20 +150,20 @@ pub struct TelemetryWriter<'conn> {
     insert_wheel: Statement<'conn>,
     insert_state: Statement<'conn>,
     /// Each car's last state written, and the session time it was last seen at.
-    last_states: HashMap<i64, (lambiase_car_state, f64)>,
+    last_states: HashMap<i64, (bono_car_state, f64)>,
 }
 
 impl<'conn> TelemetryWriter<'conn> {
     pub fn new(conn: &'conn Connection) -> rusqlite::Result<Self> {
         Ok(Self {
             conn,
-            insert_car: prepare_insert::<lambiase_telemetry>(conn, "telemetry", &[])?,
-            insert_wheel: prepare_insert::<lambiase_wheel_telemetry>(
+            insert_car: prepare_insert::<bono_telemetry>(conn, "telemetry", &[])?,
+            insert_wheel: prepare_insert::<bono_wheel_telemetry>(
                 conn,
                 "telemetry_wheel",
                 &["telemetry_id", "wheel"],
             )?,
-            insert_state: prepare_insert::<lambiase_car_state>(
+            insert_state: prepare_insert::<bono_car_state>(
                 conn,
                 "car_state",
                 &["telemetry_id", "vehicle_id", "session_time"],
@@ -176,7 +176,7 @@ impl<'conn> TelemetryWriter<'conn> {
         self.last_states.clear();
     }
 
-    pub fn write(&mut self, telemetry: &lambiase_telemetry) -> rusqlite::Result<()> {
+    pub fn write(&mut self, telemetry: &bono_telemetry) -> rusqlite::Result<()> {
         telemetry.bind(&mut self.insert_car, 1)?;
         self.insert_car.raw_execute()?;
         let telemetry_id = self.conn.last_insert_rowid();
@@ -213,15 +213,15 @@ impl<'conn> TelemetryWriter<'conn> {
 pub struct ScoringWriter<'conn> {
     insert_session: Statement<'conn>,
     insert_standing: Statement<'conn>,
-    last_session: Option<lambiase_session_info>,
-    last_standings: HashMap<i64, lambiase_standing>,
+    last_session: Option<bono_session_info>,
+    last_standings: HashMap<i64, bono_standing>,
 }
 
 impl<'conn> ScoringWriter<'conn> {
     pub fn new(conn: &'conn Connection) -> rusqlite::Result<Self> {
         Ok(Self {
-            insert_session: prepare_insert::<lambiase_session_info>(conn, "session", &[])?,
-            insert_standing: prepare_insert::<lambiase_standing>(conn, "standings", &[])?,
+            insert_session: prepare_insert::<bono_session_info>(conn, "session", &[])?,
+            insert_standing: prepare_insert::<bono_standing>(conn, "standings", &[])?,
             last_session: None,
             last_standings: HashMap::new(),
         })
@@ -234,8 +234,8 @@ impl<'conn> ScoringWriter<'conn> {
 
     pub fn write(
         &mut self,
-        session: lambiase_session_info,
-        standings: Vec<lambiase_standing>,
+        session: bono_session_info,
+        standings: Vec<bono_standing>,
     ) -> rusqlite::Result<()> {
         if self
             .last_session
@@ -270,14 +270,14 @@ impl<'conn> ScoringWriter<'conn> {
 pub struct ForecastWriter<'conn> {
     conn: &'conn Connection,
     insert: Statement<'conn>,
-    last: Vec<lambiase_forecast_point>,
+    last: Vec<bono_forecast_point>,
 }
 
 impl<'conn> ForecastWriter<'conn> {
     pub fn new(conn: &'conn Connection) -> rusqlite::Result<Self> {
         Ok(Self {
             conn,
-            insert: prepare_insert::<lambiase_forecast_point>(conn, "forecast", &[])?,
+            insert: prepare_insert::<bono_forecast_point>(conn, "forecast", &[])?,
             last: Vec::new(),
         })
     }
@@ -287,7 +287,7 @@ impl<'conn> ForecastWriter<'conn> {
     }
 
     /// Returns whether the forecast changed, and so was written.
-    pub fn write(&mut self, points: Vec<lambiase_forecast_point>) -> rusqlite::Result<bool> {
+    pub fn write(&mut self, points: Vec<bono_forecast_point>) -> rusqlite::Result<bool> {
         if points.is_empty() || same_forecast(&points, &self.last) {
             return Ok(false);
         }
@@ -305,7 +305,7 @@ impl<'conn> ForecastWriter<'conn> {
 }
 
 /// The same forecast, whenever it was read.
-fn same_forecast(a: &[lambiase_forecast_point], b: &[lambiase_forecast_point]) -> bool {
+fn same_forecast(a: &[bono_forecast_point], b: &[bono_forecast_point]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(a, b)| {
             let mut a = a.clone();

@@ -171,9 +171,9 @@
         "ca": "Tanca el joc primer: manté el plugin en ús mentre és en marxa"
     },
     "plugin.missing_hover": {
-        "en": "The plugin isn't next to lambiase (plugins\\lambiase_lmu.dll)",
-        "es": "El plugin no está junto a lambiase (plugins\\lambiase_lmu.dll)",
-        "ca": "El plugin no és al costat de lambiase (plugins\\lambiase_lmu.dll)"
+        "en": "The plugin isn't next to bono (plugins\\bono_lmu.dll)",
+        "es": "El plugin no está junto a bono (plugins\\bono_lmu.dll)",
+        "ca": "El plugin no és al costat de bono (plugins\\bono_lmu.dll)"
     },
     "plugin.install_done": {
         "en": "Plugin installed. It's loaded the next time the game starts",

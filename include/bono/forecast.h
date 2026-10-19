@@ -1,13 +1,13 @@
 #pragma once
 
-#include "lambiase.h"
+#include "bono.h"
 
 // The weather forecast for the event's sessions, as the simulator gives it (LMU
 // only): a few points through each session. Stored in the `forecast` table, a
 // whole set of rows at a time, only when the forecast changes.
 //
 // Each list entry is X(type, name), where type is f64, i64, boolean or string
-// (the lambiase_opt_* types in lambiase.h).
+// (the bono_opt_* types in bono.h).
 
 // clang-format off
 #define SIM_FORECAST_COLUMNS(X)                                                                          \
@@ -23,11 +23,11 @@
     X(string, wind_direction)               /* N, NE, E, SE, S, SW, W or NW, as the game gives it */
 // clang-format on
 
-#define SIM_DECLARE_FIELD(type, name) lambiase_opt_##type##_s name;
+#define SIM_DECLARE_FIELD(type, name) bono_opt_##type##_s name;
 
 // One point of the forecast.
-typedef struct lambiase_forecast_point {
+typedef struct bono_forecast_point {
   SIM_FORECAST_COLUMNS(SIM_DECLARE_FIELD)
-} lambiase_forecast_point_s;
+} bono_forecast_point_s;
 
 #undef SIM_DECLARE_FIELD

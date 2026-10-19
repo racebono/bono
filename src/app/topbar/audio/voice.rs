@@ -12,7 +12,7 @@ use crate::{
 use camino::{Utf8Component, Utf8Path};
 use egui::{RichText, Widget};
 use egui_extras::Column;
-use lambiase_i18n::t;
+use bono_i18n::t;
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap},

@@ -50,7 +50,7 @@ fn main() {
         // Nothing in Rust refers to lmu.cpp: without this, the linker would leave it out, and with
         // it the functions LMU looks the plugin up by
         .link_lib_modifier("+whole-archive")
-        .compile("lambiase_lmu_plugin");
+        .compile("bono_lmu_plugin");
 
     version_resource();
 }
@@ -79,11 +79,11 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "FileDescription", "lambiase plugin for Le Mans Ultimate"
+            VALUE "FileDescription", "bono plugin for Le Mans Ultimate"
             VALUE "FileVersion", "{version}"
-            VALUE "ProductName", "lambiase"
+            VALUE "ProductName", "bono"
             VALUE "ProductVersion", "{version}"
-            VALUE "OriginalFilename", "lambiase_lmu.dll"
+            VALUE "OriginalFilename", "bono_lmu.dll"
         END
     END
     BLOCK "VarFileInfo"

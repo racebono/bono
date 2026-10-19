@@ -1,9 +1,9 @@
 [package]
-name = "lambiase-phonemizer"
+name = "bono-phonemizer"
 version = "0.1.0"
 edition = "2024"
 publish = false
-# It links espeak-ng, so it's GPL like it. Lambiase only talks to it through its stdin and stdout
+# It links espeak-ng, so it's GPL like it. Bono only talks to it through its stdin and stdout
 license = "GPL-3.0-or-later"
 
 [dependencies]

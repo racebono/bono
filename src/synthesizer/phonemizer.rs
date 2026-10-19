@@ -1,5 +1,5 @@
-//! Talks to `lambiase-phonemizer`, the separate program that turns text into phonemes with
-//! espeak-ng (which is GPL, so it isn't linked into Lambiase).
+//! Talks to `bono-phonemizer`, the separate program that turns text into phonemes with
+//! espeak-ng (which is GPL, so it isn't linked into Bono).
 //!
 //! Every voice shares one phonemizer process, started on first use and again if it dies. It
 //! answers one request at a time, so callers take turns.
@@ -13,7 +13,7 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-const EXE_NAME: &str = "lambiase-phonemizer";
+const EXE_NAME: &str = "bono-phonemizer";
 
 static PROCESS: Mutex<Option<Process>> = Mutex::new(None);
 
@@ -143,7 +143,7 @@ fn exe_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// Needs the phonemizer: `cargo build -p lambiase-phonemizer` first.
+    /// Needs the phonemizer: `cargo build -p bono-phonemizer` first.
     #[test]
     #[ignore]
     fn phonemizes_through_the_process() {
