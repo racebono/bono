@@ -68,6 +68,20 @@ pub struct Raised {
 }
 
 impl Raised {
+    fn valid_at(&self, at: Instant, now: Instant) -> bool {
+        now.duration_since(at) < if self.urgent { URGENT_FOR } else { OTHER_FOR }
+    }
+
+    /// Traffic updates replace the state of the sides they describe. Unrelated alerts do not.
+    fn traffic_sides(&self) -> u8 {
+        match self.text {
+            "car left" | "still there left" | "clear left" => 1,
+            "car right" | "still there right" | "clear right" => 2,
+            "three wide" | "clear all round" => 3,
+            _ => 0,
+        }
+    }
+
     /// What's said, in `lang` (or in English when there's no translation).
     pub fn words(&self, lang: ArrayStr<2>) -> String {
         let text = translate(self.text, lang);
@@ -108,7 +122,12 @@ impl Drop for Running {
 }
 
 enum Saying {
-    Synthesizing(CacheKey, oneshot::Receiver<anyhow::Result<Speech>>),
+    Synthesizing {
+        key: CacheKey,
+        recv: oneshot::Receiver<anyhow::Result<Speech>>,
+        call: Raised,
+        at: Instant,
+    },
     /// Dropping it stops it
     Playing(AudioStreamOwner),
 }
@@ -162,13 +181,18 @@ impl Spotter {
         }
 
         let lang = self.language(config, &settings, engineer);
-        if let Some(running) = &self.running {
-            while let Ok(call) = running.calls.try_recv() {
+        if self.running.is_some() {
+            while let Some(call) = self
+                .running
+                .as_ref()
+                .and_then(|running| running.calls.try_recv().ok())
+            {
                 // A newer urgent call replaces one still waiting: "car left" is stale once it's
                 // "clear left"
                 if call.urgent {
                     self.queue.retain(|(queued, _)| !queued.urgent);
                 }
+                self.discard_stale_synthesis(Instant::now(), Some(&call));
                 self.queue.push_back((call, Instant::now()));
             }
             self.warm(rt, config, synth, lang);
@@ -222,6 +246,17 @@ impl Spotter {
         }
     }
 
+    /// Drop the receiver promptly, so an obsolete call no longer holds the engineer.
+    fn discard_stale_synthesis(&mut self, now: Instant, newer: Option<&Raised>) {
+        if let Some(Saying::Synthesizing { call, at, .. }) = &self.saying {
+            let superseded =
+                newer.is_some_and(|newer| call.traffic_sides() & newer.traffic_sides() != 0);
+            if !call.valid_at(*at, now) || superseded {
+                self.saying = None;
+            }
+        }
+    }
+
     fn say(
         &mut self,
         rt: &Handle,
@@ -231,9 +266,11 @@ impl Spotter {
         engineer: &mut Engineer,
         lang: ArrayStr<2>,
     ) {
+        self.discard_stale_synthesis(Instant::now(), None);
+
         // The call being said
         match &mut self.saying {
-            Some(Saying::Synthesizing(key, recv)) => match recv.try_recv() {
+            Some(Saying::Synthesizing { key, recv, .. }) => match recv.try_recv() {
                 Ok(Ok(speech)) => {
                     let speech = Arc::new(speech);
                     self.cache.insert(key.clone(), speech.clone());
@@ -257,9 +294,7 @@ impl Spotter {
         // The next call: urgent ones first, the rest once the engineer is quiet
         if self.saying.is_none() {
             let now = Instant::now();
-            self.queue.retain(|(call, at)| {
-                now.duration_since(*at) < if call.urgent { URGENT_FOR } else { OTHER_FOR }
-            });
+            self.queue.retain(|(call, at)| call.valid_at(*at, now));
 
             let next = match self.queue.iter().position(|(call, _)| call.urgent) {
                 Some(urgent) => Some(urgent),
@@ -267,14 +302,19 @@ impl Spotter {
                 None => None,
             };
 
-            if let Some((call, _)) = next.and_then(|next| self.queue.remove(next)) {
+            if let Some((call, at)) = next.and_then(|next| self.queue.remove(next)) {
                 let words = call.words(lang);
                 let key = Self::key(config, lang, words.clone());
                 self.saying = match self.cache.get(&key).cloned() {
                     Some(speech) => self.play(config, speaker, &speech),
                     None => {
                         let recv = synth.synthesize(rt, lang, words, Self::effects(config));
-                        Some(Saying::Synthesizing(key, recv))
+                        Some(Saying::Synthesizing {
+                            key,
+                            recv,
+                            call,
+                            at,
+                        })
                     }
                 };
             }
@@ -1224,6 +1264,105 @@ pub fn translate(text: &'static str, lang: ArrayStr<2>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending_call(
+        text: &'static str,
+        urgent: bool,
+        at: Instant,
+    ) -> (Spotter, oneshot::Sender<anyhow::Result<Speech>>) {
+        let mut spotter = Spotter::new();
+        let (send, recv) = oneshot::channel();
+        spotter.saying = Some(Saying::Synthesizing {
+            key: (arrstr!("en"), PathBuf::new(), 0, text.into()),
+            recv,
+            call: Raised {
+                text,
+                urgent,
+                number: None,
+                session_time: 0.0,
+            },
+            at,
+        });
+        (spotter, send)
+    }
+
+    #[test]
+    fn synthesis_expires_at_the_original_queue_deadline() {
+        let at = Instant::now();
+        for (urgent, lifetime) in [(true, URGENT_FOR), (false, OTHER_FOR)] {
+            let (mut spotter, send) = pending_call("car right", urgent, at);
+            spotter.discard_stale_synthesis(at + lifetime - Duration::from_nanos(1), None);
+            assert!(spotter.saying.is_some());
+            // Completion at the deadline must not reach playback, even if already received.
+            assert!(
+                send.send(Ok(Speech {
+                    samples: vec![],
+                    sample_rate: 24000,
+                }))
+                .is_ok()
+            );
+            spotter.discard_stale_synthesis(at + lifetime, None);
+            assert!(spotter.saying.is_none());
+        }
+    }
+
+    #[test]
+    fn expired_pending_synthesis_releases_the_call_without_waiting_for_completion() {
+        let at = Instant::now();
+        let (mut spotter, send) = pending_call("car right", true, at);
+        spotter.discard_stale_synthesis(at + URGENT_FOR, None);
+        assert!(spotter.saying.is_none());
+        assert!(send.is_closed());
+    }
+
+    #[test]
+    fn newer_traffic_cancels_pending_or_completed_synthesis() {
+        let at = Instant::now();
+        for completed in [false, true] {
+            for (old, new) in [
+                ("car right", "clear right"),
+                ("still there left", "clear left"),
+                ("three wide", "clear right"),
+                ("car left", "clear all round"),
+                ("clear right", "car right"),
+            ] {
+                let (mut spotter, send) = pending_call(old, true, at);
+                if completed {
+                    assert!(
+                        send.send(Ok(Speech {
+                            samples: vec![],
+                            sample_rate: 24000,
+                        }))
+                        .is_ok()
+                    );
+                }
+                let newer = Raised {
+                    text: new,
+                    urgent: true,
+                    number: None,
+                    session_time: 1.0,
+                };
+                spotter.discard_stale_synthesis(at, Some(&newer));
+                assert!(spotter.saying.is_none(), "{old} superseded by {new}");
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_calls_preserve_fresh_synthesis() {
+        let at = Instant::now();
+        for new in ["car left", "limiter, limiter", "red flag", "rain starting"] {
+            let (mut spotter, _send) = pending_call("car right", true, at);
+            let newer = Raised {
+                text: new,
+                urgent: true,
+                number: None,
+                session_time: 1.0,
+            };
+            spotter.discard_stale_synthesis(at, Some(&newer));
+            assert!(spotter.saying.is_some(), "unrelated {new}");
+        }
+    }
 
     /// The player at `t`, heading along -z (heading 0) at 50 m/s.
     fn player(t: f64) -> Player {
