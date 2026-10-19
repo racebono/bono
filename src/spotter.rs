@@ -78,6 +78,29 @@ impl Raised {
     }
 }
 
+/// Urgent state updates supersede only warnings about the same thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarningCategory {
+    Traffic,
+    Limiter,
+    Flag,
+    Other(&'static str),
+}
+
+impl Raised {
+    fn warning_category(&self) -> WarningCategory {
+        match self.text {
+            "car left" | "car right" | "three wide" | "clear left" | "clear right"
+            | "clear all round" | "still there left" | "still there right" => {
+                WarningCategory::Traffic
+            }
+            "limiter, limiter" => WarningCategory::Limiter,
+            "full course yellow" | "green flag, green flag" | "red flag" => WarningCategory::Flag,
+            text => WarningCategory::Other(text),
+        }
+    }
+}
+
 pub struct Spotter {
     /// Following the database at this path
     running: Option<Running>,
@@ -164,17 +187,20 @@ impl Spotter {
         let lang = self.language(config, &settings, engineer);
         if let Some(running) = &self.running {
             while let Ok(call) = running.calls.try_recv() {
-                // A newer urgent call replaces one still waiting: "car left" is stale once it's
-                // "clear left"
-                if call.urgent {
-                    self.queue.retain(|(queued, _)| !queued.urgent);
-                }
-                self.queue.push_back((call, Instant::now()));
+                Self::enqueue(&mut self.queue, call, Instant::now());
             }
             self.warm(rt, config, synth, lang);
         }
 
         self.say(rt, config, synth, speaker, engineer, lang);
+    }
+
+    fn enqueue(queue: &mut VecDeque<(Raised, Instant)>, call: Raised, at: Instant) {
+        if call.urgent {
+            let category = call.warning_category();
+            queue.retain(|(queued, _)| !queued.urgent || queued.warning_category() != category);
+        }
+        queue.push_back((call, at));
     }
 
     /// The calls' language: the configured one, or the pilot's; English without a voice for it.
@@ -1224,6 +1250,89 @@ pub fn translate(text: &'static str, lang: ArrayStr<2>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queued(calls: &[(&'static str, bool)]) -> Vec<(Raised, Instant)> {
+        let mut queue = VecDeque::new();
+        for &(text, urgent) in calls {
+            Spotter::enqueue(
+                &mut queue,
+                Raised {
+                    text,
+                    urgent,
+                    number: None,
+                    session_time: 0.0,
+                },
+                Instant::now(),
+            );
+        }
+        queue.into_iter().collect()
+    }
+
+    #[test]
+    fn queued_urgent_categories_survive_in_either_order() {
+        for calls in [
+            [
+                ("car right", true),
+                ("limiter, limiter", true),
+                ("full course yellow", true),
+            ],
+            [
+                ("full course yellow", true),
+                ("limiter, limiter", true),
+                ("car right", true),
+            ],
+        ] {
+            let queue = queued(&calls);
+            assert_eq!(
+                queue
+                    .iter()
+                    .map(|(call, _)| (call.text, call.urgent))
+                    .collect::<Vec<_>>(),
+                calls
+            );
+        }
+    }
+
+    #[test]
+    fn queued_updates_replace_only_their_category() {
+        let queue = queued(&[
+            ("blue flag", false),
+            ("car right", true),
+            ("full course yellow", true),
+            ("limiter, limiter", true),
+            ("clear right", true),
+            ("green flag, green flag", true),
+            ("red flag", true),
+        ]);
+        assert_eq!(
+            queue.iter().map(|(call, _)| call.text).collect::<Vec<_>>(),
+            ["blue flag", "limiter, limiter", "clear right", "red flag"]
+        );
+        assert_eq!(queue.iter().position(|(call, _)| call.urgent), Some(1));
+    }
+
+    #[test]
+    fn queued_replacement_refreshes_age_and_preserves_unrelated_age() {
+        let old = Instant::now();
+        let new = old + Duration::from_millis(100);
+        let call = |text| Raised {
+            text,
+            urgent: true,
+            number: None,
+            session_time: 0.0,
+        };
+        let mut queue = VecDeque::new();
+        Spotter::enqueue(&mut queue, call("car left"), old);
+        Spotter::enqueue(&mut queue, call("limiter, limiter"), old);
+        Spotter::enqueue(&mut queue, call("still there left"), new);
+        assert_eq!(
+            queue
+                .iter()
+                .map(|(call, at)| (call.text, *at))
+                .collect::<Vec<_>>(),
+            [("limiter, limiter", old), ("still there left", new)]
+        );
+    }
 
     /// The player at `t`, heading along -z (heading 0) at 50 m/s.
     fn player(t: f64) -> Player {
