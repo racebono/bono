@@ -155,7 +155,9 @@ impl Download {
                 let temp_path = path.with_added_extension("tmp");
                 let file = tokio::fs::File::options()
                     .write(true)
-                    .create_new(true)
+                    // A crashed download can leave this file behind. Restart from byte zero.
+                    .create(true)
+                    .truncate(true)
                     .open(&temp_path)
                     .await?;
 
@@ -261,6 +263,79 @@ impl Drop for Download {
     #[inline]
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    async fn download_over_temp(stale: Option<&[u8]>, body: &'static [u8]) {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("model.bin");
+        let temporary = destination.with_added_extension("tmp");
+        if let Some(stale) = stale {
+            std::fs::write(&temporary, stale).unwrap();
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            socket.write_all(body).unwrap();
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut download = Download::new(
+            client.get(format!("http://{address}/model")),
+            destination.clone(),
+            None,
+        );
+        tokio::time::timeout(Duration::from_secs(15), &mut download.task)
+            .await
+            .expect("download did not finish")
+            .unwrap();
+        server.join().unwrap();
+        assert!(download.done.load(Ordering::Acquire));
+        assert!(!download.failed());
+        assert_eq!(download.progress(), 1.0);
+        assert_eq!(std::fs::read(destination).unwrap(), body);
+        assert!(!temporary.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_temp_is_truncated_before_retry() {
+        download_over_temp(
+            Some(b"old partial model with a trailing suffix"),
+            b"new model",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_response_removes_all_stale_bytes() {
+        download_over_temp(Some(b"old partial model"), b"").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_creates_missing_temp_file() {
+        download_over_temp(None, b"new model").await;
     }
 }
 
