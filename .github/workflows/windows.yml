@@ -122,12 +122,7 @@ jobs:
         run: ./.github/scripts/setup-cuda.ps1
 
       - name: Set up Vulkan
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
-        with:
-          vulkan-query-version: '1.4.304.1'
-          # Glslang's optimizer requires SPIRV-Tools and its headers.
-          vulkan-components: Vulkan-Headers, Vulkan-Loader, SPIRV-Headers, SPIRV-Tools, Glslang
-          vulkan-use-cache: true
+        run: ./.github/scripts/setup-vulkan.ps1
 
       - name: Build distribution
         run: |
