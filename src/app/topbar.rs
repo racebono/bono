@@ -25,7 +25,7 @@ mod provider;
 pub(super) mod settings;
 pub(super) mod simulators;
 mod spotter;
-mod volume;
+pub(super) mod volume;
 
 pub struct Topbar {
     settings: SettingsTopbar,
@@ -164,7 +164,7 @@ const SETUP_COLOR: egui::Color32 = egui::Color32::from_rgb(240, 190, 0);
 
 /// `text`, after a yellow warning sign when what it names isn't set up yet (for a menu, something
 /// in it).
-fn setup_label<'a>(missing: bool, text: impl IntoAtoms<'a>) -> Atoms<'a> {
+pub(super) fn setup_label<'a>(missing: bool, text: impl IntoAtoms<'a>) -> Atoms<'a> {
     let mut atoms = text.into_atoms();
     if missing {
         atoms.push_left(egui::RichText::new(egui_phosphor::bold::WARNING).color(SETUP_COLOR));

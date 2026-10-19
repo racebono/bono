@@ -19,7 +19,10 @@ use bono_i18n::t;
 use camino::Utf8Path;
 use sdl3::{
     AudioSubsystem,
-    audio::{AudioDeviceID, AudioSpec, AudioStreamOwner},
+    audio::{
+        AudioDeviceID, AudioRecordingCallback, AudioSpec, AudioStream, AudioStreamOwner,
+        AudioStreamWithCallback,
+    },
     event::Event,
     get_error,
     sys::{
@@ -29,7 +32,10 @@ use sdl3::{
 };
 use std::{
     ops::Deref,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{runtime::Handle, sync::oneshot::error::TryRecvError};
@@ -76,6 +82,9 @@ pub struct AudioTopbar {
     beep_playback: Option<AudioStreamOwner>,
     /// What the pilot last said on the radio, being transcribed
     transcription: Option<Task<anyhow::Result<Option<(String, ArrayStr<2>)>>>>,
+    /// Listening to the microphone for the setup guide: `None` until it's asked for, and
+    /// `Some(None)` if it couldn't
+    meter: Option<Option<MicMeter>>,
 }
 
 impl AudioTopbar {
@@ -94,6 +103,7 @@ impl AudioTopbar {
             test_playback: None,
             beep_playback: None,
             transcription: None,
+            meter: None,
         }
     }
 
@@ -112,6 +122,116 @@ impl AudioTopbar {
     pub fn poll(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer) {
         self.whisper.poll(rt, config);
         self.voices.poll(rt, config, synth);
+        self.play_test(config);
+    }
+
+    /// Says something in the engineer's voice for the app's language, on the speaker, as loud
+    /// as the engineer.
+    pub fn test_voice(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer) {
+        if self.test.is_some() {
+            return;
+        }
+        log::debug!("Start test");
+        let (lang, effects) = {
+            let config = config.get();
+            (app_language(config.locale()), config.synth_effects())
+        };
+        self.test = Some(synth.synthesize(rt, lang, t!("audio.test_phrase").into(), effects));
+    }
+
+    /// Whether the test speech is being synthesized, or played.
+    pub fn testing(&self) -> bool {
+        self.test.is_some() || self.test_playback.is_some()
+    }
+
+    /// Whether the microphone is open: the talk button is held.
+    pub fn recording(&self) -> bool {
+        self.whisper.recording()
+    }
+
+    /// Whether what the pilot said on the radio is being transcribed.
+    pub fn transcribing(&self) -> bool {
+        self.transcription.is_some()
+    }
+
+    /// Whether the speech to text model is loaded, and can listen.
+    pub fn listening(&mut self, rt: &Handle) -> bool {
+        self.whisper.ready(rt)
+    }
+
+    /// The microphone, to pick from a list (the setup guide's). Returns whether it changed.
+    pub fn pick_microphone(&mut self, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
+        let now = Instant::now();
+        if self.microphone.list(Kind::Recording, ss, ui, config, now) {
+            // It listens to the new one
+            self.meter = None;
+        }
+    }
+
+    /// The speaker, to pick from a list (the setup guide's).
+    pub fn pick_speaker(&mut self, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
+        self.speaker
+            .list(Kind::Playback, ss, ui, config, Instant::now());
+    }
+
+    /// How loud the microphone is, from 0 to 1, for the setup guide to show it hears the pilot:
+    /// it listens until [`Self::stop_meter`]. `None` if it can't.
+    pub fn microphone_level(&mut self) -> Option<f32> {
+        let microphone = self.microphone.get();
+        let meter = self
+            .meter
+            .get_or_insert_with(|| MicMeter::open(microphone?))
+            .as_mut()?;
+        Some(meter.level())
+    }
+
+    /// Stops listening for [`Self::microphone_level`].
+    pub fn stop_meter(&mut self) {
+        self.meter = None;
+    }
+
+    /// Plays the test speech once it's synthesized, and lets go of it once it's played.
+    fn play_test(&mut self, config: &Config) {
+        if let Some(ref mut test) = self.test {
+            match test.try_recv() {
+                Ok(Ok(mut speech)) => {
+                    self.test = None;
+                    log::debug!("Test synthesized");
+                    // Played like the engineer's answers, so it previews the volume
+                    let gain = {
+                        let config = config.get();
+                        config.master_volume() * config.engineer_volume()
+                    };
+                    for sample in &mut speech.samples {
+                        *sample *= gain;
+                    }
+                    if let Some(device) = self.speaker.get() {
+                        match speech.play(device) {
+                            Ok(stream) => self.test_playback = Some(stream),
+                            Err(e) => error(t!("error.test_speech_playing"), e),
+                        }
+                    } else {
+                        log::warn!("No speaker selected (audio will not be played)");
+                    }
+                }
+                Ok(Err(e)) => {
+                    self.test = None;
+                    error(t!("error.synthesizing"), e);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Closed) => {
+                    self.test = None;
+                    log::error!("Test speech was dropped before it was synthesized");
+                }
+            }
+        }
+
+        // Once SDL has consumed all of the test speech, its stream can go
+        if let Some(ref stream) = self.test_playback
+            && stream.queued_bytes().is_ok_and(|queued| queued == 0)
+        {
+            self.test_playback = None;
+        }
     }
 
     /// Downloads the recommended speech to text model, and voice for the app's language (again,
@@ -166,59 +286,12 @@ impl AudioTopbar {
     ) {
         let now = Instant::now();
         self.microphone.update(Kind::Recording, ss, ui, config, now);
-        if self.speaker.update(Kind::Playback, ss, ui, config, now) && self.test.is_none() {
-            log::debug!("Start test");
-            self.test = Some(synth.synthesize(
-                rt,
-                arrstr!("en"),
-                "Hello, world!".into(),
-                config.get().synth_effects(),
-            ));
+        if self.speaker.update(Kind::Playback, ss, ui, config, now) {
+            self.test_voice(rt, config, synth);
         }
 
         self.whisper.update(rt, config, ui);
         self.voices.update(rt, config, ui, synth);
-
-        if let Some(ref mut test) = self.test {
-            match test.try_recv() {
-                Ok(Ok(mut speech)) => {
-                    self.test = None;
-                    log::debug!("Test synthesized");
-                    // Played like the engineer's answers, so it previews the volume
-                    let gain = {
-                        let config = config.get();
-                        config.master_volume() * config.engineer_volume()
-                    };
-                    for sample in &mut speech.samples {
-                        *sample *= gain;
-                    }
-                    if let Some(device) = self.speaker.get() {
-                        match speech.play(device) {
-                            Ok(stream) => self.test_playback = Some(stream),
-                            Err(e) => error(t!("error.test_speech_playing"), e),
-                        }
-                    } else {
-                        log::warn!("No speaker selected (audio will not be played)");
-                    }
-                }
-                Ok(Err(e)) => {
-                    self.test = None;
-                    error(t!("error.synthesizing"), e);
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Closed) => {
-                    self.test = None;
-                    log::error!("Test speech was dropped before it was synthesized");
-                }
-            }
-        }
-
-        // Once SDL has consumed all of the test speech, its stream can go
-        if let Some(ref stream) = self.test_playback
-            && stream.queued_bytes().is_ok_and(|queued| queued == 0)
-        {
-            self.test_playback = None;
-        }
     }
 
     pub fn event(&mut self, rt: &Handle, config: &Config, event: &Event) -> bool {
@@ -288,13 +361,7 @@ impl DeviceSelector {
         config: &mut Config,
         now: Instant,
     ) -> bool {
-        if now >= self.next {
-            self.update_devices(kind, ss);
-            self.next = match self.next.checked_add(DELAY) {
-                Some(next) => next.max(now),
-                None => now,
-            };
-        }
+        self.refresh(kind, ss, now);
 
         let mut test = false;
         config.maybe_update(|raw| {
@@ -308,33 +375,11 @@ impl DeviceSelector {
             );
             let updated = ui
                 .menu_button(label, |ui| {
-                    let mut updated = ui
-                        .selectable_value(
-                            &mut device,
-                            AudioDevice::Default,
-                            t!("audio.system_default"),
-                        )
-                        .clicked();
-
-                    for (id, name) in &self.devices {
-                        updated |= ui
-                            .selectable_value(
-                                &mut device,
-                                AudioDevice::Device(*id, name.clone()),
-                                name.deref(),
-                            )
-                            .clicked();
-                    }
-
+                    let updated = self.options(kind, ss, ui, &mut device);
                     if kind == Kind::Playback {
                         ui.separator();
                         test = ui.button(t!("audio.test")).clicked();
                     }
-
-                    if updated {
-                        self.open = kind.open(&ss.audio, &device);
-                    }
-
                     return updated;
                 })
                 .inner
@@ -349,10 +394,135 @@ impl DeviceSelector {
         return test;
     }
 
+    /// Every device, to pick one from a list rather than a menu. Returns whether the pick
+    /// changed.
+    fn list(
+        &mut self,
+        kind: Kind,
+        ss: &Subsystems,
+        ui: &mut egui::Ui,
+        config: &mut Config,
+        now: Instant,
+    ) -> bool {
+        self.refresh(kind, ss, now);
+
+        let mut changed = false;
+        config.maybe_update(|raw| {
+            let mut device = kind.config(raw).clone();
+            changed = self.options(kind, ss, ui, &mut device);
+            if changed {
+                kind.set(raw, device);
+            }
+            changed
+        });
+        changed
+    }
+
+    /// The system's default and every device, `device` the one picked: one picked is opened.
+    /// Returns whether the pick changed.
+    fn options(
+        &mut self,
+        kind: Kind,
+        ss: &Subsystems,
+        ui: &mut egui::Ui,
+        device: &mut AudioDevice,
+    ) -> bool {
+        let mut updated = ui
+            .selectable_value(device, AudioDevice::Default, t!("audio.system_default"))
+            .clicked();
+
+        for (id, name) in &self.devices {
+            updated |= ui
+                .selectable_value(device, AudioDevice::Device(*id, name.clone()), name.deref())
+                .clicked();
+        }
+
+        if updated {
+            self.open = kind.open(&ss.audio, device);
+        }
+        updated
+    }
+
+    /// Lists the devices again, every `DELAY`.
+    fn refresh(&mut self, kind: Kind, ss: &Subsystems, now: Instant) {
+        if now >= self.next {
+            self.update_devices(kind, ss);
+            self.next = match self.next.checked_add(DELAY) {
+                Some(next) => next.max(now),
+                None => now,
+            };
+        }
+    }
+
     fn update_devices(&mut self, kind: Kind, ss: &Subsystems) {
         self.devices.clear();
         if let Err(e) = kind.enumerate(&ss.audio, &mut self.devices) {
             log::error!("Error updating audio devices: {e}");
+        }
+    }
+}
+
+/// The language the app is in (`locale`, e.g. `en-US`): `en` if it's none.
+pub fn app_language(locale: &str) -> ArrayStr<2> {
+    ArrayStr::from_str(locale.split('-').next().unwrap_or_default()).unwrap_or(arrstr!("en"))
+}
+
+/// Listens to the microphone, for how loud it is.
+struct MicMeter {
+    /// Dropping it stops listening
+    _stream: AudioStreamWithCallback<Meter>,
+    /// The loudest sample since it was last looked at, as an `f32`'s bits
+    peak: Arc<AtomicU32>,
+    /// The level shown, from 0 to 1: it falls slowly, so peaks can be seen
+    shown: f32,
+}
+
+impl MicMeter {
+    fn open(device: &sdl3::audio::AudioDevice) -> Option<Self> {
+        let peak = Arc::new(AtomicU32::new(0));
+        let meter = Meter {
+            peak: peak.clone(),
+            buf: [0.0; 512],
+        };
+        let open = || {
+            let stream = device.open_recording_stream_with_callback(&RECORDING_SPEC, meter)?;
+            stream.resume()?;
+            Ok::<_, sdl3::Error>(stream)
+        };
+        match open() {
+            Ok(stream) => Some(Self {
+                _stream: stream,
+                peak,
+                shown: 0.0,
+            }),
+            Err(e) => {
+                log::warn!("Couldn't listen to the microphone for its level: {e}");
+                None
+            }
+        }
+    }
+
+    /// The level since last looked at, from 0 (-60 dB or less) to 1 (0 dB).
+    fn level(&mut self) -> f32 {
+        let peak = f32::from_bits(self.peak.swap(0, Ordering::Relaxed));
+        let level = ((20.0 * peak.max(1e-6).log10() + 60.0) / 60.0).clamp(0.0, 1.0);
+        self.shown = level.max(self.shown - 0.02);
+        self.shown
+    }
+}
+
+struct Meter {
+    peak: Arc<AtomicU32>,
+    buf: [f32; 512],
+}
+
+impl AudioRecordingCallback<f32> for Meter {
+    fn callback(&mut self, stream: &mut AudioStream, _available: i32) {
+        while let Ok(read @ 1..) = stream.read_f32_samples(&mut self.buf) {
+            let peak =
+                (self.buf[..read].iter()).fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+            // Positive floats order like their bits
+            self.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
         }
     }
 }

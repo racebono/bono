@@ -1249,5 +1249,130 @@
         "en": "Connected, but {model} isn't pulled: pick another, or run ollama pull {model}",
         "es": "Conectado, pero {model} no está descargado: elige otro, o ejecuta ollama pull {model}",
         "ca": "Connectat, però {model} no està baixat: tria'n un altre, o executa ollama pull {model}"
+    },
+    "audio.test_phrase": {
+        "en": "Radio check. I hear you loud and clear.",
+        "es": "Prueba de radio. Te recibo alto y claro.",
+        "ca": "Prova de ràdio. Et rebo alt i clar."
+    },
+    "onboarding.microphone_title": {
+        "en": "Hearing you",
+        "es": "Oírte",
+        "ca": "Sentir-te"
+    },
+    "onboarding.microphone_body": {
+        "en": "Pick the microphone you talk into (your headset's, usually), and say something: the bar should move.",
+        "es": "Elige el micrófono con el que hablas (el de tus auriculares, normalmente) y di algo: la barra debería moverse.",
+        "ca": "Tria el micròfon amb què parles (el dels teus auriculars, normalment) i digues alguna cosa: la barra s'hauria de moure."
+    },
+    "onboarding.mic_level": {
+        "en": "Level",
+        "es": "Nivel",
+        "ca": "Nivell"
+    },
+    "onboarding.mic_unavailable": {
+        "en": "Couldn't listen to this microphone: pick another",
+        "es": "No se pudo escuchar este micrófono: elige otro",
+        "ca": "No s'ha pogut escoltar aquest micròfon: tria'n un altre"
+    },
+    "onboarding.voice_title": {
+        "en": "The engineer's voice",
+        "es": "La voz del ingeniero",
+        "ca": "La veu de l'enginyer"
+    },
+    "onboarding.voice_body": {
+        "en": "The engineer talks to you over the radio. Pick where you hear it (your headset, usually), and try it.",
+        "es": "El ingeniero te habla por radio. Elige dónde lo oyes (tus auriculares, normalmente) y pruébalo.",
+        "ca": "L'enginyer et parla per ràdio. Tria on el sents (els teus auriculars, normalment) i prova'l."
+    },
+    "onboarding.voice_name": {
+        "en": "Voice: {name}",
+        "es": "Voz: {name}",
+        "ca": "Veu: {name}"
+    },
+    "onboarding.no_voice": {
+        "en": "No voice for this language yet: it's still downloading, or pick one in Audio › Voice",
+        "es": "Aún no hay voz para este idioma: todavía se está descargando, o elige una en Audio › Voz",
+        "ca": "Encara no hi ha veu per a aquest idioma: encara s'està baixant, o tria'n una a Àudio › Veu"
+    },
+    "onboarding.test_voice": {
+        "en": "Test the voice",
+        "es": "Probar la voz",
+        "ca": "Prova la veu"
+    },
+    "onboarding.talk_title": {
+        "en": "Your talk button",
+        "es": "Tu botón de hablar",
+        "ca": "El teu botó de parlar"
+    },
+    "onboarding.talk_body": {
+        "en": "Hold it while you talk to the engineer, like a radio. A button on your wheel is best: it works while the game is in front.",
+        "es": "Mantenlo pulsado mientras hablas con el ingeniero, como una radio. Lo mejor es un botón del volante: funciona con el juego delante.",
+        "ca": "Mantén-lo premut mentre parles amb l'enginyer, com una ràdio. El millor és un botó del volant: funciona amb el joc al davant."
+    },
+    "onboarding.talk_button": {
+        "en": "Talk button",
+        "es": "Botón de hablar",
+        "ca": "Botó de parlar"
+    },
+    "onboarding.session_button": {
+        "en": "New session button",
+        "es": "Botón de nueva sesión",
+        "ca": "Botó de nova sessió"
+    },
+    "onboarding.session_hint": {
+        "en": "Optional: the engineer starts the conversation over, forgetting what was said.",
+        "es": "Opcional: el ingeniero empieza la conversación de nuevo, olvidando lo que se dijo.",
+        "ca": "Opcional: l'enginyer torna a començar la conversa, oblidant el que s'ha dit."
+    },
+    "onboarding.radio_title": {
+        "en": "Radio check",
+        "es": "Prueba de radio",
+        "ca": "Prova de ràdio"
+    },
+    "onboarding.radio_body": {
+        "en": "Last, try it all out: talk to the engineer, and hear the answer.",
+        "es": "Por último, pruébalo todo: habla con el ingeniero y escucha la respuesta.",
+        "ca": "Per acabar, prova-ho tot: parla amb l'enginyer i escolta la resposta."
+    },
+    "onboarding.radio_not_ready": {
+        "en": "Something's still missing: Back takes you to it, or it may still be downloading.",
+        "es": "Aún falta algo: Atrás te lleva hasta ello, o puede que aún se esté descargando.",
+        "ca": "Encara falta alguna cosa: Enrere t'hi porta, o potser encara s'està baixant."
+    },
+    "onboarding.radio_hold": {
+        "en": "Hold {button} and say something, like \"radio check\".",
+        "es": "Mantén pulsado {button} y di algo, como \"prueba de radio\".",
+        "ca": "Mantén premut {button} i digues alguna cosa, com ara \"prova de ràdio\"."
+    },
+    "onboarding.radio_listening": {
+        "en": "Listening… let go when you're done",
+        "es": "Escuchando… suelta cuando acabes",
+        "ca": "Escoltant… deixa'l anar quan acabis"
+    },
+    "onboarding.radio_understanding": {
+        "en": "Understanding…",
+        "es": "Entendiendo…",
+        "ca": "Entenent…"
+    },
+    "onboarding.radio_thinking": {
+        "en": "The engineer is answering…",
+        "es": "El ingeniero está respondiendo…",
+        "ca": "L'enginyer està responent…"
+    },
+    "onboarding.radio_nothing": {
+        "en": "Nothing understood: try again, a little louder or closer to the microphone",
+        "es": "No se entendió nada: inténtalo de nuevo, un poco más alto o más cerca del micrófono",
+        "ca": "No s'ha entès res: torna-ho a provar, una mica més fort o més a prop del micròfon"
+    },
+    "onboarding.radio_done": {
+        "en": "The radio works: the engineer hears you, and answers.",
+        "es": "La radio funciona: el ingeniero te oye y responde.",
+        "ca": "La ràdio funciona: l'enginyer et sent i respon."
+    },
+    "onboarding.radio_no_game": {
+        "en": "With no game running the engineer can't tell you about your race yet: start one, and ask away.",
+        "es": "Sin ningún juego en marcha el ingeniero aún no puede hablarte de tu carrera: inicia uno y pregunta.",
+        "ca": "Sense cap joc en marxa l'enginyer encara no et pot parlar de la cursa: inicia'n un i pregunta."
     }
 }

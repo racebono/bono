@@ -55,7 +55,7 @@ impl VolumeTopbar {
 }
 
 /// A volume (or effect) from 0 to 100%, `current` until it's set. Returns whether it changed.
-fn volume(
+pub fn volume(
     ui: &mut egui::Ui,
     current: f32,
     setting: &mut Setting<f32>,

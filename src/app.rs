@@ -372,8 +372,16 @@ impl Gui {
             self.onboarding.open();
         }
         let question = self.chat.update(ui, engineer);
-        self.onboarding
-            .update(rt, ui.ctx(), config, &mut self.topbar, simulators);
+        self.onboarding.update(
+            rt,
+            ss,
+            ui.ctx(),
+            config,
+            &mut self.topbar,
+            synth,
+            simulators,
+            engineer,
+        );
         question
     }
 

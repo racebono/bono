@@ -20,8 +20,8 @@ impl SettingsTopbar {
     /// The menu isn't showing: a button still waiting for a press stops waiting, or the next key
     /// pressed anywhere (typing in the chat, say) would be bound once the menu opens again.
     pub fn closed(&mut self) {
-        self.talk_button.waiting = None;
-        self.session_button.waiting = None;
+        self.talk_button.cancel();
+        self.session_button.cancel();
     }
 
     /// Returns whether the setup guide was asked for.
@@ -40,18 +40,7 @@ impl SettingsTopbar {
             )
         };
 
-        let button = |pre: &str, val: Option<ConfigButton>| {
-            let value = match val {
-                Some(ConfigButton::Key(key)) => t!("settings.key", key = key.name()),
-                Some(ConfigButton::Joystick { guid, button }) => t!(
-                    "settings.joystick_button",
-                    button = button,
-                    device = guid_to_str(&guid)
-                ),
-                None => t!("settings.disabled").to_owned(),
-            };
-            format!("{pre}: {value}")
-        };
+        let button = |pre: &str, val: Option<ConfigButton>| format!("{pre}: {}", button_name(val));
 
         let next_talk = self.talk_button.update(
             rt,
@@ -135,6 +124,19 @@ impl SettingsTopbar {
     }
 }
 
+/// A button as the pilot reads it: the key, or the joystick's button.
+pub fn button_name(button: Option<ConfigButton>) -> String {
+    match button {
+        Some(ConfigButton::Key(key)) => t!("settings.key", key = key.name()),
+        Some(ConfigButton::Joystick { guid, button }) => t!(
+            "settings.joystick_button",
+            button = button,
+            device = guid_to_str(&guid)
+        ),
+        None => t!("settings.disabled").to_owned(),
+    }
+}
+
 /// Whether `locale` is the one picked, `current`: `en-US` is English's when there's only `en`.
 fn picked(current: &str, locale: &str) -> bool {
     current == locale
@@ -154,13 +156,21 @@ pub fn languages(ui: &mut egui::Ui, raw: &mut RawConfig) -> bool {
     changed
 }
 
+/// A button that, clicked, waits for the next button pressed (a key, or a joystick's) to bind it.
 #[derive(Default)]
-struct ChangeButton {
+pub struct ChangeButton {
     waiting: Option<LocalTask<anyhow::Result<ConfigButton>>>,
 }
 
 impl ChangeButton {
-    fn update<'a>(
+    /// Stops waiting for a press.
+    pub fn cancel(&mut self) {
+        self.waiting = None;
+    }
+
+    /// `pending` until clicked, then `working` until a button is pressed (clicking it again
+    /// stops waiting). Returns the button pressed.
+    pub fn update<'a>(
         &mut self,
         rt: &Handle,
         ss: &Subsystems,

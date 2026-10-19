@@ -262,6 +262,14 @@ impl Whisper {
         };
     }
 
+    /// Whether the model picked is loaded, and can listen.
+    pub fn ready(&mut self, rt: &Handle) -> bool {
+        matches!(
+            self.ctx.as_mut().and_then(|ctx| ctx.update(rt)),
+            Some(Some(_))
+        )
+    }
+
     /// The microphone is open, from the talk button's press until its release.
     #[inline]
     pub fn recording(&self) -> bool {
