@@ -1189,5 +1189,65 @@
         "en": "Retry",
         "es": "Reintentar",
         "ca": "Torna-ho a provar"
+    },
+    "onboarding.provider_title": {
+        "en": "The engineer's brain",
+        "es": "El cerebro del ingeniero",
+        "ca": "El cervell de l'enginyer"
+    },
+    "onboarding.provider_body": {
+        "en": "The engineer thinks with a language model. Claude answers best, but is paid for by use; a model on your PC is free, but needs a capable graphics card, and shares it with the game.",
+        "es": "El ingeniero piensa con un modelo de lenguaje. Claude es quien mejor responde, pero se paga según el uso; un modelo en tu PC es gratis, pero necesita una buena tarjeta gráfica, y la comparte con el juego.",
+        "ca": "L'enginyer pensa amb un model de llenguatge. Claude és qui millor respon, però es paga segons l'ús; un model al teu PC és gratuït, però necessita una bona targeta gràfica, i la comparteix amb el joc."
+    },
+    "onboarding.claude": {
+        "en": "Through the Claude API, with an API key.",
+        "es": "A través de la API de Claude, con una clave de la API.",
+        "ca": "A través de l'API de Claude, amb una clau de l'API."
+    },
+    "onboarding.ollama": {
+        "en": "A model Ollama runs, on this PC or another on your network.",
+        "es": "Un modelo que ejecuta Ollama, en este PC o en otro de tu red.",
+        "ca": "Un model que executa Ollama, en aquest PC o en un altre de la teva xarxa."
+    },
+    "onboarding.openai": {
+        "en": "Any OpenAI-compatible server: llama.cpp, LM Studio, vLLM, OpenRouter...",
+        "es": "Cualquier servidor compatible con OpenAI: llama.cpp, LM Studio, vLLM, OpenRouter...",
+        "ca": "Qualsevol servidor compatible amb OpenAI: llama.cpp, LM Studio, vLLM, OpenRouter..."
+    },
+    "onboarding.claude_key_link": {
+        "en": "Get an API key",
+        "es": "Consigue una clave de la API",
+        "ca": "Aconsegueix una clau de l'API"
+    },
+    "onboarding.ollama_link": {
+        "en": "Download Ollama",
+        "es": "Descarga Ollama",
+        "ca": "Baixa Ollama"
+    },
+    "onboarding.provider_checking": {
+        "en": "Checking the connection…",
+        "es": "Comprobando la conexión…",
+        "ca": "Comprovant la connexió…"
+    },
+    "onboarding.provider_check": {
+        "en": "Check again",
+        "es": "Volver a comprobar",
+        "ca": "Torna-ho a comprovar"
+    },
+    "onboarding.provider_ready": {
+        "en": "Connected",
+        "es": "Conectado",
+        "ca": "Connectat"
+    },
+    "onboarding.provider_no_model": {
+        "en": "Connected, but {model} isn't among its models: pick one",
+        "es": "Conectado, pero {model} no está entre sus modelos: elige uno",
+        "ca": "Connectat, però {model} no és entre els seus models: tria'n un"
+    },
+    "onboarding.ollama_no_model": {
+        "en": "Connected, but {model} isn't pulled: pick another, or run ollama pull {model}",
+        "es": "Conectado, pero {model} no está descargado: elige otro, o ejecuta ollama pull {model}",
+        "ca": "Connectat, però {model} no està baixat: tria'n un altre, o executa ollama pull {model}"
     }
 }

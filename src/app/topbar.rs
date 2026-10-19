@@ -31,7 +31,7 @@ pub struct Topbar {
     settings: SettingsTopbar,
     pub audio: AudioTopbar,
     volume: VolumeTopbar,
-    provider: ProviderTopbar,
+    pub provider: ProviderTopbar,
     spotter: SpotterTopbar,
     simulators: SimulatorsTopbar,
     /// "Clear data" was clicked: asking before clearing
@@ -170,6 +170,15 @@ fn setup_label<'a>(missing: bool, text: impl IntoAtoms<'a>) -> Atoms<'a> {
         atoms.push_left(egui::RichText::new(egui_phosphor::bold::WARNING).color(SETUP_COLOR));
     }
     atoms
+}
+
+/// Bytes as Ollama shows them, e.g. `6.6 GB`.
+fn size_text(bytes: u64) -> String {
+    let bytes = bytes as f64;
+    match bytes >= 1e9 {
+        true => format!("{:.1} GB", bytes / 1e9),
+        false => format!("{:.0} MB", bytes / 1e6),
+    }
 }
 
 /// A sub-menu picking one of `options` (a `ComboBox` would close the menu it's in), with

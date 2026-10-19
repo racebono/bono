@@ -1,7 +1,7 @@
 //! The language model the engineer talks through: who runs it, which model, and how.
 
 use crate::{
-    app::topbar::{pick, setup_label},
+    app::topbar::{pick, setup_label, size_text},
     config::{
         ClaudeConfig, Config, ModelConfig, ModelProvider, OllamaConfig, OpenAiConfig, Setting,
     },
@@ -9,6 +9,7 @@ use crate::{
     task::MaybeDone,
 };
 use bono_i18n::t;
+use egui::IntoAtoms;
 use std::num::NonZeroU32;
 use tokio::runtime::Handle;
 
@@ -16,6 +17,11 @@ const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 const OLLAMA_EFFORTS: [&str; 4] = ["none", "low", "medium", "high"];
 /// Empty: `reasoning_effort` left out, the model's default
 const OPENAI_EFFORTS: [&str; 5] = ["", "none", "low", "medium", "high"];
+
+/// Where Claude API keys are made
+const CLAUDE_KEYS_URL: &str = "https://platform.claude.com/settings/keys";
+/// Where Ollama is downloaded from
+const OLLAMA_DOWNLOAD_URL: &str = "https://ollama.com/download";
 
 /// How long Ollama keeps the model loaded, in seconds (`None`: Ollama's own)
 fn keep_alive_options() -> [(Option<f64>, &'static str); 5] {
@@ -78,16 +84,7 @@ impl ProviderTopbar {
     pub fn update(&mut self, rt: &Handle, ui: &mut egui::Ui, config: &mut Config) {
         let model = config.get().model.clone();
         let provider = *model.provider();
-        let host = location(&model);
-
-        // Asked again for another provider, or another address
-        let stale = self
-            .models
-            .as_ref()
-            .is_none_or(|models| models.provider != provider || models.host != host);
-        if stale {
-            self.fetch(model.clone());
-        }
+        self.refetch(&model);
 
         config.maybe_update(|raw| {
             let mut changed = raw.model.provider.edit(provider, |provider| {
@@ -128,20 +125,121 @@ impl ProviderTopbar {
         ui.weak(t!("provider.applies_next"));
     }
 
-    fn claude(&mut self, rt: &Handle, ui: &mut egui::Ui, config: &mut ClaudeConfig) -> bool {
-        let mut changed = false;
-        if let Some(api_key) = text_field(
-            &mut self.api_key,
-            ui,
-            config.api_key().clone(),
-            t!("provider.api_key"),
-            t!("provider.api_key_hint"),
-            t!("provider.api_key_hover"),
-            true,
-        ) {
-            config.api_key.set(api_key);
-            changed = true;
+    /// The setup guide's take on the tab: the provider, what it takes to reach it, and the
+    /// model, then whether it could be reached.
+    pub fn guide(&mut self, rt: &Handle, ui: &mut egui::Ui, config: &mut Config) {
+        let model = config.get().model.clone();
+        let provider = *model.provider();
+        self.refetch(&model);
+
+        config.maybe_update(|raw| {
+            let mut changed = raw.model.provider.edit(provider, |provider| {
+                let no_credentials = !provider::claude::has_credentials(&model.claude);
+                let options = [
+                    (
+                        ModelProvider::Claude,
+                        setup_label(no_credentials, "Claude"),
+                        t!("onboarding.claude"),
+                    ),
+                    (
+                        ModelProvider::Ollama,
+                        "Ollama".into_atoms(),
+                        t!("onboarding.ollama"),
+                    ),
+                    (
+                        ModelProvider::OpenAi,
+                        "OpenAI".into_atoms(),
+                        t!("onboarding.openai"),
+                    ),
+                ];
+                let mut changed = false;
+                for (option, label, about) in options {
+                    changed |= ui.radio_value(provider, option, label).changed();
+                    ui.indent(about, |ui| ui.weak(about));
+                }
+                changed
+            });
+            ui.add_space(8.0);
+
+            changed |= match provider {
+                ModelProvider::Claude => {
+                    let claude = &mut raw.model.claude;
+                    let mut changed = self.api_key(ui, claude);
+                    ui.hyperlink_to(t!("onboarding.claude_key_link"), CLAUDE_KEYS_URL);
+                    changed |= self.model(rt, ui, claude.model().clone(), &mut claude.model);
+                    changed
+                }
+                ModelProvider::Ollama => {
+                    let ollama = &mut raw.model.ollama;
+                    let mut changed = self.host(ui, ollama);
+                    ui.hyperlink_to(t!("onboarding.ollama_link"), OLLAMA_DOWNLOAD_URL);
+                    changed |= self.model(rt, ui, ollama.model().clone(), &mut ollama.model);
+                    changed
+                }
+                ModelProvider::OpenAi => {
+                    let openai = &mut raw.model.openai;
+                    let mut changed = self.base_url(ui, openai);
+                    changed |= self.model(rt, ui, openai.model().clone(), &mut openai.model);
+                    changed
+                }
+            };
+            changed
+        });
+
+        ui.add_space(4.0);
+        self.status(rt, ui, &model);
+    }
+
+    /// Whether the provider could be reached, and offers the model picked.
+    fn status(&mut self, rt: &Handle, ui: &mut egui::Ui, model: &ModelConfig) {
+        let picked = match model.provider() {
+            ModelProvider::Claude => model.claude.model(),
+            ModelProvider::Ollama => model.ollama.model(),
+            ModelProvider::OpenAi => model.openai.model(),
+        };
+        let Some(models) = self.models.as_mut() else {
+            return;
+        };
+
+        let warn = ui.visuals().warn_fg_color;
+        let mut check = false;
+        ui.horizontal_wrapped(|ui| match models.list.update(rt) {
+            None => {
+                ui.spinner();
+                ui.label(t!("onboarding.provider_checking"));
+            }
+            // Just what went wrong: why, on hover
+            Some(Err(e)) => {
+                ui.colored_label(warn, format!("{} {e}", egui_phosphor::bold::WARNING))
+                    .on_hover_text(format!("{e:#}"));
+                check = ui.button(t!("onboarding.provider_check")).clicked();
+            }
+            // One serving a single model takes any, but the rest need one they have
+            Some(Ok(list)) if !picked.is_empty() && !list.iter().any(|o| o.name == *picked) => {
+                let text = match model.provider() {
+                    ModelProvider::Ollama => t!("onboarding.ollama_no_model", model = picked),
+                    _ => t!("onboarding.provider_no_model", model = picked),
+                };
+                ui.colored_label(warn, format!("{} {text}", egui_phosphor::bold::WARNING));
+                check = ui.button(t!("onboarding.provider_check")).clicked();
+            }
+            Some(Ok(_)) => {
+                ui.label(format!(
+                    "{} {}",
+                    egui_phosphor::bold::CHECK,
+                    t!("onboarding.provider_ready")
+                ));
+            }
+        });
+
+        // Asked again next frame
+        if check {
+            self.models = None;
         }
+    }
+
+    fn claude(&mut self, rt: &Handle, ui: &mut egui::Ui, config: &mut ClaudeConfig) -> bool {
+        let mut changed = self.api_key(ui, config);
         if let Some(workspace_id) = text_field(
             &mut self.workspace_id,
             ui,
@@ -183,19 +281,7 @@ impl ProviderTopbar {
     }
 
     fn openai(&mut self, rt: &Handle, ui: &mut egui::Ui, config: &mut OpenAiConfig) -> bool {
-        let mut changed = false;
-        if let Some(base_url) = text_field(
-            &mut self.host,
-            ui,
-            config.base_url().clone(),
-            t!("provider.base_url"),
-            provider::OPENAI_DEFAULT_BASE_URL,
-            t!("provider.base_url_hover"),
-            false,
-        ) {
-            config.base_url.set(base_url);
-            changed = true;
-        }
+        let mut changed = self.base_url(ui, config);
         changed |= self.model(rt, ui, config.model().clone(), &mut config.model);
         changed |= pick(
             ui,
@@ -220,19 +306,7 @@ impl ProviderTopbar {
     }
 
     fn ollama(&mut self, rt: &Handle, ui: &mut egui::Ui, config: &mut OllamaConfig) -> bool {
-        let mut changed = false;
-        if let Some(host) = text_field(
-            &mut self.host,
-            ui,
-            config.host().clone(),
-            t!("provider.host"),
-            t!("provider.host_hint"),
-            t!("provider.host_hover"),
-            false,
-        ) {
-            config.host.set(host);
-            changed = true;
-        }
+        let mut changed = self.host(ui, config);
         changed |= self.model(rt, ui, config.model().clone(), &mut config.model);
         changed |= pick(
             ui,
@@ -277,6 +351,57 @@ impl ProviderTopbar {
         .on_hover_text(t!("provider.keep_loaded_hover"))
         .changed();
         changed
+    }
+
+    /// Claude's API key.
+    fn api_key(&mut self, ui: &mut egui::Ui, config: &mut ClaudeConfig) -> bool {
+        let Some(api_key) = text_field(
+            &mut self.api_key,
+            ui,
+            config.api_key().clone(),
+            t!("provider.api_key"),
+            t!("provider.api_key_hint"),
+            t!("provider.api_key_hover"),
+            true,
+        ) else {
+            return false;
+        };
+        config.api_key.set(api_key);
+        true
+    }
+
+    /// Where Ollama listens.
+    fn host(&mut self, ui: &mut egui::Ui, config: &mut OllamaConfig) -> bool {
+        let Some(host) = text_field(
+            &mut self.host,
+            ui,
+            config.host().clone(),
+            t!("provider.host"),
+            t!("provider.host_hint"),
+            t!("provider.host_hover"),
+            false,
+        ) else {
+            return false;
+        };
+        config.host.set(host);
+        true
+    }
+
+    /// The OpenAI-compatible API's URL.
+    fn base_url(&mut self, ui: &mut egui::Ui, config: &mut OpenAiConfig) -> bool {
+        let Some(base_url) = text_field(
+            &mut self.host,
+            ui,
+            config.base_url().clone(),
+            t!("provider.base_url"),
+            provider::OPENAI_DEFAULT_BASE_URL,
+            t!("provider.base_url_hover"),
+            false,
+        ) else {
+            return false;
+        };
+        config.base_url.set(base_url);
+        true
     }
 
     /// The model, picked from the provider's.
@@ -332,6 +457,18 @@ impl ProviderTopbar {
             self.models = None;
         }
         changed
+    }
+
+    /// Asks for the provider's models again if it's another provider, or another address.
+    fn refetch(&mut self, model: &ModelConfig) {
+        let host = location(model);
+        let stale = self
+            .models
+            .as_ref()
+            .is_none_or(|models| models.provider != *model.provider() || models.host != host);
+        if stale {
+            self.fetch(model.clone());
+        }
     }
 
     fn fetch(&mut self, model: ModelConfig) {
@@ -436,11 +573,3 @@ fn tokens(
     response.unwrap()
 }
 
-/// Bytes as Ollama shows them, e.g. `6.6 GB`.
-fn size_text(bytes: u64) -> String {
-    let bytes = bytes as f64;
-    match bytes >= 1e9 {
-        true => format!("{:.1} GB", bytes / 1e9),
-        false => format!("{:.0} MB", bytes / 1e6),
-    }
-}

@@ -2,7 +2,7 @@ use crate::{
     Download,
     app::topbar::{
         audio::{SetupItem, SetupState},
-        setup_label,
+        setup_label, size_text,
     },
     arrstr,
     button::ConfigButton,
@@ -135,7 +135,7 @@ impl Whisper {
                 egui_extras::TableBuilder::new(ui)
                     .id_salt("whisper-models")
                     .striped(true)
-                    .columns(Column::auto(), 3)
+                    .columns(Column::auto(), 4)
                     .column(Column::remainder())
                     .header(20.0, |mut header| {
                         header.col(|ui| {
@@ -146,6 +146,9 @@ impl Whisper {
                         });
                         header.col(|ui| {
                             ui.strong(t!("audio.languages"));
+                        });
+                        header.col(|ui| {
+                            ui.strong(t!("audio.size"));
                         });
                     })
                     .body(|mut body| {
@@ -169,6 +172,12 @@ impl Whisper {
                                         } else {
                                             t!("audio.all_languages")
                                         });
+                                    });
+
+                                    row.col(|ui| {
+                                        if let Some(size) = model.size {
+                                            ui.label(size_text(size));
+                                        }
                                     });
 
                                     if let Some(on_disk) = model.on_disk() {

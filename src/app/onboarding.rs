@@ -3,6 +3,7 @@
 
 use crate::{
     app::topbar::{
+        Topbar,
         audio::{AudioTopbar, SetupItem, SetupState},
         settings,
         simulators::SimulatorsTopbar,
@@ -15,7 +16,7 @@ use egui::Widget;
 use tokio::runtime::Handle;
 
 /// The guide's version: bumped when it gains a step, so pilots who went through it see it again.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -23,10 +24,12 @@ enum Step {
     Welcome,
     /// The games, and their plugins
     Simulator,
+    /// The language model the engineer thinks with
+    Provider,
 }
 
 impl Step {
-    const ALL: [Step; 2] = [Step::Welcome, Step::Simulator];
+    const ALL: [Step; 3] = [Step::Welcome, Step::Simulator, Step::Provider];
 
     fn index(self) -> usize {
         Self::ALL.iter().position(|&step| step == self).unwrap()
@@ -75,12 +78,13 @@ impl Onboarding {
         rt: &Handle,
         ctx: &egui::Context,
         config: &mut Config,
-        audio: &mut AudioTopbar,
+        topbar: &mut Topbar,
         simulators: &mut ActiveSimulator,
     ) {
         let Some(step) = self.step else {
             return;
         };
+        let audio = &mut topbar.audio;
 
         let mut action = None;
         egui::Modal::new(egui::Id::new("onboarding")).show(ctx, |ui| {
@@ -94,6 +98,13 @@ impl Onboarding {
             match step {
                 Step::Welcome => welcome(rt, ui, config, audio),
                 Step::Simulator => self.simulator(rt, ui, config, audio, simulators),
+                Step::Provider => {
+                    ui.heading(t!("onboarding.provider_title"));
+                    ui.label(t!("onboarding.provider_body"));
+                    ui.add_space(8.0);
+                    topbar.provider.guide(rt, ui, config);
+                    still_downloading(rt, ui, config, audio);
+                }
             }
 
             ui.separator();
@@ -155,16 +166,20 @@ impl Onboarding {
             ui.weak(t!("onboarding.no_simulator"));
         }
 
-        // Still going from the first step
-        let items = audio.setup_items(rt, config);
-        if !items.is_empty() {
-            ui.add_space(8.0);
-            ui.strong(t!("onboarding.downloads_title"));
-            if downloads(ui, &items) {
-                audio.setup(config);
-            }
-            ui.weak(t!("onboarding.downloads_continue"));
+        still_downloading(rt, ui, config, audio);
+    }
+}
+
+/// The downloads started on the first step, while they're still going.
+fn still_downloading(rt: &Handle, ui: &mut egui::Ui, config: &Config, audio: &mut AudioTopbar) {
+    let items = audio.setup_items(rt, config);
+    if !items.is_empty() {
+        ui.add_space(8.0);
+        ui.strong(t!("onboarding.downloads_title"));
+        if downloads(ui, &items) {
+            audio.setup(config);
         }
+        ui.weak(t!("onboarding.downloads_continue"));
     }
 }
 
