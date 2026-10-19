@@ -3,8 +3,8 @@
 use super::{Model, ModelOption, Reply, StopReason, ToolHandler, Tools, Usage, text::TextSink};
 use crate::config::ClaudeConfig;
 use anyhow::{Context, bail};
-use futures::future::{BoxFuture, join_all};
 use bono_i18n::t;
+use futures::future::{BoxFuture, join_all};
 use reqwest::{
     RequestBuilder, StatusCode,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
@@ -22,9 +22,12 @@ use std::{
 /// Where the Claude API is, unless `ConversationBuilder::base_url` says otherwise.
 const BASE_URL: &str = "https://api.anthropic.com";
 
-/// The models the Claude API offers, newest first. The credentials are a conversation's
-/// defaults (`ANTHROPIC_API_KEY`...).
-pub async fn models(client: &reqwest::Client) -> anyhow::Result<Vec<ModelOption>> {
+/// The models the Claude API offers, newest first, asked with `config`'s credentials (or the
+/// defaults, `ANTHROPIC_API_KEY`...).
+pub async fn models(
+    config: &ClaudeConfig,
+    client: &reqwest::Client,
+) -> anyhow::Result<Vec<ModelOption>> {
     #[derive(Deserialize)]
     struct Page {
         data: Vec<Entry>,
@@ -39,7 +42,11 @@ pub async fn models(client: &reqwest::Client) -> anyhow::Result<Vec<ModelOption>
         id: String,
     }
 
-    let headers = headers(None, None, String::new())?;
+    let headers = headers(
+        config.api_key().clone(),
+        config.workspace_id().clone(),
+        String::new(),
+    )?;
     let mut models = Vec::new();
     let mut after = None::<String>;
     loop {
@@ -73,6 +80,15 @@ pub async fn models(client: &reqwest::Client) -> anyhow::Result<Vec<ModelOption>
             _ => return Ok(models),
         }
     }
+}
+
+/// Whether there are credentials for the API: `config`'s key, `ANTHROPIC_API_KEY`, or
+/// `ANTHROPIC_AUTH_TOKEN`.
+pub fn has_credentials(config: &ClaudeConfig) -> bool {
+    config.api_key().is_some()
+        || ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+            .iter()
+            .any(|var| std::env::var_os(var).is_some())
 }
 
 /// The API's headers: the credentials (`api_key`, or else `ANTHROPIC_API_KEY`, then
@@ -237,6 +253,12 @@ impl Conversation {
         client: reqwest::Client,
     ) -> anyhow::Result<Self> {
         let mut builder = ConversationBuilder::new();
+        if let Some(api_key) = config.api_key() {
+            builder.api_key(api_key);
+        }
+        if let Some(workspace_id) = config.workspace_id() {
+            builder.workspace_id(workspace_id);
+        }
         builder
             .model(config.model())
             .effort(config.effort())
@@ -1556,7 +1578,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn lists_the_models() {
-        let models = super::models(&reqwest::Client::new()).await.unwrap();
+        let models = super::models(&ClaudeConfig::default(), &reqwest::Client::new())
+            .await
+            .unwrap();
         println!("{models:#?}");
         assert!(models.iter().any(|model| model.name.starts_with("claude-")));
     }

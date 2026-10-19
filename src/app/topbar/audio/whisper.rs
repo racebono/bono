@@ -1,5 +1,7 @@
 use crate::{
-    Download, arrstr,
+    Download,
+    app::topbar::setup_label,
+    arrstr,
     button::ConfigButton,
     config::{ArrayStr, Config, RawConfig},
     error,
@@ -89,8 +91,12 @@ impl Whisper {
         let client = self.client.clone();
         let catalog = self.catalog_mut(rt);
 
+        let label = setup_label(
+            config.get().whisper_model().is_none(),
+            t!("audio.speech_to_text"),
+        );
         ui.add_enabled_ui(catalog.is_some(), move |ui| {
-            ui.menu_button(t!("audio.speech_to_text"), move |ui| {
+            ui.menu_button(label, move |ui| {
                 config.maybe_update(|raw| {
                     raw.min_confidence
                         .edit(*raw.min_confidence(), |confidence| {

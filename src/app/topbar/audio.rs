@@ -1,9 +1,12 @@
 use crate::{
     app::{
         Subsystems,
-        topbar::audio::{
-            voice::Voices,
-            whisper::{RECORDING_SPEC, Whisper},
+        topbar::{
+            audio::{
+                voice::Voices,
+                whisper::{RECORDING_SPEC, Whisper},
+            },
+            setup_label,
         },
     },
     arrstr,
@@ -12,8 +15,8 @@ use crate::{
     synthesizer::{Speech, Synthesizer},
     task::Task,
 };
-use camino::Utf8Path;
 use bono_i18n::t;
+use camino::Utf8Path;
 use sdl3::{
     AudioSubsystem,
     audio::{AudioDeviceID, AudioSpec, AudioStreamOwner},
@@ -68,6 +71,16 @@ impl AudioTopbar {
             beep_playback: None,
             transcription: None,
         }
+    }
+
+    /// Whether something here isn't set up yet: a device that won't open, no speech to text
+    /// model, or no voice.
+    pub fn needs_setup(&self, config: &Config) -> bool {
+        let config = config.get();
+        self.microphone.get().is_none()
+            || self.speaker.get().is_none()
+            || config.whisper_model().is_none()
+            || config.voices().is_empty()
     }
 
     /// What the pilot said on the radio, with its language, once it's transcribed.
@@ -236,7 +249,10 @@ impl DeviceSelector {
 
             // A sub-menu rather than a `ComboBox`: egui only tracks one open popup per viewport,
             // so opening a `ComboBox` popup would close the menu it lives in.
-            let label = format!("{}: {}", kind.label(), device.name());
+            let label = setup_label(
+                self.open.is_none(),
+                format!("{}: {}", kind.label(), device.name()),
+            );
             let updated = ui
                 .menu_button(label, |ui| {
                     let mut updated = ui

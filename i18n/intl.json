@@ -391,9 +391,9 @@
         "ca": "Proveïdor:"
     },
     "provider.claude_hover": {
-        "en": "Through the Claude API: needs ANTHROPIC_API_KEY",
-        "es": "A través de la API de Claude: necesita ANTHROPIC_API_KEY",
-        "ca": "A través de l'API de Claude: necessita ANTHROPIC_API_KEY"
+        "en": "Through the Claude API: needs an API key",
+        "es": "A través de la API de Claude: necesita una clave de la API",
+        "ca": "A través de l'API de Claude: necessita una clau de l'API"
     },
     "provider.ollama_hover": {
         "en": "A model Ollama runs, on this PC or another",
@@ -1016,9 +1016,9 @@
         "ca": "No s'ha pogut connectar amb l'API de Claude"
     },
     "provider.no_claude_credentials": {
-        "en": "No Claude credentials: set ANTHROPIC_API_KEY",
-        "es": "No hay credenciales de Claude: define ANTHROPIC_API_KEY",
-        "ca": "No hi ha credencials de Claude: defineix ANTHROPIC_API_KEY"
+        "en": "No Claude credentials: enter an API key, or set ANTHROPIC_API_KEY",
+        "es": "No hay credenciales de Claude: introduce una clave de la API, o define ANTHROPIC_API_KEY",
+        "ca": "No hi ha credencials de Claude: introdueix una clau de l'API, o defineix ANTHROPIC_API_KEY"
     },
     "provider.ollama_unreachable": {
         "en": "Couldn't reach Ollama at {url} (is it running?)",
@@ -1044,6 +1044,36 @@
         "en": "The API's base, with its version, e.g. http://127.0.0.1:8080/v1. The API key comes from OPENAI_API_KEY",
         "es": "La base de la API, con su versión, p. ej. http://127.0.0.1:8080/v1. La clave de la API se toma de OPENAI_API_KEY",
         "ca": "La base de l'API, amb la seva versió, p. ex. http://127.0.0.1:8080/v1. La clau de l'API s'agafa d'OPENAI_API_KEY"
+    },
+    "provider.api_key": {
+        "en": "API key:",
+        "es": "Clave de la API:",
+        "ca": "Clau de l'API:"
+    },
+    "provider.api_key_hint": {
+        "en": "ANTHROPIC_API_KEY",
+        "es": "ANTHROPIC_API_KEY",
+        "ca": "ANTHROPIC_API_KEY"
+    },
+    "provider.api_key_hover": {
+        "en": "Your Claude API key, from platform.claude.com. ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN) when empty. Kept in the settings file, unencrypted",
+        "es": "Tu clave de la API de Claude, de platform.claude.com. ANTHROPIC_API_KEY (o ANTHROPIC_AUTH_TOKEN) si está vacía. Se guarda en el archivo de ajustes, sin cifrar",
+        "ca": "La teva clau de l'API de Claude, de platform.claude.com. ANTHROPIC_API_KEY (o ANTHROPIC_AUTH_TOKEN) si és buida. Es desa al fitxer de configuració, sense xifrar"
+    },
+    "provider.workspace_id": {
+        "en": "Workspace:",
+        "es": "Espacio de trabajo:",
+        "ca": "Espai de treball:"
+    },
+    "provider.workspace_id_hint": {
+        "en": "optional",
+        "es": "opcional",
+        "ca": "opcional"
+    },
+    "provider.workspace_id_hover": {
+        "en": "The workspace's ID, sent as anthropic-workspace-id. ANTHROPIC_WORKSPACE_ID, if set, when empty",
+        "es": "El ID del espacio de trabajo, enviado como anthropic-workspace-id. ANTHROPIC_WORKSPACE_ID, si está definida, si está vacío",
+        "ca": "L'ID de l'espai de treball, enviat com a anthropic-workspace-id. ANTHROPIC_WORKSPACE_ID, si està definida, si és buit"
     },
     "provider.openai_effort_hover": {
         "en": "reasoning_effort: the model's default when unset. None also turns thinking off in llama.cpp's thinking models",

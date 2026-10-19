@@ -10,12 +10,12 @@ use crate::{
     sim::{ActiveSimulator, Sim},
     synthesizer::Synthesizer,
 };
+use bono_i18n::t;
 use camino::Utf8Path;
 use egui::{
-    PopupCloseBehavior,
+    Atoms, IntoAtoms, PopupCloseBehavior,
     menu::{MenuButton, MenuConfig},
 };
-use bono_i18n::t;
 use sdl3::event::Event;
 use std::sync::Arc;
 use tokio::runtime::Handle;
@@ -72,9 +72,15 @@ impl Topbar {
         synth: &mut Synthesizer,
         simulators: &mut ActiveSimulator,
     ) {
+        // Every menu with something in it that isn't set up yet
+        let settings_setup = config.get().talk_button().is_none();
+        let audio_setup = self.audio.needs_setup(config);
+        let provider_setup = provider::needs_setup(config);
+        let simulators_setup = self.simulators.needs_setup(simulators);
+
         egui::Panel::top("tobpar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                let (_, settings) = MenuButton::new(t!("settings"))
+                let (_, settings) = MenuButton::new(setup_label(settings_setup, t!("settings")))
                     .config(
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
@@ -83,7 +89,7 @@ impl Topbar {
                     self.settings.closed();
                 }
 
-                MenuButton::new(t!("audio"))
+                MenuButton::new(setup_label(audio_setup, t!("audio")))
                     .config(
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
@@ -95,7 +101,7 @@ impl Topbar {
                     )
                     .ui(ui, |ui| self.volume.update(ui, config));
 
-                MenuButton::new(t!("provider"))
+                MenuButton::new(setup_label(provider_setup, t!("provider")))
                     .config(
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
@@ -107,7 +113,7 @@ impl Topbar {
                     )
                     .ui(ui, |ui| self.spotter.update(ui, config));
 
-                let (_, sims) = MenuButton::new(t!("simulators"))
+                let (_, sims) = MenuButton::new(setup_label(simulators_setup, t!("simulators")))
                     .config(
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
@@ -145,6 +151,19 @@ impl Topbar {
             }
         }
     }
+}
+
+/// The warning sign's color
+const SETUP_COLOR: egui::Color32 = egui::Color32::from_rgb(240, 190, 0);
+
+/// `text`, after a yellow warning sign when what it names isn't set up yet (for a menu, something
+/// in it).
+fn setup_label<'a>(missing: bool, text: impl IntoAtoms<'a>) -> Atoms<'a> {
+    let mut atoms = text.into_atoms();
+    if missing {
+        atoms.push_left(egui::RichText::new(egui_phosphor::bold::WARNING).color(SETUP_COLOR));
+    }
+    atoms
 }
 
 /// A sub-menu picking one of `options` (a `ComboBox` would close the menu it's in), with

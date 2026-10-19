@@ -2,21 +2,26 @@
 //! running, and for those that need a plugin, which version is installed, with a button installing
 //! the one that comes with the app.
 
-use crate::sim::{ActiveSimulator, PluginStatus};
+use crate::{
+    app::topbar::setup_label,
+    sim::{ActiveSimulator, PluginStatus},
+};
 use bono_i18n::t;
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
 
-/// While the menu is open, how often it looks at the games' folders again (the pilot may install
-/// one, or the plugin, meanwhile).
+/// How often it looks at the games' folders again (the pilot may install one, or the plugin,
+/// meanwhile).
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 pub struct SimulatorsTopbar {
     /// When it was looked up, and every simulator's, in order. Looked up again once the menu opens
     found: Option<(Instant, Vec<Found>)>,
+    /// Whether the menu was showing last frame
+    open: bool,
     /// The last plugin installed: its simulator's name, and how it went
     install: Option<(&'static str, Result<(), String>)>,
 }
@@ -27,8 +32,33 @@ struct Found {
     plugin: Option<PluginStatus>,
 }
 
+impl Found {
+    /// Whether the game is installed, and its plugin isn't (or is outdated, or disabled).
+    fn needs_setup(&self) -> bool {
+        let Some(plugin) = self.install_dir.as_ref().and(self.plugin.as_ref()) else {
+            return false;
+        };
+        !plugin.enabled
+            || match (plugin.installed, plugin.bundled.flatten()) {
+                (None, _) => true,
+                (Some(Some(installed)), Some(latest)) => installed < latest,
+                (Some(None), Some(_)) => true,
+                (Some(_), None) => false,
+            }
+    }
+}
+
 impl SimulatorsTopbar {
-    pub fn update(&mut self, ui: &mut egui::Ui, simulators: &mut ActiveSimulator) {
+    /// Whether an installed game's plugin needs installing, updating or enabling.
+    pub fn needs_setup(&mut self, simulators: &mut ActiveSimulator) -> bool {
+        self.refresh(simulators);
+        self.found
+            .as_ref()
+            .is_some_and(|(_, found)| found.iter().any(Found::needs_setup))
+    }
+
+    /// Looks at the disk again, if it's been a while.
+    fn refresh(&mut self, simulators: &mut ActiveSimulator) {
         if self
             .found
             .as_ref()
@@ -43,6 +73,14 @@ impl SimulatorsTopbar {
                 .collect();
             self.found = Some((Instant::now(), found));
         }
+    }
+
+    pub fn update(&mut self, ui: &mut egui::Ui, simulators: &mut ActiveSimulator) {
+        if !self.open {
+            self.open = true;
+            self.found = None;
+        }
+        self.refresh(simulators);
         let Some((_, found)) = &self.found else {
             unreachable!()
         };
@@ -81,7 +119,7 @@ impl SimulatorsTopbar {
             let button = ui
                 .add_enabled(
                     found.install_dir.is_some() && !running && plugin.bundled.is_some(),
-                    egui::Button::new(install_label(plugin)),
+                    egui::Button::new(setup_label(found.needs_setup(), install_label(plugin))),
                 )
                 .on_hover_text(t!("plugin.install_hover"))
                 .on_disabled_hover_text(if found.install_dir.is_none() {
@@ -122,7 +160,7 @@ impl SimulatorsTopbar {
 
     /// Looks at the disk again the next time the menu opens, and forgets the last install.
     pub fn closed(&mut self) {
-        self.found = None;
+        self.open = false;
         self.install = None;
     }
 }

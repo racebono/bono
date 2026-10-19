@@ -31,7 +31,7 @@ pub async fn models(
     client: &reqwest::Client,
 ) -> anyhow::Result<Vec<ModelOption>> {
     match config.provider() {
-        ModelProvider::Claude => claude::models(client).await,
+        ModelProvider::Claude => claude::models(&config.claude, client).await,
         ModelProvider::Ollama => ollama::models(config.ollama.host().as_deref(), client).await,
         ModelProvider::OpenAi => {
             let openai = &config.openai;

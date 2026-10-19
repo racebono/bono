@@ -1,7 +1,7 @@
 //! The language model the engineer talks through: who runs it, which model, and how.
 
 use crate::{
-    app::topbar::pick,
+    app::topbar::{pick, setup_label},
     config::{
         ClaudeConfig, Config, ModelConfig, ModelProvider, OllamaConfig, OpenAiConfig, Setting,
     },
@@ -50,6 +50,10 @@ pub struct ProviderTopbar {
     /// The address being typed (Ollama's host, or the API's URL): set once it's done (Enter, or
     /// clicking away)
     host: Option<String>,
+    /// Claude's API key being typed, likewise
+    api_key: Option<String>,
+    /// Claude's workspace being typed, likewise
+    workspace_id: Option<String>,
 }
 
 /// The models one provider offers.
@@ -66,6 +70,8 @@ impl ProviderTopbar {
             client: client.clone(),
             models: None,
             host: None,
+            api_key: None,
+            workspace_id: None,
         }
     }
 
@@ -80,16 +86,24 @@ impl ProviderTopbar {
             .as_ref()
             .is_none_or(|models| models.provider != provider || models.host != host);
         if stale {
-            self.fetch(model);
+            self.fetch(model.clone());
         }
 
         config.maybe_update(|raw| {
             let mut changed = raw.model.provider.edit(provider, |provider| {
                 ui.horizontal(|ui| {
                     ui.label(t!("provider.label"));
-                    let claude = ui
-                        .selectable_value(provider, ModelProvider::Claude, "Claude")
+                    let no_credentials = !provider::claude::has_credentials(&model.claude);
+                    let mut claude = ui
+                        .selectable_value(
+                            provider,
+                            ModelProvider::Claude,
+                            setup_label(no_credentials, "Claude"),
+                        )
                         .on_hover_text(t!("provider.claude_hover"));
+                    if no_credentials {
+                        claude = claude.on_hover_text(t!("provider.no_claude_credentials"));
+                    }
                     let ollama = ui
                         .selectable_value(provider, ModelProvider::Ollama, "Ollama")
                         .on_hover_text(t!("provider.ollama_hover"));
@@ -115,7 +129,32 @@ impl ProviderTopbar {
     }
 
     fn claude(&mut self, rt: &Handle, ui: &mut egui::Ui, config: &mut ClaudeConfig) -> bool {
-        let mut changed = self.model(rt, ui, config.model().clone(), &mut config.model);
+        let mut changed = false;
+        if let Some(api_key) = text_field(
+            &mut self.api_key,
+            ui,
+            config.api_key().clone(),
+            t!("provider.api_key"),
+            t!("provider.api_key_hint"),
+            t!("provider.api_key_hover"),
+            true,
+        ) {
+            config.api_key.set(api_key);
+            changed = true;
+        }
+        if let Some(workspace_id) = text_field(
+            &mut self.workspace_id,
+            ui,
+            config.workspace_id().clone(),
+            t!("provider.workspace_id"),
+            t!("provider.workspace_id_hint"),
+            t!("provider.workspace_id_hover"),
+            false,
+        ) {
+            config.workspace_id.set(workspace_id);
+            changed = true;
+        }
+        changed |= self.model(rt, ui, config.model().clone(), &mut config.model);
         changed |= pick(
             ui,
             t!("provider.effort"),
@@ -145,12 +184,14 @@ impl ProviderTopbar {
 
     fn openai(&mut self, rt: &Handle, ui: &mut egui::Ui, config: &mut OpenAiConfig) -> bool {
         let mut changed = false;
-        if let Some(base_url) = self.address(
+        if let Some(base_url) = text_field(
+            &mut self.host,
             ui,
             config.base_url().clone(),
             t!("provider.base_url"),
             provider::OPENAI_DEFAULT_BASE_URL,
             t!("provider.base_url_hover"),
+            false,
         ) {
             config.base_url.set(base_url);
             changed = true;
@@ -180,12 +221,14 @@ impl ProviderTopbar {
 
     fn ollama(&mut self, rt: &Handle, ui: &mut egui::Ui, config: &mut OllamaConfig) -> bool {
         let mut changed = false;
-        if let Some(host) = self.address(
+        if let Some(host) = text_field(
+            &mut self.host,
             ui,
             config.host().clone(),
             t!("provider.host"),
             t!("provider.host_hint"),
             t!("provider.host_hover"),
+            false,
         ) {
             config.host.set(host);
             changed = true;
@@ -234,43 +277,6 @@ impl ProviderTopbar {
         .on_hover_text(t!("provider.keep_loaded_hover"))
         .changed();
         changed
-    }
-
-    /// Where the provider is (Ollama's host, the API's URL): empty for its default. The new one
-    /// once it's been typed (Enter, or clicking away), if it changed.
-    fn address(
-        &mut self,
-        ui: &mut egui::Ui,
-        current: Option<String>,
-        label: &str,
-        hint: &str,
-        hover: &str,
-    ) -> Option<Option<String>> {
-        let mut text = match &self.host {
-            Some(text) => text.clone(),
-            None => current.clone().unwrap_or_default(),
-        };
-
-        let edit = ui
-            .horizontal(|ui| {
-                ui.label(label);
-                ui.add(
-                    egui::TextEdit::singleline(&mut text)
-                        .hint_text(hint)
-                        .desired_width(200.0),
-                )
-            })
-            .inner
-            .on_hover_text(hover);
-
-        if edit.has_focus() {
-            self.host = Some(text);
-            return None;
-        }
-        self.host = None;
-
-        let address = Some(text.trim().to_owned()).filter(|address| !address.is_empty());
-        (edit.lost_focus() && address != current).then_some(address)
     }
 
     /// The model, picked from the provider's.
@@ -338,13 +344,69 @@ impl ProviderTopbar {
     }
 }
 
-/// Where the provider's models are listed from: Ollama's host, or the API's URL.
+/// Whether the provider picked can't be used yet: Claude, without credentials.
+pub fn needs_setup(config: &Config) -> bool {
+    match config.get().model.provider() {
+        ModelProvider::Claude => !provider::claude::has_credentials(&config.get().model.claude),
+        ModelProvider::Ollama | ModelProvider::OpenAi => false,
+    }
+}
+
+/// Where the provider's models are listed from: Ollama's host, or the API's URL. For Claude, the
+/// credentials they were listed with.
 fn location(model: &ModelConfig) -> Option<String> {
     match model.provider() {
-        ModelProvider::Claude => None,
+        ModelProvider::Claude => {
+            let claude = &model.claude;
+            (claude.api_key().is_some() || claude.workspace_id().is_some()).then(|| {
+                let api_key = claude.api_key().as_deref().unwrap_or_default();
+                let workspace_id = claude.workspace_id().as_deref().unwrap_or_default();
+                format!("{api_key}\n{workspace_id}")
+            })
+        }
         ModelProvider::Ollama => model.ollama.host().clone(),
         ModelProvider::OpenAi => model.openai.base_url().clone(),
     }
+}
+
+/// A line of text (Ollama's host, the API's URL, a key...): empty for its default, `password` to
+/// hide what's typed. `typing` holds it while it's being typed. The new one once it's been typed
+/// (Enter, or clicking away), if it changed.
+fn text_field(
+    typing: &mut Option<String>,
+    ui: &mut egui::Ui,
+    current: Option<String>,
+    label: &str,
+    hint: &str,
+    hover: &str,
+    password: bool,
+) -> Option<Option<String>> {
+    let mut text = match typing {
+        Some(text) => text.clone(),
+        None => current.clone().unwrap_or_default(),
+    };
+
+    let edit = ui
+        .horizontal(|ui| {
+            ui.label(label);
+            ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .hint_text(hint)
+                    .password(password)
+                    .desired_width(200.0),
+            )
+        })
+        .inner
+        .on_hover_text(hover);
+
+    if edit.has_focus() {
+        *typing = Some(text);
+        return None;
+    }
+    *typing = None;
+
+    let text = Some(text.trim().to_owned()).filter(|text| !text.is_empty());
+    (edit.lost_focus() && text != current).then_some(text)
 }
 
 /// A number of tokens, from 1 to `max`. Returns the field, changed if it did.

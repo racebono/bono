@@ -567,7 +567,7 @@ settings! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelProvider {
-    /// Claude, through the Claude API: needs `ANTHROPIC_API_KEY`
+    /// Claude, through the Claude API: needs an API key
     Claude,
     /// A model Ollama runs, on this PC or another
     Ollama,
@@ -597,6 +597,10 @@ settings! {
     /// Claude, through the Claude API.
     #[derive(Debug, PartialEq)]
     pub struct ClaudeConfig {
+        /// `ANTHROPIC_API_KEY` (or else `ANTHROPIC_AUTH_TOKEN`, as a bearer token) when `None`
+        pub api_key: Option<String> = None,
+        /// Sent as `anthropic-workspace-id`: `ANTHROPIC_WORKSPACE_ID`, if set, when `None`
+        pub workspace_id: Option<String> = None,
         /// e.g. `claude-sonnet-5-5`
         pub model: String = "claude-sonnet-5-5".into(),
         /// `low`, `medium`, `high`, `xhigh` or `max` (the levels depend on the model)

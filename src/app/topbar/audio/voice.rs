@@ -3,16 +3,17 @@
 
 use crate::{
     Download,
+    app::topbar::setup_label,
     config::{ArrayStr, Config},
     error,
     synthesizer::Synthesizer,
     task::MaybeDone,
     updating,
 };
+use bono_i18n::t;
 use camino::{Utf8Component, Utf8Path};
 use egui::{RichText, Widget};
 use egui_extras::Column;
-use bono_i18n::t;
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -61,8 +62,13 @@ impl Voices {
             Some(None) | None => None,
         };
 
+        // Without any voice, the app's language is the one to get one for
+        let missing = config.get().voices().is_empty();
+        let locale = config.get().locale().clone();
+        let suggested = ArrayStr::<2>::from_str(locale.split('-').next().unwrap_or_default());
+
         ui.add_enabled_ui(catalog.is_some(), |ui| {
-            ui.menu_button(t!("audio.text_to_speech"), |ui| {
+            ui.menu_button(setup_label(missing, t!("audio.text_to_speech")), |ui| {
                 let Some(catalog) = catalog else {
                     return;
                 };
@@ -83,6 +89,8 @@ impl Voices {
                                 label = label.strong();
                             }
 
+                            let label =
+                                setup_label(missing && Some(language.code) == suggested, label);
                             ui.menu_button(label, |ui| {
                                 language.update(rt, ui, client, config, on_disk.as_deref(), synth);
                             });

@@ -1,3 +1,2 @@
-- LMU Plugin Install Button
 - Initial Startup Guide with helpers for what to install
 - Website

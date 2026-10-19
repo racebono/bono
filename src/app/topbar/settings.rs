@@ -1,8 +1,12 @@
 use crate::{
-    app::Subsystems, button::ConfigButton, config::Config, error, guid_to_str, task::LocalTask,
+    app::{Subsystems, topbar::setup_label},
+    button::ConfigButton,
+    config::Config,
+    error, guid_to_str,
+    task::LocalTask,
 };
-use egui::IntoAtoms;
 use bono_i18n::{locales, t};
+use egui::IntoAtoms;
 use std::num::NonZeroU32;
 use tokio::runtime::Handle;
 
@@ -46,7 +50,10 @@ impl SettingsTopbar {
             rt,
             ss,
             ui,
-            button(t!("settings.change_talk"), talk),
+            setup_label(
+                talk.is_none(),
+                button(t!("settings.change_talk"), talk.clone()),
+            ),
             t!("settings.press_button"),
         );
 
