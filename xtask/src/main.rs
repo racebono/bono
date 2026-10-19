@@ -1,3 +1,5 @@
+mod runtime;
+
 use anyhow::bail;
 use futures::{TryStreamExt, stream::FuturesUnordered};
 use std::{
@@ -58,7 +60,11 @@ async fn dist() -> anyhow::Result<()> {
     let phonemizer = dist.join("phonemizer");
     tokio::fs::create_dir_all(&phonemizer).await?;
     let exe = format!("bono-phonemizer{}", env::consts::EXE_SUFFIX);
-    tokio::fs::copy(root.join("target/release").join(&exe), phonemizer.join(&exe)).await?;
+    tokio::fs::copy(
+        root.join("target/release").join(&exe),
+        phonemizer.join(&exe),
+    )
+    .await?;
     tokio::fs::copy(root.join("phonemizer/COPYING"), phonemizer.join("COPYING")).await?;
 
     let Some(espeak_data) = newest_espeak_data(&root.join("target/release/build")).await? else {
@@ -66,8 +72,12 @@ async fn dist() -> anyhow::Result<()> {
     };
     copy_dir(espeak_data, phonemizer.join("espeak-ng-data")).await?;
 
-    // 6. The LMU plugin, which goes in the game's Plugins folder
+    // 6. Windows app-local runtimes and the LMU plugin (for the game's Plugins folder)
     if cfg!(windows) {
+        let cuda = env::var_os("CUDA_PATH")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("CUDA_PATH is required to package CUDA runtime DLLs"))?;
+        runtime::copy_windows_runtimes(&root.join("target/release"), &cuda, &dist).await?;
         tokio::fs::create_dir_all(dist.join("plugins")).await?;
         tokio::fs::copy(
             root.join("target/release/bono_lmu.dll"),
@@ -86,7 +96,11 @@ async fn newest_espeak_data(build_dir: &Path) -> anyhow::Result<Option<PathBuf>>
     let mut it = tokio::fs::read_dir(build_dir).await?;
 
     while let Some(entry) = it.next_entry().await? {
-        if !entry.file_name().to_string_lossy().starts_with("espeak-rs-sys-") {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("espeak-rs-sys-")
+        {
             continue;
         }
 

@@ -131,6 +131,18 @@ const DOWNLOAD_STALL: Duration = Duration::from_secs(30);
 /// model on a slow connection takes long, so it's `DOWNLOAD_STALL` that catches a dead one
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_hours(24);
 
+// Tokio file writes may still be running after write_all returns. Surface their errors
+// and persist the data before making the completed download visible.
+async fn publish_download(
+    file: &mut tokio::fs::File,
+    temp_path: &Path,
+    perm_path: &Path,
+) -> std::io::Result<()> {
+    file.flush().await?;
+    file.sync_all().await?;
+    tokio::fs::rename(temp_path, perm_path).await
+}
+
 pub(crate) struct Download {
     task: tokio::task::JoinHandle<()>,
     progress: tokio::sync::watch::Receiver<f64>,
@@ -155,7 +167,9 @@ impl Download {
                 let temp_path = path.with_added_extension("tmp");
                 let file = tokio::fs::File::options()
                     .write(true)
-                    .create_new(true)
+                    // A crashed download can leave this file behind. Restart from byte zero.
+                    .create(true)
+                    .truncate(true)
                     .open(&temp_path)
                     .await?;
 
@@ -167,10 +181,11 @@ impl Download {
             }
 
             async fn permanent(mut self) -> std::io::Result<()> {
-                let Some(temp_path) = self.temp_path.take() else {
+                let Some(temp_path) = self.temp_path.as_ref() else {
                     return Ok(());
                 };
-                tokio::fs::rename(temp_path, self.perm_path).await?;
+                publish_download(&mut self.file, temp_path, self.perm_path).await?;
+                self.temp_path = None;
                 return Ok(());
             }
         }
@@ -264,6 +279,79 @@ impl Drop for Download {
     }
 }
 
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    async fn download_over_temp(stale: Option<&[u8]>, body: &'static [u8]) {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("model.bin");
+        let temporary = destination.with_added_extension("tmp");
+        if let Some(stale) = stale {
+            std::fs::write(&temporary, stale).unwrap();
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            socket.write_all(body).unwrap();
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut download = Download::new(
+            client.get(format!("http://{address}/model")),
+            destination.clone(),
+            None,
+        );
+        tokio::time::timeout(Duration::from_secs(15), &mut download.task)
+            .await
+            .expect("download did not finish")
+            .unwrap();
+        server.join().unwrap();
+        assert!(download.done.load(Ordering::Acquire));
+        assert!(!download.failed());
+        assert_eq!(download.progress(), 1.0);
+        assert_eq!(std::fs::read(destination).unwrap(), body);
+        assert!(!temporary.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_temp_is_truncated_before_retry() {
+        download_over_temp(
+            Some(b"old partial model with a trailing suffix"),
+            b"new model",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_response_removes_all_stale_bytes() {
+        download_over_temp(Some(b"old partial model"), b"").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_creates_missing_temp_file() {
+        download_over_temp(None, b"new model").await;
+    }
+}
+
 pub(crate) fn updating<Fut>(
     interval: Duration,
     initial: Fut::Output,
@@ -294,4 +382,53 @@ where
         }
     });
     return recv;
+}
+
+#[cfg(test)]
+mod download_publication_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn publishes_complete_final_chunk_and_empty_download() {
+        let dir = tempfile::tempdir().unwrap();
+        for data in [vec![42; 128 * 1024 + 7], vec![]] {
+            let temp = dir.path().join("model.tmp");
+            let dest = dir.path().join("model");
+            let mut file = tokio::fs::File::create(&temp).await.unwrap();
+            file.write_all(&data).await.unwrap();
+            assert!(!dest.exists());
+            publish_download(&mut file, &temp, &dest).await.unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), data);
+            assert!(!temp.exists());
+            drop(file);
+            std::fs::remove_file(dest).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_write_error_prevents_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("model.tmp");
+        let dest = dir.path().join("model");
+        std::fs::write(&temp, b"partial").unwrap();
+        // A read-only handle deterministically fails the background write, just as
+        // a final write can fail on a full disk. Tokio initially buffers this write.
+        let mut file = tokio::fs::File::open(&temp).await.unwrap();
+        file.write_all(b"last chunk").await.unwrap();
+        assert!(publish_download(&mut file, &temp, &dest).await.is_err());
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read(&temp).unwrap(), b"partial");
+    }
+
+    #[tokio::test]
+    async fn rename_error_keeps_temporary_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("model.tmp");
+        let dest = dir.path().join("missing").join("model");
+        let mut file = tokio::fs::File::create(&temp).await.unwrap();
+        file.write_all(b"complete").await.unwrap();
+        assert!(publish_download(&mut file, &temp, &dest).await.is_err());
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read(&temp).unwrap(), b"complete");
+    }
 }

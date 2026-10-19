@@ -68,12 +68,63 @@ pub struct Raised {
 }
 
 impl Raised {
+    fn valid_at(&self, at: Instant, now: Instant) -> bool {
+        now.duration_since(at) < if self.urgent { URGENT_FOR } else { OTHER_FOR }
+    }
+
+    /// Traffic updates replace the state of the sides they describe. Unrelated alerts do not.
+    fn traffic_sides(&self) -> u8 {
+        match self.text {
+            "car left" | "still there left" | "clear left" => 1,
+            "car right" | "still there right" | "clear right" => 2,
+            "three wide" | "clear all round" => 3,
+            _ => 0,
+        }
+    }
+
     /// What's said, in `lang` (or in English when there's no translation).
     pub fn words(&self, lang: ArrayStr<2>) -> String {
         let text = translate(self.text, lang);
         match self.number {
             Some(number) => text.replacen("{}", &number.to_string(), 1),
             None => text.to_owned(),
+        }
+    }
+}
+
+/// Urgent state updates supersede only warnings about the same thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarningCategory {
+    Traffic,
+    Limiter,
+    Flag,
+    Other(&'static str),
+}
+
+impl Raised {
+    fn warning_category(&self) -> WarningCategory {
+        match self.text {
+            "car left" | "car right" | "three wide" | "clear left" | "clear right"
+            | "clear all round" | "still there left" | "still there right" => {
+                WarningCategory::Traffic
+            }
+            "limiter, limiter" => WarningCategory::Limiter,
+            "full course yellow" | "green flag, green flag" | "red flag" => WarningCategory::Flag,
+            text => WarningCategory::Other(text),
+        }
+    }
+
+    /// A traffic update replaces only the sides it describes; other urgent updates
+    /// replace the older state in their category.
+    fn supersedes(&self, older: &Raised) -> bool {
+        if !self.urgent || !older.urgent {
+            return false;
+        }
+        match (self.warning_category(), older.warning_category()) {
+            (WarningCategory::Traffic, WarningCategory::Traffic) => {
+                self.traffic_sides() & older.traffic_sides() != 0
+            }
+            (new, old) => new == old,
         }
     }
 }
@@ -108,7 +159,12 @@ impl Drop for Running {
 }
 
 enum Saying {
-    Synthesizing(CacheKey, oneshot::Receiver<anyhow::Result<Speech>>),
+    Synthesizing {
+        key: CacheKey,
+        recv: oneshot::Receiver<anyhow::Result<Speech>>,
+        call: Raised,
+        at: Instant,
+    },
     /// Dropping it stops it
     Playing(AudioStreamOwner),
 }
@@ -162,14 +218,15 @@ impl Spotter {
         }
 
         let lang = self.language(config, &settings, engineer);
-        if let Some(running) = &self.running {
-            while let Ok(call) = running.calls.try_recv() {
-                // A newer urgent call replaces one still waiting: "car left" is stale once it's
-                // "clear left"
-                if call.urgent {
-                    self.queue.retain(|(queued, _)| !queued.urgent);
-                }
-                self.queue.push_back((call, Instant::now()));
+        if self.running.is_some() {
+            while let Some(call) = self
+                .running
+                .as_ref()
+                .and_then(|running| running.calls.try_recv().ok())
+            {
+                let at = Instant::now();
+                self.discard_stale_synthesis(at, Some(&call));
+                Self::enqueue(&mut self.queue, call, at);
             }
             self.warm(rt, config, synth, lang);
         }
@@ -177,8 +234,18 @@ impl Spotter {
         self.say(rt, config, synth, speaker, engineer, lang);
     }
 
+    fn enqueue(queue: &mut VecDeque<(Raised, Instant)>, call: Raised, at: Instant) {
+        queue.retain(|(queued, _)| !call.supersedes(queued));
+        queue.push_back((call, at));
+    }
+
     /// The calls' language: the configured one, or the pilot's; English without a voice for it.
-    fn language(&self, config: &Config, settings: &SpotterConfig, engineer: &Engineer) -> ArrayStr<2> {
+    fn language(
+        &self,
+        config: &Config,
+        settings: &SpotterConfig,
+        engineer: &Engineer,
+    ) -> ArrayStr<2> {
         let lang = settings.language().unwrap_or(engineer.language());
         match config.get().voices().contains_key(&lang) {
             true => lang,
@@ -188,8 +255,16 @@ impl Spotter {
 
     fn key(config: &Config, lang: ArrayStr<2>, words: String) -> CacheKey {
         let config = config.get();
-        let voice = config.voices().get(&lang).map(|path| path.as_std_path().to_owned());
-        (lang, voice.unwrap_or_default(), config.radio_effect().to_bits(), words)
+        let voice = config
+            .voices()
+            .get(&lang)
+            .map(|path| path.as_std_path().to_owned());
+        (
+            lang,
+            voice.unwrap_or_default(),
+            config.radio_effect().to_bits(),
+            words,
+        )
     }
 
     fn effects(config: &Config) -> Effects {
@@ -202,14 +277,15 @@ impl Spotter {
 
     /// Synthesizes the traffic calls ahead, so the first ones aren't late.
     fn warm(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer, lang: ArrayStr<2>) {
-        self.warming.retain_mut(|(key, recv)| match recv.try_recv() {
-            Ok(Ok(speech)) => {
-                self.cache.insert(key.clone(), Arc::new(speech));
-                false
-            }
-            Ok(Err(_)) | Err(oneshot::error::TryRecvError::Closed) => false,
-            Err(oneshot::error::TryRecvError::Empty) => true,
-        });
+        self.warming
+            .retain_mut(|(key, recv)| match recv.try_recv() {
+                Ok(Ok(speech)) => {
+                    self.cache.insert(key.clone(), Arc::new(speech));
+                    false
+                }
+                Ok(Err(_)) | Err(oneshot::error::TryRecvError::Closed) => false,
+                Err(oneshot::error::TryRecvError::Empty) => true,
+            });
 
         for text in WARM {
             let words = translate(text, lang).to_owned();
@@ -222,6 +298,16 @@ impl Spotter {
         }
     }
 
+    /// Drop the receiver promptly, so an obsolete call no longer holds the engineer.
+    fn discard_stale_synthesis(&mut self, now: Instant, newer: Option<&Raised>) {
+        if let Some(Saying::Synthesizing { call, at, .. }) = &self.saying {
+            let superseded = newer.is_some_and(|newer| newer.supersedes(call));
+            if !call.valid_at(*at, now) || superseded {
+                self.saying = None;
+            }
+        }
+    }
+
     fn say(
         &mut self,
         rt: &Handle,
@@ -231,9 +317,11 @@ impl Spotter {
         engineer: &mut Engineer,
         lang: ArrayStr<2>,
     ) {
+        self.discard_stale_synthesis(Instant::now(), None);
+
         // The call being said
         match &mut self.saying {
-            Some(Saying::Synthesizing(key, recv)) => match recv.try_recv() {
+            Some(Saying::Synthesizing { key, recv, .. }) => match recv.try_recv() {
                 Ok(Ok(speech)) => {
                     let speech = Arc::new(speech);
                     self.cache.insert(key.clone(), speech.clone());
@@ -257,9 +345,7 @@ impl Spotter {
         // The next call: urgent ones first, the rest once the engineer is quiet
         if self.saying.is_none() {
             let now = Instant::now();
-            self.queue.retain(|(call, at)| {
-                now.duration_since(*at) < if call.urgent { URGENT_FOR } else { OTHER_FOR }
-            });
+            self.queue.retain(|(call, at)| call.valid_at(*at, now));
 
             let next = match self.queue.iter().position(|(call, _)| call.urgent) {
                 Some(urgent) => Some(urgent),
@@ -267,14 +353,19 @@ impl Spotter {
                 None => None,
             };
 
-            if let Some((call, _)) = next.and_then(|next| self.queue.remove(next)) {
+            if let Some((call, at)) = next.and_then(|next| self.queue.remove(next)) {
                 let words = call.words(lang);
                 let key = Self::key(config, lang, words.clone());
                 self.saying = match self.cache.get(&key).cloned() {
                     Some(speech) => self.play(config, speaker, &speech),
                     None => {
                         let recv = synth.synthesize(rt, lang, words, Self::effects(config));
-                        Some(Saying::Synthesizing(key, recv))
+                        Some(Saying::Synthesizing {
+                            key,
+                            recv,
+                            call,
+                            at,
+                        })
                     }
                 };
             }
@@ -284,7 +375,12 @@ impl Spotter {
         engineer.hold(self.saying.is_some());
     }
 
-    fn play(&self, config: &Config, speaker: Option<&AudioDevice>, speech: &Speech) -> Option<Saying> {
+    fn play(
+        &self,
+        config: &Config,
+        speaker: Option<&AudioDevice>,
+        speech: &Speech,
+    ) -> Option<Saying> {
         let speaker = speaker?;
         let gain = {
             let config = config.get();
@@ -531,7 +627,10 @@ fn player(conn: &Connection, car: Car) -> rusqlite::Result<Player> {
              WHERE vehicle_id = ?1 AND telemetry_id <= ?2 ORDER BY telemetry_id DESC LIMIT 1",
         )?
         .query_row([car.vehicle, car.id], |row| {
-            Ok((row.get::<_, Option<bool>>(0)?, row.get::<_, Option<bool>>(1)?))
+            Ok((
+                row.get::<_, Option<bool>>(0)?,
+                row.get::<_, Option<bool>>(1)?,
+            ))
         })
         .optional()?;
     let (limiter, parts_detached) = state.unwrap_or_default();
@@ -599,7 +698,10 @@ fn frame(conn: &Connection, player: &Car) -> rusqlite::Result<Vec<Car>> {
         }
     }
 
-    Ok(best.into_values().map(|(_, car)| at_time(car, time)).collect())
+    Ok(best
+        .into_values()
+        .map(|(_, car)| at_time(car, time))
+        .collect())
 }
 
 /// The newest session row, the player's newest standing and the session's newest forecast (at or
@@ -816,7 +918,12 @@ impl Logic {
         };
 
         // A new session
-        if self.prev.as_ref().and_then(|prev| prev.car.time).is_some_and(|prev| t < prev - 1.0) {
+        if self
+            .prev
+            .as_ref()
+            .and_then(|prev| prev.car.time)
+            .is_some_and(|prev| t < prev - 1.0)
+        {
             *self = Logic::default();
         }
 
@@ -931,7 +1038,11 @@ impl Logic {
             let Some((along, across)) = relative(player, other) else {
                 continue;
             };
-            let side = if across > 0.0 { Side::Right } else { Side::Left };
+            let side = if across > 0.0 {
+                Side::Right
+            } else {
+                Side::Left
+            };
             let (along, across) = (along.abs(), across.abs());
 
             if let Some(overlap) = self.overlap.get(&other.vehicle) {
@@ -1034,7 +1145,8 @@ impl Logic {
 
         if caution(&now.full_course_yellow) && !caution(&last.full_course_yellow) {
             calls.raise("full course yellow", true);
-        } else if caution(&last.full_course_yellow) && now.full_course_yellow.as_deref() == Some("none")
+        } else if caution(&last.full_course_yellow)
+            && now.full_course_yellow.as_deref() == Some("none")
         {
             calls.raise("green flag, green flag", true);
         }
@@ -1064,10 +1176,17 @@ impl Logic {
         stopped: bool,
         calls: &mut Calls,
     ) {
-        let rain = band(scoring.rain, &*config.rain_bands(), self.rain_band, *config.band_margin());
+        let rain = band(
+            scoring.rain,
+            &*config.rain_bands(),
+            self.rain_band,
+            *config.band_margin(),
+        );
         match (self.rain_band, rain) {
             (None, _) => self.rain_band = rain,
-            (Some(was), Some(now)) if now != was && t - self.last_rain_call >= *config.weather_repeat() => {
+            (Some(was), Some(now))
+                if now != was && t - self.last_rain_call >= *config.weather_repeat() =>
+            {
                 calls.raise(
                     match () {
                         _ if was == 0 => "rain starting",
@@ -1083,7 +1202,12 @@ impl Logic {
             _ => {}
         }
 
-        let track = band(scoring.wetness, &*config.wet_bands(), self.track_band, *config.band_margin());
+        let track = band(
+            scoring.wetness,
+            &*config.wet_bands(),
+            self.track_band,
+            *config.band_margin(),
+        );
         match (self.track_band, track) {
             (None, _) => self.track_band = track,
             (Some(was), Some(now))
@@ -1140,13 +1264,18 @@ impl Logic {
             if minutes > *config.forecast_rain_lead_minutes() {
                 return;
             }
-            let point = (scoring.session_type.clone().unwrap_or_default(), fraction.to_bits());
+            let point = (
+                scoring.session_type.clone().unwrap_or_default(),
+                fraction.to_bits(),
+            );
             if !self.forecast_called.insert(point) {
                 return;
             }
             match minutes.round() as i64 {
                 ..=1 => calls.raise("rain likely in about a minute", false),
-                minutes => calls.raise_number("rain likely in about {} minutes", Some(minutes), false),
+                minutes => {
+                    calls.raise_number("rain likely in about {} minutes", Some(minutes), false)
+                }
             }
             return;
         }
@@ -1225,6 +1354,235 @@ pub fn translate(text: &'static str, lang: ArrayStr<2>) -> &'static str {
 mod tests {
     use super::*;
 
+    fn queued(calls: &[(&'static str, bool)]) -> Vec<(Raised, Instant)> {
+        let mut queue = VecDeque::new();
+        for &(text, urgent) in calls {
+            Spotter::enqueue(
+                &mut queue,
+                Raised {
+                    text,
+                    urgent,
+                    number: None,
+                    session_time: 0.0,
+                },
+                Instant::now(),
+            );
+        }
+        queue.into_iter().collect()
+    }
+
+    #[test]
+    fn queued_urgent_categories_survive_in_either_order() {
+        for calls in [
+            [
+                ("car right", true),
+                ("limiter, limiter", true),
+                ("full course yellow", true),
+            ],
+            [
+                ("full course yellow", true),
+                ("limiter, limiter", true),
+                ("car right", true),
+            ],
+        ] {
+            let queue = queued(&calls);
+            assert_eq!(
+                queue
+                    .iter()
+                    .map(|(call, _)| (call.text, call.urgent))
+                    .collect::<Vec<_>>(),
+                calls
+            );
+        }
+    }
+
+    #[test]
+    fn queued_updates_replace_only_their_category() {
+        let queue = queued(&[
+            ("blue flag", false),
+            ("car right", true),
+            ("full course yellow", true),
+            ("limiter, limiter", true),
+            ("clear right", true),
+            ("green flag, green flag", true),
+            ("red flag", true),
+        ]);
+        assert_eq!(
+            queue.iter().map(|(call, _)| call.text).collect::<Vec<_>>(),
+            ["blue flag", "limiter, limiter", "clear right", "red flag"]
+        );
+        assert_eq!(queue.iter().position(|(call, _)| call.urgent), Some(1));
+    }
+
+    #[test]
+    fn queued_replacement_refreshes_age_and_preserves_unrelated_age() {
+        let old = Instant::now();
+        let new = old + Duration::from_millis(100);
+        let call = |text| Raised {
+            text,
+            urgent: true,
+            number: None,
+            session_time: 0.0,
+        };
+        let mut queue = VecDeque::new();
+        Spotter::enqueue(&mut queue, call("car left"), old);
+        Spotter::enqueue(&mut queue, call("limiter, limiter"), old);
+        Spotter::enqueue(&mut queue, call("still there left"), new);
+        assert_eq!(
+            queue
+                .iter()
+                .map(|(call, at)| (call.text, *at))
+                .collect::<Vec<_>>(),
+            [("limiter, limiter", old), ("still there left", new)]
+        );
+    }
+
+    #[test]
+    fn opposite_side_traffic_updates_do_not_erase_each_other() {
+        for calls in [
+            [("car right", true), ("clear left", true)],
+            [("car left", true), ("clear right", true)],
+            [("still there left", true), ("still there right", true)],
+        ] {
+            let queue = queued(&calls);
+            assert_eq!(
+                queue
+                    .iter()
+                    .map(|(call, _)| (call.text, call.urgent))
+                    .collect::<Vec<_>>(),
+                calls,
+            );
+        }
+        let queue = queued(&[
+            ("car right", true),
+            ("car left", true),
+            ("clear all round", true),
+        ]);
+        assert_eq!(
+            queue.iter().map(|(call, _)| call.text).collect::<Vec<_>>(),
+            ["clear all round"]
+        );
+    }
+
+    #[test]
+    fn newer_flag_state_cancels_inflight_synthesis() {
+        let at = Instant::now();
+        let (mut spotter, send) = pending_call("full course yellow", true, at);
+        let newer = Raised {
+            text: "green flag, green flag",
+            urgent: true,
+            number: None,
+            session_time: 1.0,
+        };
+        spotter.discard_stale_synthesis(at, Some(&newer));
+        Spotter::enqueue(&mut spotter.queue, newer, at);
+        assert!(spotter.saying.is_none());
+        assert!(send.is_closed());
+        assert_eq!(
+            spotter.queue.front().unwrap().0.text,
+            "green flag, green flag"
+        );
+    }
+
+    fn pending_call(
+        text: &'static str,
+        urgent: bool,
+        at: Instant,
+    ) -> (Spotter, oneshot::Sender<anyhow::Result<Speech>>) {
+        let mut spotter = Spotter::new();
+        let (send, recv) = oneshot::channel();
+        spotter.saying = Some(Saying::Synthesizing {
+            key: (arrstr!("en"), PathBuf::new(), 0, text.into()),
+            recv,
+            call: Raised {
+                text,
+                urgent,
+                number: None,
+                session_time: 0.0,
+            },
+            at,
+        });
+        (spotter, send)
+    }
+
+    #[test]
+    fn synthesis_expires_at_the_original_queue_deadline() {
+        let at = Instant::now();
+        for (urgent, lifetime) in [(true, URGENT_FOR), (false, OTHER_FOR)] {
+            let (mut spotter, send) = pending_call("car right", urgent, at);
+            spotter.discard_stale_synthesis(at + lifetime - Duration::from_nanos(1), None);
+            assert!(spotter.saying.is_some());
+            // Completion at the deadline must not reach playback, even if already received.
+            assert!(
+                send.send(Ok(Speech {
+                    samples: vec![],
+                    sample_rate: 24000,
+                }))
+                .is_ok()
+            );
+            spotter.discard_stale_synthesis(at + lifetime, None);
+            assert!(spotter.saying.is_none());
+        }
+    }
+
+    #[test]
+    fn expired_pending_synthesis_releases_the_call_without_waiting_for_completion() {
+        let at = Instant::now();
+        let (mut spotter, send) = pending_call("car right", true, at);
+        spotter.discard_stale_synthesis(at + URGENT_FOR, None);
+        assert!(spotter.saying.is_none());
+        assert!(send.is_closed());
+    }
+
+    #[test]
+    fn newer_traffic_cancels_pending_or_completed_synthesis() {
+        let at = Instant::now();
+        for completed in [false, true] {
+            for (old, new) in [
+                ("car right", "clear right"),
+                ("still there left", "clear left"),
+                ("three wide", "clear right"),
+                ("car left", "clear all round"),
+                ("clear right", "car right"),
+            ] {
+                let (mut spotter, send) = pending_call(old, true, at);
+                if completed {
+                    assert!(
+                        send.send(Ok(Speech {
+                            samples: vec![],
+                            sample_rate: 24000,
+                        }))
+                        .is_ok()
+                    );
+                }
+                let newer = Raised {
+                    text: new,
+                    urgent: true,
+                    number: None,
+                    session_time: 1.0,
+                };
+                spotter.discard_stale_synthesis(at, Some(&newer));
+                assert!(spotter.saying.is_none(), "{old} superseded by {new}");
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_calls_preserve_fresh_synthesis() {
+        let at = Instant::now();
+        for new in ["car left", "limiter, limiter", "red flag", "rain starting"] {
+            let (mut spotter, _send) = pending_call("car right", true, at);
+            let newer = Raised {
+                text: new,
+                urgent: true,
+                number: None,
+                session_time: 1.0,
+            };
+            spotter.discard_stale_synthesis(at, Some(&newer));
+            assert!(spotter.saying.is_some(), "unrelated {new}");
+        }
+    }
+
     /// The player at `t`, heading along -z (heading 0) at 50 m/s.
     fn player(t: f64) -> Player {
         Player {
@@ -1269,7 +1627,13 @@ mod tests {
         let mut calls = Vec::new();
         let mut t = from;
         while t < to {
-            calls.extend(texts(logic.update(&config, &player(t), others, &Wheels::default(), None)));
+            calls.extend(texts(logic.update(
+                &config,
+                &player(t),
+                others,
+                &Wheels::default(),
+                None,
+            )));
             t += 1.0 / 30.0;
         }
         calls
@@ -1279,7 +1643,10 @@ mod tests {
     fn calls_a_car_alongside_and_clear() {
         let mut logic = Logic::default();
         // Alongside on the right, for a second
-        assert_eq!(run(&mut logic, 0.0, 1.0, &[other(2, 1.0, 3.0)]), ["car right"]);
+        assert_eq!(
+            run(&mut logic, 0.0, 1.0, &[other(2, 1.0, 3.0)]),
+            ["car right"]
+        );
         // Gone
         assert_eq!(run(&mut logic, 1.0, 1.5, &[]), ["clear right"]);
     }
@@ -1295,9 +1662,17 @@ mod tests {
     #[test]
     fn calls_three_wide_and_clear_all_round() {
         let mut logic = Logic::default();
-        assert_eq!(run(&mut logic, 0.0, 1.0, &[other(2, 0.0, 3.0)]), ["car right"]);
         assert_eq!(
-            run(&mut logic, 1.0, 2.0, &[other(2, 0.0, 3.0), other(3, 0.0, -3.0)]),
+            run(&mut logic, 0.0, 1.0, &[other(2, 0.0, 3.0)]),
+            ["car right"]
+        );
+        assert_eq!(
+            run(
+                &mut logic,
+                1.0,
+                2.0,
+                &[other(2, 0.0, 3.0), other(3, 0.0, -3.0)]
+            ),
             ["three wide"]
         );
         assert_eq!(run(&mut logic, 2.0, 2.5, &[]), ["clear all round"]);
@@ -1306,10 +1681,16 @@ mod tests {
     #[test]
     fn keeps_a_car_at_the_edge_without_chattering() {
         let mut logic = Logic::default();
-        assert_eq!(run(&mut logic, 0.0, 1.0, &[other(2, 4.0, 3.0)]), ["car right"]);
+        assert_eq!(
+            run(&mut logic, 0.0, 1.0, &[other(2, 4.0, 3.0)]),
+            ["car right"]
+        );
         // Past the way in (4.8 m) but within the way out (5.8 m): still there
         assert!(run(&mut logic, 1.0, 3.0, &[other(2, 5.3, 3.0)]).is_empty());
-        assert_eq!(run(&mut logic, 3.0, 3.5, &[other(2, 6.5, 3.0)]), ["clear right"]);
+        assert_eq!(
+            run(&mut logic, 3.0, 3.5, &[other(2, 6.5, 3.0)]),
+            ["clear right"]
+        );
     }
 
     #[test]
@@ -1341,8 +1722,13 @@ mod tests {
         let mut logic = Logic::default();
         for i in 0..30 {
             let p = player(i as f64 / 30.0);
-            let calls =
-                logic.update(&config, &p, &[other(2, 0.0, 3.0)], &Wheels::default(), Some(&formation));
+            let calls = logic.update(
+                &config,
+                &p,
+                &[other(2, 0.0, 3.0)],
+                &Wheels::default(),
+                Some(&formation),
+            );
             assert!(calls.is_empty());
         }
     }
@@ -1377,7 +1763,11 @@ mod tests {
         scoring.penalties = Some(1);
         assert_eq!(
             step(0.4, &scoring),
-            [("yellow flag on track", false), ("blue flag", false), ("penalty", false)]
+            [
+                ("yellow flag on track", false),
+                ("blue flag", false),
+                ("penalty", false)
+            ]
         );
         scoring.phase = Some("stopped".into());
         assert_eq!(step(0.5, &scoring), [("red flag", true)]);
@@ -1387,9 +1777,8 @@ mod tests {
     fn calls_the_cars_own_alerts() {
         let config = SpotterConfig::default();
         let mut logic = Logic::default();
-        let mut step = |p: &Player, wheels: &Wheels| {
-            texts(logic.update(&config, p, &[], wheels, None))
-        };
+        let mut step =
+            |p: &Player, wheels: &Wheels| texts(logic.update(&config, p, &[], wheels, None));
 
         let mut p = player(30.0);
         assert!(step(&p, &Wheels::default()).is_empty());
@@ -1513,7 +1902,10 @@ mod tests {
             urgent: false,
             session_time: 0.0,
         };
-        assert_eq!(call.words(arrstr!("es")), "probable lluvia en unos 4 minutos");
+        assert_eq!(
+            call.words(arrstr!("es")),
+            "probable lluvia en unos 4 minutos"
+        );
         assert_eq!(call.words(arrstr!("fr")), "rain likely in about 4 minutes");
         assert_eq!(translate("car left", arrstr!("es")), "coche a la izquierda");
         assert_eq!(translate("car left", arrstr!("ca")), "cotxe a l'esquerra");
