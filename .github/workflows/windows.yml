@@ -124,6 +124,9 @@ jobs:
       - name: Set up Vulkan
         run: ./.github/scripts/setup-vulkan.ps1
 
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
       - name: Build distribution
         run: |
           # whisper's nested Vulkan CMake build exceeds MSVC's MAX_PATH limit
