@@ -146,14 +146,6 @@ jobs:
 
       - name: Package Windows distribution
         run: |
-          # ort's downloaded runtime and any other app-local native libraries.
-          Get-ChildItem target/release/*.dll -Exclude bono_lmu.dll | Copy-Item -Destination dist
-          # whisper links the CUDA runtime and cuBLAS dynamically.
-          foreach ($pattern in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
-            $dlls = @(Get-ChildItem (Join-Path $env:CUDA_PATH "bin/x64/$pattern"))
-            if ($dlls.Count -eq 0) { throw "Missing CUDA runtime: $pattern" }
-            $dlls | Copy-Item -Destination dist
-          }
           Copy-Item LICENSE dist
           Compress-Archive -Path dist/* -DestinationPath bono-windows-x86_64.zip
 
