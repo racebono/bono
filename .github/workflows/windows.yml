@@ -1,0 +1,150 @@
+name: Windows x86-64
+
+on:
+  schedule:
+    # Daily at midnight UTC.
+    - cron: '0 0 * * *'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: windows-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    name: Select revision
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.revision.outputs.build }}
+      ref: ${{ steps.revision.outputs.ref }}
+    steps:
+      - uses: actions/github-script@v8
+        id: revision
+        with:
+          script: |
+            if (context.eventName === 'release') {
+              core.setOutput('ref', `refs/tags/${context.payload.release.tag_name}`);
+              core.setOutput('build', 'true');
+              return;
+            }
+
+            const { data: commit } = await github.rest.repos.getCommit({
+              ...context.repo, ref: context.payload.repository.default_branch,
+            });
+            core.setOutput('ref', commit.sha);
+
+            if (context.eventName === 'schedule') {
+              // A skipped build also makes a workflow successful. Check the build
+              // job itself so quiet days never become the last successful build.
+              const pages = github.paginate.iterator(github.rest.actions.listWorkflowRuns, {
+                ...context.repo,
+                workflow_id: 'windows.yml',
+                event: 'schedule',
+                head_sha: commit.sha,
+                status: 'success',
+                per_page: 100,
+              });
+              for await (const { data } of pages) {
+                for (const run of data) {
+                  const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+                    ...context.repo, run_id: run.id, per_page: 100,
+                  });
+                  if (jobs.some(job => job.name === 'Build Windows x86-64' && job.conclusion === 'success')) {
+                    core.info(`Revision ${commit.sha} already has a successful daily build.`);
+                    core.setOutput('build', 'false');
+                    return;
+                  }
+                }
+              }
+            }
+            core.setOutput('build', 'true');
+
+  build:
+    name: Build Windows x86-64
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 180
+    permissions:
+      contents: write # Attach the ZIP to a published release.
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TERM_COLOR: always
+      # Distribution builds must also run on CPUs other than the runner's CPU.
+      GGML_NATIVE: 'OFF'
+      # whisper-rs otherwise passes the Unix-only -fPIC flag to MSVC via nvcc.
+      CMAKE_CUDA_FLAGS: ''
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.changes.outputs.ref }}
+          persist-credentials: false
+
+      - name: Set up x64 MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --no-self-update
+          rustup default stable-x86_64-pc-windows-msvc
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
+      - name: Set up CUDA
+        uses: Jimver/cuda-toolkit@v0.2.30
+        with:
+          cuda: '12.8.1'
+          method: network
+
+      - name: Set up Vulkan
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: '1.4.304.1'
+          vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang
+          vulkan-use-cache: true
+
+      - name: Build distribution
+        run: |
+          cargo run --locked --release --package xtask -- dist
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package Windows distribution
+        run: |
+          # ort's downloaded runtime and any other app-local native libraries.
+          Get-ChildItem target/release/*.dll -Exclude bono_lmu.dll | Copy-Item -Destination dist
+          # whisper links the CUDA runtime and cuBLAS dynamically.
+          foreach ($pattern in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+            $dlls = @(Get-ChildItem (Join-Path $env:CUDA_PATH "bin/$pattern"))
+            if ($dlls.Count -eq 0) { throw "Missing CUDA runtime: $pattern" }
+            $dlls | Copy-Item -Destination dist
+          }
+          Copy-Item LICENSE dist
+          Compress-Archive -Path dist/* -DestinationPath bono-windows-x86_64.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: bono-windows-x86_64
+          path: bono-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$env:RELEASE_TAG" bono-windows-x86_64.zip --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

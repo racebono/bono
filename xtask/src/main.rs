@@ -32,7 +32,7 @@ async fn dist() -> anyhow::Result<()> {
 
     let status = tokio::process::Command::new(&cargo)
         .current_dir(&root)
-        .args(["build", "--release"])
+        .args(["build", "--locked", "--release"])
         .args(packages)
         .status()
         .await?;
