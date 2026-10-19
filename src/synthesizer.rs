@@ -693,6 +693,19 @@ pub struct Speech {
 }
 
 impl Speech {
+    /// The radio's beep at `volume`, telling the pilot the microphone is open.
+    pub fn talk_beep(volume: f32) -> Self {
+        const SAMPLE_RATE: u32 = 48000;
+        let mut samples = Radio::default().beep(SAMPLE_RATE as f32);
+        for sample in &mut samples {
+            *sample = (*sample * volume).clamp(-1.0, 1.0);
+        }
+        return Self {
+            samples,
+            sample_rate: SAMPLE_RATE,
+        };
+    }
+
     #[inline]
     pub fn spec(&self) -> AudioSpec {
         AudioSpec {

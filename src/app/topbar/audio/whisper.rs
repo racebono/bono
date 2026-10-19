@@ -230,6 +230,12 @@ impl Whisper {
         };
     }
 
+    /// The microphone is open, from the talk button's press until its release.
+    #[inline]
+    pub fn recording(&self) -> bool {
+        self.stream.is_some()
+    }
+
     fn begin(
         &mut self,
         rt: &Handle,

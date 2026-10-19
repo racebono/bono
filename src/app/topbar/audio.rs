@@ -44,6 +44,9 @@ pub struct AudioTopbar {
     pub test: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Speech>>>,
     /// The test speech's stream, kept until it's done playing (dropping it stops playback)
     test_playback: Option<AudioStreamOwner>,
+    /// The beep when the talk button is pressed, kept until the next one (dropping it stops
+    /// playback)
+    beep_playback: Option<AudioStreamOwner>,
     /// What the pilot last said on the radio, being transcribed
     transcription: Option<Task<anyhow::Result<Option<(String, ArrayStr<2>)>>>>,
 }
@@ -62,6 +65,7 @@ impl AudioTopbar {
             voices: Voices::new(pref_path, client.clone()),
             test: None,
             test_playback: None,
+            beep_playback: None,
             transcription: None,
         }
     }
@@ -153,7 +157,13 @@ impl AudioTopbar {
 
     pub fn event(&mut self, rt: &Handle, config: &Config, event: &Event) -> bool {
         if let Some(device) = self.microphone.get() {
-            match self.whisper.event(rt, &event, config, device) {
+            let was_recording = self.whisper.recording();
+            let result = self.whisper.event(rt, &event, config, device);
+            if !was_recording && self.whisper.recording() {
+                self.beep(config);
+            }
+
+            match result {
                 // Picked up by `transcription`. One still being transcribed is dropped: the
                 // pilot already said something newer
                 Ok(handle) => self.transcription = Some(handle.into()),
@@ -162,6 +172,25 @@ impl AudioTopbar {
         }
 
         return false;
+    }
+
+    /// Tells the pilot the microphone is open.
+    fn beep(&mut self, config: &Config) {
+        let volume = {
+            let config = config.get();
+            config.master_volume() * config.beep_volume()
+        };
+        if volume <= 0.0 {
+            return;
+        }
+
+        let Some(device) = self.speaker.get() else {
+            return;
+        };
+        match Speech::talk_beep(volume).play(device) {
+            Ok(stream) => self.beep_playback = Some(stream),
+            Err(e) => log::warn!("Error playing the talk beep: {e}"),
+        }
     }
 }
 

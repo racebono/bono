@@ -191,9 +191,9 @@
         "ca": "Xiulet de ràdio"
     },
     "volume.beep_hover": {
-        "en": "The roger beep that ends each transmission, from the next one on",
-        "es": "El pitido que cierra cada transmisión, a partir de la siguiente",
-        "ca": "El xiulet que tanca cada transmissió, a partir de la següent"
+        "en": "The beep when you start talking, and the roger beep that ends each transmission (from the next one on)",
+        "es": "El pitido al empezar a hablar, y el que cierra cada transmisión (a partir de la siguiente)",
+        "ca": "El xiulet en començar a parlar, i el que tanca cada transmissió (a partir de la següent)"
     },
     "volume.radio_effect": {
         "en": "Radio effect",
