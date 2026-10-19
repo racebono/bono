@@ -3,11 +3,11 @@ use crate::{
         Subsystems,
         topbar::{
             audio::AudioTopbar, provider::ProviderTopbar, settings::SettingsTopbar,
-            spotter::SpotterTopbar, volume::VolumeTopbar,
+            simulators::SimulatorsTopbar, spotter::SpotterTopbar, volume::VolumeTopbar,
         },
     },
     config::{Config, RawConfig, Setting},
-    sim::Sim,
+    sim::{ActiveSimulator, Sim},
     synthesizer::Synthesizer,
 };
 use camino::Utf8Path;
@@ -23,6 +23,7 @@ use tokio::runtime::Handle;
 mod audio;
 mod provider;
 mod settings;
+mod simulators;
 mod spotter;
 mod volume;
 
@@ -32,6 +33,7 @@ pub struct Topbar {
     volume: VolumeTopbar,
     provider: ProviderTopbar,
     spotter: SpotterTopbar,
+    simulators: SimulatorsTopbar,
     /// "Clear data" was clicked: asking before clearing
     confirm_clear: bool,
 }
@@ -48,6 +50,7 @@ impl Topbar {
             volume: VolumeTopbar,
             provider: ProviderTopbar::new(client),
             spotter: SpotterTopbar,
+            simulators: SimulatorsTopbar::default(),
             confirm_clear: false,
             audio: AudioTopbar::new(pref_path, ss, config, client),
         }
@@ -67,7 +70,7 @@ impl Topbar {
         ui: &mut egui::Ui,
         config: &mut Config,
         synth: &mut Synthesizer,
-        simulator: Option<&mut Sim>,
+        simulators: &mut ActiveSimulator,
     ) {
         egui::Panel::top("tobpar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -104,6 +107,16 @@ impl Topbar {
                     )
                     .ui(ui, |ui| self.spotter.update(ui, config));
 
+                let (_, sims) = MenuButton::new(t!("simulators"))
+                    .config(
+                        MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
+                    )
+                    .ui(ui, |ui| self.simulators.update(ui, simulators));
+                if sims.is_none() {
+                    self.simulators.closed();
+                }
+
+                let simulator = simulators.current();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let clear = ui
                         .add_enabled(
@@ -118,16 +131,14 @@ impl Topbar {
                     }
 
                     ui.label(
-                        simulator
-                            .as_deref()
-                            .map_or(t!("topbar.no_simulator"), |simulator| simulator.name()),
+                        simulator.map_or(t!("topbar.no_simulator"), |simulator| simulator.name()),
                     );
                 });
             });
         });
 
         if self.confirm_clear {
-            match simulator {
+            match simulators.current_mut() {
                 Some(simulator) => self.confirm_clear = confirm_clear(ui.ctx(), simulator),
                 // It stopped meanwhile: nothing to clear
                 None => self.confirm_clear = false,

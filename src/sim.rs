@@ -1,9 +1,15 @@
-use crate::{sqlite::pool::Pool, steam::AppWatcher, track::TrackData};
+use crate::{
+    sqlite::pool::Pool,
+    steam::{self, AppWatcher},
+    track::TrackData,
+};
 use futures::future::select_all;
 use serde::{Deserialize, Serialize};
 use std::{
+    fmt,
     num::NonZeroU32,
     ops::{Deref, DerefMut},
+    path::PathBuf,
     sync::Arc,
 };
 use tokio::sync::{Mutex, watch};
@@ -15,6 +21,7 @@ mod rrre;
 
 pub struct Sim<T: ?Sized = dyn Simulator> {
     name: &'static str,
+    app_id: u32,
     /// Whether Steam reports the game running
     running: watch::Receiver<bool>,
     /// Shared with the task that keeps the session's track description up to date
@@ -44,6 +51,7 @@ impl<T> Sim<T> {
 
         Self {
             name: T::NAME,
+            app_id: T::APP_ID,
             running,
             track_data: Arc::new(Mutex::new(TrackData::new(T::TRACK_DATA_ID))),
             _watcher: watcher,
@@ -59,6 +67,13 @@ where
     #[inline]
     pub fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// The folder Steam installed the game in, if it's installed. Looks through Steam's libraries
+    /// on every call.
+    #[inline]
+    pub fn install_dir(&self) -> Option<PathBuf> {
+        steam::app_install_dir(self.app_id)
     }
 
     /// Whether Steam reports the game running now.
@@ -130,6 +145,44 @@ pub trait Simulator: Send {
     fn database(&mut self, running: bool) -> Option<&Pool>;
     fn apply(&mut self, settings: &SimulatorSettings);
     fn clear(&mut self);
+
+    /// The plugin the game needs installed to be recorded, for games that need one: `None` for
+    /// the others.
+    fn plugin(&mut self) -> Option<PluginStatus> {
+        None
+    }
+
+    /// Installs (or updates) the game's plugin, the copy that comes with the app, and enables it.
+    fn install_plugin(&mut self) -> anyhow::Result<()> {
+        anyhow::bail!("This game has no plugin")
+    }
+}
+
+/// What a game's plugin looks like on this computer.
+#[derive(Debug, Clone, Default)]
+pub struct PluginStatus {
+    /// The copy in the game's folder: `None` if there isn't one, `Some(None)` if it doesn't say its
+    /// version (it's older than the versioned ones)
+    pub installed: Option<Option<Version>>,
+    /// Whether the game loads it (its plugin settings may disable it)
+    pub enabled: bool,
+    /// The copy that comes with the app, which `install_plugin` installs: `None` if it's missing,
+    /// `Some(None)` if it doesn't say its version
+    pub bundled: Option<Option<Version>>,
+}
+
+/// A plugin's version, as its file says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Version {
+    pub major: u16,
+    pub minor: u16,
+    pub patch: u16,
+}
+
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -248,6 +301,7 @@ pub(crate) fn recording(pool: Pool) -> Box<Sim> {
     let (send, running) = watch::channel(true);
     Box::new(Sim {
         name: "Test",
+        app_id: 0,
         running,
         track_data: Arc::new(Mutex::new(TrackData::new("test".into()))),
         _watcher: Err(send),
@@ -276,6 +330,7 @@ mod tests {
         let (send, running) = watch::channel(running);
         let sim = Box::new(Sim {
             name,
+            app_id: 0,
             running,
             track_data: Arc::new(Mutex::new(TrackData::new(name.into()))),
             // Not the test's sender, so the test can close the channel

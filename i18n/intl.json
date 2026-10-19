@@ -85,6 +85,106 @@
         "es": "Ningún simulador en marcha",
         "ca": "Cap simulador en marxa"
     },
+    "simulators": {
+        "en": "Simulators",
+        "es": "Simuladores",
+        "ca": "Simuladors"
+    },
+    "simulators.running": {
+        "en": "Running",
+        "es": "En marcha",
+        "ca": "En marxa"
+    },
+    "simulators.installed": {
+        "en": "Installed",
+        "es": "Instalado",
+        "ca": "Instal·lat"
+    },
+    "simulators.not_installed": {
+        "en": "Not installed",
+        "es": "No instalado",
+        "ca": "No instal·lat"
+    },
+    "simulators.install_dir_hover": {
+        "en": "Installed in {path}",
+        "es": "Instalado en {path}",
+        "ca": "Instal·lat a {path}"
+    },
+    "simulators.not_installed_hover": {
+        "en": "Steam doesn't have it installed in any of its libraries",
+        "es": "Steam no lo tiene instalado en ninguna de sus bibliotecas",
+        "ca": "Steam no el té instal·lat a cap de les seves biblioteques"
+    },
+    "plugin.not_installed": {
+        "en": "Plugin not installed: nothing is recorded",
+        "es": "Plugin no instalado: no se graba nada",
+        "ca": "Plugin no instal·lat: no es grava res"
+    },
+    "plugin.up_to_date": {
+        "en": "Plugin {version} (up to date)",
+        "es": "Plugin {version} (actualizado)",
+        "ca": "Plugin {version} (actualitzat)"
+    },
+    "plugin.outdated": {
+        "en": "Plugin {version} (version {latest} available)",
+        "es": "Plugin {version} (versión {latest} disponible)",
+        "ca": "Plugin {version} (versió {latest} disponible)"
+    },
+    "plugin.installed": {
+        "en": "Plugin {version}",
+        "es": "Plugin {version}",
+        "ca": "Plugin {version}"
+    },
+    "plugin.unknown_version": {
+        "en": "Plugin installed (unknown version)",
+        "es": "Plugin instalado (versión desconocida)",
+        "ca": "Plugin instal·lat (versió desconeguda)"
+    },
+    "plugin.disabled": {
+        "en": "Disabled in the game's plugin settings",
+        "es": "Desactivado en los ajustes de plugins del juego",
+        "ca": "Desactivat a la configuració de plugins del joc"
+    },
+    "plugin.install": {
+        "en": "Install plugin",
+        "es": "Instalar plugin",
+        "ca": "Instal·la el plugin"
+    },
+    "plugin.update": {
+        "en": "Update plugin",
+        "es": "Actualizar plugin",
+        "ca": "Actualitza el plugin"
+    },
+    "plugin.reinstall": {
+        "en": "Reinstall plugin",
+        "es": "Reinstalar plugin",
+        "ca": "Reinstal·la el plugin"
+    },
+    "plugin.install_hover": {
+        "en": "Copies the plugin into the game's Plugins folder and enables it. It's loaded the next time the game starts",
+        "es": "Copia el plugin a la carpeta Plugins del juego y lo activa. Se carga la próxima vez que se inicie el juego",
+        "ca": "Copia el plugin a la carpeta Plugins del joc i l'activa. Es carrega el pròxim cop que s'iniciï el joc"
+    },
+    "plugin.running_hover": {
+        "en": "Close the game first: it keeps the plugin in use while it runs",
+        "es": "Cierra el juego primero: mantiene el plugin en uso mientras está en marcha",
+        "ca": "Tanca el joc primer: manté el plugin en ús mentre és en marxa"
+    },
+    "plugin.missing_hover": {
+        "en": "The plugin isn't next to lambiase (plugins\\lambiase_lmu.dll)",
+        "es": "El plugin no está junto a lambiase (plugins\\lambiase_lmu.dll)",
+        "ca": "El plugin no és al costat de lambiase (plugins\\lambiase_lmu.dll)"
+    },
+    "plugin.install_done": {
+        "en": "Plugin installed. It's loaded the next time the game starts",
+        "es": "Plugin instalado. Se carga la próxima vez que se inicie el juego",
+        "ca": "Plugin instal·lat. Es carrega el pròxim cop que s'iniciï el joc"
+    },
+    "plugin.install_failed": {
+        "en": "Couldn't install the plugin: {error}",
+        "es": "No se ha podido instalar el plugin: {error}",
+        "ca": "No s'ha pogut instal·lar el plugin: {error}"
+    },
     "clear.title": {
         "en": "Clear recorded data?",
         "es": "¿Borrar los datos grabados?",

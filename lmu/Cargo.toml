@@ -19,3 +19,4 @@ ureq = { version = "3", default-features = false }
 
 [build-dependencies]
 cc = "1.2"
+embed-resource = "3.0.12"

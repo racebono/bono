@@ -3,7 +3,7 @@ use crate::{
     button::{Button, ButtonWatcher, Joysticks},
     config::{Config, RawConfig},
     engineer::Engineer,
-    sim::{ActiveSimulator, Sim, SimulatorSettings},
+    sim::{ActiveSimulator, SimulatorSettings},
     spotter::Spotter,
     synthesizer::Synthesizer,
     track::TrackSync,
@@ -248,14 +248,13 @@ impl AppState {
             self.gui.topbar.audio.speaker.get(),
             &mut self.engineer,
         );
-        let simulator = self.simulators.current_mut();
         let typed = self.gui.update(
             rt,
             &self.subsystems,
             ui,
             &mut self.config,
             &mut self.synth,
-            simulator,
+            &mut self.simulators,
             &self.engineer,
         );
 
@@ -363,10 +362,10 @@ impl Gui {
         ui: &mut egui::Ui,
         config: &mut Config,
         synth: &mut Synthesizer,
-        simulator: Option<&mut Sim>,
+        simulators: &mut ActiveSimulator,
         engineer: &Engineer,
     ) -> Option<String> {
-        self.topbar.update(rt, ss, ui, config, synth, simulator);
+        self.topbar.update(rt, ss, ui, config, synth, simulators);
         self.chat.update(ui, engineer)
     }
 

@@ -6,7 +6,7 @@
 //! the game running, and the plugin replaces it the next time the pilot drives.
 
 use crate::{
-    sim::{Simulator, SimulatorInfo, SimulatorSettings},
+    sim::{PluginStatus, Simulator, SimulatorInfo, SimulatorSettings},
     sqlite::{Database, pool::Pool},
     steam::{self},
 };
@@ -18,6 +18,8 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+
+mod plugin;
 
 const STEAM_APP_ID: u32 = 2399420;
 /// The plugin's folder, in the game's UserData folder.
@@ -46,12 +48,17 @@ impl LeMansUltimate {
         }
     }
 
-    /// `UserData\lambiase`, if the game is installed.
-    fn folder(&mut self) -> Option<PathBuf> {
+    /// The game's folder, if it's installed.
+    fn install_dir(&mut self) -> Option<&Path> {
         if self.install_dir.is_none() {
             self.install_dir = steam::app_install_dir(STEAM_APP_ID);
         }
-        Some(self.install_dir.as_ref()?.join("UserData").join(FOLDER))
+        self.install_dir.as_deref()
+    }
+
+    /// `UserData\lambiase`, if the game is installed.
+    fn folder(&mut self) -> Option<PathBuf> {
+        Some(self.install_dir()?.join("UserData").join(FOLDER))
     }
 
     /// Changes settings.json, keeping what else is in it (the plugin acts on any value that
@@ -130,6 +137,25 @@ impl Simulator for LeMansUltimate {
             log::error!("Error asking Le Mans Ultimate to clear its data: {e}");
         }
     }
+
+    fn plugin(&mut self) -> Option<PluginStatus> {
+        Some(plugin::status(self.install_dir()))
+    }
+
+    fn install_plugin(&mut self) -> anyhow::Result<()> {
+        if steam::is_app_running(STEAM_APP_ID) {
+            anyhow::bail!("Le Mans Ultimate is running: close it first");
+        }
+        let Some(install_dir) = self.install_dir() else {
+            anyhow::bail!("Le Mans Ultimate isn't installed");
+        };
+        plugin::install(install_dir)?;
+        log::info!(
+            "Installed the Le Mans Ultimate plugin in {}",
+            install_dir.display()
+        );
+        Ok(())
+    }
 }
 
 /// Deletes the database in `dir` once nothing has it open: the pool's connections close as the ones
@@ -168,9 +194,11 @@ async fn remove_when_closed(dir: PathBuf, pool: Pool) {
 }
 
 /// Writes a temporary file and moves it over `path`, so the plugin never reads half a file: a
-/// half-read "clear" count would look like a new request.
+/// half-read "clear" count would look like a new request. The game neither (half a DLL).
 fn write_replacing(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let temp = path.with_extension("json.tmp");
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
     std::fs::write(&temp, contents)?;
     std::fs::rename(&temp, path)
 }

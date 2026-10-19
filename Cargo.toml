@@ -82,6 +82,7 @@ egui-phosphor = { version = "0.14.0", default-features = false, features = [
 winreg = "0.56.0"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_Threading",
