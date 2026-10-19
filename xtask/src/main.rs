@@ -24,8 +24,8 @@ async fn dist() -> anyhow::Result<()> {
     let root = project_root();
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
 
-    // 1. Build the game in release, and on Windows the Le Mans Ultimate plugin
-    let mut packages = vec!["--package", "lambiase"];
+    // 1. Build the game and its phonemizer in release, and on Windows the Le Mans Ultimate plugin
+    let mut packages = vec!["--package", "lambiase", "--package", "lambiase-phonemizer"];
     if cfg!(windows) {
         packages.extend(["--package", "lambiase-lmu"]);
     }
@@ -53,11 +53,18 @@ async fn dist() -> anyhow::Result<()> {
     // 4. Copy assets
     copy_dir(root.join("assets"), dist.join("assets")).await?;
 
-    // 5. Copy espeak-ng's compiled data, which the synthesizer loads from next to the binary
+    // 5. The phonemizer, in its own folder: it's GPL (it links espeak-ng), so it's shipped as a
+    // separate program with its license, next to the espeak-ng data it loads
+    let phonemizer = dist.join("phonemizer");
+    tokio::fs::create_dir_all(&phonemizer).await?;
+    let exe = format!("lambiase-phonemizer{}", env::consts::EXE_SUFFIX);
+    tokio::fs::copy(root.join("target/release").join(&exe), phonemizer.join(&exe)).await?;
+    tokio::fs::copy(root.join("phonemizer/COPYING"), phonemizer.join("COPYING")).await?;
+
     let Some(espeak_data) = newest_espeak_data(&root.join("target/release/build")).await? else {
         bail!("espeak-ng-data not found in espeak-rs-sys's build output");
     };
-    copy_dir(espeak_data, dist.join("espeak-ng-data")).await?;
+    copy_dir(espeak_data, phonemizer.join("espeak-ng-data")).await?;
 
     // 6. The LMU plugin, which goes in the game's Plugins folder
     if cfg!(windows) {

@@ -1,7 +1,7 @@
 //! Text to speech with [Piper](https://github.com/rhasspy/piper) voices.
 //!
 //! A voice is an `.onnx` model plus its `.onnx.json` config, and synthesis goes:
-//! 1. text → IPA phonemes, with espeak-ng
+//! 1. text → IPA phonemes, with espeak-ng in a separate program (see [`phonemizer`])
 //! 2. phonemes → IDs, with the config's `phoneme_id_map`
 //! 3. IDs → PCM, by running the model with ONNX Runtime
 //!
@@ -10,28 +10,22 @@
 use crate::{
     config::{ArrayStr, RawConfig},
     error,
-    synthesizer::radio::{Radio, RadioStream},
+    synthesizer::{
+        phonemizer::phonemize,
+        radio::{Radio, RadioStream},
+    },
 };
 use anyhow::{Context, bail};
 use camino::{Utf8Path, Utf8PathBuf};
-use espeak_rs_sys::{
-    espeak_AUDIO_OUTPUT_AUDIO_OUTPUT_SYNCHRONOUS, espeak_ERROR_EE_OK, espeak_Initialize,
-    espeak_SetVoiceByName, espeak_TextToPhonemes, espeakCHARS_UTF8, espeakINITIALIZE_DONT_EXIT,
-    espeakPHONEMES_IPA,
-};
 use lambiase_i18n::t;
 use ort::{session::Session, value::Tensor};
 use sdl3::audio::{AudioFormat, AudioSpec, AudioStreamOwner};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    ffi::{CStr, CString, c_int, c_void},
     mem::ManuallyDrop,
     num::NonZeroUsize,
-    path::{Path, PathBuf},
-    sync::{Mutex, PoisonError},
     task::Poll,
-    time::SystemTime,
 };
 use tokio::{
     runtime::Handle,
@@ -45,6 +39,7 @@ use tokio::{
 };
 use unicode_normalization::UnicodeNormalization;
 
+mod phonemizer;
 mod radio;
 
 const PAD: char = '_';
@@ -466,7 +461,7 @@ pub struct Effects {
 pub struct Voice {
     session: Session,
     sample_rate: u32,
-    espeak_voice: CString,
+    espeak_voice: String,
     phoneme_ids: BTreeMap<char, Vec<i64>>,
     scales: [f32; 3],
     /// Multi-speaker models take a speaker ID; we always use the first speaker
@@ -510,6 +505,9 @@ impl Voice {
             }
         }
 
+        // Starts the phonemizer, if it isn't yet, and checks it knows the voice
+        phonemize("", &config.espeak.voice)?;
+
         let session = (|| {
             Session::builder()?
                 .with_intra_threads(threads.get())?
@@ -526,7 +524,7 @@ impl Voice {
         return Ok(Self {
             session,
             sample_rate: config.audio.sample_rate,
-            espeak_voice: CString::new(config.espeak.voice)?,
+            espeak_voice: config.espeak.voice,
             phoneme_ids,
             scales: [
                 inference.noise_scale,
@@ -805,208 +803,9 @@ const fn default_noise_w() -> f32 {
     0.8
 }
 
-/// espeak-ng keeps global state (current voice, clause decoder), so every call into it holds
-/// this lock. The flag tracks whether it has been initialized.
-static ESPEAK: Mutex<bool> = Mutex::new(false);
-
-/// Converts `text` to IPA phonemes, one string per sentence.
-fn phonemize(text: &str, voice: &CStr) -> anyhow::Result<Vec<String>> {
-    let mut initialized = ESPEAK.lock().unwrap_or_else(PoisonError::into_inner);
-    if !*initialized {
-        init_espeak()?;
-        *initialized = true;
-    }
-
-    if unsafe { espeak_SetVoiceByName(voice.as_ptr()) } != espeak_ERROR_EE_OK {
-        bail!("Unknown espeak-ng voice '{}'", voice.to_string_lossy());
-    }
-
-    let c_text = CString::new(text).context("Text contains a null byte")?;
-    let base = c_text.as_ptr().cast::<c_void>();
-    let mut ptr = base;
-
-    let mut sentences = Vec::new();
-    let mut sentence = String::new();
-
-    // espeak translates one clause per call, advancing `ptr` past it (null once done)
-    while !ptr.is_null() {
-        let start = unsafe { ptr.byte_offset_from_unsigned(base) };
-        let phonemes = unsafe {
-            espeak_TextToPhonemes(
-                &mut ptr,
-                espeakCHARS_UTF8 as c_int,
-                espeakPHONEMES_IPA as c_int,
-            )
-        };
-
-        if phonemes.is_null() {
-            bail!("espeak-ng failed to translate text");
-        }
-
-        let end = match ptr.is_null() {
-            true => text.len(),
-            false => unsafe { ptr.byte_offset_from_unsigned(base) },
-        };
-        if end <= start {
-            bail!("espeak-ng stopped advancing through the text");
-        }
-
-        push_without_lang_switches(&mut sentence, unsafe { CStr::from_ptr(phonemes) });
-
-        // Unlike piper-phonemize's patched espeak-ng, upstream doesn't report the clause's
-        // punctuation, but the voices are trained with it, so recover it from the source text.
-        // Before the end of the text, espeak has read one character of the next clause ahead
-        // (e.g. "Hello, w"), which it carries over to the next call.
-        let mut clause = text.get(start..end).unwrap_or_default();
-        if !ptr.is_null() {
-            let mut chars = clause.chars();
-            chars.next_back();
-            clause = chars.as_str();
-        }
-
-        match clause_terminator(clause) {
-            Some(c @ ('.' | '?' | '!')) => {
-                sentence.push(c);
-                sentences.push(std::mem::take(&mut sentence));
-            }
-            Some(c) => {
-                sentence.push(c);
-                sentence.push(' ');
-            }
-            None if !sentence.is_empty() && !sentence.ends_with(' ') => sentence.push(' '),
-            None => {}
-        }
-    }
-
-    if !sentence.trim().is_empty() {
-        sentences.push(sentence);
-    }
-
-    return Ok(sentences);
-}
-
-/// The punctuation that ends a clause, normalized to ASCII.
-fn clause_terminator(clause: &str) -> Option<char> {
-    let clause = clause.trim_end_matches(|c: char| {
-        c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ']' | '}' | '”' | '’' | '»')
-    });
-
-    return match clause.chars().next_back()? {
-        c @ ('.' | '?' | '!' | ',' | ':' | ';') => Some(c),
-        '。' | '．' | '…' => Some('.'),
-        '？' => Some('?'),
-        '！' => Some('!'),
-        '，' | '、' => Some(','),
-        '：' => Some(':'),
-        '；' => Some(';'),
-        _ => None,
-    };
-}
-
-/// Appends espeak's phonemes, dropping the `(en)`-style markers it adds when it switches
-/// language mid-clause.
-fn push_without_lang_switches(dest: &mut String, phonemes: &CStr) {
-    let mut depth = 0usize;
-    for c in phonemes.to_string_lossy().chars() {
-        match c {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => dest.push(c),
-            _ => {}
-        }
-    }
-}
-
-fn init_espeak() -> anyhow::Result<()> {
-    let data = espeak_data_dir().context(
-        "Couldn't find espeak-ng's data ('espeak-ng-data' next to the executable or in the build \
-         directory)",
-    )?;
-
-    let data = data
-        .to_str()
-        .context("espeak-ng's data path isn't valid UTF-8")?;
-    let data = CString::new(data)?;
-
-    let sample_rate = unsafe {
-        espeak_Initialize(
-            espeak_AUDIO_OUTPUT_AUDIO_OUTPUT_SYNCHRONOUS,
-            0,
-            data.as_ptr(),
-            espeakINITIALIZE_DONT_EXIT as c_int,
-        )
-    };
-
-    if sample_rate <= 0 {
-        bail!("Error initializing espeak-ng (code {sample_rate})");
-    }
-    return Ok(());
-}
-
-/// The directory *containing* `espeak-ng-data`, which is what espeak-ng expects.
-///
-/// Distributions ship it next to the executable. During development it's only in
-/// espeak-rs-sys's build output, next to the executable (or its parent for test binaries).
-fn espeak_data_dir() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let exe_dir = exe.parent()?;
-
-    if exe_dir.join("espeak-ng-data").is_dir() {
-        return Some(exe_dir.to_path_buf());
-    }
-
-    return exe_dir.ancestors().take(2).find_map(newest_built_data);
-}
-
-/// The most recently built `espeak-rs-sys-*/out/share` under `{dir}/build`.
-fn newest_built_data(dir: &Path) -> Option<PathBuf> {
-    let mut newest = None::<(SystemTime, PathBuf)>;
-
-    for entry in std::fs::read_dir(dir.join("build")).ok()?.flatten() {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("espeak-rs-sys-")
-        {
-            continue;
-        }
-
-        let share = entry.path().join("out").join("share");
-        let Ok(modified) = share
-            .join("espeak-ng-data")
-            .join("phondata")
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-        else {
-            continue;
-        };
-
-        if newest.as_ref().is_none_or(|(time, _)| modified > *time) {
-            newest = Some((modified, share));
-        }
-    }
-
-    return newest.map(|(_, share)| share);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn phonemizes_sentences() {
-        let sentences = phonemize(
-            "Hello, world. It costs 3.5 dollars; really! Does it?",
-            c"en-us",
-        )
-        .unwrap();
-
-        println!("{sentences:#?}");
-        assert_eq!(sentences.len(), 3);
-        assert!(sentences[0].contains(", ") && sentences[0].ends_with('.'));
-        assert!(sentences[1].contains("; ") && sentences[1].ends_with('!'));
-        assert!(sentences[2].ends_with('?'));
-    }
 
     #[test]
     fn says_sentences_once_theyre_complete() {

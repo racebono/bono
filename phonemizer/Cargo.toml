@@ -1,0 +1,13 @@
+[package]
+name = "lambiase-phonemizer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+# It links espeak-ng, so it's GPL like it. Lambiase only talks to it through its stdin and stdout
+license = "GPL-3.0-or-later"
+
+[dependencies]
+anyhow = "1.0.104"
+espeak-rs-sys = { version = "0.2.0", features = ["compile-espeak-intonations"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"

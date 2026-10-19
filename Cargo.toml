@@ -37,7 +37,6 @@ oneshot = { version = "0.2.1", features = ["std"] }
 reqwest = { version = "0.13.5", features = ["json"] }
 tempfile = "3.27.0"
 egui_extras = "0.36.2"
-espeak-rs-sys = { version = "0.2.0", features = ["compile-espeak-intonations"] }
 ort = "=2.0.0-rc.13"
 unicode-normalization = "0.1.25"
 wide = "1.7.1"
@@ -153,13 +152,13 @@ all-languages = [
 ]
 
 [workspace]
-members = ["xtask", "sim", "lmu", "i18n"]
+members = ["xtask", "sim", "lmu", "i18n", "phonemizer"]
+
+[build-dependencies]
+bindgen = "0.73.2"
+ureq = "3.4.2"
 
 # espeak-rs-sys links the debug CRT (`msvcrtd`) when its build script has debug assertions,
 # which clashes with the release CRT (`msvcrt`) Rust and the other native dependencies link
 [profile.dev.package.espeak-rs-sys]
 debug-assertions = false
-
-[build-dependencies]
-bindgen = "0.73.2"
-ureq = "3.4.2"

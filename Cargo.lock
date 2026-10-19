@@ -1863,7 +1863,6 @@ dependencies = [
  "egui-phosphor",
  "egui-sdl3",
  "egui_extras",
- "espeak-rs-sys",
  "futures",
  "hf-hub",
  "httpdate",
@@ -1920,6 +1919,16 @@ dependencies = [
  "lambiase-sim",
  "serde_json",
  "ureq",
+]
+
+[[package]]
+name = "lambiase-phonemizer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "espeak-rs-sys",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3652,7 +3661,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4480,9 +4489,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
@@ -5359,15 +5368,6 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
-dependencies = [
- "windows-targets",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets",
 ]
