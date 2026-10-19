@@ -5,6 +5,10 @@ include = [
 [alias]
 xtask = "run --package xtask --"
 
+[target.x86_64-pc-windows-msvc]
+# Match the distribution's Whisper/ggml CPU baseline without tuning for the build host.
+rustflags = ["-C", "target-feature=+sse4.2,+avx,+avx2,+bmi2,+fma,+f16c"]
+
 [env]
 # Build CMake dependencies (whisper.cpp, SDL) with Ninja instead of MSBuild on Windows.
 # whisper.cpp's Vulkan backend breaks under MSBuild: its nested `vulkan-shaders-gen` project
