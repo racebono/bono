@@ -18,7 +18,7 @@ concurrency:
 jobs:
   changes:
     name: Select revision
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       ref: ${{ steps.revision.outputs.ref }}
     steps:
@@ -39,7 +39,7 @@ jobs:
   build:
     name: Build Windows x86-64
     needs: changes
-    runs-on: windows-2022
+    runs-on: blacksmith-4vcpu-windows-2025
     timeout-minutes: 180
     permissions:
       contents: write # Publish nightly releases and attach release ZIPs.
