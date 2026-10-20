@@ -100,6 +100,30 @@ impl App {
             .build()?;
         let tracks = TrackSync::new(client.clone(), pref_path.as_std_path());
 
+        // Account initialization never changes the UI or prevents offline use. Packaging can
+        // bake in the website origin; developers can override it for a local API.
+        let account_origin = std::env::var("BONO_ACCOUNT_ORIGIN")
+            .ok()
+            .or_else(|| option_env!("BONO_ACCOUNT_ORIGIN").map(str::to_owned));
+        let account = match account_origin {
+            Some(origin) => match bono_account::Account::new(&origin).await {
+                Ok(account) => {
+                    let restore = account.clone();
+                    rt.spawn(async move {
+                        if let Err(error) = restore.resume().await {
+                            log::warn!("Account restoration: {error}");
+                        }
+                    });
+                    Some(account)
+                }
+                Err(error) => {
+                    log::warn!("Account initialization: {error}");
+                    None
+                }
+            },
+            None => None,
+        };
+
         let guard = config.get();
         let gui = Gui::new(&pref_path, &subsystems, &guard, &client);
         let synth = Synthesizer::new(rt, &guard);
@@ -119,6 +143,7 @@ impl App {
                 simulators: ActiveSimulator::default(),
                 applied_opponent_frequency: None,
                 tracks,
+                account,
                 engineer,
                 spotter: Spotter::new(),
             },
@@ -201,6 +226,7 @@ impl DerefMut for App {
 }
 
 pub struct AppState {
+    account: Option<bono_account::Account>,
     gui: Gui,
     config: Config,
     subsystems: Subsystems,
@@ -219,6 +245,11 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Account operations are ready for a future UI; run login/logout in a background task.
+    pub fn account(&self) -> Option<&bono_account::Account> {
+        self.account.as_ref()
+    }
+
     fn update(&mut self, rt: &Handle, ui: &mut egui::Ui) {
         self.update_simulators();
         self.tracks.update(rt, self.simulators.current_mut());
