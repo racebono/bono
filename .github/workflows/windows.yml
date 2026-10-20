@@ -1,179 +1,184 @@
 name: Windows x86-64
 
 on:
-  schedule:
-    # Daily at midnight UTC.
-    - cron: '0 0 * * *'
-  release:
-    types: [published]
-  workflow_dispatch:
+    schedule:
+        # Daily at midnight UTC.
+        - cron: "0 0 * * *"
+    release:
+        types: [published]
+    workflow_dispatch:
 
 permissions:
-  contents: read
+    contents: read
 
 concurrency:
-  group: windows-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: false
+    group: windows-${{ github.event_name }}-${{ github.ref }}
+    cancel-in-progress: false
 
 jobs:
-  changes:
-    name: Select revision
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    outputs:
-      ref: ${{ steps.revision.outputs.ref }}
-    steps:
-      - uses: actions/github-script@v8
-        id: revision
-        with:
-          script: |
-            if (context.eventName === 'release') {
-              core.setOutput('ref', `refs/tags/${context.payload.release.tag_name}`);
-              return;
-            }
+    changes:
+        name: Select revision
+        runs-on: ubuntu-slim
+        outputs:
+            ref: ${{ steps.revision.outputs.ref }}
+        steps:
+            - uses: actions/github-script@v8
+              id: revision
+              with:
+                  script: |
+                      if (context.eventName === 'release') {
+                        core.setOutput('ref', `refs/tags/${context.payload.release.tag_name}`);
+                        return;
+                      }
 
-            const { data: commit } = await github.rest.repos.getCommit({
-              ...context.repo, ref: context.payload.repository.default_branch,
-            });
-            core.setOutput('ref', commit.sha);
+                      const { data: commit } = await github.rest.repos.getCommit({
+                        ...context.repo, ref: context.payload.repository.default_branch,
+                      });
+                      core.setOutput('ref', commit.sha);
 
-  build:
-    name: Build Windows x86-64
-    needs: changes
-    runs-on: blacksmith-4vcpu-windows-2025
-    timeout-minutes: 180
-    permissions:
-      contents: write # Publish nightly releases and attach release ZIPs.
-    defaults:
-      run:
-        shell: pwsh
-    env:
-      CARGO_TERM_COLOR: always
-      # Distribution builds must also run on CPUs other than the runner's CPU.
-      GGML_NATIVE: 'OFF'
-      # whisper-rs otherwise passes the Unix-only -fPIC flag to MSVC via nvcc.
-      CMAKE_CUDA_FLAGS: ''
-      CMAKE_BUILD_PARALLEL_LEVEL: '2'
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.changes.outputs.ref }}
-          persist-credentials: false
-
-      - name: Set up LMU plugin SDK
+    build:
+        name: Build Windows x86-64
+        needs: changes
+        runs-on: windows-latest
+        timeout-minutes: 180
+        permissions:
+            contents: write # Publish nightly releases and attach release ZIPs.
+        defaults:
+            run:
+                shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.LMU_SDK_READ_TOKEN }}
-          SDK_REPO: Aandreba/lmu-sdk
-          # LMU 1.4.2.0, Steam build 25661166. Update tag and hash together.
-          SDK_TAG: sdk-2026-10-19
-          SDK_SHA256: 0aa1335d961993a7c0f1344492b6db82bc78117ef63a772633e269c076a5f1ba
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
-            throw 'LMU_SDK_READ_TOKEN is not configured'
-          }
+            CARGO_TERM_COLOR: always
+            # Distribution builds must also run on CPUs other than the runner's CPU.
+            GGML_NATIVE: "OFF"
+            # whisper-rs otherwise passes the Unix-only -fPIC flag to MSVC via nvcc.
+            CMAKE_CUDA_FLAGS: ""
+            # Native code for RTX 30/40 (sm_86 also runs on 8.9) and RTX 50; Turing and newer
+            # GPUs JIT-compile the compute_75 PTX on first launch. Fewer targets, faster builds.
+            CMAKE_CUDA_ARCHITECTURES: "75-virtual;86-real;120-real"
+            CMAKE_BUILD_PARALLEL_LEVEL: "2"
+        steps:
+            - uses: actions/checkout@v6
+              with:
+                  ref: ${{ needs.changes.outputs.ref }}
+                  persist-credentials: false
 
-          $download = Join-Path $env:RUNNER_TEMP 'lmu-sdk-download'
-          $root = Join-Path $env:RUNNER_TEMP 'lmu'
-          $headers = Join-Path $root 'Support/SharedMemoryInterface'
-          New-Item -ItemType Directory -Force -Path $download, $headers | Out-Null
+            - name: Set up LMU plugin SDK
+              env:
+                  GH_TOKEN: ${{ secrets.LMU_SDK_READ_TOKEN }}
+                  SDK_REPO: Aandreba/lmu-sdk
+                  # LMU 1.4.2.0, Steam build 25661166. Update tag and hash together.
+                  SDK_TAG: sdk-2026-10-19
+                  SDK_SHA256: 0aa1335d961993a7c0f1344492b6db82bc78117ef63a772633e269c076a5f1ba
+              run: |
+                  $ErrorActionPreference = 'Stop'
+                  if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+                    throw 'LMU_SDK_READ_TOKEN is not configured'
+                  }
 
-          gh release download "$env:SDK_TAG" --repo "$env:SDK_REPO" --pattern 'lmu-sdk.zip' --dir "$download"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                  $download = Join-Path $env:RUNNER_TEMP 'lmu-sdk-download'
+                  $root = Join-Path $env:RUNNER_TEMP 'lmu'
+                  $headers = Join-Path $root 'Support/SharedMemoryInterface'
+                  New-Item -ItemType Directory -Force -Path $download, $headers | Out-Null
 
-          $archive = Join-Path $download 'lmu-sdk.zip'
-          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
-          if ($actual -ne $env:SDK_SHA256) {
-            throw "LMU SDK checksum mismatch: $actual"
-          }
+                  gh release download "$env:SDK_TAG" --repo "$env:SDK_REPO" --pattern 'lmu-sdk.zip' --dir "$download"
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          Expand-Archive -LiteralPath $archive -DestinationPath $headers
-          foreach ($header in @('InternalsPlugin.hpp', 'PluginObjects.hpp')) {
-            if (-not (Test-Path -LiteralPath (Join-Path $headers $header) -PathType Leaf)) {
-              throw "Missing LMU SDK header: $header"
-            }
-          }
-          "LMU_DIR=$root" >> $env:GITHUB_ENV
+                  $archive = Join-Path $download 'lmu-sdk.zip'
+                  $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+                  if ($actual -ne $env:SDK_SHA256) {
+                    throw "LMU SDK checksum mismatch: $actual"
+                  }
 
-      - name: Set up x64 MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
+                  Expand-Archive -LiteralPath $archive -DestinationPath $headers
+                  foreach ($header in @('InternalsPlugin.hpp', 'PluginObjects.hpp')) {
+                    if (-not (Test-Path -LiteralPath (Join-Path $headers $header) -PathType Leaf)) {
+                      throw "Missing LMU SDK header: $header"
+                    }
+                  }
+                  "LMU_DIR=$root" >> $env:GITHUB_ENV
 
-      - name: Set up Rust
-        run: |
-          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --no-self-update
-          rustup default stable-x86_64-pc-windows-msvc
-          $libclang = 'C:\Program Files\LLVM\bin'
-          if ($env:ACT) {
-            $candidates = @($env:LIBCLANG_PATH, $libclang)
-            $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
-            if (Test-Path -LiteralPath $vswhere) {
-              $candidates += & $vswhere -all -products '*' -find 'VC\Tools\Llvm\x64\bin\libclang.dll' | ForEach-Object { Split-Path -Parent $_ }
-            }
-            $libclang = $candidates | Where-Object {
-              $_ -and (Test-Path -LiteralPath (Join-Path $_ 'libclang.dll') -PathType Leaf)
-            } | Select-Object -First 1
-            if (-not $libclang) { throw 'No local libclang.dll found; install LLVM or set LIBCLANG_PATH' }
-          }
-          Write-Host "Using libclang from $libclang"
-          "LIBCLANG_PATH=$libclang" >> $env:GITHUB_ENV
+            - name: Set up x64 MSVC
+              uses: ilammy/msvc-dev-cmd@v1
+              with:
+                  arch: x64
 
-      - name: Set up CUDA
-        run: ./.github/scripts/setup-cuda.ps1
+            - name: Set up Rust
+              run: |
+                  rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --no-self-update
+                  rustup default stable-x86_64-pc-windows-msvc
+                  $libclang = 'C:\Program Files\LLVM\bin'
+                  if ($env:ACT) {
+                    $candidates = @($env:LIBCLANG_PATH, $libclang)
+                    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+                    if (Test-Path -LiteralPath $vswhere) {
+                      $candidates += & $vswhere -all -products '*' -find 'VC\Tools\Llvm\x64\bin\libclang.dll' | ForEach-Object { Split-Path -Parent $_ }
+                    }
+                    $libclang = $candidates | Where-Object {
+                      $_ -and (Test-Path -LiteralPath (Join-Path $_ 'libclang.dll') -PathType Leaf)
+                    } | Select-Object -First 1
+                    if (-not $libclang) { throw 'No local libclang.dll found; install LLVM or set LIBCLANG_PATH' }
+                  }
+                  Write-Host "Using libclang from $libclang"
+                  "LIBCLANG_PATH=$libclang" >> $env:GITHUB_ENV
 
-      - name: Set up Vulkan
-        run: ./.github/scripts/setup-vulkan.ps1
+            - name: Set up CUDA
+              run: ./.github/scripts/setup-cuda.ps1
 
-      - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@v2
+            - name: Set up Vulkan
+              run: ./.github/scripts/setup-vulkan.ps1
 
-      - name: Build distribution
-        run: |
-          # whisper's nested Vulkan CMake build exceeds MSVC's MAX_PATH limit
-          # under the runner workspace, so build through a short junction.
-          $short = Join-Path $env:SystemDrive 'bono'
-          if (Test-Path -LiteralPath $short) {
-            if ((Get-Item -LiteralPath $short -Force).LinkType -ne 'Junction') { throw "$short exists and is not a junction" }
-            cmd /c rmdir "$short"
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-          New-Item -ItemType Junction -Path $short -Target $env:GITHUB_WORKSPACE | Out-Null
-          Set-Location -LiteralPath $short
-          cargo run --locked --release --package xtask -- dist
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            - name: Cache Cargo dependencies
+              uses: Swatinem/rust-cache@v2
+              with:
+                  cache-on-failure: true
 
-      - name: Package Windows distribution
-        run: |
-          Copy-Item LICENSE dist
-          Compress-Archive -Path dist/* -DestinationPath bono-windows-x86_64.zip
+            - name: Build distribution
+              run: |
+                  # whisper's nested Vulkan CMake build exceeds MSVC's MAX_PATH limit
+                  # under the runner workspace, so build through a short junction.
+                  $short = Join-Path $env:SystemDrive 'bono'
+                  if (Test-Path -LiteralPath $short) {
+                    if ((Get-Item -LiteralPath $short -Force).LinkType -ne 'Junction') { throw "$short exists and is not a junction" }
+                    cmd /c rmdir "$short"
+                    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                  }
+                  New-Item -ItemType Junction -Path $short -Target $env:GITHUB_WORKSPACE | Out-Null
+                  Set-Location -LiteralPath $short
+                  cargo run --locked --release --package xtask -- dist
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: bono-windows-x86_64
-          path: bono-windows-x86_64.zip
-          if-no-files-found: error
-          retention-days: 30
+            - name: Package Windows distribution
+              run: |
+                  Copy-Item LICENSE dist
+                  Compress-Archive -Path dist/* -DestinationPath bono-windows-x86_64.zip
 
-      - name: Publish nightly release
-        if: github.event_name == 'schedule'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          BUILD_SHA: ${{ needs.changes.outputs.ref }}
-        run: |
-          $date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
-          $tag = "nightly-$date-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $notes = "Windows x86-64 nightly build from commit $env:BUILD_SHA.`n`nWorkflow: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
-          gh release create "$tag" bono-windows-x86_64.zip --target "$env:BUILD_SHA" --title "Nightly $date ($env:GITHUB_RUN_ID.$env:GITHUB_RUN_ATTEMPT)" --notes "$notes" --prerelease --latest=false
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            - name: Upload build artifact
+              uses: actions/upload-artifact@v6
+              with:
+                  name: bono-windows-x86_64
+                  path: bono-windows-x86_64.zip
+                  if-no-files-found: error
+                  retention-days: 30
 
-      - name: Attach to release
-        if: github.event_name == 'release'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          gh release upload "$env:RELEASE_TAG" bono-windows-x86_64.zip --clobber
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            - name: Publish nightly release
+              if: github.event_name == 'schedule'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  GH_REPO: ${{ github.repository }}
+                  BUILD_SHA: ${{ needs.changes.outputs.ref }}
+              run: |
+                  $date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
+                  $tag = "nightly-$date-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+                  $notes = "Windows x86-64 nightly build from commit $env:BUILD_SHA.`n`nWorkflow: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+                  gh release create "$tag" bono-windows-x86_64.zip --target "$env:BUILD_SHA" --title "Nightly $date ($env:GITHUB_RUN_ID.$env:GITHUB_RUN_ATTEMPT)" --notes "$notes" --prerelease --latest=false
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+            - name: Attach to release
+              if: github.event_name == 'release'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  GH_REPO: ${{ github.repository }}
+                  RELEASE_TAG: ${{ github.event.release.tag_name }}
+              run: |
+                  gh release upload "$env:RELEASE_TAG" bono-windows-x86_64.zip --clobber
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
