@@ -21,11 +21,13 @@ jobs:
         runs-on: ubuntu-slim
         outputs:
             ref: ${{ steps.revision.outputs.ref }}
+            build: ${{ steps.revision.outputs.build }}
         steps:
             - uses: actions/github-script@v8
               id: revision
               with:
                   script: |
+                      core.setOutput('build', 'true');
                       if (context.eventName === 'release') {
                         core.setOutput('ref', `refs/tags/${context.payload.release.tag_name}`);
                         return;
@@ -36,9 +38,22 @@ jobs:
                       });
                       core.setOutput('ref', commit.sha);
 
+                      // Nightlies only rebuild when the default branch moved since the last one.
+                      // Manual runs always build.
+                      if (context.eventName !== 'schedule') return;
+                      const { data: releases } = await github.rest.repos.listReleases({
+                        ...context.repo, per_page: 100,
+                      });
+                      const nightly = releases.find((release) => release.tag_name.startsWith('nightly-'));
+                      if (nightly?.target_commitish === commit.sha) {
+                        core.notice(`${nightly.tag_name} already built ${commit.sha}; skipping`);
+                        core.setOutput('build', 'false');
+                      }
+
     build:
         name: Build Windows x86-64
         needs: changes
+        if: needs.changes.outputs.build == 'true'
         runs-on: windows-latest
         timeout-minutes: 180
         permissions:
@@ -120,6 +135,13 @@ jobs:
                   }
                   Write-Host "Using libclang from $libclang"
                   "LIBCLANG_PATH=$libclang" >> $env:GITHUB_ENV
+
+            # setup-cuda.ps1 skips the installer when the cached toolkit has nvcc.
+            - name: Cache CUDA toolkit
+              uses: actions/cache@v6
+              with:
+                  path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4
+                  key: cuda-${{ runner.os }}-${{ hashFiles('.github/scripts/setup-cuda.ps1') }}
 
             - name: Set up CUDA
               run: ./.github/scripts/setup-cuda.ps1
