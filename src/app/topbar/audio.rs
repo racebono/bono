@@ -607,14 +607,22 @@ impl Kind {
             return Err(get_error());
         }
 
+        // SDL owns the allocator; release the list even if a device name lookup fails.
+        struct DeviceList(*mut sdl3::sys::audio::SDL_AudioDeviceID);
+        impl Drop for DeviceList {
+            fn drop(&mut self) {
+                unsafe { SDL_free(self.0.cast()) };
+            }
+        }
+        let devices = DeviceList(devices);
+
         dest.reserve(num_devices as usize);
         for i in 0..num_devices {
-            let instance_id = AudioDeviceID::Device(unsafe { *devices.offset(i as isize) });
+            let instance_id = AudioDeviceID::Device(unsafe { *devices.0.offset(i as isize) });
             let name = instance_id.name()?;
             dest.push((instance_id, name.into()));
         }
 
-        unsafe { SDL_free(devices.cast()) };
         return Ok(());
     }
 }
