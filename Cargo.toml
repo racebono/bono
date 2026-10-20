@@ -29,7 +29,6 @@ egui = { version = "0.36.2", features = [
 egui-sdl3 = { git = "https://github.com/Aandreba/egui-sdl3", branch = "main", features = [
     "canvas-backend",
 ], default-features = false }
-simple_logger = "5.2.0"
 whisper-rs = { git = "https://github.com/Aandreba/whisper-rs", branch = "master", features = [
     "log_backend",
     "raw-api",
@@ -76,6 +75,8 @@ phf = { version = "0.14.0", features = ["macros"] }
 egui-phosphor = { version = "0.14.0", default-features = false, features = [
     "bold",
 ] }
+fern = { version = "0.7.1", features = ["colored", "chrono"] }
+humantime = "2.4.0"
 
 [target.'cfg(windows)'.dependencies]
 # Steam's per-game "Running" flag, and watching it change
