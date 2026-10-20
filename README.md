@@ -147,6 +147,8 @@ cargo xtask dist
 
 This builds release binaries and recreates `dist/` with the application, assets, phonemizer, espeak-ng data and license, and (on Windows) the LMU plugin. Windows packaging therefore requires the LMU installation and SDK headers. The task uses the application's default CUDA and Vulkan features; it does not forward extra Cargo feature flags.
 
+Windows packaging also includes DirectML, the Vulkan loader, and app-local x64 Visual C++ runtime DLLs for the application and phonemizer. Visual C++ redistributables are located through `VCToolsRedistDir` or Visual Studio (`vswhere`); the Vulkan loader comes from `VULKAN_SDK/Bin` or the installed Windows runtime. Missing required runtimes stop packaging. The Visual C++ installer is included in `dist/prerequisites`: run it before using the LMU plugin, which is loaded by the game process. Windows and compatible GPU drivers remain prerequisites; Whisper and Piper models are downloaded by the application.
+
 Release builds load assets next to the executable, so use the complete `dist/` folder when running or distributing a release.
 
 ## Development
