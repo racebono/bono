@@ -171,15 +171,6 @@ jobs:
                   cargo run --locked --release --package xtask -- dist
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-            - name: Report target size
-              if: always()
-              run: |
-                  # Measured before rust-cache prunes unused artifacts in its post step
-                  if (-not (Test-Path -LiteralPath target)) { 'target/ not found'; exit 0 }
-                  $gb = (Get-ChildItem target -Recurse -File -Force | Measure-Object Length -Sum).Sum / 1GB
-                  'target/: {0:N1} GB' -f $gb
-                  if ($gb -gt 20) { '::warning::target/ is {0:N1} GB' -f $gb }
-
             - name: Package Windows distribution
               run: |
                   Copy-Item LICENSE dist
