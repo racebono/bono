@@ -84,6 +84,7 @@ async fn dist() -> anyhow::Result<()> {
             dist.join("plugins/bono_lmu.dll"),
         )
         .await?;
+        runtime::copy_platform_runtimes(&root.join("target/release"), &dist)?;
     }
 
     println!("packaged into {}", dist.display());
