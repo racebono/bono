@@ -41,6 +41,46 @@ Environment variables must be available to the Bono process; the application doe
 
 Speech recognition and synthesis run locally. With a remote language-model endpoint, questions and telemetry returned by the engineer's tools are sent to that endpoint. Initial speech-model downloads require internet access.
 
+## Account integration (no desktop UI yet)
+
+The `bono-account` crate implements browser login, logout, account lookup, and session
+restoration. Configure `BONO_ACCOUNT_ORIGIN` with the website origin at build time or
+runtime (for example, `https://your-site.example`). When configured, app startup loads
+the saved account and refreshes its session in the background. Without this setting,
+account integration is disabled. HTTP origins are accepted only on loopback for development.
+
+The account handle is available through `AppState::account()`. Clone it into a background
+task and call `login().await` or `logout().await`; no desktop controls have been added.
+`login()` opens the system browser for website sign-in and explicit approval, then polls
+the API using PKCE. `begin_login()` and `complete_login()` are also available separately.
+`subscribe()` reports cached identity changes, `me()` validates the account with the
+server, and `access_token()` refreshes access on demand. Do not log bearer tokens.
+
+Refresh credentials persist in Windows Credential Manager, macOS Keychain, or Linux
+Secret Service, rather than the JSON configuration. Linux requires a running Secret
+Service and development DBus libraries when building. Access tokens stay in memory.
+Temporary network/server failures retain the saved login; an expired or revoked refresh
+credential requires a new login. Cached identity supports offline use but does not grant
+server authorization. Run one account manager per OS user and website origin; independent
+app processes can race server-side token rotation.
+
+Logout immediately clears in-memory access and persists signed-out state. If the server
+is unreachable, revocation is retried on startup or the next account operation. Logout
+returns an error if revocation is pending, or if the OS credential store cannot persist
+the change. Closing the app does not log out. A working OS credential store is required
+to guarantee login/logout persistence across restarts.
+
+The website must first deploy the matching `/api/desktop/auth/` endpoints and apply its
+`0001_desktop_auth.sql` migration. The website checkout's `docs/desktop-auth.md` documents
+the protocol, token lifetimes, and deployment configuration. Neither deployment nor a
+production migration is performed by the desktop application.
+
+Run account tests independently of the native audio/simulator build:
+
+```sh
+cargo test -p bono-account
+```
+
 ## Building from source
 
 ### Prerequisites
