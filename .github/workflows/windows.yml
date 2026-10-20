@@ -180,7 +180,7 @@ jobs:
               uses: actions/upload-artifact@v6
               with:
                   name: bono-windows-x86_64
-                  path: bono-windows-x86_64.zip
+                  path: dist/
                   if-no-files-found: error
                   retention-days: 30
 
