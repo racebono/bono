@@ -16,3 +16,6 @@ rustflags = ["-C", "target-feature=+sse4.2,+avx,+avx2,+bmi2,+fma,+f16c"]
 # get built in parallel (CMP0147), so the build step runs before configure has finished.
 # Requires `ninja` on PATH.
 CMAKE_GENERATOR_x86_64_pc_windows_msvc = "Ninja"
+# Skip ggml's FlashAttention CUDA kernels, the slowest part of the CUDA build. Whisper only
+# uses them with `flash_attn`, which we leave off (`WhisperContextParameters::default()`)
+GGML_CUDA_FA = "OFF"
