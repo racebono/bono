@@ -623,10 +623,30 @@ settings! {
     }
 }
 
+/// How long Claude keeps both prompt-cache breakpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClaudeCacheTtl {
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
+impl ClaudeCacheTtl {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FiveMinutes => "5m",
+            Self::OneHour => "1h",
+        }
+    }
+}
+
 settings! {
     /// Claude, through the Claude API.
     #[derive(Debug, PartialEq)]
     pub struct ClaudeConfig {
+        /// Prompt-cache lifetime: `5m` or `1h`, shared by system and conversation caching.
+        pub cache_ttl: ClaudeCacheTtl = ClaudeCacheTtl::OneHour,
         /// `ANTHROPIC_API_KEY` (or else `ANTHROPIC_AUTH_TOKEN`, as a bearer token) when `None`
         pub api_key: Option<String> = None,
         /// Sent as `anthropic-workspace-id`: `ANTHROPIC_WORKSPACE_ID`, if set, when `None`

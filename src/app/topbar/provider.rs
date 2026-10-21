@@ -255,6 +255,19 @@ impl ProviderTopbar {
         changed |= self.model(rt, ui, config.model().clone(), &mut config.model);
         changed |= pick(
             ui,
+            t!("provider.cache_ttl"),
+            *config.cache_ttl(),
+            &mut config.cache_ttl,
+            [
+                crate::config::ClaudeCacheTtl::FiveMinutes,
+                crate::config::ClaudeCacheTtl::OneHour,
+            ]
+            .map(|ttl| (ttl, ttl.as_str().to_owned())),
+            |ttl| ttl.as_str().to_owned(),
+        )
+        .changed();
+        changed |= pick(
+            ui,
             t!("provider.effort"),
             config.effort().clone(),
             &mut config.effort,
@@ -572,4 +585,3 @@ fn tokens(
     });
     response.unwrap()
 }
-

@@ -410,6 +410,11 @@
         "es": "Esfuerzo",
         "ca": "Esforç"
     },
+    "provider.cache_ttl": {
+        "en": "Prompt cache lifetime",
+        "es": "Duración de la caché de prompts",
+        "ca": "Durada de la memòria cau de prompts"
+    },
     "provider.claude_effort_hover": {
         "en": "How much it thinks before answering (the levels depend on the model)",
         "es": "Cuánto piensa antes de responder (los niveles dependen del modelo)",
