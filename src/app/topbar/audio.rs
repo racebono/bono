@@ -13,7 +13,7 @@ use crate::{
     config::{ArrayStr, AudioDevice, Config, RawConfig},
     engineer::Heard,
     error,
-    synthesizer::{Speech, Synthesizer},
+    synthesizer::{Speech, Synthesizer, plays_on},
     task::Task,
 };
 use bono_i18n::t;
@@ -315,6 +315,17 @@ impl AudioTopbar {
         };
     }
 
+    /// The speaker `which` is gone (unplugged): nothing plays on it any more, and if it's the one
+    /// picked, nothing is played until a speaker is picked again. Returns whether it was.
+    pub fn speaker_removed(&mut self, which: u32) -> bool {
+        for playback in [&mut self.test_playback, &mut self.beep_playback] {
+            if playback.as_ref().is_some_and(|stream| plays_on(stream, which)) {
+                *playback = None;
+            }
+        }
+        self.speaker.removed(which)
+    }
+
     /// Tells the pilot the microphone is open.
     fn beep(&mut self, config: &Config) {
         let volume = {
@@ -353,6 +364,15 @@ impl DeviceSelector {
     #[inline]
     pub fn get(&self) -> Option<&sdl3::audio::AudioDevice> {
         self.open.as_ref()
+    }
+
+    /// The device `which` is gone: it's closed if it's the one open. Returns whether it was.
+    fn removed(&mut self, which: u32) -> bool {
+        let open = self.open.as_ref().is_some_and(|open| open.id().id() == which);
+        if open {
+            self.open = None;
+        }
+        open
     }
 
     fn update<'a>(

@@ -616,6 +616,12 @@ impl ConversationBuilder {
             effort => (Some(effort.to_owned()), None),
         };
 
+        let max_tokens = if is_openai(&base_url) {
+            MaxTokens::MaxCompletionTokens(self.max_tokens)
+        } else {
+            MaxTokens::MaxTokens(self.max_tokens)
+        };
+
         let mut messages = Vec::new();
         if !self.system.trim().is_empty() {
             messages.push(serde_json::json!({
@@ -650,7 +656,7 @@ impl ConversationBuilder {
                 stream_options: StreamOptions {
                     include_usage: true,
                 },
-                max_tokens: self.max_tokens,
+                max_tokens,
                 reasoning_effort,
                 chat_template_kwargs,
             },
@@ -669,6 +675,12 @@ fn base_url_or_default(base_url: Option<&str>) -> String {
         .unwrap_or(DEFAULT_BASE_URL)
         .trim_end_matches('/')
         .to_owned()
+}
+
+/// Whether `base_url` is OpenAI's own API, whose reasoning models (o-series, GPT-5) take
+/// `max_completion_tokens` and reject `max_tokens`, which compatible servers may only know.
+fn is_openai(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url).is_ok_and(|url| url.host_str() == Some("api.openai.com"))
 }
 
 /// The bearer token: `api_key`, or else `OPENAI_API_KEY`, if set.
@@ -705,12 +717,21 @@ struct RequestBody {
     stream: bool,
     /// The tokens, in the stream's last event
     stream_options: StreamOptions,
-    max_tokens: NonZeroU32,
+    #[serde(flatten)]
+    max_tokens: MaxTokens,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
     /// llama.cpp's: passed to the model's chat template
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_template_kwargs: Option<serde_json::Value>,
+}
+
+/// The most tokens in one response, under the name the server knows.
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MaxTokens {
+    MaxTokens(NonZeroU32),
+    MaxCompletionTokens(NonZeroU32),
 }
 
 #[derive(Serialize)]
@@ -945,6 +966,33 @@ mod tests {
             requests[0].1["chat_template_kwargs"]["enable_thinking"],
             false
         );
+    }
+
+    #[test]
+    fn limits_tokens_as_the_server_knows() {
+        let body = |url: &str| {
+            let mut builder = ConversationBuilder::new();
+            builder
+                .base_url(url)
+                .api_key("test")
+                .max_tokens(NonZeroU32::new(1024).unwrap());
+            let conversation = builder.build(reqwest::Client::new()).unwrap();
+            serde_json::to_value(&conversation.body).unwrap()
+        };
+
+        let openai = body("https://api.openai.com/v1/");
+        assert_eq!(openai["max_completion_tokens"], 1024);
+        assert!(openai.get("max_tokens").is_none());
+
+        for url in [
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:1234/v1",
+            "https://openrouter.ai/api/v1",
+        ] {
+            let compatible = body(url);
+            assert_eq!(compatible["max_tokens"], 1024, "{url}");
+            assert!(compatible.get("max_completion_tokens").is_none(), "{url}");
+        }
     }
 
     #[tokio::test]
