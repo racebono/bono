@@ -69,7 +69,20 @@ jobs:
               run: |
                   rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --no-self-update
                   rustup default stable-x86_64-pc-windows-msvc
-                  "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+                  $libclang = 'C:\Program Files\LLVM\bin'
+                  if ($env:ACT) {
+                    $candidates = @($env:LIBCLANG_PATH, $libclang)
+                    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+                    if (Test-Path -LiteralPath $vswhere) {
+                      $candidates += & $vswhere -all -products '*' -find 'VC\Tools\Llvm\x64\bin\libclang.dll' | ForEach-Object { Split-Path -Parent $_ }
+                    }
+                    $libclang = $candidates | Where-Object {
+                      $_ -and (Test-Path -LiteralPath (Join-Path $_ 'libclang.dll') -PathType Leaf)
+                    } | Select-Object -First 1
+                    if (-not $libclang) { throw 'No local libclang.dll found; install LLVM or set LIBCLANG_PATH' }
+                  }
+                  Write-Host "Using libclang from $libclang"
+                  "LIBCLANG_PATH=$libclang" >> $env:GITHUB_ENV
 
             - name: Cache Cargo dependencies
               uses: Swatinem/rust-cache@v2
