@@ -261,23 +261,20 @@ impl AudioTopbar {
     pub fn transcription(&mut self, rt: &Handle) -> Option<Heard> {
         let result = self.transcription.as_mut()?.update(rt)?;
         self.transcription = None;
-        match result {
-            Ok(heard) => {
-                match &heard {
-                    Heard::Question { text, lang } => log::info!("Pilot ({lang}): {text}"),
-                    Heard::Unvoiced { text, lang } => {
-                        log::info!("Pilot ({lang}, without a voice): {text}")
-                    }
-                    Heard::Nothing => log::info!("Nothing understood on the radio"),
-                    Heard::NoVoice(_) => log::info!("No voice to answer the radio with"),
-                }
-                Some(heard)
+        // Errors go to the engineer, who tells the pilot: a dialog could hide the game
+        let heard = result.unwrap_or_else(Heard::Failed);
+        match &heard {
+            Heard::Question { text, lang } => log::info!("Pilot ({lang}): {text}"),
+            Heard::Unvoiced { text, lang } => {
+                log::info!("Pilot ({lang}, without a voice): {text}")
             }
-            Err(e) => {
-                error(t!("error.speech_to_text"), e);
-                None
-            }
+            Heard::Nothing => log::info!("Nothing understood on the radio"),
+            Heard::NoVoice(_) => log::info!("No voice to answer the radio with"),
+            Heard::TooShort => log::debug!("The talk button was let go too soon"),
+            Heard::NotListening(why) => log::info!("Not listening to the radio: {why:?}"),
+            Heard::Failed(e) => log::error!("Error hearing the radio: {e:#}"),
         }
+        Some(heard)
     }
 
     pub fn update(
@@ -299,22 +296,23 @@ impl AudioTopbar {
     }
 
     pub fn event(&mut self, rt: &Handle, config: &Config, event: &Event) -> bool {
-        if let Some(device) = self.microphone.get() {
-            let was_recording = self.whisper.recording();
-            let result = self.whisper.event(rt, &event, config, device);
-            if !was_recording && self.whisper.recording() {
-                self.beep(config);
-            }
-
-            match result {
-                // Picked up by `transcription`. One still being transcribed is dropped: the
-                // pilot already said something newer
-                Ok(handle) => self.transcription = Some(handle.into()),
-                Err(e) => return e,
-            };
+        // Without a microphone, pressing the talk button still tells the pilot why nothing hears
+        let was_recording = self.whisper.recording();
+        let microphone = self.microphone.get();
+        let result = self.whisper.event(rt, &event, config, microphone);
+        if !was_recording && self.whisper.recording() {
+            self.beep(config);
         }
 
-        return false;
+        return match result {
+            // Picked up by `transcription`. One still being transcribed is dropped: the pilot
+            // already said something newer
+            Ok(handle) => {
+                self.transcription = Some(handle.into());
+                false
+            }
+            Err(e) => e,
+        };
     }
 
     /// Tells the pilot the microphone is open.

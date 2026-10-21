@@ -675,11 +675,6 @@
         "es": "Desconocida",
         "ca": "Desconeguda"
     },
-    "error.speech_to_text": {
-        "en": "Failed speech to text",
-        "es": "Error al pasar la voz a texto",
-        "ca": "Error en passar la veu a text"
-    },
     "error.test_speech_playing": {
         "en": "Error playing test speech",
         "es": "Error al reproducir la voz de prueba",
@@ -1014,6 +1009,31 @@
         "en": "Nothing understood on the radio: say it again, a little louder or closer to the microphone",
         "es": "No se entendió nada por radio: repítelo, un poco más alto o más cerca del micrófono",
         "ca": "No s'ha entès res per ràdio: torna-ho a dir, una mica més fort o més a prop del micròfon"
+    },
+    "engineer.still_not_understood": {
+        "en": "Still nothing understood on the radio: check the microphone in Audio › Microphone, or lower Language confidence in Audio › Speech To Text",
+        "es": "Sigue sin entenderse nada por radio: revisa el micrófono en Audio › Micrófono, o baja la Confianza en el idioma en Audio › Voz a texto",
+        "ca": "Encara no s'entén res per ràdio: revisa el micròfon a Àudio › Micròfon, o abaixa la Confiança en l'idioma a Àudio › Veu a text"
+    },
+    "engineer.error_hearing": {
+        "en": "Error hearing the radio: {error}",
+        "es": "Error al escuchar la radio: {error}",
+        "ca": "Error en escoltar la ràdio: {error}"
+    },
+    "engineer.no_microphone": {
+        "en": "No microphone to hear the radio with: pick one in Audio › Microphone",
+        "es": "No hay micrófono para escuchar la radio: elige uno en Audio › Micrófono",
+        "ca": "No hi ha micròfon per escoltar la ràdio: tria'n un a Àudio › Micròfon"
+    },
+    "engineer.no_stt_model": {
+        "en": "No speech to text model to hear the radio with: pick one in Audio › Speech To Text",
+        "es": "No hay modelo de voz a texto para escuchar la radio: elige uno en Audio › Voz a texto",
+        "ca": "No hi ha model de veu a text per escoltar la ràdio: tria'n un a Àudio › Veu a text"
+    },
+    "engineer.stt_loading": {
+        "en": "The speech to text model is still loading: try again in a moment",
+        "es": "El modelo de voz a texto todavía se está cargando: inténtalo de nuevo en un momento",
+        "ca": "El model de veu a text encara s'està carregant: torna-ho a provar d'aquí a un moment"
     },
     "engineer.no_voice_for": {
         "en": "Heard in {language}: \"{text}\". There's no voice to answer in {language}: get one in Audio › Text To Speech",
