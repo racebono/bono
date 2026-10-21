@@ -19,13 +19,14 @@ use anyhow::{Context, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use bono_i18n::t;
 use ort::{session::Session, value::Tensor};
-use sdl3::audio::{AudioFormat, AudioSpec, AudioStreamOwner};
+use sdl3::audio::{AudioFormat, AudioSpec, AudioStream, AudioStreamOwner};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     mem::ManuallyDrop,
     num::NonZeroUsize,
     task::Poll,
+    time::{Duration, Instant},
 };
 use tokio::{
     runtime::Handle,
@@ -733,6 +734,66 @@ impl Speech {
     }
 }
 
+/// Whether `stream` plays on the audio device `which`, as SDL reports removed devices. Every
+/// stream opened on a device gets a logical device of its own, and SDL says when each is removed.
+pub fn plays_on(stream: &AudioStream, which: u32) -> bool {
+    stream.device_id().is_some_and(|id| id.id() == which)
+}
+
+/// How long a stream may go without playing anything before it's given up on: the speaker
+/// stopped taking audio without SDL saying it was removed.
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How a stream's playback is going, from [`Drain::check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drained {
+    Playing,
+    /// All of it was played
+    Done,
+    /// The speaker stopped taking audio, or the stream can't be read: what's left won't be played
+    Stalled,
+}
+
+/// Watches a stream play out what's queued on it, so a speaker that stops taking audio doesn't
+/// keep it playing forever.
+#[derive(Debug, Clone)]
+pub struct Drain {
+    /// What was queued when last looked at
+    queued: Option<i32>,
+    /// When it last played something, or was paused
+    progress: Instant,
+}
+
+impl Drain {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            queued: None,
+            progress: now,
+        }
+    }
+
+    /// Whether the stream played out, given what's still `queued` on it (`None` if that can't be
+    /// read). One `paused` on purpose isn't stalling.
+    pub fn check(&mut self, queued: Option<i32>, paused: bool, now: Instant) -> Drained {
+        let Some(queued) = queued else {
+            return Drained::Stalled;
+        };
+        if queued <= 0 {
+            return Drained::Done;
+        }
+
+        if paused || self.queued != Some(queued) {
+            self.queued = Some(queued);
+            self.progress = now;
+            return Drained::Playing;
+        }
+        match now.saturating_duration_since(self.progress) >= STALL_TIMEOUT {
+            true => Drained::Stalled,
+            false => Drained::Playing,
+        }
+    }
+}
+
 /// Scales audio so its peak is at full volume, like Piper does before writing samples.
 // FIXME(TODO): Vectorize this method
 fn normalize(samples: &mut [f32]) {
@@ -806,6 +867,55 @@ const fn default_noise_w() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_that_never_drains_is_given_up_on() {
+        let start = Instant::now();
+        let mut drain = Drain::new(start);
+        assert_eq!(drain.check(Some(4800), false, start), Drained::Playing);
+        assert_eq!(
+            drain.check(Some(4800), false, start + STALL_TIMEOUT / 2),
+            Drained::Playing
+        );
+        assert_eq!(
+            drain.check(Some(4800), false, start + STALL_TIMEOUT),
+            Drained::Stalled
+        );
+    }
+
+    #[test]
+    fn a_draining_stream_plays_out() {
+        let start = Instant::now();
+        let mut drain = Drain::new(start);
+        let mut now = start;
+        for queued in [4800, 3200, 1600] {
+            assert_eq!(drain.check(Some(queued), false, now), Drained::Playing);
+            now += STALL_TIMEOUT - Duration::from_millis(1);
+        }
+        assert_eq!(drain.check(Some(0), false, now), Drained::Done);
+    }
+
+    #[test]
+    fn a_paused_stream_isnt_stalled() {
+        let start = Instant::now();
+        let mut drain = Drain::new(start);
+        let held = start + STALL_TIMEOUT * 10;
+        assert_eq!(drain.check(Some(4800), true, held), Drained::Playing);
+        // Released: stalling counts from there
+        let released = held + STALL_TIMEOUT / 2;
+        assert_eq!(drain.check(Some(4800), false, released), Drained::Playing);
+        assert_eq!(
+            drain.check(Some(4800), false, held + STALL_TIMEOUT),
+            Drained::Stalled
+        );
+    }
+
+    #[test]
+    fn an_unreadable_stream_is_finished() {
+        let now = Instant::now();
+        assert_eq!(Drain::new(now).check(None, false, now), Drained::Stalled);
+        assert_eq!(Drain::new(now).check(None, true, now), Drained::Stalled);
+    }
 
     #[test]
     fn says_sentences_once_theyre_complete() {

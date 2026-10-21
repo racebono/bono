@@ -1005,6 +1005,16 @@
         "es": "Error al reproducir la respuesta: {error}",
         "ca": "Error en reproduir la resposta: {error}"
     },
+    "engineer.speaker_removed": {
+        "en": "The speaker was disconnected: pick a speaker to hear the engineer again",
+        "es": "Se desconectó el altavoz: elige un altavoz para volver a oír al ingeniero",
+        "ca": "S'ha desconnectat l'altaveu: tria un altaveu per tornar a sentir l'enginyer"
+    },
+    "engineer.speaker_stalled": {
+        "en": "The speaker stopped playing: the rest of the answer was dropped",
+        "es": "El altavoz dejó de reproducir: se descartó el resto de la respuesta",
+        "ca": "L'altaveu ha deixat de reproduir: s'ha descartat la resta de la resposta"
+    },
     "engineer.cancelled": {
         "en": "Cancelled: the pilot talked over it",
         "es": "Cancelada: el piloto habló por encima",

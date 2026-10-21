@@ -9,7 +9,7 @@ use crate::{
     provider::{self, Model, Reply, StopReason, Tools},
     sim::Sim,
     sqlite::pool::Pool,
-    synthesizer::{SpeechInput, SpeechOutput, Synthesizer},
+    synthesizer::{Drain, Drained, SpeechInput, SpeechOutput, Synthesizer, plays_on},
     task::Task,
 };
 use bono_i18n::t;
@@ -18,6 +18,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     task::Poll,
+    time::Instant,
 };
 use tokio::{
     runtime::Handle,
@@ -85,6 +86,8 @@ struct Playback {
     stream: Option<AudioStreamOwner>,
     /// All the speech is on the stream
     done: bool,
+    /// Whether SDL played all of it, once it's all on the stream
+    drain: Drain,
 }
 
 struct Session {
@@ -172,6 +175,20 @@ impl Engineer {
             if let Err(e) = result {
                 log::warn!("Error holding the answer for the spotter: {e}");
             }
+        }
+    }
+
+    /// The speaker `which` is gone (unplugged): the answer being spoken on it stops. `picked`:
+    /// whether it's the speaker picked, which the pilot is told about either way.
+    pub fn speaker_removed(&mut self, which: u32, picked: bool) {
+        let on_it = (self.playback.as_ref())
+            .and_then(|playback| playback.stream.as_ref())
+            .is_some_and(|stream| plays_on(stream, which));
+        if on_it {
+            self.playback = None;
+        }
+        if on_it || picked {
+            self.notice(t!("engineer.speaker_removed"));
         }
     }
 
@@ -428,6 +445,7 @@ impl Engineer {
             speech,
             stream: None,
             done: false,
+            drain: Drain::new(Instant::now()),
         });
         (lang, input)
     }
@@ -492,14 +510,25 @@ impl Engineer {
             }
         }
 
-        // Once SDL has played all of it, the stream can go
-        if playback.done
-            && playback
-                .stream
-                .as_ref()
-                .is_none_or(|stream| stream.queued_bytes().is_ok_and(|queued| queued == 0))
-        {
-            self.playback = None;
+        // Once SDL has played all of it, the stream can go. A speaker that stops taking audio
+        // without SDL saying it was removed doesn't keep it forever, holding up the spotter's calls
+        if !playback.done {
+            return;
+        }
+        let drained = match &playback.stream {
+            Some(stream) => {
+                let queued = stream.queued_bytes().ok();
+                playback.drain.check(queued, held, Instant::now())
+            }
+            None => Drained::Done,
+        };
+        match drained {
+            Drained::Playing => {}
+            Drained::Done => self.playback = None,
+            Drained::Stalled => {
+                self.playback = None;
+                self.notice(t!("engineer.speaker_stalled"));
+            }
         }
     }
 

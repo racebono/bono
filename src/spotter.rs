@@ -13,7 +13,7 @@ use crate::{
     config::{ArrayStr, Config, SpotterConfig},
     engineer::Engineer,
     sim::Sim,
-    synthesizer::{Effects, Speech, Synthesizer},
+    synthesizer::{Drain, Drained, Effects, Speech, Synthesizer, plays_on},
 };
 use bono_i18n::t;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
@@ -165,8 +165,8 @@ enum Saying {
         call: Raised,
         at: Instant,
     },
-    /// Dropping it stops it
-    Playing(AudioStreamOwner),
+    /// Dropping the stream stops it
+    Playing(AudioStreamOwner, Drain),
 }
 
 impl Spotter {
@@ -232,6 +232,17 @@ impl Spotter {
         }
 
         self.say(rt, config, synth, speaker, engineer, lang);
+    }
+
+    /// The speaker `which` is gone (unplugged): the call on it is dropped, so the spotter says the
+    /// next ones and the engineer is let go.
+    pub fn speaker_removed(&mut self, which: u32) {
+        if let Some(Saying::Playing(stream, _)) = &self.saying
+            && plays_on(stream, which)
+        {
+            log::warn!("The speaker was removed while the spotter was speaking");
+            self.saying = None;
+        }
     }
 
     fn enqueue(queue: &mut VecDeque<(Raised, Instant)>, call: Raised, at: Instant) {
@@ -334,9 +345,15 @@ impl Spotter {
                 Err(oneshot::error::TryRecvError::Closed) => self.saying = None,
                 Err(oneshot::error::TryRecvError::Empty) => {}
             },
-            Some(Saying::Playing(stream)) => {
-                if stream.queued_bytes().is_ok_and(|queued| queued == 0) {
-                    self.saying = None;
+            // A speaker that stops taking audio doesn't keep the spotter (and the engineer) waiting
+            Some(Saying::Playing(stream, drain)) => {
+                match drain.check(stream.queued_bytes().ok(), false, Instant::now()) {
+                    Drained::Playing => {}
+                    Drained::Done => self.saying = None,
+                    Drained::Stalled => {
+                        log::warn!("The speaker stopped playing a spotter call");
+                        self.saying = None;
+                    }
                 }
             }
             None => {}
@@ -391,7 +408,7 @@ impl Spotter {
             sample_rate: speech.sample_rate,
         };
         match speech.play(speaker) {
-            Ok(stream) => Some(Saying::Playing(stream)),
+            Ok(stream) => Some(Saying::Playing(stream, Drain::new(Instant::now()))),
             Err(e) => {
                 log::warn!("Error playing a spotter call: {e}");
                 None
