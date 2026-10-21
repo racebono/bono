@@ -47,6 +47,7 @@ struct AppImpl {
 impl AppImpl {
     fn app_init() -> Option<Box<Self>> {
         setup_logger().unwrap();
+        log::info!("bono {}", env!("BONO_VERSION"));
         match init(MainThreadToken::get()?) {
             Ok(app) => Some(Box::new(app)),
             Err(e) => {

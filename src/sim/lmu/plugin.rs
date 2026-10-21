@@ -141,10 +141,29 @@ fn version(dll: &Path) -> Option<Version> {
 
     // Points into `data`, which outlives it
     let info = unsafe { &*info.cast::<VS_FIXEDFILEINFO>() };
+
+    // The build is only in the version string ("0.1.0+abc1234"), in the language `lmu/build.rs`
+    // writes it in. Older DLLs and release builds have none
+    let name = wide("\\StringFileInfo\\040904B0\\ProductVersion".as_ref());
+    let mut text = ptr::null_mut::<c_void>();
+    let mut chars = 0u32;
+    let found =
+        unsafe { VerQueryValueW(data.as_ptr().cast(), name.as_ptr(), &mut text, &mut chars) };
+    let build = (found != 0 && !text.is_null())
+        .then(|| {
+            // `chars` counts the terminating NUL
+            let text = unsafe { std::slice::from_raw_parts(text.cast::<u16>(), chars as usize) };
+            let text = String::from_utf16_lossy(text);
+            let (_, build) = text.trim_end_matches('\0').split_once('+')?;
+            Some(build.to_owned())
+        })
+        .flatten();
+
     Some(Version {
         major: (info.dwFileVersionMS >> 16) as u16,
         minor: info.dwFileVersionMS as u16,
         patch: (info.dwFileVersionLS >> 16) as u16,
+        build,
     })
 }
 
