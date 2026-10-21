@@ -5,11 +5,11 @@
 use crate::{
     arrstr,
     config::{ArrayStr, Config, ModelConfig, RawConfig},
-    language::LanguageDetector,
+    language::{self, LanguageDetector},
     provider::{self, Model, Reply, StopReason, Tools},
     sim::Sim,
     sqlite::pool::Pool,
-    synthesizer::{Drain, Drained, SpeechInput, SpeechOutput, Synthesizer, plays_on},
+    synthesizer::{Drain, Drained, Speech, SpeechInput, SpeechOutput, Synthesizer, plays_on},
     task::Task,
 };
 use bono_i18n::t;
@@ -35,6 +35,38 @@ pub struct ChatEntry {
     /// Small print under it (e.g. the tokens an answer took)
     pub detail: Option<String>,
 }
+
+/// What the pilot said on the radio, as it was heard.
+pub enum Heard {
+    /// A question, in a language with a voice to answer in
+    Question { text: String, lang: ArrayStr<2> },
+    /// Something said in a language without a voice
+    Unvoiced { text: String, lang: ArrayStr<2> },
+    /// Nothing understood: noise, silence, or a language too unclear
+    Nothing,
+    /// There's no voice to answer with: none at all (`None`), or none for the only language the
+    /// speech to text model understands
+    NoVoice(Option<ArrayStr<2>>),
+    /// The talk button was let go too soon to have said anything: likely pressed by accident
+    TooShort,
+    /// The talk button was pressed, but nothing can listen
+    NotListening(NotListening),
+    /// Recording or transcribing failed
+    Failed(anyhow::Error),
+}
+
+/// Why nothing can listen to the radio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotListening {
+    NoMicrophone,
+    /// No speech to text model is picked, or it couldn't be loaded
+    NoModel,
+    /// The speech to text model is still loading
+    Loading,
+}
+
+/// How many times in a row nothing can be understood before the pilot is told what to check.
+const MISHEARD_HINT: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Speaker {
@@ -66,6 +98,8 @@ pub struct Engineer {
     playback: Option<Playback>,
     /// The spotter is speaking: the answer waits, and carries on from there after
     held: bool,
+    /// Times in a row nothing was understood on the radio
+    misheard: u32,
 }
 
 /// A question being answered.
@@ -129,6 +163,7 @@ impl Engineer {
             turn: None,
             playback: None,
             held: false,
+            misheard: 0,
         })
     }
 
@@ -199,6 +234,94 @@ impl Engineer {
         self.notice(t!("engineer.new_session"));
     }
 
+    /// What the pilot said on the radio: a question is asked, and anything else is answered
+    /// with why it can't be, cutting off whatever was being said (the pilot talked over it).
+    pub fn hear(
+        &mut self,
+        rt: &Handle,
+        sim: Option<&mut Sim>,
+        config: &Config,
+        synth: &mut Synthesizer,
+        heard: Heard,
+    ) {
+        match heard {
+            Heard::Question { text, lang } => {
+                self.misheard = 0;
+                self.ask(rt, sim, config, synth, text, lang);
+            }
+            Heard::TooShort => {}
+            Heard::Unvoiced { text, lang } => {
+                self.stop();
+                let language = language::ui_name(lang);
+                self.notice(t!(
+                    "engineer.no_voice_for",
+                    language = language,
+                    text = text
+                ));
+                self.say_again(rt, config, synth);
+            }
+            Heard::Nothing => {
+                self.stop();
+                self.misheard += 1;
+                match self.misheard >= MISHEARD_HINT {
+                    true => {
+                        self.misheard = 0;
+                        self.notice(t!("engineer.still_not_understood"));
+                    }
+                    false => self.notice(t!("engineer.not_understood")),
+                }
+                self.say_again(rt, config, synth);
+            }
+            Heard::Failed(e) => {
+                self.stop();
+                self.notice(t!("engineer.error_hearing", error = format!("{e:#}")));
+                self.say_again(rt, config, synth);
+            }
+            // The voice may not be there either: the tone says it
+            Heard::NotListening(why) => {
+                self.stop();
+                self.notice(match why {
+                    NotListening::NoMicrophone => t!("engineer.no_microphone"),
+                    NotListening::NoModel => t!("engineer.no_stt_model"),
+                    NotListening::Loading => t!("engineer.stt_loading"),
+                });
+                self.no_beep();
+            }
+            Heard::NoVoice(lang) => {
+                self.stop();
+                self.notice(match lang {
+                    Some(lang) => {
+                        t!(
+                            "engineer.no_voice_for_model",
+                            language = language::ui_name(lang)
+                        )
+                    }
+                    None => t!("engineer.no_voices").to_owned(),
+                });
+                self.no_beep();
+            }
+        }
+    }
+
+    /// Asks the pilot to say it again, in the language they last asked in (see [`Self::voice`]).
+    /// Without any voice, the radio's low tone says it can't answer.
+    fn say_again(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer) {
+        match self.voice(config, self.last_lang) {
+            Some(lang) => self.say(rt, config, synth, t!("engineer.say_again": &lang), lang),
+            None => self.no_beep(),
+        }
+    }
+
+    /// The radio's low tone, as loud as the engineer: there's no voice to answer with.
+    fn no_beep(&mut self) {
+        self.playback = Some(Playback {
+            speech: SpeechOutput::ready(Speech::no_beep(1.0)),
+            stream: None,
+            done: false,
+            drain: Drain::new(Instant::now()),
+        });
+    }
+
     /// A question typed in the chat, answered like one asked on the radio: spoken in the
     /// question's language, or the last one the pilot used if that's unclear.
     pub fn ask_text(
@@ -238,7 +361,7 @@ impl Engineer {
 
         let Some(pool) = sim.and_then(|sim| sim.database()).cloned() else {
             // Said in the pilot's language, when there's a voice for it
-            let lang = Self::voice(config, lang);
+            let lang = self.voice(config, lang).unwrap_or(lang);
             let text = t!("engineer.no_telemetry": &lang);
             self.reply(text.into(), Some(t!("engineer.detail_no_telemetry").into()));
             self.say(rt, config, synth, text, lang);
@@ -271,7 +394,9 @@ impl Engineer {
         let auto_session = *config.get().auto_session();
 
         // What the model writes goes straight to the synthesizer, and to the chat
-        let (lang, speech) = self.speak(rt, config, synth, lang);
+        let speech = self.speak(rt, config, synth, lang);
+        let lang = speech.as_ref().map_or(lang, |(lang, _)| *lang);
+        let speech = speech.map(|(_, speech)| speech);
         let (chat, text) = mpsc::unbounded_channel();
         let task = Task::spawn(async move {
             let mut state = state.lock().await;
@@ -279,7 +404,9 @@ impl Engineer {
                 state.follow_game_session().await;
             }
             let mut on_text = |text: &str| {
-                speech.push(text);
+                if let Some(speech) = &speech {
+                    speech.push(text);
+                }
                 let _ = chat.send(text.to_owned());
             };
             state
@@ -407,7 +534,7 @@ impl Engineer {
         }
     }
 
-    /// Speaks `text` in `lang`, or in English without a voice for it.
+    /// Speaks `text` in `lang` (see [`Self::voice`]): nothing without any voice.
     fn say(
         &mut self,
         rt: &Handle,
@@ -416,28 +543,34 @@ impl Engineer {
         text: &str,
         lang: ArrayStr<2>,
     ) {
-        let (_, speech) = self.speak(rt, config, synth, lang);
-        speech.push(text);
-    }
-
-    /// Starts speaking what's pushed on the returned input (in `lang`, or in English without a
-    /// voice for it, as returned), cutting off whatever was being said.
-    /// The language `lang` is spoken in: English without a voice for it.
-    fn voice(config: &Config, lang: ArrayStr<2>) -> ArrayStr<2> {
-        match config.get().voices().contains_key(&lang) {
-            true => lang,
-            false => arrstr!("en"),
+        if let Some((_, speech)) = self.speak(rt, config, synth, lang) {
+            speech.push(text);
         }
     }
 
+    /// The language `lang` is spoken in: itself with a voice for it, or else the one the pilot
+    /// last asked in, the app's, or any with a voice. `None` without any voice.
+    pub fn voice(&self, config: &Config, lang: ArrayStr<2>) -> Option<ArrayStr<2>> {
+        let config = config.get();
+        let voices = config.voices();
+        let app = ArrayStr::from_str(config.locale().split('-').next().unwrap_or_default());
+        [Some(lang), Some(self.last_lang), app]
+            .into_iter()
+            .flatten()
+            .find(|lang| voices.contains_key(lang))
+            .or_else(|| voices.keys().next().copied())
+    }
+
+    /// Starts speaking what's pushed on the returned input (in `lang`, see [`Self::voice`], as
+    /// returned), cutting off whatever was being said. `None` without any voice.
     fn speak(
         &mut self,
         rt: &Handle,
         config: &Config,
         synth: &mut Synthesizer,
         lang: ArrayStr<2>,
-    ) -> (ArrayStr<2>, SpeechInput) {
-        let lang = Self::voice(config, lang);
+    ) -> Option<(ArrayStr<2>, SpeechInput)> {
+        let lang = self.voice(config, lang)?;
         let effects = config.get().synth_effects();
 
         let (input, speech) = synth.stream(rt, lang, effects);
@@ -447,7 +580,7 @@ impl Engineer {
             done: false,
             drain: Drain::new(Instant::now()),
         });
-        (lang, input)
+        Some((lang, input))
     }
 
     /// Plays the speech synthesized so far.

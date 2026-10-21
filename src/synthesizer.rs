@@ -128,6 +128,13 @@ impl SpeechInput {
 pub struct SpeechOutput(mpsc::UnboundedReceiver<anyhow::Result<Speech>>);
 
 impl SpeechOutput {
+    /// Just `speech`, already synthesized.
+    pub fn ready(speech: Speech) -> Self {
+        let (output, recv) = mpsc::unbounded_channel();
+        let _ = output.send(Ok(speech));
+        Self(recv)
+    }
+
     /// The next piece of speech if it's ready, or `Ready(None)` once the transmission is over
     /// (an error ends it too).
     pub fn try_next(&mut self) -> Poll<Option<anyhow::Result<Speech>>> {
@@ -694,8 +701,18 @@ pub struct Speech {
 impl Speech {
     /// The radio's beep at `volume`, telling the pilot the microphone is open.
     pub fn talk_beep(volume: f32) -> Self {
+        Self::tone(Radio::beep, volume)
+    }
+
+    /// The radio's low double tone at `volume`, for when the engineer can't answer: there's no
+    /// voice to do it with.
+    pub fn no_beep(volume: f32) -> Self {
+        Self::tone(Radio::no_beep, volume)
+    }
+
+    fn tone(tone: impl FnOnce(&Radio, f32) -> Vec<f32>, volume: f32) -> Self {
         const SAMPLE_RATE: u32 = 48000;
-        let mut samples = Radio::default().beep(SAMPLE_RATE as f32);
+        let mut samples = tone(&Radio::default(), SAMPLE_RATE as f32);
         for sample in &mut samples {
             *sample = (*sample * volume).clamp(-1.0, 1.0);
         }

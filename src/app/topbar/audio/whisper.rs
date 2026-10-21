@@ -7,12 +7,12 @@ use crate::{
     arrstr,
     button::ConfigButton,
     config::{ArrayStr, Config, RawConfig},
+    engineer::{Heard, NotListening},
     error,
     task::{JoinHandle, MaybeDone, spawn, spawn_blocking},
     updating,
 };
-use anyhow::Context;
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8Path;
 use egui::Widget;
 use egui_extras::Column;
 use bono_i18n::t;
@@ -27,7 +27,6 @@ use sdl3::{
 };
 use serde::Deserialize;
 use std::{
-    collections::btree_map,
     ffi::c_int,
     mem::MaybeUninit,
     num::{NonZero, NonZeroUsize},
@@ -37,8 +36,8 @@ use std::{
 };
 use tokio::runtime::Handle;
 use whisper_rs::{
-    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperError,
-    WhisperState, get_lang_id,
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+    get_lang_str,
 };
 
 pub const RECORDING_SPEC: AudioSpec = AudioSpec {
@@ -221,13 +220,15 @@ impl Whisper {
         rt: &Handle,
         event: &Event,
         config: &Config,
-        device: &sdl3::audio::AudioDevice,
-    ) -> Result<JoinHandle<anyhow::Result<Option<(String, ArrayStr<2>)>>>, bool> {
+        device: Option<&sdl3::audio::AudioDevice>,
+    ) -> Result<JoinHandle<anyhow::Result<Heard>>, bool> {
         return match (config.get().talk_button().clone(), event) {
+            // The key held down repeats, but it's still the one press
             (
                 Some(ConfigButton::Key(ref key_code)),
                 Event::KeyDown {
                     scancode: Some(event_code),
+                    repeat: false,
                     ..
                 },
             ) if key_code == event_code => self.begin(rt, device),
@@ -276,22 +277,25 @@ impl Whisper {
         self.stream.is_some()
     }
 
+    /// Opens the microphone. When it can't be, what's heard right away says why.
     fn begin(
         &mut self,
         rt: &Handle,
-        device: &sdl3::audio::AudioDevice,
-    ) -> Result<JoinHandle<anyhow::Result<Option<(String, ArrayStr<2>)>>>, bool> {
-        let Some(ref mut ctx) = self.ctx else {
-            return Err(false);
-        };
-
+        device: Option<&sdl3::audio::AudioDevice>,
+    ) -> Result<JoinHandle<anyhow::Result<Heard>>, bool> {
         if self.stream.is_some() {
             return Err(false);
         }
 
-        let ctx = match ctx.update(rt) {
-            Some(Some(ctx)) => ctx,
-            Some(None) | None => return Err(false),
+        let heard = |heard| Ok(spawn(std::future::ready(heard)));
+        let not_listening = |why| heard(Ok(Heard::NotListening(why)));
+        let Some(device) = device else {
+            return not_listening(NotListening::NoMicrophone);
+        };
+        let ctx = match self.ctx.as_mut().map(|ctx| ctx.update(rt)) {
+            Some(Some(Some(ctx))) => ctx,
+            Some(None) => return not_listening(NotListening::Loading),
+            Some(Some(None)) | None => return not_listening(NotListening::NoModel),
         };
 
         let f = || {
@@ -319,21 +323,16 @@ impl Whisper {
             });
         };
 
-        self.stream = match f() {
-            Ok(stream) => Some(stream),
-            Err(e) => {
-                error(t!("error.recording"), e);
-                None
+        return match f() {
+            Ok(stream) => {
+                self.stream = Some(stream);
+                Err(true)
             }
+            Err(e) => heard(Err(e.context(t!("error.recording")))),
         };
-
-        return Err(true);
     }
 
-    fn finish(
-        &mut self,
-        config: &Config,
-    ) -> Result<JoinHandle<anyhow::Result<Option<(String, ArrayStr<2>)>>>, bool> {
+    fn finish(&mut self, config: &Config) -> Result<JoinHandle<anyhow::Result<Heard>>, bool> {
         let Some(stream) = self.stream.take() else {
             return Err(false);
         };
@@ -463,7 +462,7 @@ struct WhisperStream {
 }
 
 impl WhisperStream {
-    fn finish(self, config: Config) -> JoinHandle<anyhow::Result<Option<(String, ArrayStr<2>)>>> {
+    fn finish(self, config: Config) -> JoinHandle<anyhow::Result<Heard>> {
         return self.session.finish(self.recv, self.stream, config);
     }
 }
@@ -480,7 +479,7 @@ impl WhisperSession {
         recv: oneshot::Receiver<anyhow::Result<Vec<f32>>>,
         mut stream: AudioStreamWithCallback<Recorder>,
         config: Config,
-    ) -> JoinHandle<anyhow::Result<Option<(String, ArrayStr<2>)>>> {
+    ) -> JoinHandle<anyhow::Result<Heard>> {
         if let Err(e) = stream.pause() {
             return spawn(std::future::ready(Err(e.into())));
         }
@@ -500,67 +499,68 @@ impl WhisperSession {
         return spawn_blocking(move || {
             let samples = recv.recv()??;
             log::debug!("Sample count: {}", samples.len());
-            let config = config.get();
+            if samples.len() < MIN_SAMPLES {
+                return Ok(Heard::TooShort);
+            }
+            let (voices, min_confidence) = {
+                let config = config.get();
+                let voices = config.voices().keys().copied().collect::<Vec<_>>();
+                (voices, *config.min_confidence())
+            };
+
+            // Nothing to answer with
+            if voices.is_empty() {
+                return Ok(Heard::NoVoice(None));
+            }
+            // The English-only model only hears English
+            if !self.multilingual && !voices.contains(&arrstr!("en")) {
+                return Ok(Heard::NoVoice(Some(arrstr!("en"))));
+            }
 
             self.state.pcm_to_mel(&samples, self.threads.get())?;
             drop(samples);
 
-            if let Some(lang) =
-                self.detect_language(config.voices().keys(), *config.min_confidence())?
-            {
-                drop(config);
-                return Ok(Some((self.speech_to_text(lang)?, lang)));
-            } else {
-                return Ok(None);
-            }
+            // Something said in a language without a voice is still transcribed: if it's no
+            // words after all, it was noise
+            return Ok(match self.detect_language(&voices, min_confidence)? {
+                Spoken::Voiced(lang) => match self.speech_to_text(lang)? {
+                    text if text.is_empty() => Heard::Nothing,
+                    text => Heard::Question { text, lang },
+                },
+                Spoken::Unvoiced(lang) => match self.speech_to_text(lang)? {
+                    text if text.is_empty() => Heard::Nothing,
+                    text => Heard::Unvoiced { text, lang },
+                },
+                Spoken::Unclear => Heard::Nothing,
+            });
         });
     }
 
+    /// The language spoken, among `voices` (the languages with a voice) if it's one of them.
     fn detect_language(
         &mut self,
-        mut candidates: btree_map::Keys<'_, ArrayStr<2>, Utf8PathBuf>,
+        voices: &[ArrayStr<2>],
         min_confidence: f32,
-    ) -> anyhow::Result<Option<ArrayStr<2>>> {
-        if candidates.len() == 1 {
-            return Ok(Some(
-                *candidates.next().context("Expected a language candidate")?,
-            ));
-        }
-
+    ) -> anyhow::Result<Spoken> {
         if !self.multilingual {
-            if !candidates.any(|k| k == &arrstr!("en")) {
-                return Ok(None);
-            }
-            return Ok(Some(arrstr!("en")));
+            return Ok(Spoken::Voiced(arrstr!("en")));
         }
 
+        // Even with a single voice: whatever was said may be in no language, or another one
         let (_, probs) = self.state.lang_detect(0, self.threads.get())?;
-        let mut chosen = None::<(ArrayStr<2>, f32)>;
-        for candidate in candidates {
-            let Some(id) = get_lang_id(candidate) else {
-                log::warn!("Unsupported language ({candidate})");
-                continue;
-            };
+        let mut likeliest = (probs.iter().copied().enumerate())
+            .filter_map(|(id, prob)| Some((whisper_language(id)?, prob)))
+            .collect::<Vec<_>>();
+        likeliest.sort_by(|(_, a), (_, b)| b.total_cmp(a));
+        log::info!(
+            "Languages heard on the radio: {:?}",
+            &likeliest[..likeliest.len().min(3)]
+        );
 
-            let Some(prob) = usize::try_from(id).ok().and_then(|i| probs.get(i)).copied() else {
-                continue;
-            };
-
-            if prob < min_confidence {
-                continue;
-            }
-
-            if chosen
-                .as_ref()
-                .is_none_or(|(_, cand_prob)| prob > *cand_prob)
-            {
-                chosen = Some((*candidate, prob));
-            }
-        }
-
-        return Ok(chosen.map(|(name, _)| name));
+        return Ok(Spoken::choose(&likeliest, voices, min_confidence));
     }
 
+    /// What was said in `lang`: empty if it's no words.
     fn speech_to_text(&mut self, lang: ArrayStr<2>) -> anyhow::Result<String> {
         let mut params = FullParams::new(SamplingStrategy::BeamSearch {
             beam_size: 5,
@@ -572,15 +572,110 @@ impl WhisperSession {
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
+        // No blanks, nor tokens for sounds that aren't speech
+        params.set_suppress_blank(true);
+        params.set_suppress_nst(true);
 
         self.state.full(params, &[])?;
-        let text = self
-            .state
-            .as_iter()
-            .map(|x| x.to_str())
-            .collect::<Result<String, WhisperError>>()?;
+        let mut text = String::new();
+        for segment in self.state.as_iter() {
+            // Whisper makes words up for silence and noise ("Thank you.")
+            let no_speech = segment.no_speech_probability();
+            if no_speech > NO_SPEECH {
+                log::debug!("Not speech ({no_speech}): {:?}", segment.to_str_lossy()?);
+                continue;
+            }
+            text.push_str(segment.to_str()?);
+        }
 
-        return Ok(trim_in_place(text));
+        return Ok(speech(&text));
+    }
+}
+
+/// Less than this is too short to have said anything (0.3 s): the talk button was likely
+/// pressed by accident.
+const MIN_SAMPLES: usize = 16000 * 3 / 10;
+
+/// How sure whisper has to be of a language without a voice to tell the pilot there's none for
+/// it: noise is often a little likelier to be some language or other.
+const UNVOICED_CONFIDENCE: f32 = 0.5;
+
+/// How much less likely than one without a voice the likeliest language with a voice can be
+/// before it's taken as said in the other: close languages (Catalan heard as Spanish) are
+/// still answered.
+const FAR_BEHIND: f32 = 0.25;
+
+/// How likely a segment can be to be no speech at all, and still be taken as said.
+const NO_SPEECH: f32 = 0.8;
+
+/// Whisper's language `id`, as the voices have it.
+fn whisper_language(id: usize) -> Option<ArrayStr<2>> {
+    let code = get_lang_str(i32::try_from(id).ok()?)?;
+    ArrayStr::from_str(match code {
+        // Norwegian's voices are for both its written forms
+        "nn" => "no",
+        code => code,
+    })
+}
+
+/// The language spoken on the radio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spoken {
+    /// One with a voice
+    Voiced(ArrayStr<2>),
+    /// One clearly without a voice
+    Unvoiced(ArrayStr<2>),
+    /// Unclear, if anything was said at all
+    Unclear,
+}
+
+impl Spoken {
+    /// The language spoken, from how likely each is (`likeliest`, likeliest first), among
+    /// `voices` (the languages with a voice) if it's one of them.
+    fn choose(
+        likeliest: &[(ArrayStr<2>, f32)],
+        voices: &[ArrayStr<2>],
+        min_confidence: f32,
+    ) -> Self {
+        let voiced = (likeliest.iter().copied())
+            .find(|(lang, prob)| voices.contains(lang) && *prob >= min_confidence);
+        match (likeliest.first().copied(), voiced) {
+            // Clearly another language, the likeliest with a voice far behind it
+            (Some((lang, prob)), voiced)
+                if !voices.contains(&lang)
+                    && prob >= min_confidence.max(UNVOICED_CONFIDENCE)
+                    && voiced.is_none_or(|(_, voiced)| voiced < prob * FAR_BEHIND) =>
+            {
+                Spoken::Unvoiced(lang)
+            }
+            (_, Some((lang, _))) => Spoken::Voiced(lang),
+            _ => Spoken::Unclear,
+        }
+    }
+}
+
+/// `text` without what whisper writes for sounds that aren't speech (`[BLANK_AUDIO]`, `(music)`,
+/// `♪`): empty if there are no words left.
+fn speech(text: &str) -> String {
+    let mut speech = String::with_capacity(text.len());
+    let mut closing = None;
+    for c in text.chars() {
+        match (closing, c) {
+            (Some(close), c) => {
+                if c == close {
+                    closing = None;
+                }
+            }
+            (None, '[') => closing = Some(']'),
+            (None, '(') => closing = Some(')'),
+            (None, '♩' | '♪' | '♫' | '♬') => {}
+            (None, c) => speech.push(c),
+        }
+    }
+
+    match speech.chars().any(char::is_alphanumeric) {
+        true => speech.split_whitespace().collect::<Vec<_>>().join(" "),
+        false => String::new(),
     }
 }
 
@@ -588,21 +683,6 @@ struct Segment {
     start: Duration,
     end: Duration,
     text: String,
-}
-
-fn trim_in_place(s: String) -> String {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    let offset = unsafe { trimmed.as_ptr().offset_from_unsigned(s.as_ptr()) };
-    let len = trimmed.len();
-
-    let mut bytes = s.into_bytes();
-    drop(bytes.drain(..offset));
-    unsafe { bytes.set_len(len) };
-    return unsafe { String::from_utf8_unchecked(bytes) };
 }
 
 struct Recorder {
@@ -882,7 +962,9 @@ impl Model {
 mod tests {
     use super::*;
     use crate::synthesizer::{Effects, Voice};
+    use camino::Utf8PathBuf;
     use std::collections::BTreeMap;
+    use whisper_rs::get_lang_id;
 
     /// Needs `BONO_WHISPER` (a whisper model) and `BONO_VOICE_EN`/`_ES` (Piper voices).
     #[test]
@@ -937,10 +1019,66 @@ mod tests {
                 println!("{code}: {}", probs[get_lang_id(code).unwrap() as usize]);
             }
 
-            let detected = session.detect_language(voices.keys(), 0.1).unwrap();
-            let heard = session.speech_to_text(detected.unwrap()).unwrap();
-            println!("{lang} -> {detected:?}: {heard}");
-            assert_eq!(detected, Some(lang));
+            let candidates = voices.keys().copied().collect::<Vec<_>>();
+            let Spoken::Voiced(detected) = session.detect_language(&candidates, 0.1).unwrap()
+            else {
+                panic!("{lang} wasn't detected among the voices");
+            };
+            let heard = session.speech_to_text(detected).unwrap();
+            println!("{lang} -> {detected}: {heard}");
+            assert_eq!(detected, lang);
         }
+    }
+
+    #[test]
+    fn chooses_the_language_spoken() {
+        let [en, es, fr, ca, pt] = [
+            arrstr!("en"),
+            arrstr!("es"),
+            arrstr!("fr"),
+            arrstr!("ca"),
+            arrstr!("pt"),
+        ];
+        let both = [en, es];
+        let choose = |likeliest: &[(ArrayStr<2>, f32)], voices: &[ArrayStr<2>]| {
+            Spoken::choose(likeliest, voices, 0.1)
+        };
+
+        assert_eq!(choose(&[(es, 0.8), (en, 0.1)], &both), Spoken::Voiced(es));
+        // Another language, with no voice for it
+        assert_eq!(
+            choose(&[(fr, 0.9), (en, 0.05)], &both),
+            Spoken::Unvoiced(fr)
+        );
+        // A close one is answered in the voice nearest it
+        assert_eq!(choose(&[(ca, 0.6), (es, 0.3)], &both), Spoken::Voiced(es));
+        // Far behind it, even if it's likely enough
+        assert_eq!(
+            choose(&[(fr, 0.85), (en, 0.12)], &both),
+            Spoken::Unvoiced(fr)
+        );
+        // Noise isn't any language in particular
+        assert_eq!(choose(&[(fr, 0.3), (en, 0.05)], &both), Spoken::Unclear);
+        assert_eq!(choose(&[], &both), Spoken::Unclear);
+        // With a single voice, too
+        assert_eq!(
+            choose(&[(en, 0.9), (es, 0.05)], &[es]),
+            Spoken::Unvoiced(en)
+        );
+        assert_eq!(choose(&[(es, 0.4), (pt, 0.3)], &[es]), Spoken::Voiced(es));
+        assert_eq!(choose(&[(en, 0.2), (es, 0.05)], &[es]), Spoken::Unclear);
+    }
+
+    #[test]
+    fn leaves_out_what_isnt_speech() {
+        assert_eq!(speech(" How are the tyres? "), "How are the tyres?");
+        assert_eq!(speech("[BLANK_AUDIO]"), "");
+        assert_eq!(speech(" (music) ♪ "), "");
+        assert_eq!(speech(" ... "), "");
+        assert_eq!(speech("[engine noise] Box  this lap?"), "Box this lap?");
+        assert_eq!(
+            speech("¿Cuánto (risas) combustible?"),
+            "¿Cuánto combustible?"
+        );
     }
 }

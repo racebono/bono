@@ -271,14 +271,13 @@ impl AppState {
         self.tracks.update(rt, self.simulators.current_mut());
 
         // What the pilot says on the radio goes to the engineer, and its answers come back
-        if let Some((question, lang)) = self.gui.topbar.audio.transcription(rt) {
-            self.engineer.ask(
+        if let Some(heard) = self.gui.topbar.audio.transcription(rt) {
+            self.engineer.hear(
                 rt,
                 self.simulators.current_mut(),
                 &self.config,
                 &mut self.synth,
-                question,
-                lang,
+                heard,
             );
         }
         self.engineer.update(

@@ -75,13 +75,33 @@ impl Radio {
     }
 
     pub fn beep(&self, sample_rate: f32) -> Vec<f32> {
-        struct Tone {
-            frequency: f32,
-            seconds: f32,
-        }
+        self.tones(&self.beep_tones, sample_rate)
+    }
 
+    /// The radio's low, falling double tone: the engineer can't answer.
+    pub fn no_beep(&self, sample_rate: f32) -> Vec<f32> {
+        const TONES: [Tone; 3] = [
+            Tone {
+                frequency: 620.0,
+                seconds: 0.12,
+            },
+            // A gap between the two
+            Tone {
+                frequency: 0.0,
+                seconds: 0.06,
+            },
+            Tone {
+                frequency: 440.0,
+                seconds: 0.2,
+            },
+        ];
+        self.tones(&TONES, sample_rate)
+    }
+
+    /// `tones` one after the other, each faded in and out.
+    fn tones(&self, tones: &[Tone], sample_rate: f32) -> Vec<f32> {
         let mut dest = Vec::new();
-        for tone in &self.beep_tones {
+        for tone in tones {
             let count = (tone.seconds * sample_rate).ceil() as usize;
             let edge = (self.beep_fade * sample_rate).ceil();
 

@@ -250,7 +250,8 @@ impl Spotter {
         queue.push_back((call, at));
     }
 
-    /// The calls' language: the configured one, or the pilot's; English without a voice for it.
+    /// The calls' language: the configured one, or the pilot's; the engineer's fallback without
+    /// a voice for it (English without any voice, when nothing can say them anyway).
     fn language(
         &self,
         config: &Config,
@@ -258,10 +259,7 @@ impl Spotter {
         engineer: &Engineer,
     ) -> ArrayStr<2> {
         let lang = settings.language().unwrap_or(engineer.language());
-        match config.get().voices().contains_key(&lang) {
-            true => lang,
-            false => arrstr!("en"),
-        }
+        engineer.voice(config, lang).unwrap_or(arrstr!("en"))
     }
 
     fn key(config: &Config, lang: ArrayStr<2>, words: String) -> CacheKey {
