@@ -179,6 +179,14 @@ impl App {
 
     pub fn event(&mut self, rt: &Handle, event: Event) -> AppResult {
         self.state.joysticks.event(&event);
+        if let Event::AudioDeviceRemoved {
+            which,
+            iscapture: false,
+            ..
+        } = event
+        {
+            self.state.speaker_removed(which);
+        }
         if self.ui.on_event(&event).consumed {
             return AppResult::Continue;
         }
@@ -248,6 +256,14 @@ impl AppState {
     /// Account operations are ready for a future UI; run login/logout in a background task.
     pub fn account(&self) -> Option<&bono_account::Account> {
         self.account.as_ref()
+    }
+
+    /// The speaker `which` is gone (unplugged): whatever plays on it stops, and the engineer and
+    /// the spotter carry on.
+    fn speaker_removed(&mut self, which: u32) {
+        let picked = self.gui.topbar.audio.speaker_removed(which);
+        self.engineer.speaker_removed(which, picked);
+        self.spotter.speaker_removed(which);
     }
 
     fn update(&mut self, rt: &Handle, ui: &mut egui::Ui) {
