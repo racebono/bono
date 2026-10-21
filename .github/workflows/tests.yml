@@ -1,0 +1,91 @@
+name: Tests
+
+on:
+    pull_request:
+        branches: [master]
+    push:
+        branches: [master]
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: tests-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    test:
+        name: Test workspace
+        runs-on: windows-latest
+        timeout-minutes: 90
+        defaults:
+            run:
+                shell: pwsh
+        env:
+            CARGO_TERM_COLOR: always
+        steps:
+            - uses: actions/checkout@v6
+              with:
+                  persist-credentials: false
+
+            # Testing the whole workspace on Windows also builds the LMU plugin, which needs the SDK.
+            - name: Set up LMU plugin SDK
+              env:
+                  GH_TOKEN: ${{ secrets.LMU_SDK_READ_TOKEN }}
+                  SDK_REPO: Aandreba/lmu-sdk
+                  # Keep in sync with windows.yml.
+                  SDK_TAG: sdk-2026-10-19
+                  SDK_SHA256: 0aa1335d961993a7c0f1344492b6db82bc78117ef63a772633e269c076a5f1ba
+              run: |
+                  $ErrorActionPreference = 'Stop'
+                  if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+                    throw 'LMU_SDK_READ_TOKEN is not configured'
+                  }
+
+                  $download = Join-Path $env:RUNNER_TEMP 'lmu-sdk-download'
+                  $root = Join-Path $env:RUNNER_TEMP 'lmu'
+                  $headers = Join-Path $root 'Support/SharedMemoryInterface'
+                  New-Item -ItemType Directory -Force -Path $download, $headers | Out-Null
+
+                  gh release download "$env:SDK_TAG" --repo "$env:SDK_REPO" --pattern 'lmu-sdk.zip' --dir "$download"
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+                  $archive = Join-Path $download 'lmu-sdk.zip'
+                  $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+                  if ($actual -ne $env:SDK_SHA256) {
+                    throw "LMU SDK checksum mismatch: $actual"
+                  }
+
+                  Expand-Archive -LiteralPath $archive -DestinationPath $headers
+                  "LMU_DIR=$root" >> $env:GITHUB_ENV
+
+            - name: Set up x64 MSVC
+              uses: ilammy/msvc-dev-cmd@v1
+              with:
+                  arch: x64
+
+            - name: Set up Rust
+              run: |
+                  rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --no-self-update
+                  rustup default stable-x86_64-pc-windows-msvc
+                  "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
+            - name: Cache Cargo dependencies
+              uses: Swatinem/rust-cache@v2
+              with:
+                  cache-on-failure: true
+                  # PR caches can't be restored by other PRs; only master's are shared.
+                  save-if: ${{ github.ref == 'refs/heads/master' }}
+
+            # Synthesizer tests talk to the phonemizer, so it must be built first.
+            - name: Build phonemizer
+              run: |
+                  cargo build --locked -p bono-phonemizer
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+            # CPU-only: the tests don't exercise the CUDA or Vulkan Whisper backends.
+            - name: Run tests
+              run: |
+                  cargo test --locked --workspace --no-default-features
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
