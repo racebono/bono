@@ -71,6 +71,8 @@ jobs:
             # GPUs JIT-compile the compute_75 PTX on first launch. Fewer targets, faster builds.
             CMAKE_CUDA_ARCHITECTURES: "75-virtual;86-real;120-real"
             CMAKE_BUILD_PARALLEL_LEVEL: "2"
+        outputs:
+            nightly-tag: ${{ steps.nightly.outputs.tag }}
         steps:
             - uses: actions/checkout@v6
               with:
@@ -185,6 +187,7 @@ jobs:
                   retention-days: 30
 
             - name: Publish nightly release
+              id: nightly
               if: github.event_name == 'schedule'
               env:
                   GH_TOKEN: ${{ github.token }}
@@ -196,6 +199,7 @@ jobs:
                   $notes = "Windows x86-64 nightly build from commit $env:BUILD_SHA.`n`nWorkflow: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
                   gh release create "$tag" bono-windows-x86_64.zip --target "$env:BUILD_SHA" --title "Nightly $date ($env:GITHUB_RUN_ID.$env:GITHUB_RUN_ATTEMPT)" --notes "$notes" --prerelease --latest=false
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                  "tag=$tag" >> $env:GITHUB_OUTPUT
 
             - name: Attach to release
               if: github.event_name == 'release'
@@ -206,3 +210,47 @@ jobs:
               run: |
                   gh release upload "$env:RELEASE_TAG" bono-windows-x86_64.zip --clobber
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    notify:
+        name: Notify website
+        needs: build
+        if: github.event_name == 'schedule' || github.event_name == 'release'
+        runs-on: ubuntu-slim
+        permissions: {}
+        steps:
+            # A website outage must not fail the release; failures still surface as annotations.
+            - name: Refresh website release cache
+              continue-on-error: true
+              env:
+                  HOOK_URL: ${{ vars.RELEASES_HOOK_URL }}
+                  HOOK_SECRET: ${{ secrets.RELEASES_HOOK_SECRET }}
+                  EVENT: ${{ github.event_name == 'schedule' && 'nightly' || 'release' }}
+                  TAG: ${{ github.event_name == 'schedule' && needs.build.outputs.nightly-tag || github.event.release.tag_name }}
+              run: |
+                  set -euo pipefail
+                  if [ -z "$HOOK_URL" ] || [ -z "$HOOK_SECRET" ]; then
+                    echo "::notice::RELEASES_HOOK_URL or RELEASES_HOOK_SECRET is not configured; skipping"
+                    exit 0
+                  fi
+
+                  # Ref names cannot contain control characters, so escaping \ and " yields valid JSON.
+                  # The signature covers the exact bytes sent, so the body must not gain a trailing newline.
+                  tag=${TAG//\\/\\\\}
+                  tag=${tag//\"/\\\"}
+                  body=$(printf '{"event":"%s","tag":"%s"}' "$EVENT" "$tag")
+                  signature=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$HOOK_SECRET" -r | cut -d' ' -f1)
+
+                  for delay in 5 15 45 0; do
+                    status=$(curl -sS -o response.txt -w '%{http_code}' --max-time 30 -X POST \
+                      -H 'Content-Type: application/json' \
+                      -H "X-Hub-Signature-256: sha256=$signature" \
+                      --data-binary "$body" "$HOOK_URL") || status=000
+                    case "$status" in
+                      2??) echo "Website notified ($status) for $EVENT $TAG"; exit 0 ;;
+                      5??|000) echo "::warning::Website hook returned $status" ;;
+                      *) echo "::error::Website hook rejected the request ($status): $(head -c 500 response.txt)"; exit 1 ;;
+                    esac
+                    [ "$delay" -eq 0 ] || sleep "$delay"
+                  done
+                  echo "::error::Website hook failed after retries"
+                  exit 1
