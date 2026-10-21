@@ -5,6 +5,7 @@
 
 use super::write_replacing;
 use crate::sim::{PluginStatus, Version};
+use anyhow::Context;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -24,9 +25,9 @@ pub fn status(install_dir: Option<&Path>) -> PluginStatus {
         .map(|dll| version(&dll));
     let enabled = install_dir.is_some_and(|dir| {
         read_settings(&settings_path(dir))
-            .get(DLL)
-            .and_then(|plugin| plugin.get(ENABLED))
-            .and_then(Value::as_i64)
+            .ok()
+            .and_then(|settings| settings.get(DLL).cloned())
+            .and_then(|plugin| plugin.get(ENABLED).and_then(Value::as_i64))
             .is_some_and(|enabled| enabled != 0)
     });
 
@@ -47,6 +48,9 @@ pub fn install(install_dir: &Path) -> anyhow::Result<()> {
 }
 
 fn install_from(bundled: &Path, install_dir: &Path) -> anyhow::Result<()> {
+    // Validate existing settings before replacing the DLL or changing any files.
+    let path = settings_path(install_dir);
+    let mut settings = read_settings(&path)?;
     let dll = installed_dll(install_dir);
     if let Some(plugins) = dll.parent() {
         std::fs::create_dir_all(plugins)?;
@@ -54,8 +58,6 @@ fn install_from(bundled: &Path, install_dir: &Path) -> anyhow::Result<()> {
     write_replacing(&dll, &std::fs::read(bundled)?)?;
 
     // Keeps whatever else is in it: every other plugin's settings, and ours
-    let path = settings_path(install_dir);
-    let mut settings = read_settings(&path);
     let plugin = settings
         .entry(DLL)
         .or_insert_with(|| Value::Object(Map::new()));
@@ -86,12 +88,17 @@ fn settings_path(install_dir: &Path) -> PathBuf {
         .fold(install_dir.to_owned(), |path, part| path.join(part))
 }
 
-/// Empty if it's missing or isn't JSON (the game makes it on its first run).
-fn read_settings(path: &Path) -> Map<String, Value> {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Map<String, Value>>(&bytes).ok())
-        .unwrap_or_default()
+/// Empty only if it's missing (the game makes it on its first run).
+fn read_settings(path: &Path) -> anyhow::Result<Map<String, Value>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Could not read {}", path.display()));
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("Could not parse {} as a JSON object", path.display()))
 }
 
 /// The DLL that comes with the app: in `plugins` next to it once packaged (`cargo xtask dist`), or
@@ -175,7 +182,7 @@ mod tests {
             b"not really a dll"
         );
         assert_eq!(
-            Value::Object(read_settings(&settings)),
+            Value::Object(read_settings(&settings).unwrap()),
             json!({
                 "Other.dll": { " Enabled": 1, "Mode": 3 },
                 DLL: { " Enabled": 1, "Kept": 2 },
@@ -195,8 +202,50 @@ mod tests {
         install_from(&bundled, game.path()).unwrap();
 
         assert_eq!(
-            Value::Object(read_settings(&settings_path(game.path()))),
+            Value::Object(read_settings(&settings_path(game.path())).unwrap()),
             json!({ DLL: { " Enabled": 1 } })
         );
+    }
+
+    #[test]
+    fn rejects_invalid_settings_without_changing_files() {
+        for contents in [
+            "\u{feff}{\"Other.dll\":{\" Enabled\":1}}",
+            "{ /* comment */ \"Other.dll\": {} }",
+            "{\"Other.dll\":",
+            "",
+            "[]",
+            "null",
+        ] {
+            let game = tempfile::tempdir().unwrap();
+            let settings = settings_path(game.path());
+            std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+            std::fs::write(&settings, contents).unwrap();
+            let dll = installed_dll(game.path());
+            std::fs::create_dir_all(dll.parent().unwrap()).unwrap();
+            std::fs::write(&dll, b"original dll").unwrap();
+            let bundled = game.path().join("bundled.dll");
+            std::fs::write(&bundled, b"new dll").unwrap();
+
+            let error = install_from(&bundled, game.path()).unwrap_err();
+            assert!(error.to_string().contains("CustomPluginVariables.JSON"));
+            assert_eq!(std::fs::read(&settings).unwrap(), contents.as_bytes());
+            assert_eq!(std::fs::read(&dll).unwrap(), b"original dll");
+            assert!(!status(Some(game.path())).enabled);
+        }
+    }
+
+    #[test]
+    fn rejects_settings_read_errors_before_installing() {
+        let game = tempfile::tempdir().unwrap();
+        let settings = settings_path(game.path());
+        // A directory at the file path reliably causes a read error on Windows.
+        std::fs::create_dir_all(&settings).unwrap();
+        let bundled = game.path().join("bundled.dll");
+        std::fs::write(&bundled, b"dll").unwrap();
+
+        assert!(install_from(&bundled, game.path()).is_err());
+        assert!(settings.is_dir());
+        assert!(!installed_dll(game.path()).exists());
     }
 }
