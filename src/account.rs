@@ -171,7 +171,7 @@ impl Account {
             .expect("fixed API path")
     }
 
-    /// Prepare login without opening a window. A future UI can display/open the URL.
+    /// Prepare login without opening a window, allowing callers to display/open the URL.
     pub async fn begin_login(&self) -> anyhow::Result<PendingLogin> {
         let mut state = self.inner.state.lock().await;
         if state.saved.as_ref().is_some_and(|s| s.pending_logout) {
@@ -216,7 +216,7 @@ impl Account {
         })
     }
 
-    /// System-browser login, suitable for a background task; no desktop UI changes.
+    /// System-browser login, suitable for a background task.
     pub async fn login(&self) -> anyhow::Result<User> {
         let pending = self.begin_login().await?;
         webbrowser::open(pending.verification_uri.as_str())

@@ -52,7 +52,7 @@ fn tokens() -> serde_json::Value {
 }
 
 /// Minimal HTTP fixture checks real request paths/bodies and bearer headers without
-/// invoking the system browser, live production credentials, or native application build.
+/// invoking the system browser or live production credentials.
 async fn server(
     replies: Vec<(&'static str, u16, serde_json::Value, &'static str)>,
 ) -> (Url, tokio::task::JoinHandle<()>) {

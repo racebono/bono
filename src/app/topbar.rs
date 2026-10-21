@@ -2,8 +2,9 @@ use crate::{
     app::{
         Subsystems,
         topbar::{
-            audio::AudioTopbar, provider::ProviderTopbar, settings::SettingsTopbar,
-            simulators::SimulatorsTopbar, spotter::SpotterTopbar, volume::VolumeTopbar,
+            account::AccountTopbar, audio::AudioTopbar, provider::ProviderTopbar,
+            settings::SettingsTopbar, simulators::SimulatorsTopbar, spotter::SpotterTopbar,
+            volume::VolumeTopbar,
         },
     },
     config::{Config, RawConfig, Setting},
@@ -20,6 +21,7 @@ use sdl3::event::Event;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 
+mod account;
 pub(super) mod audio;
 mod provider;
 pub(super) mod settings;
@@ -28,6 +30,7 @@ mod spotter;
 pub(super) mod volume;
 
 pub struct Topbar {
+    account: AccountTopbar,
     settings: SettingsTopbar,
     pub audio: AudioTopbar,
     volume: VolumeTopbar,
@@ -46,6 +49,7 @@ impl Topbar {
         client: &reqwest::Client,
     ) -> Self {
         Self {
+            account: AccountTopbar::default(),
             settings: SettingsTopbar::default(),
             volume: VolumeTopbar,
             provider: ProviderTopbar::new(client),
@@ -72,8 +76,10 @@ impl Topbar {
         config: &mut Config,
         synth: &mut Synthesizer,
         simulators: &mut ActiveSimulator,
+        account: Option<&crate::account::Account>,
     ) -> bool {
         self.audio.poll(rt, config, synth);
+        self.account.poll(rt);
 
         // Every menu with something in it that isn't set up yet
         let settings_setup = config.get().talk_button().is_none();
@@ -126,6 +132,12 @@ impl Topbar {
                 if sims.is_none() {
                     self.simulators.closed();
                 }
+
+                MenuButton::new(t!("account"))
+                    .config(
+                        MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
+                    )
+                    .ui(ui, |ui| self.account.update(ui, account));
 
                 let simulator = simulators.current();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

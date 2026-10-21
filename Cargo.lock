@@ -420,8 +420,8 @@ name = "bono"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bindgen 0.73.2",
- "bono-account",
  "bono-i18n",
  "bono-sim",
  "camino",
@@ -435,6 +435,7 @@ dependencies = [
  "hf-hub",
  "httpdate",
  "humantime",
+ "keyring",
  "lingua",
  "log",
  "ollama-rs",
@@ -450,6 +451,7 @@ dependencies = [
  "sdl3-main",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "slab",
  "steamlocate",
  "tempfile",
@@ -457,26 +459,11 @@ dependencies = [
  "unicode-normalization",
  "ureq",
  "utils-atomics",
+ "webbrowser",
  "whisper-rs",
  "wide",
  "windows-sys 0.61.2",
  "winreg",
-]
-
-[[package]]
-name = "bono-account"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "keyring",
- "rand 0.10.3",
- "reqwest 0.13.5",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "webbrowser",
 ]
 
 [[package]]

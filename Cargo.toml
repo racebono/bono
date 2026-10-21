@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bono-account = { path = "account" }
+base64 = "0.22"
+keyring = { version = "3.6.3", features = ["windows-native", "apple-native", "sync-secret-service", "crypto-rust"] }
+sha2 = "0.10"
+webbrowser = "1"
 bono-sim = { path = "sim" }
 bono-i18n = { path = "i18n" }
 pin-project = "1.1.13"
@@ -15,6 +18,7 @@ tokio = { version = "1.53.2", features = [
     "fs",
     "io-util",
     "macros",
+    "time",
 ] }
 sdl3 = { version = "0.20.0", features = ["build-from-source-static", "main"] }
 sdl3-main = "0.7.0"
@@ -154,7 +158,10 @@ all-languages = [
 ]
 
 [workspace]
-members = ["xtask", "sim", "lmu", "i18n", "phonemizer", "account"]
+members = ["xtask", "sim", "lmu", "i18n", "phonemizer"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "test-util"] }
 
 [build-dependencies]
 bindgen = "0.73.2"
