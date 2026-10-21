@@ -39,9 +39,9 @@ impl Found {
             return false;
         };
         !plugin.enabled
-            || match (plugin.installed, plugin.bundled.flatten()) {
+            || match (&plugin.installed, plugin.bundled_version()) {
                 (None, _) => true,
-                (Some(Some(installed)), Some(latest)) => installed < latest,
+                (Some(Some(installed)), Some(latest)) => latest.replaces(installed),
                 (Some(None), Some(_)) => true,
                 (Some(_), None) => false,
             }
@@ -175,8 +175,8 @@ impl SimulatorsTopbar {
 /// Which version of the plugin is installed, next to the one that comes with the app.
 fn plugin_status(ui: &mut egui::Ui, plugin: &PluginStatus) {
     let warn = ui.visuals().warn_fg_color;
-    let latest = plugin.bundled.flatten();
-    match plugin.installed {
+    let latest = plugin.bundled_version();
+    match &plugin.installed {
         None => {
             ui.colored_label(warn, t!("plugin.not_installed"));
         }
@@ -184,7 +184,7 @@ fn plugin_status(ui: &mut egui::Ui, plugin: &PluginStatus) {
             ui.colored_label(warn, t!("plugin.unknown_version"));
         }
         Some(Some(version)) => match latest {
-            Some(latest) if latest > version => {
+            Some(latest) if latest.replaces(version) => {
                 ui.colored_label(
                     warn,
                     t!("plugin.outdated", version = version, latest = latest),
@@ -204,11 +204,14 @@ fn plugin_status(ui: &mut egui::Ui, plugin: &PluginStatus) {
     }
 }
 
-/// Install, update (the app's is newer, or the installed one doesn't say), or reinstall.
+/// Install, update (the app's is newer or another build, or the installed one doesn't say), or
+/// reinstall.
 fn install_label(plugin: &PluginStatus) -> &'static str {
-    match (plugin.installed, plugin.bundled.flatten()) {
+    match (&plugin.installed, plugin.bundled_version()) {
         (None, _) => t!("plugin.install"),
-        (Some(Some(installed)), Some(latest)) if installed >= latest => t!("plugin.reinstall"),
+        (Some(Some(installed)), Some(latest)) if !latest.replaces(installed) => {
+            t!("plugin.reinstall")
+        }
         (Some(_), Some(_)) => t!("plugin.update"),
         (Some(_), None) => t!("plugin.reinstall"),
     }

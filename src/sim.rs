@@ -171,17 +171,43 @@ pub struct PluginStatus {
     pub bundled: Option<Option<Version>>,
 }
 
+impl PluginStatus {
+    /// The version of the copy that comes with the app, if it's there and says it.
+    pub fn bundled_version(&self) -> Option<&Version> {
+        self.bundled.as_ref()?.as_ref()
+    }
+}
+
 /// A plugin's version, as its file says.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
     pub major: u16,
     pub minor: u16,
     pub patch: u16,
+    /// The build metadata after `+`: the commit, in nightly builds
+    pub build: Option<String>,
+}
+
+impl Version {
+    /// Whether this (the copy that comes with the app) should replace `installed`: it's newer, or
+    /// it's the same version from another build, since nightlies only differ in their commit.
+    pub fn replaces(&self, installed: &Version) -> bool {
+        let number = |v: &Version| (v.major, v.minor, v.patch);
+        match number(self).cmp(&number(installed)) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => self.build != installed.build,
+            std::cmp::Ordering::Less => false,
+        }
+    }
 }
 
 impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        if let Some(build) = &self.build {
+            write!(f, "+{build}")?;
+        }
+        Ok(())
     }
 }
 
@@ -390,5 +416,25 @@ mod tests {
 
         b_running.send(true).unwrap();
         assert_eq!(next(&mut active).await, Some("b"));
+    }
+
+    #[test]
+    fn bundled_plugin_replaces_older_versions_and_other_builds() {
+        let version = |patch, build: Option<&str>| Version {
+            major: 0,
+            minor: 1,
+            patch,
+            build: build.map(str::to_owned),
+        };
+
+        assert!(version(1, None).replaces(&version(0, None)));
+        assert!(!version(0, None).replaces(&version(1, None)));
+        assert!(!version(0, None).replaces(&version(0, None)));
+        assert!(!version(0, Some("abc1234")).replaces(&version(0, Some("abc1234"))));
+        assert!(version(0, Some("def5678")).replaces(&version(0, Some("abc1234"))));
+        assert!(version(0, Some("abc1234")).replaces(&version(0, None)));
+        assert!(version(0, None).replaces(&version(0, Some("abc1234"))));
+        // A newer number wins whatever the build
+        assert!(!version(0, Some("def5678")).replaces(&version(1, Some("abc1234"))));
     }
 }
