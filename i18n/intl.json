@@ -735,6 +735,11 @@
         "es": "Error al guardar los cambios de la configuración",
         "ca": "Error en desar els canvis de la configuració"
     },
+    "error.invalid_config": {
+        "en": "Invalid config: using the defaults (the old one is kept as config.json.bak)",
+        "es": "Configuración no válida: se usa la predeterminada (la anterior se guarda como config.json.bak)",
+        "ca": "Configuració no vàlida: s'usa la predeterminada (l'anterior es desa com a config.json.bak)"
+    },
     "error.initializing": {
         "en": "Error initializing application",
         "es": "Error al iniciar la aplicación",

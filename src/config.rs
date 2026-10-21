@@ -13,14 +13,10 @@ use std::{
     fmt::{Debug, Display},
     num::NonZeroU32,
     ops::{Deref, DerefMut},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    runtime::Handle,
-    sync::watch::Ref,
-};
+use tokio::{io::AsyncWriteExt, runtime::Handle, sync::watch::Ref};
 
 #[derive(Clone)]
 pub struct Config {
@@ -29,25 +25,12 @@ pub struct Config {
 
 impl Config {
     pub async fn new(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let mut file = tokio::fs::File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)
-            .await?;
-
-        file.rewind().await?;
-        let mut contents = Vec::new();
-        if let Ok(len) = usize::try_from(file.metadata().await?.len()) {
-            if len == 0 {
-                contents.extend_from_slice(b"{}");
-            } else {
-                contents.try_reserve(len)?;
-                file.read_to_end(&mut contents).await?;
-            }
+        let path = path.as_ref().to_owned();
+        let (mut data, invalid) = load(&path).await?;
+        if let Some(e) = invalid {
+            error(t!("error.invalid_config"), e);
         }
 
-        let mut data = serde_json::from_slice::<RawConfig>(&contents)?;
         let changed = !set_locale(data.locale());
 
         if changed {
@@ -61,6 +44,7 @@ impl Config {
         }
 
         tokio::spawn(async move {
+            let mut contents = Vec::new();
             while recv.changed().await.is_ok() {
                 let fut = async {
                     contents.clear();
@@ -69,9 +53,7 @@ impl Config {
                         serde_json::to_writer_pretty(&mut contents, &*raw)?;
                     };
 
-                    file.set_len(0).await?;
-                    file.rewind().await?;
-                    file.write_all(&mut contents).await?;
+                    save(&path, &contents).await?;
                     Ok::<_, anyhow::Error>(())
                 };
 
@@ -113,6 +95,57 @@ impl Config {
             raw.height.set(h);
         });
     }
+}
+
+/// `path` with `suffix` added to its file name (`config.json` -> `config.json.bak`).
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut path = path.as_os_str().to_owned();
+    path.push(suffix);
+    path.into()
+}
+
+/// Reads the config at `path`: the defaults when there's none yet. One that can't be read (a
+/// save cut short, or a hand edit gone wrong) is kept aside as `config.json.bak`, and the
+/// defaults are used instead of keeping the app from starting; why it couldn't be read is
+/// returned with them.
+async fn load(path: &Path) -> anyhow::Result<(RawConfig, Option<String>)> {
+    let contents = match tokio::fs::read(path).await {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(e.into()),
+    };
+    if contents.trim_ascii().is_empty() {
+        return Ok(Default::default());
+    }
+
+    let e = match serde_json::from_slice::<RawConfig>(&contents) {
+        Ok(data) => return Ok((data, None)),
+        Err(e) => e,
+    };
+
+    let backup = with_suffix(path, ".bak");
+    let message = match tokio::fs::rename(path, &backup).await {
+        Ok(()) => format!("{e}\n\n{}", backup.display()),
+        Err(rename) => {
+            log::warn!(
+                "Couldn't keep the invalid config as {}: {rename}",
+                backup.display()
+            );
+            e.to_string()
+        }
+    };
+    Ok((RawConfig::default(), Some(message)))
+}
+
+/// Writes the config whole, through a temporary file it then takes the place of: one cut short
+/// (the app killed, the power gone) leaves the last one as it was.
+async fn save(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let tmp = with_suffix(path, ".tmp");
+    let mut file = tokio::fs::File::create(&tmp).await?;
+    file.write_all(contents).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&tmp, path).await
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -718,5 +751,49 @@ mod tests {
         assert_eq!(*loaded.spotter.debounce(), 0.2);
         assert_eq!(*loaded.spotter.language(), Some(crate::arrstr!("es")));
         assert_eq!(loaded.spotter, disabled.spotter);
+    }
+
+    #[tokio::test]
+    async fn saves_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{\"master_volume\": 0.5}").unwrap();
+
+        let mut config = RawConfig::default();
+        config.master_volume.set(0.25);
+        save(&path, &serde_json::to_vec_pretty(&config).unwrap())
+            .await
+            .unwrap();
+
+        let saved = serde_json::from_slice::<RawConfig>(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(*saved.master_volume(), 0.25);
+        let files = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(files, ["config.json"]);
+    }
+
+    #[tokio::test]
+    async fn loads_the_defaults_over_an_invalid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        // None yet, or left empty
+        let (config, invalid) = load(&path).await.unwrap();
+        assert!(config.is_default() && invalid.is_none());
+        std::fs::write(&path, "").unwrap();
+        let (config, invalid) = load(&path).await.unwrap();
+        assert!(config.is_default() && invalid.is_none());
+
+        // Cut short
+        let truncated = "{\n  \"master_volume\": 0.";
+        std::fs::write(&path, truncated).unwrap();
+        let (config, invalid) = load(&path).await.unwrap();
+        assert!(config.is_default());
+        assert!(invalid.is_some());
+        assert!(!path.exists());
+        let backup = dir.path().join("config.json.bak");
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), truncated);
     }
 }
