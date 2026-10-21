@@ -4,23 +4,20 @@ use crate::{
     i18n::{self, set_locale},
     synthesizer::{Effects, Synthesizer, SynthesizerInner},
 };
-use camino::{Utf8Path, Utf8PathBuf};
 use bono_i18n::t;
+use camino::{Utf8Path, Utf8PathBuf};
 use sdl3::audio::AudioDeviceID;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     collections::BTreeMap,
     fmt::{Debug, Display},
+    io::Write,
     num::NonZeroU32,
     ops::{Deref, DerefMut},
     path::Path,
     sync::Arc,
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    runtime::Handle,
-    sync::watch::Ref,
-};
+use tokio::{runtime::Handle, sync::watch::Ref};
 
 #[derive(Clone)]
 pub struct Config {
@@ -29,25 +26,8 @@ pub struct Config {
 
 impl Config {
     pub async fn new(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let mut file = tokio::fs::File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)
-            .await?;
-
-        file.rewind().await?;
-        let mut contents = Vec::new();
-        if let Ok(len) = usize::try_from(file.metadata().await?.len()) {
-            if len == 0 {
-                contents.extend_from_slice(b"{}");
-            } else {
-                contents.try_reserve(len)?;
-                file.read_to_end(&mut contents).await?;
-            }
-        }
-
-        let mut data = serde_json::from_slice::<RawConfig>(&contents)?;
+        let path = path.as_ref().to_owned();
+        let mut data = load_config(&path).await?;
         let changed = !set_locale(data.locale());
 
         if changed {
@@ -63,15 +43,12 @@ impl Config {
         tokio::spawn(async move {
             while recv.changed().await.is_ok() {
                 let fut = async {
-                    contents.clear();
-                    {
+                    let contents = {
                         let raw = recv.borrow();
-                        serde_json::to_writer_pretty(&mut contents, &*raw)?;
+                        serde_json::to_vec_pretty(&*raw)?
                     };
-
-                    file.set_len(0).await?;
-                    file.rewind().await?;
-                    file.write_all(&mut contents).await?;
+                    let path = path.clone();
+                    tokio::task::spawn_blocking(move || save_config(&path, &contents)).await??;
                     Ok::<_, anyhow::Error>(())
                 };
 
@@ -112,6 +89,56 @@ impl Config {
             raw.width.set(w);
             raw.height.set(h);
         });
+    }
+}
+
+/// Never open the destination for writing: readers see either the old or the new JSON.
+fn save_config(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(contents)?;
+    temp.flush()?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)?;
+    Ok(())
+}
+
+async fn load_config(path: &Path) -> anyhow::Result<RawConfig> {
+    let contents = match tokio::fs::read(path).await {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RawConfig::default()),
+        Err(e) => return Err(e.into()),
+    };
+    match serde_json::from_slice(&contents) {
+        Ok(data) => Ok(data),
+        Err(e) => {
+            // Keep earlier recovery backups too. Renaming requires no second copy of secrets.
+            let mut backup = path.as_os_str().to_owned();
+            backup.push(".bak");
+            let mut backup = std::path::PathBuf::from(backup);
+            let mut index = 1;
+            while tokio::fs::try_exists(&backup).await? {
+                let mut name = path.as_os_str().to_owned();
+                name.push(format!(".bak.{index}"));
+                backup = name.into();
+                index += 1;
+            }
+            match tokio::fs::rename(path, &backup).await {
+                Ok(()) => log::warn!(
+                    "Invalid config at {} ({e}); preserved at {}. Using defaults.",
+                    path.display(),
+                    backup.display()
+                ),
+                Err(backup_error) => log::warn!(
+                    "Invalid config at {} ({e}); could not back it up: {backup_error}. Using defaults.",
+                    path.display()
+                ),
+            }
+            Ok(RawConfig::default())
+        }
     }
 }
 
@@ -643,6 +670,59 @@ settings! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_save_replaces_json_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"old contents that must be replaced").unwrap();
+        let mut data = RawConfig::default();
+        data.master_volume.set(0.5);
+        save_config(&path, &serde_json::to_vec_pretty(&data).unwrap()).unwrap();
+        let loaded: RawConfig = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(*loaded.master_volume(), 0.5);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_save_cleans_up_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::create_dir(&path).unwrap();
+        assert!(save_config(&path, b"{}").is_err());
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn corrupt_config_recovers_and_preserves_backups() {
+        for contents in [b"".as_slice(), b"{", b"invalid", br#"{"width":0}"#] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.json");
+            let backup = dir.path().join("config.json.bak");
+            std::fs::write(&backup, b"earlier backup").unwrap();
+            std::fs::write(&path, contents).unwrap();
+            assert!(load_config(&path).await.unwrap().is_default());
+            assert_eq!(std::fs::read(&backup).unwrap(), b"earlier backup");
+            assert_eq!(
+                std::fs::read(dir.path().join("config.json.bak.1")).unwrap(),
+                contents
+            );
+            assert!(!path.exists());
+            save_config(&path, b"{}").unwrap();
+            assert!(load_config(&path).await.unwrap().is_default());
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_and_valid_config_load_without_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        assert!(load_config(&path).await.unwrap().is_default());
+        std::fs::write(&path, br#"{"master_volume":0.5}"#).unwrap();
+        assert_eq!(*load_config(&path).await.unwrap().master_volume(), 0.5);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn saves_only_what_was_set() {
