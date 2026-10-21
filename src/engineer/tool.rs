@@ -115,7 +115,8 @@ impl Engineer {
 
     pub fn description() -> String {
         "Race-engineer queries over the live telemetry database of the simulator the pilot is \
-         driving (read-only). `command` picks the query: quick (urgent snapshot from the newest \
+         driving (read-only). Each question includes a fresh quick snapshot; use it first. \
+         `command` picks the query: quick (fallback when no snapshot is attached, from the newest \
          rows), status (full snapshot of the player's car), laps, stint (range on fuel and \
          virtual energy against what the race needs), nearby (cars around in metres), field \
          (official standings), track (the circuit), corners (time gained or lost per corner, \
@@ -195,6 +196,20 @@ impl Engineer {
     /// question doesn't wait for it.
     pub async fn warm(&self) -> anyhow::Result<String> {
         Ok(self.query(EngineerInput::command(Command::Warm)).await?.0)
+    }
+
+    /// Attach current telemetry once, before the question enters provider history.
+    /// Use the same query and quoting as the tool; a failed read leaves the question intact.
+    pub async fn question_with_snapshot(&self, question: String) -> String {
+        match self.run(EngineerInput::command(Command::Quick)).await {
+            Ok(snapshot) => format!(
+                "{question}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\n{snapshot}\n[END UNTRUSTED TELEMETRY SNAPSHOT]"
+            ),
+            Err(e) => {
+                log::warn!("Error attaching the engineer's telemetry snapshot: {e:#}");
+                question
+            }
+        }
     }
 
     async fn run(&self, input: EngineerInput) -> anyhow::Result<String> {
@@ -4307,6 +4322,13 @@ mod tests {
         .unwrap();
         drop(conn);
         let quoted = telemetry_text(name);
+        let attached = engineer
+            .question_with_snapshot("Who's behind?".into())
+            .await;
+        assert!(attached.starts_with("Who's behind?\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\n"));
+        assert!(attached.contains(&quoted), "{attached}");
+        assert!(!attached.contains(name), "{attached}");
+        assert!(attached.ends_with("\n[END UNTRUSTED TELEMETRY SNAPSHOT]"));
         for command in ["quick", "nearby", "field", "laps", "status", "corners"] {
             let out = run(
                 &engineer,
@@ -4335,6 +4357,43 @@ mod tests {
             .await
             .contains(&quoted)
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_failure_preserves_the_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let one = std::num::NonZeroUsize::new(1).unwrap();
+        let pool = Pool::new(
+            crate::sqlite::Database::read_only(Arc::new(dir.path().join("missing.db"))),
+            one,
+            one,
+        );
+        let engineer = Engineer::new(pool, "".into());
+        let question = "How are the tyres?\nPlease check.";
+        assert_eq!(
+            engineer.question_with_snapshot(question.into()).await,
+            question
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshots_are_fresh_and_previous_messages_stay_unchanged() {
+        let (dir, engineer) = race();
+        let first = engineer
+            .question_with_snapshot("Who's behind?".into())
+            .await;
+        let saved = first.clone();
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute(
+            "UPDATE standings SET driver = 'New rival' WHERE vehicle_id = 2",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let second = engineer.question_with_snapshot("And now?".into()).await;
+        assert!(second.contains("New rival"), "{second}");
+        assert!(!first.contains("New rival"), "{first}");
+        assert_eq!(first, saved);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4941,6 +5000,7 @@ mod evals {
                     .join(&run);
                 let prompt = eval["prompt"].as_str().unwrap().to_owned();
                 async move {
+                    let question = tool.question_with_snapshot(prompt.clone()).await;
                     let calls = Arc::new(StdMutex::new(Vec::new()));
                     let mut builder = ConversationBuilder::new();
                     builder.model(model).effort(effort).system(system).tool(
@@ -4955,7 +5015,7 @@ mod evals {
                     let mut conversation = builder.build(reqwest::Client::new()).unwrap();
 
                     let start = Instant::now();
-                    let reply = conversation.send(prompt.clone()).await;
+                    let reply = conversation.send(question.clone()).await;
                     let elapsed = start.elapsed();
 
                     let outputs = dir.join("outputs");
@@ -4968,11 +5028,12 @@ mod evals {
                         Err(e) => (format!("ERROR: {e:#}"), String::new()),
                     };
                     std::fs::write(outputs.join("reply.md"), format!("{text}\n")).unwrap();
+                    let tool_calls = calls.lock().unwrap().len();
                     let calls = calls.lock().unwrap().join("\n");
                     std::fs::write(
                         dir.join("transcript.md"),
                         format!(
-                            "## Pilot\n\n{prompt}\n\n{calls}\n## Engineer\n\n{text}\n\n{usage}\n"
+                            "## Pilot\n\n{question}\n\n{calls}\n## Engineer\n\n{text}\n\n{usage}\n"
                         ),
                     )
                     .unwrap();
@@ -4983,6 +5044,9 @@ mod evals {
                     std::fs::write(
                         dir.join("timing.json"),
                         serde_json::json!({
+                            "tool_calls": tool_calls,
+                            "answered_without_tool_call": reply.is_ok() && tool_calls == 0,
+                            "cache_read_tokens": reply.as_ref().map_or(0, |r| r.usage.cache_read_tokens),
                             "total_tokens": tokens,
                             "duration_ms": elapsed.as_millis() as u64,
                             "total_duration_seconds": elapsed.as_secs_f64(),
