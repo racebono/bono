@@ -1,4 +1,39 @@
 {
+    "account": {
+        "en": "Account",
+        "es": "Cuenta",
+        "ca": "Compte"
+    },
+    "account.unavailable": {
+        "en": "Account sign-in is unavailable in this installation.",
+        "es": "El inicio de sesión no está disponible en esta instalación.",
+        "ca": "L'inici de sessió no està disponible en aquesta instal·lació."
+    },
+    "account.signed_out": {
+        "en": "You are signed out.",
+        "es": "No has iniciado sesión.",
+        "ca": "No has iniciat sessió."
+    },
+    "account.log_in": {
+        "en": "Log in…",
+        "es": "Iniciar sesión…",
+        "ca": "Inicia la sessió…"
+    },
+    "account.sign_out": {
+        "en": "Sign out",
+        "es": "Cerrar sesión",
+        "ca": "Tanca la sessió"
+    },
+    "account.waiting": {
+        "en": "Complete sign-in in your browser…",
+        "es": "Completa el inicio de sesión en tu navegador…",
+        "ca": "Completa l'inici de sessió al navegador…"
+    },
+    "account.signing_out": {
+        "en": "Signing out…",
+        "es": "Cerrando sesión…",
+        "ca": "S'està tancant la sessió…"
+    },
     "settings": {
         "en": "Settings",
         "es": "Ajustes",

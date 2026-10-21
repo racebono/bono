@@ -43,16 +43,19 @@ Claude's **Prompt cache lifetime** setting defaults to `1h`; choose `5m` for sho
 
 Speech recognition and synthesis run locally. With a remote language-model endpoint, questions and telemetry returned by the engineer's tools are sent to that endpoint. Initial speech-model downloads require internet access.
 
-## Account integration (no desktop UI yet)
+## Account integration
 
-The `bono-account` crate implements browser login, logout, account lookup, and session
+The application's `account` module implements browser login, logout, account lookup, and session
 restoration. Configure `BONO_ACCOUNT_ORIGIN` with the website origin at build time or
 runtime (for example, `https://your-site.example`). When configured, app startup loads
 the saved account and refreshes its session in the background. Without this setting,
 account integration is disabled. HTTP origins are accepted only on loopback for development.
 
 The account handle is available through `AppState::account()`. Clone it into a background
-task and call `login().await` or `logout().await`; no desktop controls have been added.
+task and call `login().await` or `logout().await`. The topbar's **Account** menu opens
+browser login, shows the signed-in user's name and email, and offers **Sign out**.
+While login is pending, **Cancel** stops polling for browser approval. Account operations
+run in the background; progress and errors appear in the menu.
 `login()` opens the system browser for website sign-in and explicit approval, then polls
 the API using PKCE. `begin_login()` and `complete_login()` are also available separately.
 `subscribe()` reports cached identity changes, `me()` validates the account with the
@@ -77,10 +80,10 @@ The website must first deploy the matching `/api/desktop/auth/` endpoints and ap
 the protocol, token lifetimes, and deployment configuration. Neither deployment nor a
 production migration is performed by the desktop application.
 
-Run account tests independently of the native audio/simulator build:
+Run the account module's tests (requires the application's native build prerequisites):
 
 ```sh
-cargo test -p bono-account
+cargo test -p bono account::tests
 ```
 
 ## Building from source

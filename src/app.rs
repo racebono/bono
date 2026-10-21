@@ -100,13 +100,8 @@ impl App {
             .build()?;
         let tracks = TrackSync::new(client.clone(), pref_path.as_std_path());
 
-        // Account initialization never changes the UI or prevents offline use. Packaging can
-        // bake in the website origin; developers can override it for a local API.
-        let account_origin = std::env::var("BONO_ACCOUNT_ORIGIN")
-            .ok()
-            .or_else(|| option_env!("BONO_ACCOUNT_ORIGIN").map(str::to_owned));
-        let account = match account_origin {
-            Some(origin) => match bono_account::Account::new(&origin).await {
+        let account = match option_env!("BONO_ACCOUNT_ORIGIN") {
+            Some(origin) => match crate::account::Account::new(origin).await {
                 Ok(account) => {
                     let restore = account.clone();
                     rt.spawn(async move {
@@ -237,7 +232,7 @@ impl DerefMut for App {
 }
 
 pub struct AppState {
-    account: Option<bono_account::Account>,
+    account: Option<crate::account::Account>,
     gui: Gui,
     config: Config,
     subsystems: Subsystems,
@@ -256,8 +251,8 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Account operations are ready for a future UI; run login/logout in a background task.
-    pub fn account(&self) -> Option<&bono_account::Account> {
+    /// Clone the account handle to run account operations in a background task.
+    pub fn account(&self) -> Option<&crate::account::Account> {
         self.account.as_ref()
     }
 
@@ -306,6 +301,7 @@ impl AppState {
             &mut self.synth,
             &mut self.simulators,
             &self.engineer,
+            self.account.as_ref(),
         );
 
         // A question typed in the chat
@@ -416,8 +412,12 @@ impl Gui {
         synth: &mut Synthesizer,
         simulators: &mut ActiveSimulator,
         engineer: &Engineer,
+        account: Option<&crate::account::Account>,
     ) -> Option<String> {
-        if self.topbar.update(rt, ss, ui, config, synth, simulators) {
+        if self
+            .topbar
+            .update(rt, ss, ui, config, synth, simulators, account)
+        {
             self.onboarding.open();
         }
         let question = self.chat.update(ui, engineer);

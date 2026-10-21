@@ -3,3 +3,4 @@
 .env
 .cargo/config.priv.toml
 TODO.md
+*.log

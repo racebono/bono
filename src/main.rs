@@ -23,6 +23,7 @@ use tokio::{io::AsyncWriteExt, runtime::Runtime, time::MissedTickBehavior};
 #[doc(hidden)]
 pub extern crate std;
 
+mod account;
 mod app;
 mod button;
 mod config;
