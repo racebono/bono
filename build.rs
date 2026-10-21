@@ -1,5 +1,5 @@
 use std::{
-    env::var_os,
+    env::{var, var_os},
     path::{Path, PathBuf},
 };
 
@@ -7,6 +7,15 @@ pub fn main() -> Result<(), ureq::Error> {
     let out_dir = PathBuf::from(var_os("OUT_DIR").unwrap());
     // Without it, any change to the package reruns this, downloading the header again
     println!("cargo::rerun-if-changed=build.rs");
+    println!("cargo::rerun-if-env-changed=BONO_COMMIT");
+
+    // The app's version, with the commit as build metadata (`0.1.0+abc1234`) in nightly builds,
+    // which set `BONO_COMMIT`
+    let mut version = var("CARGO_PKG_VERSION").unwrap();
+    if let Some(commit) = var("BONO_COMMIT").ok().filter(|commit| !commit.is_empty()) {
+        version = format!("{version}+{}", &commit[..commit.len().min(7)]);
+    }
+    println!("cargo::rustc-env=BONO_VERSION={version}");
 
     if var_os("CARGO_CFG_WINDOWS").is_some() {
         race_room(&out_dir)?;

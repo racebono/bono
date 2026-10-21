@@ -17,6 +17,7 @@ fn main() {
     println!("cargo::rerun-if-changed=recorder.h");
     println!("cargo::rerun-if-changed=../include");
     println!("cargo::rerun-if-env-changed=LMU_DIR");
+    println!("cargo::rerun-if-env-changed=BONO_COMMIT");
 
     // LMU only runs on Windows: elsewhere the crate is empty
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
@@ -56,9 +57,16 @@ fn main() {
 }
 
 /// The DLL's version (this crate's), as a Windows version resource: the app reads it from the copy
-/// in the game's Plugins folder to tell which one is installed, and Explorer shows it too.
+/// in the game's Plugins folder to tell which one is installed, and Explorer shows it too. Nightly
+/// builds set `BONO_COMMIT`, which goes in the version string as build metadata (`0.1.0+abc1234`).
 fn version_resource() {
-    let version = env::var("CARGO_PKG_VERSION").unwrap();
+    let mut version = env::var("CARGO_PKG_VERSION").unwrap();
+    if let Some(commit) = env::var("BONO_COMMIT")
+        .ok()
+        .filter(|commit| !commit.is_empty())
+    {
+        version = format!("{version}+{}", &commit[..commit.len().min(7)]);
+    }
     let number = |name: &str| env::var(name).unwrap().parse::<u16>().unwrap_or(0);
     let (major, minor, patch) = (
         number("CARGO_PKG_VERSION_MAJOR"),

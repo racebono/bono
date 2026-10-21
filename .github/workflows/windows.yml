@@ -71,6 +71,8 @@ jobs:
             # GPUs JIT-compile the compute_75 PTX on first launch. Fewer targets, faster builds.
             CMAKE_CUDA_ARCHITECTURES: "75-virtual;86-real;120-real"
             CMAKE_BUILD_PARALLEL_LEVEL: "2"
+            # Nightlies carry their commit in the version (`0.1.0+abc1234`); releases don't.
+            BONO_COMMIT: ${{ github.event_name == 'schedule' && needs.changes.outputs.ref || '' }}
         steps:
             - uses: actions/checkout@v6
               with:
