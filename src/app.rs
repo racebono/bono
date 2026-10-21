@@ -187,7 +187,10 @@ impl App {
         {
             self.state.speaker_removed(which);
         }
-        if self.ui.on_event(&event).consumed {
+        // A text field taking the talk button's release mustn't leave the microphone open
+        if self.ui.on_event(&event).consumed
+            && !(self.state.gui.topbar.audio.whisper).ends_recording(&self.state.config, &event)
+        {
             return AppResult::Continue;
         }
 

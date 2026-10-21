@@ -118,6 +118,33 @@ impl ConfigButton {
             _ => false,
         }
     }
+
+    /// Whether `event` lets go of this button.
+    pub fn released(&self, event: &Event) -> bool {
+        match (self, event) {
+            (
+                ConfigButton::Key(key),
+                Event::KeyUp {
+                    scancode: Some(scancode),
+                    ..
+                },
+            ) => key == scancode,
+            (
+                ConfigButton::Joystick { guid, button },
+                Event::JoyButtonUp {
+                    which, button_idx, ..
+                },
+            ) => {
+                button == button_idx
+                    && unsafe {
+                        sdl3::sys::joystick::SDL_GetJoystickGUIDForID(
+                            sdl3::sys::joystick::SDL_JoystickID(which.raw()),
+                        )
+                    } == *guid
+            }
+            _ => false,
+        }
+    }
 }
 
 pub struct ButtonWatcher {

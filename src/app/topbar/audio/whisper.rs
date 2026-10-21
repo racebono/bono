@@ -18,12 +18,9 @@ use egui_extras::Column;
 use bono_i18n::t;
 use sdl3::{
     audio::{AudioFormat, AudioRecordingCallback, AudioSpec, AudioStream, AudioStreamWithCallback},
-    event::Event,
+    event::{Event, WindowEvent},
     get_error,
-    sys::{
-        audio::{SDL_AudioStream, SDL_GetAudioStreamAvailable, SDL_GetAudioStreamData},
-        joystick::{SDL_GetJoystickGUIDForID, SDL_JoystickID},
-    },
+    sys::audio::{SDL_AudioStream, SDL_GetAudioStreamAvailable, SDL_GetAudioStreamData},
 };
 use serde::Deserialize;
 use std::{
@@ -222,45 +219,18 @@ impl Whisper {
         config: &Config,
         device: Option<&sdl3::audio::AudioDevice>,
     ) -> Result<JoinHandle<anyhow::Result<Heard>>, bool> {
-        return match (config.get().talk_button().clone(), event) {
-            // The key held down repeats, but it's still the one press
-            (
-                Some(ConfigButton::Key(ref key_code)),
-                Event::KeyDown {
-                    scancode: Some(event_code),
-                    repeat: false,
-                    ..
-                },
-            ) if key_code == event_code => self.begin(rt, device),
-            (
-                Some(ConfigButton::Key(ref key_code)),
-                Event::KeyUp {
-                    scancode: Some(event_code),
-                    ..
-                },
-            ) if key_code == event_code => self.finish(config),
-            (
-                Some(ConfigButton::Joystick { guid, ref button }),
-                Event::JoyButtonDown {
-                    which, button_idx, ..
-                },
-            ) if button == button_idx
-                && unsafe { SDL_GetJoystickGUIDForID(SDL_JoystickID(which.raw())) } == guid =>
-            {
-                self.begin(rt, device)
-            }
-            (
-                Some(ConfigButton::Joystick { guid, ref button }),
-                Event::JoyButtonUp {
-                    which, button_idx, ..
-                },
-            ) if button == button_idx
-                && unsafe { SDL_GetJoystickGUIDForID(SDL_JoystickID(which.raw())) } == guid =>
-            {
-                self.finish(config)
-            }
-            _ => Err(false),
+        let talk_button = config.get().talk_button().clone();
+        return match talk(talk_button.as_ref(), event, self.recording()) {
+            Talk::Begin => self.begin(rt, device),
+            Talk::Finish => self.finish(config),
+            Talk::Ignore => Err(false),
         };
+    }
+
+    /// Whether `event` ends the recording, so it must reach [`Self::event`] even when the UI used
+    /// it (a text field with focus takes the talk key's release).
+    pub fn ends_recording(&self, config: &Config, event: &Event) -> bool {
+        talk(config.get().talk_button().as_ref(), event, self.recording()) == Talk::Finish
     }
 
     /// Whether the model picked is loaded, and can listen.
@@ -453,6 +423,44 @@ impl Whisper {
             },
         ));
     }
+}
+
+/// What an event does to the talk button's recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Talk {
+    Begin,
+    Finish,
+    Ignore,
+}
+
+fn talk(button: Option<&ConfigButton>, event: &Event, recording: bool) -> Talk {
+    let Some(button) = button else {
+        return Talk::Ignore;
+    };
+    // The key held down repeats, but it's still the one press
+    if button.pressed(event) {
+        return Talk::Begin;
+    }
+    if !recording {
+        return Talk::Ignore;
+    }
+    if button.released(event) {
+        return Talk::Finish;
+    }
+    // A key's release goes to whichever window has focus, so once Bono loses it the release may
+    // never come. Joysticks are heard in the background, so their release still will
+    if matches!(button, ConfigButton::Key(_))
+        && matches!(
+            event,
+            Event::Window {
+                win_event: WindowEvent::FocusLost,
+                ..
+            }
+        )
+    {
+        return Talk::Finish;
+    }
+    Talk::Ignore
 }
 
 struct WhisperStream {
@@ -963,8 +971,82 @@ mod tests {
     use super::*;
     use crate::synthesizer::{Effects, Voice};
     use camino::Utf8PathBuf;
+    use sdl3::keyboard::{Mod, Scancode};
     use std::collections::BTreeMap;
     use whisper_rs::get_lang_id;
+
+    fn key(scancode: Scancode, down: bool) -> Event {
+        let (timestamp, window_id, keycode, keymod, repeat, which, raw) =
+            (0, 1, None, Mod::NOMOD, false, 0, 0);
+        let scancode = Some(scancode);
+        match down {
+            true => Event::KeyDown {
+                timestamp,
+                window_id,
+                keycode,
+                scancode,
+                keymod,
+                repeat,
+                which,
+                raw,
+            },
+            false => Event::KeyUp {
+                timestamp,
+                window_id,
+                keycode,
+                scancode,
+                keymod,
+                repeat,
+                which,
+                raw,
+            },
+        }
+    }
+
+    fn window(win_event: WindowEvent) -> Event {
+        Event::Window {
+            timestamp: 0,
+            window_id: 1,
+            win_event,
+        }
+    }
+
+    #[test]
+    fn the_talk_keys_release_finishes_the_recording() {
+        let button = ConfigButton::Key(Scancode::Space);
+        let release = key(Scancode::Space, false);
+        assert_eq!(
+            talk(Some(&button), &key(Scancode::Space, true), false),
+            Talk::Begin
+        );
+        assert_eq!(talk(Some(&button), &release, true), Talk::Finish);
+        // Nothing to finish, so a text field may keep it
+        assert_eq!(talk(Some(&button), &release, false), Talk::Ignore);
+        assert_eq!(
+            talk(Some(&button), &key(Scancode::A, false), true),
+            Talk::Ignore
+        );
+        assert_eq!(talk(None, &release, true), Talk::Ignore);
+    }
+
+    #[test]
+    fn losing_focus_finishes_a_key_recording() {
+        let key = ConfigButton::Key(Scancode::Space);
+        let focus_lost = window(WindowEvent::FocusLost);
+        assert_eq!(talk(Some(&key), &focus_lost, true), Talk::Finish);
+        assert_eq!(talk(Some(&key), &focus_lost, false), Talk::Ignore);
+        assert_eq!(
+            talk(Some(&key), &window(WindowEvent::FocusGained), true),
+            Talk::Ignore
+        );
+
+        // A joystick's release is still heard in the background
+        let joystick = ConfigButton::Joystick {
+            guid: unsafe { std::mem::zeroed() },
+            button: 0,
+        };
+        assert_eq!(talk(Some(&joystick), &focus_lost, true), Talk::Ignore);
+    }
 
     /// Needs `BONO_WHISPER` (a whisper model) and `BONO_VOICE_EN`/`_ES` (Piper voices).
     #[test]
