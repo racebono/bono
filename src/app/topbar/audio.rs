@@ -11,6 +11,7 @@ use crate::{
     },
     arrstr,
     config::{ArrayStr, AudioDevice, Config, RawConfig},
+    engineer::Heard,
     error,
     synthesizer::{Speech, Synthesizer},
     task::Task,
@@ -81,7 +82,7 @@ pub struct AudioTopbar {
     /// playback)
     beep_playback: Option<AudioStreamOwner>,
     /// What the pilot last said on the radio, being transcribed
-    transcription: Option<Task<anyhow::Result<Option<(String, ArrayStr<2>)>>>>,
+    transcription: Option<Task<anyhow::Result<Heard>>>,
     /// Listening to the microphone for the setup guide: `None` until it's asked for, and
     /// `Some(None)` if it couldn't
     meter: Option<Option<MicMeter>>,
@@ -256,18 +257,21 @@ impl AudioTopbar {
         .collect()
     }
 
-    /// What the pilot said on the radio, with its language, once it's transcribed.
-    pub fn transcription(&mut self, rt: &Handle) -> Option<(String, ArrayStr<2>)> {
+    /// What the pilot said on the radio, once it's transcribed.
+    pub fn transcription(&mut self, rt: &Handle) -> Option<Heard> {
         let result = self.transcription.as_mut()?.update(rt)?;
         self.transcription = None;
         match result {
-            Ok(Some((text, lang))) => {
-                log::info!("Pilot ({lang}): {text}");
-                Some((text, lang))
-            }
-            Ok(None) => {
-                log::debug!("Nothing understood on the radio");
-                None
+            Ok(heard) => {
+                match &heard {
+                    Heard::Question { text, lang } => log::info!("Pilot ({lang}): {text}"),
+                    Heard::Unvoiced { text, lang } => {
+                        log::info!("Pilot ({lang}, without a voice): {text}")
+                    }
+                    Heard::Nothing => log::info!("Nothing understood on the radio"),
+                    Heard::NoVoice(_) => log::info!("No voice to answer the radio with"),
+                }
+                Some(heard)
             }
             Err(e) => {
                 error(t!("error.speech_to_text"), e);

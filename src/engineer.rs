@@ -5,11 +5,11 @@
 use crate::{
     arrstr,
     config::{ArrayStr, Config, ModelConfig, RawConfig},
-    language::LanguageDetector,
+    language::{self, LanguageDetector},
     provider::{self, Model, Reply, StopReason, Tools},
     sim::Sim,
     sqlite::pool::Pool,
-    synthesizer::{SpeechInput, SpeechOutput, Synthesizer},
+    synthesizer::{Speech, SpeechInput, SpeechOutput, Synthesizer},
     task::Task,
 };
 use bono_i18n::t;
@@ -33,6 +33,19 @@ pub struct ChatEntry {
     pub text: String,
     /// Small print under it (e.g. the tokens an answer took)
     pub detail: Option<String>,
+}
+
+/// What the pilot said on the radio, as it was heard.
+pub enum Heard {
+    /// A question, in a language with a voice to answer in
+    Question { text: String, lang: ArrayStr<2> },
+    /// Something said in a language without a voice
+    Unvoiced { text: String, lang: ArrayStr<2> },
+    /// Nothing understood: noise, silence, or a language too unclear
+    Nothing,
+    /// There's no voice to answer with: none at all (`None`), or none for the only language the
+    /// speech to text model understands
+    NoVoice(Option<ArrayStr<2>>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +193,78 @@ impl Engineer {
         self.stop();
         self.new_session = true;
         self.notice(t!("engineer.new_session"));
+    }
+
+    /// What the pilot said on the radio: a question is asked, and anything else is answered
+    /// with why it can't be, cutting off whatever was being said (the pilot talked over it).
+    pub fn hear(
+        &mut self,
+        rt: &Handle,
+        sim: Option<&mut Sim>,
+        config: &Config,
+        synth: &mut Synthesizer,
+        heard: Heard,
+    ) {
+        match heard {
+            Heard::Question { text, lang } => self.ask(rt, sim, config, synth, text, lang),
+            Heard::Unvoiced { text, lang } => {
+                self.stop();
+                let language = language::ui_name(lang);
+                self.notice(t!(
+                    "engineer.no_voice_for",
+                    language = language,
+                    text = text
+                ));
+                self.say_again(rt, config, synth);
+            }
+            Heard::Nothing => {
+                self.stop();
+                self.notice(t!("engineer.not_understood"));
+                self.say_again(rt, config, synth);
+            }
+            Heard::NoVoice(lang) => {
+                self.stop();
+                self.notice(match lang {
+                    Some(lang) => {
+                        t!(
+                            "engineer.no_voice_for_model",
+                            language = language::ui_name(lang)
+                        )
+                    }
+                    None => t!("engineer.no_voices").to_owned(),
+                });
+                self.no_beep();
+            }
+        }
+    }
+
+    /// Asks the pilot to say it again: in the language they last asked in, the app's, or any
+    /// with a voice. Without any voice, the radio's low tone says it can't answer.
+    fn say_again(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer) {
+        let lang = {
+            let config = config.get();
+            let voices = config.voices();
+            let app = ArrayStr::from_str(config.locale().split('-').next().unwrap_or_default());
+            [Some(self.last_lang), app]
+                .into_iter()
+                .flatten()
+                .find(|lang| voices.contains_key(lang))
+                .or_else(|| voices.keys().next().copied())
+        };
+
+        match lang {
+            Some(lang) => self.say(rt, config, synth, t!("engineer.say_again": &lang), lang),
+            None => self.no_beep(),
+        }
+    }
+
+    /// The radio's low tone, as loud as the engineer: there's no voice to answer with.
+    fn no_beep(&mut self) {
+        self.playback = Some(Playback {
+            speech: SpeechOutput::ready(Speech::no_beep(1.0)),
+            stream: None,
+            done: false,
+        });
     }
 
     /// A question typed in the chat, answered like one asked on the radio: spoken in the
