@@ -135,6 +135,7 @@ struct Session {
 struct SessionState {
     conversation: Box<dyn Model>,
     pool: Pool,
+    tool: EngineerTool,
     /// The game session the conversation is about (track, session type and number), for
     /// `auto_session`
     game_session: Option<String>,
@@ -403,6 +404,9 @@ impl Engineer {
             if auto_session {
                 state.follow_game_session().await;
             }
+            // Only the new user message gets a snapshot. Older messages and thinking
+            // blocks remain untouched, preserving the conversation's cached prefix.
+            let question = state.tool.question_with_snapshot(question).await;
             let mut on_text = |text: &str| {
                 if let Some(speech) = &speech {
                     speech.push(text);
@@ -708,8 +712,9 @@ impl Engineer {
             provider::conversation(&model, self.skill.clone(), tools, self.client.clone())?;
 
         // The history cache is built now, so the first history question doesn't wait for it
+        let warming_tool = tool.clone();
         tokio::spawn(async move {
-            if let Err(e) = tool.warm().await {
+            if let Err(e) = warming_tool.warm().await {
                 log::debug!("Not warming the engineer's history yet: {e:#}");
             }
         });
@@ -721,6 +726,7 @@ impl Engineer {
             model,
             state: Arc::new(Mutex::new(SessionState {
                 conversation,
+                tool,
                 pool,
                 game_session: None,
             })),
@@ -857,6 +863,7 @@ mod tests {
         builder.api_key("test");
         let mut state = SessionState {
             conversation: Box::new(builder.build(reqwest::Client::new()).unwrap()),
+            tool: EngineerTool::new(pool.clone(), "".into()),
             pool,
             game_session: None,
         };
