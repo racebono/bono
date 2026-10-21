@@ -1,7 +1,7 @@
 //! Claude, through the Claude API.
 
 use super::{Model, ModelOption, Reply, StopReason, ToolHandler, Tools, Usage, text::TextSink};
-use crate::config::ClaudeConfig;
+use crate::config::{ClaudeCacheTtl, ClaudeConfig};
 use anyhow::{Context, bail};
 use bono_i18n::t;
 use futures::future::{BoxFuture, join_all};
@@ -262,6 +262,7 @@ impl Conversation {
         builder
             .model(config.model())
             .effort(config.effort())
+            .cache_ttl(*config.cache_ttl())
             .max_tokens(*config.max_tokens())
             .compaction(*config.compaction())
             .system(system)
@@ -573,6 +574,7 @@ impl Display for ApiError {
 impl std::error::Error for ApiError {}
 
 pub struct ConversationBuilder {
+    cache_ttl: ClaudeCacheTtl,
     api_key: Option<String>,
     workspace_id: Option<String>,
     base_url: String,
@@ -593,6 +595,7 @@ pub struct ConversationBuilder {
 impl ConversationBuilder {
     pub fn new() -> Self {
         Self {
+            cache_ttl: ClaudeCacheTtl::OneHour,
             api_key: Default::default(),
             workspace_id: Default::default(),
             base_url: BASE_URL.into(),
@@ -643,6 +646,13 @@ impl ConversationBuilder {
     #[inline]
     pub fn effort(&mut self, effort: impl Into<String>) -> &mut Self {
         self.effort = effort.into();
+        self
+    }
+
+    /// The lifetime of both prompt-cache breakpoints. Defaults to one hour.
+    #[inline]
+    pub fn cache_ttl(&mut self, ttl: ClaudeCacheTtl) -> &mut Self {
+        self.cache_ttl = ttl;
         self
     }
 
@@ -771,6 +781,7 @@ impl ConversationBuilder {
                 text: self.system.clone(),
                 cache_control: RequestCacheControl {
                     r#type: "ephemeral",
+                    ttl: Some(self.cache_ttl.as_str()),
                 },
             }],
         };
@@ -796,6 +807,7 @@ impl ConversationBuilder {
                 },
                 cache_control: RequestCacheControl {
                     r#type: "ephemeral",
+                    ttl: Some(self.cache_ttl.as_str()),
                 },
                 system,
                 messages: Vec::new(),
@@ -900,6 +912,8 @@ struct RequestOutputConfig {
 #[derive(Serialize)]
 struct RequestCacheControl {
     r#type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<&'static str>,
 }
 
 #[derive(Deserialize)]
@@ -1674,6 +1688,32 @@ mod tests {
         assert_eq!(types, ["text", "fallback", "text"]);
     }
 
+    #[test]
+    fn configured_cache_ttl_applies_to_both_breakpoints() {
+        for (value, expected) in [(None, "1h"), (Some("5m"), "5m"), (Some("1h"), "1h")] {
+            let mut json = json!({"api_key": "test-key"});
+            if let Some(value) = value {
+                json["cache_ttl"] = json!(value);
+            }
+            let config: ClaudeConfig = serde_json::from_value(json).unwrap();
+            let conversation = Conversation::new(
+                &config,
+                "You are a race engineer.".into(),
+                Tools::default(),
+                reqwest::Client::new(),
+            )
+            .unwrap();
+            let body = serde_json::to_value(&conversation.body).unwrap();
+            let control = json!({"type": "ephemeral", "ttl": expected});
+            assert_eq!(body["cache_control"], control);
+            assert_eq!(body["system"][0]["cache_control"], control);
+            let saved = serde_json::to_value(&config).unwrap();
+            let restored: ClaudeConfig = serde_json::from_value(saved).unwrap();
+            assert_eq!(restored.cache_ttl().as_str(), expected);
+        }
+        assert!(serde_json::from_value::<ClaudeConfig>(json!({"cache_ttl": "10m"})).is_err());
+    }
+
     async fn send(conversation: &mut Conversation, text: &str) -> anyhow::Result<Reply> {
         timeout(Duration::from_secs(5), conversation.send(text.into()))
             .await
@@ -1708,9 +1748,19 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests[0]["system"][0]["text"], "You are a race engineer.");
         assert_eq!(
-            requests[0]["system"][0]["cache_control"]["type"],
-            "ephemeral"
+            requests[0]["system"][0]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
         );
+        for request in requests.iter() {
+            assert_eq!(
+                request["cache_control"],
+                json!({"type": "ephemeral", "ttl": "1h"})
+            );
+            assert_eq!(
+                request["system"][0]["cache_control"],
+                request["cache_control"]
+            );
+        }
         let result = &requests[1]["messages"][2]["content"][0];
         assert_eq!(result["type"], "tool_result");
         assert_eq!(result["tool_use_id"], "t1");

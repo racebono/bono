@@ -39,6 +39,8 @@ Choose the provider and model in the Provider menu. The model must support tool 
 
 Environment variables must be available to the Bono process; the application does not automatically load a `.env` file. Credentials entered in the app are persisted in its JSON configuration.
 
+Claude's **Prompt cache lifetime** setting defaults to `1h`; choose `5m` for shorter caching. The JSON setting is `model.claude.cache_ttl`. It applies to both the system prompt and conversation cache. One-hour cache writes cost more, but keep the cache available between questions more than five minutes apart.
+
 Speech recognition and synthesis run locally. With a remote language-model endpoint, questions and telemetry returned by the engineer's tools are sent to that endpoint. Initial speech-model downloads require internet access.
 
 ## Account integration (no desktop UI yet)
