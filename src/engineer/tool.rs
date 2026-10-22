@@ -4678,8 +4678,8 @@ mod tests {
     async fn topic_guidance_is_available_without_an_extra_lookup() {
         let (_dir, engineer) = race();
         for (command, expected) in [
-            ("corners", "never invent"),
-            ("stint", "never as certain"),
+            ("corners", "Never invent marker boards"),
+            ("stint", "conditional on actual rain/wetness"),
             ("status", "Interpret, don't read out"),
             ("schema", "## 4. Everything else"),
         ] {
