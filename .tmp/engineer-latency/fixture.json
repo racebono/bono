@@ -1,0 +1,8 @@
+{
+  "synthetic": true,
+  "telemetry_rows": 20280,
+  "session_time": 701.5193089835243,
+  "race_time_remaining": 900,
+  "database_bytes": 8613888,
+  "caveat": "Controlled synthetic fixture; not the original eval recording. Review assertions against actual tool output."
+}

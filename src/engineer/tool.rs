@@ -4944,6 +4944,8 @@ mod evals {
     struct Recording {
         tool: Engineer,
         calls: Arc<StdMutex<Vec<String>>>,
+        events: Arc<StdMutex<Vec<serde_json::Value>>>,
+        start: Instant,
     }
 
     impl ToolHandler for Recording {
@@ -4955,11 +4957,20 @@ mod evals {
         ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
             let tool = self.tool.clone();
             let calls = self.calls.clone();
+            let events = self.events.clone();
+            let start = self.start;
             async move {
+                events.lock().unwrap().push(serde_json::json!({
+                    "kind": "tool_start", "ms": start.elapsed().as_millis() as u64,
+                    "input": input,
+                }));
                 let result = match EngineerInput::deserialize(&input) {
                     Ok(parsed) => tool.run(parsed).await,
                     Err(e) => Err(e.into()),
                 };
+                events.lock().unwrap().push(serde_json::json!({
+                    "kind": "tool_end", "ms": start.elapsed().as_millis() as u64,
+                }));
                 let answer = match &result {
                     Ok(text) => text.clone(),
                     Err(e) => format!("ERROR: {e:#}"),
@@ -5067,6 +5078,8 @@ mod evals {
                 async move {
                     let question = tool.question_with_snapshot(prompt.clone()).await;
                     let calls = Arc::new(StdMutex::new(Vec::new()));
+                    let events = Arc::new(StdMutex::new(Vec::new()));
+                    let start = Instant::now();
                     let mut builder = ConversationBuilder::new();
                     builder.model(model).effort(effort).system(system).tool(
                         Engineer::NAME,
@@ -5075,16 +5088,24 @@ mod evals {
                         Recording {
                             tool,
                             calls: calls.clone(),
+                            events: events.clone(),
+                            start,
                         },
                     );
                     let mut conversation = builder.build(reqwest::Client::new()).unwrap();
 
-                    let start = Instant::now();
-                    let reply = conversation.send(question.clone()).await;
+                    let reply = conversation.send_streaming(question.clone(), &mut |text| {
+                        events.lock().unwrap().push(serde_json::json!({
+                            "kind": "text", "ms": start.elapsed().as_millis() as u64,
+                            "text": text,
+                        }));
+                    }).await;
                     let elapsed = start.elapsed();
 
                     let outputs = dir.join("outputs");
                     std::fs::create_dir_all(&outputs).unwrap();
+                    std::fs::write(dir.join("events.json"),
+                        serde_json::to_string_pretty(&*events.lock().unwrap()).unwrap()).unwrap();
                     let (text, usage) = match &reply {
                         Ok(reply) => (
                             reply.text.clone(),
@@ -5112,6 +5133,9 @@ mod evals {
                             "tool_calls": tool_calls,
                             "answered_without_tool_call": reply.is_ok() && tool_calls == 0,
                             "cache_read_tokens": reply.as_ref().map_or(0, |r| r.usage.cache_read_tokens),
+                            "input_tokens": reply.as_ref().map_or(0, |r| r.usage.total_input_tokens()),
+                            "output_tokens": reply.as_ref().map_or(0, |r| r.usage.output_tokens),
+                            "success": reply.is_ok(),
                             "total_tokens": tokens,
                             "duration_ms": elapsed.as_millis() as u64,
                             "total_duration_seconds": elapsed.as_secs_f64(),

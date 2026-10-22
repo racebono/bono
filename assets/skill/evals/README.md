@@ -14,6 +14,17 @@ with matching `EVAL_IDS`; running every case against one database gives invalid 
 The ignored Rust harness records replies and transcripts but does not itself grade these
 behavioral assertions. Check API errors and grade the recorded answers explicitly.
 
+Also inspect streaming text and tool-call timestamps for responsiveness. For slow
+corner/history/SQL requests, the acknowledgement must be emitted as a separate text
+block ending in a newline before the first tool call, followed by the answer after
+the results. An acknowledgement prepended to the final answer fails even if its words
+are correct. Check that the acknowledgement reaches speech before tool work finishes.
+For a standalone radio check or facts present in the attached snapshot, expect a direct
+answer with zero tool calls and no acknowledgement preamble. Compare time to first text
+and first audible speech separately from total completion time, using the same model,
+effort and fixture for baseline and candidate. Record measured times; a transcript alone
+cannot establish improved latency.
+
 Use the same database, model and effort for the old and new skill, with multiple runs.
 Build both versions: topic references are compiled into the tool, so changing only
 `EVAL_SKILL` leaves the newer tool guidance in the baseline. Save distinct `EVAL_CONFIG`
