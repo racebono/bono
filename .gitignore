@@ -6,3 +6,4 @@ TODO.md
 *.log
 reports/
 research_notes/
+.tmp/
