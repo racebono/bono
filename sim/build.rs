@@ -11,7 +11,7 @@ use std::{
 const HEADERS: &[&str] = &["forecast.h", "scoring.h", "telemetry.h"];
 
 fn main() {
-    let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("../include");
+    let include = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../include");
     println!("cargo::rerun-if-changed={}", include.display());
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
 
@@ -63,7 +63,11 @@ fn sim_columns(include: &Path, out: &Path) {
 
         for (name, columns) in column_lists(&text) {
             writeln!(code, "macro_rules! {} {{", name.to_lowercase()).unwrap();
-            writeln!(code, "    ($m:ident!($($args:tt)*)) => {{ $m! {{ $($args)* [").unwrap();
+            writeln!(
+                code,
+                "    ($m:ident!($($args:tt)*)) => {{ $m! {{ $($args)* ["
+            )
+            .unwrap();
             for (ty, column, compared) in columns {
                 writeln!(code, "        ({ty}, {column}, {compared}),").unwrap();
             }
@@ -154,11 +158,7 @@ impl ParseCallbacks for PrivateFields {
 }
 
 /// Structs with no strings, which can be `Copy` (`bono_opt_string` owns its string).
-const COPY_STRUCTS: &[&str] = &[
-    "bono_wheel_telemetry",
-    "bono_car_state",
-    "bono_telemetry",
-];
+const COPY_STRUCTS: &[&str] = &["bono_wheel_telemetry", "bono_car_state", "bono_telemetry"];
 
 /// bindgen can't see the traits of the hand-written `bono_opt_*` types (they're
 /// blocklisted), so it derives nothing for the structs containing them: add the derives back.
