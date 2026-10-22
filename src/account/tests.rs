@@ -271,12 +271,18 @@ async fn cancelled_browser_login_cannot_resurrect_a_logged_out_session() {
     let store = Arc::new(MemoryStore::default());
     let base = validate_origin("https://example.com").unwrap();
     let account = Account::with_store(base.clone(), store).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let pending = PendingLogin {
         verification_uri: base,
-        device_code: "device".into(),
+        redirect_uri: Url::parse(&format!(
+            "http://{}/callback",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap(),
+        listener,
+        state: "state".into(),
         verifier: "verifier".into(),
         deadline: Instant::now() + Duration::from_secs(60),
-        interval: Duration::ZERO,
         generation: 0,
         owner: account.inner.clone(),
     };
@@ -292,23 +298,96 @@ async fn cancelled_browser_login_cannot_resurrect_a_logged_out_session() {
 }
 
 #[tokio::test]
-async fn browser_approval_polls_then_persists_login_before_publishing_identity() {
+async fn browser_callback_exchanges_code_and_persists_login() {
     let store = Arc::new(MemoryStore::default());
     let (base, http) = server(vec![
-        ("/start", 200, serde_json::json!({"device_code":"device-secret","verification_uri":"$ORIGIN/desktop/authorize?request=public-id","expires_in":600,"interval":1}), "\"code_challenge_method\":\"s256\""),
-        ("/token", 400, serde_json::json!({"error":"authorization_pending"}), "\"code_verifier\":"),
-        ("/token", 200, tokens(), "device-secret"),
+        ("/start", 200, serde_json::json!({"verification_uri":"$ORIGIN/desktop/authorize?request=public-id","expires_in":600}), "\"redirect_uri\":\"http://127.0.0.1:"),
+        ("/exchange", 200, tokens(), "\"code\":\"one-time-code\""),
     ]).await;
     let account = Account::with_store(base.clone(), store.clone())
         .await
         .unwrap();
     let pending = account.begin_login().await.unwrap();
     assert_eq!(pending.verification_uri.origin(), base.origin());
-    assert!(!pending.verification_uri.as_str().contains("device-secret"));
+    let mut callback = pending.redirect_uri.clone();
+    callback
+        .query_pairs_mut()
+        .append_pair("code", "one-time-code")
+        .append_pair("state", &pending.state);
+    let address = pending.listener.local_addr().unwrap();
     assert_eq!(account.status(), Status::SignedOut);
-    assert_eq!(account.complete_login(pending).await.unwrap(), user());
+    let completion = tokio::spawn({
+        let account = account.clone();
+        async move { account.complete_login(pending).await }
+    });
+    // An unrelated request must not consume the pending login.
+    let invalid = Client::new()
+        .get(format!("http://{address}/callback?code=bad&state=wrong"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    let reply = Client::new().get(callback).send().await.unwrap();
+    assert_eq!(reply.status(), StatusCode::OK);
+    assert!(reply.text().await.unwrap().contains("You're signed in"));
+    assert_eq!(completion.await.unwrap().unwrap(), user());
     assert_eq!(saved(&store).refresh_token, "refresh-new");
     assert_eq!(account.status(), Status::SignedIn(user()));
+    assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    http.await.unwrap();
+}
+
+#[test]
+fn callback_rejects_wrong_host_state_path_and_ambiguous_outcomes() {
+    let redirect = Url::parse("http://127.0.0.1:49152/callback").unwrap();
+    let parse = |target: &str, host: &str| {
+        parse_callback(
+            format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes(),
+            &redirect,
+            "expected",
+        )
+    };
+    assert_eq!(
+        parse("/callback?code=code&state=expected", "127.0.0.1:49152").unwrap(),
+        Some("code".into())
+    );
+    assert_eq!(
+        parse(
+            "/callback?error=access_denied&state=expected",
+            "127.0.0.1:49152"
+        )
+        .unwrap(),
+        None
+    );
+    for target in [
+        "/other?code=x&state=expected",
+        "/callback?code=x&state=wrong",
+        "/callback?code=x&state=expected&state=expected",
+        "/callback?code=x&code=y&state=expected",
+        "/callback?code=x&error=denied&state=expected",
+        "/callback?state=expected",
+    ] {
+        assert!(parse(target, "127.0.0.1:49152").is_err());
+    }
+    assert!(parse("/callback?code=x&state=expected", "evil.example").is_err());
+}
+
+#[tokio::test]
+async fn dropping_pending_login_closes_listener() {
+    let (base, http) = server(vec![(
+        "/start",
+        200,
+        serde_json::json!({"verification_uri":"$ORIGIN/desktop/authorize","expires_in":600}),
+        "s256",
+    )])
+    .await;
+    let account = Account::with_store(base, Arc::new(MemoryStore::default()))
+        .await
+        .unwrap();
+    let pending = account.begin_login().await.unwrap();
+    let address = pending.listener.local_addr().unwrap();
+    drop(pending);
+    assert!(tokio::net::TcpStream::connect(address).await.is_err());
     http.await.unwrap();
 }
 
@@ -368,5 +447,71 @@ async fn login_rejects_cross_origin_verification_url() {
             .to_string()
             .contains("Untrusted")
     );
+    http.await.unwrap();
+}
+
+#[tokio::test]
+async fn denied_callback_and_timeout_leave_account_signed_out() {
+    for denied in [true, false] {
+        let store = Arc::new(MemoryStore::default());
+        let (base, http) = server(vec![(
+            "/start",
+            200,
+            serde_json::json!({"verification_uri":"$ORIGIN/desktop/authorize","expires_in":600}),
+            "s256",
+        )])
+        .await;
+        let account = Account::with_store(base, store.clone()).await.unwrap();
+        let mut pending = account.begin_login().await.unwrap();
+        let address = pending.listener.local_addr().unwrap();
+        if denied {
+            let mut callback = pending.redirect_uri.clone();
+            callback
+                .query_pairs_mut()
+                .append_pair("error", "access_denied")
+                .append_pair("state", &pending.state);
+            let (result, response) = tokio::join!(
+                account.complete_login(pending),
+                Client::new().get(callback).send()
+            );
+            assert!(result.unwrap_err().to_string().contains("denied"));
+            assert_eq!(response.unwrap().status(), StatusCode::BAD_REQUEST);
+        } else {
+            pending.deadline = Instant::now();
+            assert!(
+                account
+                    .complete_login(pending)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("expired")
+            );
+        }
+        assert_eq!(account.status(), Status::SignedOut);
+        assert!(store.load().unwrap().is_none());
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        http.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn aborting_login_task_closes_callback_listener() {
+    let (base, http) = server(vec![(
+        "/start",
+        200,
+        serde_json::json!({"verification_uri":"$ORIGIN/desktop/authorize","expires_in":600}),
+        "s256",
+    )])
+    .await;
+    let account = Account::with_store(base, Arc::new(MemoryStore::default()))
+        .await
+        .unwrap();
+    let pending = account.begin_login().await.unwrap();
+    let address = pending.listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { account.complete_login(pending).await });
+    tokio::task::yield_now().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(tokio::net::TcpStream::connect(address).await.is_err());
     http.await.unwrap();
 }
