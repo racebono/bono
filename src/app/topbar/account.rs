@@ -49,7 +49,7 @@ impl AccountTopbar {
                 });
             });
             if self.logging_in && ui.button(t!("cancel")).clicked() {
-                // Task aborts its future on drop, stopping browser-approval polling.
+                // Task aborts its future on drop, closing the browser callback listener.
                 self.operation = None;
             }
         } else {

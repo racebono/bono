@@ -10,7 +10,11 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, watch};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    sync::{Mutex, watch},
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct User {
@@ -86,20 +90,19 @@ struct Inner {
 /// In-progress login secrets intentionally do not implement Debug or Serialize.
 pub struct PendingLogin {
     pub verification_uri: Url,
-    device_code: String,
+    listener: TcpListener,
+    redirect_uri: Url,
+    state: String,
     verifier: String,
     deadline: Instant,
-    interval: Duration,
     generation: u64,
     owner: Arc<Inner>,
 }
 
 #[derive(Deserialize)]
 struct StartResponse {
-    device_code: String,
     verification_uri: String,
     expires_in: u64,
-    interval: u64,
 }
 #[derive(Deserialize)]
 struct Tokens {
@@ -185,9 +188,14 @@ impl Account {
             "Log out before signing in to another account"
         );
         state.generation += 1;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("Could not start local sign-in server")?;
+        let redirect_uri = Url::parse(&format!("http://{}/callback", listener.local_addr()?))?;
+        let login_state = new_verifier()?;
         let verifier = new_verifier()?;
         let response = self.inner.client.post(self.endpoint("start"))
-            .json(&serde_json::json!({"code_challenge": challenge(&verifier), "code_challenge_method": "S256"}))
+            .json(&serde_json::json!({"code_challenge": challenge(&verifier), "code_challenge_method": "S256", "redirect_uri": redirect_uri.as_str(), "state": login_state}))
             .send().await.context("Could not start account login")?;
         ensure!(
             response.status().is_success(),
@@ -203,17 +211,16 @@ impl Account {
             "Untrusted login URL"
         );
         ensure!(
-            !start.device_code.is_empty()
-                && (1..=1800).contains(&start.expires_in)
-                && (1..=60).contains(&start.interval),
+            (1..=1800).contains(&start.expires_in),
             "Invalid login parameters"
         );
         Ok(PendingLogin {
             verification_uri,
-            device_code: start.device_code,
+            listener,
+            redirect_uri,
+            state: login_state,
             verifier,
             deadline: Instant::now() + Duration::from_secs(start.expires_in),
-            interval: Duration::from_secs(start.interval),
             generation: state.generation,
             owner: self.inner.clone(),
         })
@@ -227,43 +234,84 @@ impl Account {
         self.complete_login(pending).await
     }
 
-    /// Poll until browser approval. Dropping this future cancels local polling.
-    pub async fn complete_login(&self, mut pending: PendingLogin) -> anyhow::Result<User> {
+    /// Wait for the browser callback. Dropping this future closes the local listener.
+    pub async fn complete_login(&self, pending: PendingLogin) -> anyhow::Result<User> {
         ensure!(
             Arc::ptr_eq(&pending.owner, &self.inner),
             "Login belongs to a different account client"
         );
-        loop {
-            ensure!(Instant::now() < pending.deadline, "Login request expired");
-            tokio::time::sleep(pending.interval).await;
-            let mut state = self.inner.state.lock().await;
-            ensure!(
-                state.generation == pending.generation,
-                "Login was cancelled"
-            );
-            ensure!(Instant::now() < pending.deadline, "Login request expired");
-            let response = self.inner.client.post(self.endpoint("token"))
-                .json(&serde_json::json!({"device_code": pending.device_code, "code_verifier": pending.verifier}))
-                .send().await.context("Could not complete account login")?;
-            let status = response.status();
-            if status.is_success() {
-                let tokens: Tokens = response.json().await.context("Invalid token response")?;
-                return self.install(&mut state, tokens).await;
-            }
-            if status == StatusCode::TOO_MANY_REQUESTS {
-                pending.interval =
-                    (pending.interval + Duration::from_secs(5)).min(Duration::from_secs(60));
-                continue;
-            }
-            let error = response.json::<ApiError>().await.ok();
-            match (status, error.as_ref().map(|e| e.error.as_str())) {
-                (StatusCode::BAD_REQUEST, Some("authorization_pending")) => {}
-                (StatusCode::BAD_REQUEST, Some("slow_down")) => {
-                    pending.interval += Duration::from_secs(5)
+        let remaining = pending.deadline.saturating_duration_since(Instant::now());
+        tokio::time::timeout(remaining, async {
+            loop {
+                ensure!(
+                    self.inner.state.lock().await.generation == pending.generation,
+                    "Login was cancelled"
+                );
+                let (mut stream, _) = pending.listener.accept().await?;
+                // Limit each connection so an incomplete request cannot block browser approval.
+                let callback = tokio::time::timeout(Duration::from_secs(5), async {
+                    let mut bytes = Vec::new();
+                    loop {
+                        let mut part = [0; 1024];
+                        let n = stream.read(&mut part).await?;
+                        ensure!(n > 0, "Incomplete callback request");
+                        bytes.extend_from_slice(&part[..n]);
+                        ensure!(bytes.len() <= 8192, "Callback request too large");
+                        if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    parse_callback(&bytes, &pending.redirect_uri, &pending.state)
+                })
+                .await;
+                let result = match callback {
+                    Ok(Ok(result)) => result,
+                    _ => {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(1),
+                            callback_reply(&mut stream, false),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let outcome = async {
+                    let code = result.context("Account login was denied; start a new login")?;
+                    let mut state = self.inner.state.lock().await;
+                    ensure!(
+                        state.generation == pending.generation,
+                        "Login was cancelled"
+                    );
+                    let response = self
+                        .inner
+                        .client
+                        .post(self.endpoint("exchange"))
+                        .json(
+                            &serde_json::json!({"code": code, "code_verifier": pending.verifier,
+                            "redirect_uri": pending.redirect_uri.as_str()}),
+                        )
+                        .send()
+                        .await
+                        .context("Could not complete account login")?;
+                    ensure!(
+                        response.status().is_success(),
+                        "Account login failed ({}); start a new login",
+                        response.status()
+                    );
+                    let tokens: Tokens = response.json().await.context("Invalid token response")?;
+                    self.install(&mut state, tokens).await
                 }
-                _ => bail!("Account login failed ({status}); start a new login"),
+                .await;
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    callback_reply(&mut stream, outcome.is_ok()),
+                )
+                .await;
+                return outcome;
             }
-        }
+        })
+        .await
+        .context("Login request expired")?
     }
 
     /// Restore access after restart. Transient failures leave durable credentials intact.
@@ -497,3 +545,62 @@ fn challenge(verifier: &str) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// Accept only a direct request to our callback, with one matching state and one outcome.
+fn parse_callback(bytes: &[u8], redirect: &Url, state: &str) -> anyhow::Result<Option<String>> {
+    let request = std::str::from_utf8(bytes)?;
+    let mut lines = request.split("\r\n");
+    let mut first = lines
+        .next()
+        .context("Missing callback request")?
+        .split_whitespace();
+    ensure!(first.next() == Some("GET"), "Invalid callback method");
+    let target = first.next().context("Missing callback target")?;
+    ensure!(target.starts_with("/callback?"), "Invalid callback path");
+    ensure!(
+        first.next() == Some("HTTP/1.1") && first.next().is_none(),
+        "Invalid HTTP version"
+    );
+    let hosts: Vec<_> = lines
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.trim())
+        .collect();
+    let expected_host = format!(
+        "127.0.0.1:{}",
+        redirect.port().context("Missing callback port")?
+    );
+    ensure!(hosts == [expected_host.as_str()], "Invalid callback host");
+    let url = redirect.join(target)?;
+    ensure!(
+        url.path() == redirect.path() && url.fragment().is_none(),
+        "Invalid callback URL"
+    );
+    let pairs: Vec<_> = url.query_pairs().collect();
+    let values = |key: &str| {
+        pairs
+            .iter()
+            .filter(|(name, _)| name == key)
+            .map(|(_, value)| value.as_ref())
+            .collect::<Vec<_>>()
+    };
+    ensure!(values("state") == [state], "Invalid callback state");
+    let codes = values("code");
+    let errors = values("error");
+    match (codes.as_slice(), errors.as_slice()) {
+        ([code], []) if !code.is_empty() => Ok(Some((*code).to_owned())),
+        ([], [error]) if !error.is_empty() => Ok(None),
+        _ => bail!("Invalid callback outcome"),
+    }
+}
+
+async fn callback_reply(stream: &mut tokio::net::TcpStream, success: bool) -> anyhow::Result<()> {
+    let body = if success {
+        "You're signed in. You can close this tab and return to Bono."
+    } else {
+        "Sign-in could not be completed. Return to Bono and try again."
+    };
+    let status = if success { "200 OK" } else { "400 Bad Request" };
+    stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
+    Ok(())
+}

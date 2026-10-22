@@ -524,7 +524,10 @@ impl ApiError {
                         .to_owned(),
                 )
             })
-            .or_else(|| Some(body).filter(|body| !body.trim().is_empty()));
+            // Plain text, but not a web page (e.g. a website's 404 page): the status says enough
+            .or_else(|| {
+                Some(body).filter(|body| !body.trim().is_empty() && !body.trim().starts_with('<'))
+            });
         Self { status, message }
     }
 }
