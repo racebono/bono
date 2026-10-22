@@ -11,21 +11,10 @@
         "Uses the race length from the session data without asking the pilot for it",
         "Does not read back values shown on the game UI (virtual energy %, fuel litres, per-lap usage, lap times, time left)",
         "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
-        "Adds nothing the pilot didn't ask for: no advice on what to do, no reasons, no other topics or reassurance"
-      ]
-    },
-    {
-      "id": 2,
-      "prompt": "anyone around me?? feels like someone's on my right",
-      "expected_output": "",
-      "files": [],
-      "assertions": [
-        "Confirms a car alongside on the right",
-        "Identifies it as a lapped car and/or a GT3 (or Hughes)",
-        "No distances in metres, speeds or other numbers the pilot didn't ask for",
-        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
-        "Answers straight away, with no acknowledgement like \"Copy, checking.\" first"
-      ]
+        "Briefly confirms the radio check and also answers the energy question; no extra advice or topics",
+        "Answers all requested parts without unrelated topics or a raw-data recital; at most 45 words excluding a brief acknowledgement"
+      ],
+      "session": "race"
     },
     {
       "id": 3,
@@ -39,20 +28,10 @@
         "Does not name another car as the contact partner",
         "Doesn't blame the slow lap after the hit on the tyres or damage; if it gives a cause, it's the early braking into T2 Curva del Lago",
         "At most 3 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
-        "Starts with a brief acknowledgement of a few words (like \"Copy, checking.\") before the answer, without guessing at the answer in it"
-      ]
-    },
-    {
-      "id": 4,
-      "prompt": "CAR LEFT OR RIGHT??",
-      "expected_output": "",
-      "files": [],
-      "assertions": [
-        "Says the car is on the RIGHT",
-        "Answer is at most ~12 words",
-        "Gives the side only: not who it is, nor the other side",
-        "Answers straight away, with no acknowledgement like \"Copy, checking.\" first"
-      ]
+        "Starts with a brief acknowledgement of a few words (like \"Copy, checking.\") before the answer, without guessing at the answer in it",
+        "Answers all requested parts without unrelated topics or a raw-data recital; at most 45 words excluding a brief acknowledgement"
+      ],
+      "session": "race"
     },
     {
       "id": 5,
@@ -63,7 +42,8 @@
         "Gives a temperature for each of the four tyres",
         "Gives a pressure for each of the four tyres",
         "Stays brief: no unrequested extra topics (energy, gaps, contact)"
-      ]
+      ],
+      "session": "race"
     },
     {
       "id": 6,
@@ -75,20 +55,10 @@
         "Says she is not quicker / not closing",
         "Does not read back lap times or gaps the pilot can see",
         "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
-        "Adds nothing the pilot didn't ask for: no advice on what to do, no reasons, no other topics or reassurance"
-      ]
-    },
-    {
-      "id": 7,
-      "prompt": "how many more track limits can I get away with?",
-      "expected_output": "",
-      "files": [],
-      "assertions": [
-        "Says one more track limit point/warning will bring a penalty",
-        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
         "Adds nothing the pilot didn't ask for: no advice on what to do, no reasons, no other topics or reassurance",
-        "Answers straight away, with no acknowledgement like \"Copy, checking.\" first"
-      ]
+        "Answers all requested parts without unrelated topics or a raw-data recital; at most 45 words excluding a brief acknowledgement"
+      ],
+      "session": "race"
     },
     {
       "id": 8,
@@ -100,8 +70,10 @@
         "Says it is dry / no rain",
         "At most 3 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
         "Adds nothing beyond the time left and the weather (no strategy, tyres or energy)",
-        "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times"
-      ]
+        "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times",
+        "Answers all requested parts without unrelated topics or a raw-data recital; at most 45 words excluding a brief acknowledgement"
+      ],
+      "session": "race"
     },
     {
       "id": 9,
@@ -113,8 +85,10 @@
         "Does not claim big losses elsewhere (the other corners are close to the reference)",
         "Does not volunteer how to fix it (no braking advice) or why, since the pilot only asked where",
         "At most 2 sentences, no lap times read back, not counting a brief acknowledgement like \"Copy, checking.\" before it",
-        "Starts with a brief acknowledgement of a few words (like \"Copy, checking.\") before the answer, without guessing at the answer in it"
-      ]
+        "Starts with a brief acknowledgement of a few words (like \"Copy, checking.\") before the answer, without guessing at the answer in it",
+        "At most 30 words excluding a brief acknowledgement; gives all requested information"
+      ],
+      "session": "race"
     },
     {
       "id": 10,
@@ -126,8 +100,10 @@
         "Phrases the advice relative to the pilot's own driving, without inventing marker boards",
         "Doesn't explain the reasoning or talk about other corners",
         "At most 1 sentence, not counting a brief acknowledgement like \"Copy, checking.\" before it",
-        "Starts with a brief acknowledgement of a few words (like \"Copy, checking.\") before the answer, without guessing at the answer in it"
-      ]
+        "Starts with a brief acknowledgement of a few words (like \"Copy, checking.\") before the answer, without guessing at the answer in it",
+        "At most 30 words excluding a brief acknowledgement; gives all requested information"
+      ],
+      "session": "race"
     },
     {
       "id": 11,
@@ -138,20 +114,10 @@
         "Names T3 / Esse as where lap 7 lost its time",
         "Says it was the exit / too slow through the corner (low apex or exit speed), not the braking point",
         "At most 3 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
-        "Starts with a brief acknowledgement of a few words (like \"Copy, checking.\") before the answer, without guessing at the answer in it"
-      ]
-    },
-    {
-      "id": 12,
-      "prompt": "is it going to rain before the end?",
-      "expected_output": "",
-      "files": [],
-      "assertions": [
-        "Says rain is likely / a good chance late in the race (around the last part / finish), not certain",
-        "Doesn't add other topics (time left, tyres, energy, strategy)",
-        "At most 1 sentence, not counting a brief acknowledgement like \"Copy, checking.\" before it",
-        "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times"
-      ]
+        "Starts with a brief acknowledgement of a few words (like \"Copy, checking.\") before the answer, without guessing at the answer in it",
+        "At most 30 words excluding a brief acknowledgement; gives all requested information"
+      ],
+      "session": "race"
     },
     {
       "id": 13,
@@ -161,8 +127,10 @@
       "assertions": [
         "Says we cannot make it on energy as things are (short by about three laps) so a stop is needed",
         "Does not bring in the weather, tyres or other topics the pilot didn't ask about",
-        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it"
-      ]
+        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
+        "At most 30 words excluding a brief acknowledgement; gives all requested information"
+      ],
+      "session": "race"
     },
     {
       "id": 14,
@@ -173,8 +141,11 @@
         "Names T2 / Curva del Lago as the biggest difference on the last lap",
         "Names only the biggest difference (at most one more if it is similar in size), no rundown of every corner",
         "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
-        "Starts with a brief acknowledgement of a few words (like \"Copy, checking.\") before the answer, without guessing at the answer in it"
-      ]
+        "Starts with a brief acknowledgement of a few words (like \"Copy, checking.\") before the answer, without guessing at the answer in it",
+        "At most 30 words excluding a brief acknowledgement; gives all requested information",
+        "Does not add an unrequested braking explanation or driving advice"
+      ],
+      "session": "race"
     },
     {
       "id": 15,
@@ -186,8 +157,10 @@
         "Gives pressures",
         "Gives wear, with the front left as the most worn",
         "Goes beyond a one sentence verdict, since the pilot asked for everything",
-        "Stays on the tyres (no energy, gaps or weather)"
-      ]
+        "Stays on the tyres (no energy, gaps or weather)",
+        "Covers all four tyres, grouping equal values, without inventing an impact-related cause or unrequested driving advice"
+      ],
+      "session": "race"
     },
     {
       "id": 16,
@@ -198,19 +171,10 @@
         "Says we cannot make it to the end on energy",
         "Says when to box (a lap or a number of laps from now)",
         "Gives a reason for that timing, since the pilot asked why",
-        "At most 3 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it"
-      ]
-    },
-    {
-      "id": 17,
-      "prompt": "when's the rain coming?",
-      "expected_output": "",
-      "files": [],
-      "assertions": [
-        "Says rain is likely (a chance, not certain), building over the next few minutes and most likely by the end",
-        "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times",
-        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it"
-      ]
+        "At most 3 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
+        "Answers all requested parts without unrelated topics or a raw-data recital; at most 45 words excluding a brief acknowledgement"
+      ],
+      "session": "race"
     },
     {
       "id": 18,
@@ -220,8 +184,10 @@
       "assertions": [
         "Dry now, rain chances rising to about 70 percent by the finish",
         "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times",
-        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it"
-      ]
+        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
+        "Answers all requested parts without unrelated topics or a raw-data recital; at most 45 words excluding a brief acknowledgement"
+      ],
+      "session": "race"
     },
     {
       "id": 19,
@@ -232,8 +198,11 @@
         "Treats rain as a chance, not a certainty",
         "Ties any tyre call to when the rain is likely, relative to now or to the stop",
         "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times",
-        "At most 3 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it"
-      ]
+        "At most 3 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
+        "Makes a concrete tyre recommendation (stay on slicks now; prepare/switch to wets only if the track becomes wet), not just a forecast",
+        "At most 45 words after any acknowledgement; answers the requested tyre decision"
+      ],
+      "session": "race"
     },
     {
       "id": 20,
@@ -243,8 +212,10 @@
       "assertions": [
         "Says rain is a good chance late in the race (around 70 percent towards the end), as a chance",
         "Places it in the race with words like early, halfway, late or by the end, never as percent marks or clock times",
-        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it"
-      ]
+        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
+        "At most 30 words excluding a brief acknowledgement; gives all requested information"
+      ],
+      "session": "practice"
     },
     {
       "id": 21,
@@ -254,7 +225,114 @@
       "assertions": [
         "Says it stays dry (rain chances only a few percent) for the rest of practice",
         "Gives forecast timing relative to now (in a number of minutes, soon, later, late in the race, by the end), never as percent marks of the session or session clock times",
-        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it"
+        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
+        "At most 30 words excluding a brief acknowledgement; gives all requested information"
+      ],
+      "session": "practice"
+    },
+    {
+      "id": 22,
+      "prompt": "Where am I losing time and what should I change?",
+      "expected_output": "Controlled synthetic fixture; concise but complete advice",
+      "files": [],
+      "session": "race",
+      "assertions": [
+        "Names T2 / Curva del Lago and the entry phase as the main loss",
+        "Recommends trying to brake about 30 to 40 metres later than the last lap, based on recorded passes",
+        "Answers BOTH where and what to change, in at most 35 words excluding a brief acknowledgement",
+        "No invented marker boards, unrelated corners, raw lap times or unrequested explanation"
+      ]
+    },
+    {
+      "id": 23,
+      "prompt": "Can we make it on energy? If not, when should I box and why, and should I fit wets at that stop?",
+      "expected_output": "Controlled synthetic fixture; concise but complete advice",
+      "files": [],
+      "session": "race",
+      "assertions": [
+        "Says energy is insufficient and gives an actual pit lap or time within the available range",
+        "Gives a supported reason for that timing",
+        "Gives a tyre recommendation for the stop, conditional on actual rain/wetness rather than assuming the forecast is certain",
+        "Answers all FOUR requested parts in at most 60 words excluding a brief acknowledgement",
+        "Does not recite current fuel, energy percentages, tyre measurements or lap times"
+      ]
+    },
+    {
+      "id": 24,
+      "prompt": "All four tyre temperatures, pressures and wear. Keep it brief.",
+      "expected_output": "Controlled synthetic fixture; concise but complete advice",
+      "files": [],
+      "session": "race",
+      "assertions": [
+        "Reports all four temperatures: front left 110, front right 91, rear left 89, rear right 90 degrees, allowing sensible rounding/grouping",
+        "Reports front left pressure 178 and other three 170 kPa",
+        "Reports front left about 64 percent life remaining (or 36 percent worn) and other three about 91 percent remaining (or 9 percent worn)",
+        "Covers ALL three requested measures for ALL four tyres in at most 65 words excluding acknowledgement",
+        "No unrelated energy, weather, contact theory or driving advice"
+      ]
+    },
+    {
+      "id": 25,
+      "prompt": "How are the tyres overall?",
+      "expected_output": "Controlled synthetic fixture; concise but complete advice",
+      "files": [],
+      "session": "race",
+      "assertions": [
+        "Identifies front left as hot/worn and the other three as fine",
+        "At most 20 words excluding acknowledgement; no numeric temperatures, pressures, wear percentages or lap times",
+        "No unrequested driving advice, contact explanation or other topics"
+      ]
+    },
+    {
+      "id": 26,
+      "prompt": "Why was lap 7 slow, and what should I change there?",
+      "expected_output": "Controlled synthetic fixture; concise but complete advice",
+      "files": [],
+      "session": "race",
+      "assertions": [
+        "Names T3 / Esse and the exit/minimum-speed loss rather than a braking-point difference",
+        "Suggests trying to carry more speed through the apex/exit based on the faster recorded pass",
+        "Answers both cause and requested action in at most 40 words excluding acknowledgement",
+        "Does not blame damage/contact/tyres or invent a braking marker",
+        "Does not recite raw speeds or invent steering, line or throttle changes not established by the tool evidence"
+      ]
+    },
+    {
+      "id": 27,
+      "prompt": "Can I make it on energy? Just the verdict.",
+      "expected_output": "Controlled synthetic fixture; concise but complete advice",
+      "files": [],
+      "session": "race",
+      "assertions": [
+        "Says no / cannot make it, optionally giving the approximately three-lap deficit",
+        "At most 15 words excluding acknowledgement",
+        "No stop timing, energy-saving alternative, weather, tyres, fuel or calculation"
+      ]
+    },
+    {
+      "id": 28,
+      "prompt": "Is Ruiz catching me, and how much quicker is she?",
+      "expected_output": "Controlled synthetic fixture; concise but complete advice",
+      "files": [],
+      "session": "race",
+      "assertions": [
+        "Says Ruiz is not catching / is slower, correcting the premise",
+        "Gives the relative pace difference (about half a second slower) rather than listing both lap times",
+        "Answers both trend and relative pace in at most 25 words excluding acknowledgement",
+        "Does not add unrequested gap or position readouts; distinguishes relative lap pace from an observed gap trend when gap history is unavailable"
+      ]
+    },
+    {
+      "id": 29,
+      "prompt": "What would you change about my driving at Curva del Lago? Give me the action and why.",
+      "expected_output": "Controlled synthetic fixture; concise but complete advice",
+      "files": [],
+      "session": "race",
+      "assertions": [
+        "Suggests trying to brake about thirty metres later than the last lap",
+        "Gives the supported reason: the faster pass braked later with the same apex/exit speed, or early braking costs entry time",
+        "Answers both action and reason in at most 35 words excluding acknowledgement",
+        "No invented marker boards, guaranteed optimum, tyre diagnosis or unrelated corners"
       ]
     }
   ]

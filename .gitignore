@@ -4,3 +4,5 @@
 .cargo/config.priv.toml
 TODO.md
 *.log
+reports/
+research_notes/

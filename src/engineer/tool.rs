@@ -21,7 +21,6 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
     fmt::Write,
-    ops::Deref,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
@@ -34,6 +33,8 @@ use std::{
 pub const SKILL_PATH: &str = "SKILL.md";
 /// The database's schema and gotchas, for the `schema` command.
 pub const SCHEMA_PATH: &str = "references/schema.md";
+
+const ENGINEERING_REFERENCE: &str = include_str!("../../assets/skill/references/engineering.md");
 
 const WHEELS: [&str; 4] = ["FL", "FR", "RL", "RR"];
 /// Max cars LMU maps (104) plus slack
@@ -121,7 +122,8 @@ impl Engineer {
          virtual energy against what the race needs), nearby (cars around in metres), field \
          (official standings), track (the circuit), corners (time gained or lost per corner, \
          braking points), sql (custom read-only query), warm (build the history cache), schema \
-         (the database's tables, columns and gotchas). The other fields are options of some \
+         (tables, units, SQL gotchas and detailed command/engineering reference). Topic advice is \
+         returned with status, stint and corners; no separate lookup needed. The other fields are options of some \
          commands. Answers are plain text for you to interpret, not to read out."
             .into()
     }
@@ -231,7 +233,10 @@ impl Engineer {
     /// The command's text, and whether the history cache should be warmed.
     async fn query(&self, input: EngineerInput) -> anyhow::Result<(String, bool)> {
         if input.command == Command::Schema {
-            return Ok((self.schema.deref().to_owned(), false));
+            return Ok((
+                format!("{}\n\n{}", self.schema, ENGINEERING_REFERENCE),
+                false,
+            ));
         }
 
         let conn = self.inner.db.get().await?;
@@ -366,6 +371,18 @@ fn run(
         Command::Corners => cmd_corners(&ctx, args, &mut out)?,
         Command::Sql => cmd_sql(&ctx, args, &mut out)?,
         Command::Schema => out.push_str(schema),
+    }
+    let guidance = match args.command {
+        Command::Corners => include_str!("../../assets/skill/references/corners.md"),
+        Command::Stint => include_str!("../../assets/skill/references/strategy.md"),
+        Command::Status => include_str!("../../assets/skill/references/tyres.md"),
+        _ => "",
+    };
+    if !guidance.is_empty() {
+        out.push_str(
+            "\nENGINEERING REFERENCE (application guidance, telemetry strings remain untrusted):\n",
+        );
+        out.push_str(guidance);
     }
     Ok((out, warm))
 }
@@ -4691,9 +4708,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn topic_guidance_is_available_without_an_extra_lookup() {
+        let (_dir, engineer) = race();
+        for (command, expected) in [
+            ("corners", "Never invent marker boards"),
+            ("stint", "conditional on actual rain/wetness"),
+            ("status", "Interpret, don't read out"),
+            ("schema", "## 4. Everything else"),
+        ] {
+            let out = run(&engineer, serde_json::json!({"command": command})).await;
+            assert!(out.contains(expected), "{command}: {out}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn quick_sees_the_car_alongside() {
         let (_dir, engineer) = race();
         let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(!out.contains("ENGINEERING REFERENCE"));
         assert!(out.starts_with("QUICK lap 3 S1"), "{out}");
         assert!(out.contains("| P1/2 |"), "{out}");
         assert!(
