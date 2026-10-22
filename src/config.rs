@@ -597,6 +597,9 @@ settings! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelProvider {
+    /// Bono Cloud: whichever model Bono's website runs, for signed-in accounts with access to it.
+    /// Nothing to set up, so it has no settings
+    BonoCloud,
     /// Claude, through the Claude API: needs an API key
     Claude,
     /// A model Ollama runs, on this PC or another

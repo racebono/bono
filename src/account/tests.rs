@@ -47,6 +47,30 @@ fn seed(store: &MemoryStore) {
         )
         .unwrap();
 }
+/// Signed in as [`user`] against `base`, with `access_token` good for an hour, for other
+/// modules' tests of APIs that take it.
+pub(crate) fn signed_in(base: Url, access_token: &str) -> Account {
+    let store = MemoryStore::default();
+    seed(&store);
+    let saved = saved(&store);
+    let (status, _) = watch::channel(Status::SignedIn(saved.user.clone()));
+    Account {
+        inner: Arc::new(Inner {
+            base,
+            client: Client::new(),
+            store: Arc::new(store),
+            state: Mutex::new(State {
+                saved: Some(saved),
+                access: Some((
+                    access_token.into(),
+                    Instant::now() + Duration::from_secs(3600),
+                )),
+                generation: 0,
+            }),
+            status,
+        }),
+    }
+}
 fn tokens() -> serde_json::Value {
     serde_json::json!({"token_type":"Bearer","access_token":"access-new","refresh_token":"refresh-new","expires_in":3600,"user":user()})
 }

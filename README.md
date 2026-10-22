@@ -2,7 +2,7 @@
 
 Bono is a desktop AI race engineer and spotter for sim racing. Ask questions by voice or text and get spoken answers grounded in live telemetry: fuel range, tyre condition, lap times, nearby cars, and race standings.
 
-Built in Rust with SDL3 and egui, Bono uses local Whisper speech recognition and Piper text-to-speech. The engineer supports Claude, Ollama, and OpenAI-compatible APIs. An automatic spotter reads telemetry directly to call traffic, flags, car alerts, and weather changes.
+Built in Rust with SDL3 and egui, Bono uses local Whisper speech recognition and Piper text-to-speech. The engineer supports Bono Cloud, Claude, Ollama, and OpenAI-compatible APIs. An automatic spotter reads telemetry directly to call traffic, flags, car alerts, and weather changes.
 
 ## Simulator support
 
@@ -33,6 +33,7 @@ Reopen the guide from Settings at any time. Start your simulator, enter a sessio
 
 Choose the provider and model in the Provider menu. The model must support tool calls so the engineer can query telemetry.
 
+- **Bono Cloud:** offered only while signed in to a Bono account the website authorizes for it. It has no settings: the website chooses the model, the backend serving it, and its parameters. The app calls an OpenAI-compatible chat completions API at `/api/cloud/v1` on `BONO_ACCOUNT_ORIGIN` (`GET models`, streamed `POST chat/completions`), sending the account's access token as the bearer token. The website answers `403` to accounts without access, and Bono hides the provider for them. The website must deploy this endpoint before the provider can be used.
 - **Claude** (the default): enter an API key in the app, or launch it with `ANTHROPIC_API_KEY` set. The client also accepts `ANTHROPIC_AUTH_TOKEN` when no API key is set, and an optional `ANTHROPIC_WORKSPACE_ID`.
 - **Ollama:** run an Ollama server and pull a model before selecting it in Bono. The default address is `http://127.0.0.1:11434`; override it in the app or with `OLLAMA_HOST`.
 - **OpenAI-compatible API:** use a server implementing chat completions and model listing. The default base URL is `http://127.0.0.1:8080/v1`. Set the base URL in the app, including `/v1` where required, and use `OPENAI_API_KEY` if authentication is required. This adapter supports local servers such as llama.cpp and LM Studio as well as hosted endpoints. For llama.cpp, enable tool calling with `--jinja`.

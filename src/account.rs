@@ -164,11 +164,14 @@ impl Account {
         self.inner.status.borrow().clone()
     }
 
+    /// `path` (absolute, e.g. `/api/cloud/v1`) on the account's website, for other APIs that
+    /// take its access token.
+    pub fn url(&self, path: &str) -> Url {
+        self.inner.base.join(path).expect("fixed API path")
+    }
+
     fn endpoint(&self, name: &str) -> Url {
-        self.inner
-            .base
-            .join(&format!("/api/desktop/auth/{name}"))
-            .expect("fixed API path")
+        self.url(&format!("/api/desktop/auth/{name}"))
     }
 
     /// Prepare login without opening a window, allowing callers to display/open the URL.
@@ -480,4 +483,4 @@ fn challenge(verifier: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

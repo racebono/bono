@@ -1120,6 +1120,26 @@
         "es": " (descárgalo con `ollama pull`)",
         "ca": " (baixa'l amb `ollama pull`)"
     },
+    "provider.bono_cloud_hover": {
+        "en": "Bono's own engineer models, included with your Bono account: nothing to set up",
+        "es": "Los modelos de ingeniero de Bono, incluidos con tu cuenta de Bono: no hay nada que configurar",
+        "ca": "Els models d'enginyer de Bono, inclosos amb el teu compte de Bono: no cal configurar res"
+    },
+    "provider.bono_cloud_about": {
+        "en": "Bono Cloud picks the model and its settings for you.",
+        "es": "Bono Cloud elige el modelo y su configuración por ti.",
+        "ca": "Bono Cloud tria el model i la seva configuració per tu."
+    },
+    "provider.bono_cloud_unavailable": {
+        "en": "Bono Cloud needs a signed-in Bono account with access to it",
+        "es": "Bono Cloud necesita una cuenta de Bono con acceso, con la sesión iniciada",
+        "ca": "Bono Cloud necessita un compte de Bono amb accés, amb la sessió iniciada"
+    },
+    "provider.bono_cloud_sign_in": {
+        "en": "Sign in to your Bono account to use Bono Cloud",
+        "es": "Inicia sesión en tu cuenta de Bono para usar Bono Cloud",
+        "ca": "Inicia la sessió al teu compte de Bono per fer servir Bono Cloud"
+    },
     "provider.openai_hover": {
         "en": "Any OpenAI-compatible API: llama.cpp's llama-server (started with --jinja), LM Studio, vLLM, OpenRouter, OpenAI...",
         "es": "Cualquier API compatible con OpenAI: llama-server de llama.cpp (iniciado con --jinja), LM Studio, vLLM, OpenRouter, OpenAI...",
@@ -1299,6 +1319,11 @@
         "en": "A model Ollama runs, on this PC or another on your network.",
         "es": "Un modelo que ejecuta Ollama, en este PC o en otro de tu red.",
         "ca": "Un model que executa Ollama, en aquest PC o en un altre de la teva xarxa."
+    },
+    "onboarding.bono_cloud": {
+        "en": "Included with your Bono account: nothing to set up",
+        "es": "Incluido con tu cuenta de Bono: no hay nada que configurar",
+        "ca": "Inclòs amb el teu compte de Bono: no cal configurar res"
     },
     "onboarding.openai": {
         "en": "Any OpenAI-compatible server: llama.cpp, LM Studio, vLLM, OpenRouter...",

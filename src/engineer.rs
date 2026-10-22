@@ -3,6 +3,7 @@
 //! is spoken back over the radio as the model writes it.
 
 use crate::{
+    account::Account,
     arrstr,
     config::{ArrayStr, Config, ModelConfig, RawConfig},
     language::{self, LanguageDetector},
@@ -78,6 +79,8 @@ pub enum Speaker {
 
 pub struct Engineer {
     client: reqwest::Client,
+    /// Who Bono Cloud is used as
+    account: Option<Account>,
     skill: Arc<str>,
     schema: Arc<str>,
     /// Everything said, for the chat
@@ -146,6 +149,7 @@ impl Engineer {
         assets_path: &Path,
         config: &RawConfig,
         client: reqwest::Client,
+        account: Option<Account>,
     ) -> anyhow::Result<Self> {
         let (skill, schema) = tokio::try_join!(
             tokio::fs::read_to_string(assets_path.join(config.skill_path()).join(SKILL_PATH)),
@@ -154,6 +158,7 @@ impl Engineer {
 
         Ok(Self {
             client,
+            account,
             skill: instructions(skill).into(),
             schema: schema.into(),
             chat: Vec::new(),
@@ -708,8 +713,13 @@ impl Engineer {
             tool.clone(),
         );
         let model = config.get().model.clone();
-        let conversation =
-            provider::conversation(&model, self.skill.clone(), tools, self.client.clone())?;
+        let conversation = provider::conversation(
+            &model,
+            self.account.as_ref(),
+            self.skill.clone(),
+            tools,
+            self.client.clone(),
+        )?;
 
         // The history cache is built now, so the first history question doesn't wait for it
         let warming_tool = tool.clone();
@@ -817,7 +827,12 @@ mod tests {
             .build()
             .unwrap();
         let mut engineer = rt
-            .block_on(Engineer::new(Path::new("assets"), &config.get(), client))
+            .block_on(Engineer::new(
+                Path::new("assets"),
+                &config.get(),
+                client,
+                None,
+            ))
             .unwrap();
 
         let questions = std::env::var("EVAL_QUESTIONS")

@@ -139,6 +139,15 @@ impl Conversation {
         builder.build(client)
     }
 
+    /// Sends `api_key` as the bearer token from now on, for credentials that expire.
+    pub(super) fn set_api_key(&mut self, api_key: &str) -> anyhow::Result<()> {
+        self.headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {api_key}"))?,
+        );
+        Ok(())
+    }
+
     async fn run_turn(&mut self, text: String, sink: &mut TextSink<'_>) -> anyhow::Result<Reply> {
         self.body.messages.push(serde_json::json!({
             "role": "user",

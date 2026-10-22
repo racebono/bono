@@ -1,12 +1,17 @@
 //! The language models the race engineer talks through, whoever runs them: a [`Model`] is one
-//! conversation with one, tool calls included. [`claude`] is Claude's (the Claude API), and
-//! [`ollama`] any model Ollama runs; others (e.g. OpenAI's) implement the same trait.
+//! conversation with one, tool calls included. [`claude`] is Claude's (the Claude API),
+//! [`ollama`] any model Ollama runs, and [`bono_cloud`] whichever Bono's website runs for the
+//! signed-in account; others (e.g. OpenAI's) implement the same trait.
 
-use crate::config::{ModelConfig, ModelProvider};
+use crate::{
+    account::Account,
+    config::{ModelConfig, ModelProvider},
+};
 use futures::future::BoxFuture;
 pub use openai::DEFAULT_BASE_URL as OPENAI_DEFAULT_BASE_URL;
 use std::{collections::BTreeMap, ops::AddAssign, sync::Arc};
 
+pub mod bono_cloud;
 pub mod claude;
 pub mod ollama;
 pub mod openai;
@@ -25,12 +30,14 @@ pub struct ModelOption {
 }
 
 /// The models the provider `config` picks offers (for Ollama, the ones pulled at its host; for
-/// an OpenAI-compatible API, the ones at its URL).
+/// an OpenAI-compatible API, the ones at its URL; for Bono Cloud, the ones `account` may use).
 pub async fn models(
     config: &ModelConfig,
+    account: Option<&Account>,
     client: &reqwest::Client,
 ) -> anyhow::Result<Vec<ModelOption>> {
     match config.provider() {
+        ModelProvider::BonoCloud => bono_cloud::models(account, client).await,
         ModelProvider::Claude => claude::models(&config.claude, client).await,
         ModelProvider::Ollama => ollama::models(config.ollama.host().as_deref(), client).await,
         ModelProvider::OpenAi => {
@@ -73,14 +80,19 @@ pub trait Model: Send {
     fn usage(&self) -> &BTreeMap<String, Usage>;
 }
 
-/// A conversation with the model `config` picks, with the `system` prompt and `tools`.
+/// A conversation with the model `config` picks, with the `system` prompt and `tools`. Bono
+/// Cloud's is as `account`.
 pub fn conversation(
     config: &ModelConfig,
+    account: Option<&Account>,
     system: Arc<str>,
     tools: Tools,
     client: reqwest::Client,
 ) -> anyhow::Result<Box<dyn Model>> {
     Ok(match config.provider() {
+        ModelProvider::BonoCloud => Box::new(bono_cloud::Conversation::new(
+            account, system, tools, client,
+        )?),
         ModelProvider::Claude => Box::new(claude::Conversation::new(
             &config.claude,
             system,

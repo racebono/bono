@@ -1,6 +1,7 @@
 //! The language model the engineer talks through: who runs it, which model, and how.
 
 use crate::{
+    account::{Account, Status},
     app::topbar::{pick, setup_label, size_text},
     config::{
         ClaudeConfig, Config, ModelConfig, ModelProvider, OllamaConfig, OpenAiConfig, Setting,
@@ -51,6 +52,10 @@ fn effort_name(effort: &str) -> String {
 
 pub struct ProviderTopbar {
     client: reqwest::Client,
+    /// Who Bono Cloud is used as
+    account: Option<Account>,
+    /// Whether the signed-in account may use Bono Cloud
+    cloud: Option<CloudAccess>,
     /// The provider's models, fetched when the tab first shows them
     models: Option<Models>,
     /// The address being typed (Ollama's host, or the API's URL): set once it's done (Enter, or
@@ -62,6 +67,13 @@ pub struct ProviderTopbar {
     workspace_id: Option<String>,
 }
 
+/// Whether one account may use Bono Cloud.
+struct CloudAccess {
+    /// The account's user id
+    user: String,
+    authorized: MaybeDone<anyhow::Result<bool>>,
+}
+
 /// The models one provider offers.
 struct Models {
     provider: ModelProvider,
@@ -71,9 +83,11 @@ struct Models {
 }
 
 impl ProviderTopbar {
-    pub fn new(client: &reqwest::Client) -> Self {
+    pub fn new(client: &reqwest::Client, account: Option<&Account>) -> Self {
         Self {
             client: client.clone(),
+            account: account.cloned(),
+            cloud: None,
             models: None,
             host: None,
             api_key: None,
@@ -85,11 +99,24 @@ impl ProviderTopbar {
         let model = config.get().model.clone();
         let provider = *model.provider();
         self.refetch(&model);
+        let cloud = self.cloud_access(rt);
 
         config.maybe_update(|raw| {
             let mut changed = raw.model.provider.edit(provider, |provider| {
                 ui.horizontal(|ui| {
                     ui.label(t!("provider.label"));
+                    // Kept while picked, so it can be switched away from
+                    let mut cloud_clicked = false;
+                    if cloud == Some(true) || *provider == ModelProvider::BonoCloud {
+                        cloud_clicked = ui
+                            .selectable_value(
+                                provider,
+                                ModelProvider::BonoCloud,
+                                setup_label(cloud == Some(false), "Bono Cloud"),
+                            )
+                            .on_hover_text(t!("provider.bono_cloud_hover"))
+                            .clicked();
+                    }
                     let no_credentials = !provider::claude::has_credentials(&model.claude);
                     let mut claude = ui
                         .selectable_value(
@@ -107,13 +134,17 @@ impl ProviderTopbar {
                     let openai = ui
                         .selectable_value(provider, ModelProvider::OpenAi, "OpenAI")
                         .on_hover_text(t!("provider.openai_hover"));
-                    claude.clicked() || ollama.clicked() || openai.clicked()
+                    cloud_clicked || claude.clicked() || ollama.clicked() || openai.clicked()
                 })
                 .inner
             });
             ui.separator();
 
             changed |= match provider {
+                ModelProvider::BonoCloud => {
+                    bono_cloud(ui, cloud);
+                    false
+                }
                 ModelProvider::Claude => self.claude(rt, ui, &mut raw.model.claude),
                 ModelProvider::Ollama => self.ollama(rt, ui, &mut raw.model.ollama),
                 ModelProvider::OpenAi => self.openai(rt, ui, &mut raw.model.openai),
@@ -131,10 +162,19 @@ impl ProviderTopbar {
         let model = config.get().model.clone();
         let provider = *model.provider();
         self.refetch(&model);
+        let cloud = self.cloud_access(rt);
 
         config.maybe_update(|raw| {
             let mut changed = raw.model.provider.edit(provider, |provider| {
                 let no_credentials = !provider::claude::has_credentials(&model.claude);
+                let cloud_option = (cloud == Some(true) || *provider == ModelProvider::BonoCloud)
+                    .then(|| {
+                        (
+                            ModelProvider::BonoCloud,
+                            setup_label(cloud == Some(false), "Bono Cloud"),
+                            t!("onboarding.bono_cloud"),
+                        )
+                    });
                 let options = [
                     (
                         ModelProvider::Claude,
@@ -153,7 +193,7 @@ impl ProviderTopbar {
                     ),
                 ];
                 let mut changed = false;
-                for (option, label, about) in options {
+                for (option, label, about) in cloud_option.into_iter().chain(options) {
                     changed |= ui.radio_value(provider, option, label).changed();
                     ui.indent(about, |ui| ui.weak(about));
                 }
@@ -162,6 +202,10 @@ impl ProviderTopbar {
             ui.add_space(8.0);
 
             changed |= match provider {
+                ModelProvider::BonoCloud => {
+                    bono_cloud(ui, cloud);
+                    false
+                }
                 ModelProvider::Claude => {
                     let claude = &mut raw.model.claude;
                     let mut changed = self.api_key(ui, claude);
@@ -193,6 +237,8 @@ impl ProviderTopbar {
     /// Whether the provider could be reached, and offers the model picked.
     fn status(&mut self, rt: &Handle, ui: &mut egui::Ui, model: &ModelConfig) {
         let picked = match model.provider() {
+            // Whichever the website picks
+            ModelProvider::BonoCloud => "",
             ModelProvider::Claude => model.claude.model(),
             ModelProvider::Ollama => model.ollama.model(),
             ModelProvider::OpenAi => model.openai.model(),
@@ -235,6 +281,7 @@ impl ProviderTopbar {
         // Asked again next frame
         if check {
             self.models = None;
+            self.cloud = None;
         }
     }
 
@@ -468,13 +515,14 @@ impl ProviderTopbar {
         // Asked again next frame
         if refresh {
             self.models = None;
+            self.cloud = None;
         }
         changed
     }
 
     /// Asks for the provider's models again if it's another provider, or another address.
     fn refetch(&mut self, model: &ModelConfig) {
-        let host = location(model);
+        let host = location(model, self.account.as_ref());
         let stale = self
             .models
             .as_ref()
@@ -486,26 +534,97 @@ impl ProviderTopbar {
 
     fn fetch(&mut self, model: ModelConfig) {
         let client = self.client.clone();
+        let account = self.account.clone();
         self.models = Some(Models {
             provider: *model.provider(),
-            host: location(&model),
-            list: MaybeDone::spawn(async move { provider::models(&model, &client).await }),
+            host: location(&model, account.as_ref()),
+            list: MaybeDone::spawn(async move {
+                provider::models(&model, account.as_ref(), &client).await
+            }),
         });
+    }
+
+    /// Whether the account may use Bono Cloud: `None` while it's being asked. Asked again for
+    /// another account.
+    fn cloud_access(&mut self, rt: &Handle) -> Option<bool> {
+        let user = match self.account.as_ref().map(Account::status) {
+            Some(Status::SignedIn(user)) => user,
+            Some(Status::SignedOut) | None => {
+                self.cloud = None;
+                return Some(false);
+            }
+        };
+
+        if self
+            .cloud
+            .as_ref()
+            .is_none_or(|cloud| cloud.user != user.id)
+        {
+            let account = self.account.clone().unwrap();
+            let client = self.client.clone();
+            self.cloud = Some(CloudAccess {
+                user: user.id,
+                authorized: MaybeDone::spawn(async move {
+                    provider::bono_cloud::authorized(&account, &client).await
+                }),
+            });
+        }
+
+        let authorized = self.cloud.as_mut()?.authorized.update(rt)?;
+        Some(match authorized {
+            Ok(authorized) => *authorized,
+            Err(e) => {
+                log::debug!("Couldn't tell whether Bono Cloud may be used: {e:#}");
+                false
+            }
+        })
+    }
+
+    /// Whether the provider picked can't be used yet: Claude, without credentials, or Bono Cloud,
+    /// without an account that may use it.
+    pub fn needs_setup(&mut self, rt: &Handle, config: &Config) -> bool {
+        match config.get().model.provider() {
+            ModelProvider::BonoCloud => self.cloud_access(rt) == Some(false),
+            ModelProvider::Claude => !provider::claude::has_credentials(&config.get().model.claude),
+            ModelProvider::Ollama | ModelProvider::OpenAi => false,
+        }
     }
 }
 
-/// Whether the provider picked can't be used yet: Claude, without credentials.
-pub fn needs_setup(config: &Config) -> bool {
-    match config.get().model.provider() {
-        ModelProvider::Claude => !provider::claude::has_credentials(&config.get().model.claude),
-        ModelProvider::Ollama | ModelProvider::OpenAi => false,
+/// Bono Cloud's tab: nothing to set, just whether it may be used.
+fn bono_cloud(ui: &mut egui::Ui, cloud: Option<bool>) {
+    match cloud {
+        Some(true) => {
+            ui.label(t!("provider.bono_cloud_about"));
+        }
+        Some(false) => {
+            let warn = ui.visuals().warn_fg_color;
+            ui.colored_label(
+                warn,
+                format!(
+                    "{} {}",
+                    egui_phosphor::bold::WARNING,
+                    t!("provider.bono_cloud_unavailable")
+                ),
+            );
+        }
+        None => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(t!("onboarding.provider_checking"));
+            });
+        }
     }
 }
 
 /// Where the provider's models are listed from: Ollama's host, or the API's URL. For Claude, the
-/// credentials they were listed with.
-fn location(model: &ModelConfig) -> Option<String> {
+/// credentials they were listed with, and for Bono Cloud, the account.
+fn location(model: &ModelConfig, account: Option<&Account>) -> Option<String> {
     match model.provider() {
+        ModelProvider::BonoCloud => match account.map(Account::status) {
+            Some(Status::SignedIn(user)) => Some(user.id),
+            Some(Status::SignedOut) | None => None,
+        },
         ModelProvider::Claude => {
             let claude = &model.claude;
             (claude.api_key().is_some() || claude.workspace_id().is_some()).then(|| {
