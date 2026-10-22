@@ -71,7 +71,11 @@ pub(crate) fn signed_in(base: Url, access_token: &str) -> Account {
         }),
     }
 }
-fn tokens() -> serde_json::Value {
+pub(crate) async fn expire_access_token(account: &Account) {
+    account.inner.state.lock().await.access.as_mut().unwrap().1 = Instant::now();
+}
+
+pub(crate) fn tokens() -> serde_json::Value {
     serde_json::json!({"token_type":"Bearer","access_token":"access-new","refresh_token":"refresh-new","expires_in":3600,"user":user()})
 }
 
@@ -333,6 +337,19 @@ async fn me_refreshes_once_on_unauthorized_and_concurrent_access_uses_one_refres
     let (a, b) = tokio::join!(account.access_token(), account.access_token());
     assert_eq!(a.unwrap(), b.unwrap());
     assert_eq!(account.me().await.unwrap(), user());
+    http.await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_rejected_tokens_use_one_refresh() {
+    let (base, http) = server(vec![("/refresh", 200, tokens(), "refresh-old")]).await;
+    let account = signed_in(base, "access-old");
+    let (first, second) = tokio::join!(
+        account.refresh_access_token("access-old"),
+        account.refresh_access_token("access-old"),
+    );
+    assert_eq!(first.unwrap(), "access-new");
+    assert_eq!(second.unwrap(), "access-new");
     http.await.unwrap();
 }
 

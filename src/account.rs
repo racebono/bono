@@ -290,6 +290,19 @@ impl Account {
         Ok(state.access.as_ref().context("Not signed in")?.0.clone())
     }
 
+    /// Refresh a rejected bearer unless another caller already replaced it. Do not log it.
+    pub async fn refresh_access_token(&self, rejected: &str) -> anyhow::Result<String> {
+        let mut state = self.inner.state.lock().await;
+        if state
+            .access
+            .as_ref()
+            .is_some_and(|(token, _)| token == rejected)
+        {
+            self.refresh_locked(&mut state).await?;
+        }
+        Ok(state.access.as_ref().context("Not signed in")?.0.clone())
+    }
+
     /// Revalidate identity with the API, retrying once after access-token expiry/revocation.
     pub async fn me(&self) -> anyhow::Result<User> {
         let mut state = self.inner.state.lock().await;

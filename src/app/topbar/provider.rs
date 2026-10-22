@@ -102,7 +102,7 @@ impl ProviderTopbar {
         let cloud = self.cloud_access(rt);
 
         config.maybe_update(|raw| {
-            let mut changed = raw.model.provider.edit(provider, |provider| {
+            let mut changed = raw.model.edit_provider(provider, |provider| {
                 ui.horizontal(|ui| {
                     ui.label(t!("provider.label"));
                     // Kept while picked, so it can be switched away from
@@ -142,7 +142,7 @@ impl ProviderTopbar {
 
             changed |= match provider {
                 ModelProvider::BonoCloud => {
-                    bono_cloud(ui, cloud);
+                    self.bono_cloud(rt, ui, cloud);
                     false
                 }
                 ModelProvider::Claude => self.claude(rt, ui, &mut raw.model.claude),
@@ -165,7 +165,7 @@ impl ProviderTopbar {
         let cloud = self.cloud_access(rt);
 
         config.maybe_update(|raw| {
-            let mut changed = raw.model.provider.edit(provider, |provider| {
+            let mut changed = raw.model.edit_provider(provider, |provider| {
                 let no_credentials = !provider::claude::has_credentials(&model.claude);
                 let cloud_option = (cloud == Some(true) || *provider == ModelProvider::BonoCloud)
                     .then(|| {
@@ -203,7 +203,7 @@ impl ProviderTopbar {
 
             changed |= match provider {
                 ModelProvider::BonoCloud => {
-                    bono_cloud(ui, cloud);
+                    self.bono_cloud(rt, ui, cloud);
                     false
                 }
                 ModelProvider::Claude => {
@@ -580,6 +580,66 @@ impl ProviderTopbar {
         })
     }
 
+    /// Bono Cloud's tab: nothing to set, just whether it may be used, and why not. Asking again
+    /// is offered whenever the answer may change without signing in again: access granted
+    /// since, or the website reachable again.
+    fn bono_cloud(&mut self, rt: &Handle, ui: &mut egui::Ui, cloud: Option<bool>) {
+        let warn = ui.visuals().warn_fg_color;
+        let mut check = false;
+        match cloud {
+            Some(true) => {
+                ui.label(t!("provider.bono_cloud_about"));
+            }
+            Some(false) => {
+                // Signed out, signing in asks again
+                let signed_in = self.cloud.is_some();
+                let failed = self
+                    .cloud
+                    .as_mut()
+                    .and_then(|cloud| cloud.authorized.update(rt))
+                    .and_then(|authorized| authorized.as_ref().err())
+                    .map(|e| (e.to_string(), format!("{e:#}")));
+                ui.horizontal_wrapped(|ui| {
+                    // Just what went wrong: why, on hover
+                    match failed {
+                        Some((error, why)) => {
+                            ui.colored_label(
+                                warn,
+                                format!("{} {error}", egui_phosphor::bold::WARNING),
+                            )
+                            .on_hover_text(why);
+                        }
+                        None => {
+                            ui.colored_label(
+                                warn,
+                                format!(
+                                    "{} {}",
+                                    egui_phosphor::bold::WARNING,
+                                    t!("provider.bono_cloud_unavailable")
+                                ),
+                            );
+                        }
+                    }
+                    if signed_in {
+                        check = ui.button(t!("onboarding.provider_check")).clicked();
+                    }
+                });
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(t!("onboarding.provider_checking"));
+                });
+            }
+        }
+
+        // Asked again next frame
+        if check {
+            self.cloud = None;
+            self.models = None;
+        }
+    }
+
     /// Whether the provider picked can't be used yet: Claude, without credentials, or Bono Cloud,
     /// without an account that may use it.
     pub fn needs_setup(&mut self, rt: &Handle, config: &Config) -> bool {
@@ -587,32 +647,6 @@ impl ProviderTopbar {
             ModelProvider::BonoCloud => self.cloud_access(rt) == Some(false),
             ModelProvider::Claude => !provider::claude::has_credentials(&config.get().model.claude),
             ModelProvider::Ollama | ModelProvider::OpenAi => false,
-        }
-    }
-}
-
-/// Bono Cloud's tab: nothing to set, just whether it may be used.
-fn bono_cloud(ui: &mut egui::Ui, cloud: Option<bool>) {
-    match cloud {
-        Some(true) => {
-            ui.label(t!("provider.bono_cloud_about"));
-        }
-        Some(false) => {
-            let warn = ui.visuals().warn_fg_color;
-            ui.colored_label(
-                warn,
-                format!(
-                    "{} {}",
-                    egui_phosphor::bold::WARNING,
-                    t!("provider.bono_cloud_unavailable")
-                ),
-            );
-        }
-        None => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(t!("onboarding.provider_checking"));
-            });
         }
     }
 }

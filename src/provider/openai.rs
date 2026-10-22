@@ -5,8 +5,8 @@
 use super::{Model, ModelOption, Reply, StopReason, ToolHandler, Tools, Usage, text::TextSink};
 use crate::config::OpenAiConfig;
 use anyhow::{Context, bail};
-use futures::future::{BoxFuture, join_all};
 use bono_i18n::t;
+use futures::future::{BoxFuture, join_all};
 use reqwest::{
     StatusCode,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
@@ -68,11 +68,18 @@ pub async fn models(
     Ok(models)
 }
 
+/// Credentials supplied by providers whose bearer tokens can expire.
+pub(super) trait BearerSource: Send + Sync {
+    /// Obtain a bearer for each request, or replace one rejected before streaming began.
+    fn token<'a>(&'a self, rejected: Option<&'a str>) -> BoxFuture<'a, anyhow::Result<String>>;
+}
+
 /// A conversation with a model behind an OpenAI-compatible API.
 pub struct Conversation {
     client: reqwest::Client,
     base_url: String,
     headers: HeaderMap,
+    bearer_source: Option<Arc<dyn BearerSource>>,
     body: RequestBody,
     /// The messages kept through a reset: the system prompt's
     kept: usize,
@@ -139,13 +146,9 @@ impl Conversation {
         builder.build(client)
     }
 
-    /// Sends `api_key` as the bearer token from now on, for credentials that expire.
-    pub(super) fn set_api_key(&mut self, api_key: &str) -> anyhow::Result<()> {
-        self.headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {api_key}"))?,
-        );
-        Ok(())
+    /// Supplies expiring credentials per request, including tool-call round trips.
+    pub(super) fn set_bearer_source(&mut self, source: Arc<dyn BearerSource>) {
+        self.bearer_source = Some(source);
     }
 
     async fn run_turn(&mut self, text: String, sink: &mut TextSink<'_>) -> anyhow::Result<Reply> {
@@ -248,15 +251,37 @@ impl Conversation {
     /// Sends the request and reads the streamed response (server-sent events), handing its text
     /// to `sink` as it comes.
     async fn post(&self, sink: &mut TextSink<'_>) -> anyhow::Result<Response> {
-        let mut resp = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .headers(self.headers.clone())
-            .timeout(self.timeout)
-            .json(&self.body)
-            .send()
-            .await
-            .with_context(|| t!("provider.openai_unreachable", url = self.base_url))?;
+        let mut token = match &self.bearer_source {
+            Some(source) => Some(source.token(None).await?),
+            None => None,
+        };
+        let mut retried = false;
+        let mut resp = loop {
+            let mut headers = self.headers.clone();
+            if let Some(token) = &token {
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {token}"))?,
+                );
+            }
+            let resp = self
+                .client
+                .post(format!("{}/chat/completions", self.base_url))
+                .headers(headers)
+                .timeout(self.timeout)
+                .json(&self.body)
+                .send()
+                .await
+                .with_context(|| t!("provider.openai_unreachable", url = self.base_url))?;
+            if resp.status() == StatusCode::UNAUTHORIZED && !retried {
+                if let Some(source) = &self.bearer_source {
+                    token = Some(source.token(token.as_deref()).await?);
+                    retried = true;
+                    continue;
+                }
+            }
+            break resp;
+        };
         if !resp.status().is_success() {
             return Err(ApiError::read(resp).await.into());
         }
@@ -656,6 +681,7 @@ impl ConversationBuilder {
             client,
             base_url,
             headers,
+            bearer_source: None,
             kept: messages.len(),
             body: RequestBody {
                 model: self.model,
