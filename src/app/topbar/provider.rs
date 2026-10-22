@@ -105,18 +105,19 @@ impl ProviderTopbar {
             let mut changed = raw.model.edit_provider(provider, |provider| {
                 ui.horizontal(|ui| {
                     ui.label(t!("provider.label"));
-                    // Kept while picked, so it can be switched away from
-                    let mut cloud_clicked = false;
-                    if cloud == Some(true) || *provider == ModelProvider::BonoCloud {
-                        cloud_clicked = ui
-                            .selectable_value(
+                    let picked = *provider == ModelProvider::BonoCloud;
+                    let cloud_clicked = ui
+                        .add_enabled_ui(cloud == Some(true), |ui| {
+                            ui.selectable_value(
                                 provider,
                                 ModelProvider::BonoCloud,
-                                setup_label(cloud == Some(false), "Bono Cloud"),
+                                setup_label(picked && cloud == Some(false), "Bono Cloud"),
                             )
-                            .on_hover_text(t!("provider.bono_cloud_hover"))
-                            .clicked();
-                    }
+                        })
+                        .inner
+                        .on_hover_text(t!("provider.bono_cloud_hover"))
+                        .on_disabled_hover_text(self.cloud_unavailable(cloud))
+                        .clicked();
                     let no_credentials = !provider::claude::has_credentials(&model.claude);
                     let mut claude = ui
                         .selectable_value(
@@ -167,14 +168,20 @@ impl ProviderTopbar {
         config.maybe_update(|raw| {
             let mut changed = raw.model.edit_provider(provider, |provider| {
                 let no_credentials = !provider::claude::has_credentials(&model.claude);
-                let cloud_option = (cloud == Some(true) || *provider == ModelProvider::BonoCloud)
-                    .then(|| {
-                        (
+                let picked = *provider == ModelProvider::BonoCloud;
+                let mut changed = ui
+                    .add_enabled_ui(cloud == Some(true), |ui| {
+                        ui.radio_value(
+                            provider,
                             ModelProvider::BonoCloud,
-                            setup_label(cloud == Some(false), "Bono Cloud"),
-                            t!("onboarding.bono_cloud"),
+                            setup_label(picked && cloud == Some(false), "Bono Cloud"),
                         )
-                    });
+                    })
+                    .inner
+                    .on_disabled_hover_text(self.cloud_unavailable(cloud))
+                    .changed();
+                let about = t!("onboarding.bono_cloud");
+                ui.indent(about, |ui| ui.weak(about));
                 let options = [
                     (
                         ModelProvider::Claude,
@@ -192,8 +199,7 @@ impl ProviderTopbar {
                         t!("onboarding.openai"),
                     ),
                 ];
-                let mut changed = false;
-                for (option, label, about) in cloud_option.into_iter().chain(options) {
+                for (option, label, about) in options {
                     changed |= ui.radio_value(provider, option, label).changed();
                     ui.indent(about, |ui| ui.weak(about));
                 }
@@ -579,6 +585,15 @@ impl ProviderTopbar {
         Some(matches!(authorized, Ok(true)))
     }
 
+    /// Why Bono Cloud can't be picked: signed out, still asking, or no access.
+    fn cloud_unavailable(&self, cloud: Option<bool>) -> &'static str {
+        match (cloud, &self.cloud) {
+            (None, _) => t!("onboarding.provider_checking"),
+            (_, None) => t!("provider.bono_cloud_sign_in"),
+            (_, Some(_)) => t!("provider.bono_cloud_unavailable"),
+        }
+    }
+
     /// Bono Cloud's tab: nothing to set, just whether it may be used, and why not. Asking again
     /// is offered whenever the answer may change without signing in again: access granted
     /// since, or the website reachable again.
@@ -592,6 +607,7 @@ impl ProviderTopbar {
             Some(false) => {
                 // Signed out, signing in asks again
                 let signed_in = self.cloud.is_some();
+                let unavailable = self.cloud_unavailable(cloud);
                 let failed = self
                     .cloud
                     .as_mut()
@@ -614,7 +630,7 @@ impl ProviderTopbar {
                                 format!(
                                     "{} {}",
                                     egui_phosphor::bold::WARNING,
-                                    t!("provider.bono_cloud_unavailable")
+                                    unavailable
                                 ),
                             );
                         }

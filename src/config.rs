@@ -613,11 +613,11 @@ impl IsDefault for ModelConfig {
 }
 
 impl ModelConfig {
+    /// Bono Cloud unless another provider was picked.
     pub fn provider(&self) -> &ModelProvider {
-        if *self.bono_cloud.get_or(&false) {
-            &ModelProvider::BonoCloud
-        } else {
-            self.fallback_provider.get_or(&ModelProvider::Claude)
+        match (&self.bono_cloud, &self.fallback_provider) {
+            (Setting::Set(true), _) | (_, Setting::Default) => &ModelProvider::BonoCloud,
+            (_, Setting::Set(provider)) => provider,
         }
     }
 
@@ -873,7 +873,7 @@ mod tests {
             .unwrap();
             std::fs::write(&path, &contents).unwrap();
             let loaded = load_config(&path).await.unwrap();
-            assert_eq!(*loaded.model.provider(), ModelProvider::Claude);
+            assert_eq!(*loaded.model.provider(), ModelProvider::BonoCloud);
             assert!(loaded.model.fallback_provider.is_default());
             assert_eq!(*loaded.master_volume(), 0.5);
             assert_eq!(loaded.voices()[&arrstr!("en")], "voices/engineer.onnx");
@@ -972,7 +972,7 @@ mod tests {
         assert!(defaults.is_default());
         assert_eq!(*defaults.master_volume(), 1.0);
         assert_eq!(*defaults.spotter.debounce(), 0.12);
-        assert_eq!(*defaults.model.provider(), ModelProvider::Claude);
+        assert_eq!(*defaults.model.provider(), ModelProvider::BonoCloud);
         assert_eq!(defaults.model.claude.model(), "claude-sonnet-5-5");
         assert_eq!(serde_json::to_string(&defaults).unwrap(), "{}");
 
