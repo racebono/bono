@@ -81,6 +81,7 @@ pub struct Conversation {
     headers: HeaderMap,
     bearer_source: Option<Arc<dyn BearerSource>>,
     body: RequestBody,
+    native_history: bool,
     /// The messages kept through a reset: the system prompt's
     kept: usize,
     timeout: Duration,
@@ -146,9 +147,9 @@ impl Conversation {
         builder.build(client)
     }
 
-    /// Opt into Bono Cloud's signed native history extension. Thinking stays out of TextSink.
+    /// Preserve Bono Cloud's signed native history extension. Thinking stays out of TextSink.
     pub(super) fn enable_native_history(&mut self) {
-        self.body.bono_native_history = Some(true);
+        self.native_history = true;
     }
 
     /// Supplies expiring credentials per request, including tool-call round trips.
@@ -205,7 +206,7 @@ impl Conversation {
                         })
                         .collect();
                 }
-                if self.body.bono_native_history == Some(true) {
+                if self.native_history {
                     if let Some(blocks) = response.bono_content {
                         message["bono_content"] = serde_json::Value::Array(blocks);
                     }
@@ -704,6 +705,7 @@ impl ConversationBuilder {
             base_url,
             headers,
             bearer_source: None,
+            native_history: false,
             kept: messages.len(),
             body: RequestBody {
                 model: self.model,
@@ -714,7 +716,6 @@ impl ConversationBuilder {
                     include_usage: true,
                 },
                 max_tokens,
-                bono_native_history: None,
                 reasoning_effort,
                 chat_template_kwargs,
             },
@@ -766,8 +767,6 @@ fn headers(api_key: Option<String>) -> anyhow::Result<HeaderMap> {
 
 #[derive(Serialize)]
 struct RequestBody {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bono_native_history: Option<bool>,
     model: String,
     /// Each message as it's sent: the model's own are kept as received
     messages: Vec<serde_json::Value>,
@@ -1058,7 +1057,7 @@ mod tests {
         assert_eq!(requests.len(), 2);
         let (path, first) = &requests[0];
         assert_eq!(path, "/v1/chat/completions");
-        assert_eq!(first["bono_native_history"], true);
+        assert!(first.get("bono_native_history").is_none());
         assert_eq!(first["stream"], true);
         assert_eq!(first["stream_options"]["include_usage"], true);
         assert_eq!(first["model"], "qwen3.5-9b");
