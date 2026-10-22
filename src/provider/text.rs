@@ -51,7 +51,7 @@ impl<'a> TextSink<'a> {
                 // Mid-sentence, where a space matters
                 true => self.emit(&pending),
                 false => {
-                    if !self.text.is_empty() {
+                    if !self.text.is_empty() && !self.text.ends_with("\n\n") {
                         self.emit("\n\n");
                     }
                     self.emit(text.trim_start());
@@ -67,10 +67,52 @@ impl<'a> TextSink<'a> {
         self.started = false;
     }
 
+    /// Flush spoken text before waiting for client tools, even when the model omitted
+    /// trailing whitespace. Do not wait until the next response to emit its separator.
+    pub fn before_tools(&mut self) {
+        self.end_block();
+        if !self.text.is_empty() && !self.text.ends_with("\n\n") {
+            self.emit("\n\n");
+        }
+    }
+
     fn emit(&mut self, text: &str) {
         if !text.is_empty() {
             self.text.push_str(text);
             (self.on_text)(text);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flushes_acknowledgement_before_tools_without_duplicate_separator() {
+        let mut pieces = Vec::new();
+        let mut callback = |text: &str| pieces.push(text.to_owned());
+        let mut sink = TextSink::new(&mut callback);
+        sink.push("Copy, checking.");
+        sink.end_block();
+        sink.before_tools();
+        assert_eq!(sink.text, "Copy, checking.\n\n");
+        sink.start_response();
+        sink.push("The hairpin on entry.");
+        assert_eq!(sink.text, "Copy, checking.\n\nThe hairpin on entry.");
+        let text = sink.text.clone();
+        drop(sink);
+        assert_eq!(pieces.concat(), text);
+    }
+
+    #[test]
+    fn silent_tools_add_no_spoken_preamble() {
+        let mut pieces = Vec::new();
+        let mut callback = |text: &str| pieces.push(text.to_owned());
+        let mut sink = TextSink::new(&mut callback);
+        sink.before_tools();
+        sink.start_response();
+        sink.push("Radio check, loud and clear.");
+        assert_eq!(sink.text, "Radio check, loud and clear.");
     }
 }

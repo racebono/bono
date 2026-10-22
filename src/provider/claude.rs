@@ -344,6 +344,7 @@ impl Conversation {
 
             // Only once the turn is known to be whole: a `tool_use` cut off at `max_tokens` can
             // still parse, with part of its input missing
+            sink.before_tools();
             let tools = &self.tools;
             let results = join_all(calls.iter().map(|call| {
                 let name = call.get("name").and_then(serde_json::Value::as_str);
