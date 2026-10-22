@@ -565,19 +565,18 @@ impl ProviderTopbar {
             self.cloud = Some(CloudAccess {
                 user: user.id,
                 authorized: MaybeDone::spawn(async move {
-                    provider::bono_cloud::authorized(&account, &client).await
+                    let authorized = provider::bono_cloud::authorized(&account, &client).await;
+                    // Once per check, not every frame it's looked at
+                    if let Err(e) = &authorized {
+                        log::debug!("Couldn't tell whether Bono Cloud may be used: {e:#}");
+                    }
+                    authorized
                 }),
             });
         }
 
         let authorized = self.cloud.as_mut()?.authorized.update(rt)?;
-        Some(match authorized {
-            Ok(authorized) => *authorized,
-            Err(e) => {
-                log::debug!("Couldn't tell whether Bono Cloud may be used: {e:#}");
-                false
-            }
-        })
+        Some(matches!(authorized, Ok(true)))
     }
 
     /// Bono Cloud's tab: nothing to set, just whether it may be used, and why not. Asking again
