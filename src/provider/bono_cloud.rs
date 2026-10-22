@@ -31,13 +31,15 @@ pub async fn models(
     result.map_err(readable_error)
 }
 
-/// Whether `account` may use Bono Cloud, as the website says.
+/// Whether `account` may use Bono Cloud, as the website says. A website without the API (`404`)
+/// doesn't offer it to anyone.
 pub async fn authorized(account: &Account, client: &reqwest::Client) -> anyhow::Result<bool> {
     match models(Some(account), client).await {
         Ok(_) => Ok(true),
         Err(e)
-            if e.downcast_ref::<openai::ApiError>()
-                .is_some_and(|e| e.status == StatusCode::FORBIDDEN) =>
+            if e.downcast_ref::<openai::ApiError>().is_some_and(|e| {
+                matches!(e.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND)
+            }) =>
         {
             Ok(false)
         }
@@ -230,6 +232,13 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert!(requests[0].0.starts_with("get /api/cloud/v1/models "));
         assert!(requests[0].0.contains("authorization: bearer access-1"));
+    }
+
+    #[tokio::test]
+    async fn website_without_the_api_offers_nothing() {
+        let (url, _) = mock(vec![(404, "<!doctype html><title>404</title>".into())]).await;
+        let account = signed_in(url, "access-1");
+        assert!(!authorized(&account, &reqwest::Client::new()).await.unwrap());
     }
 
     #[tokio::test]
