@@ -234,6 +234,13 @@ impl Account {
         self.complete_login(pending).await
     }
 
+    /// Opens the website's sign-up page. Creating an account there doesn't sign the app in: that
+    /// still takes [`Self::login`].
+    pub fn sign_up(&self) -> anyhow::Result<()> {
+        webbrowser::open(self.url("/signup").as_str())
+            .context("Could not open account creation in your browser")
+    }
+
     /// Wait for the browser callback. Dropping this future closes the local listener.
     pub async fn complete_login(&self, pending: PendingLogin) -> anyhow::Result<User> {
         ensure!(

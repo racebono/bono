@@ -21,7 +21,7 @@ use sdl3::event::Event;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 
-mod account;
+pub(super) mod account;
 pub(super) mod audio;
 mod provider;
 pub(super) mod settings;
@@ -30,7 +30,7 @@ mod spotter;
 pub(super) mod volume;
 
 pub struct Topbar {
-    account: AccountTopbar,
+    pub account: AccountTopbar,
     settings: SettingsTopbar,
     pub audio: AudioTopbar,
     volume: VolumeTopbar,

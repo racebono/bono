@@ -34,6 +34,21 @@
         "es": "Cerrando sesión…",
         "ca": "S'està tancant la sessió…"
     },
+    "account.no_account": {
+        "en": "No account yet?",
+        "es": "¿Aún no tienes cuenta?",
+        "ca": "Encara no tens compte?"
+    },
+    "account.create": {
+        "en": "Create account…",
+        "es": "Crear cuenta…",
+        "ca": "Crea un compte…"
+    },
+    "account.create_then_log_in": {
+        "en": "Creating an account in your browser won't log you in to the app. Once your account has been created, come back and click \"{button}\".",
+        "es": "Crear una cuenta en el navegador no inicia sesión en la aplicación. Cuando se haya creado la cuenta, vuelve aquí y haz clic en \"{button}\".",
+        "ca": "Crear un compte al navegador no inicia la sessió a l'aplicació. Quan s'hagi creat el compte, torna aquí i fes clic a \"{button}\"."
+    },
     "settings": {
         "en": "Settings",
         "es": "Ajustes",
@@ -1314,6 +1329,21 @@
         "en": "Retry",
         "es": "Reintentar",
         "ca": "Torna-ho a provar"
+    },
+    "onboarding.account_title": {
+        "en": "Your Bono account",
+        "es": "Tu cuenta de Bono",
+        "ca": "El teu compte de Bono"
+    },
+    "onboarding.account_body": {
+        "en": "With a Bono account, the engineer can think with Bono Cloud: nothing else to set up.",
+        "es": "Con una cuenta de Bono, el ingeniero puede pensar con Bono Cloud: no hay nada más que configurar.",
+        "ca": "Amb un compte de Bono, l'enginyer pot pensar amb Bono Cloud: no cal configurar res més."
+    },
+    "onboarding.account_optional": {
+        "en": "An account is optional: skip this step with \"Next\", and log in later from the Account menu.",
+        "es": "La cuenta es opcional: salta este paso con \"Siguiente\" e inicia sesión más tarde desde el menú Cuenta.",
+        "ca": "El compte és opcional: omet aquest pas amb \"Següent\" i inicia la sessió més tard des del menú Compte."
     },
     "onboarding.provider_title": {
         "en": "The engineer's brain",

@@ -2,6 +2,7 @@
 //! walks the pilot through what bono needs, a step at a time, and can be skipped at any point.
 
 use crate::{
+    account::Account,
     app::{
         Subsystems,
         topbar::{
@@ -23,7 +24,7 @@ use egui::{RichText, Widget};
 use tokio::runtime::Handle;
 
 /// The guide's version: bumped when it gains a step, so pilots who went through it see it again.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -31,6 +32,8 @@ enum Step {
     Welcome,
     /// The games, and their plugins
     Simulator,
+    /// The pilot's bono account, which Bono Cloud needs: optional
+    Account,
     /// The language model the engineer thinks with
     Provider,
     /// The microphone, and whether it hears the pilot
@@ -44,9 +47,10 @@ enum Step {
 }
 
 impl Step {
-    const ALL: [Step; 7] = [
+    const ALL: [Step; 8] = [
         Step::Welcome,
         Step::Simulator,
+        Step::Account,
         Step::Provider,
         Step::Microphone,
         Step::Voice,
@@ -54,16 +58,23 @@ impl Step {
         Step::RadioCheck,
     ];
 
-    fn index(self) -> usize {
-        Self::ALL.iter().position(|&step| step == self).unwrap()
+    /// The steps shown: the account's only where this installation has accounts.
+    fn all(account: bool) -> Vec<Step> {
+        (Self::ALL.into_iter())
+            .filter(|&step| account || step != Step::Account)
+            .collect()
     }
 
-    fn next(self) -> Option<Step> {
-        Self::ALL.get(self.index() + 1).copied()
+    fn index(self, steps: &[Step]) -> usize {
+        steps.iter().position(|&step| step == self).unwrap_or(0)
     }
 
-    fn previous(self) -> Option<Step> {
-        Some(Self::ALL[self.index().checked_sub(1)?])
+    fn next(self, steps: &[Step]) -> Option<Step> {
+        steps.get(self.index(steps) + 1).copied()
+    }
+
+    fn previous(self, steps: &[Step]) -> Option<Step> {
+        Some(steps[self.index(steps).checked_sub(1)?])
     }
 }
 
@@ -123,6 +134,7 @@ impl Onboarding {
         synth: &mut Synthesizer,
         simulators: &mut ActiveSimulator,
         engineer: &Engineer,
+        account: Option<&Account>,
     ) {
         // What a step started stops once it isn't showing
         if self.step != Some(Step::Microphone) {
@@ -136,14 +148,15 @@ impl Onboarding {
         let Some(step) = self.step else {
             return;
         };
+        let steps = Step::all(account.is_some());
 
         let mut action = None;
         egui::Modal::new(egui::Id::new("onboarding")).show(ctx, |ui| {
             ui.set_width(480.0);
             ui.weak(t!(
                 "onboarding.step",
-                step = step.index() + 1,
-                steps = Step::ALL.len()
+                step = step.index(&steps) + 1,
+                steps = steps.len()
             ));
 
             // Room left for the buttons below, however small the window
@@ -154,6 +167,22 @@ impl Onboarding {
                     Step::Welcome => welcome(rt, ui, config, &mut topbar.audio),
                     Step::Simulator => {
                         self.simulator(rt, ui, config, &mut topbar.audio, simulators)
+                    }
+                    Step::Account => {
+                        ui.heading(t!("onboarding.account_title"));
+                        ui.label(t!("onboarding.account_body"));
+                        ui.add_space(8.0);
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            topbar.account.update(ui, account);
+                        });
+                        if let Some(account) = account {
+                            ui.add_space(8.0);
+                            topbar.account.sign_up(ui, account);
+                        }
+                        ui.add_space(8.0);
+                        ui.weak(t!("onboarding.account_optional"));
+                        still_downloading(rt, ui, config, &mut topbar.audio);
                     }
                     Step::Provider => {
                         ui.heading(t!("onboarding.provider_title"));
@@ -172,19 +201,20 @@ impl Onboarding {
 
             ui.separator();
             ui.horizontal(|ui| {
-                if step.next().is_some() && ui.button(t!("onboarding.skip")).clicked() {
+                if step.next(&steps).is_some() && ui.button(t!("onboarding.skip")).clicked() {
                     action = Some(Action::Close);
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (label, forward) = match step.next() {
+                    let (label, forward) = match step.next(&steps) {
                         Some(_) => (t!("onboarding.next"), Action::Next),
                         None => (t!("onboarding.finish"), Action::Close),
                     };
                     if ui.button(label).clicked() {
                         action = Some(forward);
                     }
-                    if step.previous().is_some() && ui.button(t!("onboarding.back")).clicked() {
+                    if step.previous(&steps).is_some() && ui.button(t!("onboarding.back")).clicked()
+                    {
                         action = Some(Action::Back);
                     }
                 });
@@ -192,13 +222,13 @@ impl Onboarding {
         });
 
         match action {
-            Some(Action::Back) => self.step = step.previous(),
+            Some(Action::Back) => self.step = step.previous(&steps),
             Some(Action::Next) => {
                 // The language is picked: what it needs can start downloading
                 if step == Step::Welcome {
                     topbar.audio.setup(config);
                 }
-                self.step = step.next();
+                self.step = step.next(&steps);
                 if self.step == Some(Step::RadioCheck) {
                     self.radio_from = engineer.chat().len();
                     self.nothing_heard = false;

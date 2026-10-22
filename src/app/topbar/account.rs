@@ -21,6 +21,22 @@ impl AccountTopbar {
         }
     }
 
+    /// Opens account creation in the browser, while signed out, with a reminder that it doesn't
+    /// log the app in.
+    pub fn sign_up(&mut self, ui: &mut egui::Ui, account: &Account) {
+        if self.operation.is_some() || matches!(account.status(), Status::SignedIn(_)) {
+            return;
+        }
+        ui.strong(t!("account.no_account"));
+        if ui.button(t!("account.create")).clicked() {
+            self.error = account.sign_up().err().map(|error| format!("{error:#}"));
+        }
+        ui.label(t!(
+            "account.create_then_log_in",
+            button = t!("account.log_in")
+        ));
+    }
+
     pub fn update(&mut self, ui: &mut egui::Ui, account: Option<&Account>) {
         ui.set_max_width(320.0);
         let Some(account) = account else {
