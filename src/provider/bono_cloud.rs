@@ -80,6 +80,7 @@ impl Conversation {
             .system(system)
             .tools(tools);
         let mut inner = builder.build(client)?;
+        inner.enable_native_history();
         inner.set_bearer_source(Arc::new(Bearer(account.clone())));
         Ok(Self { inner })
     }

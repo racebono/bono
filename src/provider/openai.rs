@@ -146,6 +146,11 @@ impl Conversation {
         builder.build(client)
     }
 
+    /// Opt into Bono Cloud's signed native history extension. Thinking stays out of TextSink.
+    pub(super) fn enable_native_history(&mut self) {
+        self.body.bono_native_history = Some(true);
+    }
+
     /// Supplies expiring credentials per request, including tool-call round trips.
     pub(super) fn set_bearer_source(&mut self, source: Arc<dyn BearerSource>) {
         self.bearer_source = Some(source);
@@ -199,6 +204,11 @@ impl Conversation {
                             })
                         })
                         .collect();
+                }
+                if self.body.bono_native_history == Some(true) {
+                    if let Some(blocks) = response.bono_content {
+                        message["bono_content"] = serde_json::Value::Array(blocks);
+                    }
                 }
                 self.body.messages.push(message);
             }
@@ -333,6 +343,7 @@ impl Drop for Turn<'_> {
 struct Response {
     model: Option<String>,
     content: String,
+    bono_content: Option<Vec<serde_json::Value>>,
     tool_calls: Vec<ToolCall>,
     finish_reason: Option<String>,
     usage: Usage,
@@ -374,6 +385,8 @@ impl Response {
         struct Delta {
             #[serde(default)]
             content: Option<String>,
+            #[serde(default)]
+            bono_content: Option<Vec<serde_json::Value>>,
             #[serde(default)]
             tool_calls: Vec<DeltaCall>,
         }
@@ -440,6 +453,12 @@ impl Response {
 
         for choice in chunk.choices {
             if let Some(delta) = choice.delta {
+                if let Some(blocks) = delta.bono_content {
+                    if self.bono_content.is_some() {
+                        bail!("Duplicate native history");
+                    }
+                    self.bono_content = Some(blocks);
+                }
                 if let Some(content) = delta.content {
                     sink.push(&content);
                     self.content.push_str(&content);
@@ -695,6 +714,7 @@ impl ConversationBuilder {
                     include_usage: true,
                 },
                 max_tokens,
+                bono_native_history: None,
                 reasoning_effort,
                 chat_template_kwargs,
             },
@@ -746,6 +766,8 @@ fn headers(api_key: Option<String>) -> anyhow::Result<HeaderMap> {
 
 #[derive(Serialize)]
 struct RequestBody {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bono_native_history: Option<bool>,
     model: String,
     /// Each message as it's sent: the model's own are kept as received
     messages: Vec<serde_json::Value>,
@@ -972,6 +994,81 @@ mod tests {
 
         let messages = requests[1].1["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 4);
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "Let me check.");
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            messages[2]["tool_calls"][0]["function"]["arguments"],
+            "{\"what\": \"gap\"}"
+        );
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call_1");
+        assert_eq!(messages[3]["content"], "looked up \"gap\"");
+        drop(requests);
+
+        assert_eq!(conversation.body.messages.len(), 5);
+        conversation.reset();
+        assert_eq!(conversation.body.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn preserves_native_thinking_silently_across_tool_rounds() {
+        let call =
+            |delta: Value| json!({"choices": [{"index": 0, "delta": {"tool_calls": [delta]}}]});
+        let native = json!([
+            {"type":"thinking", "thinking":"private summary", "signature":"signed-block"},
+            {"type":"redacted_thinking", "data":"opaque-data"},
+            {"type":"text", "text":"Let me check."},
+            {"type":"tool_use", "id":"call_1", "name":"lookup", "input":{"what":"gap"}}
+        ]);
+        let (url, requests) = mock(vec![
+            stream(vec![
+                text("Let me "),
+                text("check."),
+                call(json!({"index": 0, "id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": ""}})),
+                call(json!({"index": 0, "function": {"arguments": "{\"what\": "}})),
+                call(json!({"index": 0, "function": {"arguments": "\"gap\"}"}})),
+                json!({"choices":[{"delta":{"bono_content":native.clone()}}]}),
+                finish("tool_calls"),
+            ]),
+            stream(vec![text("\nThe gap "), text("is 1.2s."), finish("stop")]),
+        ])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = builder(&url, &calls).build(reqwest::Client::new()).unwrap();
+
+        conversation.enable_native_history();
+        let (reply, pieces) = send_streaming(&mut conversation, "Gap?").await.unwrap();
+        assert_eq!(reply.stop, StopReason::EndTurn);
+        assert_eq!(reply.text, "Let me check.\n\nThe gap is 1.2s.");
+        assert_eq!(pieces.concat(), reply.text);
+        assert_eq!(reply.model, "qwen3.5-9b");
+        assert_eq!(
+            reply.usage,
+            Usage {
+                input_tokens: 200,
+                cache_write_tokens: 0,
+                cache_read_tokens: 400,
+                output_tokens: 40,
+            }
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let (path, first) = &requests[0];
+        assert_eq!(path, "/v1/chat/completions");
+        assert_eq!(first["bono_native_history"], true);
+        assert_eq!(first["stream"], true);
+        assert_eq!(first["stream_options"]["include_usage"], true);
+        assert_eq!(first["model"], "qwen3.5-9b");
+        assert!(first.get("reasoning_effort").is_none());
+        assert_eq!(first["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(first["messages"][0]["role"], "system");
+
+        let messages = requests[1].1["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[2]["bono_content"], native);
         assert_eq!(messages[2]["role"], "assistant");
         assert_eq!(messages[2]["content"], "Let me check.");
         assert_eq!(messages[2]["tool_calls"][0]["id"], "call_1");
