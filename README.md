@@ -47,18 +47,21 @@ Speech recognition and synthesis run locally. With a remote language-model endpo
 ## Account integration
 
 The application's `account` module implements browser login, logout, account lookup, and session
-restoration. Configure `BONO_ACCOUNT_ORIGIN` with the website origin at build time or
-runtime (for example, `https://your-site.example`). When configured, app startup loads
+restoration. Configure `BONO_ACCOUNT_ORIGIN` with the website origin at build time
+(for example, `https://your-site.example`). When configured, app startup loads
 the saved account and refreshes its session in the background. Without this setting,
 account integration is disabled. HTTP origins are accepted only on loopback for development.
 
 The account handle is available through `AppState::account()`. Clone it into a background
 task and call `login().await` or `logout().await`. The topbar's **Account** menu opens
 browser login, shows the signed-in user's name and email, and offers **Sign out**.
-While login is pending, **Cancel** stops polling for browser approval. Account operations
+While login is pending, **Cancel** closes the local callback listener. Account operations
 run in the background; progress and errors appear in the menu.
-`login()` opens the system browser for website sign-in and explicit approval, then polls
-the API using PKCE. `begin_login()` and `complete_login()` are also available separately.
+`login()` opens the system browser for website sign-in and explicit approval, then receives a browser
+redirect on a temporary HTTP listener bound to `127.0.0.1`
+on an OS-assigned port. The callback carries a single-use authorization code and random
+state; the app exchanges the code over HTTPS using PKCE. Tokens never travel in the
+browser redirect. `begin_login()` and `complete_login()` are also available separately.
 `subscribe()` reports cached identity changes, `me()` validates the account with the
 server, and `access_token()` refreshes access on demand. Do not log bearer tokens.
 
@@ -86,6 +89,32 @@ Run the account module's tests (requires the application's native build prerequi
 ```sh
 cargo test -p bono account::tests
 ```
+
+### Loopback login protocol
+
+The website must support this protocol before this desktop version can sign in:
+
+1. Bono binds `127.0.0.1:0` and calls `POST /api/desktop/auth/start` with
+   `{code_challenge, code_challenge_method: "S256", redirect_uri, state}`.
+   `redirect_uri` is `http://127.0.0.1:<port>/callback`; `state` is random per attempt.
+   The response is `{verification_uri, expires_in}` (maximum 1800 seconds), with
+   `verification_uri` on the configured website origin.
+2. The website keeps the callback, state, and PKCE challenge bound to the login request.
+   After website sign-in and explicit approval, it redirects to the callback with
+   `?code=<short-lived-single-use-code>&state=<original-state>`. Denial redirects with
+   `?error=access_denied&state=<original-state>`. Validate the literal loopback address,
+   callback path, and dynamic port before accepting a redirect URI.
+3. Bono validates the callback path, Host, state, and unambiguous code/error parameters.
+   It calls `POST /api/desktop/auth/exchange` with `{code, code_verifier, redirect_uri}`.
+   The website must validate PKCE and the exact original redirect URI, consume the code
+   once, and return the existing token/profile response. No tokens belong in redirect URLs.
+4. Bono saves credentials before showing success in the browser, then closes the listener.
+   Cancel, timeout, or dropping the login task also closes it. Existing `refresh`, `me`,
+   and `logout` endpoints and credential persistence are unchanged.
+
+The desktop no longer calls the polling `/api/desktop/auth/token` endpoint. Retire it on
+the website once supported older desktop releases no longer depend on it; `/exchange`
+remains necessary for the authorization-code exchange.
 
 ## Building from source
 
