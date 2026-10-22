@@ -321,7 +321,7 @@ impl Engineer {
         }
     }
 
-    /// The radio's low tone, as loud as the engineer: there's no voice to answer with.
+    /// The radio's low tone, as loud as the engineer: the request couldn't be answered.
     fn no_beep(&mut self) {
         self.playback = Some(Playback {
             speech: SpeechOutput::ready(Speech::no_beep(1.0)),
@@ -390,6 +390,7 @@ impl Engineer {
                 Ok(session) => self.session = Some(session),
                 Err(e) => {
                     self.notice(t!("engineer.error_starting", error = format!("{e:#}")));
+                    self.no_beep();
                     return;
                 }
             }
@@ -449,16 +450,23 @@ impl Engineer {
         self.languages.update(rt, config.get().voices());
         // The game stopped: the conversation lets go of the database, so the plugin can delete it
         if !sim_running && self.session.is_some() {
-            self.turn = None;
+            let interrupted = self.turn.take().is_some();
             self.session = None;
             self.notice(t!("engineer.sim_stopped"));
+            if interrupted {
+                self.no_beep();
+            }
         }
         // The account the conversation is had as signed out (or another signed in): it ends,
         // answer on its way included
         if self.session.as_ref().is_some_and(|s| !self.signed_in_as(s)) {
+            let interrupted = self.turn.is_some();
             self.stop();
             self.session = None;
             self.notice(t!("engineer.signed_out"));
+            if interrupted {
+                self.no_beep();
+            }
         }
 
         if let Some(turn) = &mut self.turn {
@@ -487,6 +495,7 @@ impl Engineer {
                             self.chat[entry].detail = Some(t!("engineer.detail_cut_off").into());
                         }
                         self.notice(t!("engineer.error_asking", error = format!("{e:#}")));
+                        self.no_beep();
                     }
                 }
             }
@@ -528,19 +537,29 @@ impl Engineer {
                 detail = format!("{detail} | {}", t!("engineer.detail_declined"));
                 let say_again = t!("engineer.say_again": &turn.lang);
                 self.say(rt, config, synth, say_again, turn.lang);
+                if self.voice(config, turn.lang).is_none() {
+                    self.no_beep();
+                }
                 say_again.to_owned()
             }
             StopReason::MaxTokens => {
                 detail = format!("{detail} | {}", t!("engineer.detail_cut_off"));
+                self.no_beep();
                 reply.text
             }
             // Every later question would end the same way: the next one starts over
             StopReason::ContextWindowExceeded => {
                 self.new_session = true;
                 detail = format!("{detail} | {}", t!("engineer.detail_full"));
+                self.no_beep();
                 reply.text
             }
-            StopReason::EndTurn | StopReason::StopSequence => reply.text,
+            StopReason::EndTurn | StopReason::StopSequence => {
+                if reply.text.trim().is_empty() {
+                    self.no_beep();
+                }
+                reply.text
+            }
         };
 
         match turn.entry {
@@ -616,6 +635,7 @@ impl Engineer {
                 Poll::Ready(Some(Err(e))) => {
                     self.playback = None;
                     self.notice(t!("engineer.error_synthesizing", error = format!("{e:#}")));
+                    self.no_beep();
                     return;
                 }
                 // SDL plays what's left
@@ -830,6 +850,64 @@ mod tests {
         sys::bono_session_info,
     };
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn incomplete_answers_play_a_tone_without_a_voice() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let rt = runtime.handle();
+        let dir = tempfile::tempdir().unwrap();
+        let config = rt
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let mut synth = Synthesizer::new(rt, &config.get());
+        let mut engineer = rt
+            .block_on(Engineer::new(
+                Path::new("assets"),
+                &config.get(),
+                reqwest::Client::new(),
+                None,
+            ))
+            .unwrap();
+
+        for (stop, text, tone) in [
+            (StopReason::MaxTokens, "Partial answer", true),
+            (StopReason::ContextWindowExceeded, "Partial answer", true),
+            (StopReason::Refusal, "", true),
+            (StopReason::EndTurn, "", true),
+            (StopReason::EndTurn, "Complete answer", false),
+            (StopReason::StopSequence, "Complete answer", false),
+        ] {
+            engineer.playback = None;
+            let (_, receiver) = mpsc::unbounded_channel();
+            let turn = Turn {
+                task: Task::spawn(std::future::pending()),
+                lang: arrstr!("en"),
+                text: receiver,
+                entry: None,
+            };
+            engineer.answer(
+                rt,
+                &config,
+                &mut synth,
+                Reply {
+                    text: text.into(),
+                    stop,
+                    usage: Default::default(),
+                    model: "test".into(),
+                },
+                turn,
+            );
+            assert_eq!(engineer.playback.is_some(), tone, "{stop:?}");
+            if let Some(playback) = &mut engineer.playback {
+                let Poll::Ready(Some(Ok(speech))) = playback.speech.try_next() else {
+                    panic!("failure tone must be ready without speech synthesis");
+                };
+                assert!(speech.samples.iter().any(|sample| *sample != 0.0));
+            }
+        }
+        assert!(engineer.new_session);
+    }
 
     /// A typed question answered the way the app does it: `ask_text`, then `update` every frame
     /// until the answer is in. Needs `ANTHROPIC_API_KEY` and `EVAL_DB` (a recorded race).
