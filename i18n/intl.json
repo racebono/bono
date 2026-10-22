@@ -1020,6 +1020,11 @@
         "es": "El simulador se ha detenido: la sesión ha terminado",
         "ca": "El simulador s'ha aturat: la sessió s'ha acabat"
     },
+    "engineer.signed_out": {
+        "en": "You signed out of your Bono account: the Bono Cloud conversation ended",
+        "es": "Has cerrado la sesión de tu cuenta de Bono: la conversación con Bono Cloud ha terminado",
+        "ca": "Has tancat la sessió del teu compte de Bono: la conversa amb Bono Cloud s'ha acabat"
+    },
     "engineer.error_asking": {
         "en": "Error asking the race engineer: {error}",
         "es": "Error al preguntar al ingeniero de carrera: {error}",
