@@ -120,11 +120,11 @@ impl App {
         };
 
         let guard = config.get();
-        let gui = Gui::new(&pref_path, &subsystems, &guard, &client);
+        let gui = Gui::new(&pref_path, &subsystems, &guard, &client, account.as_ref());
         let synth = Synthesizer::new(rt, &guard);
         let (tracks, engineer) = tokio::try_join!(
             async move { Ok(tracks.await) },
-            Engineer::new(assets_path.as_std_path(), &guard, client)
+            Engineer::new(assets_path.as_std_path(), &guard, client, account.clone())
         )?;
         drop(guard);
 
@@ -392,9 +392,10 @@ impl Gui {
         ss: &Subsystems,
         config: &RawConfig,
         client: &reqwest::Client,
+        account: Option<&crate::account::Account>,
     ) -> Self {
         Self {
-            topbar: Topbar::new(pref_path, ss, config, client),
+            topbar: Topbar::new(pref_path, ss, config, client, account),
             chat: Chat::default(),
             onboarding: Onboarding::new(config),
             applied_text_scale: None,

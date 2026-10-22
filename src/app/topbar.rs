@@ -47,12 +47,13 @@ impl Topbar {
         ss: &Subsystems,
         config: &RawConfig,
         client: &reqwest::Client,
+        account: Option<&crate::account::Account>,
     ) -> Self {
         Self {
             account: AccountTopbar::default(),
             settings: SettingsTopbar::default(),
             volume: VolumeTopbar,
-            provider: ProviderTopbar::new(client),
+            provider: ProviderTopbar::new(client, account),
             spotter: SpotterTopbar,
             simulators: SimulatorsTopbar::default(),
             confirm_clear: false,
@@ -84,7 +85,7 @@ impl Topbar {
         // Every menu with something in it that isn't set up yet
         let settings_setup = config.get().talk_button().is_none();
         let audio_setup = self.audio.needs_setup(config);
-        let provider_setup = provider::needs_setup(config);
+        let provider_setup = self.provider.needs_setup(rt, config);
         let simulators_setup = self.simulators.needs_setup(simulators);
 
         let mut guide = false;

@@ -580,23 +580,88 @@ settings! {
     }
 }
 
-settings! {
-    /// The language model the engineer talks through. Each provider's settings are kept while
-    /// another one is in use.
-    #[derive(Debug, PartialEq)]
-    pub struct ModelConfig {
-        pub provider: ModelProvider = ModelProvider::Claude,
+/// The language model the engineer talks through. Each provider's settings are kept while
+/// another one is in use.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelConfig {
+    #[serde(
+        default,
+        rename = "provider",
+        skip_serializing_if = "Setting::is_default",
+        deserialize_with = "deserialize_provider"
+    )]
+    fallback_provider: Setting<ModelProvider>,
+    /// Older builds ignore this and keep using the previous provider.
+    #[serde(default, skip_serializing_if = "Setting::is_default")]
+    bono_cloud: Setting<bool>,
+    #[serde(default, skip_serializing_if = "IsDefault::is_default")]
+    pub claude: ClaudeConfig,
+    #[serde(default, skip_serializing_if = "IsDefault::is_default")]
+    pub ollama: OllamaConfig,
+    #[serde(default, skip_serializing_if = "IsDefault::is_default")]
+    pub openai: OpenAiConfig,
+}
+
+impl IsDefault for ModelConfig {
+    fn is_default(&self) -> bool {
+        self.fallback_provider.is_default()
+            && self.bono_cloud.is_default()
+            && self.claude.is_default()
+            && self.ollama.is_default()
+            && self.openai.is_default()
     }
-    groups {
-        claude: ClaudeConfig,
-        ollama: OllamaConfig,
-        openai: OpenAiConfig,
+}
+
+impl ModelConfig {
+    pub fn provider(&self) -> &ModelProvider {
+        if *self.bono_cloud.get_or(&false) {
+            &ModelProvider::BonoCloud
+        } else {
+            self.fallback_provider.get_or(&ModelProvider::Claude)
+        }
     }
+
+    pub fn set_provider(&mut self, provider: ModelProvider) {
+        match provider {
+            ModelProvider::BonoCloud => self.bono_cloud.set(true),
+            ModelProvider::Claude | ModelProvider::Ollama | ModelProvider::OpenAi => {
+                self.fallback_provider.set(provider);
+                self.bono_cloud = Setting::Default;
+            }
+        }
+    }
+
+    pub fn edit_provider(
+        &mut self,
+        mut current: ModelProvider,
+        edit: impl FnOnce(&mut ModelProvider) -> bool,
+    ) -> bool {
+        let changed = edit(&mut current);
+        if changed {
+            self.set_provider(current);
+        }
+        changed
+    }
+}
+
+/// A newer provider must not send the whole config through corruption recovery.
+fn deserialize_provider<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Setting<ModelProvider>, D::Error> {
+    Ok(match String::deserialize(deserializer)?.as_str() {
+        "claude" => Setting::Set(ModelProvider::Claude),
+        "ollama" => Setting::Set(ModelProvider::Ollama),
+        "openai" => Setting::Set(ModelProvider::OpenAi),
+        _ => Setting::Default,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelProvider {
+    /// Bono Cloud: whichever model Bono's website runs, for signed-in accounts with access to it.
+    /// Nothing to set up, so it has no settings
+    BonoCloud,
     /// Claude, through the Claude API: needs an API key
     Claude,
     /// A model Ollama runs, on this PC or another
@@ -690,6 +755,163 @@ settings! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum ReleasedProvider {
+        Claude,
+        Ollama,
+        OpenAi,
+    }
+
+    #[derive(Deserialize)]
+    struct ReleasedModelConfig {
+        #[serde(default)]
+        provider: Setting<ReleasedProvider>,
+        #[serde(default)]
+        claude: ClaudeConfig,
+        #[serde(default)]
+        ollama: OllamaConfig,
+        #[serde(default)]
+        openai: OpenAiConfig,
+    }
+
+    #[derive(Deserialize)]
+    struct ReleasedConfig {
+        #[serde(default)]
+        master_volume: Setting<f32>,
+        #[serde(default)]
+        voices: Setting<BTreeMap<ArrayStr<2>, Utf8PathBuf>>,
+        model: ReleasedModelConfig,
+    }
+
+    #[tokio::test]
+    async fn bono_cloud_round_trips_with_legacy_fallback() {
+        for fallback in [
+            None,
+            Some(ModelProvider::Claude),
+            Some(ModelProvider::Ollama),
+            Some(ModelProvider::OpenAi),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.json");
+            let mut data = RawConfig::default();
+            if let Some(fallback) = fallback {
+                data.model.set_provider(fallback);
+            }
+            data.model.set_provider(ModelProvider::BonoCloud);
+            data.master_volume.set(0.5);
+            data.voices.set(BTreeMap::from([(
+                arrstr!("en"),
+                Utf8PathBuf::from("voices/engineer.onnx"),
+            )]));
+            data.model.claude.api_key.set(Some("claude-key".into()));
+            data.model.ollama.model.set("local-model".into());
+            data.model.openai.api_key.set(Some("openai-key".into()));
+
+            let contents = serde_json::to_vec_pretty(&data).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&contents).unwrap();
+            assert_eq!(json["model"]["bono_cloud"], true);
+            assert_ne!(json["model"]["provider"], "bonocloud");
+            save_config(&path, &contents).unwrap();
+            let loaded = load_config(&path).await.unwrap();
+            assert_eq!(*loaded.model.provider(), ModelProvider::BonoCloud);
+            assert_eq!(loaded.model, data.model);
+            assert_eq!(loaded.voices(), data.voices());
+            assert_eq!(*loaded.master_volume(), 0.5);
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+            let released: ReleasedConfig = serde_json::from_slice(&contents).unwrap();
+            let expected = match fallback {
+                None | Some(ModelProvider::Claude) => ReleasedProvider::Claude,
+                Some(ModelProvider::Ollama) => ReleasedProvider::Ollama,
+                Some(ModelProvider::OpenAi) => ReleasedProvider::OpenAi,
+                Some(ModelProvider::BonoCloud) => unreachable!(),
+            };
+            assert_eq!(
+                *released.model.provider.get_or(&ReleasedProvider::Claude),
+                expected
+            );
+            assert_eq!(released.master_volume, data.master_volume);
+            assert_eq!(released.voices, data.voices);
+            assert_eq!(released.model.claude, data.model.claude);
+            assert_eq!(released.model.ollama, data.model.ollama);
+            assert_eq!(released.model.openai, data.model.openai);
+        }
+    }
+
+    #[test]
+    fn released_config_rejects_unknown_provider_but_ignores_extra_fields() {
+        let error = serde_json::from_str::<ReleasedConfig>(r#"{"model":{"provider":"bonocloud"}}"#)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("unknown variant `bonocloud`"));
+        let released: ReleasedConfig = serde_json::from_str(
+            r#"{"future_setting":true,"model":{"provider":"ollama","bono_cloud":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            released.model.provider,
+            Setting::Set(ReleasedProvider::Ollama)
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_provider_defaults_without_recovering_config() {
+        for provider in ["future-provider", "bonocloud"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.json");
+            let contents = serde_json::to_vec(&serde_json::json!({
+                "master_volume": 0.5,
+                "voices": {"en": "voices/engineer.onnx"},
+                "model": {
+                    "provider": provider,
+                    "claude": {"api_key": "claude-key"},
+                    "openai": {"api_key": "openai-key"}
+                }
+            }))
+            .unwrap();
+            std::fs::write(&path, &contents).unwrap();
+            let loaded = load_config(&path).await.unwrap();
+            assert_eq!(*loaded.model.provider(), ModelProvider::Claude);
+            assert!(loaded.model.fallback_provider.is_default());
+            assert_eq!(*loaded.master_volume(), 0.5);
+            assert_eq!(loaded.voices()[&arrstr!("en")], "voices/engineer.onnx");
+            assert_eq!(loaded.model.claude.api_key().as_deref(), Some("claude-key"));
+            assert_eq!(loaded.model.openai.api_key().as_deref(), Some("openai-key"));
+            assert_eq!(std::fs::read(&path).unwrap(), contents);
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+            let saved = serde_json::to_value(&loaded).unwrap();
+            assert!(saved["model"].get("provider").is_none());
+        }
+    }
+
+    #[test]
+    fn switching_away_from_bono_cloud_clears_override() {
+        let mut model = ModelConfig::default();
+        model.set_provider(ModelProvider::Ollama);
+        assert!(model.edit_provider(*model.provider(), |provider| {
+            *provider = ModelProvider::BonoCloud;
+            true
+        }));
+        assert!(!model.edit_provider(*model.provider(), |_| false));
+        assert_eq!(*model.provider(), ModelProvider::BonoCloud);
+        for provider in [
+            ModelProvider::Claude,
+            ModelProvider::Ollama,
+            ModelProvider::OpenAi,
+        ] {
+            model.set_provider(ModelProvider::BonoCloud);
+            assert!(model.edit_provider(*model.provider(), |current| {
+                *current = provider;
+                true
+            }));
+            let saved = serde_json::to_value(&model).unwrap();
+            assert!(saved.get("bono_cloud").is_none());
+            let loaded: ModelConfig = serde_json::from_value(saved).unwrap();
+            assert_eq!(*loaded.provider(), provider);
+        }
+    }
 
     #[test]
     fn atomic_save_replaces_json_and_cleans_up() {

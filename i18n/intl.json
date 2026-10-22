@@ -1020,6 +1020,11 @@
         "es": "El simulador se ha detenido: la sesión ha terminado",
         "ca": "El simulador s'ha aturat: la sessió s'ha acabat"
     },
+    "engineer.signed_out": {
+        "en": "You signed out of your Bono account: the Bono Cloud conversation ended",
+        "es": "Has cerrado la sesión de tu cuenta de Bono: la conversación con Bono Cloud ha terminado",
+        "ca": "Has tancat la sessió del teu compte de Bono: la conversa amb Bono Cloud s'ha acabat"
+    },
     "engineer.error_asking": {
         "en": "Error asking the race engineer: {error}",
         "es": "Error al preguntar al ingeniero de carrera: {error}",
@@ -1119,6 +1124,36 @@
         "en": " (pull it with `ollama pull`)",
         "es": " (descárgalo con `ollama pull`)",
         "ca": " (baixa'l amb `ollama pull`)"
+    },
+    "provider.bono_cloud_hover": {
+        "en": "Bono's own engineer models, included with your Bono account: nothing to set up",
+        "es": "Los modelos de ingeniero de Bono, incluidos con tu cuenta de Bono: no hay nada que configurar",
+        "ca": "Els models d'enginyer de Bono, inclosos amb el teu compte de Bono: no cal configurar res"
+    },
+    "provider.bono_cloud_about": {
+        "en": "Bono Cloud picks the model and its settings for you.",
+        "es": "Bono Cloud elige el modelo y su configuración por ti.",
+        "ca": "Bono Cloud tria el model i la seva configuració per tu."
+    },
+    "provider.bono_cloud_unavailable": {
+        "en": "Bono Cloud needs a signed-in Bono account with access to it",
+        "es": "Bono Cloud necesita una cuenta de Bono con acceso, con la sesión iniciada",
+        "ca": "Bono Cloud necessita un compte de Bono amb accés, amb la sessió iniciada"
+    },
+    "provider.bono_cloud_sign_in": {
+        "en": "Sign in to your Bono account to use Bono Cloud",
+        "es": "Inicia sesión en tu cuenta de Bono para usar Bono Cloud",
+        "ca": "Inicia la sessió al teu compte de Bono per fer servir Bono Cloud"
+    },
+    "provider.bono_cloud_session_ended": {
+        "en": "Your Bono account's session ended: sign in again",
+        "es": "La sesión de tu cuenta de Bono ha terminado: vuelve a iniciar sesión",
+        "ca": "La sessió del teu compte de Bono ha acabat: torna a iniciar la sessió"
+    },
+    "provider.bono_cloud_refresh_failed": {
+        "en": "Could not refresh your Bono session: try again; you are still signed in",
+        "es": "No se pudo renovar tu sesión de Bono: vuelve a intentarlo; sigues conectado",
+        "ca": "No s'ha pogut renovar la sessió de Bono: torna-ho a provar; continues connectat"
     },
     "provider.openai_hover": {
         "en": "Any OpenAI-compatible API: llama.cpp's llama-server (started with --jinja), LM Studio, vLLM, OpenRouter, OpenAI...",
@@ -1299,6 +1334,11 @@
         "en": "A model Ollama runs, on this PC or another on your network.",
         "es": "Un modelo que ejecuta Ollama, en este PC o en otro de tu red.",
         "ca": "Un model que executa Ollama, en aquest PC o en un altre de la teva xarxa."
+    },
+    "onboarding.bono_cloud": {
+        "en": "Included with your Bono account: nothing to set up",
+        "es": "Incluido con tu cuenta de Bono: no hay nada que configurar",
+        "ca": "Inclòs amb el teu compte de Bono: no cal configurar res"
     },
     "onboarding.openai": {
         "en": "Any OpenAI-compatible server: llama.cpp, LM Studio, vLLM, OpenRouter...",

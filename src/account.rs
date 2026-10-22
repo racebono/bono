@@ -164,11 +164,14 @@ impl Account {
         self.inner.status.borrow().clone()
     }
 
+    /// `path` (absolute, e.g. `/api/cloud/v1`) on the account's website, for other APIs that
+    /// take its access token.
+    pub fn url(&self, path: &str) -> Url {
+        self.inner.base.join(path).expect("fixed API path")
+    }
+
     fn endpoint(&self, name: &str) -> Url {
-        self.inner
-            .base
-            .join(&format!("/api/desktop/auth/{name}"))
-            .expect("fixed API path")
+        self.url(&format!("/api/desktop/auth/{name}"))
     }
 
     /// Prepare login without opening a window, allowing callers to display/open the URL.
@@ -284,6 +287,19 @@ impl Account {
             }
         }
         self.refresh_locked(&mut state).await?;
+        Ok(state.access.as_ref().context("Not signed in")?.0.clone())
+    }
+
+    /// Refresh a rejected bearer unless another caller already replaced it. Do not log it.
+    pub async fn refresh_access_token(&self, rejected: &str) -> anyhow::Result<String> {
+        let mut state = self.inner.state.lock().await;
+        if state
+            .access
+            .as_ref()
+            .is_some_and(|(token, _)| token == rejected)
+        {
+            self.refresh_locked(&mut state).await?;
+        }
         Ok(state.access.as_ref().context("Not signed in")?.0.clone())
     }
 
@@ -480,4 +496,4 @@ fn challenge(verifier: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -3,8 +3,9 @@
 //! is spoken back over the radio as the model writes it.
 
 use crate::{
+    account::{Account, Status},
     arrstr,
-    config::{ArrayStr, Config, ModelConfig, RawConfig},
+    config::{ArrayStr, Config, ModelConfig, ModelProvider, RawConfig},
     language::{self, LanguageDetector},
     provider::{self, Model, Reply, StopReason, Tools},
     sim::Sim,
@@ -78,6 +79,8 @@ pub enum Speaker {
 
 pub struct Engineer {
     client: reqwest::Client,
+    /// Who Bono Cloud is used as
+    account: Option<Account>,
     skill: Arc<str>,
     schema: Arc<str>,
     /// Everything said, for the chat
@@ -129,6 +132,9 @@ struct Session {
     db: PathBuf,
     /// The model settings it was started with: changing them starts over
     model: ModelConfig,
+    /// The account's user id, when the conversation is the account's (Bono Cloud's): it ends
+    /// once that account signs out
+    user: Option<String>,
     state: Arc<Mutex<SessionState>>,
 }
 
@@ -146,6 +152,7 @@ impl Engineer {
         assets_path: &Path,
         config: &RawConfig,
         client: reqwest::Client,
+        account: Option<Account>,
     ) -> anyhow::Result<Self> {
         let (skill, schema) = tokio::try_join!(
             tokio::fs::read_to_string(assets_path.join(config.skill_path()).join(SKILL_PATH)),
@@ -154,6 +161,7 @@ impl Engineer {
 
         Ok(Self {
             client,
+            account,
             skill: instructions(skill).into(),
             schema: schema.into(),
             chat: Vec::new(),
@@ -445,6 +453,13 @@ impl Engineer {
             self.session = None;
             self.notice(t!("engineer.sim_stopped"));
         }
+        // The account the conversation is had as signed out (or another signed in): it ends,
+        // answer on its way included
+        if self.session.as_ref().is_some_and(|s| !self.signed_in_as(s)) {
+            self.stop();
+            self.session = None;
+            self.notice(t!("engineer.signed_out"));
+        }
 
         if let Some(turn) = &mut self.turn {
             // The answer so far
@@ -669,6 +684,19 @@ impl Engineer {
         }
     }
 
+    /// Whether the account `session` is had as, if any, is still signed in.
+    fn signed_in_as(&self, session: &Session) -> bool {
+        let Some(user) = &session.user else {
+            return true;
+        };
+        self.account
+            .as_ref()
+            .is_some_and(|account| match account.status() {
+                Status::SignedIn(signed_in) => signed_in.id == *user,
+                Status::SignedOut => false,
+            })
+    }
+
     /// Drops the answer on its way and stops the one being spoken.
     fn stop(&mut self) {
         if let Some(turn) = self.turn.take() {
@@ -708,8 +736,21 @@ impl Engineer {
             tool.clone(),
         );
         let model = config.get().model.clone();
-        let conversation =
-            provider::conversation(&model, self.skill.clone(), tools, self.client.clone())?;
+        // Taken before the conversation: if the account signs out meanwhile, it ends next frame
+        let user = match model.provider() {
+            ModelProvider::BonoCloud => match self.account.as_ref().map(Account::status) {
+                Some(Status::SignedIn(user)) => Some(user.id),
+                Some(Status::SignedOut) | None => anyhow::bail!(t!("provider.bono_cloud_sign_in")),
+            },
+            ModelProvider::Claude | ModelProvider::Ollama | ModelProvider::OpenAi => None,
+        };
+        let conversation = provider::conversation(
+            &model,
+            self.account.as_ref(),
+            self.skill.clone(),
+            tools,
+            self.client.clone(),
+        )?;
 
         // The history cache is built now, so the first history question doesn't wait for it
         let warming_tool = tool.clone();
@@ -724,6 +765,7 @@ impl Engineer {
         Ok(Session {
             db,
             model,
+            user,
             state: Arc::new(Mutex::new(SessionState {
                 conversation,
                 tool,
@@ -817,7 +859,12 @@ mod tests {
             .build()
             .unwrap();
         let mut engineer = rt
-            .block_on(Engineer::new(Path::new("assets"), &config.get(), client))
+            .block_on(Engineer::new(
+                Path::new("assets"),
+                &config.get(),
+                client,
+                None,
+            ))
             .unwrap();
 
         let questions = std::env::var("EVAL_QUESTIONS")
