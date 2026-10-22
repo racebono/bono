@@ -105,19 +105,16 @@ impl ProviderTopbar {
             let mut changed = raw.model.edit_provider(provider, |provider| {
                 ui.horizontal(|ui| {
                     ui.label(t!("provider.label"));
-                    let picked = *provider == ModelProvider::BonoCloud;
-                    let cloud_clicked = ui
-                        .add_enabled_ui(cloud == Some(true), |ui| {
-                            ui.selectable_value(
-                                provider,
-                                ModelProvider::BonoCloud,
-                                setup_label(picked && cloud == Some(false), "Bono Cloud"),
-                            )
-                        })
-                        .inner
-                        .on_hover_text(t!("provider.bono_cloud_hover"))
-                        .on_disabled_hover_text(self.cloud_unavailable(cloud))
-                        .clicked();
+                    let mut cloud_option = ui
+                        .selectable_value(
+                            provider,
+                            ModelProvider::BonoCloud,
+                            setup_label(cloud == Some(false), "Bono Cloud"),
+                        )
+                        .on_hover_text(t!("provider.bono_cloud_hover"));
+                    if cloud == Some(false) {
+                        cloud_option = cloud_option.on_hover_text(self.cloud_unavailable());
+                    }
                     let no_credentials = !provider::claude::has_credentials(&model.claude);
                     let mut claude = ui
                         .selectable_value(
@@ -135,7 +132,7 @@ impl ProviderTopbar {
                     let openai = ui
                         .selectable_value(provider, ModelProvider::OpenAi, "OpenAI")
                         .on_hover_text(t!("provider.openai_hover"));
-                    cloud_clicked || claude.clicked() || ollama.clicked() || openai.clicked()
+                    cloud_option.clicked() || claude.clicked() || ollama.clicked() || openai.clicked()
                 })
                 .inner
             });
@@ -168,18 +165,15 @@ impl ProviderTopbar {
         config.maybe_update(|raw| {
             let mut changed = raw.model.edit_provider(provider, |provider| {
                 let no_credentials = !provider::claude::has_credentials(&model.claude);
-                let picked = *provider == ModelProvider::BonoCloud;
-                let mut changed = ui
-                    .add_enabled_ui(cloud == Some(true), |ui| {
-                        ui.radio_value(
-                            provider,
-                            ModelProvider::BonoCloud,
-                            setup_label(picked && cloud == Some(false), "Bono Cloud"),
-                        )
-                    })
-                    .inner
-                    .on_disabled_hover_text(self.cloud_unavailable(cloud))
-                    .changed();
+                let mut cloud_option = ui.radio_value(
+                    provider,
+                    ModelProvider::BonoCloud,
+                    setup_label(cloud == Some(false), "Bono Cloud"),
+                );
+                if cloud == Some(false) {
+                    cloud_option = cloud_option.on_hover_text(self.cloud_unavailable());
+                }
+                let mut changed = cloud_option.changed();
                 let about = t!("onboarding.bono_cloud");
                 ui.indent(about, |ui| ui.weak(about));
                 let options = [
@@ -585,12 +579,11 @@ impl ProviderTopbar {
         Some(matches!(authorized, Ok(true)))
     }
 
-    /// Why Bono Cloud can't be picked: signed out, still asking, or no access.
-    fn cloud_unavailable(&self, cloud: Option<bool>) -> &'static str {
-        match (cloud, &self.cloud) {
-            (None, _) => t!("onboarding.provider_checking"),
-            (_, None) => t!("provider.bono_cloud_sign_in"),
-            (_, Some(_)) => t!("provider.bono_cloud_unavailable"),
+    /// Why Bono Cloud can't be used: signed out, or no access.
+    fn cloud_unavailable(&self) -> &'static str {
+        match self.cloud {
+            None => t!("provider.bono_cloud_sign_in"),
+            Some(_) => t!("provider.bono_cloud_unavailable"),
         }
     }
 
@@ -607,7 +600,7 @@ impl ProviderTopbar {
             Some(false) => {
                 // Signed out, signing in asks again
                 let signed_in = self.cloud.is_some();
-                let unavailable = self.cloud_unavailable(cloud);
+                let unavailable = self.cloud_unavailable();
                 let failed = self
                     .cloud
                     .as_mut()
