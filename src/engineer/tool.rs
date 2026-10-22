@@ -4360,6 +4360,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn every_question_attaches_the_exact_quick_output() {
+        let (_dir, engineer) = race();
+        let quick = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        // Include non-urgent questions: deciding which extra tools are needed belongs
+        // to the model, not a keyword filter that might omit useful current context.
+        for question in ["Car right?", "Compare my last three laps", "Hello!\nTyres?"] {
+            let attached = engineer.question_with_snapshot(question.into()).await;
+            assert_eq!(
+                attached,
+                format!(
+                    "{question}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\n{quick}\n[END UNTRUSTED TELEMETRY SNAPSHOT]"
+                )
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_recovers_after_a_failed_read() {
+        let (dir, engineer) = race();
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute("ALTER TABLE telemetry RENAME TO unavailable", [])
+            .unwrap();
+        let failed = engineer.question_with_snapshot("Gap?".into()).await;
+        assert_eq!(failed, "Gap?");
+        conn.execute("ALTER TABLE unavailable RENAME TO telemetry", [])
+            .unwrap();
+        let recovered = engineer.question_with_snapshot("And now?".into()).await;
+        assert!(recovered.starts_with("And now?\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]"));
+        assert!(recovered.contains("Fischer"), "{recovered}");
+        assert_eq!(failed, "Gap?");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn snapshot_failure_preserves_the_question() {
         let dir = tempfile::tempdir().unwrap();
         let one = std::num::NonZeroUsize::new(1).unwrap();

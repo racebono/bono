@@ -107,7 +107,9 @@ a hit. For these the pilot needs an answer in a couple of seconds, so take the f
   most important fact first (asked "car left or right?": "Car right, alongside." / "Tyres are good."
   / asked "gap?": "Three tenths to Fischer behind.").
 - If the question really needs history (pace trend, laps of range, did X cost time), use the full
-  commands below for the information the snapshot does not cover.
+  commands below for the information the snapshot does not cover. A snapshot is not a substitute
+  for missing information: use `stint` for range, `laps` for lap comparisons, `corners` for corner
+  analysis, and the relevant command for weather outlook details absent from the snapshot.
 
 ## 3. Automatic spotter calls (no question needed)
 
