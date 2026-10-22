@@ -457,6 +457,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "unicode-normalization",
+ "unicode-segmentation",
  "ureq",
  "utils-atomics",
  "webbrowser",

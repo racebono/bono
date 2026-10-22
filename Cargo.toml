@@ -42,6 +42,7 @@ reqwest = { version = "0.13.5", features = ["json"] }
 tempfile = "3.27.0"
 egui_extras = "0.36.2"
 ort = "=2.0.0-rc.13"
+unicode-segmentation = "1.13"
 unicode-normalization = "0.1.25"
 wide = "1.7.1"
 rayon = "1.12.0"

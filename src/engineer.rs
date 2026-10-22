@@ -27,7 +27,9 @@ use tokio::{
 };
 use tool::{Engineer as EngineerTool, SCHEMA_PATH, SKILL_PATH, instructions};
 
+mod speech_queue;
 mod tool;
+use speech_queue::SpeechQueue;
 
 /// One line of the conversation, as the chat shows it.
 pub struct ChatEntry {
@@ -125,6 +127,7 @@ struct Playback {
     done: bool,
     /// Whether SDL played all of it, once it's all on the stream
     drain: Drain,
+    queue: SpeechQueue,
 }
 
 struct Session {
@@ -201,23 +204,37 @@ impl Engineer {
     }
 
     /// Pauses the answer being spoken (and holds one about to start) while the spotter speaks;
-    /// releasing it carries on from where it stopped.
+    /// releasing it restarts the first word that was not completely played.
     pub fn hold(&mut self, held: bool) {
         if std::mem::replace(&mut self.held, held) == held {
             return;
         }
 
-        if let Some(stream) = self
-            .playback
-            .as_ref()
-            .and_then(|playback| playback.stream.as_ref())
+        if let Some(playback) = &mut self.playback
+            && let Some(stream) = &playback.stream
         {
-            let result = match held {
-                true => stream.pause(),
-                false => stream.resume(),
-            };
+            let result = (|| {
+                if held {
+                    // Pause first: no consumption may race the progress snapshot or requeue.
+                    stream.pause()?;
+                    let queued = stream.queued_bytes()?;
+                    playback.queue.advance(queued);
+                    stream.clear()?;
+                    for speech in playback.queue.remaining() {
+                        stream.put_data_f32(&speech.samples)?;
+                    }
+                    if playback.done {
+                        stream.flush()?;
+                    }
+                } else {
+                    stream.resume()?;
+                }
+                Ok::<_, sdl3::Error>(())
+            })();
             if let Err(e) = result {
                 log::warn!("Error holding the answer for the spotter: {e}");
+                // An unreadable position must not silently skip words or replay old speech.
+                self.playback = None;
             }
         }
     }
@@ -328,6 +345,7 @@ impl Engineer {
             stream: None,
             done: false,
             drain: Drain::new(Instant::now()),
+            queue: SpeechQueue::default(),
         });
     }
 
@@ -598,6 +616,7 @@ impl Engineer {
             stream: None,
             done: false,
             drain: Drain::new(Instant::now()),
+            queue: SpeechQueue::default(),
         });
         Some((lang, input))
     }
@@ -608,6 +627,12 @@ impl Engineer {
         let Some(playback) = &mut self.playback else {
             return;
         };
+
+        if let Some(stream) = &playback.stream {
+            if let Ok(queued) = stream.queued_bytes() {
+                playback.queue.advance(queued);
+            }
+        }
 
         while !playback.done {
             let mut speech = match playback.speech.try_next() {
@@ -640,13 +665,8 @@ impl Engineer {
 
             let played = match (&playback.stream, speaker) {
                 (Some(stream), _) => stream.put_data_f32(&speech.samples),
-                (None, Some(speaker)) => speech.start(speaker).and_then(|stream| {
-                    // Starts held while the spotter speaks
-                    if held {
-                        stream.pause()?;
-                    }
+                (None, Some(speaker)) => speech.start_held(speaker, held).map(|stream| {
                     playback.stream = Some(stream);
-                    Ok(())
                 }),
                 (None, None) => {
                     self.playback = None;
@@ -655,6 +675,9 @@ impl Engineer {
                 }
             };
 
+            if played.is_ok() {
+                playback.queue.push(speech);
+            }
             if let Err(e) = played {
                 self.playback = None;
                 self.notice(t!("engineer.error_playing", error = e));
@@ -830,6 +853,44 @@ mod tests {
         sys::bono_session_info,
     };
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn cancelling_a_held_answer_cannot_resume_retained_words() {
+        let mut queue = SpeechQueue::default();
+        queue.push(Speech {
+            samples: vec![0.25; 100],
+            sample_rate: 24000,
+        });
+        queue.advance(50 * 4);
+        let mut engineer = Engineer {
+            client: reqwest::Client::new(),
+            account: None,
+            skill: "".into(),
+            schema: "".into(),
+            chat: Vec::new(),
+            last_lang: arrstr!("en"),
+            languages: LanguageDetector::new(),
+            session: None,
+            new_session: false,
+            turn: None,
+            playback: Some(Playback {
+                speech: SpeechOutput::ready(Speech::no_beep(0.0)),
+                stream: None,
+                done: false,
+                drain: Drain::new(Instant::now()),
+                queue,
+            }),
+            held: true,
+            misheard: 0,
+        };
+        assert!(engineer.is_speaking());
+        engineer.stop();
+        engineer.hold(false);
+        assert!(!engineer.is_speaking());
+        engineer.hold(true);
+        engineer.hold(false);
+        assert!(engineer.playback.is_none());
+    }
 
     /// A typed question answered the way the app does it: `ask_text`, then `update` every frame
     /// until the answer is in. Needs `ANTHROPIC_API_KEY` and `EVAL_DB` (a recorded race).

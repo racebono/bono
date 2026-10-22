@@ -5,7 +5,8 @@
 //! 2. phonemes → IDs, with the config's `phoneme_id_map`
 //! 3. IDs → PCM, by running the model with ONNX Runtime
 //!
-//! Each sentence is synthesized separately, like Piper does.
+//! Complete utterances use sentence synthesis; engineer streams render words separately
+//! to retain exact PCM boundaries for interruption and resumption.
 
 use crate::{
     config::{ArrayStr, RawConfig},
@@ -16,8 +17,8 @@ use crate::{
     },
 };
 use anyhow::{Context, bail};
-use camino::{Utf8Path, Utf8PathBuf};
 use bono_i18n::t;
+use camino::{Utf8Path, Utf8PathBuf};
 use ort::{session::Session, value::Tensor};
 use sdl3::audio::{AudioFormat, AudioSpec, AudioStream, AudioStreamOwner};
 use serde::Deserialize;
@@ -39,6 +40,7 @@ use tokio::{
     },
 };
 use unicode_normalization::UnicodeNormalization;
+use unicode_segmentation::UnicodeSegmentation;
 
 mod phonemizer;
 mod radio;
@@ -85,8 +87,8 @@ impl Synthesizer {
         return recv;
     }
 
-    /// Speaks text as it comes in, a sentence at a time: each one is synthesized as soon as
-    /// it's complete, and comes out of the [`SpeechOutput`] while the next is still being
+    /// Speaks text as it comes in, a word at a time: each one is synthesized as soon as
+    /// its boundary is known, and comes out of the [`SpeechOutput`] while the next is still being
     /// written. The transmission ends when the [`SpeechInput`] is dropped, and stops early when
     /// the [`SpeechOutput`] is.
     pub fn stream(
@@ -123,7 +125,7 @@ impl SpeechInput {
     }
 }
 
-/// The speech of a [`Synthesizer::stream`], a sentence or so at a time: dropping it stops the
+/// The speech of a [`Synthesizer::stream`], a word at a time: dropping it stops the
 /// synthesis.
 pub struct SpeechOutput(mpsc::UnboundedReceiver<anyhow::Result<Speech>>);
 
@@ -352,7 +354,7 @@ impl Stream {
         })
     }
 
-    /// Says the next complete sentence, or the end of the transmission once its text is over.
+    /// Says the next complete word, or the end of the transmission once its text is over.
     fn step(&mut self, voice: Option<&mut Voice>) -> Step {
         if self.output.is_closed() {
             return Step::Done;
@@ -374,8 +376,8 @@ impl Stream {
             return Step::Done;
         };
 
-        // A sentence at a time even once all the text is in, so the first is heard sooner
-        let len = match sentence_len(&self.pending) {
+        // Render complete words separately: each output piece is an exact restart boundary.
+        let len = match word_len(&self.pending) {
             Some(len) => len,
             None if self.ended => self.pending.len(),
             None => 0,
@@ -385,8 +387,8 @@ impl Stream {
             0 if self.ended => (Ok(voice.end(&mut self.transmission)), true),
             0 => return Step::Waiting,
             len => {
-                let sentence = self.pending.drain(..len).collect::<String>();
-                (voice.speak(&mut self.transmission, &sentence), false)
+                let word = self.pending.drain(..len).collect::<String>();
+                (voice.speak_word(&mut self.transmission, &word), false)
             }
         };
 
@@ -415,34 +417,11 @@ impl Stream {
     }
 }
 
-/// How much of `text` to say now: up to the end of its first sentence (its punctuation, then a
-/// space) or line. `None` while the first sentence is still being written.
-fn sentence_len(text: &str) -> Option<usize> {
-    let mut chars = text.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        let mut end = i + c.len_utf8();
-        match c {
-            // No space after these
-            '\n' | '。' | '？' | '！' => return Some(end),
-            '.' | '?' | '!' | '…' => {
-                // Past closing quotes and brackets
-                while let Some(&(j, q)) = chars.peek()
-                    && matches!(q, '"' | '\'' | ')' | ']' | '”' | '’' | '»')
-                {
-                    end = j + q.len_utf8();
-                    chars.next();
-                }
-
-                // Not "3.5", nor a sentence that may still be going
-                if chars.peek().is_some_and(|&(_, next)| next.is_whitespace()) {
-                    return Some(end);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    return None;
+/// Wait for the next Unicode word before committing the preceding word and its
+/// punctuation. This avoids splitting a word across model text deltas, including
+/// scripts that do not separate words with spaces.
+fn word_len(text: &str) -> Option<usize> {
+    text.unicode_word_indices().nth(1).map(|(start, _)| start)
 }
 
 impl Drop for SynthesizerInner {
@@ -579,6 +558,24 @@ impl Voice {
         transmission: &mut Transmission,
         text: &str,
     ) -> anyhow::Result<Vec<f32>> {
+        self.speak_piece(transmission, text, true)
+    }
+
+    /// Independently rendered words give the engineer exact PCM restart boundaries.
+    fn speak_word(
+        &mut self,
+        transmission: &mut Transmission,
+        text: &str,
+    ) -> anyhow::Result<Vec<f32>> {
+        self.speak_piece(transmission, text, false)
+    }
+
+    fn speak_piece(
+        &mut self,
+        transmission: &mut Transmission,
+        text: &str,
+        sentence_pause: bool,
+    ) -> anyhow::Result<Vec<f32>> {
         let sentences = phonemize(text, &self.espeak_voice)?;
         let silence = (self.sample_rate as f32 * SENTENCE_SILENCE) as usize;
         let mut voice = Vec::<f32>::new();
@@ -586,7 +583,7 @@ impl Voice {
         for phonemes in sentences {
             let ids = self.phoneme_ids(&phonemes);
             // After the sentence before, even if it was in an earlier piece
-            if transmission.open || !voice.is_empty() {
+            if sentence_pause && (transmission.open || !voice.is_empty()) {
                 voice.resize(voice.len() + silence, 0.0);
             }
 
@@ -744,9 +741,20 @@ impl Speech {
         &self,
         device: &sdl3::audio::AudioDevice,
     ) -> Result<AudioStreamOwner, sdl3::Error> {
+        self.start_held(device, false)
+    }
+
+    /// Queue before starting the device, so an engineer held by the spotter never leaks audio.
+    pub fn start_held(
+        &self,
+        device: &sdl3::audio::AudioDevice,
+        held: bool,
+    ) -> Result<AudioStreamOwner, sdl3::Error> {
         let stream = device.clone().open_device_stream(Some(&self.spec()))?;
         stream.put_data_f32(&self.samples)?;
-        stream.resume()?;
+        if !held {
+            stream.resume()?;
+        }
         return Ok(stream);
     }
 }
@@ -935,15 +943,35 @@ mod tests {
     }
 
     #[test]
-    fn says_sentences_once_theyre_complete() {
-        assert_eq!(sentence_len("You are P3"), None);
-        assert_eq!(sentence_len("It's 3.5 seconds"), None);
-        // Could still be going ("lap...")
-        assert_eq!(sentence_len("Box this lap."), None);
-        assert_eq!(sentence_len("Box this lap. Tyres"), Some(13));
-        assert_eq!(sentence_len("He said \"go!\" Then"), Some(13));
-        assert_eq!(sentence_len("Copy\nNext"), Some(5));
-        assert_eq!(sentence_len("好。下"), Some("好。".len()));
+    fn words_wait_for_boundaries_and_preserve_punctuation() {
+        assert_eq!(word_len("Box"), None);
+        assert_eq!(word_len("Box this"), Some(4));
+        assert_eq!(word_len("You're P3, the"), Some(7));
+        assert_eq!(word_len("3.5 seconds"), Some(4));
+        assert_eq!(word_len("¡Sí! Ahora"), Some("¡Sí! ".len()));
+        assert_eq!(word_len("好。下"), Some("好。".len()));
+        // Arbitrary model deltas cannot split the unfinished word.
+        let mut pending = String::new();
+        let mut spoken = String::new();
+        for delta in ["Bo", "x th", "is lap", "."] {
+            pending.push_str(delta);
+            while let Some(len) = word_len(&pending) {
+                spoken.extend(pending.drain(..len));
+            }
+        }
+        assert_eq!(spoken, "Box this ");
+        assert_eq!(pending, "lap.");
+    }
+
+    #[test]
+    fn dropping_speech_output_cancels_delivery() {
+        let (send, recv) = mpsc::unbounded_channel();
+        let mut output = SpeechOutput(recv);
+        assert!(output.try_next().is_pending());
+        send.send(Ok(Speech::no_beep(0.0))).unwrap();
+        drop(output);
+        assert!(send.is_closed());
+        assert!(send.send(Ok(Speech::no_beep(0.0))).is_err());
     }
 
     async fn next(output: &mut SpeechOutput) -> Option<anyhow::Result<Speech>> {
@@ -960,7 +988,7 @@ mod tests {
     /// Needs a Piper voice: `BONO_VOICE` is the path to its `.onnx`.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
-    async fn speaks_a_sentence_at_a_time() {
+    async fn speaks_a_word_at_a_time() {
         let model = std::env::var("BONO_VOICE").expect("BONO_VOICE isn't set");
         let rt = Handle::current();
         let inner = SynthesizerInner::new(rt.clone());
@@ -975,7 +1003,7 @@ mod tests {
         };
         let (input, mut output) = synth.stream(&rt, crate::arrstr!("en"), effects);
 
-        // The first sentence is said while the next is still coming
+        // The first complete word is said while the next is still coming
         input.push("Copy. You're P3, the gap");
         let first = next(&mut output).await.unwrap().unwrap();
         assert!(!first.samples.is_empty());
@@ -989,8 +1017,8 @@ mod tests {
             pieces.push(speech.unwrap());
         }
 
-        // The other two sentences, then the beep and the squelch closing
-        assert_eq!(pieces.len(), 4);
+        // Twelve words, then the beep and the squelch closing
+        assert_eq!(pieces.len(), 13);
         let samples = pieces.iter().flat_map(|piece| &piece.samples);
         assert!(samples.clone().all(|sample| sample.abs() <= 1.0));
         let seconds = samples.count() as f32 / pieces[0].sample_rate as f32;
