@@ -401,6 +401,7 @@ impl Engineer {
             return;
         };
         let state = session.state.clone();
+        let attach_snapshot = session.model.provider() != ModelProvider::BonoCloud;
         let auto_session = *config.get().auto_session();
 
         // What the model writes goes straight to the synthesizer, and to the chat
@@ -413,9 +414,13 @@ impl Engineer {
             if auto_session {
                 state.follow_game_session().await;
             }
-            // Only the new user message gets a snapshot. Older messages and thinking
-            // blocks remain untouched, preserving the conversation's cached prefix.
-            let question = state.tool.question_with_snapshot(question).await;
+            // Cloud selects its initial telemetry tool server-side (bono-web #46).
+            // Other providers still receive a snapshot on the new user message only.
+            let question = if attach_snapshot {
+                state.tool.question_with_snapshot(question).await
+            } else {
+                question
+            };
             let mut on_text = |text: &str| {
                 if let Some(speech) = &speech {
                     speech.push(text);
