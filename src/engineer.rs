@@ -30,6 +30,7 @@ use tokio::{
 };
 use tool::{Engineer as EngineerTool, SCHEMA_PATH, SKILL_PATH, instructions};
 
+mod routing;
 mod tool;
 
 /// One line of the conversation, as the chat shows it.
@@ -86,6 +87,8 @@ pub struct Engineer {
     account: Option<Account>,
     skill: Arc<str>,
     schema: Arc<str>,
+    /// The skill's documents for Bono Cloud's router
+    routing: Arc<[routing::SkillDocs]>,
     /// Everything said, for the chat
     chat: Vec<ChatEntry>,
     /// The language the pilot last asked in: typed questions whose language is unclear are
@@ -166,9 +169,11 @@ impl Engineer {
             tokio::fs::read_to_string(assets_path.join(config.skill_path()).join(SCHEMA_PATH))
         )?;
 
+        let routing = routing::skill_docs(&skill, &EngineerTool::input_schema()).into();
         Ok(Self {
             client,
             account,
+            routing,
             skill: instructions(skill).into(),
             schema: schema.into(),
             chat: Vec::new(),
@@ -412,7 +417,8 @@ impl Engineer {
             return;
         };
         let state = session.state.clone();
-        let attach_snapshot = *session.model.provider() != ModelProvider::BonoCloud;
+        let cloud = *session.model.provider() == ModelProvider::BonoCloud;
+        let routing = self.routing.clone();
         let auto_session = *config.get().auto_session();
 
         // What the model writes goes straight to the synthesizer, and to the chat
@@ -423,12 +429,23 @@ impl Engineer {
         let task = Task::spawn(async move {
             let mut state = state.lock().await;
             state.follow_game_session(auto_session).await;
-            // Cloud selects its initial telemetry tool server-side (bono-web #46).
-            // Other providers still receive a snapshot on the new user message only.
-            let question = if attach_snapshot {
-                state.tool.question_with_snapshot(question).await
-            } else {
-                question
+            // Bono Cloud's router picks the first telemetry command, from the skill's documents
+            // and the session's state as they are now: a snapshot would stop it routing. Other
+            // providers get a snapshot with the new question only.
+            let question = match cloud {
+                true => {
+                    let session = match routing::session(&state.pool).await {
+                        Ok(session) => Some(session),
+                        Err(e) => {
+                            log::warn!("Error reading the session for Bono Cloud's router: {e:#}");
+                            None
+                        }
+                    };
+                    let context = routing::context(&routing, session).map(Arc::new);
+                    state.conversation.set_routing_context(context);
+                    question
+                }
+                false => state.tool.question_with_snapshot(question).await,
             };
             let mut on_text = |text: &str| {
                 if let Some(speech) = &speech {

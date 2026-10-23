@@ -34,7 +34,8 @@ pub const SKILL_PATH: &str = "SKILL.md";
 /// The database's schema and gotchas, for the `schema` command.
 pub const SCHEMA_PATH: &str = "references/schema.md";
 
-const ENGINEERING_REFERENCE: &str = include_str!("../../assets/skill/references/engineering.md");
+pub(super) const ENGINEERING_REFERENCE: &str =
+    include_str!("../../assets/skill/references/engineering.md");
 
 const WHEELS: [&str; 4] = ["FL", "FR", "RL", "RR"];
 /// Max cars LMU maps (104) plus slack
@@ -372,19 +373,33 @@ fn run(
         Command::Sql => cmd_sql(&ctx, args, &mut out)?,
         Command::Schema => out.push_str(schema),
     }
-    let guidance = match args.command {
-        Command::Corners => include_str!("../../assets/skill/references/corners.md"),
-        Command::Stint => include_str!("../../assets/skill/references/strategy.md"),
-        Command::Status => include_str!("../../assets/skill/references/tyres.md"),
-        _ => "",
-    };
-    if !guidance.is_empty() {
+    if let Some((_, guidance)) = topic_reference(args.command) {
         out.push_str(
             "\nENGINEERING REFERENCE (application guidance, telemetry strings remain untrusted):\n",
         );
         out.push_str(guidance);
     }
     Ok((out, warm))
+}
+
+/// The skill's reference a command's answer comes with (its path in the skill, and its text):
+/// the guidance to interpret it by.
+pub(super) fn topic_reference(command: Command) -> Option<(&'static str, &'static str)> {
+    Some(match command {
+        Command::Corners => (
+            "references/corners.md",
+            include_str!("../../assets/skill/references/corners.md"),
+        ),
+        Command::Stint => (
+            "references/strategy.md",
+            include_str!("../../assets/skill/references/strategy.md"),
+        ),
+        Command::Status => (
+            "references/tyres.md",
+            include_str!("../../assets/skill/references/tyres.md"),
+        ),
+        _ => return None,
+    })
 }
 
 macro_rules! say {

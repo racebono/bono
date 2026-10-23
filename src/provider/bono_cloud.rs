@@ -10,6 +10,12 @@
 //! Each game session's requests draw on a [`Lease`]: a share of the account's weekly allowance
 //! reserved for it up front (`/v1/sessions`). Requests without one count against a rolling
 //! 24-hour ceiling instead, a fraction of the week, which a long race can run into midway.
+//!
+//! Each driver question is a turn its router (Jev) may answer the first request of with a default
+//! `engineer` call, from the commands the conversation's [`routing::RoutingContext`] documents;
+//! without one, the website doesn't route the turn with the skill's documents (see [`routing`]).
+
+pub mod routing;
 
 use super::{Model, ModelOption, Reply, Tools, Usage, claude};
 use crate::{
@@ -602,6 +608,8 @@ fn no_lease_allowed(error: &anyhow::Error) -> bool {
 pub struct Conversation {
     inner: claude::Conversation,
     lease: Lease,
+    /// What the router is told about the next questions: none sends them without routing fields
+    routing: Option<Arc<routing::RoutingContext>>,
     /// Keeps the website warm while the engineer follows a game session
     keep_warm: Option<tokio::task::AbortHandle>,
 }
@@ -632,6 +640,7 @@ impl Conversation {
         Ok(Self {
             inner: builder.build(client)?,
             lease,
+            routing: None,
             keep_warm: None,
         })
     }
@@ -644,7 +653,14 @@ impl Model for Conversation {
         on_text: &'a mut (dyn FnMut(&str) + Send),
     ) -> BoxFuture<'a, anyhow::Result<Reply>> {
         Box::pin(async move {
+            // A turn of its own for every question, never reused for the next
+            let turn = self
+                .routing
+                .clone()
+                .map(|context| (routing::turn_id(), context));
+            self.inner.set_routing(turn);
             let reply = self.inner.send_streaming(text, on_text).await;
+            self.inner.set_routing(None);
             TURNS.fetch_add(1, Ordering::Relaxed);
             reply.map_err(readable_error)
         })
@@ -672,6 +688,16 @@ impl Model for Conversation {
 
     fn lease(&self) -> Option<Lease> {
         Some(self.lease.clone())
+    }
+
+    fn set_routing_context(&mut self, context: Option<Arc<routing::RoutingContext>>) {
+        self.routing = context.filter(|context| match context.validate() {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("Not routing with an invalid context, Claude answers: {e}");
+                false
+            }
+        });
     }
 }
 
@@ -1262,6 +1288,301 @@ mod tests {
         );
         assert_eq!(text, "Box.");
         assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    fn routing_context() -> Arc<routing::RoutingContext> {
+        let skill = |command: &str| routing::RoutingSkill {
+            command: command.into(),
+            description: format!("The `{command}` command."),
+            instructions: "Use it.".into(),
+            references: Vec::new(),
+        };
+        Arc::new(routing::RoutingContext::new(
+            Some("Session type: race.".into()),
+            vec![skill("quick"), skill("stint")],
+        ))
+    }
+
+    /// The engineer tool, recording its calls.
+    struct Recorded(Arc<Mutex<Vec<Value>>>);
+
+    impl ToolHandler for Recorded {
+        type Input = Value;
+
+        fn handle(
+            &self,
+            input: Value,
+        ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
+            self.0.lock().unwrap().push(input);
+            async { Ok("Range: 12 laps".into()) }
+        }
+    }
+
+    fn engineer_tools() -> (Tools, Arc<Mutex<Vec<Value>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = Tools::default();
+        tools.insert(
+            "engineer",
+            None,
+            json!({"type": "object"}),
+            Recorded(calls.clone()),
+        );
+        (tools, calls)
+    }
+
+    /// Jev's answer: a native message calling `engineer`, which Claude hasn't run yet.
+    fn synthetic(id: &str) -> Value {
+        json!({
+            "model": "claude-sonnet-5-5",
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "content": [{"type": "tool_use", "id": id, "name": "engineer", "input": {"command": "stint"}}],
+        })
+    }
+
+    fn sse(message: &Value) -> String {
+        let mut events = vec![json!({"type": "message_start", "message": {
+            "model": message["model"], "content": [], "usage": message["usage"]}})];
+        for (index, block) in message["content"].as_array().unwrap().iter().enumerate() {
+            let mut start = block.clone();
+            if block["type"] == "tool_use" {
+                start["input"] = json!({});
+            }
+            events.push(
+                json!({"type": "content_block_start", "index": index, "content_block": start}),
+            );
+            if block["type"] == "tool_use" {
+                events.push(
+                    json!({"type": "content_block_delta", "index": index, "delta":
+                    {"type": "input_json_delta", "partial_json": block["input"].to_string()}}),
+                );
+            }
+            events.push(json!({"type": "content_block_stop", "index": index}));
+        }
+        events.push(
+            json!({"type": "message_delta", "delta": {"stop_reason": message["stop_reason"]},
+            "usage": {"output_tokens": 0}}),
+        );
+        events.push(json!({"type": "message_stop"}));
+        events
+            .iter()
+            .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+            .collect()
+    }
+
+    fn idempotency_key(head: &str) -> &str {
+        head.lines()
+            .find_map(|line| line.strip_prefix("idempotency-key:"))
+            .map(str::trim)
+            .expect("an idempotency key")
+    }
+
+    #[tokio::test]
+    async fn routes_each_question_once_and_carries_its_turn_through_tool_calls() {
+        for streamed in [false, true] {
+            let jev = synthetic("toolu_jev");
+            let claude_call = json!({
+                "model": "claude-sonnet-5-5",
+                "stop_reason": "tool_use",
+                "content": [
+                    {"type": "thinking", "thinking": "Need status too.", "signature": "signed"},
+                    {"type": "tool_use", "id": "toolu_claude", "name": "engineer", "input": {"command": "status"}},
+                ],
+            });
+            let first = match streamed {
+                true => sse(&jev),
+                false => jev.to_string(),
+            };
+            let (url, requests) = mock(vec![
+                (200, first),
+                (200, claude_call.to_string()),
+                answer(),
+                answer(),
+            ])
+            .await;
+            let account = signed_in(url, "access-1");
+            let (tools, calls) = engineer_tools();
+            let mut conversation = conversation(&account, tools);
+            conversation.set_routing_context(Some(routing_context()));
+
+            let reply = conversation.send("Can we make it?".into()).await.unwrap();
+            assert_eq!(reply.text, "Box.");
+            // Jev's call costs Claude nothing
+            assert_eq!(reply.usage.output_tokens, 0);
+            assert_eq!(
+                *calls.lock().unwrap(),
+                [json!({"command": "stint"}), json!({"command": "status"})]
+            );
+            conversation.send("And now?".into()).await.unwrap();
+
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 4);
+            let turn = |i: usize| &requests[i].1["routing_turn"];
+            let first_id = turn(0)["id"].as_str().unwrap().to_owned();
+            assert!(routing::valid_turn_id(&first_id));
+            assert_eq!(turn(0)["version"], 1);
+            assert_eq!(turn(0)["phase"], "start");
+            for i in [1, 2] {
+                assert_eq!(turn(i)["id"], first_id.as_str());
+                assert_eq!(turn(i)["phase"], "continue");
+            }
+            // The next question is a turn of its own
+            assert_ne!(turn(3)["id"], first_id.as_str());
+            assert_eq!(turn(3)["phase"], "start");
+            let context = serde_json::to_value(&*routing_context()).unwrap();
+            for (_, body) in requests.iter() {
+                assert_eq!(body["routing_context"], context);
+                // Claude still gets its whole request
+                assert_eq!(body["system"][0]["text"], "You are a race engineer.");
+                assert_eq!(body["tools"][0]["name"], "engineer");
+            }
+            // A new inference, a new request id
+            let keys = requests
+                .iter()
+                .map(|(head, _)| idempotency_key(head))
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(keys.len(), 4);
+
+            // Jev's call and Claude's go back as received, each with its own result
+            let history = requests[2].1["messages"].as_array().unwrap();
+            assert_eq!(history[0]["content"], "Can we make it?");
+            assert_eq!(history[1]["content"], jev["content"]);
+            assert_eq!(history[2]["content"][0]["tool_use_id"], "toolu_jev");
+            assert_eq!(history[3]["content"], claude_call["content"]);
+            assert_eq!(history[4]["content"][0]["tool_use_id"], "toolu_claude");
+        }
+    }
+
+    #[tokio::test]
+    async fn takes_claudes_own_answer_when_the_router_passes() {
+        let (url, requests) = mock(vec![answer()]).await;
+        let account = signed_in(url, "access-1");
+        let (tools, calls) = engineer_tools();
+        let mut conversation = conversation(&account, tools);
+        conversation.set_routing_context(Some(routing_context()));
+        let reply = conversation.send("Who's ahead on lap five?".into());
+        assert_eq!(reply.await.unwrap().text, "Box.");
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(
+            requests.lock().unwrap()[0].1["routing_turn"]["phase"],
+            "start"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_valid_context_nothing_is_routed() {
+        let mut invalid = (*routing_context()).clone();
+        invalid.skills.push(invalid.skills[0].clone());
+        for context in [None, Some(Arc::new(invalid))] {
+            let (url, requests) = mock(vec![answer()]).await;
+            let account = signed_in(url, "access-1");
+            let mut conversation = conversation(&account, Tools::default());
+            conversation.set_routing_context(context);
+            conversation.send("Pit?".into()).await.unwrap();
+            let requests = requests.lock().unwrap();
+            let (head, body) = &requests[0];
+            assert!(body.get("routing_turn").is_none());
+            assert!(body.get("routing_context").is_none());
+            assert!(!head.contains("idempotency-key"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_already_routed_carries_on_without_rerouting() {
+        let (url, requests) = mock(vec![
+            cloud_error(409, "routing_turn_conflict"),
+            cloud_error(409, "routing_turn_conflict"),
+        ])
+        .await;
+        let account = signed_in(url, "access-1");
+        let mut conversation = conversation(&account, Tools::default());
+        conversation.set_routing_context(Some(routing_context()));
+        assert!(conversation.send("Pit?".into()).await.is_err());
+        let requests = requests.lock().unwrap();
+        // Once more as Claude's, on the same turn: never a fresh one, never a second start
+        assert_eq!(requests.len(), 2);
+        let turn = |i: usize| &requests[i].1["routing_turn"];
+        assert_eq!(turn(0)["phase"], "start");
+        assert_eq!(turn(1)["phase"], "continue");
+        assert_eq!(turn(0)["id"], turn(1)["id"]);
+        assert_ne!(
+            idempotency_key(&requests[0].0),
+            idempotency_key(&requests[1].0)
+        );
+        assert_eq!(requests[0].1["messages"], requests[1].1["messages"]);
+    }
+
+    #[tokio::test]
+    async fn a_lost_routed_answer_is_recovered_by_claude_without_inventing_results() {
+        // The stream breaks before Jev's call arrives whole
+        let broken = sse(&synthetic("toolu_lost"))
+            .split("event: content_block_stop")
+            .next()
+            .unwrap()
+            .to_owned();
+        let (url, requests) = mock(vec![(200, broken), answer()]).await;
+        let account = signed_in(url, "access-1");
+        let (tools, calls) = engineer_tools();
+        let mut conversation = conversation(&account, tools);
+        conversation.set_routing_context(Some(routing_context()));
+        let reply = conversation.send("Can we make it?".into()).await.unwrap();
+        assert_eq!(reply.text, "Box.");
+        assert!(calls.lock().unwrap().is_empty());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let turn = |i: usize| &requests[i].1["routing_turn"];
+        assert_eq!(turn(1)["phase"], "continue");
+        assert_eq!(turn(0)["id"], turn(1)["id"]);
+        assert_ne!(
+            idempotency_key(&requests[0].0),
+            idempotency_key(&requests[1].0)
+        );
+        // Only the question: no call it never received, no result for it
+        assert_eq!(
+            requests[1].1["messages"],
+            json!([{"role": "user", "content": "Can we make it?"}])
+        );
+    }
+
+    /// A tool still running when the pilot talks over it.
+    struct Hang;
+
+    impl ToolHandler for Hang {
+        type Input = Value;
+
+        fn handle(
+            &self,
+            _: Value,
+        ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
+            futures::future::pending()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_turn_runs_no_more_and_the_next_question_is_a_new_turn() {
+        let (url, requests) = mock(vec![(200, synthetic("toolu_jev").to_string()), answer()]).await;
+        let account = signed_in(url, "access-1");
+        let mut tools = Tools::default();
+        tools.insert("engineer", None, json!({"type": "object"}), Hang);
+        let mut conversation = conversation(&account, tools);
+        conversation.set_routing_context(Some(routing_context()));
+        {
+            let send = conversation.send("Can we make it?".into());
+            // The pilot talks over it
+            let waited = tokio::time::timeout(Duration::from_millis(300), send).await;
+            assert!(waited.is_err());
+        }
+        conversation.send("Gap?".into()).await.unwrap();
+        let requests = requests.lock().unwrap();
+        // No continuation for the cancelled turn, and nothing of it left in the history
+        assert_eq!(requests.len(), 2);
+        let turn = |i: usize| &requests[i].1["routing_turn"];
+        assert_ne!(turn(0)["id"], turn(1)["id"]);
+        assert_eq!(turn(1)["phase"], "start");
+        assert_eq!(
+            requests[1].1["messages"],
+            json!([{"role": "user", "content": "Gap?"}])
+        );
     }
 
     #[test]
