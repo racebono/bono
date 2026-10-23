@@ -78,6 +78,15 @@ pub trait Model: Send {
     /// Every turn's tokens so far (resets included), by the model that answered it.
     #[allow(dead_code)]
     fn usage(&self) -> &BTreeMap<String, Usage>;
+
+    /// The game session the conversation is about now. Bono Cloud's requests draw on a lease
+    /// for it (see [`bono_cloud::Lease`]); the others don't need to know.
+    fn set_game_session(&mut self, _game: &bono_cloud::GameSession) {}
+
+    /// Bono Cloud's lease, to end it without the conversation (which may be answering).
+    fn lease(&self) -> Option<bono_cloud::Lease> {
+        None
+    }
 }
 
 /// A conversation with the model `config` picks, with the `system` prompt and `tools`. Bono
