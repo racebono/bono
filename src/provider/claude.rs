@@ -1,6 +1,10 @@
 //! Claude, through the Claude API.
 
-use super::{Model, ModelOption, Reply, StopReason, ToolHandler, Tools, Usage, text::TextSink};
+use super::{
+    Model, ModelOption, Reply, StopReason, ToolHandler, Tools, Usage,
+    bono_cloud::routing::{self, Phase, RoutingContext, RoutingTurn},
+    text::TextSink,
+};
 use crate::config::{ClaudeCacheTtl, ClaudeConfig};
 use anyhow::{Context, bail};
 use bono_i18n::t;
@@ -223,6 +227,17 @@ pub struct Conversation {
     tools: Tools,
     /// Every request's tokens, by the model that answered it
     usage: BTreeMap<String, Usage>,
+    /// The driver turn Bono Cloud's router is told about, if it's told
+    routing: Option<Routing>,
+}
+
+/// A driver turn, for Bono Cloud's router (see [`routing`]).
+pub(super) struct Routing {
+    pub id: String,
+    pub context: Arc<RoutingContext>,
+    /// Starts the turn until its first request is sent: every later one carries on (tool
+    /// results, a lost answer, the history trimmed) and never routes it again
+    pub phase: Phase,
 }
 
 /// Tokens billed, by kind, as the API counts them.
@@ -327,6 +342,16 @@ impl Conversation {
         let mut builder = ConversationBuilder::from_config(config);
         builder.system(system).tools(tools);
         builder.build(client)
+    }
+
+    /// The driver turn the next message starts, for Bono Cloud's router, or none (it isn't told
+    /// about any).
+    pub(super) fn set_routing(&mut self, turn: Option<(String, Arc<RoutingContext>)>) {
+        self.routing = turn.map(|(id, context)| Routing {
+            id,
+            context,
+            phase: Phase::Start,
+        });
     }
 
     /// Trim only between complete user turns. The system prefix and newest turn survive.
@@ -519,7 +544,16 @@ impl Conversation {
 
     /// Sends the request and reads the response, streamed (handing its text to `sink` as it
     /// comes) or whole.
-    async fn post(&self, sink: &mut TextSink<'_>) -> anyhow::Result<ResponseBody> {
+    async fn post(&mut self, sink: &mut TextSink<'_>) -> anyhow::Result<ResponseBody> {
+        let result = self.post_once(sink).await;
+        // Whatever happened to it, the turn's been started: the website routes it only once
+        if let Some(routing) = &mut self.routing {
+            routing.phase = Phase::Continue;
+        }
+        result
+    }
+
+    async fn post_once(&mut self, sink: &mut TextSink<'_>) -> anyhow::Result<ResponseBody> {
         const RETRY_AFTER: HeaderName = HeaderName::from_static("retry-after");
         const SHOULD_RETRY: HeaderName = HeaderName::from_static("x-should-retry");
 
@@ -529,6 +563,11 @@ impl Conversation {
         // one was (once per request)
         let mut invalid_lease = None::<String>;
         let mut released = false;
+        // Each inference's identity: a retry of the same HTTP request keeps it, a new inference
+        // (e.g. after a lost answer) gets another
+        let mut request_id = self.routing.as_ref().map(|_| new_request_id());
+        // Whether the router already said this turn was started (once per request)
+        let mut duplicate = false;
         loop {
             sink.start_response();
             let bearer = match &self.bearer_source {
@@ -540,7 +579,7 @@ impl Conversation {
                 None => None,
             };
             let resp = match self
-                .request(bearer.as_deref(), lease.as_deref())
+                .request(bearer.as_deref(), lease.as_deref(), request_id.as_deref())
                 .send()
                 .await
             {
@@ -577,6 +616,12 @@ impl Conversation {
                             && retryable_stream_error(&e) =>
                     {
                         log::warn!("Claude's response failed midway, retrying: {e:#}");
+                        // A routed first answer may be what was lost: carried on from the history
+                        // as a new inference, so it's never routed twice nor a tool call invented
+                        if let Some(routing) = &mut self.routing {
+                            routing.phase = Phase::Continue;
+                            request_id = Some(new_request_id());
+                        }
                         tokio::time::sleep(backoff(attempt)).await;
                         attempt += 1;
                         continue;
@@ -614,6 +659,20 @@ impl Conversation {
                 return Err(error.into());
             }
 
+            // The router already took this turn (e.g. its answer was lost): Claude carries it on,
+            // with the same turn, never a fresh one
+            if status == StatusCode::CONFLICT
+                && !duplicate
+                && let Some(routing) = &mut self.routing
+                && routing.phase == Phase::Start
+            {
+                log::info!("Bono Cloud already routed this turn, carrying it on: {error}");
+                duplicate = true;
+                routing.phase = Phase::Continue;
+                request_id = Some(new_request_id());
+                continue;
+            }
+
             // A wait that long would hold the pilot's question up: given up on instead
             if !retryable
                 || attempt >= self.max_retries
@@ -628,8 +687,14 @@ impl Conversation {
         }
     }
 
-    fn request(&self, bearer: Option<&str>, lease: Option<&str>) -> RequestBuilder {
-        let request = self
+    fn request(
+        &self,
+        bearer: Option<&str>,
+        lease: Option<&str>,
+        request_id: Option<&str>,
+    ) -> RequestBuilder {
+        let routing = self.routing.as_ref();
+        let mut request = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
             .headers(self.headers.clone())
@@ -637,7 +702,16 @@ impl Conversation {
             .json(&LeasedRequest {
                 body: &self.body,
                 session_id: lease,
+                routing_turn: routing.map(|routing| RoutingTurn {
+                    version: routing::VERSION,
+                    id: &routing.id,
+                    phase: routing.phase,
+                }),
+                routing_context: routing.map(|routing| &*routing.context),
             });
+        if let Some(request_id) = request_id {
+            request = request.header("idempotency-key", request_id);
+        }
         return match bearer {
             Some(bearer) => request.bearer_auth(bearer),
             None => request,
@@ -1128,6 +1202,7 @@ impl ConversationBuilder {
             max_requests: self.max_requests,
             tools: self.tools,
             usage: BTreeMap::new(),
+            routing: None,
         });
     }
 }
@@ -1139,6 +1214,15 @@ struct LeasedRequest<'a> {
     body: &'a RequestBody,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routing_turn: Option<RoutingTurn<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routing_context: Option<&'a RoutingContext>,
+}
+
+/// A new `Idempotency-Key`, for one inference.
+fn new_request_id() -> String {
+    format!("req-{:032x}", rand::random::<u128>())
 }
 
 #[derive(Serialize)]

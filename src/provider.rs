@@ -87,6 +87,11 @@ pub trait Model: Send {
     fn lease(&self) -> Option<bono_cloud::Lease> {
         None
     }
+
+    /// What Bono Cloud's router is told about the next questions: the commands it may answer
+    /// them with, from the skill, and the session's state (`None`: Claude answers them all). The
+    /// others don't route.
+    fn set_routing_context(&mut self, _context: Option<Arc<bono_cloud::routing::RoutingContext>>) {}
 }
 
 /// A conversation with the model `config` picks, with the `system` prompt and `tools`. Bono
