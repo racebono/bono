@@ -7,7 +7,10 @@ use crate::{
     arrstr,
     config::{ArrayStr, Config, ModelConfig, ModelProvider, RawConfig},
     language::{self, LanguageDetector},
-    provider::{self, Model, Reply, StopReason, Tools},
+    provider::{
+        self, Model, Reply, StopReason, Tools,
+        bono_cloud::{GameSession, Lease},
+    },
     sim::Sim,
     sqlite::pool::Pool,
     synthesizer::{Drain, Drained, Speech, SpeechInput, SpeechOutput, Synthesizer, plays_on},
@@ -19,7 +22,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     task::Poll,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::{
     runtime::Handle,
@@ -135,12 +138,16 @@ struct Session {
     /// The account's user id, when the conversation is the account's (Bono Cloud's): it ends
     /// once that account signs out
     user: Option<String>,
+    /// Bono Cloud's session lease, ended without waiting for the conversation
+    lease: Option<Lease>,
     state: Arc<Mutex<SessionState>>,
 }
 
 struct SessionState {
     conversation: Box<dyn Model>,
     pool: Pool,
+    /// The simulator writing the database, e.g. `lmu`
+    sim: &'static str,
     tool: EngineerTool,
     /// The game session the conversation is about (track, session type and number), for
     /// `auto_session`
@@ -239,6 +246,9 @@ impl Engineer {
     /// Starts a new conversation with the next question: the engineer forgets what was said.
     pub fn new_session(&mut self) {
         self.stop();
+        if let Some(lease) = self.session.as_ref().and_then(|s| s.lease.as_ref()) {
+            lease.end();
+        }
         self.new_session = true;
         self.notice(t!("engineer.new_session"));
     }
@@ -368,7 +378,8 @@ impl Engineer {
             detail: None,
         });
 
-        let Some(pool) = sim.and_then(|sim| sim.database()).cloned() else {
+        let database = sim.and_then(|sim| Some((sim.id(), sim.database()?.clone())));
+        let Some((sim, pool)) = database else {
             // Said in the pilot's language, when there's a voice for it
             let lang = self.voice(config, lang).unwrap_or(lang);
             let text = t!("engineer.no_telemetry": &lang);
@@ -386,7 +397,7 @@ impl Engineer {
             self.notice(t!("engineer.new_model"));
         }
         if self.new_session || model_changed || self.session.as_ref().is_none_or(|s| s.db != db) {
-            match self.start(config, pool) {
+            match self.start(config, sim, pool) {
                 Ok(session) => self.session = Some(session),
                 Err(e) => {
                     self.notice(t!("engineer.error_starting", error = format!("{e:#}")));
@@ -411,9 +422,7 @@ impl Engineer {
         let (chat, text) = mpsc::unbounded_channel();
         let task = Task::spawn(async move {
             let mut state = state.lock().await;
-            if auto_session {
-                state.follow_game_session().await;
-            }
+            state.follow_game_session(auto_session).await;
             // Cloud selects its initial telemetry tool server-side (bono-web #46).
             // Other providers still receive a snapshot on the new user message only.
             let question = if attach_snapshot {
@@ -461,6 +470,14 @@ impl Engineer {
             if interrupted {
                 self.no_beep();
             }
+        }
+        // Bono Cloud's no longer picked: its lease isn't needed until it is again (the conversation
+        // goes with the next question)
+        if let Some(session) = &self.session
+            && let Some(lease) = &session.lease
+            && session.model != config.get().model
+        {
+            lease.end();
         }
         // The account the conversation is had as signed out (or another signed in): it ends,
         // answer on its way included
@@ -751,7 +768,7 @@ impl Engineer {
         });
     }
 
-    fn start(&self, config: &Config, pool: Pool) -> anyhow::Result<Session> {
+    fn start(&self, config: &Config, sim: &'static str, pool: Pool) -> anyhow::Result<Session> {
         let tool = EngineerTool::new(pool.clone(), self.schema.clone());
         let mut tools = Tools::default();
         tools.insert(
@@ -791,54 +808,82 @@ impl Engineer {
             db,
             model,
             user,
+            lease: conversation.lease(),
             state: Arc::new(Mutex::new(SessionState {
                 conversation,
                 tool,
                 pool,
+                sim,
                 game_session: None,
             })),
         })
     }
+
+    /// The app is quitting: Bono Cloud's lease is ended, waiting for the website a moment, as
+    /// nothing will be left to after.
+    pub fn quit(&mut self, rt: &Handle) {
+        /// The longest the app waits on the website to quit
+        const WAIT: Duration = Duration::from_secs(3);
+
+        self.stop();
+        // Before the conversation goes: it would end the lease without waiting
+        if let Some(lease) = self.session.as_ref().and_then(|s| s.lease.as_ref())
+            && rt
+                .block_on(async { tokio::time::timeout(WAIT, lease.end_and_wait()).await })
+                .is_err()
+        {
+            log::warn!("Gave up ending the Cloud session lease: it expires on its own");
+        }
+        self.session = None;
+    }
 }
 
 impl SessionState {
-    /// A new game session (another track, or the next practice, qualifying or race) starts the
-    /// conversation over.
-    async fn follow_game_session(&mut self) {
-        let current = match game_session(&self.pool).await {
-            Ok(current) => current,
+    /// Tells the conversation which game session it's about (Bono Cloud leases it). With
+    /// `auto_session`, a new one (another track, or the next practice, qualifying or race) starts
+    /// the conversation over.
+    async fn follow_game_session(&mut self, auto_session: bool) {
+        let current = match game_session(&self.pool, self.sim).await {
+            Ok(Some(current)) => current,
+            Ok(None) => return,
             Err(e) => {
                 log::warn!("Error reading the game session: {e:#}");
                 return;
             }
         };
 
-        if current.is_some() && current != self.game_session {
-            if self.game_session.is_some() {
+        if self.game_session.as_ref() != Some(&current.key) {
+            if auto_session && self.game_session.is_some() {
                 log::info!("New game session: the engineer starts over");
                 self.conversation.reset();
             }
-            self.game_session = current;
+            self.game_session = Some(current.key.clone());
         }
+        self.conversation.set_game_session(&current);
     }
 }
 
-/// The game session in the database: its track, type and number.
-async fn game_session(pool: &Pool) -> anyhow::Result<Option<String>> {
+/// The game session in the database: its track, type and number, and how long it's scheduled
+/// to last.
+async fn game_session(pool: &Pool, sim: &'static str) -> anyhow::Result<Option<GameSession>> {
     let conn = pool.get().await?;
     Ok(conn
-        .run(|conn| {
+        .run(move |conn| {
             use rusqlite::OptionalExtension;
             conn.query_row(
-                "SELECT track, session_type, session_number FROM session ORDER BY id DESC LIMIT 1",
+                "SELECT track, session_type, session_number, session_end_time FROM session \
+                 ORDER BY id DESC LIMIT 1",
                 [],
                 |row| {
-                    Ok(format!(
+                    let session_type = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+                    let key = format!(
                         "{}|{}|{}",
                         row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                        row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        session_type,
                         row.get::<_, Option<i64>>(2)?.unwrap_or_default()
-                    ))
+                    );
+                    let scheduled = row.get::<_, Option<f64>>(3)?;
+                    Ok(GameSession::new(key, sim, &session_type, scheduled))
                 },
             )
             .optional()
@@ -979,42 +1024,96 @@ mod tests {
         session
     }
 
+    /// A conversation that only records what it's told about game sessions.
+    #[derive(Default)]
+    struct Recorded {
+        games: Vec<GameSession>,
+        resets: usize,
+    }
+
+    struct RecordingModel(Arc<std::sync::Mutex<Recorded>>);
+
+    impl Model for RecordingModel {
+        fn send_streaming<'a>(
+            &'a mut self,
+            _: String,
+            _: &'a mut (dyn FnMut(&str) + Send),
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<Reply>> {
+            unimplemented!()
+        }
+
+        fn reset(&mut self) {
+            self.0.lock().unwrap().resets += 1;
+        }
+
+        fn usage(&self) -> &std::collections::BTreeMap<String, provider::Usage> {
+            unimplemented!()
+        }
+
+        fn set_game_session(&mut self, game: &GameSession) {
+            self.0.lock().unwrap().games.push(game.clone());
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn follows_the_game_session() {
-        let dir = tempfile::tempdir().unwrap();
-        let recorder = Recorder::new(dir.path(), None).unwrap();
-        recorder.push_scoring(session("practice", 1), Vec::new());
-        // Written by the recorder's thread, soon
-        let path = dir.path().join(DATABASE);
-        let one = NonZeroUsize::new(1).unwrap();
-        let pool = Pool::new(Database::read_only(Arc::new(path)), one, one);
+        use provider::bono_cloud::SessionType;
 
-        let mut builder = provider::claude::ConversationBuilder::new();
-        builder.api_key("test");
-        let mut state = SessionState {
-            conversation: Box::new(builder.build(reqwest::Client::new()).unwrap()),
-            tool: EngineerTool::new(pool.clone(), "".into()),
-            pool,
-            game_session: None,
-        };
+        for auto_session in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let recorder = Recorder::new(dir.path(), None).unwrap();
+            recorder.push_scoring(session("practice", 1), Vec::new());
+            // Written by the recorder's thread, soon
+            let path = dir.path().join(DATABASE);
+            let one = NonZeroUsize::new(1).unwrap();
+            let pool = Pool::new(Database::read_only(Arc::new(path)), one, one);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while state.game_session.is_none() {
-            assert!(std::time::Instant::now() < deadline, "no session recorded");
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            state.follow_game_session().await;
+            let recorded = Arc::new(std::sync::Mutex::new(Recorded::default()));
+            let mut state = SessionState {
+                conversation: Box::new(RecordingModel(recorded.clone())),
+                tool: EngineerTool::new(pool.clone(), "".into()),
+                pool,
+                sim: "lmu",
+                game_session: None,
+            };
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while state.game_session.is_none() {
+                assert!(std::time::Instant::now() < deadline, "no session recorded");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                state.follow_game_session(auto_session).await;
+            }
+            assert_eq!(
+                state.game_session.as_deref(),
+                Some("Circuit de la Sarthe|practice|1")
+            );
+            state.follow_game_session(auto_session).await;
+
+            let mut race = session("race", 1);
+            race.session_end_time = Some(5400.0).into();
+            recorder.push_scoring(race, Vec::new());
+            drop(recorder);
+            state.follow_game_session(auto_session).await;
+            assert_eq!(
+                state.game_session.as_deref(),
+                Some("Circuit de la Sarthe|race|1")
+            );
+
+            let recorded = recorded.lock().unwrap();
+            // Told every turn, so a lease ended meanwhile is started again
+            let games = &recorded.games;
+            assert_eq!(games.len(), 3);
+            assert_eq!(games[0], games[1]);
+            assert_eq!(games[0].key, "Circuit de la Sarthe|practice|1");
+            assert_eq!(games[0].sim, "lmu");
+            assert_eq!(games[0].session_type, SessionType::Practice);
+            // Not scheduled: the type's default
+            assert_eq!(games[0].expected_minutes, 60);
+            assert_eq!(games[2].key, "Circuit de la Sarthe|race|1");
+            assert_eq!(games[2].session_type, SessionType::Race);
+            assert_eq!(games[2].expected_minutes, 90);
+            // Only auto sessions start the conversation over
+            assert_eq!(recorded.resets, usize::from(auto_session));
         }
-        assert_eq!(
-            state.game_session.as_deref(),
-            Some("Circuit de la Sarthe|practice|1")
-        );
-
-        recorder.push_scoring(session("race", 1), Vec::new());
-        drop(recorder);
-        state.follow_game_session().await;
-        assert_eq!(
-            state.game_session.as_deref(),
-            Some("Circuit de la Sarthe|race|1")
-        );
     }
 }
