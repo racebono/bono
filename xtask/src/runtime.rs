@@ -236,8 +236,8 @@ fn package_platform_runtimes(
                 })
         })
         .context("Missing x64 Microsoft.VC*.CRT directory")?;
-    // Required by the app, phonemizer and LMU plugin respectively. Fail rather than
-    // silently depending on the developer's globally installed VC runtime.
+    // Fail rather than silently depending on the developer's globally installed VC runtime.
+    // The LMU plugin uses the bundled redistributable installer in the game process.
     for name in [
         "msvcp140.dll",
         "msvcp140_1.dll",
@@ -268,11 +268,7 @@ fn package_platform_runtimes(
         "Missing Visual C++ installer: {}",
         installer.display()
     );
-    for directory in [
-        dist.to_path_buf(),
-        dist.join("phonemizer"),
-        dist.join("plugins"),
-    ] {
+    for directory in [dist.to_path_buf(), dist.join("phonemizer")] {
         fs::create_dir_all(&directory)?;
         // Keep companion CRT libraries from the same redistributable version together.
         for entry in fs::read_dir(&crt)? {
@@ -332,11 +328,12 @@ mod platform_tests {
         let vulkan = temp.path().join("vulkan-1.dll");
         fs::write(&vulkan, "vulkan").unwrap();
         package_platform_runtimes(&release, &redist, &vulkan, &dist).unwrap();
-        for directory in [&dist, &dist.join("phonemizer"), &dist.join("plugins")] {
+        for directory in [&dist, &dist.join("phonemizer")] {
             for name in dlls {
                 assert_eq!(fs::read_to_string(directory.join(name)).unwrap(), name);
             }
         }
+        assert!(!dist.join("plugins").exists());
         assert_eq!(
             fs::read_to_string(dist.join("DirectML.dll")).unwrap(),
             "directml"
@@ -397,7 +394,6 @@ mod installed_runtime_tests {
             "vulkan-1.dll",
             "msvcp140.dll",
             "phonemizer/vcruntime140.dll",
-            "plugins/msvcp140_2.dll",
             "prerequisites/vc_redist.x64.exe",
         ] {
             assert!(dist.path().join(name).is_file(), "{name}");
