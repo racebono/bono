@@ -3550,8 +3550,12 @@ impl Trace {
             match on {
                 None if braking => on = Some(self.d[i]),
                 // A short lift or dab well before the apex isn't the braking point: keep looking
-                Some(start) if !braking && self.d[i] - start > 0.0 && Some(&i) != idx.last() => {
-                    if apex - self.d[i] > 60.0 {
+                Some(start)
+                    if !braking
+                        && (self.d[i] - start).rem_euclid(self.length) > 0.0
+                        && Some(&i) != idx.last() =>
+                {
+                    if (apex - self.d[i]).rem_euclid(self.length) > 60.0 {
                         on = None;
                     }
                 }
@@ -3559,6 +3563,30 @@ impl Trace {
             }
         }
         on
+    }
+
+    /// Partition the lap at boundaries after the previous apex and at or before this apex.
+    /// Shared braking runs (e.g. chicanes) must not make a corner cover almost a whole lap.
+    fn corner_bounds(&self, turns: &[Turn]) -> Vec<f64> {
+        turns
+            .iter()
+            .enumerate()
+            .map(|(k, turn)| {
+                let previous = turns[(k + turns.len() - 1) % turns.len()].apex;
+                let gap = if turns.len() == 1 {
+                    self.length
+                } else {
+                    (turn.apex - previous).rem_euclid(self.length)
+                };
+                let bound = self.braking_point(turn.apex).unwrap_or(turn.start);
+                let progress = (bound - previous).rem_euclid(self.length);
+                if progress > 0.0 && progress <= gap {
+                    bound
+                } else {
+                    (previous + gap / 2.0).rem_euclid(self.length)
+                }
+            })
+            .collect()
     }
 
     /// Metrics of one corner: braking point, minimum speed and where, exit speed, throttle back.
@@ -3724,12 +3752,7 @@ fn cmd_corners(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Res
         fmt_lap(ref_lap.time)
     );
 
-    // Boundaries: the reference lap's braking point before each apex (or the turn's start when it
-    // doesn't brake)
-    let bounds = turns
-        .iter()
-        .map(|t| reference.braking_point(t.apex).unwrap_or(t.start))
-        .collect::<Vec<_>>();
+    let bounds = reference.corner_bounds(&turns);
     let measure = |trace: &Trace| -> Vec<Measured> {
         turns
             .iter()
@@ -3845,7 +3868,7 @@ fn cmd_corners(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Res
     }
     say!(
         out,
-        "(entry = from the reference's braking point to the apex: braking and turn-in; exit = apex to the next braking point: traction and the straight after. Positive = slower than the reference. Distances are the game's lap_distance{})",
+        "(entry = boundary to apex: braking and turn-in; exit = apex to the next boundary: traction and the straight after. Boundaries use the reference's braking point (or turn start without braking), falling back to the midpoint between apexes if outside that interval. Positive = slower than the reference. Distances are the game's lap_distance{})",
         if source == "track data" {
             ", turn positions from the track data are approximate (about 1% of the lap)"
         } else {
@@ -4370,6 +4393,84 @@ mod tests {
         sys::{bono_session_info, bono_standing, bono_telemetry},
     };
     use std::num::NonZeroUsize;
+
+    fn corner_trace(zones: &[(f64, f64)]) -> Trace {
+        let d: Vec<_> = (0..=500).map(|i| i as f64 * 10.0).collect();
+        Trace {
+            length: 5000.0,
+            t: d.iter().map(|d| d / 50.0).collect(),
+            v: vec![Some(50.0); d.len()],
+            brake: d
+                .iter()
+                .map(|d| {
+                    Some(if zones.iter().any(|(a, b)| d >= a && d <= b) {
+                        1.0
+                    } else {
+                        0.0
+                    })
+                })
+                .collect(),
+            throttle: vec![None; d.len()],
+            gear: vec![None; d.len()],
+            d,
+            has_pedals: true,
+            ok: true,
+        }
+    }
+
+    #[test]
+    fn corner_braking_search_wraps_at_start_finish() {
+        let trace = corner_trace(&[(4600.0, 4700.0), (100.0, 220.0)]);
+        assert_eq!(trace.braking_point(250.0), Some(100.0));
+        // A run that releases only after crossing the line must also be discarded.
+        let trace = corner_trace(&[(4900.0, 5000.0), (0.0, 20.0), (100.0, 220.0)]);
+        assert_eq!(trace.braking_point(250.0), Some(100.0));
+        // Preserve actual braking across the line when the release is near the apex.
+        assert_eq!(trace.braking_point(50.0), Some(4900.0));
+        assert_eq!(corner_trace(&[]).braking_point(250.0), None);
+    }
+
+    #[test]
+    fn corner_bounds_partition_chicanes_and_the_start_finish_interval() {
+        let trace = corner_trace(&[(880.0, 1010.0), (4600.0, 4700.0)]);
+        let turns: Vec<_> = [
+            (250.0, 4800.0),
+            (1000.0, 880.0),
+            (1060.0, 880.0),
+            (4720.0, 4600.0),
+        ]
+        .into_iter()
+        .map(|(apex, start)| Turn {
+            label: String::new(),
+            start,
+            apex,
+            end: apex + 20.0,
+        })
+        .collect();
+        let bounds = trace.corner_bounds(&turns);
+        assert_eq!(bounds, [4800.0, 880.0, 1030.0, 4600.0]);
+        let total: f64 = turns
+            .iter()
+            .enumerate()
+            .map(|(k, turn)| {
+                trace.span(bounds[k], turn.apex)
+                    + trace.span(turn.apex, bounds[(k + 1) % bounds.len()])
+            })
+            .sum();
+        assert!((total - trace.span(0.0, trace.length)).abs() < 1e-9);
+
+        let trace = corner_trace(&[]);
+        let mut turns = turns;
+        // Reject fallback starts outside the interval, including its open lower endpoint.
+        turns[0].start = 4600.0;
+        turns[2].start = 1000.0;
+        assert_eq!(trace.corner_bounds(&turns)[0], 4985.0);
+        assert_eq!(trace.corner_bounds(&turns)[2], 1030.0);
+        turns[2].start = turns[2].apex;
+        assert_eq!(trace.corner_bounds(&turns)[2], 1060.0);
+        assert_eq!(trace.corner_bounds(&[]), Vec::<f64>::new());
+        assert_eq!(trace.corner_bounds(&turns[1..2]), [880.0]);
+    }
 
     #[test]
     fn external_text_stays_on_one_line() {
