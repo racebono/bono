@@ -291,6 +291,7 @@ impl Model for Conversation {
             if let Some(limits) = turn.conversation.history_limits {
                 turn.conversation.prepare_history(&text, limits.target)?;
             }
+            let mut before = turn.conversation.body.messages.len();
             let mut result = turn.conversation.run_turn(text.clone(), &mut sink).await;
             // A limit may be reached within a tool loop, too. Roll that entire attempt back
             // before retrying; never edit the signed history of a live tool loop.
@@ -298,6 +299,12 @@ impl Model for Conversation {
                 if !result.as_ref().is_err_and(history_limit_error)
                     || turn.conversation.history_limits.is_none()
                 {
+                    break;
+                }
+                // Only an attempt that came to nothing is tried again: one that said something
+                // would say it again, and one that ran tools (or got past its first request)
+                // would run them again
+                if !sink.text.is_empty() || turn.conversation.body.messages.len() != before + 1 {
                     break;
                 }
                 turn.conversation.body.messages = turn.original.as_ref().unwrap().clone();
@@ -309,6 +316,7 @@ impl Model for Conversation {
                     );
                     turn.conversation.reset();
                 }
+                before = turn.conversation.body.messages.len();
                 result = turn.conversation.run_turn(text.clone(), &mut sink).await;
             }
             let reply = result?;
@@ -364,9 +372,8 @@ impl Conversation {
         }))?
         .len()
             + 1;
-        let size = |this: &Self| -> anyhow::Result<usize> {
-            Ok(serde_json::to_vec(&this.body)?.len() + question_bytes)
-        };
+        let size =
+            |this: &Self| -> anyhow::Result<usize> { Ok(this.request_size()? + question_bytes) };
         if target == limits.target
             && size(self)? <= limits.max_bytes
             && self.body.messages.len() < limits.max_messages
@@ -491,7 +498,7 @@ impl Conversation {
             sink.before_tools();
             let tools = &self.tools;
             let result_limit = self.history_limits.map(|limits| limits.max_bytes / 8);
-            let results = join_all(calls.iter().map(|call| {
+            let mut results = join_all(calls.iter().map(|call| {
                 let name = call.get("name").and_then(serde_json::Value::as_str);
                 let input = call.get("input");
                 let handled = name
@@ -509,16 +516,7 @@ impl Conversation {
                     };
 
                     if let Some(limit) = result_limit {
-                        if content.len() > limit {
-                            let mut end = limit;
-                            while !content.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            content.truncate(end);
-                            content.push_str(
-                                "\n[tool result truncated to stay within conversation limits]",
-                            );
-                        }
+                        truncate_result(&mut content, limit);
                     }
                     ResultBody {
                         r#type: "tool_result",
@@ -529,6 +527,24 @@ impl Conversation {
                 }
             }))
             .await;
+
+            // Together, too: the request that carries them back must still fit
+            if let Some(limits) = self.history_limits {
+                let mut contents = results
+                    .iter_mut()
+                    .map(|result| std::mem::take(&mut result.content))
+                    .collect::<Vec<_>>();
+                self.body.messages.push(RequestMessage {
+                    role: "user",
+                    content: serde_json::to_value(&results)?,
+                });
+                let size = self.request_size();
+                self.body.messages.pop();
+                fit_results(&mut contents, limits.max_bytes.saturating_sub(size?));
+                for (result, content) in results.iter_mut().zip(contents) {
+                    result.content = content;
+                }
+            }
 
             self.body.messages.push(RequestMessage {
                 role: "user",
@@ -546,8 +562,11 @@ impl Conversation {
     /// comes) or whole.
     async fn post(&mut self, sink: &mut TextSink<'_>) -> anyhow::Result<ResponseBody> {
         let result = self.post_once(sink).await;
-        // Whatever happened to it, the turn's been started: the website routes it only once
-        if let Some(routing) = &mut self.routing {
+        // Whatever happened to it, the turn's been started: the website routes it only once.
+        // Except when it was turned away for its size, before any routing or inference
+        if let Some(routing) = &mut self.routing
+            && !result.as_ref().is_err_and(history_limit_error)
+        {
             routing.phase = Phase::Continue;
         }
         result
@@ -693,22 +712,12 @@ impl Conversation {
         lease: Option<&str>,
         request_id: Option<&str>,
     ) -> RequestBuilder {
-        let routing = self.routing.as_ref();
         let mut request = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
             .headers(self.headers.clone())
             .timeout(self.timeout)
-            .json(&LeasedRequest {
-                body: &self.body,
-                session_id: lease,
-                routing_turn: routing.map(|routing| RoutingTurn {
-                    version: routing::VERSION,
-                    id: &routing.id,
-                    phase: routing.phase,
-                }),
-                routing_context: routing.map(|routing| &*routing.context),
-            });
+            .json(&self.leased_request(lease));
         if let Some(request_id) = request_id {
             request = request.header("idempotency-key", request_id);
         }
@@ -716,6 +725,31 @@ impl Conversation {
             Some(bearer) => request.bearer_auth(bearer),
             None => request,
         };
+    }
+
+    /// The request as it's sent, on `lease` (if any).
+    fn leased_request<'a>(&'a self, lease: Option<&'a str>) -> LeasedRequest<'a> {
+        let routing = self.routing.as_ref();
+        LeasedRequest {
+            body: &self.body,
+            session_id: lease,
+            routing_turn: routing.map(|routing| RoutingTurn {
+                version: routing::VERSION,
+                id: &routing.id,
+                phase: routing.phase,
+            }),
+            routing_context: routing.map(|routing| &*routing.context),
+        }
+    }
+
+    /// The size of the next request, serialized as it's sent: routing fields and all, with room
+    /// for a lease (not known until it's sent).
+    fn request_size(&self) -> anyhow::Result<usize> {
+        /// `,"session_id":"…"`, with room for an id of up to 128 characters
+        const LEASE: usize = 160;
+
+        let lease = self.lease_source.as_ref().map_or(0, |_| LEASE);
+        Ok(serde_json::to_vec(&self.leased_request(None))?.len() + lease)
     }
 }
 
@@ -855,6 +889,53 @@ fn history_limit_error(error: &anyhow::Error) -> bool {
             || (error.status == StatusCode::BAD_REQUEST
                 && error.code.as_deref() == Some("conversation_too_long"))
     })
+}
+
+const TRUNCATED: &str = "\n[tool result truncated to stay within conversation limits]";
+
+/// Cuts a tool result to at most `max` bytes once serialized as a JSON string (but never to less
+/// than the note saying so).
+fn truncate_result(content: &mut String, max: usize) {
+    if json_len(content) <= max {
+        return;
+    }
+    let room = max.saturating_sub(json_len(TRUNCATED));
+    let mut width = 0;
+    let end = content
+        .char_indices()
+        .find(|&(_, c)| {
+            width += json_width(c);
+            width > room
+        })
+        .map_or(content.len(), |(index, _)| index);
+    content.truncate(end);
+    content.push_str(TRUNCATED);
+}
+
+/// Cuts a round's tool results to `budget` bytes between them, serialized: each gets an even
+/// share, and what the shorter ones leave goes to the longer ones.
+fn fit_results(contents: &mut [String], budget: usize) {
+    let mut order = (0..contents.len()).collect::<Vec<_>>();
+    order.sort_by_cached_key(|&index| json_len(&contents[index]));
+    let mut left = budget;
+    for (done, &index) in order.iter().enumerate() {
+        let share = left / (order.len() - done);
+        truncate_result(&mut contents[index], share);
+        left = left.saturating_sub(json_len(&contents[index]));
+    }
+}
+
+/// The bytes `text` takes inside a JSON string, escaped as `serde_json` escapes it.
+fn json_len(text: &str) -> usize {
+    text.chars().map(json_width).sum()
+}
+
+fn json_width(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if c < ' ' => 6,
+        c => c.len_utf8(),
+    }
 }
 
 fn strip_snapshot(text: &str) -> String {
@@ -1915,6 +1996,137 @@ mod tests {
             serde_json::to_value(&conversation.body.messages).unwrap(),
             original
         );
+    }
+
+    #[tokio::test]
+    async fn history_limit_after_speaking_or_tools_is_not_replayed() {
+        let (url, requests) = mock(vec![
+            message(
+                "tool_use",
+                json!([
+                    {"type": "text", "text": "Copy, checking."},
+                    {"type": "tool_use", "id": "call", "name": "lookup", "input": {"what": "gap"}}
+                ]),
+            ),
+            (
+                413,
+                "",
+                json!({"error": {"type": "request_too_large", "message": "too large"}}),
+            ),
+            message("end_turn", json!([{"type": "text", "text": "Answer"}])),
+        ])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+        conversation.history_limits = Some(HistoryLimits {
+            max_bytes: 120_000,
+            max_messages: 100,
+            target: 0.5,
+        });
+        let mut spoken = String::new();
+        let mut on_text = |text: &str| spoken.push_str(text);
+        let error = conversation
+            .send_streaming("Gap?".into(), &mut on_text)
+            .await
+            .unwrap_err();
+        assert!(history_limit_error(&error));
+        assert_eq!(spoken.trim_end(), "Copy, checking.");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert!(conversation.body.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_limit_retry_keeps_the_turn_unrouted() {
+        let (url, requests) = mock(vec![
+            (
+                413,
+                "",
+                json!({"error": {"type": "request_too_large", "message": "too large"}}),
+            ),
+            message("end_turn", json!([{"type": "text", "text": "Answer"}])),
+        ])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+        conversation.history_limits = Some(HistoryLimits {
+            max_bytes: 120_000,
+            max_messages: 100,
+            target: 0.5,
+        });
+        conversation.set_routing(Some((
+            routing::turn_id(),
+            Arc::new(RoutingContext::new(None, Vec::new())),
+        )));
+        assert_eq!(
+            conversation.send("Gap?".into()).await.unwrap().text,
+            "Answer"
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["routing_turn"]["phase"], "start");
+        assert_eq!(requests[1]["routing_turn"]["phase"], "start");
+    }
+
+    #[test]
+    fn tool_results_share_the_room_left() {
+        let mut contents = vec!["short".to_owned(), "\"".repeat(1000), "x".repeat(1000)];
+        fit_results(&mut contents, 600);
+        assert_eq!(contents[0], "short");
+        assert!(contents[1].ends_with(TRUNCATED) && contents[2].ends_with(TRUNCATED));
+        assert!(
+            contents
+                .iter()
+                .map(|content| json_len(content))
+                .sum::<usize>()
+                <= 600
+        );
+        // Each long one gets about half of what the short one left
+        assert!(json_len(&contents[1]).abs_diff(json_len(&contents[2])) <= 2);
+    }
+
+    #[tokio::test]
+    async fn tool_results_fit_the_request_together() {
+        struct Big;
+
+        impl ToolHandler for Big {
+            type Input = Value;
+
+            fn handle(
+                &self,
+                _: Value,
+            ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
+                async { Ok("x".repeat(2_000)) }
+            }
+        }
+
+        let calls = (0..8)
+            .map(|i| json!({"type": "tool_use", "id": format!("call{i}"), "name": "big", "input": {}}))
+            .collect::<Vec<_>>();
+        let (url, requests) = mock(vec![
+            message("tool_use", Value::Array(calls)),
+            message("end_turn", json!([{"type": "text", "text": "Answer"}])),
+        ])
+        .await;
+        let mut builder = ConversationBuilder::new();
+        builder
+            .api_key("test")
+            .base_url(&url)
+            .system("You are a race engineer.")
+            .tool("big", None, json!({"type": "object"}), Big)
+            .history_limits(HistoryLimits {
+                max_bytes: 10_000,
+                max_messages: 100,
+                target: 0.5,
+            });
+        let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+        assert_eq!(
+            conversation.send("Gap?".into()).await.unwrap().text,
+            "Answer"
+        );
+        // Each result alone is within its cap (an eighth), but not all eight together
+        let requests = requests.lock().unwrap();
+        assert!(serde_json::to_vec(&requests[1]).unwrap().len() <= 10_000);
     }
 
     fn message(stop_reason: &str, content: Value) -> (u16, &'static str, Value) {
