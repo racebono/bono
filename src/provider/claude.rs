@@ -1675,7 +1675,7 @@ fn backoff(attempt: u32) -> Duration {
         .mul_f64(rand::random_range(0.5..1.5))
 }
 
-fn parse_retry_after(value: &HeaderValue) -> Option<Duration> {
+pub(super) fn parse_retry_after(value: &HeaderValue) -> Option<Duration> {
     let value = value.to_str().ok()?.trim();
 
     if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {

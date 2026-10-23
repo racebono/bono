@@ -45,6 +45,18 @@ const LEASE_RETRY: Duration = Duration::from_secs(60);
 /// How long the website may take to answer anything but a conversation's request
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long an engineer session's connection may sit idle before it's pinged: short enough to
+/// keep it, and the website's worker and its database connection, from going cold between turns.
+/// Each wait is up to a fifth longer, at random, so clients don't ping in step.
+const KEEP_WARM: Duration = Duration::from_secs(60);
+
+/// How long the pings go on without a turn: past it, the pilot isn't talking to the engineer
+/// (e.g. the game's left open), and there's nothing to keep warm until they do
+const KEEP_WARM_IDLE: Duration = Duration::from_secs(20 * 60);
+
+/// The longest the pings back off to after failing, or being told to slow down
+const KEEP_WARM_MAX_BACKOFF: Duration = Duration::from_secs(15 * 60);
+
 /// Turns had with Bono Cloud since the app started, answered or not
 static TURNS: AtomicU64 = AtomicU64::new(0);
 
@@ -271,6 +283,8 @@ struct LeaseState {
     /// The token the last request was sent with: once the account signs out, the lease is
     /// ended with it
     token: Option<String>,
+    /// When the conversation last sent a request (pings aren't counted)
+    last_request: Option<Instant>,
 }
 
 /// What the website answers a lease with.
@@ -384,6 +398,85 @@ impl Lease {
         }
     }
 
+    /// Pings the website with a cheap authenticated request whenever the conversation's gone
+    /// [`KEEP_WARM`] without one, until aborted. Only while a lease is held (a session's being
+    /// raced) and the pilot's spoken in the last [`KEEP_WARM_IDLE`]; failures and `429`s back
+    /// off (as long as `Retry-After` says, if longer), and `401`s and `403`s stop the pings.
+    async fn keep_warm(self) {
+        let keeper = &self.0;
+        let url = format!("{}/v1/models", keeper.base_url);
+        let mut backoff = KEEP_WARM;
+        loop {
+            let jitter = KEEP_WARM.mul_f64(rand::random::<f64>() * 0.2);
+            let (leased, last_request) = {
+                let state = self.state();
+                (state.id.is_some(), state.last_request)
+            };
+            let idle = last_request.map_or(Duration::MAX, |at| at.elapsed());
+            if !leased || idle >= KEEP_WARM_IDLE || idle < KEEP_WARM {
+                // Nothing to keep warm, or a turn did it: wait for the next chance
+                let wait = KEEP_WARM.saturating_sub(idle.min(KEEP_WARM));
+                tokio::time::sleep(wait.max(Duration::from_secs(1)) + jitter).await;
+                continue;
+            }
+            if !matches!(keeper.account.status(), Status::SignedIn(_)) {
+                return;
+            }
+
+            let send = |token: &str| {
+                keeper
+                    .client
+                    .get(&url)
+                    .bearer_auth(token)
+                    .headers(claude::api_headers("").unwrap_or_default())
+                    .timeout(TIMEOUT)
+                    .send()
+            };
+            let result = async {
+                let token = access_token(&keeper.account).await?;
+                let mut resp = send(&token).await?;
+                if resp.status() == StatusCode::UNAUTHORIZED {
+                    let token = refresh_token(&keeper.account, &token).await?;
+                    resp = send(&token).await?;
+                }
+                anyhow::Ok(resp)
+            }
+            .await;
+            let wait = match result {
+                Ok(resp) if resp.status().is_success() => {
+                    backoff = KEEP_WARM;
+                    KEEP_WARM
+                }
+                Ok(resp)
+                    if matches!(
+                        resp.status(),
+                        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                    ) =>
+                {
+                    log::debug!("Stopped keeping Bono Cloud warm: {}", resp.status());
+                    return;
+                }
+                failed => {
+                    let retry_after = match &failed {
+                        Ok(resp) => {
+                            log::debug!("Couldn't keep Bono Cloud warm: {}", resp.status());
+                            resp.headers()
+                                .get(reqwest::header::RETRY_AFTER)
+                                .and_then(claude::parse_retry_after)
+                        }
+                        Err(e) => {
+                            log::debug!("Couldn't keep Bono Cloud warm: {e:#}");
+                            None
+                        }
+                    };
+                    backoff = (backoff * 2).min(KEEP_WARM_MAX_BACKOFF);
+                    backoff.max(retry_after.unwrap_or_default())
+                }
+            };
+            tokio::time::sleep(wait + jitter).await;
+        }
+    }
+
     /// Asks the website for a lease for `game`.
     async fn start(&self, game: &GameSession, client_session_id: &str) -> anyhow::Result<String> {
         #[derive(Serialize)]
@@ -438,7 +531,9 @@ impl claude::BearerSource for Lease {
                 Some(token) => refresh_token(account, token).await,
                 None => access_token(account).await,
             }?;
-            self.state().token = Some(token.clone());
+            let mut state = self.state();
+            state.token = Some(token.clone());
+            state.last_request = Some(Instant::now());
             Ok(token)
         })
     }
@@ -515,6 +610,8 @@ pub struct Conversation {
     lease: Lease,
     /// What the router is told about the next questions: none sends them without routing fields
     routing: Option<Arc<routing::RoutingContext>>,
+    /// Keeps the website warm while the engineer follows a game session
+    keep_warm: Option<tokio::task::AbortHandle>,
 }
 
 impl Conversation {
@@ -544,6 +641,7 @@ impl Conversation {
             inner: builder.build(client)?,
             lease,
             routing: None,
+            keep_warm: None,
         })
     }
 }
@@ -581,6 +679,11 @@ impl Model for Conversation {
 
     fn set_game_session(&mut self, game: &GameSession) {
         self.lease.set_game(game.clone());
+        if self.keep_warm.is_none()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            self.keep_warm = Some(rt.spawn(self.lease.clone().keep_warm()).abort_handle());
+        }
     }
 
     fn lease(&self) -> Option<Lease> {
@@ -600,6 +703,9 @@ impl Model for Conversation {
 
 impl Drop for Conversation {
     fn drop(&mut self) {
+        if let Some(keep_warm) = self.keep_warm.take() {
+            keep_warm.abort();
+        }
         self.lease.end();
     }
 }
