@@ -1,5 +1,9 @@
 # Engineer response evaluations
 
+`wet-transition.md` adds controlled manual/model scenarios for current wetness, compound
+choice at a required stop, and reconsidering slicks late in a wet race. These require
+their stated evidence; do not run them against the existing dry database unchanged.
+
 These cases test the race engineer's answers, not the automatic spotter. Direct side/clear
 calls, immediate alerts and imminent-rain announcements are excluded. Rival pace, longer
 weather outlooks, strategy and driving advice remain in scope.
