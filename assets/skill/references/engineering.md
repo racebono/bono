@@ -61,8 +61,14 @@ damage caused a slow lap.
 For energy-only, give the verdict and useful margin, without an unrequested stop plan.
 "Do I need to box?" asks whether, not when: don't add a pit lap or saving options.
 For a stop plan, recommend usable timing inside the available range. Add the reason if
-asked. For wets, recommend stay/fit/wait and tie the decision to actual wetness; forecast
-probability is not certainty. Use naturally rounded time from now, or early/late in a
+asked. For wets, recommend stay/fit/wait using fresh racing-line wetness as well as the
+forecast; light rain does not establish a nearly dry surface. Describe present severity
+separately from trend, and do not label a wet track as merely starting to get wet. Assess
+conditions at the stop and over the remaining stint. Distinguish incremental tyre service
+at a required stop from an extra pit stop. A short remaining race alone cannot rule out
+wets: weigh supported slick losses, stop cost and driveability. Do not invent crossover
+thresholds or comparative pace; qualify missing evidence and reassess earlier advice.
+Forecast probability is not certainty. Use naturally rounded time from now, or early/late in a
 race not started. Five forecast points provide an arrival window, not an exact minute.
 
 For tyre checks, interpret temperatures, wear and pressures. For an explicit breakdown,
