@@ -39,6 +39,10 @@ const LEASE_RETRY: Duration = Duration::from_secs(60);
 /// How long the website may take to answer anything but a conversation's request
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often an engineer session's connection is pinged: often enough to keep it, and the
+/// website's worker and its database connection, from going cold between turns
+const KEEP_WARM: Duration = Duration::from_secs(60);
+
 /// Turns had with Bono Cloud since the app started, answered or not
 static TURNS: AtomicU64 = AtomicU64::new(0);
 
@@ -378,6 +382,34 @@ impl Lease {
         }
     }
 
+    /// Pings the website every [`KEEP_WARM`] with a cheap authenticated request, until aborted.
+    async fn keep_warm(self) {
+        let keeper = &self.0;
+        let url = format!("{}/v1/models", keeper.base_url);
+        let mut interval = tokio::time::interval(KEEP_WARM);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if !matches!(keeper.account.status(), Status::SignedIn(_)) {
+                continue;
+            }
+            let result = call(&keeper.account, |token| {
+                keeper
+                    .client
+                    .get(&url)
+                    .bearer_auth(token)
+                    .headers(claude::api_headers("").unwrap_or_default())
+                    .timeout(TIMEOUT)
+                    .send()
+            })
+            .await;
+            if let Err(e) = result {
+                log::debug!("Couldn't keep Bono Cloud warm: {e:#}");
+            }
+        }
+    }
+
     /// Asks the website for a lease for `game`.
     async fn start(&self, game: &GameSession, client_session_id: &str) -> anyhow::Result<String> {
         #[derive(Serialize)]
@@ -507,6 +539,8 @@ fn no_lease_allowed(error: &anyhow::Error) -> bool {
 pub struct Conversation {
     inner: claude::Conversation,
     lease: Lease,
+    /// Keeps the website warm while the engineer follows a game session
+    keep_warm: Option<tokio::task::AbortHandle>,
 }
 
 impl Conversation {
@@ -535,6 +569,7 @@ impl Conversation {
         Ok(Self {
             inner: builder.build(client)?,
             lease,
+            keep_warm: None,
         })
     }
 }
@@ -565,6 +600,11 @@ impl Model for Conversation {
 
     fn set_game_session(&mut self, game: &GameSession) {
         self.lease.set_game(game.clone());
+        if self.keep_warm.is_none()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            self.keep_warm = Some(rt.spawn(self.lease.clone().keep_warm()).abort_handle());
+        }
     }
 
     fn lease(&self) -> Option<Lease> {
@@ -574,6 +614,9 @@ impl Model for Conversation {
 
 impl Drop for Conversation {
     fn drop(&mut self) {
+        if let Some(keep_warm) = self.keep_warm.take() {
+            keep_warm.abort();
+        }
         self.lease.end();
     }
 }
