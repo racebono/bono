@@ -216,6 +216,7 @@ pub struct Conversation {
     headers: HeaderMap,
     bearer_source: Option<Arc<dyn BearerSource>>,
     lease_source: Option<Arc<dyn LeaseSource>>,
+    history_limits: Option<HistoryLimits>,
     timeout: Duration,
     max_retries: u32,
     max_requests: NonZeroU32,
@@ -264,19 +265,40 @@ impl Model for Conversation {
         on_text: &'a mut (dyn FnMut(&str) + Send),
     ) -> BoxFuture<'a, anyhow::Result<Reply>> {
         Box::pin(async move {
+            let original = self.history_limits.map(|_| self.body.messages.clone());
             let mut turn = Turn {
                 start: self.body.messages.len(),
                 conversation: self,
                 keep: false,
+                original,
             };
-
-            let reply = turn
-                .conversation
-                .run_turn(text, &mut TextSink::new(on_text))
-                .await?;
-
+            let mut sink = TextSink::new(on_text);
+            if let Some(limits) = turn.conversation.history_limits {
+                turn.conversation.prepare_history(&text, limits.target)?;
+            }
+            let mut result = turn.conversation.run_turn(text.clone(), &mut sink).await;
+            // A limit may be reached within a tool loop, too. Roll that entire attempt back
+            // before retrying; never edit the signed history of a live tool loop.
+            for attempt in 0..2 {
+                if !result.as_ref().is_err_and(history_limit_error)
+                    || turn.conversation.history_limits.is_none()
+                {
+                    break;
+                }
+                turn.conversation.body.messages = turn.original.as_ref().unwrap().clone();
+                if attempt == 0 {
+                    turn.conversation.prepare_history(&text, 0.25)?;
+                } else {
+                    log::warn!(
+                        "Bono Cloud: resetting conversation after repeated history limit errors"
+                    );
+                    turn.conversation.reset();
+                }
+                result = turn.conversation.run_turn(text.clone(), &mut sink).await;
+            }
+            let reply = result?;
             turn.keep = reply.stop != StopReason::Refusal;
-            return Ok(reply);
+            Ok(reply)
         })
     }
 
@@ -305,6 +327,63 @@ impl Conversation {
         let mut builder = ConversationBuilder::from_config(config);
         builder.system(system).tools(tools);
         builder.build(client)
+    }
+
+    /// Trim only between complete user turns. The system prefix and newest turn survive.
+    fn prepare_history(&mut self, question: &str, target: f64) -> anyhow::Result<()> {
+        let Some(limits) = self.history_limits else {
+            return Ok(());
+        };
+        let question_bytes = serde_json::to_vec(&serde_json::json!({
+            "role": "user", "content": question
+        }))?
+        .len()
+            + 1;
+        let size = |this: &Self| -> anyhow::Result<usize> {
+            Ok(serde_json::to_vec(&this.body)?.len() + question_bytes)
+        };
+        if target == limits.target
+            && size(self)? <= limits.max_bytes
+            && self.body.messages.len() < limits.max_messages
+        {
+            return Ok(());
+        }
+        let before = self.body.messages.len();
+        let starts: Vec<_> = self
+            .body
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.role == "user" && message.content.is_string())
+            .map(|(index, _)| index)
+            .collect();
+        let recent = starts.iter().rev().nth(3).copied().unwrap_or(0);
+        for message in &mut self.body.messages[0..recent] {
+            if message.role == "user" {
+                if let Some(text) = message.content.as_str() {
+                    message.content = serde_json::Value::String(strip_snapshot(text));
+                }
+            }
+        }
+        while size(self)? > (limits.max_bytes as f64 * target) as usize
+            || self.body.messages.len() + 1 > (limits.max_messages as f64 * target) as usize
+        {
+            let next = self
+                .body
+                .messages
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(_, message)| message.role == "user" && message.content.is_string())
+                .map(|(index, _)| index);
+            let Some(next) = next else { break };
+            self.body.messages.drain(0..next);
+        }
+        log::info!(
+            "Bono Cloud: forgot {} older messages to stay within limits",
+            before - self.body.messages.len()
+        );
+        Ok(())
     }
 
     async fn run_turn(&mut self, text: String, sink: &mut TextSink<'_>) -> anyhow::Result<Reply> {
@@ -386,6 +465,7 @@ impl Conversation {
             // still parse, with part of its input missing
             sink.before_tools();
             let tools = &self.tools;
+            let result_limit = self.history_limits.map(|limits| limits.max_bytes / 8);
             let results = join_all(calls.iter().map(|call| {
                 let name = call.get("name").and_then(serde_json::Value::as_str);
                 let input = call.get("input");
@@ -395,7 +475,7 @@ impl Conversation {
                 let tool_use_id = call["id"].clone();
 
                 async move {
-                    let (content, is_error) = match handled {
+                    let (mut content, is_error) = match handled {
                         Some(handled) => match handled.await {
                             Ok(content) => (content, false),
                             Err(e) => (format!("{e:#}"), true),
@@ -403,6 +483,18 @@ impl Conversation {
                         None => ("Invalid tool call request".into(), true),
                     };
 
+                    if let Some(limit) = result_limit {
+                        if content.len() > limit {
+                            let mut end = limit;
+                            while !content.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            content.truncate(end);
+                            content.push_str(
+                                "\n[tool result truncated to stay within conversation limits]",
+                            );
+                        }
+                    }
                     ResultBody {
                         r#type: "tool_result",
                         tool_use_id,
@@ -560,12 +652,17 @@ struct Turn<'a> {
     conversation: &'a mut Conversation,
     start: usize,
     keep: bool,
+    original: Option<Vec<RequestMessage>>,
 }
 
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
         if !self.keep {
-            self.conversation.body.messages.truncate(self.start);
+            if let Some(original) = self.original.take() {
+                self.conversation.body.messages = original;
+            } else {
+                self.conversation.body.messages.truncate(self.start);
+            }
         }
     }
 }
@@ -670,6 +767,37 @@ impl Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
+/// Optional budgets for providers with a small request envelope.
+#[derive(Clone, Copy)]
+pub struct HistoryLimits {
+    pub max_bytes: usize,
+    pub max_messages: usize,
+    pub target: f64,
+}
+
+fn history_limit_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ApiError>().is_some_and(|error| {
+        error.status == StatusCode::PAYLOAD_TOO_LARGE
+            || (error.status == StatusCode::BAD_REQUEST
+                && error.code.as_deref() == Some("conversation_too_long"))
+    })
+}
+
+fn strip_snapshot(text: &str) -> String {
+    const BEGIN: &str = "[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]";
+    const END: &str = "[END UNTRUSTED TELEMETRY SNAPSHOT]";
+    let mut text = text.to_owned();
+    if let Some(start) = text.find(BEGIN) {
+        if let Some(end) = text[start + BEGIN.len()..].find(END) {
+            text.replace_range(
+                start..start + BEGIN.len() + end + END.len(),
+                "[telemetry snapshot omitted]",
+            );
+        }
+    }
+    text
+}
+
 pub struct ConversationBuilder {
     cache_ttl: ClaudeCacheTtl,
     api_key: Option<String>,
@@ -689,6 +817,7 @@ pub struct ConversationBuilder {
     timeout: Duration,
     bearer_source: Option<Arc<dyn BearerSource>>,
     lease_source: Option<Arc<dyn LeaseSource>>,
+    history_limits: Option<HistoryLimits>,
     /// The model and its settings are left out of requests, for the server to choose
     server_settings: bool,
 }
@@ -714,6 +843,7 @@ impl ConversationBuilder {
             bearer_source: None,
             lease_source: None,
             server_settings: false,
+            history_limits: None,
         }
     }
 
@@ -907,7 +1037,22 @@ impl ConversationBuilder {
         self
     }
 
+    pub fn history_limits(&mut self, limits: HistoryLimits) -> &mut Self {
+        self.history_limits = Some(limits);
+        self
+    }
+
     pub fn build(self, client: reqwest::Client) -> anyhow::Result<Conversation> {
+        if let Some(limits) = self.history_limits {
+            anyhow::ensure!(
+                limits.max_bytes > 0
+                    && limits.max_messages > 0
+                    && limits.target > 0.0
+                    && limits.target < 1.0,
+                "Invalid history limits"
+            );
+        }
+
         let mut betas = String::from("server-side-fallback-2026-07-01");
         if !self.skills.is_empty() {
             betas.push_str(",code-execution-2025-08-25");
@@ -977,6 +1122,7 @@ impl ConversationBuilder {
             headers,
             bearer_source: self.bearer_source,
             lease_source: self.lease_source,
+            history_limits: self.history_limits,
             timeout: self.timeout,
             max_retries: self.max_retries,
             max_requests: self.max_requests,
@@ -1040,7 +1186,7 @@ struct RequestSystemBlock {
     cache_control: RequestCacheControl,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct RequestMessage {
     role: &'static str,
     content: serde_json::Value,
@@ -1557,6 +1703,134 @@ mod tests {
                 Lookup(calls.clone()),
             );
         builder.build(reqwest::Client::new()).unwrap()
+    }
+
+    #[test]
+    fn trims_complete_turns_and_keeps_signed_thinking() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation("http://localhost", &calls);
+        conversation.history_limits = Some(HistoryLimits {
+            max_bytes: 100_000,
+            max_messages: 10,
+            target: 0.5,
+        });
+        for index in 0..5 {
+            conversation.body.messages.extend([
+                RequestMessage {
+                    role: "user",
+                    content: json!(format!("Question {index}")),
+                },
+                RequestMessage {
+                    role: "assistant",
+                    content: json!([
+                        {"type": "thinking", "thinking": "thought", "signature": "signed"},
+                        {"type": "tool_use", "id": "call", "name": "lookup", "input": {}}
+                    ]),
+                },
+                RequestMessage {
+                    role: "user",
+                    content: json!([
+                        {"type": "tool_result", "tool_use_id": "call", "content": "result"}
+                    ]),
+                },
+                RequestMessage {
+                    role: "assistant",
+                    content: json!([{"type": "text", "text": "Answer"}]),
+                },
+            ]);
+        }
+        let newest = serde_json::to_value(&conversation.body.messages[16..]).unwrap();
+        conversation.prepare_history("Next?", 0.5).unwrap();
+        assert_eq!(
+            serde_json::to_value(&conversation.body.messages).unwrap(),
+            newest
+        );
+        conversation.prepare_history("Next?", 0.5).unwrap();
+        assert_eq!(
+            serde_json::to_value(&conversation.body.messages).unwrap(),
+            newest
+        );
+    }
+
+    #[test]
+    fn byte_trim_strips_stale_snapshots_and_keeps_recent_questions() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation("http://localhost", &calls);
+        conversation.history_limits = Some(HistoryLimits {
+            max_bytes: 10_000,
+            max_messages: 100,
+            target: 0.5,
+        });
+        for index in 0..6 {
+            conversation.body.messages.push(RequestMessage { role: "user", content: json!(format!(
+                "Question {index} [BEGIN UNTRUSTED TELEMETRY SNAPSHOT]{}[END UNTRUSTED TELEMETRY SNAPSHOT] suffix",
+                "x".repeat(if index < 2 { 6000 } else { 10 }))) });
+            conversation.body.messages.push(RequestMessage {
+                role: "assistant",
+                content: json!([{"type": "text", "text": "Answer"}]),
+            });
+        }
+        let recent = serde_json::to_value(&conversation.body.messages[4..]).unwrap();
+        conversation.prepare_history("Next?", 0.5).unwrap();
+        assert_eq!(
+            conversation.body.messages[0].content,
+            "Question 0 [telemetry snapshot omitted] suffix"
+        );
+        assert_eq!(
+            serde_json::to_value(&conversation.body.messages[4..]).unwrap(),
+            recent
+        );
+    }
+
+    #[tokio::test]
+    async fn history_limit_recovery_resets_and_failed_recovery_rolls_back() {
+        let limit = || {
+            (
+                413,
+                "",
+                json!({"error": {"type": "request_too_large", "message": "too large"}}),
+            )
+        };
+        let (url, requests) = mock(vec![limit(),
+            (400, "", json!({"error": {"type": "invalid_request_error", "code": "conversation_too_long"}})),
+            message("end_turn", json!([{"type": "text", "text": "Answer"}])),
+            limit(), limit(), limit(),
+            (400, "", json!({"error": {"type": "invalid_request_error", "code": "invalid_request"}})),
+        ]).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+        conversation.history_limits = Some(HistoryLimits {
+            max_bytes: 120_000,
+            max_messages: 100,
+            target: 0.5,
+        });
+        conversation.body.messages.push(RequestMessage {
+            role: "user",
+            content: json!("Old question"),
+        });
+        assert_eq!(
+            conversation.send("Next?".into()).await.unwrap().text,
+            "Answer"
+        );
+        assert_eq!(
+            requests.lock().unwrap()[2]["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let original = serde_json::to_value(&conversation.body.messages).unwrap();
+        assert!(conversation.send("Again?".into()).await.is_err());
+        assert_eq!(
+            serde_json::to_value(&conversation.body.messages).unwrap(),
+            original
+        );
+        assert!(conversation.send("Again?".into()).await.is_err());
+        assert_eq!(requests.lock().unwrap().len(), 7);
+        assert_eq!(
+            serde_json::to_value(&conversation.body.messages).unwrap(),
+            original
+        );
     }
 
     fn message(stop_reason: &str, content: Value) -> (u16, &'static str, Value) {

@@ -521,6 +521,11 @@ impl Conversation {
         // The rest is Claude's defaults: none of it is the pilot's to change
         let mut builder = claude::ConversationBuilder::from_config(&ClaudeConfig::default());
         builder
+            .history_limits(claude::HistoryLimits {
+                max_bytes: 120_000,
+                max_messages: 100,
+                target: 0.5,
+            })
             .base_url(base_url(account))
             .bearer_source(Arc::new(lease.clone()))
             .lease_source(Arc::new(lease.clone()))
@@ -787,6 +792,33 @@ mod tests {
             "content": [{"type": "text", "text": "Box."}],
         });
         (200, message.to_string())
+    }
+
+    #[tokio::test]
+    async fn long_sessions_keep_answering_with_bounded_history() {
+        let (url, requests) = mock((0..120).map(|_| answer()).collect()).await;
+        let account = signed_in(url, "access-1");
+        let mut conversation = conversation(&account, Tools::default());
+        for index in 0..120 {
+            let question = format!(
+                "Question {index} [BEGIN UNTRUSTED TELEMETRY SNAPSHOT]{}[END UNTRUSTED TELEMETRY SNAPSHOT]",
+                "x".repeat(2000)
+            );
+            assert_eq!(conversation.send(question).await.unwrap().text, "Box.");
+        }
+        let requests = requests.lock().unwrap();
+        let mut trimmed = false;
+        for pair in requests.windows(2) {
+            trimmed |= pair[1].1["messages"].as_array().unwrap().len()
+                < pair[0].1["messages"].as_array().unwrap().len();
+        }
+        assert!(trimmed);
+        for (_, body) in requests.iter() {
+            assert!(serde_json::to_vec(body).unwrap().len() <= 120_000);
+            let messages = body["messages"].as_array().unwrap();
+            assert!(messages.len() <= 100);
+            assert_eq!(messages[0]["role"], "user");
+        }
     }
 
     fn rejected() -> (u16, String) {
