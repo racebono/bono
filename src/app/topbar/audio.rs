@@ -322,10 +322,7 @@ impl AudioTopbar {
     /// picked, nothing is played until a speaker is picked again. Returns whether it was.
     pub fn speaker_removed(&mut self, which: u32) -> bool {
         for playback in [&mut self.test_playback, &mut self.beep_playback] {
-            if playback
-                .as_ref()
-                .is_some_and(|stream| plays_on(stream, which))
-            {
+            if playback.as_ref().is_some_and(|stream| plays_on(stream, which)) {
                 *playback = None;
             }
         }
@@ -374,10 +371,7 @@ impl DeviceSelector {
 
     /// The device `which` is gone: it's closed if it's the one open. Returns whether it was.
     fn removed(&mut self, which: u32) -> bool {
-        let open = self
-            .open
-            .as_ref()
-            .is_some_and(|open| open.id().id() == which);
+        let open = self.open.as_ref().is_some_and(|open| open.id().id() == which);
         if open {
             self.open = None;
         }

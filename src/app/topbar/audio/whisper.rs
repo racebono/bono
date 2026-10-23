@@ -12,10 +12,10 @@ use crate::{
     task::{JoinHandle, MaybeDone, spawn, spawn_blocking},
     updating,
 };
-use bono_i18n::t;
 use camino::Utf8Path;
 use egui::Widget;
 use egui_extras::Column;
+use bono_i18n::t;
 use sdl3::{
     audio::{AudioFormat, AudioRecordingCallback, AudioSpec, AudioStream},
     event::{Event, WindowEvent},
