@@ -1,7 +1,11 @@
 //! Bono Cloud: Claude, through Bono's website, for signed-in accounts that have access to it. The
 //! website speaks the Claude API at [`PATH`] (`/v1/messages`, `/v1/models`), with the account's
-//! access token as the bearer token, and answers `403` to accounts without access. The
-//! conversation is the Claude provider's with its default settings: there's nothing to set up.
+//! access token as the bearer token, and answers `403` to accounts without access.
+//!
+//! The conversation is the Claude provider's with its default settings, except for the model,
+//! effort (`output_config`), `max_tokens` and the cache breakpoints' `ttl`: requests leave those
+//! out, and the website chooses them. The website ignores them when a request does send them
+//! (e.g. one made by hand), so they can't be changed from this side. There's nothing to set up.
 
 use super::{Model, ModelOption, Reply, Tools, Usage, claude};
 use crate::{
@@ -91,11 +95,12 @@ impl Conversation {
         client: reqwest::Client,
     ) -> anyhow::Result<Self> {
         let account = signed_in(account)?;
-        // Claude's defaults: the settings aren't the pilot's to change
+        // The rest is Claude's defaults: none of it is the pilot's to change
         let mut builder = claude::ConversationBuilder::from_config(&ClaudeConfig::default());
         builder
             .base_url(base_url(account))
             .bearer_source(Arc::new(Bearer(account.clone())))
+            .server_settings()
             .system(system)
             .tools(tools);
         Ok(Self {
@@ -274,7 +279,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn talks_as_the_account_like_claude_by_default() {
+    async fn talks_as_the_account_leaving_the_settings_to_the_website() {
         let (url, requests) = mock(vec![answer()]).await;
         let account = signed_in(url, "access-1");
         let mut conversation = conversation(&account, Tools::default());
@@ -291,12 +296,16 @@ mod tests {
         assert!(!head.contains("x-api-key"));
         assert!(!head.contains("oauth-2025-04-20"));
 
-        // Exactly what the Claude provider sends with its default settings
-        let defaults = ClaudeConfig::default();
-        assert_eq!(body["model"], defaults.model().as_str());
-        assert_eq!(body["output_config"]["effort"], defaults.effort().as_str());
-        assert_eq!(body["max_tokens"], defaults.max_tokens().get());
-        assert_eq!(body["cache_control"]["ttl"], defaults.cache_ttl().as_str());
+        // The website chooses the model and its settings
+        assert!(body.get("model").is_none());
+        assert!(body.get("output_config").is_none());
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        // The rest is what the Claude provider sends with its defaults
         assert_eq!(body["stream"], true);
         assert_eq!(body["fallbacks"], "default");
         assert!(body.get("context_management").is_none());

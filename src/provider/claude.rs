@@ -305,7 +305,10 @@ impl Conversation {
                 self.body.container.get_or_insert_default().id = Some(container_id);
             }
 
-            let model = response.model.unwrap_or_else(|| self.body.model.clone());
+            let model = response
+                .model
+                .or_else(|| self.body.model.clone())
+                .unwrap_or_default();
             let usage = response.usage.total();
             turn_usage += usage;
             *self.usage.entry(model.clone()).or_default() += usage;
@@ -629,6 +632,8 @@ pub struct ConversationBuilder {
     max_retries: u32,
     timeout: Duration,
     bearer_source: Option<Arc<dyn BearerSource>>,
+    /// The model and its settings are left out of requests, for the server to choose
+    server_settings: bool,
 }
 
 impl ConversationBuilder {
@@ -650,6 +655,7 @@ impl ConversationBuilder {
             max_retries: 2,
             timeout: Duration::from_mins(10),
             bearer_source: None,
+            server_settings: false,
         }
     }
 
@@ -697,6 +703,15 @@ impl ConversationBuilder {
     #[inline]
     pub(super) fn bearer_source(&mut self, source: Arc<dyn BearerSource>) -> &mut Self {
         self.bearer_source = Some(source);
+        self
+    }
+
+    /// Leaves the model, effort, `max_tokens` and the cache breakpoints' lifetime out of every
+    /// request, for the server to choose (Bono Cloud's): the ones set here aren't sent. The
+    /// breakpoints themselves stay.
+    #[inline]
+    pub(super) fn server_settings(&mut self) -> &mut Self {
+        self.server_settings = true;
         self
     }
 
@@ -841,6 +856,9 @@ impl ConversationBuilder {
             None => headers(self.api_key, self.workspace_id, betas)?,
         };
 
+        let own_settings = !self.server_settings;
+        let ttl = own_settings.then(|| self.cache_ttl.as_str());
+
         // The system prompt gets its own cache breakpoint, so it's read from the cache even when
         // the conversation's (the top-level `cache_control`) misses
         let system = match self.system.trim().is_empty() {
@@ -850,7 +868,7 @@ impl ConversationBuilder {
                 text: self.system.clone(),
                 cache_control: RequestCacheControl {
                     r#type: "ephemeral",
-                    ttl: Some(self.cache_ttl.as_str()),
+                    ttl,
                 },
             }],
         };
@@ -867,16 +885,16 @@ impl ConversationBuilder {
             client,
             base_url: self.base_url,
             body: RequestBody {
-                model: self.model,
-                max_tokens: self.max_tokens,
+                model: own_settings.then_some(self.model),
+                max_tokens: own_settings.then_some(self.max_tokens),
                 stream: true,
                 fallbacks: "default",
-                output_config: RequestOutputConfig {
+                output_config: own_settings.then_some(RequestOutputConfig {
                     effort: self.effort,
-                },
+                }),
                 cache_control: RequestCacheControl {
                     r#type: "ephemeral",
-                    ttl: Some(self.cache_ttl.as_str()),
+                    ttl,
                 },
                 system,
                 messages: Vec::new(),
@@ -904,14 +922,19 @@ impl ConversationBuilder {
 
 #[derive(Serialize)]
 struct RequestBody {
-    model: String,
-    max_tokens: NonZeroU32,
+    /// The server's choice when `None` (see `ConversationBuilder::server_settings`), like
+    /// `max_tokens` and `output_config`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<NonZeroU32>,
     /// Always: answers are spoken as they're written, and long requests don't time out
     stream: bool,
     /// Retries refusals on Anthropic's recommended model for the refusal's category (needs the
     /// `server-side-fallback-2026-07-01` beta)
     fallbacks: &'static str,
-    output_config: RequestOutputConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<RequestOutputConfig>,
     /// Automatic caching: a breakpoint on the conversation's last block, moving with it
     cache_control: RequestCacheControl,
     #[serde(skip_serializing_if = "Vec::is_empty")]
