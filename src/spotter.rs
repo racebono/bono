@@ -1261,6 +1261,14 @@ impl Logic {
     /// Rain on the way: the first forecast point ahead likely to bring rain, once it's a few
     /// minutes away, while it's still dry. Each point is called once.
     fn forecast(&mut self, config: &SpotterConfig, scoring: &Scoring, t: f64, calls: &mut Calls) {
+        // Until the session's under way, LMU's end time is the end of the current phase (the
+        // countdown, the formation lap), not of the session
+        if !matches!(
+            scoring.phase.as_deref(),
+            Some("green" | "full_course_yellow")
+        ) {
+            return;
+        }
         let Some(end) = scoring.session_end_time.filter(|end| *end > 0.0) else {
             return;
         };
@@ -1881,6 +1889,7 @@ mod tests {
         let mut logic = Logic::default();
         let scoring = Scoring {
             rain: Some(0.0),
+            phase: Some("green".into()),
             session_type: Some("race".into()),
             session_end_time: Some(3600.0),
             // Rain likely at the end, an hour in
@@ -1900,6 +1909,38 @@ mod tests {
         assert_eq!(at(3060.0), ["rain likely in about 9 minutes"]);
         // Once
         assert!(at(3100.0).is_empty());
+    }
+
+    #[test]
+    fn no_rain_on_the_way_before_the_start() {
+        let config = SpotterConfig::default();
+        let mut logic = Logic::default();
+        // As recorded on the grid: the end time is the countdown's, 5 s in
+        let mut scoring = Scoring {
+            rain: Some(0.0),
+            phase: Some("before_start".into()),
+            session_type: Some("race".into()),
+            session_end_time: Some(5.0),
+            forecast: vec![(0.0, 0.0), (0.25, 0.0), (0.5, 0.9), (0.75, 0.0), (1.0, 0.0)],
+            ..Scoring::default()
+        };
+        let mut at = |t: f64, scoring: &Scoring| {
+            logic
+                .update(&config, &player(t), &[], &Wheels::default(), Some(scoring))
+                .into_iter()
+                .map(|call| call.words(arrstr!("en")))
+                .collect::<Vec<_>>()
+        };
+
+        assert!(at(0.2, &scoring).is_empty());
+        // The formation lap's end
+        scoring.phase = Some("formation_lap".into());
+        scoring.session_end_time = Some(83.0);
+        assert!(at(30.0, &scoring).is_empty());
+        // Under way, the rain's 15 minutes off
+        scoring.phase = Some("green".into());
+        scoring.session_end_time = Some(1883.0);
+        assert!(at(90.0, &scoring).is_empty());
     }
 
     #[test]
