@@ -1165,6 +1165,46 @@
         "es": "La sesión de tu cuenta de Bono ha terminado: vuelve a iniciar sesión",
         "ca": "La sessió del teu compte de Bono ha acabat: torna a iniciar la sessió"
     },
+    "provider.bono_cloud_unreachable": {
+        "en": "Couldn't reach Bono Cloud",
+        "es": "No se pudo conectar con Bono Cloud",
+        "ca": "No s'ha pogut connectar amb Bono Cloud"
+    },
+    "provider.bono_cloud_no_allowance": {
+        "en": "You've used this week's Bono Cloud allowance: it starts over when the week resets",
+        "es": "Has gastado la asignación semanal de Bono Cloud: se renueva cuando empieza la nueva semana",
+        "ca": "Has gastat l'assignació setmanal de Bono Cloud: es renova quan comença la setmana nova"
+    },
+    "provider.bono_cloud_daily_allowance": {
+        "en": "You've reached Bono Cloud's daily limit: try again later",
+        "es": "Has llegado al límite diario de Bono Cloud: vuelve a intentarlo más tarde",
+        "ca": "Has arribat al límit diari de Bono Cloud: torna-ho a provar més tard"
+    },
+    "provider.bono_cloud_too_long": {
+        "en": "The conversation is too long for Bono Cloud: start a new session",
+        "es": "La conversación es demasiado larga para Bono Cloud: empieza una sesión nueva",
+        "ca": "La conversa és massa llarga per a Bono Cloud: comença una sessió nova"
+    },
+    "provider.bono_cloud_hours_left": {
+        "en": "About {hours} h of driving left this week (resets in {resets})",
+        "es": "Quedan unas {hours} h de conducción esta semana (se renueva en {resets})",
+        "ca": "Queden unes {hours} h de conducció aquesta setmana (es renova en {resets})"
+    },
+    "provider.bono_cloud_allowance_low": {
+        "en": "Bono Cloud allowance running low: about {hours} h left this week (resets in {resets})",
+        "es": "Queda poca asignación de Bono Cloud: unas {hours} h esta semana (se renueva en {resets})",
+        "ca": "Queda poca assignació de Bono Cloud: unes {hours} h aquesta setmana (es renova en {resets})"
+    },
+    "provider.bono_cloud_resets_days": {
+        "en": "{days} d {hours} h",
+        "es": "{days} d {hours} h",
+        "ca": "{days} d {hours} h"
+    },
+    "provider.bono_cloud_resets_hours": {
+        "en": "{hours} h",
+        "es": "{hours} h",
+        "ca": "{hours} h"
+    },
     "provider.bono_cloud_refresh_failed": {
         "en": "Could not refresh your Bono session: try again; you are still signed in",
         "es": "No se pudo renovar tu sesión de Bono: vuelve a intentarlo; sigues conectado",

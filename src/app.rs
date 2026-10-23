@@ -172,6 +172,11 @@ impl App {
         AppResult::Continue
     }
 
+    /// The app is quitting: what the website holds for it is given back.
+    pub fn quit(&mut self, rt: &Handle) {
+        self.state.engineer.quit(rt);
+    }
+
     pub fn event(&mut self, rt: &Handle, event: Event) -> AppResult {
         self.state.joysticks.event(&event);
         if let Event::AudioDeviceRemoved {

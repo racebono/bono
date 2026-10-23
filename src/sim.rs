@@ -21,6 +21,8 @@ mod rrre;
 
 pub struct Sim<T: ?Sized = dyn Simulator> {
     name: &'static str,
+    /// e.g. `lmu`
+    id: &'static str,
     app_id: u32,
     /// Whether Steam reports the game running
     running: watch::Receiver<bool>,
@@ -51,6 +53,7 @@ impl<T> Sim<T> {
 
         Self {
             name: T::NAME,
+            id: T::TRACK_DATA_ID,
             app_id: T::APP_ID,
             running,
             track_data: Arc::new(Mutex::new(TrackData::new(T::TRACK_DATA_ID))),
@@ -67,6 +70,12 @@ where
     #[inline]
     pub fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// The app's identifier for the simulator, e.g. `lmu` or `rrre`.
+    #[inline]
+    pub fn id(&self) -> &'static str {
+        self.id
     }
 
     /// The folder Steam installed the game in, if it's installed. Looks through Steam's libraries
@@ -327,6 +336,7 @@ pub(crate) fn recording(pool: Pool) -> Box<Sim> {
     let (send, running) = watch::channel(true);
     Box::new(Sim {
         name: "Test",
+        id: "test",
         app_id: 0,
         running,
         track_data: Arc::new(Mutex::new(TrackData::new("test".into()))),
@@ -356,6 +366,7 @@ mod tests {
         let (send, running) = watch::channel(running);
         let sim = Box::new(Sim {
             name,
+            id: name,
             app_id: 0,
             running,
             track_data: Arc::new(Mutex::new(TrackData::new(name.into()))),

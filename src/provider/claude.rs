@@ -28,6 +28,30 @@ pub async fn models(
     config: &ClaudeConfig,
     client: &reqwest::Client,
 ) -> anyhow::Result<Vec<ModelOption>> {
+    let headers = headers(
+        config.api_key().clone(),
+        config.workspace_id().clone(),
+        String::new(),
+    )?;
+    list_models(
+        client,
+        BASE_URL,
+        &headers,
+        None,
+        t!("provider.claude_unreachable"),
+    )
+    .await
+}
+
+/// The models the API at `base_url` offers, newest first, asked with `headers` (and `bearer`, if
+/// any). `unreachable` explains a request that never got an answer.
+pub(super) async fn list_models(
+    client: &reqwest::Client,
+    base_url: &str,
+    headers: &HeaderMap,
+    bearer: Option<&str>,
+    unreachable: &'static str,
+) -> anyhow::Result<Vec<ModelOption>> {
     #[derive(Deserialize)]
     struct Page {
         data: Vec<Entry>,
@@ -42,27 +66,23 @@ pub async fn models(
         id: String,
     }
 
-    let headers = headers(
-        config.api_key().clone(),
-        config.workspace_id().clone(),
-        String::new(),
-    )?;
     let mut models = Vec::new();
     let mut after = None::<String>;
     loop {
-        let mut url = format!("{BASE_URL}/v1/models?limit=1000");
+        let mut url = format!("{base_url}/v1/models?limit=1000");
         if let Some(after) = &after {
             url.push_str("&after_id=");
             url.push_str(after);
         }
 
-        let resp = client
+        let mut request = client
             .get(url)
             .headers(headers.clone())
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-            .context(t!("provider.claude_unreachable"))?;
+            .timeout(Duration::from_secs(30));
+        if let Some(bearer) = bearer {
+            request = request.bearer_auth(bearer);
+        }
+        let resp = request.send().await.context(unreachable)?;
         if !resp.status().is_success() {
             return Err(ApiError::read(resp).await.into());
         }
@@ -128,21 +148,19 @@ fn headers(
     };
 
     const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
-    const ANTHROPIC_BETA: HeaderName = HeaderName::from_static("anthropic-beta");
     const ANTHROPIC_WORKSPACE_ID: HeaderName = HeaderName::from_static("anthropic-workspace-id");
-    const ANTHROPIC_VERSION: HeaderName = HeaderName::from_static("anthropic-version");
-    const ANTHROPIC_VERSION_VALUE: HeaderValue = HeaderValue::from_static("2023-06-01");
-
-    let mut headers = HeaderMap::new();
-    headers.insert(ANTHROPIC_VERSION, ANTHROPIC_VERSION_VALUE);
 
     if use_bearer {
-        let bearer = format!("Bearer {api_key}");
-        headers.insert(AUTHORIZATION, HeaderValue::from_str(&bearer)?);
         if !betas.is_empty() {
             betas.push(',');
         }
         betas.push_str("oauth-2025-04-20");
+    }
+
+    let mut headers = api_headers(&betas)?;
+    if use_bearer {
+        let bearer = format!("Bearer {api_key}");
+        headers.insert(AUTHORIZATION, HeaderValue::from_str(&bearer)?);
     } else {
         headers.insert(X_API_KEY, HeaderValue::from_str(&api_key)?);
     }
@@ -153,12 +171,42 @@ fn headers(
             HeaderValue::from_str(&workspace_id)?,
         );
     }
+    Ok(headers)
+}
 
+/// The API's headers without credentials: the version, and the `betas` (comma-separated).
+pub(super) fn api_headers(betas: &str) -> anyhow::Result<HeaderMap> {
+    const ANTHROPIC_BETA: HeaderName = HeaderName::from_static("anthropic-beta");
+    const ANTHROPIC_VERSION: HeaderName = HeaderName::from_static("anthropic-version");
+    const ANTHROPIC_VERSION_VALUE: HeaderValue = HeaderValue::from_static("2023-06-01");
+
+    let mut headers = HeaderMap::new();
+    headers.insert(ANTHROPIC_VERSION, ANTHROPIC_VERSION_VALUE);
     if !betas.is_empty() {
-        headers.insert(ANTHROPIC_BETA, HeaderValue::from_str(&betas)?);
+        headers.insert(ANTHROPIC_BETA, HeaderValue::from_str(betas)?);
     }
     Ok(headers)
 }
+
+/// Credentials that expire, sent as a bearer token in place of an API key (Bono Cloud's).
+pub(super) trait BearerSource: Send + Sync {
+    /// The token for the next request, or a new one in place of `rejected`.
+    fn token<'a>(&'a self, rejected: Option<&'a str>) -> BoxFuture<'a, anyhow::Result<String>>;
+}
+
+/// A session lease the requests draw on, sent as their `session_id` (Bono Cloud's): the server
+/// answers `409 invalid_session` once it's no longer valid.
+pub(super) trait LeaseSource: Send + Sync {
+    /// The lease for the next request (`None`: it's sent without one), or another in place of
+    /// `rejected`, which the server said is no longer valid.
+    fn lease<'a>(
+        &'a self,
+        rejected: Option<&'a str>,
+    ) -> BoxFuture<'a, anyhow::Result<Option<String>>>;
+}
+
+/// The longest `Retry-After` waited for: past it, the request is given up on.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
 
 /// A conversation with Claude.
 pub struct Conversation {
@@ -166,6 +214,8 @@ pub struct Conversation {
     base_url: String,
     body: RequestBody,
     headers: HeaderMap,
+    bearer_source: Option<Arc<dyn BearerSource>>,
+    lease_source: Option<Arc<dyn LeaseSource>>,
     timeout: Duration,
     max_retries: u32,
     max_requests: NonZeroU32,
@@ -252,21 +302,8 @@ impl Conversation {
         tools: Tools,
         client: reqwest::Client,
     ) -> anyhow::Result<Self> {
-        let mut builder = ConversationBuilder::new();
-        if let Some(api_key) = config.api_key() {
-            builder.api_key(api_key);
-        }
-        if let Some(workspace_id) = config.workspace_id() {
-            builder.workspace_id(workspace_id);
-        }
-        builder
-            .model(config.model())
-            .effort(config.effort())
-            .cache_ttl(*config.cache_ttl())
-            .max_tokens(*config.max_tokens())
-            .compaction(*config.compaction())
-            .system(system)
-            .tools(tools);
+        let mut builder = ConversationBuilder::from_config(config);
+        builder.system(system).tools(tools);
         builder.build(client)
     }
 
@@ -283,7 +320,10 @@ impl Conversation {
                 self.body.container.get_or_insert_default().id = Some(container_id);
             }
 
-            let model = response.model.unwrap_or_else(|| self.body.model.clone());
+            let model = response
+                .model
+                .or_else(|| self.body.model.clone())
+                .unwrap_or_default();
             let usage = response.usage.total();
             turn_usage += usage;
             *self.usage.entry(model.clone()).or_default() += usage;
@@ -392,9 +432,26 @@ impl Conversation {
         const SHOULD_RETRY: HeaderName = HeaderName::from_static("x-should-retry");
 
         let mut attempt = 0;
+        let mut rejected = None::<String>;
+        // The lease the server said is no longer valid, until a new one is asked for, and whether
+        // one was (once per request)
+        let mut invalid_lease = None::<String>;
+        let mut released = false;
         loop {
             sink.start_response();
-            let resp = match self.request().send().await {
+            let bearer = match &self.bearer_source {
+                Some(source) => Some(source.token(rejected.as_deref()).await?),
+                None => None,
+            };
+            let lease = match &self.lease_source {
+                Some(source) => source.lease(invalid_lease.take().as_deref()).await?,
+                None => None,
+            };
+            let resp = match self
+                .request(bearer.as_deref(), lease.as_deref())
+                .send()
+                .await
+            {
                 Ok(resp) => resp,
                 // The request may never have reached the API: worth another try
                 Err(e)
@@ -410,6 +467,12 @@ impl Conversation {
             };
 
             let status = resp.status();
+            // The token expired: a new one, once, for the same request
+            if status == StatusCode::UNAUTHORIZED && rejected.is_none() && bearer.is_some() {
+                rejected = bearer;
+                continue;
+            }
+
             if status.is_success() {
                 let said = sink.text.len();
                 match read_response(resp, sink).await {
@@ -447,7 +510,23 @@ impl Conversation {
             let retry_after = resp.headers().get(RETRY_AFTER).and_then(parse_retry_after);
             let error = ApiError::read(resp).await;
 
-            if !retryable || attempt >= self.max_retries {
+            // The lease ended, expired, or its week reset: a new one (or none), once, for the
+            // same request
+            if status == StatusCode::CONFLICT && error.code.as_deref() == Some("invalid_session") {
+                if !released && let Some(lease) = lease {
+                    log::info!("Cloud session lease {lease} is no longer valid: starting another");
+                    invalid_lease = Some(lease);
+                    released = true;
+                    continue;
+                }
+                return Err(error.into());
+            }
+
+            // A wait that long would hold the pilot's question up: given up on instead
+            if !retryable
+                || attempt >= self.max_retries
+                || retry_after.is_some_and(|wait| wait > MAX_RETRY_WAIT)
+            {
                 return Err(error.into());
             }
 
@@ -457,13 +536,20 @@ impl Conversation {
         }
     }
 
-    fn request(&self) -> RequestBuilder {
-        return self
+    fn request(&self, bearer: Option<&str>, lease: Option<&str>) -> RequestBuilder {
+        let request = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
             .headers(self.headers.clone())
             .timeout(self.timeout)
-            .json(&self.body);
+            .json(&LeasedRequest {
+                body: &self.body,
+                session_id: lease,
+            });
+        return match bearer {
+            Some(bearer) => request.bearer_auth(bearer),
+            None => request,
+        };
     }
 }
 
@@ -490,12 +576,14 @@ pub struct ApiError {
     pub status: StatusCode,
     /// e.g. `invalid_request_error`, `authentication_error`, `overloaded_error`
     pub r#type: Option<String>,
+    /// What exactly went wrong, from APIs that say (Bono Cloud's), e.g. `invalid_session`
+    pub code: Option<String>,
     pub message: Option<String>,
     pub request_id: Option<String>,
 }
 
 impl ApiError {
-    async fn read(resp: reqwest::Response) -> Self {
+    pub(super) async fn read(resp: reqwest::Response) -> Self {
         const REQUEST_ID: HeaderName = HeaderName::from_static("request-id");
 
         #[derive(Deserialize)]
@@ -506,6 +594,8 @@ impl ApiError {
         #[derive(Deserialize)]
         struct Detail {
             r#type: Option<String>,
+            #[serde(default)]
+            code: Option<String>,
             message: Option<String>,
         }
 
@@ -517,14 +607,19 @@ impl ApiError {
             .map(str::to_owned);
 
         let body = resp.text().await.unwrap_or_default();
-        let (r#type, message) = match serde_json::from_str::<Body>(&body) {
-            Ok(body) => (body.error.r#type, body.error.message),
-            Err(_) => (None, Some(body).filter(|body| !body.trim().is_empty())),
+        let (r#type, code, message) = match serde_json::from_str::<Body>(&body) {
+            Ok(body) => (body.error.r#type, body.error.code, body.error.message),
+            Err(_) => (
+                None,
+                None,
+                Some(body).filter(|body| !body.trim().is_empty()),
+            ),
         };
 
         Self {
             status,
             r#type,
+            code,
             message,
             request_id,
         }
@@ -550,6 +645,7 @@ impl ApiError {
         Self {
             status,
             r#type,
+            code: error["code"].as_str().map(str::to_owned),
             message: error["message"].as_str().map(str::to_owned),
             request_id: None,
         }
@@ -591,6 +687,10 @@ pub struct ConversationBuilder {
     max_requests: NonZeroU32,
     max_retries: u32,
     timeout: Duration,
+    bearer_source: Option<Arc<dyn BearerSource>>,
+    lease_source: Option<Arc<dyn LeaseSource>>,
+    /// The model and its settings are left out of requests, for the server to choose
+    server_settings: bool,
 }
 
 impl ConversationBuilder {
@@ -611,7 +711,28 @@ impl ConversationBuilder {
             max_requests: NonZeroU32::new(16).unwrap(),
             max_retries: 2,
             timeout: Duration::from_mins(10),
+            bearer_source: None,
+            lease_source: None,
+            server_settings: false,
         }
+    }
+
+    /// Set as `config` says, with the defaults for the rest.
+    pub fn from_config(config: &ClaudeConfig) -> Self {
+        let mut builder = Self::new();
+        if let Some(api_key) = config.api_key() {
+            builder.api_key(api_key);
+        }
+        if let Some(workspace_id) = config.workspace_id() {
+            builder.workspace_id(workspace_id);
+        }
+        builder
+            .model(config.model())
+            .effort(config.effort())
+            .cache_ttl(*config.cache_ttl())
+            .max_tokens(*config.max_tokens())
+            .compaction(*config.compaction());
+        builder
     }
 
     /// Defaults to `ANTHROPIC_API_KEY`, then `ANTHROPIC_AUTH_TOKEN` (sent as a bearer token).
@@ -632,6 +753,30 @@ impl ConversationBuilder {
     #[inline]
     pub fn base_url(&mut self, base_url: impl Into<String>) -> &mut Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// Asks `source` for a bearer token before each request, and for a new one when it's
+    /// rejected (once per request), in place of an API key and workspace.
+    #[inline]
+    pub(super) fn bearer_source(&mut self, source: Arc<dyn BearerSource>) -> &mut Self {
+        self.bearer_source = Some(source);
+        self
+    }
+
+    /// Asks `source` for the lease to send each request with (see [`LeaseSource`]).
+    #[inline]
+    pub(super) fn lease_source(&mut self, source: Arc<dyn LeaseSource>) -> &mut Self {
+        self.lease_source = Some(source);
+        self
+    }
+
+    /// Leaves the model, effort, `max_tokens` and the cache breakpoints' lifetime out of every
+    /// request, for the server to choose (Bono Cloud's): the ones set here aren't sent. The
+    /// breakpoints themselves stay.
+    #[inline]
+    pub(super) fn server_settings(&mut self) -> &mut Self {
+        self.server_settings = true;
         self
     }
 
@@ -771,7 +916,13 @@ impl ConversationBuilder {
             betas.push_str(",compact-2026-01-12");
         }
 
-        let headers = headers(self.api_key, self.workspace_id, betas)?;
+        let headers = match self.bearer_source {
+            Some(_) => api_headers(&betas)?,
+            None => headers(self.api_key, self.workspace_id, betas)?,
+        };
+
+        let own_settings = !self.server_settings;
+        let ttl = own_settings.then(|| self.cache_ttl.as_str());
 
         // The system prompt gets its own cache breakpoint, so it's read from the cache even when
         // the conversation's (the top-level `cache_control`) misses
@@ -782,7 +933,7 @@ impl ConversationBuilder {
                 text: self.system.clone(),
                 cache_control: RequestCacheControl {
                     r#type: "ephemeral",
-                    ttl: Some(self.cache_ttl.as_str()),
+                    ttl,
                 },
             }],
         };
@@ -799,16 +950,16 @@ impl ConversationBuilder {
             client,
             base_url: self.base_url,
             body: RequestBody {
-                model: self.model,
-                max_tokens: self.max_tokens,
+                model: own_settings.then_some(self.model),
+                max_tokens: own_settings.then_some(self.max_tokens),
                 stream: true,
                 fallbacks: "default",
-                output_config: RequestOutputConfig {
+                output_config: own_settings.then_some(RequestOutputConfig {
                     effort: self.effort,
-                },
+                }),
                 cache_control: RequestCacheControl {
                     r#type: "ephemeral",
-                    ttl: Some(self.cache_ttl.as_str()),
+                    ttl,
                 },
                 system,
                 messages: Vec::new(),
@@ -824,6 +975,8 @@ impl ConversationBuilder {
                 }),
             },
             headers,
+            bearer_source: self.bearer_source,
+            lease_source: self.lease_source,
             timeout: self.timeout,
             max_retries: self.max_retries,
             max_requests: self.max_requests,
@@ -833,16 +986,30 @@ impl ConversationBuilder {
     }
 }
 
+/// A request as it's sent: the body, with the lease it draws on, if any.
+#[derive(Serialize)]
+struct LeasedRequest<'a> {
+    #[serde(flatten)]
+    body: &'a RequestBody,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+}
+
 #[derive(Serialize)]
 struct RequestBody {
-    model: String,
-    max_tokens: NonZeroU32,
+    /// The server's choice when `None` (see `ConversationBuilder::server_settings`), like
+    /// `max_tokens` and `output_config`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<NonZeroU32>,
     /// Always: answers are spoken as they're written, and long requests don't time out
     stream: bool,
     /// Retries refusals on Anthropic's recommended model for the refusal's category (needs the
     /// `server-side-fallback-2026-07-01` beta)
     fallbacks: &'static str,
-    output_config: RequestOutputConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<RequestOutputConfig>,
     /// Automatic caching: a breakpoint on the conversation's last block, moving with it
     cache_control: RequestCacheControl,
     #[serde(skip_serializing_if = "Vec::is_empty")]

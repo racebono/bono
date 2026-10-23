@@ -659,8 +659,8 @@ fn deserialize_provider<'de, D: Deserializer<'de>>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelProvider {
-    /// Bono Cloud: whichever model Bono's website runs, for signed-in accounts with access to it.
-    /// Nothing to set up, so it has no settings
+    /// Bono Cloud: Claude, through Bono's website, for signed-in accounts with access to it. The
+    /// website chooses the model and its settings (and ignores any sent), so it has no settings
     BonoCloud,
     /// Claude, through the Claude API: needs an API key
     Claude,

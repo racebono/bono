@@ -6,12 +6,15 @@ use crate::{
     config::{
         ClaudeConfig, Config, ModelConfig, ModelProvider, OllamaConfig, OpenAiConfig, Setting,
     },
-    provider::{self, ModelOption},
+    provider::{self, ModelOption, bono_cloud::Entitlement},
     task::MaybeDone,
 };
 use bono_i18n::t;
 use egui::IntoAtoms;
-use std::num::NonZeroU32;
+use std::{
+    num::NonZeroU32,
+    time::{Duration, Instant, SystemTime},
+};
 use tokio::runtime::Handle;
 
 const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -23,6 +26,13 @@ const OPENAI_EFFORTS: [&str; 5] = ["", "none", "low", "medium", "high"];
 const CLAUDE_KEYS_URL: &str = "https://platform.claude.com/settings/keys";
 /// Where Ollama is downloaded from
 const OLLAMA_DOWNLOAD_URL: &str = "https://ollama.com/download";
+
+/// Bono Cloud's allowance is asked again this long after a turn, at the soonest
+const ALLOWANCE_DEBOUNCE: Duration = Duration::from_secs(30);
+/// ...and this long after it was last asked, turns or not (others may use the account)
+const ALLOWANCE_MAX_AGE: Duration = Duration::from_mins(5);
+/// Below this many hours of driving left, the allowance is said to be running low
+const ALLOWANCE_LOW_HOURS: f64 = 2.0;
 
 /// How long Ollama keeps the model loaded, in seconds (`None`: Ollama's own)
 fn keep_alive_options() -> [(Option<f64>, &'static str); 5] {
@@ -56,6 +66,8 @@ pub struct ProviderTopbar {
     account: Option<Account>,
     /// Whether the signed-in account may use Bono Cloud
     cloud: Option<CloudAccess>,
+    /// What's left of its Bono Cloud allowance
+    allowance: Option<Allowance>,
     /// The provider's models, fetched when the tab first shows them
     models: Option<Models>,
     /// The address being typed (Ollama's host, or the API's URL): set once it's done (Enter, or
@@ -74,6 +86,18 @@ struct CloudAccess {
     authorized: MaybeDone<anyhow::Result<bool>>,
 }
 
+/// What's left of one account's Bono Cloud allowance.
+struct Allowance {
+    /// The account's user id
+    user: String,
+    /// Bono Cloud's turns when it was asked
+    turns: u64,
+    asked: Instant,
+    entitlement: MaybeDone<anyhow::Result<Entitlement>>,
+    /// The last answer, shown while it's asked again
+    last: Option<Entitlement>,
+}
+
 /// The models one provider offers.
 struct Models {
     provider: ModelProvider,
@@ -88,6 +112,7 @@ impl ProviderTopbar {
             client: client.clone(),
             account: account.cloned(),
             cloud: None,
+            allowance: None,
             models: None,
             host: None,
             api_key: None,
@@ -132,7 +157,10 @@ impl ProviderTopbar {
                     let openai = ui
                         .selectable_value(provider, ModelProvider::OpenAi, "OpenAI")
                         .on_hover_text(t!("provider.openai_hover"));
-                    cloud_option.clicked() || claude.clicked() || ollama.clicked() || openai.clicked()
+                    cloud_option.clicked()
+                        || claude.clicked()
+                        || ollama.clicked()
+                        || openai.clicked()
                 })
                 .inner
             });
@@ -596,6 +624,7 @@ impl ProviderTopbar {
         match cloud {
             Some(true) => {
                 ui.label(t!("provider.bono_cloud_about"));
+                self.show_allowance(rt, ui);
             }
             Some(false) => {
                 // Signed out, signing in asks again
@@ -620,11 +649,7 @@ impl ProviderTopbar {
                         None => {
                             ui.colored_label(
                                 warn,
-                                format!(
-                                    "{} {}",
-                                    egui_phosphor::bold::WARNING,
-                                    unavailable
-                                ),
+                                format!("{} {}", egui_phosphor::bold::WARNING, unavailable),
                             );
                         }
                     }
@@ -648,6 +673,86 @@ impl ProviderTopbar {
         }
     }
 
+    /// What's left of the account's allowance this week, warning when it runs low.
+    fn show_allowance(&mut self, rt: &Handle, ui: &mut egui::Ui) {
+        let Some(entitlement) = self.allowance(rt) else {
+            return;
+        };
+        let Some(hours) = entitlement.estimated_hours_left else {
+            return;
+        };
+        let resets = (entitlement.week.as_ref())
+            .and_then(|week| week.resets_at.as_deref())
+            .and_then(resets_in)
+            .unwrap_or_else(|| "?".into());
+        let hours_left = format!("{:.1}", hours.max(0.0));
+        if hours < ALLOWANCE_LOW_HOURS {
+            let text = t!(
+                "provider.bono_cloud_allowance_low",
+                hours = hours_left,
+                resets = resets
+            );
+            let warn = ui.visuals().warn_fg_color;
+            ui.colored_label(warn, format!("{} {text}", egui_phosphor::bold::WARNING));
+        } else {
+            ui.weak(t!(
+                "provider.bono_cloud_hours_left",
+                hours = hours_left,
+                resets = resets
+            ));
+        }
+    }
+
+    /// What's left of the signed-in account's Bono Cloud allowance, as last asked: asked again
+    /// a while after each turn, and every few minutes. `None` until it's known.
+    fn allowance(&mut self, rt: &Handle) -> Option<&Entitlement> {
+        let user = match self.account.as_ref().map(Account::status) {
+            Some(Status::SignedIn(user)) => user,
+            Some(Status::SignedOut) | None => {
+                self.allowance = None;
+                return None;
+            }
+        };
+
+        let turns = provider::bono_cloud::turns();
+        let stale = self.allowance.as_ref().is_none_or(|allowance| {
+            let age = allowance.asked.elapsed();
+            allowance.user != user.id
+                || age >= ALLOWANCE_MAX_AGE
+                || (allowance.turns != turns && age >= ALLOWANCE_DEBOUNCE)
+        });
+        if stale {
+            let last = self
+                .allowance
+                .take()
+                .filter(|allowance| allowance.user == user.id)
+                .and_then(|allowance| allowance.last);
+            let account = self.account.clone();
+            let client = self.client.clone();
+            self.allowance = Some(Allowance {
+                user: user.id,
+                turns,
+                asked: Instant::now(),
+                entitlement: MaybeDone::spawn(async move {
+                    let entitlement =
+                        provider::bono_cloud::entitlement(account.as_ref(), &client).await;
+                    // Once per check, not every frame it's looked at
+                    if let Err(e) = &entitlement {
+                        log::debug!("Couldn't tell what's left of Bono Cloud's allowance: {e:#}");
+                    }
+                    entitlement
+                }),
+                last,
+            });
+        }
+
+        let allowance = self.allowance.as_mut()?;
+        if let Some(Ok(entitlement)) = allowance.entitlement.update(rt) {
+            allowance.last = Some(entitlement.clone());
+        }
+        allowance.last.as_ref()
+    }
+
     /// Whether the provider picked can't be used yet: Claude, without credentials, or Bono Cloud,
     /// without an account that may use it.
     pub fn needs_setup(&mut self, rt: &Handle, config: &Config) -> bool {
@@ -657,6 +762,21 @@ impl ProviderTopbar {
             ModelProvider::Ollama | ModelProvider::OpenAi => false,
         }
     }
+}
+
+/// How long until `at` (RFC 3339), roughly, as the pilot reads it.
+fn resets_in(at: &str) -> Option<String> {
+    let at = humantime::parse_rfc3339_weak(at).ok()?;
+    let left = at.duration_since(SystemTime::now()).unwrap_or_default();
+    let hours = left.as_secs().div_ceil(3600);
+    Some(match hours / 24 {
+        0 => t!("provider.bono_cloud_resets_hours", hours = hours),
+        days => t!(
+            "provider.bono_cloud_resets_days",
+            days = days,
+            hours = hours % 24
+        ),
+    })
 }
 
 /// Where the provider's models are listed from: Ollama's host, or the API's URL. For Claude, the
