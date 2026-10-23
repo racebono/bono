@@ -811,14 +811,6 @@ impl Engineer {
             self.client.clone(),
         )?;
 
-        // The history cache is built now, so the first history question doesn't wait for it
-        let warming_tool = tool.clone();
-        tokio::spawn(async move {
-            if let Err(e) = warming_tool.warm().await {
-                log::debug!("Not warming the engineer's history yet: {e:#}");
-            }
-        });
-
         let db = pool.database().path().to_owned();
         log::info!("Engineer session started on {}", db.display());
         Ok(Session {
