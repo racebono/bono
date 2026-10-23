@@ -131,6 +131,8 @@ struct Playback {
     done: bool,
     /// Whether SDL played all of it, once it's all on the stream
     drain: Drain,
+    /// Play the incomplete-answer tone once this speech has drained.
+    tone_after_drain: bool,
 }
 
 struct Session {
@@ -343,7 +345,16 @@ impl Engineer {
             stream: None,
             done: false,
             drain: Drain::new(Instant::now()),
+            tone_after_drain: false,
         });
+    }
+
+    /// Preserve the answer still being synthesized or played before sounding its failure tone.
+    fn incomplete_beep(&mut self) {
+        match &mut self.playback {
+            Some(playback) => playback.tone_after_drain = true,
+            None => self.no_beep(),
+        }
     }
 
     /// A question typed in the chat, answered like one asked on the radio: spoken in the
@@ -583,14 +594,14 @@ impl Engineer {
             }
             StopReason::MaxTokens => {
                 detail = format!("{detail} | {}", t!("engineer.detail_cut_off"));
-                self.no_beep();
+                self.incomplete_beep();
                 reply.text
             }
             // Every later question would end the same way: the next one starts over
             StopReason::ContextWindowExceeded => {
                 self.new_session = true;
                 detail = format!("{detail} | {}", t!("engineer.detail_full"));
-                self.no_beep();
+                self.incomplete_beep();
                 reply.text
             }
             StopReason::EndTurn | StopReason::StopSequence => {
@@ -656,6 +667,7 @@ impl Engineer {
             stream: None,
             done: false,
             drain: Drain::new(Instant::now()),
+            tone_after_drain: false,
         });
         Some((lang, input))
     }
@@ -735,7 +747,13 @@ impl Engineer {
         };
         match drained {
             Drained::Playing => {}
-            Drained::Done => self.playback = None,
+            Drained::Done => {
+                let tone = playback.tone_after_drain;
+                self.playback = None;
+                if tone {
+                    self.no_beep();
+                }
+            }
             Drained::Stalled => {
                 self.playback = None;
                 self.notice(t!("engineer.speaker_stalled"));
@@ -909,6 +927,77 @@ mod tests {
         sys::bono_session_info,
     };
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn incomplete_answers_preserve_speech_before_the_tone() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let rt = runtime.handle();
+        let dir = tempfile::tempdir().unwrap();
+        let config = rt
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let mut synth = Synthesizer::new(rt, &config.get());
+        let mut engineer = rt
+            .block_on(Engineer::new(
+                Path::new("assets"),
+                &config.get(),
+                reqwest::Client::new(),
+                None,
+            ))
+            .unwrap();
+
+        for stop in [StopReason::MaxTokens, StopReason::ContextWindowExceeded] {
+            // Stand in for synthesized speech without loading a voice or opening a device.
+            engineer.playback = Some(Playback {
+                speech: SpeechOutput::ready(Speech {
+                    samples: vec![0.25, -0.25],
+                    sample_rate: 22050,
+                }),
+                stream: None,
+                done: false,
+                drain: Drain::new(Instant::now()),
+                tone_after_drain: false,
+            });
+            let (_, text) = mpsc::unbounded_channel();
+            engineer.answer(
+                rt,
+                &config,
+                &mut synth,
+                Reply {
+                    text: "Partial answer".into(),
+                    stop,
+                    usage: Default::default(),
+                    model: "test".into(),
+                },
+                Turn {
+                    task: Task::spawn(std::future::pending()),
+                    lang: arrstr!("en"),
+                    text,
+                    entry: None,
+                },
+            );
+            let playback = engineer.playback.as_mut().unwrap();
+            assert!(playback.tone_after_drain, "{stop:?}");
+            assert!(!playback.done);
+            let Poll::Ready(Some(Ok(speech))) = playback.speech.try_next() else {
+                panic!("the answer's speech must be preserved");
+            };
+            assert_eq!(speech.samples, [0.25, -0.25]);
+            assert_eq!(speech.sample_rate, 22050);
+
+            // With the speech consumed and no device queue left, playback has drained.
+            engineer.play(&config, None);
+            let playback = engineer.playback.as_mut().expect("tone follows the answer");
+            assert!(!playback.tone_after_drain);
+            let Poll::Ready(Some(Ok(tone))) = playback.speech.try_next() else {
+                panic!("failure tone must be ready after the answer drains");
+            };
+            assert_eq!(tone.samples, Speech::no_beep(1.0).samples);
+            engineer.play(&config, None);
+            assert!(engineer.playback.is_none(), "tone must only play once");
+        }
+    }
 
     #[test]
     fn incomplete_answers_play_a_tone_without_a_voice() {
