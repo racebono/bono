@@ -1165,6 +1165,11 @@
         "es": "La sesión de tu cuenta de Bono ha terminado: vuelve a iniciar sesión",
         "ca": "La sessió del teu compte de Bono ha acabat: torna a iniciar la sessió"
     },
+    "provider.bono_cloud_unreachable": {
+        "en": "Couldn't reach Bono Cloud",
+        "es": "No se pudo conectar con Bono Cloud",
+        "ca": "No s'ha pogut connectar amb Bono Cloud"
+    },
     "provider.bono_cloud_refresh_failed": {
         "en": "Could not refresh your Bono session: try again; you are still signed in",
         "es": "No se pudo renovar tu sesión de Bono: vuelve a intentarlo; sigues conectado",

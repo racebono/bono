@@ -1,6 +1,6 @@
 //! The language models the race engineer talks through, whoever runs them: a [`Model`] is one
 //! conversation with one, tool calls included. [`claude`] is Claude's (the Claude API),
-//! [`ollama`] any model Ollama runs, and [`bono_cloud`] whichever Bono's website runs for the
+//! [`ollama`] any model Ollama runs, and [`bono_cloud`] Claude through Bono's website, for the
 //! signed-in account; others (e.g. OpenAI's) implement the same trait.
 
 use crate::{

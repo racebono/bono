@@ -28,6 +28,30 @@ pub async fn models(
     config: &ClaudeConfig,
     client: &reqwest::Client,
 ) -> anyhow::Result<Vec<ModelOption>> {
+    let headers = headers(
+        config.api_key().clone(),
+        config.workspace_id().clone(),
+        String::new(),
+    )?;
+    list_models(
+        client,
+        BASE_URL,
+        &headers,
+        None,
+        t!("provider.claude_unreachable"),
+    )
+    .await
+}
+
+/// The models the API at `base_url` offers, newest first, asked with `headers` (and `bearer`, if
+/// any). `unreachable` explains a request that never got an answer.
+pub(super) async fn list_models(
+    client: &reqwest::Client,
+    base_url: &str,
+    headers: &HeaderMap,
+    bearer: Option<&str>,
+    unreachable: &'static str,
+) -> anyhow::Result<Vec<ModelOption>> {
     #[derive(Deserialize)]
     struct Page {
         data: Vec<Entry>,
@@ -42,27 +66,23 @@ pub async fn models(
         id: String,
     }
 
-    let headers = headers(
-        config.api_key().clone(),
-        config.workspace_id().clone(),
-        String::new(),
-    )?;
     let mut models = Vec::new();
     let mut after = None::<String>;
     loop {
-        let mut url = format!("{BASE_URL}/v1/models?limit=1000");
+        let mut url = format!("{base_url}/v1/models?limit=1000");
         if let Some(after) = &after {
             url.push_str("&after_id=");
             url.push_str(after);
         }
 
-        let resp = client
+        let mut request = client
             .get(url)
             .headers(headers.clone())
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-            .context(t!("provider.claude_unreachable"))?;
+            .timeout(Duration::from_secs(30));
+        if let Some(bearer) = bearer {
+            request = request.bearer_auth(bearer);
+        }
+        let resp = request.send().await.context(unreachable)?;
         if !resp.status().is_success() {
             return Err(ApiError::read(resp).await.into());
         }
@@ -128,21 +148,19 @@ fn headers(
     };
 
     const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
-    const ANTHROPIC_BETA: HeaderName = HeaderName::from_static("anthropic-beta");
     const ANTHROPIC_WORKSPACE_ID: HeaderName = HeaderName::from_static("anthropic-workspace-id");
-    const ANTHROPIC_VERSION: HeaderName = HeaderName::from_static("anthropic-version");
-    const ANTHROPIC_VERSION_VALUE: HeaderValue = HeaderValue::from_static("2023-06-01");
-
-    let mut headers = HeaderMap::new();
-    headers.insert(ANTHROPIC_VERSION, ANTHROPIC_VERSION_VALUE);
 
     if use_bearer {
-        let bearer = format!("Bearer {api_key}");
-        headers.insert(AUTHORIZATION, HeaderValue::from_str(&bearer)?);
         if !betas.is_empty() {
             betas.push(',');
         }
         betas.push_str("oauth-2025-04-20");
+    }
+
+    let mut headers = api_headers(&betas)?;
+    if use_bearer {
+        let bearer = format!("Bearer {api_key}");
+        headers.insert(AUTHORIZATION, HeaderValue::from_str(&bearer)?);
     } else {
         headers.insert(X_API_KEY, HeaderValue::from_str(&api_key)?);
     }
@@ -153,11 +171,27 @@ fn headers(
             HeaderValue::from_str(&workspace_id)?,
         );
     }
+    Ok(headers)
+}
 
+/// The API's headers without credentials: the version, and the `betas` (comma-separated).
+pub(super) fn api_headers(betas: &str) -> anyhow::Result<HeaderMap> {
+    const ANTHROPIC_BETA: HeaderName = HeaderName::from_static("anthropic-beta");
+    const ANTHROPIC_VERSION: HeaderName = HeaderName::from_static("anthropic-version");
+    const ANTHROPIC_VERSION_VALUE: HeaderValue = HeaderValue::from_static("2023-06-01");
+
+    let mut headers = HeaderMap::new();
+    headers.insert(ANTHROPIC_VERSION, ANTHROPIC_VERSION_VALUE);
     if !betas.is_empty() {
-        headers.insert(ANTHROPIC_BETA, HeaderValue::from_str(&betas)?);
+        headers.insert(ANTHROPIC_BETA, HeaderValue::from_str(betas)?);
     }
     Ok(headers)
+}
+
+/// Credentials that expire, sent as a bearer token in place of an API key (Bono Cloud's).
+pub(super) trait BearerSource: Send + Sync {
+    /// The token for the next request, or a new one in place of `rejected`.
+    fn token<'a>(&'a self, rejected: Option<&'a str>) -> BoxFuture<'a, anyhow::Result<String>>;
 }
 
 /// A conversation with Claude.
@@ -166,6 +200,7 @@ pub struct Conversation {
     base_url: String,
     body: RequestBody,
     headers: HeaderMap,
+    bearer_source: Option<Arc<dyn BearerSource>>,
     timeout: Duration,
     max_retries: u32,
     max_requests: NonZeroU32,
@@ -252,21 +287,8 @@ impl Conversation {
         tools: Tools,
         client: reqwest::Client,
     ) -> anyhow::Result<Self> {
-        let mut builder = ConversationBuilder::new();
-        if let Some(api_key) = config.api_key() {
-            builder.api_key(api_key);
-        }
-        if let Some(workspace_id) = config.workspace_id() {
-            builder.workspace_id(workspace_id);
-        }
-        builder
-            .model(config.model())
-            .effort(config.effort())
-            .cache_ttl(*config.cache_ttl())
-            .max_tokens(*config.max_tokens())
-            .compaction(*config.compaction())
-            .system(system)
-            .tools(tools);
+        let mut builder = ConversationBuilder::from_config(config);
+        builder.system(system).tools(tools);
         builder.build(client)
     }
 
@@ -392,9 +414,14 @@ impl Conversation {
         const SHOULD_RETRY: HeaderName = HeaderName::from_static("x-should-retry");
 
         let mut attempt = 0;
+        let mut rejected = None::<String>;
         loop {
             sink.start_response();
-            let resp = match self.request().send().await {
+            let bearer = match &self.bearer_source {
+                Some(source) => Some(source.token(rejected.as_deref()).await?),
+                None => None,
+            };
+            let resp = match self.request(bearer.as_deref()).send().await {
                 Ok(resp) => resp,
                 // The request may never have reached the API: worth another try
                 Err(e)
@@ -410,6 +437,12 @@ impl Conversation {
             };
 
             let status = resp.status();
+            // The token expired: a new one, once, for the same request
+            if status == StatusCode::UNAUTHORIZED && rejected.is_none() && bearer.is_some() {
+                rejected = bearer;
+                continue;
+            }
+
             if status.is_success() {
                 let said = sink.text.len();
                 match read_response(resp, sink).await {
@@ -457,13 +490,17 @@ impl Conversation {
         }
     }
 
-    fn request(&self) -> RequestBuilder {
-        return self
+    fn request(&self, bearer: Option<&str>) -> RequestBuilder {
+        let request = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
             .headers(self.headers.clone())
             .timeout(self.timeout)
             .json(&self.body);
+        return match bearer {
+            Some(bearer) => request.bearer_auth(bearer),
+            None => request,
+        };
     }
 }
 
@@ -591,6 +628,7 @@ pub struct ConversationBuilder {
     max_requests: NonZeroU32,
     max_retries: u32,
     timeout: Duration,
+    bearer_source: Option<Arc<dyn BearerSource>>,
 }
 
 impl ConversationBuilder {
@@ -611,7 +649,26 @@ impl ConversationBuilder {
             max_requests: NonZeroU32::new(16).unwrap(),
             max_retries: 2,
             timeout: Duration::from_mins(10),
+            bearer_source: None,
         }
+    }
+
+    /// Set as `config` says, with the defaults for the rest.
+    pub fn from_config(config: &ClaudeConfig) -> Self {
+        let mut builder = Self::new();
+        if let Some(api_key) = config.api_key() {
+            builder.api_key(api_key);
+        }
+        if let Some(workspace_id) = config.workspace_id() {
+            builder.workspace_id(workspace_id);
+        }
+        builder
+            .model(config.model())
+            .effort(config.effort())
+            .cache_ttl(*config.cache_ttl())
+            .max_tokens(*config.max_tokens())
+            .compaction(*config.compaction());
+        builder
     }
 
     /// Defaults to `ANTHROPIC_API_KEY`, then `ANTHROPIC_AUTH_TOKEN` (sent as a bearer token).
@@ -632,6 +689,14 @@ impl ConversationBuilder {
     #[inline]
     pub fn base_url(&mut self, base_url: impl Into<String>) -> &mut Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// Asks `source` for a bearer token before each request, and for a new one when it's
+    /// rejected (once per request), in place of an API key and workspace.
+    #[inline]
+    pub(super) fn bearer_source(&mut self, source: Arc<dyn BearerSource>) -> &mut Self {
+        self.bearer_source = Some(source);
         self
     }
 
@@ -771,7 +836,10 @@ impl ConversationBuilder {
             betas.push_str(",compact-2026-01-12");
         }
 
-        let headers = headers(self.api_key, self.workspace_id, betas)?;
+        let headers = match self.bearer_source {
+            Some(_) => api_headers(&betas)?,
+            None => headers(self.api_key, self.workspace_id, betas)?,
+        };
 
         // The system prompt gets its own cache breakpoint, so it's read from the cache even when
         // the conversation's (the top-level `cache_control`) misses
@@ -824,6 +892,7 @@ impl ConversationBuilder {
                 }),
             },
             headers,
+            bearer_source: self.bearer_source,
             timeout: self.timeout,
             max_retries: self.max_retries,
             max_requests: self.max_requests,
