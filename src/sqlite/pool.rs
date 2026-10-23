@@ -210,7 +210,9 @@ mod tests {
         let path = dir.path().join("telemetry.db");
         let writer = rusqlite::Connection::open(&path).unwrap();
         writer
-            .execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; CREATE TABLE t (x); INSERT INTO t VALUES (1);",
+            )
             .unwrap();
 
         let one = NonZeroUsize::new(1).unwrap();

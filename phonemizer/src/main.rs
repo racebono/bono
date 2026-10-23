@@ -42,7 +42,12 @@ enum Response {
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let res = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+    let res = match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
         ["--serve"] => serve(),
         ["--voice", voice, text @ ..] if !text.is_empty() => print(voice, &text.join(" ")),
         _ => {
@@ -285,8 +290,11 @@ mod tests {
     #[test]
     fn phonemizes_sentences() {
         init_espeak().unwrap();
-        let sentences =
-            phonemize("Hello, world. It costs 3.5 dollars; really! Does it?", "en-us").unwrap();
+        let sentences = phonemize(
+            "Hello, world. It costs 3.5 dollars; really! Does it?",
+            "en-us",
+        )
+        .unwrap();
 
         println!("{sentences:#?}");
         assert_eq!(sentences.len(), 3);

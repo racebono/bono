@@ -27,12 +27,15 @@ use sdl3::{
     event::Event,
     get_error,
     sys::{
-        audio::{SDL_GetAudioPlaybackDevices, SDL_GetAudioRecordingDevices},
+        audio::{
+            SDL_GetAudioPlaybackDevices, SDL_GetAudioRecordingDevices,
+            SDL_SetAudioStreamPutCallback,
+        },
         stdinc::SDL_free,
     },
 };
 use std::{
-    ops::Deref,
+    ops::{Deref, DerefMut},
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -319,7 +322,10 @@ impl AudioTopbar {
     /// picked, nothing is played until a speaker is picked again. Returns whether it was.
     pub fn speaker_removed(&mut self, which: u32) -> bool {
         for playback in [&mut self.test_playback, &mut self.beep_playback] {
-            if playback.as_ref().is_some_and(|stream| plays_on(stream, which)) {
+            if playback
+                .as_ref()
+                .is_some_and(|stream| plays_on(stream, which))
+            {
                 *playback = None;
             }
         }
@@ -368,7 +374,10 @@ impl DeviceSelector {
 
     /// The device `which` is gone: it's closed if it's the one open. Returns whether it was.
     fn removed(&mut self, which: u32) -> bool {
-        let open = self.open.as_ref().is_some_and(|open| open.id().id() == which);
+        let open = self
+            .open
+            .as_ref()
+            .is_some_and(|open| open.id().id() == which);
         if open {
             self.open = None;
         }
@@ -489,10 +498,45 @@ pub fn app_language(locale: &str) -> ArrayStr<2> {
     ArrayStr::from_str(locale.split('-').next().unwrap_or_default()).unwrap_or(arrstr!("en"))
 }
 
+/// A recording stream with a callback, that stops calling it before it's dropped.
+///
+/// sdl3 frees an [`AudioStreamWithCallback`]'s callback before destroying its stream, while
+/// SDL's audio thread may still be running it, or about to: that would use it after it's freed.
+struct RecordingStream<CB>(AudioStreamWithCallback<CB>);
+
+impl<CB> RecordingStream<CB> {
+    fn new(stream: AudioStreamWithCallback<CB>) -> Self {
+        Self(stream)
+    }
+}
+
+impl<CB> Deref for RecordingStream<CB> {
+    type Target = AudioStreamWithCallback<CB>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<CB> DerefMut for RecordingStream<CB> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<CB> Drop for RecordingStream<CB> {
+    fn drop(&mut self) {
+        let _ = self.0.pause();
+        // SDL calls the callback with the stream locked, and this locks it too: it waits for a
+        // call in progress, and none can start after it
+        unsafe { SDL_SetAudioStreamPutCallback(self.0.raw(), None, std::ptr::null_mut()) };
+    }
+}
+
 /// Listens to the microphone, for how loud it is.
 struct MicMeter {
     /// Dropping it stops listening
-    _stream: AudioStreamWithCallback<Meter>,
+    _stream: RecordingStream<Meter>,
     /// The loudest sample since it was last looked at, as an `f32`'s bits
     peak: Arc<AtomicU32>,
     /// The level shown, from 0 to 1: it falls slowly, so peaks can be seen
@@ -507,7 +551,9 @@ impl MicMeter {
             buf: [0.0; 512],
         };
         let open = || {
-            let stream = device.open_recording_stream_with_callback(&RECORDING_SPEC, meter)?;
+            let stream = RecordingStream::new(
+                device.open_recording_stream_with_callback(&RECORDING_SPEC, meter)?,
+            );
             stream.resume()?;
             Ok::<_, sdl3::Error>(stream)
         };

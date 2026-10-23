@@ -96,24 +96,26 @@ impl Recorder {
             failed: AtomicBool::new(false),
         });
 
-        let thread = std::thread::Builder::new().name("bono recorder".into()).spawn({
-            let shared = shared.clone();
-            let mut writer = Writer {
-                database: dir.join(DATABASE),
-                left_over,
-                settings_path: dir.join(SETTINGS),
-                clear_requests: settings.clear,
-                settings_modified: None,
-                next_settings_check: Instant::now() + SETTINGS_CHECK,
-                forecast,
-            };
-            move || {
-                let result = catch_unwind(AssertUnwindSafe(|| writer.run(&shared)));
-                if !matches!(result, Ok(Ok(()))) {
-                    shared.failed.store(true, Ordering::Relaxed);
+        let thread = std::thread::Builder::new()
+            .name("bono recorder".into())
+            .spawn({
+                let shared = shared.clone();
+                let mut writer = Writer {
+                    database: dir.join(DATABASE),
+                    left_over,
+                    settings_path: dir.join(SETTINGS),
+                    clear_requests: settings.clear,
+                    settings_modified: None,
+                    next_settings_check: Instant::now() + SETTINGS_CHECK,
+                    forecast,
+                };
+                move || {
+                    let result = catch_unwind(AssertUnwindSafe(|| writer.run(&shared)));
+                    if !matches!(result, Ok(Ok(()))) {
+                        shared.failed.store(true, Ordering::Relaxed);
+                    }
                 }
-            }
-        })?;
+            })?;
 
         Ok(Self {
             dir,
@@ -148,7 +150,11 @@ impl Recorder {
             return true;
         }
 
-        let frequency = self.shared.opponent_frequency.load(Ordering::Relaxed).max(1);
+        let frequency = self
+            .shared
+            .opponent_frequency
+            .load(Ordering::Relaxed)
+            .max(1);
         let updates = tracking.opponent_updates.entry(vehicle_id).or_default();
         let keep = *updates % frequency == 0;
         *updates = updates.wrapping_add(1);
@@ -446,7 +452,8 @@ impl Writer {
         }
         self.next_settings_check = now + SETTINGS_CHECK;
 
-        let Ok(modified) = fs::metadata(&self.settings_path).and_then(|meta| meta.modified()) else {
+        let Ok(modified) = fs::metadata(&self.settings_path).and_then(|meta| meta.modified())
+        else {
             return false;
         };
         if self.settings_modified == Some(modified) {
@@ -522,8 +529,10 @@ mod tests {
         drop(recorder);
         let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
         let count = |table: &str| -> i64 {
-            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0))
-                .unwrap()
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
         };
         assert_eq!(count("session"), 1);
         assert_eq!(count("standings"), 2);
@@ -612,7 +621,9 @@ mod tests {
 
         let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
         let telemetry = conn
-            .query_row("SELECT count(*) FROM telemetry", [], |row| row.get::<_, i64>(0))
+            .query_row("SELECT count(*) FROM telemetry", [], |row| {
+                row.get::<_, i64>(0)
+            })
             .unwrap();
         assert_eq!(telemetry, 0);
         let vehicles = conn
@@ -630,7 +641,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DATABASE);
         let count = |conn: &rusqlite::Connection| {
-            conn.query_row("SELECT count(*) FROM standings", [], |row| row.get::<_, i64>(0))
+            conn.query_row("SELECT count(*) FROM standings", [], |row| {
+                row.get::<_, i64>(0)
+            })
         };
 
         let recorder = Recorder::new(dir.path(), None).unwrap();
@@ -649,7 +662,10 @@ mod tests {
             if count(&conn).is_ok_and(|rows| rows == 0) {
                 break;
             }
-            assert!(Instant::now() < deadline, "the last run's rows are still there");
+            assert!(
+                Instant::now() < deadline,
+                "the last run's rows are still there"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         drop((reader, recorder));
@@ -686,13 +702,17 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
-        let reader =
-            rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .unwrap();
+        let reader = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
         reader.busy_timeout(Duration::from_secs(1)).unwrap();
 
         loop {
-            let rows = reader.query_row("SELECT count(*) FROM standings", [], |row| row.get::<_, i64>(0));
+            let rows = reader.query_row("SELECT count(*) FROM standings", [], |row| {
+                row.get::<_, i64>(0)
+            });
             if rows.as_ref().is_ok_and(|rows| *rows == 1) {
                 break;
             }
