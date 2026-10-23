@@ -401,7 +401,7 @@ impl Engineer {
             return;
         };
         let state = session.state.clone();
-        let attach_snapshot = session.model.provider() != ModelProvider::BonoCloud;
+        let attach_snapshot = *session.model.provider() != ModelProvider::BonoCloud;
         let auto_session = *config.get().auto_session();
 
         // What the model writes goes straight to the synthesizer, and to the chat
