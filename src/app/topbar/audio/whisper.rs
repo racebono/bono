@@ -1,7 +1,7 @@
 use crate::{
     Download,
     app::topbar::{
-        audio::{SetupItem, SetupState},
+        audio::{RecordingStream, SetupItem, SetupState},
         setup_label, size_text,
     },
     arrstr,
@@ -17,7 +17,7 @@ use egui::Widget;
 use egui_extras::Column;
 use bono_i18n::t;
 use sdl3::{
-    audio::{AudioFormat, AudioRecordingCallback, AudioSpec, AudioStream, AudioStreamWithCallback},
+    audio::{AudioFormat, AudioRecordingCallback, AudioSpec, AudioStream},
     event::{Event, WindowEvent},
     get_error,
     sys::audio::{SDL_AudioStream, SDL_GetAudioStreamAvailable, SDL_GetAudioStreamData},
@@ -270,7 +270,7 @@ impl Whisper {
 
         let f = || {
             let (send, recv) = oneshot::channel();
-            let stream = device.open_recording_stream_with_callback(
+            let stream = RecordingStream::new(device.open_recording_stream_with_callback(
                 &RECORDING_SPEC,
                 Recorder {
                     send: Some(send),
@@ -278,7 +278,7 @@ impl Whisper {
                     remaining_buf: [0; 3],
                     remaining_count: 0,
                 },
-            )?;
+            )?);
             stream.resume()?;
             log::debug!("Started microphone recording");
 
@@ -466,7 +466,7 @@ fn talk(button: Option<&ConfigButton>, event: &Event, recording: bool) -> Talk {
 struct WhisperStream {
     recv: oneshot::Receiver<anyhow::Result<Vec<f32>>>,
     session: WhisperSession,
-    stream: AudioStreamWithCallback<Recorder>,
+    stream: RecordingStream<Recorder>,
 }
 
 impl WhisperStream {
@@ -485,7 +485,7 @@ impl WhisperSession {
     fn finish(
         mut self,
         recv: oneshot::Receiver<anyhow::Result<Vec<f32>>>,
-        mut stream: AudioStreamWithCallback<Recorder>,
+        mut stream: RecordingStream<Recorder>,
         config: Config,
     ) -> JoinHandle<anyhow::Result<Heard>> {
         if let Err(e) = stream.pause() {
