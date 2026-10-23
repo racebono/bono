@@ -82,6 +82,7 @@ pub struct Conversation {
     bearer_source: Option<Arc<dyn BearerSource>>,
     body: RequestBody,
     native_history: bool,
+    history_limits: Option<HistoryLimits>,
     /// The messages kept through a reset: the system prompt's
     kept: usize,
     timeout: Duration,
@@ -98,18 +99,40 @@ impl Model for Conversation {
         on_text: &'a mut (dyn FnMut(&str) + Send),
     ) -> BoxFuture<'a, anyhow::Result<Reply>> {
         Box::pin(async move {
+            let original = self.history_limits.map(|_| self.body.messages.clone());
             let mut turn = Turn {
                 start: self.body.messages.len(),
                 conversation: self,
                 keep: false,
+                original,
             };
-            let reply = turn
-                .conversation
-                .run_turn(text, &mut TextSink::new(on_text))
-                .await?;
-
+            let mut sink = TextSink::new(on_text);
+            if let Some(limits) = turn.conversation.history_limits {
+                turn.conversation.prepare_history(&text, limits.target)?;
+            }
+            let mut result = turn.conversation.run_turn(text.clone(), &mut sink).await;
+            // A limit may be reached within a tool loop, too. Roll that entire attempt back
+            // before retrying; never edit the signed history of a live tool loop.
+            for attempt in 0..2 {
+                if !result.as_ref().is_err_and(history_limit_error)
+                    || turn.conversation.history_limits.is_none()
+                {
+                    break;
+                }
+                turn.conversation.body.messages = turn.original.as_ref().unwrap().clone();
+                if attempt == 0 {
+                    turn.conversation.prepare_history(&text, 0.25)?;
+                } else {
+                    log::warn!(
+                        "Bono Cloud: resetting conversation after repeated history limit errors"
+                    );
+                    turn.conversation.reset();
+                }
+                result = turn.conversation.run_turn(text.clone(), &mut sink).await;
+            }
+            let reply = result?;
             turn.keep = reply.stop != StopReason::Refusal;
-            return Ok(reply);
+            Ok(reply)
         })
     }
 
@@ -155,6 +178,63 @@ impl Conversation {
     /// Supplies expiring credentials per request, including tool-call round trips.
     pub(super) fn set_bearer_source(&mut self, source: Arc<dyn BearerSource>) {
         self.bearer_source = Some(source);
+    }
+
+    /// Trim only between complete user turns. The system prefix and newest turn survive.
+    fn prepare_history(&mut self, question: &str, target: f64) -> anyhow::Result<()> {
+        let Some(limits) = self.history_limits else {
+            return Ok(());
+        };
+        let question_bytes = serde_json::to_vec(&serde_json::json!({
+            "role": "user", "content": question
+        }))?
+        .len()
+            + 1;
+        let size = |this: &Self| -> anyhow::Result<usize> {
+            Ok(serde_json::to_vec(&this.body)?.len() + question_bytes)
+        };
+        if target == limits.target
+            && size(self)? <= limits.max_bytes
+            && self.body.messages.len() < limits.max_messages
+        {
+            return Ok(());
+        }
+        let before = self.body.messages.len();
+        let starts: Vec<_> = self
+            .body
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message["role"] == "user" && message["content"].is_string())
+            .map(|(index, _)| index)
+            .collect();
+        let recent = starts.iter().rev().nth(3).copied().unwrap_or(self.kept);
+        for message in &mut self.body.messages[self.kept..recent] {
+            if message["role"] == "user" {
+                if let Some(text) = message["content"].as_str() {
+                    message["content"] = serde_json::Value::String(strip_snapshot(text));
+                }
+            }
+        }
+        while size(self)? > (limits.max_bytes as f64 * target) as usize
+            || self.body.messages.len() + 1 > (limits.max_messages as f64 * target) as usize
+        {
+            let next = self
+                .body
+                .messages
+                .iter()
+                .enumerate()
+                .skip(self.kept + 1)
+                .find(|(_, message)| message["role"] == "user" && message["content"].is_string())
+                .map(|(index, _)| index);
+            let Some(next) = next else { break };
+            self.body.messages.drain(self.kept..next);
+        }
+        log::info!(
+            "Bono Cloud: forgot {} older messages to stay within limits",
+            before - self.body.messages.len()
+        );
+        Ok(())
     }
 
     async fn run_turn(&mut self, text: String, sink: &mut TextSink<'_>) -> anyhow::Result<Reply> {
@@ -224,6 +304,7 @@ impl Conversation {
             }
 
             let tools = &self.tools;
+            let result_limit = self.history_limits.map(|limits| limits.max_bytes / 8);
             let results = join_all(calls.iter().map(|call| {
                 // The arguments are JSON text, empty for none
                 let input = match call.arguments.trim() {
@@ -234,13 +315,25 @@ impl Conversation {
                 let id = call.id.clone();
 
                 async move {
-                    let content = match handled {
+                    let mut content = match handled {
                         Ok(handled) => match handled.await {
                             Ok(content) => content,
                             Err(e) => format!("Error: {e:#}"),
                         },
                         Err(e) => format!("Error: the arguments aren't valid JSON: {e}"),
                     };
+                    if let Some(limit) = result_limit {
+                        if content.len() > limit {
+                            let mut end = limit;
+                            while !content.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            content.truncate(end);
+                            content.push_str(
+                                "\n[tool result truncated to stay within conversation limits]",
+                            );
+                        }
+                    }
                     serde_json::json!({
                         "role": "tool",
                         "tool_call_id": id,
@@ -329,12 +422,17 @@ struct Turn<'a> {
     conversation: &'a mut Conversation,
     start: usize,
     keep: bool,
+    original: Option<Vec<serde_json::Value>>,
 }
 
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
         if !self.keep {
-            self.conversation.body.messages.truncate(self.start);
+            if let Some(original) = self.original.take() {
+                self.conversation.body.messages = original;
+            } else {
+                self.conversation.body.messages.truncate(self.start);
+            }
         }
     }
 }
@@ -525,12 +623,16 @@ impl Response {
 pub struct ApiError {
     pub status: StatusCode,
     pub message: Option<String>,
+    pub code: Option<String>,
 }
 
 impl ApiError {
     async fn read(resp: reqwest::Response) -> Self {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        let code = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|body| body["error"]["code"].as_str().map(str::to_owned));
         // `{"error": {"message": ...}}`, or `{"error": "..."}`
         let message = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
@@ -548,7 +650,11 @@ impl ApiError {
             .or_else(|| {
                 Some(body).filter(|body| !body.trim().is_empty() && !body.trim().starts_with('<'))
             });
-        Self { status, message }
+        Self {
+            status,
+            message,
+            code,
+        }
     }
 }
 
@@ -564,6 +670,37 @@ impl Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
+/// Optional budgets for providers with a small request envelope.
+#[derive(Clone, Copy)]
+pub struct HistoryLimits {
+    pub max_bytes: usize,
+    pub max_messages: usize,
+    pub target: f64,
+}
+
+fn history_limit_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ApiError>().is_some_and(|error| {
+        error.status == StatusCode::PAYLOAD_TOO_LARGE
+            || (error.status == StatusCode::BAD_REQUEST
+                && error.code.as_deref() == Some("conversation_too_long"))
+    })
+}
+
+fn strip_snapshot(text: &str) -> String {
+    const BEGIN: &str = "[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]";
+    const END: &str = "[END UNTRUSTED TELEMETRY SNAPSHOT]";
+    let mut text = text.to_owned();
+    if let Some(start) = text.find(BEGIN) {
+        if let Some(end) = text[start + BEGIN.len()..].find(END) {
+            text.replace_range(
+                start..start + BEGIN.len() + end + END.len(),
+                "[telemetry snapshot omitted]",
+            );
+        }
+    }
+    text
+}
+
 pub struct ConversationBuilder {
     base_url: Option<String>,
     api_key: Option<String>,
@@ -574,6 +711,7 @@ pub struct ConversationBuilder {
     max_tokens: NonZeroU32,
     max_requests: NonZeroU32,
     timeout: Duration,
+    history_limits: Option<HistoryLimits>,
 }
 
 impl ConversationBuilder {
@@ -588,6 +726,7 @@ impl ConversationBuilder {
             max_tokens: NonZeroU32::new(16000).unwrap(),
             max_requests: NonZeroU32::new(16).unwrap(),
             timeout: Duration::from_mins(10),
+            history_limits: None,
         }
     }
 
@@ -660,7 +799,21 @@ impl ConversationBuilder {
         self
     }
 
+    pub fn history_limits(&mut self, limits: HistoryLimits) -> &mut Self {
+        self.history_limits = Some(limits);
+        self
+    }
+
     pub fn build(self, client: reqwest::Client) -> anyhow::Result<Conversation> {
+        if let Some(limits) = self.history_limits {
+            anyhow::ensure!(
+                limits.max_bytes > 0
+                    && limits.max_messages > 0
+                    && limits.target > 0.0
+                    && limits.target < 1.0,
+                "Invalid history limits"
+            );
+        }
         let base_url = base_url_or_default(self.base_url.as_deref());
         let headers = headers(self.api_key)?;
 
@@ -706,6 +859,7 @@ impl ConversationBuilder {
             headers,
             bearer_source: None,
             native_history: false,
+            history_limits: self.history_limits,
             kept: messages.len(),
             body: RequestBody {
                 model: self.model,
@@ -943,6 +1097,134 @@ mod tests {
         .await
         .expect("timed out")?;
         Ok((reply, pieces))
+    }
+
+    #[test]
+    fn trims_whole_turns_and_preserves_native_history() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = builder("http://localhost", &calls);
+        builder.history_limits(HistoryLimits {
+            max_bytes: 100_000,
+            max_messages: 12,
+            target: 0.5,
+        });
+        let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+        for index in 0..4 {
+            conversation.body.messages.extend([
+                json!({"role": "user", "content": format!("Question {index}")}),
+                json!({"role": "assistant", "tool_calls": [{"id": "call"}],
+                    "bono_content": [{"type": "thinking", "signature": "signed"}]}),
+                json!({"role": "tool", "tool_call_id": "call", "content": "result"}),
+                json!({"role": "assistant", "content": "answer"}),
+            ]);
+        }
+        let newest = conversation.body.messages[13..].to_vec();
+        conversation.prepare_history("Next?", 0.5).unwrap();
+        assert_eq!(conversation.body.messages[0]["role"], "system");
+        assert_eq!(&conversation.body.messages[1..], newest);
+        let stable = conversation.body.messages.clone();
+        conversation.prepare_history("Next?", 0.5).unwrap();
+        assert_eq!(conversation.body.messages, stable);
+    }
+
+    #[test]
+    fn strips_only_stale_snapshot_sections_on_byte_trim() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = builder("http://localhost", &calls);
+        builder.history_limits(HistoryLimits {
+            max_bytes: 10_000,
+            max_messages: 100,
+            target: 0.5,
+        });
+        let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+        for index in 0..6 {
+            conversation.body.messages.push(json!({"role": "user", "content": format!(
+                "Question {index} [BEGIN UNTRUSTED TELEMETRY SNAPSHOT]{}[END UNTRUSTED TELEMETRY SNAPSHOT] suffix",
+                "x".repeat(if index < 2 { 6000 } else { 10 }))}));
+            conversation
+                .body
+                .messages
+                .push(json!({"role": "assistant", "content": "answer"}));
+        }
+        let recent = conversation.body.messages[5..].to_vec();
+        conversation.prepare_history("Next?", 0.5).unwrap();
+        assert_eq!(
+            conversation.body.messages[1]["content"],
+            "Question 0 [telemetry snapshot omitted] suffix"
+        );
+        assert_eq!(&conversation.body.messages[5..], recent);
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_restores_history_and_unrelated_errors_are_not_retried() {
+        let limit = || (413, json!({"error": {"message": "too large"}}).to_string());
+        let (url, requests) = mock(vec![
+            limit(),
+            limit(),
+            limit(),
+            (
+                400,
+                json!({"error": {"code": "invalid_request", "message": "bad"}}).to_string(),
+            ),
+        ])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = builder(&url, &calls);
+        builder.history_limits(HistoryLimits {
+            max_bytes: 120_000,
+            max_messages: 100,
+            target: 0.5,
+        });
+        let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+        conversation.body.messages.extend([
+            json!({"role": "user", "content": "Old question"}),
+            json!({"role": "assistant", "content": "Old answer"}),
+        ]);
+        let original = conversation.body.messages.clone();
+        assert!(send_streaming(&mut conversation, "Next?").await.is_err());
+        assert_eq!(conversation.body.messages, original);
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        assert!(send_streaming(&mut conversation, "Next?").await.is_err());
+        assert_eq!(conversation.body.messages, original);
+        assert_eq!(requests.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn recovers_from_limit_errors_and_resets_as_a_last_resort() {
+        let (url, requests) = mock(vec![
+            (413, json!({"error": {"message": "too large"}}).to_string()),
+            (
+                400,
+                json!({"error": {"code": "conversation_too_long", "message": "too long"}})
+                    .to_string(),
+            ),
+            stream(vec![text("Answer"), finish("stop")]),
+        ])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = builder(&url, &calls);
+        builder.history_limits(HistoryLimits {
+            max_bytes: 120_000,
+            max_messages: 100,
+            target: 0.5,
+        });
+        let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+        conversation.body.messages.extend([
+            json!({"role": "user", "content": "Old question"}),
+            json!({"role": "assistant", "content": "Old answer"}),
+        ]);
+        assert_eq!(
+            send_streaming(&mut conversation, "Next?")
+                .await
+                .unwrap()
+                .0
+                .text,
+            "Answer"
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].1["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(requests[2].1["messages"][1]["content"], "Next?");
     }
 
     #[tokio::test]
