@@ -23,7 +23,7 @@ use std::{
     fmt::Write,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
+        Arc, Mutex, MutexGuard, PoisonError, TryLockError,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
     time::{Duration, Instant, SystemTime},
@@ -218,12 +218,17 @@ impl Engineer {
     async fn run(&self, input: EngineerInput) -> anyhow::Result<String> {
         let (out, warm) = self.query(input).await?;
 
-        // An urgent first question never waits for the one-off history scan: it's started after
+        // Start the one-off scan only after the first quick snapshot has been read.
         if warm && !self.inner.warming.swap(true, AtomicOrdering::Relaxed) {
             let engineer = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = engineer.warm().await {
-                    log::warn!("Error warming the race engineer's history: {e:#}");
+                match engineer.warm().await {
+                    Ok(result) => log::debug!("Engineer history warm-up: {result}"),
+                    Err(e) => {
+                        log::warn!("Error warming the race engineer's history: {e:#}");
+                        // A transient database failure must not disable warm-up for the session.
+                        engineer.inner.warming.store(false, AtomicOrdering::Relaxed);
+                    }
                 }
             });
         }
@@ -360,7 +365,13 @@ fn run(
     match args.command {
         Command::Quick => {
             cmd_quick(&ctx, &mut out)?;
-            warm = lock(&inner.history).last_id == 0;
+            // A busy cache is already being built by another command. Never wait for it
+            // merely to decide whether to schedule background work.
+            warm = match inner.history.try_lock() {
+                Ok(history) => history.last_id == 0,
+                Err(TryLockError::Poisoned(e)) => e.into_inner().last_id == 0,
+                Err(TryLockError::WouldBlock) => false,
+            };
         }
         Command::Warm => cmd_warm(&ctx, &mut out)?,
         Command::Status => cmd_status(&ctx, &mut out)?,
@@ -782,9 +793,18 @@ impl<'a> Ctx<'a> {
 
     /// Per-lap aggregates for the current session, brought up to date once per command.
     fn history(&self) -> anyhow::Result<MutexGuard<'a, History>> {
+        let waiting = Instant::now();
         let mut history = lock(&self.inner.history);
+        let waited = waiting.elapsed();
         if !self.history_updated.get() {
+            let started = Instant::now();
             history.update(self.conn, &self.player_filter)?;
+            log::debug!(
+                "Engineer history: waited {:.3}s for cache, scanned {} rows in {:.3}s",
+                waited.as_secs_f64(),
+                history.scanned,
+                started.elapsed().as_secs_f64()
+            );
             self.history_updated.set(true);
         }
         Ok(history)
@@ -2728,18 +2748,7 @@ type Json = serde_json::Value;
 /// The track description saved next to the database, if there's one for this session's track:
 /// its positions moved to line up with the car's laps (see `calibrate`).
 fn load_track(ctx: &Ctx, sc: &Scoring) -> Option<Json> {
-    let path = ctx.inner.path.parent()?.join(crate::track::TRACK_FILE);
-    let mut track = serde_json::from_slice::<Json>(&std::fs::read(path).ok()?).ok()?;
-    if !track.is_object() {
-        return None;
-    }
-    let name = sc.session.as_ref().and_then(|s| s.text("track"));
-    match (track.get("source_track").and_then(Json::as_str), name) {
-        // Left from another track
-        (Some(source), Some(name)) if !source.is_empty() && source != name => return None,
-        _ => {}
-    }
-
+    let mut track = read_track(ctx, sc)?;
     if let Some(length) = track_length(&track, sc).filter(|l| *l > 0.0)
         && let Some(calibration) = calibration(ctx, sc, &track, length)
     {
@@ -2752,6 +2761,23 @@ fn load_track(ctx: &Ctx, sc: &Scoring) -> Option<Json> {
             "lap": calibration.lap,
         });
     }
+    Some(track)
+}
+
+/// Read the description without computing a calibration (which needs lap history).
+fn read_track(ctx: &Ctx, sc: &Scoring) -> Option<Json> {
+    let path = ctx.inner.path.parent()?.join(crate::track::TRACK_FILE);
+    let track = serde_json::from_slice::<Json>(&std::fs::read(path).ok()?).ok()?;
+    if !track.is_object() {
+        return None;
+    }
+    let name = sc.session.as_ref().and_then(|s| s.text("track"));
+    match (track.get("source_track").and_then(Json::as_str), name) {
+        // Left from another track
+        (Some(source), Some(name)) if !source.is_empty() && source != name => return None,
+        _ => {}
+    }
+
     Some(track)
 }
 
@@ -3086,9 +3112,23 @@ fn pit_class(vehicle_class: Option<&str>) -> Option<&'static str> {
 
 /// Where the player is on the lap, from the track description: for quick.
 fn track_line(ctx: &Ctx, sc: &Scoring) -> Option<String> {
-    let track = load_track(ctx, sc)?;
+    // Quick must stay independent of history, including on tracks needing calibration.
+    let mut track = read_track(ctx, sc)?;
     let distance = ctx.player.f("lap_distance")?;
     let length = track_length(&track, sc).filter(|l| *l > 0.0)?;
+    // Reuse a calibration already computed by a history command, but never calculate one
+    // here. The shift describes track geometry and remains useful between laps/sessions.
+    let name = track
+        .get("source_track")
+        .or_else(|| track.get("name"))
+        .and_then(Json::as_str)
+        .unwrap_or_default();
+    if let Ok(cached) = ctx.inner.calibration.try_lock()
+        && let Some(((cached_name, _, _), Some(calibration))) = &*cached
+        && cached_name == name
+    {
+        shift_track(&mut track, calibration.shift / length);
+    }
     let (place, ahead) = track_position(&track, distance.rem_euclid(length) / length, length);
 
     let mut parts = vec![format!(
@@ -4704,6 +4744,30 @@ mod tests {
         assert!(track.contains("T5 1810 m-1890 m, apex 1850 m"), "{track}");
         assert!(track.contains("PIT LANE entry 1750 m"), "{track}");
 
+        // Quick reuses the correction without updating or waiting for history.
+        let conn = Connection::open(engineer.inner.path.clone()).unwrap();
+        let ctx = Ctx::new(&conn, &engineer.inner, None).unwrap();
+        let sc = ctx.scoring().unwrap();
+        let expected = load_track(&ctx, sc).unwrap();
+        let history = lock(&engineer.inner.history);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            engineer.query(EngineerInput::command(Command::Quick)),
+        )
+        .await;
+        drop(history);
+        let (quick, _) = result.expect("quick waited for history").unwrap();
+        let length = track_length(&expected, sc).unwrap();
+        let distance = ctx.player.f("lap_distance").unwrap();
+        let (_, ahead) = track_position(&expected, distance.rem_euclid(length) / length, length);
+        assert!(!ahead.is_empty());
+        for (text, metres) in ahead {
+            assert!(
+                quick.contains(&format!("{text} in {metres:.0} m")),
+                "{quick}"
+            );
+        }
+
         // The corners are the same ones
         let corners = run(&engineer, serde_json::json!({"command": "corners"})).await;
         assert!(corners.contains("track data"), "{corners}");
@@ -4749,6 +4813,45 @@ mod tests {
         );
         assert!(out.contains("SESSION race | green"), "{out}");
         assert!(out.contains("ALERTS (act now) none"), "{out}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quick_does_not_wait_for_history_or_track_calibration() {
+        // Exercise both the direct warm-up check and the indirect track-description path.
+        for (_dir, engineer) in [race(), shifted_ring()] {
+            let history = lock(&engineer.inner.history);
+            let calibration = lock(&engineer.inner.calibration);
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                engineer.query(EngineerInput::command(Command::Quick)),
+            )
+            .await;
+            // Release before asserting, so a regression cannot leave a DB worker blocked.
+            drop(calibration);
+            drop(history);
+            let (out, warm) = result.expect("quick waited for the history cache").unwrap();
+            assert!(out.starts_with("QUICK"), "{out}");
+            assert!(!warm, "a busy history cache must not schedule another scan");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quick_leaves_history_cold_until_background_warm_up() {
+        let (_dir, engineer) = shifted_ring();
+        let (out, warm) = engineer
+            .query(EngineerInput::command(Command::Quick))
+            .await
+            .unwrap();
+        assert!(out.contains("TRACK"), "{out}");
+        assert!(warm);
+        assert_eq!(lock(&engineer.inner.history).last_id, 0);
+
+        engineer.warm().await.unwrap();
+        let (_, warm) = engineer
+            .query(EngineerInput::command(Command::Quick))
+            .await
+            .unwrap();
+        assert!(!warm);
     }
 
     #[tokio::test(flavor = "multi_thread")]
