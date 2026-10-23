@@ -86,10 +86,7 @@ impl Process {
             .spawn()
             .with_context(|| format!("Error starting '{}'", exe.display()))?;
         let stdin = child.stdin.take().context("The phonemizer has no stdin")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("The phonemizer has no stdout")?;
+        let stdout = child.stdout.take().context("The phonemizer has no stdout")?;
         log::info!("Started the phonemizer ({})", exe.display());
 
         Ok(Self {

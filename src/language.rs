@@ -146,14 +146,8 @@ mod tests {
             detector.update(rt, &voices);
         }
 
-        assert_eq!(
-            detector.detect("How are the tyres looking?"),
-            Some(arrstr!("en"))
-        );
-        assert_eq!(
-            detector.detect("¿Cuánto combustible me queda?"),
-            Some(arrstr!("es"))
-        );
+        assert_eq!(detector.detect("How are the tyres looking?"), Some(arrstr!("en")));
+        assert_eq!(detector.detect("¿Cuánto combustible me queda?"), Some(arrstr!("es")));
         assert_eq!(detector.detect("cuándo paro"), Some(arrstr!("es")));
 
         // Nothing to choose between with a single voice

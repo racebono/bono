@@ -3,8 +3,8 @@
 //! `forecast`. The columns come from the headers' column lists (see `build.rs`).
 
 use crate::sys::{
-    bono_car_state, bono_forecast_point, bono_session_info, bono_standing, bono_telemetry,
-    bono_wheel_telemetry,
+    bono_car_state, bono_forecast_point, bono_session_info, bono_standing,
+    bono_telemetry, bono_wheel_telemetry,
 };
 use rusqlite::{Connection, PrepFlags, Statement};
 use std::collections::HashMap;
@@ -117,10 +117,7 @@ pub fn clear_tables(conn: &Connection) -> rusqlite::Result<()> {
     // Checked at the commit instead, once they're all empty, whatever order they're in. Ends with it
     tx.pragma_update(None, "defer_foreign_keys", true)?;
     for table in tables {
-        tx.execute(
-            &format!("DELETE FROM \"{}\"", table.replace('"', "\"\"")),
-            [],
-        )?;
+        tx.execute(&format!("DELETE FROM \"{}\"", table.replace('"', "\"\"")), [])?;
     }
     tx.commit()?;
 
@@ -203,10 +200,8 @@ impl<'conn> TelemetryWriter<'conn> {
         }
 
         self.insert_state.raw_bind_parameter(1, telemetry_id)?;
-        self.insert_state
-            .raw_bind_parameter(2, &telemetry.vehicle_id)?;
-        self.insert_state
-            .raw_bind_parameter(3, &telemetry.session_time)?;
+        self.insert_state.raw_bind_parameter(2, &telemetry.vehicle_id)?;
+        self.insert_state.raw_bind_parameter(3, &telemetry.session_time)?;
         telemetry.state.bind(&mut self.insert_state, 4)?;
         self.insert_state.raw_execute()?;
         self.last_states.insert(vehicle, (telemetry.state, time));
@@ -343,17 +338,11 @@ mod tests {
 
         let start = Instant::now();
         clear_tables(&conn).unwrap();
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "took {:?}",
-            start.elapsed()
-        );
+        assert!(start.elapsed() < Duration::from_secs(2), "took {:?}", start.elapsed());
 
         for table in ["telemetry", "telemetry_wheel", "car_state"] {
             let count = conn
-                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                    row.get::<_, i64>(0)
-                })
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get::<_, i64>(0))
                 .unwrap();
             assert_eq!(count, 0, "{table}");
         }
