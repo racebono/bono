@@ -82,6 +82,13 @@ impl AppImpl {
 
         return result;
     }
+
+    fn app_quit(&self) {
+        let Some(token) = MainThreadToken::get() else {
+            return;
+        };
+        self.app.get(token).borrow_mut().quit(self.rt.handle());
+    }
 }
 
 fn setup_logger() -> Result<(), fern::InitError> {

@@ -194,6 +194,20 @@ pub(super) trait BearerSource: Send + Sync {
     fn token<'a>(&'a self, rejected: Option<&'a str>) -> BoxFuture<'a, anyhow::Result<String>>;
 }
 
+/// A session lease the requests draw on, sent as their `session_id` (Bono Cloud's): the server
+/// answers `409 invalid_session` once it's no longer valid.
+pub(super) trait LeaseSource: Send + Sync {
+    /// The lease for the next request (`None`: it's sent without one), or another in place of
+    /// `rejected`, which the server said is no longer valid.
+    fn lease<'a>(
+        &'a self,
+        rejected: Option<&'a str>,
+    ) -> BoxFuture<'a, anyhow::Result<Option<String>>>;
+}
+
+/// The longest `Retry-After` waited for: past it, the request is given up on.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
+
 /// A conversation with Claude.
 pub struct Conversation {
     client: reqwest::Client,
@@ -201,6 +215,7 @@ pub struct Conversation {
     body: RequestBody,
     headers: HeaderMap,
     bearer_source: Option<Arc<dyn BearerSource>>,
+    lease_source: Option<Arc<dyn LeaseSource>>,
     timeout: Duration,
     max_retries: u32,
     max_requests: NonZeroU32,
@@ -418,13 +433,25 @@ impl Conversation {
 
         let mut attempt = 0;
         let mut rejected = None::<String>;
+        // The lease the server said is no longer valid, until a new one is asked for, and whether
+        // one was (once per request)
+        let mut invalid_lease = None::<String>;
+        let mut released = false;
         loop {
             sink.start_response();
             let bearer = match &self.bearer_source {
                 Some(source) => Some(source.token(rejected.as_deref()).await?),
                 None => None,
             };
-            let resp = match self.request(bearer.as_deref()).send().await {
+            let lease = match &self.lease_source {
+                Some(source) => source.lease(invalid_lease.take().as_deref()).await?,
+                None => None,
+            };
+            let resp = match self
+                .request(bearer.as_deref(), lease.as_deref())
+                .send()
+                .await
+            {
                 Ok(resp) => resp,
                 // The request may never have reached the API: worth another try
                 Err(e)
@@ -483,7 +510,23 @@ impl Conversation {
             let retry_after = resp.headers().get(RETRY_AFTER).and_then(parse_retry_after);
             let error = ApiError::read(resp).await;
 
-            if !retryable || attempt >= self.max_retries {
+            // The lease ended, expired, or its week reset: a new one (or none), once, for the
+            // same request
+            if status == StatusCode::CONFLICT && error.code.as_deref() == Some("invalid_session") {
+                if !released && let Some(lease) = lease {
+                    log::info!("Cloud session lease {lease} is no longer valid: starting another");
+                    invalid_lease = Some(lease);
+                    released = true;
+                    continue;
+                }
+                return Err(error.into());
+            }
+
+            // A wait that long would hold the pilot's question up: given up on instead
+            if !retryable
+                || attempt >= self.max_retries
+                || retry_after.is_some_and(|wait| wait > MAX_RETRY_WAIT)
+            {
                 return Err(error.into());
             }
 
@@ -493,13 +536,16 @@ impl Conversation {
         }
     }
 
-    fn request(&self, bearer: Option<&str>) -> RequestBuilder {
+    fn request(&self, bearer: Option<&str>, lease: Option<&str>) -> RequestBuilder {
         let request = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
             .headers(self.headers.clone())
             .timeout(self.timeout)
-            .json(&self.body);
+            .json(&LeasedRequest {
+                body: &self.body,
+                session_id: lease,
+            });
         return match bearer {
             Some(bearer) => request.bearer_auth(bearer),
             None => request,
@@ -530,12 +576,14 @@ pub struct ApiError {
     pub status: StatusCode,
     /// e.g. `invalid_request_error`, `authentication_error`, `overloaded_error`
     pub r#type: Option<String>,
+    /// What exactly went wrong, from APIs that say (Bono Cloud's), e.g. `invalid_session`
+    pub code: Option<String>,
     pub message: Option<String>,
     pub request_id: Option<String>,
 }
 
 impl ApiError {
-    async fn read(resp: reqwest::Response) -> Self {
+    pub(super) async fn read(resp: reqwest::Response) -> Self {
         const REQUEST_ID: HeaderName = HeaderName::from_static("request-id");
 
         #[derive(Deserialize)]
@@ -546,6 +594,8 @@ impl ApiError {
         #[derive(Deserialize)]
         struct Detail {
             r#type: Option<String>,
+            #[serde(default)]
+            code: Option<String>,
             message: Option<String>,
         }
 
@@ -557,14 +607,19 @@ impl ApiError {
             .map(str::to_owned);
 
         let body = resp.text().await.unwrap_or_default();
-        let (r#type, message) = match serde_json::from_str::<Body>(&body) {
-            Ok(body) => (body.error.r#type, body.error.message),
-            Err(_) => (None, Some(body).filter(|body| !body.trim().is_empty())),
+        let (r#type, code, message) = match serde_json::from_str::<Body>(&body) {
+            Ok(body) => (body.error.r#type, body.error.code, body.error.message),
+            Err(_) => (
+                None,
+                None,
+                Some(body).filter(|body| !body.trim().is_empty()),
+            ),
         };
 
         Self {
             status,
             r#type,
+            code,
             message,
             request_id,
         }
@@ -590,6 +645,7 @@ impl ApiError {
         Self {
             status,
             r#type,
+            code: error["code"].as_str().map(str::to_owned),
             message: error["message"].as_str().map(str::to_owned),
             request_id: None,
         }
@@ -632,6 +688,7 @@ pub struct ConversationBuilder {
     max_retries: u32,
     timeout: Duration,
     bearer_source: Option<Arc<dyn BearerSource>>,
+    lease_source: Option<Arc<dyn LeaseSource>>,
     /// The model and its settings are left out of requests, for the server to choose
     server_settings: bool,
 }
@@ -655,6 +712,7 @@ impl ConversationBuilder {
             max_retries: 2,
             timeout: Duration::from_mins(10),
             bearer_source: None,
+            lease_source: None,
             server_settings: false,
         }
     }
@@ -703,6 +761,13 @@ impl ConversationBuilder {
     #[inline]
     pub(super) fn bearer_source(&mut self, source: Arc<dyn BearerSource>) -> &mut Self {
         self.bearer_source = Some(source);
+        self
+    }
+
+    /// Asks `source` for the lease to send each request with (see [`LeaseSource`]).
+    #[inline]
+    pub(super) fn lease_source(&mut self, source: Arc<dyn LeaseSource>) -> &mut Self {
+        self.lease_source = Some(source);
         self
     }
 
@@ -911,6 +976,7 @@ impl ConversationBuilder {
             },
             headers,
             bearer_source: self.bearer_source,
+            lease_source: self.lease_source,
             timeout: self.timeout,
             max_retries: self.max_retries,
             max_requests: self.max_requests,
@@ -918,6 +984,15 @@ impl ConversationBuilder {
             usage: BTreeMap::new(),
         });
     }
+}
+
+/// A request as it's sent: the body, with the lease it draws on, if any.
+#[derive(Serialize)]
+struct LeasedRequest<'a> {
+    #[serde(flatten)]
+    body: &'a RequestBody,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]

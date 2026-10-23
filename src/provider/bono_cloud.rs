@@ -6,6 +6,10 @@
 //! effort (`output_config`), `max_tokens` and the cache breakpoints' `ttl`: requests leave those
 //! out, and the website chooses them. The website ignores them when a request does send them
 //! (e.g. one made by hand), so they can't be changed from this side. There's nothing to set up.
+//!
+//! Each game session's requests draw on a [`Lease`]: a share of the account's weekly allowance
+//! reserved for it up front (`/v1/sessions`). Requests without one count against a rolling
+//! 24-hour ceiling instead, a fraction of the week, which a long race can run into midway.
 
 use super::{Model, ModelOption, Reply, Tools, Usage, claude};
 use crate::{
@@ -16,10 +20,27 @@ use anyhow::Context;
 use bono_i18n::t;
 use futures::future::BoxFuture;
 use reqwest::StatusCode;
-use std::{collections::BTreeMap, sync::Arc};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 /// Where the API is, on the account's website
 const PATH: &str = "/api/cloud";
+
+/// How long requests go without a lease after one failed to start, before another is tried
+const LEASE_RETRY: Duration = Duration::from_secs(60);
+
+/// How long the website may take to answer anything but a conversation's request
+const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Turns had with Bono Cloud since the app started, answered or not
+static TURNS: AtomicU64 = AtomicU64::new(0);
 
 /// The models Bono Cloud offers `account`.
 pub async fn models(
@@ -69,22 +90,423 @@ pub async fn authorized(account: &Account, client: &reqwest::Client) -> anyhow::
     }
 }
 
-/// A conversation with Bono Cloud, as `account`.
-pub struct Conversation {
-    inner: claude::Conversation,
+/// What an account may still use of Bono Cloud, as the website says (`/v1/entitlement`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Entitlement {
+    /// `none` without access
+    pub status: String,
+    #[serde(default)]
+    pub week: Option<Week>,
+    /// How long the rest of the week's allowance lasts, roughly, in hours of driving
+    #[serde(default)]
+    pub estimated_hours_left: Option<f64>,
 }
 
-struct Bearer(Account);
+/// The week's allowance, in micro-USD.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Week {
+    pub used: i64,
+    pub budget: i64,
+    /// Held for sessions' leases
+    pub reserved: i64,
+    /// When the allowance starts over (RFC 3339)
+    #[serde(default)]
+    pub resets_at: Option<String>,
+}
 
-impl claude::BearerSource for Bearer {
+/// What `account` may still use of Bono Cloud.
+pub async fn entitlement(
+    account: Option<&Account>,
+    client: &reqwest::Client,
+) -> anyhow::Result<Entitlement> {
+    let account = signed_in(account)?;
+    let url = format!("{}/v1/entitlement", base_url(account));
+    let resp = call(account, |token| {
+        client.get(&url).bearer_auth(token).timeout(TIMEOUT).send()
+    })
+    .await
+    .map_err(readable_error)?;
+    resp.json()
+        .await
+        .context("Bono Cloud sent an allowance that couldn't be read")
+}
+
+/// How many turns have been had with Bono Cloud: each changes what's left of the allowance.
+#[inline]
+pub fn turns() -> u64 {
+    TURNS.load(Ordering::Relaxed)
+}
+
+/// Sends the request `send` makes with the account's token, and once more with a new one if the
+/// website rejects it. A response that isn't a success is an error ([`claude::ApiError`]).
+async fn call<F>(account: &Account, send: impl Fn(&str) -> F) -> anyhow::Result<reqwest::Response>
+where
+    F: Future<Output = reqwest::Result<reqwest::Response>>,
+{
+    let token = access_token(account).await?;
+    let mut resp = send(&token)
+        .await
+        .context(t!("provider.bono_cloud_unreachable"))?;
+    if resp.status() == StatusCode::UNAUTHORIZED {
+        let token = refresh_token(account, &token).await?;
+        resp = send(&token)
+            .await
+            .context(t!("provider.bono_cloud_unreachable"))?;
+    }
+    if !resp.status().is_success() {
+        return Err(claude::ApiError::read(resp).await.into());
+    }
+    Ok(resp)
+}
+
+/// The game session a conversation is about, for its [`Lease`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameSession {
+    /// Tells it apart from the others: its track, type and number
+    pub key: String,
+    /// The app's identifier for the simulator, e.g. `lmu`
+    pub sim: &'static str,
+    pub session_type: SessionType,
+    /// How long it's expected to last: the lease reserves the allowance for as long
+    pub expected_minutes: u32,
+}
+
+/// A session's type, as leases know them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionType {
+    Practice,
+    Qualifying,
+    Race,
+}
+
+impl SessionType {
+    /// The type the simulators call `session_type` (`test`, `practice`, `qualifying`, `warmup`,
+    /// `race`): any but qualifying and race is practice.
+    pub fn from_sim(session_type: &str) -> Self {
+        match session_type {
+            "qualifying" => Self::Qualifying,
+            "race" => Self::Race,
+            _ => Self::Practice,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Practice => "practice",
+            Self::Qualifying => "qualifying",
+            Self::Race => "race",
+        }
+    }
+
+    /// How long a session of the type lasts, when the simulator doesn't say. Too long only
+    /// reserves more: what's left is given back once the lease ends
+    fn default_minutes(self) -> u32 {
+        match self {
+            Self::Practice => 60,
+            Self::Qualifying => 30,
+            Self::Race => 120,
+        }
+    }
+}
+
+impl GameSession {
+    /// The session `key` of `sim`, of the simulator's `session_type`, scheduled to end
+    /// `scheduled` seconds in, if the simulator says (timed sessions).
+    pub fn new(key: String, sim: &'static str, session_type: &str, scheduled: Option<f64>) -> Self {
+        /// The most a lease may be asked for, in minutes
+        const MAX_MINUTES: f64 = 1440.0;
+
+        let session_type = SessionType::from_sim(session_type);
+        let expected_minutes = scheduled
+            .map(|seconds| (seconds / 60.0).ceil())
+            .filter(|minutes| minutes.is_finite() && *minutes > 0.0)
+            .map(|minutes| minutes.clamp(1.0, MAX_MINUTES))
+            .map_or(session_type.default_minutes(), |minutes| minutes as u32);
+        Self {
+            key,
+            sim,
+            session_type,
+            expected_minutes,
+        }
+    }
+}
+
+/// A conversation's Cloud session lease: a share of the week's allowance the website reserves for
+/// one game session, which its requests draw on (sent as their `session_id`) instead of the daily
+/// ceiling. Started before the session's first request, and ended when the session changes, the
+/// conversation starts over, or it's let go of. One never ended expires on its own, and gives
+/// back what it held then.
+///
+/// Clones share the lease: ending any ends it.
+#[derive(Clone)]
+pub struct Lease(Arc<LeaseKeeper>);
+
+struct LeaseKeeper {
+    account: Account,
+    client: reqwest::Client,
+    base_url: String,
+    /// Tells this conversation's `client_session_id`s from any other's: the website answers one
+    /// it's seen before with the same lease, even once it's ended
+    nonce: u64,
+    state: Mutex<LeaseState>,
+}
+
+#[derive(Default)]
+struct LeaseState {
+    game: Option<GameSession>,
+    /// The lease's id, once it's started
+    id: Option<String>,
+    /// How many leases were asked for, numbering the next `client_session_id`
+    started: u64,
+    /// After one failed to start, no other is tried before then
+    retry_at: Option<Instant>,
+    /// The token the last request was sent with: once the account signs out, the lease is
+    /// ended with it
+    token: Option<String>,
+}
+
+/// What the website answers a lease with.
+#[derive(Deserialize)]
+struct LeaseBody {
+    id: String,
+}
+
+impl Lease {
+    fn new(account: Account, client: reqwest::Client) -> Self {
+        Self(Arc::new(LeaseKeeper {
+            base_url: base_url(&account),
+            account,
+            client,
+            nonce: rand::random(),
+            state: Mutex::default(),
+        }))
+    }
+
+    fn state(&self) -> MutexGuard<'_, LeaseState> {
+        self.0.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The game session the requests are for now: another one ends the lease, and the next
+    /// request starts one for it.
+    fn set_game(&self, game: GameSession) {
+        let ended = {
+            let mut state = self.state();
+            let same = state.game.as_ref().is_some_and(|g| g.key == game.key);
+            state.game = Some(game);
+            match same {
+                true => None,
+                false => {
+                    state.retry_at = None;
+                    state.id.take()
+                }
+            }
+        };
+        if let Some(id) = ended {
+            self.end_in_background(id);
+        }
+    }
+
+    /// Ends the lease, if there's one, without waiting for the website: the next request starts
+    /// another.
+    pub fn end(&self) {
+        let ended = {
+            let mut state = self.state();
+            state.started += 1;
+            state.retry_at = None;
+            state.id.take()
+        };
+        if let Some(id) = ended {
+            self.end_in_background(id);
+        }
+    }
+
+    /// Ends the lease, if there's one, and waits for the website to say so (e.g. as the app
+    /// quits, when nothing would be left to wait for it).
+    pub async fn end_and_wait(&self) {
+        let ended = {
+            let mut state = self.state();
+            state.started += 1;
+            state.id.take()
+        };
+        if let Some(id) = ended {
+            self.clone().end_lease(id).await;
+        }
+    }
+
+    fn end_in_background(&self, id: String) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(self.clone().end_lease(id));
+            }
+            Err(_) => log::debug!("Not ending Cloud session lease {id}: no runtime available"),
+        }
+    }
+
+    async fn end_lease(self, id: String) {
+        let keeper = &self.0;
+        let url = format!("{}/v1/sessions/{id}/end", keeper.base_url);
+        let send = |token: &str| {
+            keeper
+                .client
+                .post(&url)
+                .bearer_auth(token)
+                .timeout(TIMEOUT)
+                .send()
+        };
+        let result = match keeper.account.status() {
+            Status::SignedIn(_) => call(&keeper.account, send).await.map(drop),
+            // Signed out since: with the token it was used with, if it's still good
+            Status::SignedOut => {
+                let token = self.state().token.clone();
+                match token {
+                    Some(token) => match send(&token).await {
+                        Ok(resp) if resp.status().is_success() => Ok(()),
+                        Ok(resp) => Err(claude::ApiError::read(resp).await.into()),
+                        Err(e) => Err(e.into()),
+                    },
+                    None => Err(anyhow::anyhow!("signed out")),
+                }
+            }
+        };
+        match result {
+            Ok(()) => log::info!("Ended Cloud session lease {id}"),
+            Err(e) => {
+                log::warn!("Couldn't end Cloud session lease {id} (it expires on its own): {e:#}")
+            }
+        }
+    }
+
+    /// Asks the website for a lease for `game`.
+    async fn start(&self, game: &GameSession, client_session_id: &str) -> anyhow::Result<String> {
+        #[derive(Serialize)]
+        struct NewLease<'a> {
+            client_session_id: &'a str,
+            sim: &'a str,
+            session_type: &'static str,
+            expected_minutes: u32,
+        }
+
+        let keeper = &self.0;
+        let url = format!("{}/v1/sessions", keeper.base_url);
+        let body = NewLease {
+            client_session_id,
+            sim: game.sim,
+            session_type: game.session_type.as_str(),
+            expected_minutes: game.expected_minutes,
+        };
+        let resp = call(&keeper.account, |token| {
+            keeper
+                .client
+                .post(&url)
+                .bearer_auth(token)
+                .timeout(TIMEOUT)
+                .json(&body)
+                .send()
+        })
+        .await?;
+        let lease = resp
+            .json::<LeaseBody>()
+            .await
+            .context("Bono Cloud sent a session lease that couldn't be read")?;
+        Ok(lease.id)
+    }
+}
+
+/// The `client_session_id` of the `count`th lease asked for the game session `key`: at most 128
+/// characters, the key (cut short if need be) last.
+fn client_session_id(nonce: u64, count: u64, key: &str) -> String {
+    let mut id = format!("{nonce:016x}-{count}-{key}");
+    if let Some((end, _)) = id.char_indices().nth(128) {
+        id.truncate(end);
+    }
+    id
+}
+
+impl claude::BearerSource for Lease {
     fn token<'a>(&'a self, rejected: Option<&'a str>) -> BoxFuture<'a, anyhow::Result<String>> {
         Box::pin(async move {
-            match rejected {
-                Some(token) => refresh_token(&self.0, token).await,
-                None => access_token(&self.0).await,
+            let account = &self.0.account;
+            let token = match rejected {
+                Some(token) => refresh_token(account, token).await,
+                None => access_token(account).await,
+            }?;
+            self.state().token = Some(token.clone());
+            Ok(token)
+        })
+    }
+}
+
+impl claude::LeaseSource for Lease {
+    fn lease<'a>(
+        &'a self,
+        rejected: Option<&'a str>,
+    ) -> BoxFuture<'a, anyhow::Result<Option<String>>> {
+        Box::pin(async move {
+            let (game, client_session_id, generation) = {
+                let mut state = self.state();
+                if rejected.is_some() && state.id.as_deref() == rejected {
+                    state.id = None;
+                }
+                let Some(game) = state.game.clone() else {
+                    return Ok(None);
+                };
+                if let Some(id) = &state.id {
+                    return Ok(Some(id.clone()));
+                }
+                if state.retry_at.is_some_and(|at| Instant::now() < at) {
+                    return Ok(None);
+                }
+                state.started += 1;
+                let id = client_session_id(self.0.nonce, state.started, &game.key);
+                (game, id, state.started)
+            };
+
+            match self.start(&game, &client_session_id).await {
+                Ok(id) => {
+                    let mut state = self.state();
+                    let current = state.game.as_ref().is_some_and(|g| g.key == game.key);
+                    if current && state.started == generation && state.id.is_none() {
+                        log::info!(
+                            "Started Cloud session lease {id} for {} ({} minutes)",
+                            game.key,
+                            game.expected_minutes
+                        );
+                        state.id = Some(id.clone());
+                        return Ok(Some(id));
+                    }
+                    // The session changed meanwhile: the lease isn't this one's
+                    drop(state);
+                    self.end_in_background(id);
+                    Ok(None)
+                }
+                Err(e) if no_lease_allowed(&e) => Err(readable_error(e)),
+                Err(e) => {
+                    log::warn!(
+                        "Couldn't start a Cloud session lease, asking without one (it counts \
+                         against the daily ceiling): {e:#}"
+                    );
+                    self.state().retry_at = Some(Instant::now() + LEASE_RETRY);
+                    Ok(None)
+                }
             }
         })
     }
+}
+
+/// Whether the website won't lease anything to the account: nothing's left this week, or it has
+/// no access.
+fn no_lease_allowed(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<claude::ApiError>().is_some_and(|e| {
+        e.status == StatusCode::FORBIDDEN || e.code.as_deref() == Some("allowance_exhausted")
+    })
+}
+
+/// A conversation with Bono Cloud, as `account`.
+pub struct Conversation {
+    inner: claude::Conversation,
+    lease: Lease,
 }
 
 impl Conversation {
@@ -95,16 +517,19 @@ impl Conversation {
         client: reqwest::Client,
     ) -> anyhow::Result<Self> {
         let account = signed_in(account)?;
+        let lease = Lease::new(account.clone(), client.clone());
         // The rest is Claude's defaults: none of it is the pilot's to change
         let mut builder = claude::ConversationBuilder::from_config(&ClaudeConfig::default());
         builder
             .base_url(base_url(account))
-            .bearer_source(Arc::new(Bearer(account.clone())))
+            .bearer_source(Arc::new(lease.clone()))
+            .lease_source(Arc::new(lease.clone()))
             .server_settings()
             .system(system)
             .tools(tools);
         Ok(Self {
             inner: builder.build(client)?,
+            lease,
         })
     }
 }
@@ -116,20 +541,35 @@ impl Model for Conversation {
         on_text: &'a mut (dyn FnMut(&str) + Send),
     ) -> BoxFuture<'a, anyhow::Result<Reply>> {
         Box::pin(async move {
-            self.inner
-                .send_streaming(text, on_text)
-                .await
-                .map_err(readable_error)
+            let reply = self.inner.send_streaming(text, on_text).await;
+            TURNS.fetch_add(1, Ordering::Relaxed);
+            reply.map_err(readable_error)
         })
     }
 
+    /// Also ends the lease: the next request starts another.
     fn reset(&mut self) {
         self.inner.reset();
+        self.lease.end();
     }
 
     #[inline]
     fn usage(&self) -> &BTreeMap<String, Usage> {
         self.inner.usage()
+    }
+
+    fn set_game_session(&mut self, game: &GameSession) {
+        self.lease.set_game(game.clone());
+    }
+
+    fn lease(&self) -> Option<Lease> {
+        Some(self.lease.clone())
+    }
+}
+
+impl Drop for Conversation {
+    fn drop(&mut self) {
+        self.lease.end();
     }
 }
 
@@ -167,11 +607,18 @@ fn unauthorized(error: &anyhow::Error) -> bool {
 }
 
 fn readable_error(error: anyhow::Error) -> anyhow::Error {
-    match error.downcast_ref::<claude::ApiError>().map(|e| e.status) {
-        Some(StatusCode::UNAUTHORIZED) => error.context(t!("provider.bono_cloud_session_ended")),
-        Some(StatusCode::FORBIDDEN) => error.context(t!("provider.bono_cloud_unavailable")),
-        _ => error,
-    }
+    let Some(api) = error.downcast_ref::<claude::ApiError>() else {
+        return error;
+    };
+    let readable = match (api.status, api.code.as_deref()) {
+        (StatusCode::UNAUTHORIZED, _) => t!("provider.bono_cloud_session_ended"),
+        (StatusCode::FORBIDDEN, _) => t!("provider.bono_cloud_unavailable"),
+        (_, Some("allowance_exhausted")) => t!("provider.bono_cloud_no_allowance"),
+        (_, Some("daily_allowance_exhausted")) => t!("provider.bono_cloud_daily_allowance"),
+        (StatusCode::PAYLOAD_TOO_LARGE, _) => t!("provider.bono_cloud_too_long"),
+        _ => return error,
+    };
+    error.context(readable)
 }
 
 fn base_url(account: &Account) -> String {
@@ -197,6 +644,13 @@ mod tests {
     /// when it starts with `event:`, JSON otherwise), and records each request's head
     /// (lowercased) and body. A status of 0 answers nothing.
     async fn mock(responses: Vec<(u16, String)>) -> (Url, Arc<Mutex<Vec<(String, Value)>>>) {
+        mock_headers(responses, "").await
+    }
+
+    async fn mock_headers(
+        responses: Vec<(u16, String)>,
+        headers: &'static str,
+    ) -> (Url, Arc<Mutex<Vec<(String, Value)>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -235,7 +689,7 @@ mod tests {
                     false => "application/json",
                 };
                 let response = format!(
-                    "HTTP/1.1 {status} Mock\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Mock\r\n{headers}content-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
@@ -338,6 +792,148 @@ mod tests {
     fn rejected() -> (u16, String) {
         let error = json!({"type": "error", "error": {"type": "authentication_error", "message": "invalid token"}});
         (401, error.to_string())
+    }
+
+    fn lease_body(id: &str) -> (u16, String) {
+        (
+            200,
+            json!({"id": id, "status": "active", "expires_at": "2099-01-01T00:00:00Z"}).to_string(),
+        )
+    }
+
+    fn cloud_error(status: u16, code: &str) -> (u16, String) {
+        (
+            status,
+            json!({"type": "error", "error": {"type": "api_error", "code": code, "message": code}})
+                .to_string(),
+        )
+    }
+
+    fn game(key: &str) -> GameSession {
+        GameSession::new(key.into(), "lmu", "race", Some(5400.0))
+    }
+
+    #[tokio::test]
+    async fn leases_once_per_session_and_ends_before_the_next() {
+        let (url, requests) = mock(vec![
+            lease_body("first"),
+            answer(),
+            answer(),
+            (200, json!({"ok": true}).to_string()),
+            lease_body("second"),
+            answer(),
+        ])
+        .await;
+        let account = signed_in(url, "access-1");
+        let mut conversation = conversation(&account, Tools::default());
+        conversation.set_game_session(&game("track|race|1"));
+        conversation.send("Pit?".into()).await.unwrap();
+        conversation.send("Now?".into()).await.unwrap();
+        conversation.set_game_session(&game("track|race|2"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while requests.lock().unwrap().len() < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        conversation.send("Pit?".into()).await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 6);
+        assert!(requests[0].0.starts_with("post /api/cloud/v1/sessions "));
+        assert_eq!(requests[0].1["sim"], "lmu");
+        assert_eq!(requests[0].1["session_type"], "race");
+        assert_eq!(requests[0].1["expected_minutes"], 90);
+        assert_eq!(requests[1].1["session_id"], "first");
+        assert_eq!(requests[2].1["session_id"], "first");
+        assert!(
+            requests[3]
+                .0
+                .starts_with("post /api/cloud/v1/sessions/first/end ")
+        );
+        assert_ne!(
+            requests[0].1["client_session_id"],
+            requests[4].1["client_session_id"]
+        );
+        assert_eq!(requests[5].1["session_id"], "second");
+    }
+
+    #[tokio::test]
+    async fn replaces_invalid_lease_once() {
+        for fails_again in [false, true] {
+            let last = if fails_again {
+                cloud_error(409, "invalid_session")
+            } else {
+                answer()
+            };
+            let (url, requests) = mock(vec![
+                lease_body("old"),
+                cloud_error(409, "invalid_session"),
+                lease_body("new"),
+                last,
+            ])
+            .await;
+            let account = signed_in(url, "access-1");
+            let mut conversation = conversation(&account, Tools::default());
+            conversation.set_game_session(&game("track|race|1"));
+            assert_eq!(conversation.send("Pit?".into()).await.is_err(), fails_again);
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 4);
+            assert_ne!(
+                requests[0].1["client_session_id"],
+                requests[2].1["client_session_id"]
+            );
+            assert_eq!(requests[1].1["session_id"], "old");
+            assert_eq!(requests[3].1["session_id"], "new");
+            assert_eq!(requests[1].1["messages"], requests[3].1["messages"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_failure_falls_back_but_denied_allowance_stops_the_turn() {
+        for (status, code, denied) in [
+            (503, "unavailable", false),
+            (429, "allowance_exhausted", true),
+            (403, "forbidden", true),
+        ] {
+            let mut responses = vec![cloud_error(status, code)];
+            if !denied {
+                responses.extend([answer(), answer()]);
+            }
+            let (url, requests) = mock(responses).await;
+            let account = signed_in(url, "access-1");
+            let mut conversation = conversation(&account, Tools::default());
+            conversation.set_game_session(&game("track|race|1"));
+            assert_eq!(conversation.send("Pit?".into()).await.is_err(), denied);
+            if !denied {
+                conversation.send("Now?".into()).await.unwrap();
+                let requests = requests.lock().unwrap();
+                assert_eq!(requests.len(), 3);
+                assert!(requests[1].1.get("session_id").is_none());
+                assert!(requests[2].1.get("session_id").is_none());
+            } else {
+                assert_eq!(requests.lock().unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn long_retry_after_never_holds_the_turn() {
+        for headers in [
+            "retry-after: 86400\r\nx-should-retry: false\r\n",
+            "retry-after: 86400\r\nx-should-retry: true\r\n",
+        ] {
+            let (url, requests) =
+                mock_headers(vec![cloud_error(429, "rate_limited")], headers).await;
+            let account = signed_in(url, "access-1");
+            let mut conversation = conversation(&account, Tools::default());
+            let result =
+                tokio::time::timeout(Duration::from_secs(1), conversation.send("Pit?".into()))
+                    .await
+                    .unwrap();
+            assert!(result.is_err());
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]
@@ -463,7 +1059,7 @@ mod tests {
                     {"type": "tool_use", "id": "gap-1", "name": "gap", "input": {}},
                 ],
             });
-            let mut responses = vec![(200, call.to_string())];
+            let mut responses = vec![lease_body("tool-session"), (200, call.to_string())];
             if !expire {
                 responses.push(rejected());
             }
@@ -481,10 +1077,17 @@ mod tests {
                 },
             );
             let mut conversation = conversation(&account, tools);
+            conversation.set_game_session(&game("track|race|1"));
             let reply = conversation.send("Pit?".into()).await.unwrap();
             assert_eq!(reply.text, "Checking.\n\nBox.");
             let requests = requests.lock().unwrap();
             let last = requests.last().unwrap();
+            for (_, body) in requests
+                .iter()
+                .filter(|(head, _)| head.starts_with("post /api/cloud/v1/messages "))
+            {
+                assert_eq!(body["session_id"], "tool-session");
+            }
             assert!(last.0.contains("authorization: bearer access-new"));
             let messages = last.1["messages"].as_array().unwrap();
             assert_eq!(messages.len(), 3);
@@ -494,7 +1097,7 @@ mod tests {
             assert_eq!(messages[2]["content"][0]["tool_use_id"], "gap-1");
             assert_eq!(messages[2]["content"][0]["content"], "Gap: 2s");
             if !expire {
-                assert_eq!(requests[1].1, last.1);
+                assert_eq!(requests[2].1, last.1);
             }
         }
     }
