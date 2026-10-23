@@ -116,7 +116,7 @@ impl Engineer {
 
     pub fn description() -> String {
         "Race-engineer queries over the live telemetry database of the simulator the pilot is \
-         driving (read-only). Each question includes a fresh quick snapshot; use it first. \
+         driving (read-only). If a question includes a fresh quick snapshot, use it first. \
          `command` picks the query: quick (fallback when no snapshot is attached, from the newest \
          rows), status (full snapshot of the player's car), laps, stint (range on fuel and \
          virtual energy against what the race needs), nearby (cars around in metres), field \
