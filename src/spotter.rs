@@ -192,7 +192,7 @@ impl Spotter {
         engineer: &mut Engineer,
     ) {
         let settings = config.get().spotter.clone();
-        let frequency = config.get().opponent_frequency.get();
+        let frequency = config.get().opponent_frequency().get();
         let db = sim
             .filter(|_| *settings.enabled())
             .and_then(|sim| sim.database())
