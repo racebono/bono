@@ -10,7 +10,7 @@ use crate::{
     task::{JoinHandle, spawn_blocking},
 };
 use anyhow::Context;
-use futures::{StreamExt, join, stream::FuturesUnordered};
+use futures::join;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -85,7 +85,7 @@ async fn install_from(bundled: &Path, install_dir: &Path) -> anyhow::Result<()> 
     let mut settings = read_settings(&path).await?;
     let dll = installed_dll(install_dir);
     if let Some(plugins) = dll.parent() {
-        std::fs::create_dir_all(plugins)?;
+        tokio::fs::create_dir_all(plugins).await?;
     }
     write_replacing(&dll, &tokio::fs::read(bundled).await?).await?;
 
@@ -139,24 +139,16 @@ async fn bundled_dll() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
 
-    let mut it = [dir.join("plugins").join(DLL), dir.join(DLL)]
-        .into_iter()
-        .map(|dll| async move {
-            tokio::fs::metadata(&dll)
-                .await
-                .map(|m| m.is_file())
-                .unwrap_or(false)
-                .then_some(dll)
-        })
-        .collect::<FuturesUnordered<_>>();
-
-    while let Some(dll) = it.next().await {
-        if dll.is_some() {
-            return dll;
+    // In order: the packaged one first
+    for dll in [dir.join("plugins").join(DLL), dir.join(DLL)] {
+        if tokio::fs::metadata(&dll)
+            .await
+            .is_ok_and(|metadata| metadata.is_file())
+        {
+            return Some(dll);
         }
     }
-
-    return None;
+    None
 }
 
 /// The SHA-256 of the DLL's contents.
@@ -229,8 +221,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn installs_and_enables_keeping_other_plugins_settings() {
+    #[tokio::test]
+    async fn installs_and_enables_keeping_other_plugins_settings() {
         let game = tempfile::tempdir().unwrap();
         let settings = settings_path(game.path());
         std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
@@ -244,28 +236,28 @@ mod tests {
         )
         .unwrap();
 
-        let before = status(Some(game.path()));
+        let before = status(Some(game.path().to_owned())).await;
         assert!(before.installed.is_none());
         assert!(!before.enabled);
 
         // A DLL without a version resource
         let bundled = game.path().join("bundled.dll");
         std::fs::write(&bundled, b"not really a dll").unwrap();
-        install_from(&bundled, game.path()).unwrap();
+        install_from(&bundled, game.path()).await.unwrap();
 
         assert_eq!(
             std::fs::read(installed_dll(game.path())).unwrap(),
             b"not really a dll"
         );
         assert_eq!(
-            Value::Object(read_settings(&settings).unwrap()),
+            Value::Object(read_settings(&settings).await.unwrap()),
             json!({
                 "Other.dll": { " Enabled": 1, "Mode": 3 },
                 DLL: { " Enabled": 1, "Kept": 2 },
             })
         );
 
-        let after = status(Some(game.path()));
+        let after = status(Some(game.path().to_owned())).await;
         assert_eq!(after.installed, Some(None));
         assert!(after.enabled);
         // No bundled copy next to the test binary to compare it with
@@ -285,21 +277,21 @@ mod tests {
         assert!(digest(dir.path().join("missing.dll")).await.is_err());
     }
 
-    #[test]
-    fn installs_into_a_game_that_never_ran() {
+    #[tokio::test]
+    async fn installs_into_a_game_that_never_ran() {
         let game = tempfile::tempdir().unwrap();
         let bundled = game.path().join("bundled.dll");
         std::fs::write(&bundled, b"dll").unwrap();
-        install_from(&bundled, game.path()).unwrap();
+        install_from(&bundled, game.path()).await.unwrap();
 
         assert_eq!(
-            Value::Object(read_settings(&settings_path(game.path())).unwrap()),
+            Value::Object(read_settings(&settings_path(game.path())).await.unwrap()),
             json!({ DLL: { " Enabled": 1 } })
         );
     }
 
-    #[test]
-    fn rejects_invalid_settings_without_changing_files() {
+    #[tokio::test]
+    async fn rejects_invalid_settings_without_changing_files() {
         for contents in [
             "\u{feff}{\"Other.dll\":{\" Enabled\":1}}",
             "{ /* comment */ \"Other.dll\": {} }",
@@ -318,16 +310,16 @@ mod tests {
             let bundled = game.path().join("bundled.dll");
             std::fs::write(&bundled, b"new dll").unwrap();
 
-            let error = install_from(&bundled, game.path()).unwrap_err();
+            let error = install_from(&bundled, game.path()).await.unwrap_err();
             assert!(error.to_string().contains("CustomPluginVariables.JSON"));
             assert_eq!(std::fs::read(&settings).unwrap(), contents.as_bytes());
             assert_eq!(std::fs::read(&dll).unwrap(), b"original dll");
-            assert!(!status(Some(game.path())).enabled);
+            assert!(!status(Some(game.path().to_owned())).await.enabled);
         }
     }
 
-    #[test]
-    fn rejects_settings_read_errors_before_installing() {
+    #[tokio::test]
+    async fn rejects_settings_read_errors_before_installing() {
         let game = tempfile::tempdir().unwrap();
         let settings = settings_path(game.path());
         // A directory at the file path reliably causes a read error on Windows.
@@ -335,7 +327,7 @@ mod tests {
         let bundled = game.path().join("bundled.dll");
         std::fs::write(&bundled, b"dll").unwrap();
 
-        assert!(install_from(&bundled, game.path()).is_err());
+        assert!(install_from(&bundled, game.path()).await.is_err());
         assert!(settings.is_dir());
         assert!(!installed_dll(game.path()).exists());
     }

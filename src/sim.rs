@@ -163,9 +163,10 @@ pub trait Simulator: Send {
         None
     }
 
-    /// Installs (or updates) the game's plugin, the copy that comes with the app, and enables it.
-    fn install_plugin(&mut self) -> anyhow::Result<()> {
-        anyhow::bail!("This game has no plugin")
+    /// Installs (or updates) the game's plugin, the copy that comes with the app, and enables it,
+    /// in the background.
+    fn install_plugin(&mut self) -> MaybeDone<anyhow::Result<()>> {
+        MaybeDone::Done(Err(anyhow::anyhow!("This game has no plugin")))
     }
 }
 

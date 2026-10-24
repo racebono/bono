@@ -19,6 +19,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tokio::sync::mpsc;
 
 mod plugin;
 
@@ -37,16 +38,30 @@ const REMOVE_EVERY: Duration = Duration::from_secs(1);
 pub struct LeMansUltimate {
     /// The database the plugin is writing right now, read-only
     live: Option<Pool>,
+    /// Hands changes to settings.json to the task writing them, which makes them one at a time and
+    /// in order (two "clear" requests at once would otherwise both read the same count). Started
+    /// with the first change
+    settings: Option<mpsc::UnboundedSender<SettingsChange>>,
+}
+
+/// A change to settings.json in a folder, and what it's for (for the log, if it fails).
+struct SettingsChange {
+    folder: PathBuf,
+    change: Box<dyn FnOnce(&mut Map<String, Value>) + Send>,
+    purpose: &'static str,
 }
 
 impl LeMansUltimate {
     pub fn new() -> Self {
-        Self { live: None }
+        Self {
+            live: None,
+            settings: None,
+        }
     }
 
     /// The game's folder, if it's installed.
     fn install_dir(&self) -> Option<PathBuf> {
-        steam::app_install_dir(STEAM_APP_ID).filter(|dir| dir.is_dir())
+        install_dir()
     }
 
     /// `UserData\bono`, if the game is installed.
@@ -54,29 +69,39 @@ impl LeMansUltimate {
         Some(self.install_dir()?.join("UserData").join(FOLDER))
     }
 
-    /// Changes settings.json, keeping what else is in it (the plugin acts on any value that
-    /// changes). Does nothing if the game isn't installed.
-    async fn update_settings(
+    /// Changes settings.json in the background, keeping what else is in it (the plugin acts on any
+    /// value that changes). Does nothing if the game isn't installed.
+    fn update_settings(
         &mut self,
-        change: impl FnOnce(&mut Map<String, Value>),
-    ) -> anyhow::Result<()> {
+        purpose: &'static str,
+        change: impl FnOnce(&mut Map<String, Value>) + Send + 'static,
+    ) {
         let Some(folder) = self.folder() else {
-            return Ok(());
+            return;
         };
 
-        let path = folder.join(SETTINGS);
-        let mut settings = tokio::fs::read(&path)
-            .await
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Map<String, Value>>(&bytes).ok())
-            .unwrap_or_default();
-        change(&mut settings);
-
-        tokio::fs::create_dir_all(&folder).await?;
-        let mut json = serde_json::to_vec_pretty(&settings)?;
-        json.push(b'\n');
-        write_replacing(&path, &json).await?;
-        Ok(())
+        let settings = self.settings.get_or_insert_with(|| {
+            let (send, mut recv) = mpsc::unbounded_channel::<SettingsChange>();
+            tokio::spawn(async move {
+                while let Some(SettingsChange {
+                    folder,
+                    change,
+                    purpose,
+                }) = recv.recv().await
+                {
+                    if let Err(e) = write_settings(&folder, change).await {
+                        log::error!("Error {purpose}: {e}");
+                    }
+                }
+            });
+            send
+        });
+        // Only fails if the task panicked
+        let _ = settings.send(SettingsChange {
+            folder,
+            change: Box::new(change),
+            purpose,
+        });
     }
 }
 
@@ -122,40 +147,48 @@ impl Simulator for LeMansUltimate {
     /// The plugin reads settings.json when it starts recording and whenever it changes.
     fn apply(&mut self, settings: &SimulatorSettings) {
         let frequency = settings.opponent_frequency.get();
-        if let Err(e) = self.update_settings(|json| {
-            json.insert("opponent_frequency".into(), frequency.into());
-        }) {
-            log::error!("Error passing the recording settings to Le Mans Ultimate: {e}");
-        }
+        self.update_settings(
+            "passing the recording settings to Le Mans Ultimate",
+            move |json| {
+                json.insert("opponent_frequency".into(), frequency.into());
+            },
+        );
     }
 
     /// The plugin clears its data when the "clear" count in settings.json changes.
     fn clear(&mut self) {
-        if let Err(e) = self.update_settings(|json| {
+        self.update_settings("asking Le Mans Ultimate to clear its data", |json| {
             let clear = json.get("clear").and_then(Value::as_i64).unwrap_or(0);
             json.insert("clear".into(), (clear + 1).into());
-        }) {
-            log::error!("Error asking Le Mans Ultimate to clear its data: {e}");
-        }
+        });
     }
 
     fn plugin(&mut self) -> Option<MaybeDone<PluginStatus>> {
         Some(MaybeDone::spawn(plugin::status(self.install_dir())))
     }
 
-    fn install_plugin(&mut self) -> anyhow::Result<()> {
-        if steam::is_app_running(STEAM_APP_ID) {
-            anyhow::bail!("Le Mans Ultimate is running: close it first");
-        }
-        let Some(install_dir) = self.install_dir() else {
-            anyhow::bail!("Le Mans Ultimate isn't installed");
-        };
-        plugin::install(&install_dir)?;
-        log::info!(
-            "Installed the Le Mans Ultimate plugin in {}",
-            install_dir.display()
-        );
-        Ok(())
+    fn install_plugin(&mut self) -> MaybeDone<anyhow::Result<()>> {
+        MaybeDone::spawn(async {
+            let result = async {
+                if steam::is_app_running(STEAM_APP_ID) {
+                    anyhow::bail!("Le Mans Ultimate is running: close it first");
+                }
+                let Some(install_dir) = install_dir() else {
+                    anyhow::bail!("Le Mans Ultimate isn't installed");
+                };
+                plugin::install(&install_dir).await?;
+                log::info!(
+                    "Installed the Le Mans Ultimate plugin in {}",
+                    install_dir.display()
+                );
+                Ok(())
+            }
+            .await;
+            if let Err(e) = &result {
+                log::error!("Error installing the Le Mans Ultimate plugin: {e}");
+            }
+            result
+        })
     }
 }
 
@@ -192,6 +225,31 @@ async fn remove_when_closed(dir: PathBuf, pool: Pool) {
             Err(_) => {}
         }
     }
+}
+
+/// The game's folder, if it's installed.
+fn install_dir() -> Option<PathBuf> {
+    steam::app_install_dir(STEAM_APP_ID).filter(|dir| dir.is_dir())
+}
+
+/// Changes settings.json in `folder`, keeping what else is in it.
+async fn write_settings(
+    folder: &Path,
+    change: impl FnOnce(&mut Map<String, Value>),
+) -> anyhow::Result<()> {
+    let path = folder.join(SETTINGS);
+    let mut settings = tokio::fs::read(&path)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Map<String, Value>>(&bytes).ok())
+        .unwrap_or_default();
+    change(&mut settings);
+
+    tokio::fs::create_dir_all(folder).await?;
+    let mut json = serde_json::to_vec_pretty(&settings)?;
+    json.push(b'\n');
+    write_replacing(&path, &json).await?;
+    Ok(())
 }
 
 /// Writes a temporary file and moves it over `path`, so the plugin never reads half a file: a
