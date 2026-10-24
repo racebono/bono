@@ -20,6 +20,7 @@ use sdl3::{
     audio::{AudioFormat, AudioRecordingCallback, AudioSpec, AudioStream},
     event::{Event, WindowEvent},
     get_error,
+    joystick::JoystickId,
     sys::audio::{SDL_AudioStream, SDL_GetAudioStreamAvailable, SDL_GetAudioStreamData},
 };
 use serde::Deserialize;
@@ -57,6 +58,9 @@ pub struct Whisper {
     /// for again
     setup_started: bool,
     stream: Option<WhisperStream>,
+    /// The joystick whose talk button started the recording: unplugging it means the release
+    /// never comes
+    talk_joystick: Option<JoystickId>,
     catalog: MaybeDone<Option<Vec<Model>>>,
     threads: NonZeroUsize,
     client: reqwest::Client,
@@ -81,6 +85,7 @@ impl Whisper {
             setup: false,
             setup_started: false,
             stream: None,
+            talk_joystick: None,
             catalog: MaybeDone::spawn(async move {
                 match Model::fetch_catalog(&pref_path, &client).await {
                     Ok(catalog) => Some(catalog),
@@ -220,8 +225,14 @@ impl Whisper {
         device: Option<&sdl3::audio::AudioDevice>,
     ) -> Result<JoinHandle<anyhow::Result<Heard>>, bool> {
         let talk_button = config.get().talk_button().clone();
-        return match talk(talk_button.as_ref(), event, self.recording()) {
-            Talk::Begin => self.begin(rt, device),
+        return match talk(talk_button.as_ref(), event, self.talking()) {
+            Talk::Begin => {
+                self.talk_joystick = match *event {
+                    Event::JoyButtonDown { which, .. } => Some(which),
+                    _ => None,
+                };
+                self.begin(rt, device)
+            }
             Talk::Finish => self.finish(config),
             Talk::Ignore => Err(false),
         };
@@ -235,7 +246,12 @@ impl Whisper {
     /// Whether `event` ends the recording, so it must reach [`Self::event`] even when the UI used
     /// it (a text field with focus takes the talk key's release).
     pub fn ends_recording(&self, config: &Config, event: &Event) -> bool {
-        talk(config.get().talk_button().as_ref(), event, self.recording()) == Talk::Finish
+        talk(config.get().talk_button().as_ref(), event, self.talking()) == Talk::Finish
+    }
+
+    /// What [`talk`] needs to know of the recording: whether there's one, and who started it.
+    fn talking(&self) -> Option<Option<JoystickId>> {
+        self.recording().then_some(self.talk_joystick)
     }
 
     /// Whether the model picked is loaded, and can listen.
@@ -438,7 +454,12 @@ enum Talk {
     Ignore,
 }
 
-fn talk(button: Option<&ConfigButton>, event: &Event, recording: bool) -> Talk {
+/// `recording` is `None` without a recording, or the joystick that started it.
+fn talk(
+    button: Option<&ConfigButton>,
+    event: &Event,
+    recording: Option<Option<JoystickId>>,
+) -> Talk {
     let Some(button) = button else {
         return Talk::Ignore;
     };
@@ -446,9 +467,9 @@ fn talk(button: Option<&ConfigButton>, event: &Event, recording: bool) -> Talk {
     if button.pressed(event) {
         return Talk::Begin;
     }
-    if !recording {
+    let Some(joystick) = recording else {
         return Talk::Ignore;
-    }
+    };
     if button.released(event) {
         return Talk::Finish;
     }
@@ -462,6 +483,12 @@ fn talk(button: Option<&ConfigButton>, event: &Event, recording: bool) -> Talk {
                 ..
             }
         )
+    {
+        return Talk::Finish;
+    }
+    // An unplugged joystick never sends its button's release
+    if let Event::JoyDeviceRemoved { which, .. } = *event
+        && joystick == Some(which)
     {
         return Talk::Finish;
     }
@@ -1021,27 +1048,27 @@ mod tests {
         let button = ConfigButton::Key(Scancode::Space);
         let release = key(Scancode::Space, false);
         assert_eq!(
-            talk(Some(&button), &key(Scancode::Space, true), false),
+            talk(Some(&button), &key(Scancode::Space, true), None),
             Talk::Begin
         );
-        assert_eq!(talk(Some(&button), &release, true), Talk::Finish);
+        assert_eq!(talk(Some(&button), &release, Some(None)), Talk::Finish);
         // Nothing to finish, so a text field may keep it
-        assert_eq!(talk(Some(&button), &release, false), Talk::Ignore);
+        assert_eq!(talk(Some(&button), &release, None), Talk::Ignore);
         assert_eq!(
-            talk(Some(&button), &key(Scancode::A, false), true),
+            talk(Some(&button), &key(Scancode::A, false), Some(None)),
             Talk::Ignore
         );
-        assert_eq!(talk(None, &release, true), Talk::Ignore);
+        assert_eq!(talk(None, &release, Some(None)), Talk::Ignore);
     }
 
     #[test]
     fn losing_focus_finishes_a_key_recording() {
         let key = ConfigButton::Key(Scancode::Space);
         let focus_lost = window(WindowEvent::FocusLost);
-        assert_eq!(talk(Some(&key), &focus_lost, true), Talk::Finish);
-        assert_eq!(talk(Some(&key), &focus_lost, false), Talk::Ignore);
+        assert_eq!(talk(Some(&key), &focus_lost, Some(None)), Talk::Finish);
+        assert_eq!(talk(Some(&key), &focus_lost, None), Talk::Ignore);
         assert_eq!(
-            talk(Some(&key), &window(WindowEvent::FocusGained), true),
+            talk(Some(&key), &window(WindowEvent::FocusGained), Some(None)),
             Talk::Ignore
         );
 
@@ -1050,7 +1077,25 @@ mod tests {
             guid: unsafe { std::mem::zeroed() },
             button: 0,
         };
-        assert_eq!(talk(Some(&joystick), &focus_lost, true), Talk::Ignore);
+        assert_eq!(talk(Some(&joystick), &focus_lost, Some(None)), Talk::Ignore);
+    }
+
+    #[test]
+    fn unplugging_the_talk_joystick_finishes_its_recording() {
+        let button = ConfigButton::Joystick {
+            guid: unsafe { std::mem::zeroed() },
+            button: 0,
+        };
+        let removed = |id: u32| Event::JoyDeviceRemoved {
+            timestamp: 0,
+            which: JoystickId::new(id),
+        };
+        let wheel = Some(JoystickId::new(7));
+        assert_eq!(talk(Some(&button), &removed(7), Some(wheel)), Talk::Finish);
+        // Another joystick, a key's recording, or no recording at all
+        assert_eq!(talk(Some(&button), &removed(8), Some(wheel)), Talk::Ignore);
+        assert_eq!(talk(Some(&button), &removed(7), Some(None)), Talk::Ignore);
+        assert_eq!(talk(Some(&button), &removed(7), None), Talk::Ignore);
     }
 
     /// Needs `BONO_WHISPER` (a whisper model) and `BONO_VOICE_EN`/`_ES` (Piper voices).
