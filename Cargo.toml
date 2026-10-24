@@ -5,7 +5,12 @@ edition = "2024"
 
 [dependencies]
 base64 = "0.22"
-keyring = { version = "3.6.3", features = ["windows-native", "apple-native", "sync-secret-service", "crypto-rust"] }
+keyring = { version = "3.6.3", features = [
+    "windows-native",
+    "apple-native",
+    "sync-secret-service",
+    "crypto-rust",
+] }
 sha2 = "0.10"
 md-5 = "0.10"
 webbrowser = "1"
@@ -13,7 +18,7 @@ bono-sim = { path = "sim" }
 bono-i18n = { path = "i18n" }
 pin-project = "1.1.13"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
-tokio = { version = "1.53.2", features = [
+tokio = { version = "^1.54.1", features = [
     "rt-multi-thread",
     "sync",
     "fs",
