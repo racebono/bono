@@ -179,13 +179,32 @@ impl App {
 
     pub fn event(&mut self, rt: &Handle, event: Event) -> AppResult {
         self.state.joysticks.event(&event);
-        if let Event::AudioDeviceRemoved {
-            which,
-            iscapture: false,
-            ..
-        } = event
-        {
-            self.state.speaker_removed(which);
+        match event {
+            Event::AudioDeviceRemoved {
+                which,
+                iscapture: true,
+                ..
+            } => {
+                if self.state.gui.topbar.audio.microphone_removed(which) {
+                    self.state.engineer.microphone_removed();
+                }
+            }
+            Event::AudioDeviceRemoved {
+                which,
+                iscapture: false,
+                ..
+            } => {
+                self.state.speaker_removed(which);
+            }
+            Event::AudioDeviceAdded { iscapture, .. } => {
+                let state = &mut self.state;
+                state.gui.topbar.audio.device_added(
+                    iscapture,
+                    &state.subsystems.audio,
+                    &state.config.get(),
+                );
+            }
+            _ => {}
         }
         // A text field taking the talk button's release mustn't leave the microphone open
         if self.ui.on_event(&event).consumed

@@ -12,10 +12,10 @@ use crate::{
     task::{JoinHandle, MaybeDone, spawn, spawn_blocking},
     updating,
 };
+use bono_i18n::t;
 use camino::Utf8Path;
 use egui::Widget;
 use egui_extras::Column;
-use bono_i18n::t;
 use sdl3::{
     audio::{AudioFormat, AudioRecordingCallback, AudioSpec, AudioStream},
     event::{Event, WindowEvent},
@@ -225,6 +225,11 @@ impl Whisper {
             Talk::Finish => self.finish(config),
             Talk::Ignore => Err(false),
         };
+    }
+
+    /// Discard an interrupted recording instead of transcribing silence or partial speech.
+    pub fn cancel_recording(&mut self) {
+        self.stream = None;
     }
 
     /// Whether `event` ends the recording, so it must reach [`Self::event`] even when the UI used

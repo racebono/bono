@@ -236,6 +236,10 @@ impl Engineer {
         }
     }
 
+    pub fn microphone_removed(&mut self) {
+        self.notice(t!("engineer.microphone_removed"));
+    }
+
     /// The speaker `which` is gone (unplugged): the answer being spoken on it stops. `picked`:
     /// whether it's the speaker picked, which the pilot is told about either way.
     pub fn speaker_removed(&mut self, which: u32, picked: bool) {

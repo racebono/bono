@@ -1060,6 +1060,11 @@
         "es": "Error al reproducir la respuesta: {error}",
         "ca": "Error en reproduir la resposta: {error}"
     },
+    "engineer.microphone_removed": {
+        "en": "The microphone was disconnected: reconnect it or pick a microphone in Audio › Microphone",
+        "es": "Se desconectó el micrófono: vuelve a conectarlo o elige uno en Audio › Micrófono",
+        "ca": "S'ha desconnectat el micròfon: torna'l a connectar o tria'n un a Àudio › Micròfon"
+    },
     "engineer.speaker_removed": {
         "en": "The speaker was disconnected: pick a speaker to hear the engineer again",
         "es": "Se desconectó el altavoz: elige un altavoz para volver a oír al ingeniero",
