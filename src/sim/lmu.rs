@@ -36,11 +36,15 @@ const REMOVE_EVERY: Duration = Duration::from_secs(1);
 pub struct LeMansUltimate {
     /// The database the plugin is writing right now, read-only
     live: Option<Pool>,
+    code_check: plugin::CodeCheck,
 }
 
 impl LeMansUltimate {
     pub fn new() -> Self {
-        Self { live: None }
+        Self {
+            live: None,
+            code_check: plugin::CodeCheck::default(),
+        }
     }
 
     /// The game's folder, if it's installed.
@@ -138,7 +142,8 @@ impl Simulator for LeMansUltimate {
     }
 
     fn plugin(&mut self) -> Option<PluginStatus> {
-        Some(plugin::status(self.install_dir().as_deref()))
+        let dir = self.install_dir();
+        Some(self.code_check.status(dir.as_deref()))
     }
 
     fn install_plugin(&mut self) -> anyhow::Result<()> {
@@ -149,6 +154,7 @@ impl Simulator for LeMansUltimate {
             anyhow::bail!("Le Mans Ultimate isn't installed");
         };
         plugin::install(&install_dir)?;
+        self.code_check = plugin::CodeCheck::default();
         log::info!(
             "Installed the Le Mans Ultimate plugin in {}",
             install_dir.display()

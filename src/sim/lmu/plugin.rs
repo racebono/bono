@@ -19,7 +19,12 @@ const ENABLED: &str = " Enabled";
 
 /// The plugin as installed in `install_dir` (the game's folder, if it's installed), and the copy
 /// that comes with the app.
+#[cfg(test)]
 pub fn status(install_dir: Option<&Path>) -> PluginStatus {
+    status_with_code(install_dir, None)
+}
+
+fn status_with_code(install_dir: Option<&Path>, code: Option<PluginCodeStatus>) -> PluginStatus {
     let bundled = bundled_dll();
     let installed = install_dir
         .map(installed_dll)
@@ -33,14 +38,64 @@ pub fn status(install_dir: Option<&Path>) -> PluginStatus {
             .is_some_and(|enabled| enabled != 0)
     });
 
-    let code = install_dir
-        .filter(|_| installed.is_some())
-        .map(|dir| code_status(&installed_dll(dir), bundled.as_deref()));
     PluginStatus {
         installed,
         enabled,
         bundled: bundled.as_deref().map(version),
         code,
+    }
+}
+
+/// Keeps at most one hash comparison running, away from the UI thread.
+#[derive(Default)]
+pub struct CodeCheck {
+    paths: Option<(PathBuf, Option<PathBuf>)>,
+    pending: Option<std::sync::mpsc::Receiver<PluginCodeStatus>>,
+    result: Option<PluginCodeStatus>,
+}
+
+impl CodeCheck {
+    pub fn status(&mut self, install_dir: Option<&Path>) -> PluginStatus {
+        let mut status = status_with_code(install_dir, None);
+        let paths = install_dir
+            .filter(|_| status.installed.is_some())
+            .map(|dir| (installed_dll(dir), bundled_dll()));
+        if self.paths != paths {
+            self.paths = paths;
+            self.pending = None;
+            self.result = None;
+        }
+        if let Some(pending) = &self.pending {
+            match pending.try_recv() {
+                Ok(result) => {
+                    self.result = Some(result);
+                    self.pending = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.result = Some(PluginCodeStatus::Unavailable);
+                    self.pending = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.pending.is_none() {
+            if let Some((installed, bundled)) = self.paths.clone() {
+                let (send, recv) = std::sync::mpsc::channel();
+                if std::thread::Builder::new()
+                    .name("plugin-hash".into())
+                    .spawn(move || {
+                        let _ = send.send(code_status(&installed, bundled.as_deref()));
+                    })
+                    .is_ok()
+                {
+                    self.pending = Some(recv);
+                } else {
+                    self.result = Some(PluginCodeStatus::Unavailable);
+                }
+            }
+        }
+        status.code = self.result;
+        status
     }
 }
 
@@ -192,6 +247,27 @@ fn version(dll: &Path) -> Option<Version> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn pending_hash_check_does_not_wait_for_worker() {
+        let game = tempfile::tempdir().unwrap();
+        let dll = installed_dll(game.path());
+        std::fs::create_dir_all(dll.parent().unwrap()).unwrap();
+        std::fs::write(&dll, b"plugin").unwrap();
+        let (send, recv) = std::sync::mpsc::channel();
+        let mut check = CodeCheck {
+            paths: Some((dll, bundled_dll())),
+            pending: Some(recv),
+            result: None,
+        };
+        // The sender remains alive without producing a result: status must return immediately.
+        assert_eq!(check.status(Some(game.path())).code, None);
+        send.send(PluginCodeStatus::Different).unwrap();
+        assert_eq!(
+            check.status(Some(game.path())).code,
+            Some(PluginCodeStatus::Different)
+        );
+    }
 
     #[test]
     fn verifies_bytes_even_without_version_metadata() {

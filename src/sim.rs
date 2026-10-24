@@ -179,7 +179,7 @@ pub struct PluginStatus {
     /// The copy that comes with the app, which `install_plugin` installs: `None` if it's missing,
     /// `Some(None)` if it doesn't say its version
     pub bundled: Option<Option<Version>>,
-    /// SHA-256 comparison with the bundled DLL; absent when no plugin is installed.
+    /// SHA-256 comparison with the bundled DLL; absent while pending or when no plugin is installed.
     pub code: Option<PluginCodeStatus>,
 }
 
