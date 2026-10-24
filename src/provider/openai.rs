@@ -626,7 +626,7 @@ impl ConversationBuilder {
             "" => (None, None),
             "none" if !is_openai(&base_url) => (
                 Some("none".to_owned()),
-                Some(serde_json::json!({"enable_thinking": false})),
+                (!is_openai(&base_url)).then(|| serde_json::json!({"enable_thinking": false})),
             ),
             effort => (Some(effort.to_owned()), None),
         };
