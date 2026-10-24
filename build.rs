@@ -19,9 +19,19 @@ pub fn main() -> Result<(), ureq::Error> {
 
     if var_os("CARGO_CFG_WINDOWS").is_some() {
         race_room(&out_dir)?;
+        icon();
     }
 
     Ok(())
+}
+
+// Embeds the favicon as the executable's icon
+fn icon() {
+    println!("cargo::rerun-if-changed=assets/favicon.ico");
+    winresource::WindowsResource::new()
+        .set_icon("assets/favicon.ico")
+        .compile()
+        .expect("Unable to embed the executable's icon");
 }
 
 fn race_room(out_dir: &Path) -> Result<(), ureq::Error> {
