@@ -30,8 +30,7 @@ effort and fixture for baseline and candidate. Record measured times; a transcri
 cannot establish improved latency.
 
 Use the same database, model and effort for the old and new skill, with multiple runs.
-Build both versions: topic references are compiled into the tool, so changing only
-`EVAL_SKILL` leaves the newer tool guidance in the baseline. Save distinct `EVAL_CONFIG`
+Build both versions: the skill, schema and topic references are all compiled into the tool. Save distinct `EVAL_CONFIG`
 and `EVAL_RUN` values. The current model comparison uses Haiku 5.5 high and Sonnet 5.5 low.
 
 `scripts/generate_mock_telemetry.py` at the repository root creates controlled race and

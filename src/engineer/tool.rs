@@ -1,5 +1,5 @@
 //! The race engineer's tool: read-only race-engineer queries over the telemetry database the
-//! simulator's plugin is writing (see `assets/skill`, whose instructions say when to use each
+//! simulator's plugin is writing (see `skill`, whose instructions say when to use each
 //! command). Ported from my-engineer's `engineer.py`.
 //!
 //! Latest-frame commands (`quick`, `nearby`, the live part of `status`) are a few indexed lookups
@@ -29,13 +29,13 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-/// The race engineer's instructions (`assets/skill/SKILL.md`), for the system prompt.
-pub const SKILL_PATH: &str = "SKILL.md";
+/// The race engineer's instructions (`skill/SKILL.md`), for the system prompt.
+pub const SKILL: &str = include_str!("../../skill/SKILL.md");
 /// The database's schema and gotchas, for the `schema` command.
-pub const SCHEMA_PATH: &str = "references/schema.md";
+pub const SCHEMA: &str = include_str!("../../skill/references/schema.md");
 
 pub(super) const ENGINEERING_REFERENCE: &str =
-    include_str!("../../assets/skill/references/engineering.md");
+    include_str!("../../skill/references/engineering.md");
 
 const WHEELS: [&str; 4] = ["FL", "FR", "RL", "RR"];
 /// Max cars LMU maps (104) plus slack
@@ -399,15 +399,15 @@ pub(super) fn topic_reference(command: Command) -> Option<(&'static str, &'stati
     Some(match command {
         Command::Corners => (
             "references/corners.md",
-            include_str!("../../assets/skill/references/corners.md"),
+            include_str!("../../skill/references/corners.md"),
         ),
         Command::Stint => (
             "references/strategy.md",
-            include_str!("../../assets/skill/references/strategy.md"),
+            include_str!("../../skill/references/strategy.md"),
         ),
         Command::Status => (
             "references/tyres.md",
-            include_str!("../../assets/skill/references/tyres.md"),
+            include_str!("../../skill/references/tyres.md"),
         ),
         _ => return None,
     })
@@ -5018,9 +5018,9 @@ mod tests {
         assert!(corners.contains("T1"), "{corners}");
     }
 
-    /// The skill's own schema reference, as the app reads it from the assets.
+    /// The skill's own schema reference, embedded in the app.
     fn schema() -> Arc<str> {
-        include_str!("../../assets/skill/references/schema.md").into()
+        SCHEMA.into()
     }
 
     async fn run(engineer: &Engineer, input: serde_json::Value) -> String {
@@ -5277,18 +5277,18 @@ mod tests {
         assert_eq!(part_of(0.0), "at the start");
         assert_eq!(part_of(0.75), "late");
         assert_eq!(part_of(1.0), "at the end");
-        let instructions = instructions(include_str!("../../assets/skill/SKILL.md").to_owned());
+        let instructions = instructions(SKILL.to_owned());
         assert!(!instructions.starts_with("---"));
         assert!(instructions.starts_with("# Race engineer"));
     }
 }
 
-/// Runs the skill's evals (`assets/skill/evals/evals.json`) with Claude against a race database,
+/// Runs the skill's evals (`skill/evals/evals.json`) with Claude against a race database,
 /// to compare versions of the skill. Needs `ANTHROPIC_API_KEY`, and spends tokens.
 ///
+/// The skill and schema are embedded at build time.
+///
 /// - `EVAL_DB`: the race's `telemetry.db` (kept looking fresh while the evals run)
-/// - `EVAL_SKILL`, `EVAL_SCHEMA`: the `SKILL.md` and `schema.md` to use (default: the ones in
-///   `assets/skill`)
 /// - `EVAL_OUT`: where each eval's reply goes, as `eval-<id>/<EVAL_CONFIG>/<EVAL_RUN>/`
 /// - `EVAL_CONFIG` (default `with_skill`), `EVAL_RUN` (default `run-1`), `EVAL_MODEL`,
 ///   `EVAL_EFFORT`, `EVAL_IDS` (e.g. `1,5,9`)
@@ -5387,11 +5387,8 @@ mod evals {
         let run = var("EVAL_RUN").unwrap_or_else(|| "run-1".into());
         let model = var("EVAL_MODEL").unwrap_or_else(|| "claude-sonnet-5-5".into());
         let effort = var("EVAL_EFFORT").unwrap_or_else(|| "high".into());
-        let skill = var("EVAL_SKILL").unwrap_or_else(|| "assets/skill/SKILL.md".into());
-        let system = instructions(std::fs::read_to_string(skill).unwrap());
-        let schema =
-            var("EVAL_SCHEMA").unwrap_or_else(|| "assets/skill/references/schema.md".into());
-        let schema: Arc<str> = std::fs::read_to_string(schema).unwrap().into();
+        let system = instructions(SKILL.to_owned());
+        let schema: Arc<str> = SCHEMA.into();
         let ids = var("EVAL_IDS").map(|ids| {
             ids.split(',')
                 .map(|id| id.trim().parse::<u64>().unwrap())
@@ -5399,7 +5396,7 @@ mod evals {
         });
 
         let evals: serde_json::Value =
-            serde_json::from_str(include_str!("../../assets/skill/evals/evals.json")).unwrap();
+            serde_json::from_str(include_str!("../../skill/evals/evals.json")).unwrap();
         let evals = evals["evals"]
             .as_array()
             .unwrap()

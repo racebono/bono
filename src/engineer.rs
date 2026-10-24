@@ -5,7 +5,7 @@
 use crate::{
     account::{Account, Status},
     arrstr,
-    config::{ArrayStr, Config, ModelConfig, ModelProvider, RawConfig},
+    config::{ArrayStr, Config, ModelConfig, ModelProvider},
     language::{self, LanguageDetector},
     provider::{
         self, Model, Reply, StopReason, Tools,
@@ -19,7 +19,7 @@ use crate::{
 use bono_i18n::t;
 use sdl3::audio::{AudioDevice, AudioStreamOwner};
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     task::Poll,
     time::{Duration, Instant},
@@ -28,7 +28,7 @@ use tokio::{
     runtime::Handle,
     sync::{Mutex, mpsc},
 };
-use tool::{Engineer as EngineerTool, SCHEMA_PATH, SKILL_PATH, instructions};
+use tool::{Engineer as EngineerTool, SCHEMA, SKILL, instructions};
 
 mod routing;
 mod tool;
@@ -160,24 +160,14 @@ struct SessionState {
 }
 
 impl Engineer {
-    pub async fn new(
-        assets_path: &Path,
-        config: &RawConfig,
-        client: reqwest::Client,
-        account: Option<Account>,
-    ) -> anyhow::Result<Self> {
-        let (skill, schema) = tokio::try_join!(
-            tokio::fs::read_to_string(assets_path.join(config.skill_path()).join(SKILL_PATH)),
-            tokio::fs::read_to_string(assets_path.join(config.skill_path()).join(SCHEMA_PATH))
-        )?;
-
-        let routing = routing::skill_docs(&skill, &EngineerTool::input_schema()).into();
-        Ok(Self {
+    pub fn new(client: reqwest::Client, account: Option<Account>) -> Self {
+        let routing = routing::skill_docs(SKILL, &EngineerTool::input_schema()).into();
+        Self {
             client,
             account,
             routing,
-            skill: instructions(skill).into(),
-            schema: schema.into(),
+            skill: instructions(SKILL.to_owned()).into(),
+            schema: SCHEMA.into(),
             chat: Vec::new(),
             last_lang: arrstr!("en"),
             languages: LanguageDetector::new(),
@@ -187,7 +177,7 @@ impl Engineer {
             playback: None,
             held: false,
             misheard: 0,
-        })
+        }
     }
 
     /// Everything said so far, oldest first.
@@ -942,14 +932,7 @@ mod tests {
             .block_on(Config::new(dir.path().join("config.json")))
             .unwrap();
         let mut synth = Synthesizer::new(rt, &config.get());
-        let mut engineer = rt
-            .block_on(Engineer::new(
-                Path::new("assets"),
-                &config.get(),
-                reqwest::Client::new(),
-                None,
-            ))
-            .unwrap();
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
 
         for stop in [StopReason::MaxTokens, StopReason::ContextWindowExceeded] {
             // Stand in for synthesized speech without loading a voice or opening a device.
@@ -1013,14 +996,7 @@ mod tests {
             .block_on(Config::new(dir.path().join("config.json")))
             .unwrap();
         let mut synth = Synthesizer::new(rt, &config.get());
-        let mut engineer = rt
-            .block_on(Engineer::new(
-                Path::new("assets"),
-                &config.get(),
-                reqwest::Client::new(),
-                None,
-            ))
-            .unwrap();
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
 
         for (stop, text, tone) in [
             (StopReason::MaxTokens, "Partial answer", true),
@@ -1088,14 +1064,7 @@ mod tests {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap();
-        let mut engineer = rt
-            .block_on(Engineer::new(
-                Path::new("assets"),
-                &config.get(),
-                client,
-                None,
-            ))
-            .unwrap();
+        let mut engineer = Engineer::new(client, None);
 
         let questions = std::env::var("EVAL_QUESTIONS")
             .unwrap_or_else(|_| "how are the tyres?|where am I losing time?".into());
