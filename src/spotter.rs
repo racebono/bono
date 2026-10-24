@@ -746,7 +746,7 @@ fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scor
         return Ok(None);
     };
 
-    // Live, only the newest rows are looked through: the player's standing changes every sector
+    // Live, try the newest rows first, then look further back if the player has been in the garage
     let standing = match upto {
         None => conn
             .prepare_cached(
@@ -755,7 +755,15 @@ fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scor
                  ORDER BY id DESC LIMIT 1",
             )?
             .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .optional()?,
+            .optional()?
+            .map(|standing| Ok(Some(standing)))
+            .unwrap_or_else(|| {
+                conn.prepare_cached(
+                    "SELECT flag, penalties FROM standings WHERE is_player = 1 ORDER BY id DESC LIMIT 1",
+                )?
+                .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()
+            })?,
         Some(upto) => conn
             .prepare_cached(
                 "SELECT flag, penalties FROM standings WHERE is_player = 1 AND session_time <= ?1 \
@@ -1802,6 +1810,68 @@ mod tests {
         );
         scoring.phase = Some("stopped".into());
         assert_eq!(step(0.5, &scoring), [("red flag", true)]);
+    }
+
+    #[test]
+    fn keeps_flags_and_penalties_outside_the_standing_window() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id INTEGER PRIMARY KEY, session_time REAL,
+             full_course_yellow TEXT, phase TEXT, local_yellow_1 INTEGER,
+             local_yellow_2 INTEGER, local_yellow_3 INTEGER, rain REAL,
+             track_wetness_average REAL, session_type TEXT, session_end_time REAL);
+             CREATE TABLE standings (id INTEGER PRIMARY KEY, is_player INTEGER,
+             session_time REAL, flag TEXT, penalties INTEGER);
+             INSERT INTO session (session_time) VALUES (0);
+             INSERT INTO standings VALUES (1, 1, 0, 'blue', 1);",
+        )
+        .unwrap();
+        let config = SpotterConfig::default();
+        let mut logic = Logic::default();
+        let mut step = |t| {
+            let scoring = scoring(&conn, None).unwrap().unwrap();
+            assert_eq!(scoring.flag.as_deref(), Some("blue"));
+            assert_eq!(scoring.penalties, Some(1));
+            texts(logic.update(&config, &player(t), &[], &Wheels::default(), Some(&scoring)))
+        };
+        assert!(step(0.0).is_empty());
+        conn.execute_batch(
+            "WITH RECURSIVE ids(id) AS (SELECT 2 UNION ALL SELECT id + 1 FROM ids WHERE id < 5001)
+             INSERT INTO standings SELECT id, 0, 1, 'green', 0 FROM ids;",
+        )
+        .unwrap();
+        assert!(step(1800.0).is_empty());
+        conn.execute_batch("INSERT INTO standings VALUES (5002, 1, 1801, 'blue', 1);")
+            .unwrap();
+        assert!(step(1801.0).is_empty());
+        // The recorder clears the tables for a new session.
+        conn.execute_batch("DELETE FROM standings; DELETE FROM session; INSERT INTO session (session_time) VALUES (0);")
+            .unwrap();
+        let scoring = scoring(&conn, None).unwrap().unwrap();
+        assert_eq!(scoring.flag, None);
+        assert_eq!(scoring.penalties, None);
+    }
+
+    #[test]
+    fn resets_flag_and_penalty_edges_for_a_new_session() {
+        let config = SpotterConfig::default();
+        let mut logic = Logic::default();
+        let mut step = |t, scoring: &Scoring| {
+            texts(logic.update(&config, &player(t), &[], &Wheels::default(), Some(scoring)))
+        };
+        assert!(step(1800.0, &Scoring::default()).is_empty());
+        let mut scoring = Scoring {
+            flag: Some("blue".into()),
+            penalties: Some(1),
+            ..Scoring::default()
+        };
+        // The first row of a new session seeds the edges without calling them.
+        assert!(step(0.0, &scoring).is_empty());
+        scoring = Scoring::default();
+        assert!(step(0.1, &scoring).is_empty());
+        scoring.flag = Some("blue".into());
+        scoring.penalties = Some(1);
+        assert_eq!(step(0.2, &scoring), ["blue flag", "penalty"]);
     }
 
     #[test]
