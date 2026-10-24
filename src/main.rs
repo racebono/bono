@@ -2,6 +2,7 @@ use crate::{app::App, config::ArrayStr};
 use bono_i18n::t;
 use sdl3::{
     event::Event,
+    filesystem::get_pref_path,
     messagebox::{MessageBoxFlag, show_simple_message_box},
     sys::{events::SDL_Event, guid::SDL_GUID},
 };
@@ -47,7 +48,9 @@ struct AppImpl {
 #[app_impl]
 impl AppImpl {
     fn app_init() -> Option<Box<Self>> {
-        setup_logger().unwrap();
+        if let Err(e) = setup_logger() {
+            eprintln!("failed to set up logger: {e}");
+        }
         log::info!("bono {}", env!("BONO_VERSION"));
         match init(MainThreadToken::get()?) {
             Ok(app) => Some(Box::new(app)),
@@ -92,7 +95,7 @@ impl AppImpl {
 }
 
 fn setup_logger() -> Result<(), fern::InitError> {
-    fern::Dispatch::new()
+    let dispatch = fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
                 "[{} {} {}] {}",
@@ -103,9 +106,21 @@ fn setup_logger() -> Result<(), fern::InitError> {
             ))
         })
         .level(log::LevelFilter::Debug)
-        .chain(std::io::stdout())
-        .chain(fern::log_file("output.log")?)
-        .apply()?;
+        .chain(std::io::stdout());
+
+    // Log next to config.json rather than in the working directory, which may be
+    // read-only (e.g. `C:\Windows\System32` when started by a launcher).
+    let log_file = get_pref_path(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_NAME"))
+        .map_err(|e| e.to_string())
+        .and_then(|dir| fern::log_file(dir.join("output.log")).map_err(|e| e.to_string()));
+
+    match log_file {
+        Ok(file) => dispatch.chain(file).apply()?,
+        Err(e) => {
+            dispatch.apply()?;
+            log::warn!("Could not open log file, logging to stdout only: {e}");
+        }
+    }
     Ok(())
 }
 
