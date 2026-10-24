@@ -7,6 +7,7 @@ use sdl3::{
     sys::{events::SDL_Event, guid::SDL_GUID},
 };
 use sdl3_main::{AppResult, MainThreadData, MainThreadToken, app_impl};
+use sha2::Digest;
 use std::{
     cell::RefCell,
     fmt::Display,
@@ -191,11 +192,17 @@ pub(crate) struct Download {
     done: Arc<AtomicBool>,
 }
 
+pub(crate) enum DownloadDigest {
+    Sha256(String),
+    Md5(String),
+}
+
 impl Download {
     pub fn new(
         src: reqwest::RequestBuilder,
         dst: impl AsRef<Path> + Send + 'static,
         size_hint: Option<u64>,
+        digest: Option<DownloadDigest>,
     ) -> Self {
         struct TempFile<'a> {
             perm_path: &'a Path,
@@ -267,7 +274,10 @@ impl Download {
             let (mut resp, ()) = tokio::try_join!(req, parent)?;
 
             let mut temp_file = TempFile::new(path).await?;
-            let size_hint = resp.content_length().or(size_hint).map(|s| s as f64);
+            let expected_size = size_hint.or(resp.content_length());
+            let size_hint = expected_size.map(|s| s as f64);
+            let mut sha256 = sha2::Sha256::new();
+            let mut md5 = md5::Md5::new();
             let mut downloaded = 0u64;
 
             while let Some(mut chunk) =
@@ -275,6 +285,11 @@ impl Download {
                     .await
                     .map_err(|_| anyhow::anyhow!("Nothing received in {DOWNLOAD_STALL:?}"))??
             {
+                match &digest {
+                    Some(DownloadDigest::Sha256(_)) => sha256.update(&chunk),
+                    Some(DownloadDigest::Md5(_)) => md5.update(&chunk),
+                    None => {}
+                }
                 let chunk_size = chunk.len();
                 temp_file.file.write_all_buf(&mut chunk).await?;
                 downloaded = downloaded.saturating_add(chunk_size as u64);
@@ -283,6 +298,26 @@ impl Download {
                 }
             }
 
+            if let Some(expected) = expected_size {
+                anyhow::ensure!(
+                    downloaded == expected,
+                    "Download size mismatch: expected {expected} bytes, received {downloaded}"
+                );
+            }
+            if let Some(digest) = digest {
+                let (algorithm, expected, actual) = match digest {
+                    DownloadDigest::Sha256(expected) => {
+                        ("SHA-256", expected, format!("{:x}", sha256.finalize()))
+                    }
+                    DownloadDigest::Md5(expected) => {
+                        ("MD5", expected, format!("{:x}", md5.finalize()))
+                    }
+                };
+                anyhow::ensure!(
+                    actual.eq_ignore_ascii_case(&expected),
+                    "{algorithm} mismatch: expected {expected}, received {actual}"
+                );
+            }
             temp_file.permanent().await?;
             set_done.store(true, Ordering::Release);
             let _ = send.send(1.0);
@@ -325,7 +360,13 @@ mod download_tests {
     use super::*;
     use std::io::{Read, Write};
 
-    async fn download_over_temp(stale: Option<&[u8]>, body: &'static [u8]) {
+    async fn checked_download(
+        stale: Option<&[u8]>,
+        body: &'static [u8],
+        digest: Option<DownloadDigest>,
+        size: Option<u64>,
+        succeeds: bool,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let destination = dir.path().join("model.bin");
         let temporary = destination.with_added_extension("tmp");
@@ -359,18 +400,55 @@ mod download_tests {
         let mut download = Download::new(
             client.get(format!("http://{address}/model")),
             destination.clone(),
-            None,
+            size,
+            digest,
         );
         tokio::time::timeout(Duration::from_secs(15), &mut download.task)
             .await
             .expect("download did not finish")
             .unwrap();
         server.join().unwrap();
-        assert!(download.done.load(Ordering::Acquire));
-        assert!(!download.failed());
+        assert_eq!(download.done.load(Ordering::Acquire), succeeds);
+        assert_eq!(download.failed(), !succeeds);
+        if !succeeds {
+            assert!(!destination.exists());
+            assert!(!temporary.exists());
+            return;
+        }
         assert_eq!(download.progress(), 1.0);
         assert_eq!(std::fs::read(destination).unwrap(), body);
         assert!(!temporary.exists());
+    }
+
+    async fn download_over_temp(stale: Option<&[u8]>, body: &'static [u8]) {
+        checked_download(stale, body, None, None, true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn matching_digests_succeed() {
+        for digest in [
+            DownloadDigest::Sha256(
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            ),
+            DownloadDigest::Md5("900150983CD24FB0D6963F7D28E17F72".into()),
+        ] {
+            checked_download(None, b"abc", Some(digest), Some(3), true).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mismatched_digests_remove_download() {
+        for digest in [
+            DownloadDigest::Sha256("00".repeat(32)),
+            DownloadDigest::Md5("00".repeat(16)),
+        ] {
+            checked_download(Some(b"stale"), b"abc", Some(digest), Some(3), false).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catalog_size_mismatch_removes_download() {
+        checked_download(None, b"abc", None, Some(4), false).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
