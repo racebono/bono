@@ -1,12 +1,13 @@
 //! The plugin (`lmu/`) in the game: the DLL goes in the game's `Plugins` folder, and the game
 //! loads it if `UserData\player\CustomPluginVariables.JSON` enables it. The DLL carries its version
-//! in a version resource (see `lmu/build.rs`), which is how the installed one is told apart from the
-//! one that comes with the app.
+//! in a version resource (see `lmu/build.rs`). SHA-256 also checks that its bytes match the
+//! copy that comes with the app, even when the version is unchanged.
 
 use super::write_replacing;
-use crate::sim::{PluginStatus, Version};
+use crate::sim::{PluginCodeStatus, PluginStatus, Version};
 use anyhow::Context;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// The DLL's name, in the app's `plugins` folder and the game's `Plugins` folder.
@@ -19,6 +20,7 @@ const ENABLED: &str = " Enabled";
 /// The plugin as installed in `install_dir` (the game's folder, if it's installed), and the copy
 /// that comes with the app.
 pub fn status(install_dir: Option<&Path>) -> PluginStatus {
+    let bundled = bundled_dll();
     let installed = install_dir
         .map(installed_dll)
         .filter(|dll| dll.is_file())
@@ -31,10 +33,29 @@ pub fn status(install_dir: Option<&Path>) -> PluginStatus {
             .is_some_and(|enabled| enabled != 0)
     });
 
+    let code = install_dir
+        .filter(|_| installed.is_some())
+        .map(|dir| code_status(&installed_dll(dir), bundled.as_deref()));
     PluginStatus {
         installed,
         enabled,
-        bundled: bundled_dll().map(|dll| version(&dll)),
+        bundled: bundled.as_deref().map(version),
+        code,
+    }
+}
+
+/// Verification is advisory: missing or unreadable files never prevent recording or installation.
+fn code_status(installed: &Path, bundled: Option<&Path>) -> PluginCodeStatus {
+    let hash = |path: &Path| -> std::io::Result<_> {
+        let mut file = std::fs::File::open(path)?;
+        let mut hash = Sha256::new();
+        std::io::copy(&mut file, &mut hash)?;
+        Ok(hash.finalize())
+    };
+    match bundled.map(|bundled| (hash(installed), hash(bundled))) {
+        Some((Ok(installed), Ok(bundled))) if installed == bundled => PluginCodeStatus::Matches,
+        Some((Ok(_), Ok(_))) => PluginCodeStatus::Different,
+        _ => PluginCodeStatus::Unavailable,
     }
 }
 
@@ -171,6 +192,34 @@ fn version(dll: &Path) -> Option<Version> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn verifies_bytes_even_without_version_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("installed.dll");
+        let bundled = dir.path().join("bundled.dll");
+        std::fs::write(&installed, b"expected code").unwrap();
+        std::fs::write(&bundled, b"expected code").unwrap();
+        assert_eq!(
+            code_status(&installed, Some(&bundled)),
+            PluginCodeStatus::Matches
+        );
+        std::fs::write(&installed, b"modified code").unwrap();
+        assert_eq!(
+            code_status(&installed, Some(&bundled)),
+            PluginCodeStatus::Different
+        );
+        assert_eq!(code_status(&installed, None), PluginCodeStatus::Unavailable);
+        std::fs::remove_file(&bundled).unwrap();
+        assert_eq!(
+            code_status(&installed, Some(&bundled)),
+            PluginCodeStatus::Unavailable
+        );
+        assert_eq!(
+            code_status(&bundled, Some(&installed)),
+            PluginCodeStatus::Unavailable
+        );
+    }
 
     #[test]
     fn installs_and_enables_keeping_other_plugins_settings() {

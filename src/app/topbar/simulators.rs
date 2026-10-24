@@ -4,7 +4,7 @@
 
 use crate::{
     app::topbar::setup_label,
-    sim::{ActiveSimulator, PluginStatus},
+    sim::{ActiveSimulator, PluginCodeStatus, PluginStatus},
 };
 use bono_i18n::t;
 use std::{
@@ -38,7 +38,10 @@ impl Found {
         let Some(plugin) = self.install_dir.as_ref().and(self.plugin.as_ref()) else {
             return false;
         };
-        !plugin.enabled
+        matches!(
+            plugin.code,
+            Some(PluginCodeStatus::Different | PluginCodeStatus::Unavailable)
+        ) || !plugin.enabled
             || match (&plugin.installed, plugin.bundled_version()) {
                 (None, _) => true,
                 (Some(Some(installed)), Some(latest)) => latest.replaces(installed),
@@ -190,13 +193,23 @@ fn plugin_status(ui: &mut egui::Ui, plugin: &PluginStatus) {
                     t!("plugin.outdated", version = version, latest = latest),
                 );
             }
-            Some(latest) if latest == version => {
+            Some(latest) if latest == version && plugin.code == Some(PluginCodeStatus::Matches) => {
                 ui.label(t!("plugin.up_to_date", version = version));
             }
             _ => {
                 ui.label(t!("plugin.installed", version = version));
             }
         },
+    }
+
+    match plugin.code {
+        Some(PluginCodeStatus::Different) => {
+            ui.colored_label(warn, t!("plugin.code_different"));
+        }
+        Some(PluginCodeStatus::Unavailable) => {
+            ui.colored_label(warn, t!("plugin.code_unavailable"));
+        }
+        _ => {}
     }
 
     if plugin.installed.is_some() && !plugin.enabled {
