@@ -146,7 +146,7 @@ type CacheKey = (ArrayStr<2>, PathBuf, u32, String);
 
 struct Running {
     db: PathBuf,
-    settings: watch::Sender<SpotterConfig>,
+    settings: watch::Sender<(SpotterConfig, u32)>,
     calls: mpsc::Receiver<Raised>,
     stop: Arc<AtomicBool>,
 }
@@ -192,6 +192,7 @@ impl Spotter {
         engineer: &mut Engineer,
     ) {
         let settings = config.get().spotter.clone();
+        let frequency = config.get().opponent_frequency.get();
         let db = sim
             .filter(|_| *settings.enabled())
             .and_then(|sim| sim.database())
@@ -200,13 +201,13 @@ impl Spotter {
         match (&mut self.running, db) {
             (Some(running), Some(db)) if running.db == db => {
                 running.settings.send_if_modified(|current| {
-                    let changed = *current != settings;
-                    *current = settings.clone();
+                    let changed = *current != (settings.clone(), frequency);
+                    *current = (settings.clone(), frequency);
                     changed
                 });
             }
             (_, Some(db)) => {
-                self.running = Some(Running::start(db, settings.clone()));
+                self.running = Some(Running::start(db, settings.clone(), frequency));
                 self.queue.clear();
             }
             (_, None) => {
@@ -416,8 +417,8 @@ impl Spotter {
 }
 
 impl Running {
-    fn start(db: PathBuf, settings: SpotterConfig) -> Self {
-        let (settings, settings_recv) = watch::channel(settings);
+    fn start(db: PathBuf, settings: SpotterConfig, frequency: u32) -> Self {
+        let (settings, settings_recv) = watch::channel((settings, frequency));
         let (send, calls) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -443,7 +444,7 @@ impl Running {
 /// Polls the database until stopped, sending the calls.
 fn follow(
     db: &Path,
-    settings: watch::Receiver<SpotterConfig>,
+    settings: watch::Receiver<(SpotterConfig, u32)>,
     calls: mpsc::Sender<Raised>,
     stop: &AtomicBool,
 ) {
@@ -460,9 +461,9 @@ fn follow(
     let mut failing = false;
     while !stop.load(Ordering::Relaxed) {
         let start = Instant::now();
-        let config = settings.borrow().clone();
+        let (config, frequency) = settings.borrow().clone();
 
-        match poll(&conn, &mut logic, &config, &mut last_id) {
+        match poll(&conn, &mut logic, &config, frequency, &mut last_id) {
             Ok(raised) => {
                 failing = false;
                 for call in raised {
@@ -498,6 +499,7 @@ fn poll(
     conn: &Connection,
     logic: &mut Logic,
     config: &SpotterConfig,
+    frequency: u32,
     last_id: &mut Option<i64>,
 ) -> rusqlite::Result<Vec<Raised>> {
     let Some(car) = latest(conn)? else {
@@ -509,7 +511,7 @@ fn poll(
     *last_id = Some(car.id);
 
     let player = player(conn, car)?;
-    let others = frame(conn, &player.car)?;
+    let others = frame(conn, &player.car, frequency)?;
     let wheels = wheels(conn, player.car.id)?;
     let scoring = scoring(conn, None)?;
     Ok(logic.update(config, &player, &others, &wheels, scoring.as_ref()))
@@ -532,7 +534,7 @@ pub fn replay(db: &Path, config: &SpotterConfig) -> rusqlite::Result<Vec<Raised>
     for car in cars.into_iter().filter(|car| car.time.is_some()) {
         let time = car.time;
         let player = player(&conn, car)?;
-        let others = frame(&conn, &player.car)?;
+        let others = frame(&conn, &player.car, 5)?;
         let wheels = wheels(&conn, player.car.id)?;
         let scoring = scoring(&conn, time)?;
         calls.extend(logic.update(config, &player, &others, &wheels, scoring.as_ref()));
@@ -684,15 +686,34 @@ fn wheels(conn: &Connection, telemetry_id: i64) -> rusqlite::Result<Wheels> {
 }
 
 /// Every other car near the player's row, moved to the player's time.
-fn frame(conn: &Connection, player: &Car) -> rusqlite::Result<Vec<Car>> {
+fn frame(conn: &Connection, player: &Car, frequency: u32) -> rusqlite::Result<Vec<Car>> {
     let Some(time) = player.time else {
         return Ok(Vec::new());
     };
 
+    // Keep the default frame unchanged; sparse recordings need a full opponent cycle,
+    // with slack for polling and rows for the rest of the field.
+    let (window, max_age) = if frequency > 5 {
+        let previous = conn
+            .prepare_cached(
+                "SELECT session_time FROM telemetry WHERE is_player = 1 AND id < ?1 \
+                 ORDER BY id DESC LIMIT 1",
+            )?
+            .query_row([player.id], |row| row.get::<_, Option<f64>>(0))
+            .optional()?
+            .flatten();
+        let interval = previous.map_or(0.0, |previous| (time - previous).max(0.0));
+        (
+            FRAME_WINDOW * ((i64::from(frequency) + 4) / 5),
+            MAX_FRAME_AGE.max(interval * f64::from(frequency) * 1.5),
+        )
+    } else {
+        (FRAME_WINDOW, MAX_FRAME_AGE)
+    };
     let mut statement = conn.prepare_cached(&format!(
         "SELECT {CAR_COLUMNS} FROM telemetry WHERE id BETWEEN ?1 AND ?2"
     ))?;
-    let rows = statement.query_map([player.id - FRAME_WINDOW, player.id + FRAME_WINDOW], car)?;
+    let rows = statement.query_map([player.id - window, player.id + window], car)?;
 
     // Per car, the row closest in time (then in id) to the player's
     let mut best = HashMap::<i64, ((f64, i64), Car)>::new();
@@ -705,7 +726,7 @@ fn frame(conn: &Connection, player: &Car) -> rusqlite::Result<Vec<Car>> {
             continue;
         }
         let key = ((car_time - time).abs(), (car.id - player.id).abs());
-        if key.0 >= MAX_FRAME_AGE {
+        if key.0 >= max_age {
             continue;
         }
         if best.get(&car.vehicle).is_none_or(|(best, _)| key < *best) {
@@ -1048,6 +1069,8 @@ impl Logic {
     /// Follows the cars beside the player: they count once they've been there `debounce`, and
     /// stop counting past the (wider) exit distances.
     fn track(&mut self, config: &SpotterConfig, player: &Car, others: &[Car], t: f64) {
+        self.pending
+            .retain(|vehicle, _| others.iter().any(|other| other.vehicle == *vehicle));
         let mut seen = Vec::new();
         for other in others {
             if other.x.is_none() || other.z.is_none() || other.in_pit_lane {
@@ -1688,6 +1711,73 @@ mod tests {
         // Alongside for less than the debounce: nothing
         assert!(run(&mut logic, 0.0, 0.08, &[other(2, 1.0, -3.0)]).is_empty());
         assert!(run(&mut logic, 0.08, 0.5, &[]).is_empty());
+    }
+
+    #[test]
+    fn missing_car_restarts_the_debounce() {
+        let mut logic = Logic::default();
+        let config = SpotterConfig::default();
+        let others = [other(2, 1.0, 3.0)];
+        logic.track(&config, &player(0.0).car, &others, 0.0);
+        logic.track(&config, &player(0.1).car, &[], 0.1);
+        assert!(logic.pending.is_empty());
+        logic.track(&config, &player(1.0).car, &others, 1.0);
+        assert!(logic.overlap.is_empty());
+        logic.track(&config, &player(1.2).car, &others, 1.2);
+        assert!(logic.overlap.get(&2) == Some(&Side::Right));
+    }
+
+    #[test]
+    fn sparse_frames_keep_traffic_until_it_really_clears() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE telemetry (
+                id INTEGER PRIMARY KEY, vehicle_id INTEGER, session_time REAL,
+                is_player INTEGER, in_pit_lane INTEGER, speed REAL,
+                position_x REAL, position_y REAL, position_z REAL, heading REAL
+            );",
+        )
+        .unwrap();
+        let mut logic = Logic::default();
+        let mut calls = Vec::new();
+        let mut default_expired = false;
+        for tick in 0..240 {
+            let t = tick as f64 / 60.0;
+            // Sixty opponents, recorded once a second; the player is kept at 60 Hz.
+            if tick % 60 == 0 {
+                for vehicle in 2..=61 {
+                    let x = if vehicle == 2 { -3.0 } else { -100.0 };
+                    let z = -50.0 * t + if tick < 120 { 0.0 } else { -100.0 };
+                    conn.execute(
+                        "INSERT INTO telemetry VALUES (NULL, ?1, ?2, 0, 0, 50, ?3, 0, ?4, 0)",
+                        rusqlite::params![vehicle, t, x, z],
+                    )
+                    .unwrap();
+                }
+            }
+            conn.execute(
+                "INSERT INTO telemetry VALUES (NULL, 1, ?1, 1, 0, 50, 0, 0, 0, 0)",
+                [t],
+            )
+            .unwrap();
+            let mut p = player(t);
+            p.car.id = conn.last_insert_rowid();
+            p.car.z = Some(-50.0 * t);
+            let others = frame(&conn, &p.car, 60).unwrap();
+            assert_eq!(others.len(), 60);
+            if tick == 59 {
+                default_expired = frame(&conn, &p.car, 5).unwrap().is_empty();
+            }
+            calls.extend(texts(logic.update(
+                &SpotterConfig::default(),
+                &p,
+                &others,
+                &Wheels::default(),
+                None,
+            )));
+        }
+        assert!(default_expired);
+        assert_eq!(calls, ["car right", "clear right"]);
     }
 
     #[test]
