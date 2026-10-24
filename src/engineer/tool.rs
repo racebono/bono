@@ -1730,6 +1730,19 @@ fn best_lap(laps: &[Lap]) -> Option<&Lap> {
 
 // --------------------------------------------------------------------------- stint / strategy
 
+/// The longest race clock we accept; anything past this is a bad input, not a race.
+const MAX_RACE_TIME_LEFT: f64 = 48.0 * 3600.0;
+
+/// Steps after `first`, `step` apart, until reaching `target`: the smallest `k >= 0` with
+/// `first + k * step >= target`. Closed form, so a huge `target` can't spin forever.
+fn steps_to(first: f64, step: f64, target: f64) -> f64 {
+    if first >= target {
+        0.0
+    } else {
+        ((target - first) / step).ceil()
+    }
+}
+
 /// Laps the player still has to drive (including the rest of this one), and where that came from.
 fn race_need(
     ctx: &Ctx,
@@ -1771,8 +1784,17 @@ fn race_need(
         needs.push((n.max(0.0), format!("{max_laps} lap race")));
     }
 
-    let time_left = args.race_time_left.or_else(|| sc.time_left(Some(now)));
-    if let (Some(time_left), Some(avg)) = (time_left, avg_time.filter(|a| *a > 0.0)) {
+    if let Some(t) = args.race_time_left
+        && !(t.is_finite() && (0.0..=MAX_RACE_TIME_LEFT).contains(&t))
+    {
+        bail!("race_time_left must be between 0 and {MAX_RACE_TIME_LEFT} seconds, got {t}");
+    }
+    let time_left = args
+        .race_time_left
+        .or_else(|| sc.time_left(Some(now)))
+        .filter(|t| t.is_finite() && *t <= MAX_RACE_TIME_LEFT);
+    let lap_ok = |t: &f64| t.is_finite() && *t > 0.0;
+    if let (Some(time_left), Some(avg)) = (time_left, avg_time.filter(lap_ok)) {
         // The flag falls when the leader crosses the line after the clock runs out; you then
         // finish your lap
         let mut t_flag = now + time_left;
@@ -1783,32 +1805,24 @@ fn race_need(
                 let leader_row = leader.i("vehicle_id").and_then(|v| frame.get(&v));
                 let leader_lap = leader
                     .f("last_lap_time")
-                    .filter(|t| *t > 0.0)
-                    .or_else(|| leader.f("estimated_lap_time").filter(|t| *t > 0.0))
+                    .filter(lap_ok)
+                    .or_else(|| leader.f("estimated_lap_time").filter(lap_ok))
                     .unwrap_or(avg);
-                if let Some(start) = leader_row.and_then(|r| r.f("lap_start_time")) {
-                    let mut cross = start + leader_lap;
-                    while cross < now + time_left {
-                        cross += leader_lap;
-                    }
-                    t_flag = cross;
+                if let Some(start) = leader_row
+                    .and_then(|r| r.f("lap_start_time"))
+                    .filter(|t| t.is_finite())
+                {
+                    let first = start + leader_lap;
+                    t_flag = first + steps_to(first, leader_lap, now + time_left) * leader_lap;
                 }
             }
             _ => {
-                let mut cross = now + (1.0 - frac) * avg;
-                while cross < now + time_left {
-                    cross += avg;
-                }
-                t_flag = cross;
+                let first = now + (1.0 - frac) * avg;
+                t_flag = first + steps_to(first, avg, now + time_left) * avg;
             }
         }
 
-        let mut mine = now + (1.0 - frac) * avg;
-        let mut n = 1.0 - frac;
-        while mine < t_flag - 0.5 {
-            mine += avg;
-            n += 1.0;
-        }
+        let n = 1.0 - frac + steps_to(now + (1.0 - frac) * avg, avg, t_flag - 0.5);
         let source = if args.race_time_left.is_none() {
             " (from the session)"
         } else {
@@ -4416,6 +4430,17 @@ mod tests {
             has_pedals: true,
             ok: true,
         }
+    }
+
+    #[test]
+    fn steps_to_matches_stepping_and_stays_bounded() {
+        assert_eq!(steps_to(10.0, 5.0, 3.0), 0.0);
+        assert_eq!(steps_to(10.0, 5.0, 10.0), 0.0);
+        assert_eq!(steps_to(10.0, 5.0, 10.1), 1.0);
+        assert_eq!(steps_to(10.0, 5.0, 20.0), 2.0);
+        assert_eq!(steps_to(10.0, 5.0, 20.1), 3.0);
+        // Used to loop (near) forever
+        assert!(steps_to(0.0, 90.0, 1e19).is_finite());
     }
 
     #[test]
