@@ -30,7 +30,9 @@ jobs:
                   persist-credentials: false
 
             # Testing the whole workspace on Windows also builds the LMU plugin, which needs the SDK.
+            # Fork PRs don't get the secret, so they test everything but the plugin.
             - name: Set up LMU plugin SDK
+              id: lmu-sdk
               env:
                   GH_TOKEN: ${{ secrets.LMU_SDK_READ_TOKEN }}
                   SDK_REPO: Aandreba/lmu-sdk
@@ -40,7 +42,9 @@ jobs:
               run: |
                   $ErrorActionPreference = 'Stop'
                   if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
-                    throw 'LMU_SDK_READ_TOKEN is not configured'
+                    Write-Host '::notice::LMU_SDK_READ_TOKEN is not available; skipping the LMU plugin'
+                    "available=false" >> $env:GITHUB_OUTPUT
+                    exit 0
                   }
 
                   $download = Join-Path $env:RUNNER_TEMP 'lmu-sdk-download'
@@ -59,6 +63,7 @@ jobs:
 
                   Expand-Archive -LiteralPath $archive -DestinationPath $headers
                   "LMU_DIR=$root" >> $env:GITHUB_ENV
+                  "available=true" >> $env:GITHUB_OUTPUT
 
             - name: Set up x64 MSVC
               uses: ilammy/msvc-dev-cmd@v1
@@ -99,6 +104,9 @@ jobs:
 
             # CPU-only: the tests don't exercise the CUDA or Vulkan Whisper backends.
             - name: Run tests
+              env:
+                  LMU_SDK: ${{ steps.lmu-sdk.outputs.available }}
               run: |
-                  cargo test --locked --workspace --no-default-features
+                  $exclude = if ($env:LMU_SDK -eq 'true') { @() } else { @('--exclude', 'bono-lmu') }
+                  cargo test --locked --workspace --no-default-features @exclude
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
