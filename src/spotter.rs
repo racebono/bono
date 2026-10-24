@@ -961,7 +961,16 @@ impl Logic {
 
         self.traffic(config, p, others, t, quiet, &mut calls);
         if let Some(prev) = self.prev.take() {
-            self.alerts(config, player, &prev, wheels, t, formation_lap, &mut calls);
+            let race = scoring.is_some_and(|s| s.session_type.as_deref() == Some("race"));
+            self.alerts(
+                config,
+                player,
+                &prev,
+                wheels,
+                t,
+                race && !formation_lap,
+                &mut calls,
+            );
         }
         if let Some(scoring) = scoring {
             self.flags(scoring, &mut calls);
@@ -1109,7 +1118,7 @@ impl Logic {
         prev: &Player,
         wheels: &Wheels,
         t: f64,
-        formation_lap: bool,
+        race_gap: bool,
         calls: &mut Calls,
     ) {
         let rose = |now: bool, before: bool| now && !before;
@@ -1137,7 +1146,8 @@ impl Logic {
         }
 
         // A car closing to within a second, called again only once it's dropped back. Not on the
-        // formation lap, where the field runs nose to tail
+        // formation lap, where the field runs nose to tail. Standings gaps outside races
+        // do not describe proximity on track
         let gap = p.gap_behind.unwrap_or(0.0);
         if gap != 0.0 && gap >= *config.gap_behind_off() {
             self.gap_armed = true;
@@ -1146,7 +1156,7 @@ impl Logic {
             && self.gap_armed
             && !p.car.in_pit_lane
             && t > GAP_BEHIND_AFTER
-            && !formation_lap
+            && race_gap
         {
             self.gap_armed = false;
             calls.raise(
@@ -1846,10 +1856,14 @@ mod tests {
     fn calls_a_car_closing_behind_once() {
         let config = SpotterConfig::default();
         let mut logic = Logic::default();
+        let scoring = Scoring {
+            session_type: Some("race".into()),
+            ..Scoring::default()
+        };
         let mut at = |t: f64, gap: f64| {
             let mut p = player(t);
             p.gap_behind = Some(gap);
-            texts(logic.update(&config, &p, &[], &Wheels::default(), None))
+            texts(logic.update(&config, &p, &[], &Wheels::default(), Some(&scoring)))
         };
 
         assert!(at(30.0, 2.0).is_empty());
@@ -1859,6 +1873,31 @@ mod tests {
         // Dropped back and closed again
         assert!(at(30.3, 1.6).is_empty());
         assert_eq!(at(30.4, 0.1), ["car close behind"]);
+    }
+
+    #[test]
+    fn does_not_call_standings_gaps_outside_races() {
+        let config = SpotterConfig::default();
+        for kind in [Some("practice"), Some("qualifying"), Some("warmup"), None] {
+            for gap in [0.8, 0.1] {
+                let scoring = Scoring {
+                    session_type: kind.map(str::to_owned),
+                    ..Scoring::default()
+                };
+                for scoring in [Some(&scoring), None] {
+                    let mut logic = Logic::default();
+                    for (t, gap) in [(30.0, 2.0), (30.1, gap)] {
+                        let mut p = player(t);
+                        p.gap_behind = Some(gap);
+                        assert!(
+                            logic
+                                .update(&config, &p, &[], &Wheels::default(), scoring)
+                                .is_empty()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
