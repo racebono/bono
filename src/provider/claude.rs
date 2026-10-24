@@ -472,8 +472,11 @@ impl Conversation {
             // follow the turn with their `tool_use` blocks, a `pause_turn` resumes from it, and
             // thinking blocks are only valid in an unedited history. Except when it ended with
             // tool calls that won't run (cut off, or declined): a `tool_use` without its result
-            // would make every later request fail
-            if !response.content.is_empty() && (stop.is_none() || calls.is_empty()) {
+            // would make every later request fail. Keep only the text in that case.
+            if stop.is_some() && !calls.is_empty() {
+                response.content.retain(|block| block["type"] == "text");
+            }
+            if !response.content.is_empty() {
                 self.body.messages.push(RequestMessage {
                     role: "assistant",
                     content: serde_json::Value::Array(response.content),
@@ -2503,6 +2506,37 @@ mod tests {
         assert_eq!(result["type"], "tool_result");
         assert_eq!(result["tool_use_id"], "t1");
         assert_eq!(result["content"], "looked up \"gap\"");
+    }
+
+    #[tokio::test]
+    async fn keeps_text_from_cut_off_tool_turns() {
+        let text = json!({"type": "text", "text": "Checking the gap."});
+        let (url, requests) = mock(vec![
+            message(
+                "max_tokens",
+                json!([
+                    {"type": "thinking", "thinking": "Checking", "signature": "signed"},
+                    {"type": "redacted_thinking", "data": "hidden"},
+                    text.clone(),
+                    {"type": "tool_use", "id": "t1", "name": "lookup", "input": {}}
+                ]),
+            ),
+            message("end_turn", json!([{"type": "text", "text": "Done."}])),
+        ])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+        let reply = send(&mut conversation, "Gap?").await.unwrap();
+        assert_eq!(reply.stop, StopReason::MaxTokens);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(conversation.body.messages[1].content, json!([text.clone()]));
+        send(&mut conversation, "And now?").await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[1]["messages"][1],
+            json!({"role": "assistant", "content": [text]})
+        );
+        assert_eq!(requests[1]["messages"][2]["role"], "user");
     }
 
     #[tokio::test]
