@@ -1088,10 +1088,18 @@ impl Scoring {
     /// The newest forecast for a session type ("race", "qualifying"...): its points, start to
     /// finish.
     fn forecast(conn: &Connection, session_type: &str) -> rusqlite::Result<Vec<Row>> {
+        // Older recordings have no set identity beyond the session clock.
+        let set = if conn.column_exists(None, "forecast", "generation")? {
+            "generation"
+        } else {
+            "session_time"
+        };
         rows(
             conn,
-            "SELECT * FROM forecast WHERE session_type = ? AND session_time = \
-             (SELECT session_time FROM forecast ORDER BY id DESC LIMIT 1) ORDER BY session_fraction",
+            &format!(
+                "SELECT * FROM forecast WHERE session_type = ? AND {set} = \
+                 (SELECT {set} FROM forecast ORDER BY id DESC LIMIT 1) ORDER BY session_fraction"
+            ),
             [session_type],
         )
     }
@@ -4448,6 +4456,26 @@ mod tests {
         sys::{bono_session_info, bono_standing, bono_telemetry},
     };
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn forecast_uses_newest_set_with_frozen_session_time() {
+        use bono_sim::{sql::ForecastWriter, sys::bono_forecast_point};
+
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        let mut writer = ForecastWriter::new(&conn).unwrap();
+        for chance in [0.9, 0.1] {
+            let mut point = bono_forecast_point::default();
+            point.session_time = Some(0.0).into();
+            point.session_type = Some("race".to_owned()).into();
+            point.session_fraction = Some(1.0).into();
+            point.rain_chance = Some(chance).into();
+            writer.write(vec![point]).unwrap();
+        }
+        let forecast = Scoring::forecast(&conn, "race").unwrap();
+        assert_eq!(forecast.len(), 1);
+        assert_eq!(forecast[0].f("rain_chance"), Some(0.1));
+    }
 
     #[test]
     fn opponent_moved_to_player_time() {
