@@ -895,6 +895,7 @@ impl Model {
                 client.get(format!("{FILE_URL}{}", self.file)),
                 path,
                 self.size,
+                self.sha256.clone().map(crate::DownloadDigest::Sha256),
             )
         })
     }

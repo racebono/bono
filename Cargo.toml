@@ -7,6 +7,7 @@ edition = "2024"
 base64 = "0.22"
 keyring = { version = "3.6.3", features = ["windows-native", "apple-native", "sync-secret-service", "crypto-rust"] }
 sha2 = "0.10"
+md-5 = "0.10"
 webbrowser = "1"
 bono-sim = { path = "sim" }
 bono-i18n = { path = "i18n" }

@@ -238,6 +238,7 @@ impl Catalog {
         #[derive(Deserialize)]
         struct RawFile {
             size_bytes: u64,
+            md5_digest: Option<String>,
         }
 
         let catalog = client
@@ -264,10 +265,10 @@ impl Catalog {
                     .files
                     .iter()
                     .find(|(path, _)| path.ends_with(extension) && is_relative_path(path))
-                    .map(|(path, file)| (path.clone(), file.size_bytes))
+                    .map(|(path, file)| (path.clone(), file.size_bytes, file.md5_digest.clone()))
             };
 
-            let (Some((model_file, model_size)), Some((_, config_size))) =
+            let (Some((model_file, model_size, model_md5)), Some((_, config_size, config_md5))) =
                 (file(".onnx"), file(".onnx.json"))
             else {
                 log::warn!("Skipping voice '{key}': missing model or config file");
@@ -291,6 +292,8 @@ impl Catalog {
                 model_file,
                 model_size,
                 config_size,
+                model_md5,
+                config_md5,
                 downloads: None,
             });
         }
@@ -450,6 +453,8 @@ struct Voice {
     model_file: String,
     model_size: u64,
     config_size: u64,
+    model_md5: Option<String>,
+    config_md5: Option<String>,
     /// The model's and the config's
     downloads: Option<[Download; 2]>,
 }
@@ -484,11 +489,13 @@ impl Voice {
                     client.get(format!("{FILE_URL}{}", self.model_file)),
                     path.to_path_buf(),
                     Some(self.model_size),
+                    self.model_md5.clone().map(crate::DownloadDigest::Md5),
                 ),
                 Download::new(
                     client.get(format!("{FILE_URL}{}.json", self.model_file)),
                     path.with_added_extension("json"),
                     Some(self.config_size),
+                    self.config_md5.clone().map(crate::DownloadDigest::Md5),
                 ),
             ]
         });
