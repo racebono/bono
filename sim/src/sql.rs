@@ -89,14 +89,19 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
 
         CREATE TABLE IF NOT EXISTS session (id INTEGER PRIMARY KEY{session});
         CREATE TABLE IF NOT EXISTS standings (id INTEGER PRIMARY KEY{standing});
-        CREATE TABLE IF NOT EXISTS forecast (id INTEGER PRIMARY KEY{forecast});",
+        CREATE TABLE IF NOT EXISTS forecast (id INTEGER PRIMARY KEY, generation INTEGER{forecast});",
         telemetry = bono_telemetry::DEFINITIONS,
         wheel = bono_wheel_telemetry::DEFINITIONS,
         state = bono_car_state::DEFINITIONS,
         session = bono_session_info::DEFINITIONS,
         standing = bono_standing::DEFINITIONS,
         forecast = bono_forecast_point::DEFINITIONS,
-    ))
+    ))?;
+    // A database left open by an older recorder can be reused after its rows are cleared.
+    if !conn.column_exists(None, "forecast", "generation")? {
+        conn.execute_batch("ALTER TABLE forecast ADD COLUMN generation INTEGER")?;
+    }
+    Ok(())
 }
 
 /// Deletes every row of every table.
@@ -277,7 +282,7 @@ impl<'conn> ForecastWriter<'conn> {
     pub fn new(conn: &'conn Connection) -> rusqlite::Result<Self> {
         Ok(Self {
             conn,
-            insert: prepare_insert::<bono_forecast_point>(conn, "forecast", &[])?,
+            insert: prepare_insert::<bono_forecast_point>(conn, "forecast", &["generation"])?,
             last: Vec::new(),
         })
     }
@@ -293,8 +298,14 @@ impl<'conn> ForecastWriter<'conn> {
         }
 
         let tx = self.conn.unchecked_transaction()?;
+        // The first row's id identifies this set even while the session clock is stopped.
+        let generation: i64 =
+            tx.query_row("SELECT coalesce(max(id), 0) + 1 FROM forecast", [], |row| {
+                row.get(0)
+            })?;
         for point in &points {
-            point.bind(&mut self.insert, 1)?;
+            self.insert.raw_bind_parameter(1, generation)?;
+            point.bind(&mut self.insert, 2)?;
             self.insert.raw_execute()?;
         }
         tx.commit()?;

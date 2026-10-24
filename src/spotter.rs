@@ -793,15 +793,20 @@ fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scor
         scoring.penalties = penalties;
     }
 
-    // The forecast is LMU's only, written as a whole set of rows (same `session_time`) when it
-    // changes
+    // The forecast is LMU's only, written as a whole set of rows when it changes
     if let Some(kind) = &scoring.session_type {
-        let mut statement = conn.prepare_cached(
+        // Older recordings have no set identity beyond the session clock.
+        let set = if conn.column_exists(None, "forecast", "generation")? {
+            "generation"
+        } else {
+            "session_time"
+        };
+        let mut statement = conn.prepare_cached(&format!(
             "SELECT session_fraction, rain_chance FROM forecast WHERE session_type = ?1 \
-             AND session_time = (SELECT session_time FROM forecast \
+             AND {set} = (SELECT {set} FROM forecast \
              WHERE ?2 IS NULL OR session_time <= ?2 ORDER BY id DESC LIMIT 1) \
              ORDER BY session_fraction",
-        )?;
+        ))?;
         let points = statement.query_map(rusqlite::params![kind, upto], |row| {
             Ok((row.get::<_, Option<f64>>(0)?, row.get::<_, Option<f64>>(1)?))
         })?;
@@ -1418,6 +1423,63 @@ pub fn translate(text: &'static str, lang: ArrayStr<2>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoring_uses_newest_forecast_set_with_frozen_session_time() {
+        use bono_sim::{sql::ForecastWriter, sys::bono_forecast_point};
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE forecast (id INTEGER PRIMARY KEY{})",
+            <bono_forecast_point as bono_sim::sql::Columns>::DEFINITIONS
+        ))
+        .unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session (session_time, session_type) VALUES (0, 'race')",
+            [],
+        )
+        .unwrap();
+        let point = |time, kind: &str, fraction, chance| {
+            let mut point = bono_forecast_point::default();
+            point.session_time = Some(time).into();
+            point.session_type = Some(kind.to_owned()).into();
+            point.session_fraction = Some(fraction).into();
+            point.rain_chance = Some(chance).into();
+            point
+        };
+        let mut writer = ForecastWriter::new(&conn).unwrap();
+        for time in [0.0, 20.0] {
+            writer
+                .write(vec![
+                    point(time, "race", 0.0, 0.0),
+                    point(time, "race", 0.5, 0.9),
+                    point(time, "race", 1.0, 0.8),
+                ])
+                .unwrap();
+            writer
+                .write(vec![
+                    point(time, "qualifying", 0.0, 0.7),
+                    point(time, "race", 0.0, 0.0),
+                    point(time, "race", 1.0, 0.1),
+                ])
+                .unwrap();
+            for upto in [None, Some(time)] {
+                assert_eq!(
+                    scoring(&conn, upto).unwrap().unwrap().forecast,
+                    vec![(0.0, 0.0), (1.0, 0.1)]
+                );
+            }
+        }
+        assert_eq!(
+            scoring(&conn, Some(0.0)).unwrap().unwrap().forecast,
+            vec![(0.0, 0.0), (1.0, 0.1)]
+        );
+        writer
+            .write(vec![point(30.0, "qualifying", 0.0, 0.6)])
+            .unwrap();
+        assert!(scoring(&conn, None).unwrap().unwrap().forecast.is_empty());
+    }
 
     #[test]
     fn failed_warmups_wait_for_backoff_for_the_same_key() {
