@@ -291,7 +291,6 @@ settings! {
         pub whisper_model: Option<Arc<Utf8Path>> = None,
         pub text_scale: f32 = 1.3,
         pub min_confidence: f32 = 0.1,
-        pub skill_path: Utf8PathBuf = Utf8PathBuf::from("skill"),
         /// The setup guide's version the pilot last finished (or skipped): an older one shows it
         /// again
         pub onboarding: u32 = 0,

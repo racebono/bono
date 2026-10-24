@@ -24,7 +24,7 @@ def read(path):
     return (root / path).read_text(encoding='utf-8')
 
 
-skill = read('assets/skill/SKILL.md')
+skill = read('skill/SKILL.md')
 system = skill.split('\n---', 1)[1].lstrip() if skill.startswith('---') else skill
 tool = read('src/engineer/tool.rs')
 schema = tool.split('pub fn input_schema()', 1)[1].split('serde_json::json!(', 1)[1].split('\n        })', 1)[0] + '\n        }'

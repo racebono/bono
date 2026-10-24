@@ -194,7 +194,7 @@ Release builds load assets next to the executable, so use the complete `dist/` f
 - `phonemizer/`: separate espeak-ng helper process for speech synthesis.
 - `i18n/`: translations and translation macros; strings live in `i18n/intl.json`.
 - `include/bono/`: C headers shared by plugins and generated Rust bindings.
-- `assets/skill/`: race-engineer instructions and telemetry schema reference.
+- `skill/`: race-engineer instructions and telemetry references, embedded at build time.
 - `xtask/`: release packaging.
 
 Useful checks, using CPU-only application features:

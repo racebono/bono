@@ -388,14 +388,14 @@ mod tests {
     use super::*;
     use crate::engineer::tool::Engineer;
 
-    const SKILL: &str = include_str!("../../assets/skill/SKILL.md");
+    const SKILL: &str = super::super::tool::SKILL;
 
     fn real() -> Vec<SkillDocs> {
         skill_docs(SKILL, &Engineer::input_schema())
     }
 
     #[test]
-    fn documents_all_six_commands_from_the_installed_skill() {
+    fn documents_all_six_commands_from_the_embedded_skill() {
         let docs = real();
         let context = context(&docs, Some("Race session.".into())).unwrap();
         assert_eq!(context.validate(), Ok(()));

@@ -122,10 +122,8 @@ impl App {
         let guard = config.get();
         let gui = Gui::new(&pref_path, &subsystems, &guard, &client, account.as_ref());
         let synth = Synthesizer::new(rt, &guard);
-        let (tracks, engineer) = tokio::try_join!(
-            async move { Ok(tracks.await) },
-            Engineer::new(assets_path.as_std_path(), &guard, client, account.clone())
-        )?;
+        let engineer = Engineer::new(client, account.clone());
+        let tracks = tracks.await;
         drop(guard);
 
         return Ok(Self {
