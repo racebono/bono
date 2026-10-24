@@ -318,11 +318,40 @@ impl AudioTopbar {
         };
     }
 
+    /// Stop using an unplugged microphone, including any unfinished recording.
+    pub fn microphone_removed(&mut self, which: u32) -> bool {
+        if !self.microphone.removed(which) {
+            return false;
+        }
+        self.whisper.cancel_recording();
+        self.meter = None;
+        true
+    }
+
+    /// Retry only a missing device, preserving an already open device and the saved pick.
+    pub fn device_added(&mut self, recording: bool, audio: &AudioSubsystem, config: &RawConfig) {
+        let (selector, kind) = if recording {
+            (&mut self.microphone, Kind::Recording)
+        } else {
+            (&mut self.speaker, Kind::Playback)
+        };
+        selector.next = Instant::now();
+        if selector.open.is_none() {
+            selector.open = kind.open(audio, kind.config(config));
+            if recording {
+                self.meter = None;
+            }
+        }
+    }
+
     /// The speaker `which` is gone (unplugged): nothing plays on it any more, and if it's the one
-    /// picked, nothing is played until a speaker is picked again. Returns whether it was.
+    /// picked, nothing is played until it reconnects or another is picked. Returns whether it was.
     pub fn speaker_removed(&mut self, which: u32) -> bool {
         for playback in [&mut self.test_playback, &mut self.beep_playback] {
-            if playback.as_ref().is_some_and(|stream| plays_on(stream, which)) {
+            if playback
+                .as_ref()
+                .is_some_and(|stream| plays_on(stream, which))
+            {
                 *playback = None;
             }
         }
@@ -371,7 +400,10 @@ impl DeviceSelector {
 
     /// The device `which` is gone: it's closed if it's the one open. Returns whether it was.
     fn removed(&mut self, which: u32) -> bool {
-        let open = self.open.as_ref().is_some_and(|open| open.id().id() == which);
+        let open = self
+            .open
+            .as_ref()
+            .is_some_and(|open| open.id().id() == which);
         if open {
             self.open = None;
         }
@@ -623,10 +655,20 @@ impl Kind {
         device: &AudioDevice,
     ) -> Option<sdl3::audio::AudioDevice> {
         log::debug!("{device:#?}");
+        // SDL IDs are transient: a reconnected device has a new ID. Resolve the saved
+        // name whenever opening, including a device that was absent at startup.
+        let resolved;
         let device = match device {
             AudioDevice::Default => None,
-            AudioDevice::Device(id, _) => Some(id),
-            AudioDevice::Unknown(_) => return None,
+            AudioDevice::Device(_, name) | AudioDevice::Unknown(name) => {
+                let mut devices = Vec::new();
+                if let Err(e) = self.enumerate(audio, &mut devices) {
+                    log::warn!("Couldn't resolve audio device: {e}");
+                    return None;
+                }
+                resolved = resolve_device(name, &devices)?;
+                Some(&resolved)
+            }
         };
 
         let res = match self {
@@ -686,5 +728,44 @@ impl Kind {
         }
 
         return Ok(());
+    }
+}
+
+/// Match names only within the requested kind's current device inventory.
+fn resolve_device(name: &str, devices: &[(AudioDeviceID, Arc<str>)]) -> Option<AudioDeviceID> {
+    devices
+        .iter()
+        .find(|(_, candidate)| candidate.as_ref() == name)
+        .map(|(id, _)| *id)
+}
+
+#[cfg(test)]
+mod hotplug_tests {
+    use super::*;
+
+    #[test]
+    fn saved_name_resolves_to_the_current_id_after_reconnection() {
+        let old = [(
+            AudioDeviceID::Device(sdl3::sys::audio::SDL_AudioDeviceID(10)),
+            Arc::from("Headset"),
+        )];
+        let new = [(
+            AudioDeviceID::Device(sdl3::sys::audio::SDL_AudioDeviceID(20)),
+            Arc::from("Headset"),
+        )];
+        assert_eq!(
+            resolve_device("Headset", &old),
+            Some(AudioDeviceID::Device(sdl3::sys::audio::SDL_AudioDeviceID(
+                10
+            )))
+        );
+        assert_eq!(resolve_device("Headset", &[]), None);
+        assert_eq!(
+            resolve_device("Headset", &new),
+            Some(AudioDeviceID::Device(sdl3::sys::audio::SDL_AudioDeviceID(
+                20
+            )))
+        );
+        assert_eq!(resolve_device("Other microphone", &new), None);
     }
 }
