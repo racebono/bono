@@ -9,6 +9,7 @@ use crate::{
     sim::{PluginStatus, Simulator, SimulatorInfo, SimulatorSettings},
     sqlite::{Database, pool::Pool},
     steam::{self},
+    task::MaybeDone,
 };
 use bono_sim::recorder::{DATABASE, SETTINGS, try_remove_database};
 use serde_json::{Map, Value};
@@ -55,7 +56,7 @@ impl LeMansUltimate {
 
     /// Changes settings.json, keeping what else is in it (the plugin acts on any value that
     /// changes). Does nothing if the game isn't installed.
-    fn update_settings(
+    async fn update_settings(
         &mut self,
         change: impl FnOnce(&mut Map<String, Value>),
     ) -> anyhow::Result<()> {
@@ -64,16 +65,17 @@ impl LeMansUltimate {
         };
 
         let path = folder.join(SETTINGS);
-        let mut settings = std::fs::read(&path)
+        let mut settings = tokio::fs::read(&path)
+            .await
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Map<String, Value>>(&bytes).ok())
             .unwrap_or_default();
         change(&mut settings);
 
-        std::fs::create_dir_all(&folder)?;
+        tokio::fs::create_dir_all(&folder).await?;
         let mut json = serde_json::to_vec_pretty(&settings)?;
         json.push(b'\n');
-        write_replacing(&path, &json)?;
+        write_replacing(&path, &json).await?;
         Ok(())
     }
 }
@@ -137,8 +139,8 @@ impl Simulator for LeMansUltimate {
         }
     }
 
-    fn plugin(&mut self) -> Option<PluginStatus> {
-        Some(plugin::status(self.install_dir().as_deref()))
+    fn plugin(&mut self) -> Option<MaybeDone<PluginStatus>> {
+        Some(MaybeDone::spawn(plugin::status(self.install_dir())))
     }
 
     fn install_plugin(&mut self) -> anyhow::Result<()> {
@@ -194,10 +196,10 @@ async fn remove_when_closed(dir: PathBuf, pool: Pool) {
 
 /// Writes a temporary file and moves it over `path`, so the plugin never reads half a file: a
 /// half-read "clear" count would look like a new request. The game neither (half a DLL).
-fn write_replacing(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+async fn write_replacing(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let mut temp = path.as_os_str().to_owned();
     temp.push(".tmp");
     let temp = PathBuf::from(temp);
-    std::fs::write(&temp, contents)?;
-    std::fs::rename(&temp, path)
+    tokio::fs::write(&temp, contents).await?;
+    tokio::fs::rename(&temp, path).await
 }

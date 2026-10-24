@@ -5,11 +5,16 @@
 //! (a local build, or a damaged or modified file) is told apart.
 
 use super::write_replacing;
-use crate::sim::{PluginStatus, Version};
+use crate::{
+    sim::{PluginStatus, Version},
+    task::{JoinHandle, spawn_blocking},
+};
 use anyhow::Context;
+use futures::{StreamExt, join, stream::FuturesUnordered};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use tokio::try_join;
 
 /// The DLL's name, in the app's `plugins` folder and the game's `Plugins` folder.
 const DLL: &str = "bono_lmu.dll";
@@ -20,54 +25,69 @@ const ENABLED: &str = " Enabled";
 
 /// The plugin as installed in `install_dir` (the game's folder, if it's installed), and the copy
 /// that comes with the app.
-pub fn status(install_dir: Option<&Path>) -> PluginStatus {
-    let installed_dll = install_dir.map(installed_dll).filter(|dll| dll.is_file());
-    let bundled_dll = bundled_dll();
-    let enabled = install_dir.is_some_and(|dir| {
-        read_settings(&settings_path(dir))
-            .ok()
-            .and_then(|settings| settings.get(DLL).cloned())
-            .and_then(|plugin| plugin.get(ENABLED).and_then(Value::as_i64))
-            .is_some_and(|enabled| enabled != 0)
-    });
+pub async fn status(install_dir: Option<PathBuf>) -> PluginStatus {
+    let bundled_dll = bundled_dll().await;
+    let installed_dll = install_dir
+        .as_deref()
+        .map(installed_dll)
+        .filter(|dll| dll.is_file());
 
-    let same_as_bundled = match (&installed_dll, &bundled_dll) {
-        (Some(installed), Some(bundled)) => match (digest(installed), digest(bundled)) {
-            (Ok(installed), Ok(bundled)) => Some(installed == bundled),
-            (Err(e), _) | (_, Err(e)) => {
-                log::warn!("Couldn't hash the Le Mans Ultimate plugin: {e}");
-                None
-            }
-        },
-        _ => None,
+    let installed = installed_dll.as_deref().map(version);
+    let bundled = bundled_dll.as_deref().map(version);
+
+    let enabled = async {
+        if let Some(ref dir) = install_dir {
+            return read_settings(&settings_path(dir))
+                .await
+                .ok()
+                .and_then(|settings| settings.get(DLL).cloned())
+                .and_then(|plugin| plugin.get(ENABLED).and_then(Value::as_i64))
+                .is_some_and(|enabled| enabled != 0);
+        }
+        return false;
     };
 
+    let same_as_bundled = async {
+        match (installed_dll, bundled_dll) {
+            (Some(installed), Some(bundled)) => match try_join!(digest(installed), digest(bundled))
+            {
+                Ok((installed, bundled)) => Some(installed == bundled),
+                Err(e) => {
+                    log::warn!("Couldn't hash the Le Mans Ultimate plugin: {e}");
+                    None
+                }
+            },
+            _ => None,
+        }
+    };
+
+    let (enabled, same_as_bundled) = join!(enabled, same_as_bundled);
     PluginStatus {
-        installed: installed_dll.as_deref().map(version),
+        installed,
         enabled,
-        bundled: bundled_dll.as_deref().map(version),
+        bundled,
         same_as_bundled,
     }
 }
 
 /// Copies the app's DLL into the game's `Plugins` folder, replacing the one there, and enables it.
 /// Fails while the game runs, since it keeps the DLL it loaded open.
-pub fn install(install_dir: &Path) -> anyhow::Result<()> {
-    let Some(bundled) = bundled_dll() else {
+pub async fn install(install_dir: &Path) -> anyhow::Result<()> {
+    let Some(bundled) = bundled_dll().await else {
         anyhow::bail!("{DLL} isn't next to the app");
     };
-    install_from(&bundled, install_dir)
+    install_from(&bundled, install_dir).await
 }
 
-fn install_from(bundled: &Path, install_dir: &Path) -> anyhow::Result<()> {
+async fn install_from(bundled: &Path, install_dir: &Path) -> anyhow::Result<()> {
     // Validate existing settings before replacing the DLL or changing any files.
     let path = settings_path(install_dir);
-    let mut settings = read_settings(&path)?;
+    let mut settings = read_settings(&path).await?;
     let dll = installed_dll(install_dir);
     if let Some(plugins) = dll.parent() {
         std::fs::create_dir_all(plugins)?;
     }
-    write_replacing(&dll, &std::fs::read(bundled)?)?;
+    write_replacing(&dll, &tokio::fs::read(bundled).await?).await?;
 
     // Keeps whatever else is in it: every other plugin's settings, and ours
     let plugin = settings
@@ -82,11 +102,11 @@ fn install_from(bundled: &Path, install_dir: &Path) -> anyhow::Result<()> {
         .insert(ENABLED.into(), 1.into());
 
     if let Some(player) = path.parent() {
-        std::fs::create_dir_all(player)?;
+        tokio::fs::create_dir_all(player).await?;
     }
     let mut json = serde_json::to_vec_pretty(&settings)?;
     json.push(b'\n');
-    write_replacing(&path, &json)?;
+    write_replacing(&path, &json).await?;
     Ok(())
 }
 
@@ -101,8 +121,8 @@ fn settings_path(install_dir: &Path) -> PathBuf {
 }
 
 /// Empty only if it's missing (the game makes it on its first run).
-fn read_settings(path: &Path) -> anyhow::Result<Map<String, Value>> {
-    let bytes = match std::fs::read(path) {
+async fn read_settings(path: &Path) -> anyhow::Result<Map<String, Value>> {
+    let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
         Err(error) => {
@@ -115,19 +135,37 @@ fn read_settings(path: &Path) -> anyhow::Result<Map<String, Value>> {
 
 /// The DLL that comes with the app: in `plugins` next to it once packaged (`cargo xtask dist`), or
 /// right next to it when built with the workspace (`cargo build --workspace`).
-fn bundled_dll() -> Option<PathBuf> {
+async fn bundled_dll() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    [dir.join("plugins").join(DLL), dir.join(DLL)]
+
+    let mut it = [dir.join("plugins").join(DLL), dir.join(DLL)]
         .into_iter()
-        .find(|dll| dll.is_file())
+        .map(|dll| async move {
+            tokio::fs::metadata(&dll)
+                .await
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+                .then_some(dll)
+        })
+        .collect::<FuturesUnordered<_>>();
+
+    while let Some(dll) = it.next().await {
+        if dll.is_some() {
+            return dll;
+        }
+    }
+
+    return None;
 }
 
 /// The SHA-256 of the DLL's contents.
-fn digest(dll: &Path) -> std::io::Result<[u8; 32]> {
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut std::fs::File::open(dll)?, &mut hasher)?;
-    Ok(hasher.finalize().into())
+fn digest(dll: PathBuf) -> JoinHandle<std::io::Result<[u8; 32]>> {
+    spawn_blocking(move || {
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut std::fs::File::open(dll)?, &mut hasher)?;
+        Ok(hasher.finalize().into())
+    })
 }
 
 /// The file version in the DLL's version resource, if it has one.
@@ -234,17 +272,17 @@ mod tests {
         assert_eq!(after.same_as_bundled, None);
     }
 
-    #[test]
-    fn digest_tells_copies_apart_by_contents() {
+    #[tokio::test]
+    async fn digest_tells_copies_apart_by_contents() {
         let dir = tempfile::tempdir().unwrap();
         let [a, b, c] = ["a.dll", "b.dll", "c.dll"].map(|name| dir.path().join(name));
-        std::fs::write(&a, b"plugin").unwrap();
-        std::fs::write(&b, b"plugin").unwrap();
-        std::fs::write(&c, b"plugin, modified").unwrap();
+        tokio::fs::write(&a, b"plugin").await.unwrap();
+        tokio::fs::write(&b, b"plugin").await.unwrap();
+        tokio::fs::write(&c, b"plugin, modified").await.unwrap();
 
-        assert_eq!(digest(&a).unwrap(), digest(&b).unwrap());
-        assert_ne!(digest(&a).unwrap(), digest(&c).unwrap());
-        assert!(digest(&dir.path().join("missing.dll")).is_err());
+        assert_eq!(digest(a.clone()).await.unwrap(), digest(b).await.unwrap());
+        assert_ne!(digest(a).await.unwrap(), digest(c).await.unwrap());
+        assert!(digest(dir.path().join("missing.dll")).await.is_err());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::{
     sqlite::pool::Pool,
     steam::{self, AppWatcher},
+    task::MaybeDone,
     track::TrackData,
 };
 use futures::future::select_all;
@@ -158,7 +159,7 @@ pub trait Simulator: Send {
 
     /// The plugin the game needs installed to be recorded, for games that need one: `None` for
     /// the others.
-    fn plugin(&mut self) -> Option<PluginStatus> {
+    fn plugin(&mut self) -> Option<MaybeDone<PluginStatus>> {
         None
     }
 
@@ -169,7 +170,6 @@ pub trait Simulator: Send {
 }
 
 /// What a game's plugin looks like on this computer.
-#[derive(Debug, Clone, Default)]
 pub struct PluginStatus {
     /// The copy in the game's folder: `None` if there isn't one, `Some(None)` if it doesn't say its
     /// version (it's older than the versioned ones)
