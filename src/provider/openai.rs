@@ -411,9 +411,21 @@ impl Response {
                     self.content.push_str(&content);
                 }
                 for piece in delta.tool_calls {
-                    let index = piece
-                        .index
-                        .unwrap_or(self.tool_calls.len().saturating_sub(1));
+                    let index = piece.index.unwrap_or_else(|| {
+                        let new_call = self.tool_calls.last().is_some_and(|call| {
+                            piece
+                                .id
+                                .as_ref()
+                                .is_some_and(|id| !call.id.is_empty() && *id != call.id)
+                                || (piece.function.as_ref().is_some_and(|f| f.name.is_some())
+                                    && !call.name.is_empty())
+                        });
+                        if new_call {
+                            self.tool_calls.len()
+                        } else {
+                            self.tool_calls.len().saturating_sub(1)
+                        }
+                    });
                     if self.tool_calls.len() <= index {
                         self.tool_calls.resize_with(index + 1, ToolCall::default);
                     }
@@ -887,6 +899,44 @@ mod tests {
         .await
         .expect("timed out")?;
         Ok((reply, pieces))
+    }
+
+    #[test]
+    fn assembles_indexless_parallel_tool_calls_and_continuations() {
+        for second in [
+            json!({"id": "call_2", "function": {"name": "lookup", "arguments": "{\"b\":2}"}}),
+            json!({"id": "call_2", "function": {"arguments": "{\"b\":2}"}}),
+            json!({"function": {"name": "lookup", "arguments": "{\"b\":2}"}}),
+        ] {
+            let mut response = Response::default();
+            let mut on_text = |_: &str| {};
+            let mut sink = TextSink::new(&mut on_text);
+            for piece in [
+                json!({"id": "call_1", "function": {"name": "lookup", "arguments": "{\"a\":"}}),
+                json!({"id": "call_1", "function": {"arguments": "1"}}),
+                json!({"function": {"arguments": "}"}}),
+                second.clone(),
+            ] {
+                let line = format!(
+                    "data: {}",
+                    json!({"choices": [{"delta": {"tool_calls": [piece]}}]})
+                );
+                response.line(line.as_bytes(), &mut sink).unwrap();
+            }
+            assert_eq!(response.tool_calls.len(), 2);
+            assert_eq!(response.tool_calls[0].id, "call_1");
+            assert_eq!(response.tool_calls[0].name, "lookup");
+            assert_eq!(response.tool_calls[0].arguments, "{\"a\":1}");
+            assert_eq!(
+                response.tool_calls[1].id,
+                second["id"].as_str().unwrap_or("")
+            );
+            assert_eq!(
+                response.tool_calls[1].name,
+                second["function"]["name"].as_str().unwrap_or("")
+            );
+            assert_eq!(response.tool_calls[1].arguments, "{\"b\":2}");
+        }
     }
 
     #[tokio::test]
