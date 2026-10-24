@@ -33,12 +33,14 @@ struct Found {
 }
 
 impl Found {
-    /// Whether the game is installed, and its plugin isn't (or is outdated, or disabled).
+    /// Whether the game is installed, and its plugin isn't (or is outdated, disabled, or not the
+    /// code its version should be).
     fn needs_setup(&self) -> bool {
         let Some(plugin) = self.install_dir.as_ref().and(self.plugin.as_ref()) else {
             return false;
         };
         !plugin.enabled
+            || plugin.unexpected_code()
             || match (&plugin.installed, plugin.bundled_version()) {
                 (None, _) => true,
                 (Some(Some(installed)), Some(latest)) => latest.replaces(installed),
@@ -199,6 +201,10 @@ fn plugin_status(ui: &mut egui::Ui, plugin: &PluginStatus) {
         },
     }
 
+    if plugin.unexpected_code() {
+        ui.colored_label(warn, t!("plugin.unexpected_code"))
+            .on_hover_text(t!("plugin.unexpected_code_hover"));
+    }
     if plugin.installed.is_some() && !plugin.enabled {
         ui.colored_label(warn, t!("plugin.disabled"));
     }

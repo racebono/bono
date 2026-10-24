@@ -179,12 +179,24 @@ pub struct PluginStatus {
     /// The copy that comes with the app, which `install_plugin` installs: `None` if it's missing,
     /// `Some(None)` if it doesn't say its version
     pub bundled: Option<Option<Version>>,
+    /// Whether the installed copy's contents hash the same as the one that comes with the app:
+    /// `None` if either is missing or couldn't be read
+    pub same_as_bundled: Option<bool>,
 }
 
 impl PluginStatus {
     /// The version of the copy that comes with the app, if it's there and says it.
     pub fn bundled_version(&self) -> Option<&Version> {
         self.bundled.as_ref()?.as_ref()
+    }
+
+    /// Whether the installed copy says it's the same version as the one that comes with the app,
+    /// but its code isn't (a local build, or a damaged or modified file). Other versions are
+    /// expected to differ.
+    pub fn unexpected_code(&self) -> bool {
+        self.same_as_bundled == Some(false)
+            && self.installed.is_some()
+            && self.installed == self.bundled
     }
 }
 
@@ -517,5 +529,30 @@ mod tests {
         assert!(version(0, None).replaces(&version(0, Some("abc1234"))));
         // A newer number wins whatever the build
         assert!(!version(0, Some("def5678")).replaces(&version(1, Some("abc1234"))));
+    }
+
+    #[test]
+    fn only_same_version_plugins_with_other_code_are_unexpected() {
+        let version = |patch| {
+            Some(Some(Version {
+                major: 0,
+                minor: 1,
+                patch,
+                build: None,
+            }))
+        };
+        let status = |installed, bundled, same_as_bundled| PluginStatus {
+            installed,
+            enabled: true,
+            bundled,
+            same_as_bundled,
+        };
+
+        assert!(status(version(0), version(0), Some(false)).unexpected_code());
+        assert!(!status(version(0), version(0), Some(true)).unexpected_code());
+        assert!(!status(version(0), version(0), None).unexpected_code());
+        // Another version is expected to be other code
+        assert!(!status(version(0), version(1), Some(false)).unexpected_code());
+        assert!(!status(None, version(0), None).unexpected_code());
     }
 }

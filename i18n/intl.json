@@ -190,6 +190,16 @@
         "es": "Plugin instalado (versión desconocida)",
         "ca": "Plugin instal·lat (versió desconeguda)"
     },
+    "plugin.unexpected_code": {
+        "en": "The installed plugin isn't the one that comes with bono",
+        "es": "El plugin instalado no es el que viene con bono",
+        "ca": "El plugin instal·lat no és el que ve amb bono"
+    },
+    "plugin.unexpected_code_hover": {
+        "en": "It says it's the same version, but its contents differ (a modified or damaged file, or another build). Reinstall it to be sure the recording works",
+        "es": "Dice ser la misma versión, pero su contenido es distinto (un archivo modificado o dañado, u otra compilación). Reinstálalo para asegurarte de que la grabación funciona",
+        "ca": "Diu que és la mateixa versió, però el contingut és diferent (un fitxer modificat o malmès, o una altra compilació). Reinstal·la'l per assegurar-te que la gravació funciona"
+    },
     "plugin.disabled": {
         "en": "Disabled in the game's plugin settings",
         "es": "Desactivado en los ajustes de plugins del juego",
