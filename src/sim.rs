@@ -11,6 +11,7 @@ use std::{
     ops::{Deref, DerefMut},
     path::PathBuf,
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, watch};
 
@@ -231,6 +232,7 @@ pub struct SimulatorSettings {
 pub struct ActiveSimulator {
     simulators: Vec<Box<Sim<dyn Simulator>>>,
     current: Option<usize>,
+    last_watch_retry: Instant,
 }
 
 impl ActiveSimulator {
@@ -238,6 +240,7 @@ impl ActiveSimulator {
         let mut this = Self {
             simulators,
             current: None,
+            last_watch_retry: Instant::now(),
         };
         this.current = this.pick();
         this
@@ -264,15 +267,23 @@ impl ActiveSimulator {
     /// reported. Waits forever if no simulator can start or stop any more.
     pub async fn changed(&mut self) -> Option<&mut Sim<dyn Simulator>> {
         loop {
+            if self.last_watch_retry.elapsed() >= Duration::from_secs(2) {
+                self.last_watch_retry = Instant::now();
+                for sim in &mut self.simulators {
+                    retry_watcher(&mut sim._watcher, &mut sim.running, || {
+                        let watcher = AppWatcher::new(sim.app_id).ok()?;
+                        let running = watcher.subscribe();
+                        Some((watcher, running))
+                    });
+                }
+            }
             let next = self.pick();
             if next != self.current {
                 self.current = next;
                 break;
             }
 
-            // Simulators that can't be followed any more (closed) stay as they last were, and
-            // aren't waited on (a closed channel never waits). They stay in the list, so indices
-            // (`current`) stay valid
+            // Closed channels aren't waited on: the next retry reconnects them.
             let waits = self
                 .simulators
                 .iter_mut()
@@ -280,10 +291,19 @@ impl ActiveSimulator {
                 .map(|sim| Box::pin(sim.running.changed()))
                 .collect::<Vec<_>>();
 
-            if waits.is_empty() {
-                std::future::pending::<()>().await;
+            let retry = tokio::time::sleep(
+                Duration::from_secs(2).saturating_sub(self.last_watch_retry.elapsed()),
+            );
+            tokio::select! {
+                _ = retry => {},
+                _ = async {
+                    if waits.is_empty() {
+                        std::future::pending::<()>().await;
+                    } else {
+                        let _ = select_all(waits).await;
+                    }
+                } => {},
             }
-            let _ = select_all(waits).await;
         }
 
         self.current_mut()
@@ -300,6 +320,20 @@ impl ActiveSimulator {
         self.current
             .filter(|&current| is_running(current))
             .or_else(|| (0..self.simulators.len()).find(|&i| is_running(i)))
+    }
+}
+
+/// Keeps the fallback channel until Steam can be followed, then takes its current state too.
+fn retry_watcher<W>(
+    watcher: &mut Result<W, watch::Sender<bool>>,
+    running: &mut watch::Receiver<bool>,
+    create: impl FnOnce() -> Option<(W, watch::Receiver<bool>)>,
+) {
+    if (watcher.is_err() || running.has_changed().is_err())
+        && let Some((next, receiver)) = create()
+    {
+        *running = receiver;
+        *watcher = Ok(next);
     }
 }
 
@@ -350,6 +384,34 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::time::timeout;
+
+    #[test]
+    fn retries_missing_watcher_and_adopts_its_running_state() {
+        let (send, mut running) = watch::channel(false);
+        let mut watcher: Result<(), _> = Err(send);
+        retry_watcher(&mut watcher, &mut running, || None);
+        assert!(watcher.is_err());
+        assert!(!*running.borrow());
+
+        let (send, receiver) = watch::channel(true);
+        retry_watcher(&mut watcher, &mut running, || Some(((), receiver)));
+        assert!(watcher.is_ok());
+        assert!(*running.borrow());
+        retry_watcher(&mut watcher, &mut running, || panic!("already watching"));
+        send.send(false).unwrap();
+        assert!(!*running.borrow());
+    }
+
+    #[test]
+    fn reconnects_a_closed_watcher() {
+        let (send, mut running) = watch::channel(true);
+        drop(send);
+        let mut watcher = Ok(());
+        let (_send, receiver) = watch::channel(false);
+        retry_watcher(&mut watcher, &mut running, || Some(((), receiver)));
+        assert!(!*running.borrow());
+        assert!(running.has_changed().is_ok());
+    }
 
     struct Fake;
 
@@ -427,6 +489,14 @@ mod tests {
 
         b_running.send(true).unwrap();
         assert_eq!(next(&mut active).await, Some("b"));
+    }
+
+    #[tokio::test]
+    async fn waits_when_all_watcher_channels_are_closed() {
+        let (sim, running) = fake("a", false);
+        drop(running);
+        let mut active = ActiveSimulator::new(vec![sim]);
+        no_change(&mut active).await;
     }
 
     #[test]
