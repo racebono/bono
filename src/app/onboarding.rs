@@ -257,7 +257,7 @@ impl Onboarding {
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            self.simulators.update(ui, simulators);
+            self.simulators.update(rt, ui, simulators);
         });
         if !self.simulators.any_installed() {
             ui.weak(t!("onboarding.no_simulator"));

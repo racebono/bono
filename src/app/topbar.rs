@@ -86,7 +86,7 @@ impl Topbar {
         let settings_setup = config.get().talk_button().is_none();
         let audio_setup = self.audio.needs_setup(config);
         let provider_setup = self.provider.needs_setup(rt, config);
-        let simulators_setup = self.simulators.needs_setup(simulators);
+        let simulators_setup = self.simulators.needs_setup(rt, simulators);
 
         let mut guide = false;
         egui::Panel::top("tobpar").show(ui, |ui| {
@@ -129,7 +129,7 @@ impl Topbar {
                     .config(
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
-                    .ui(ui, |ui| self.simulators.update(ui, simulators));
+                    .ui(ui, |ui| self.simulators.update(rt, ui, simulators));
                 if sims.is_none() {
                     self.simulators.closed();
                 }
