@@ -805,11 +805,19 @@ fn at_time(mut car: Car, t: f64) -> Car {
     if let (Some(time), Some(x), Some(z), Some(heading), Some(speed)) =
         (car.time, car.x, car.z, car.heading, car.speed)
     {
-        let dt = t - time;
-        car.x = Some(x - heading.sin() * speed * dt);
-        car.z = Some(z - heading.cos() * speed * dt);
+        let (x, z) = extrapolate(x, z, heading, speed, t - time);
+        car.x = Some(x);
+        car.z = Some(z);
     }
     car
+}
+
+/// World x/z moved `dt` seconds along `heading` at `speed` (forward is (-sin h, -cos h)).
+pub(crate) fn extrapolate(x: f64, z: f64, heading: f64, speed: f64, dt: f64) -> (f64, f64) {
+    (
+        x - heading.sin() * speed * dt,
+        z - heading.cos() * speed * dt,
+    )
 }
 
 /// The band `value` is in, moving from `current` one band at a time and only `margin` past an

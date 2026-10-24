@@ -840,7 +840,12 @@ impl<'a> Ctx<'a> {
                 best.insert(vehicle, (key, r));
             }
         }
-        Ok(best.into_iter().map(|(v, (_, r))| (v, r)).collect())
+        // Opponents are recorded only every few updates: move each one along its heading to the
+        // player's time, or a car alongside at racing speed reads metres ahead or behind
+        Ok(best
+            .into_iter()
+            .map(|(v, (_, r))| (v, at_time(r, t)))
+            .collect())
     }
 
     fn wheels(&self, telemetry_id: i64) -> rusqlite::Result<BTreeMap<usize, Row>> {
@@ -2101,6 +2106,29 @@ fn rel(player: &Row, other: &Row) -> Option<(f64, f64)> {
     let forward = dx * -h.sin() + dz * -h.cos();
     let right = dx * -h.cos() + dz * h.sin();
     Some((forward, right))
+}
+
+/// The row with its position moved to session time `t` (see `spotter::extrapolate`); unchanged
+/// when it is already at `t` or lacks what's needed.
+fn at_time(r: Row, t: f64) -> Row {
+    let moved = (|| {
+        let dt = t - r.f("session_time")?;
+        if dt == 0.0 {
+            return None;
+        }
+        let (x, z) = crate::spotter::extrapolate(
+            r.f("position_x")?,
+            r.f("position_z")?,
+            r.f("heading")?,
+            r.f("speed")?,
+            dt,
+        );
+        Some(r.with(vec![
+            ("position_x".to_owned(), Value::Real(x)),
+            ("position_z".to_owned(), Value::Real(z)),
+        ]))
+    })();
+    moved.unwrap_or(r)
 }
 
 /// Vehicle ids in running order, each one's place, and whether that's the official order (from
@@ -4420,6 +4448,37 @@ mod tests {
         sys::{bono_session_info, bono_standing, bono_telemetry},
     };
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn opponent_moved_to_player_time() {
+        let car = |x: f64, z: f64, time: f64, speed: f64| {
+            let names = [
+                "position_x",
+                "position_z",
+                "session_time",
+                "heading",
+                "speed",
+            ];
+            Row {
+                columns: Arc::new(
+                    names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| (n.to_string(), i))
+                        .collect(),
+                ),
+                values: [x, z, time, 0.0, speed].map(Value::Real).to_vec(),
+            }
+        };
+        // Alongside at 80 m/s, but the opponent's row is 0.1 s older: 8 m behind raw, level moved
+        let player = car(0.0, -8.0, 10.1, 80.0);
+        let other = car(3.0, 0.0, 10.0, 80.0);
+        let (ahead, _) = rel(&player, &other).unwrap();
+        assert!((ahead + 8.0).abs() < 1e-9);
+        let (ahead, right) = rel(&player, &at_time(other, 10.1)).unwrap();
+        assert!(ahead.abs() < 1e-9);
+        assert!((right + 3.0).abs() < 1e-9);
+    }
 
     #[test]
     fn find_turn_prefers_exact_number() {
