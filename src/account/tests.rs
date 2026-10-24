@@ -267,6 +267,108 @@ async fn offline_logout_cannot_restore_login_and_retries_revocation() {
 }
 
 #[tokio::test]
+async fn permanent_revocation_rejections_clear_logout_tombstones() {
+    for (status, error) in [
+        (400, "invalid_grant"),
+        (400, "invalid_token"),
+        (401, "unauthorized"),
+        (403, "forbidden"),
+        (404, "not_found"),
+        (422, "invalid_request"),
+    ] {
+        let store = Arc::new(MemoryStore::default());
+        seed(&store);
+        let (base, http) = server(vec![
+            ("/logout", 503, serde_json::json!({}), "refresh-old"),
+            ("/logout", status, serde_json::json!({"error":error}), "refresh-old"),
+            ("/start", 200, serde_json::json!({"verification_uri":"$ORIGIN/desktop/authorize","expires_in":600}), "s256"),
+        ]).await;
+        let account = Account::with_store(base.clone(), store.clone())
+            .await
+            .unwrap();
+        assert!(account.logout().await.is_err());
+        drop(account);
+        let account = Account::with_store(base, store.clone()).await.unwrap();
+        account.resume().await.unwrap();
+        assert_eq!(account.status(), Status::SignedOut);
+        assert!(store.load().unwrap().is_none());
+        account.begin_login().await.unwrap();
+        http.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn transient_revocation_failures_remain_pending_on_resume() {
+    for status in [408, 429, 500, 503] {
+        let store = Arc::new(MemoryStore::default());
+        seed(&store);
+        let (base, http) = server(vec![
+            ("/logout", status, serde_json::json!({}), "refresh-old"),
+            ("/logout", status, serde_json::json!({}), "refresh-old"),
+        ])
+        .await;
+        let account = Account::with_store(base.clone(), store.clone())
+            .await
+            .unwrap();
+        assert!(account.logout().await.is_err());
+        drop(account);
+        let account = Account::with_store(base, store.clone()).await.unwrap();
+        assert!(account.resume().await.is_err());
+        assert_eq!(account.status(), Status::SignedOut);
+        assert!(saved(&store).pending_logout);
+        assert_eq!(saved(&store).refresh_token, "refresh-old");
+        http.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn transient_revocation_failure_does_not_block_new_login() {
+    let store = Arc::new(MemoryStore::default());
+    seed(&store);
+    let (base, http) = server(vec![
+        ("/logout", 503, serde_json::json!({}), "refresh-old"),
+        ("/logout", 429, serde_json::json!({}), "refresh-old"),
+        (
+            "/start",
+            200,
+            serde_json::json!({"verification_uri":"$ORIGIN/desktop/authorize","expires_in":600}),
+            "s256",
+        ),
+        ("/exchange", 200, tokens(), "one-time-code"),
+    ])
+    .await;
+    let account = Account::with_store(base.clone(), store.clone())
+        .await
+        .unwrap();
+    assert!(account.logout().await.is_err());
+    drop(account);
+    let account = Account::with_store(base.clone(), store.clone())
+        .await
+        .unwrap();
+    let pending = account.begin_login().await.unwrap();
+    assert!(saved(&store).pending_logout);
+    assert_eq!(saved(&store).refresh_token, "refresh-old");
+    let mut callback = pending.redirect_uri.clone();
+    callback
+        .query_pairs_mut()
+        .append_pair("code", "one-time-code")
+        .append_pair("state", &pending.state);
+    let (result, response) = tokio::join!(
+        account.complete_login(pending),
+        Client::new().get(callback).send()
+    );
+    assert_eq!(result.unwrap(), user());
+    assert_eq!(response.unwrap().status(), StatusCode::OK);
+    assert_eq!(saved(&store).refresh_token, "refresh-new");
+    assert!(!saved(&store).pending_logout);
+    assert_eq!(account.access_token().await.unwrap(), "access-new");
+    drop(account);
+    let account = Account::with_store(base, store).await.unwrap();
+    assert_eq!(account.status(), Status::SignedIn(user()));
+    http.await.unwrap();
+}
+
+#[tokio::test]
 async fn cancelled_browser_login_cannot_resurrect_a_logged_out_session() {
     let store = Arc::new(MemoryStore::default());
     let base = validate_origin("https://example.com").unwrap();

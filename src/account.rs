@@ -181,10 +181,11 @@ impl Account {
     pub async fn begin_login(&self) -> anyhow::Result<PendingLogin> {
         let mut state = self.inner.state.lock().await;
         if state.saved.as_ref().is_some_and(|s| s.pending_logout) {
-            self.revoke_locked(&mut state).await?;
+            // Retry the old session best-effort; a new login may replace its tombstone.
+            let _ = self.revoke_locked(&mut state).await;
         }
         ensure!(
-            state.saved.is_none(),
+            state.saved.as_ref().is_none_or(|s| s.pending_logout),
             "Log out before signing in to another account"
         );
         state.generation += 1;
@@ -439,8 +440,12 @@ impl Account {
             .send()
             .await
             .context("Signed out locally; server revocation will be retried")?;
+        let status = response.status();
+        let already_revoked = status.is_client_error()
+            && status != StatusCode::REQUEST_TIMEOUT
+            && status != StatusCode::TOO_MANY_REQUESTS;
         ensure!(
-            response.status().is_success(),
+            status.is_success() || already_revoked,
             "Signed out locally; server revocation will be retried"
         );
         self.clear().await?;
