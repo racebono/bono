@@ -40,6 +40,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(200);
 /// How long a call is still worth saying.
 const URGENT_FOR: Duration = Duration::from_millis(1500);
 const OTHER_FOR: Duration = Duration::from_secs(10);
+const WARM_RETRY_AFTER: Duration = Duration::from_secs(5);
 /// A gap behind called this close is "close behind" rather than "within a second".
 const CLOSE_BEHIND: f64 = 0.15;
 /// The gap behind isn't called in the session's first seconds (the start, the field nose to tail).
@@ -140,6 +141,8 @@ pub struct Spotter {
     cache: HashMap<CacheKey, Arc<Speech>>,
     /// Calls being synthesized ahead
     warming: Vec<(CacheKey, oneshot::Receiver<anyhow::Result<Speech>>)>,
+    /// Failed warm-ups wait before retrying the same voice, language and effects
+    warm_failed: HashMap<CacheKey, Instant>,
 }
 
 type CacheKey = (ArrayStr<2>, PathBuf, u32, String);
@@ -177,6 +180,7 @@ impl Spotter {
             saying: None,
             cache: HashMap::new(),
             warming: Vec::new(),
+            warm_failed: HashMap::new(),
         }
     }
 
@@ -286,25 +290,37 @@ impl Spotter {
 
     /// Synthesizes the traffic calls ahead, so the first ones aren't late.
     fn warm(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer, lang: ArrayStr<2>) {
+        self.finish_warming(Instant::now());
+
+        for text in WARM {
+            let words = translate(text, lang).to_owned();
+            let key = Self::key(config, lang, words.clone());
+            if self.cache.contains_key(&key)
+                || self.warm_failed.contains_key(&key)
+                || self.warming.iter().any(|(k, _)| *k == key)
+            {
+                continue;
+            }
+            let recv = synth.synthesize(rt, lang, words, Self::effects(config));
+            self.warming.push((key, recv));
+        }
+    }
+
+    fn finish_warming(&mut self, now: Instant) {
+        self.warm_failed
+            .retain(|_, at| now.duration_since(*at) < WARM_RETRY_AFTER);
         self.warming
             .retain_mut(|(key, recv)| match recv.try_recv() {
                 Ok(Ok(speech)) => {
                     self.cache.insert(key.clone(), Arc::new(speech));
                     false
                 }
-                Ok(Err(_)) | Err(oneshot::error::TryRecvError::Closed) => false,
+                Ok(Err(_)) | Err(oneshot::error::TryRecvError::Closed) => {
+                    self.warm_failed.insert(key.clone(), now);
+                    false
+                }
                 Err(oneshot::error::TryRecvError::Empty) => true,
             });
-
-        for text in WARM {
-            let words = translate(text, lang).to_owned();
-            let key = Self::key(config, lang, words.clone());
-            if self.cache.contains_key(&key) || self.warming.iter().any(|(k, _)| *k == key) {
-                continue;
-            }
-            let recv = synth.synthesize(rt, lang, words, Self::effects(config));
-            self.warming.push((key, recv));
-        }
     }
 
     /// Drop the receiver promptly, so an obsolete call no longer holds the engineer.
@@ -746,7 +762,7 @@ fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scor
         return Ok(None);
     };
 
-    // Live, only the newest rows are looked through: the player's standing changes every sector
+    // Live, try the newest rows first, then look further back if the player has been in the garage
     let standing = match upto {
         None => conn
             .prepare_cached(
@@ -755,7 +771,15 @@ fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scor
                  ORDER BY id DESC LIMIT 1",
             )?
             .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .optional()?,
+            .optional()?
+            .map(|standing| Ok(Some(standing)))
+            .unwrap_or_else(|| {
+                conn.prepare_cached(
+                    "SELECT flag, penalties FROM standings WHERE is_player = 1 ORDER BY id DESC LIMIT 1",
+                )?
+                .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()
+            })?,
         Some(upto) => conn
             .prepare_cached(
                 "SELECT flag, penalties FROM standings WHERE is_player = 1 AND session_time <= ?1 \
@@ -1447,6 +1471,58 @@ mod tests {
         assert!(scoring(&conn, None).unwrap().unwrap().forecast.is_empty());
     }
 
+    #[test]
+    fn failed_warmups_wait_for_backoff_for_the_same_key() {
+        let now = Instant::now();
+        for closed in [false, true] {
+            let mut spotter = Spotter::new();
+            let key = (arrstr!("en"), PathBuf::new(), 0, "car left".into());
+            let (send, recv) = oneshot::channel();
+            spotter.warming.push((key.clone(), recv));
+            if closed {
+                drop(send);
+            } else {
+                assert!(send.send(Err(anyhow::anyhow!("No voice loaded"))).is_ok());
+            }
+            spotter.finish_warming(now);
+            assert!(spotter.warming.is_empty());
+            assert!(spotter.cache.is_empty());
+            assert!(spotter.warm_failed.contains_key(&key));
+            for changed in [
+                (arrstr!("es"), key.1.clone(), key.2, key.3.clone()),
+                (key.0, PathBuf::from("voice.onnx"), key.2, key.3.clone()),
+                (key.0, key.1.clone(), 1.0_f32.to_bits(), key.3.clone()),
+            ] {
+                assert!(!spotter.warm_failed.contains_key(&changed));
+            }
+            spotter.finish_warming(now + WARM_RETRY_AFTER - Duration::from_nanos(1));
+            assert!(spotter.warm_failed.contains_key(&key));
+            spotter.finish_warming(now + WARM_RETRY_AFTER);
+            assert!(!spotter.warm_failed.contains_key(&key));
+        }
+    }
+
+    #[test]
+    fn warmups_keep_pending_jobs_and_cache_successes() {
+        let mut spotter = Spotter::new();
+        let key = (arrstr!("en"), PathBuf::new(), 0, "car left".into());
+        let (send, recv) = oneshot::channel();
+        spotter.warming.push((key.clone(), recv));
+        spotter.finish_warming(Instant::now());
+        assert_eq!(spotter.warming.len(), 1);
+        assert!(
+            send.send(Ok(Speech {
+                samples: vec![0.5],
+                sample_rate: 24000,
+            }))
+            .is_ok()
+        );
+        spotter.finish_warming(Instant::now());
+        assert!(spotter.warming.is_empty());
+        assert_eq!(spotter.cache[&key].samples, [0.5]);
+        assert!(spotter.warm_failed.is_empty());
+    }
+
     fn queued(calls: &[(&'static str, bool)]) -> Vec<(Raised, Instant)> {
         let mut queue = VecDeque::new();
         for &(text, urgent) in calls {
@@ -1864,6 +1940,68 @@ mod tests {
         );
         scoring.phase = Some("stopped".into());
         assert_eq!(step(0.5, &scoring), [("red flag", true)]);
+    }
+
+    #[test]
+    fn keeps_flags_and_penalties_outside_the_standing_window() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id INTEGER PRIMARY KEY, session_time REAL,
+             full_course_yellow TEXT, phase TEXT, local_yellow_1 INTEGER,
+             local_yellow_2 INTEGER, local_yellow_3 INTEGER, rain REAL,
+             track_wetness_average REAL, session_type TEXT, session_end_time REAL);
+             CREATE TABLE standings (id INTEGER PRIMARY KEY, is_player INTEGER,
+             session_time REAL, flag TEXT, penalties INTEGER);
+             INSERT INTO session (session_time) VALUES (0);
+             INSERT INTO standings VALUES (1, 1, 0, 'blue', 1);",
+        )
+        .unwrap();
+        let config = SpotterConfig::default();
+        let mut logic = Logic::default();
+        let mut step = |t| {
+            let scoring = scoring(&conn, None).unwrap().unwrap();
+            assert_eq!(scoring.flag.as_deref(), Some("blue"));
+            assert_eq!(scoring.penalties, Some(1));
+            texts(logic.update(&config, &player(t), &[], &Wheels::default(), Some(&scoring)))
+        };
+        assert!(step(0.0).is_empty());
+        conn.execute_batch(
+            "WITH RECURSIVE ids(id) AS (SELECT 2 UNION ALL SELECT id + 1 FROM ids WHERE id < 5001)
+             INSERT INTO standings SELECT id, 0, 1, 'green', 0 FROM ids;",
+        )
+        .unwrap();
+        assert!(step(1800.0).is_empty());
+        conn.execute_batch("INSERT INTO standings VALUES (5002, 1, 1801, 'blue', 1);")
+            .unwrap();
+        assert!(step(1801.0).is_empty());
+        // The recorder clears the tables for a new session.
+        conn.execute_batch("DELETE FROM standings; DELETE FROM session; INSERT INTO session (session_time) VALUES (0);")
+            .unwrap();
+        let scoring = scoring(&conn, None).unwrap().unwrap();
+        assert_eq!(scoring.flag, None);
+        assert_eq!(scoring.penalties, None);
+    }
+
+    #[test]
+    fn resets_flag_and_penalty_edges_for_a_new_session() {
+        let config = SpotterConfig::default();
+        let mut logic = Logic::default();
+        let mut step = |t, scoring: &Scoring| {
+            texts(logic.update(&config, &player(t), &[], &Wheels::default(), Some(scoring)))
+        };
+        assert!(step(1800.0, &Scoring::default()).is_empty());
+        let mut scoring = Scoring {
+            flag: Some("blue".into()),
+            penalties: Some(1),
+            ..Scoring::default()
+        };
+        // The first row of a new session seeds the edges without calling them.
+        assert!(step(0.0, &scoring).is_empty());
+        scoring = Scoring::default();
+        assert!(step(0.1, &scoring).is_empty());
+        scoring.flag = Some("blue".into());
+        scoring.penalties = Some(1);
+        assert_eq!(step(0.2, &scoring), ["blue flag", "penalty"]);
     }
 
     #[test]

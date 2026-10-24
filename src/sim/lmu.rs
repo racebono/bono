@@ -34,26 +34,18 @@ const REMOVE_FOR: Duration = Duration::from_secs(60);
 const REMOVE_EVERY: Duration = Duration::from_secs(1);
 
 pub struct LeMansUltimate {
-    /// Found once; looked for again on every call while the game isn't installed
-    install_dir: Option<PathBuf>,
     /// The database the plugin is writing right now, read-only
     live: Option<Pool>,
 }
 
 impl LeMansUltimate {
     pub fn new() -> Self {
-        Self {
-            install_dir: None,
-            live: None,
-        }
+        Self { live: None }
     }
 
     /// The game's folder, if it's installed.
-    fn install_dir(&mut self) -> Option<&Path> {
-        if self.install_dir.is_none() {
-            self.install_dir = steam::app_install_dir(STEAM_APP_ID);
-        }
-        self.install_dir.as_deref()
+    fn install_dir(&self) -> Option<PathBuf> {
+        steam::app_install_dir(STEAM_APP_ID).filter(|dir| dir.is_dir())
     }
 
     /// `UserData\bono`, if the game is installed.
@@ -113,6 +105,13 @@ impl Simulator for LeMansUltimate {
             return None;
         };
 
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|pool| pool.database().path() != &path)
+        {
+            self.live = None;
+        }
         Some(self.live.get_or_insert_with(|| {
             Pool::new(Database::read_only(Arc::new(path)), MAX_IDLE, MAX_OPEN)
         }))
@@ -139,7 +138,7 @@ impl Simulator for LeMansUltimate {
     }
 
     fn plugin(&mut self) -> Option<PluginStatus> {
-        Some(plugin::status(self.install_dir()))
+        Some(plugin::status(self.install_dir().as_deref()))
     }
 
     fn install_plugin(&mut self) -> anyhow::Result<()> {
@@ -149,7 +148,7 @@ impl Simulator for LeMansUltimate {
         let Some(install_dir) = self.install_dir() else {
             anyhow::bail!("Le Mans Ultimate isn't installed");
         };
-        plugin::install(install_dir)?;
+        plugin::install(&install_dir)?;
         log::info!(
             "Installed the Le Mans Ultimate plugin in {}",
             install_dir.display()
