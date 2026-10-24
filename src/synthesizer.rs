@@ -268,9 +268,10 @@ impl SynthesizerInner {
                 Some(Event::Model) => {
                     // Its speech so far was in the old voice
                     stream = None;
-                    let model = model.borrow();
-                    match &*model {
-                        Some(model) => match Voice::load(model, threads) {
+                    // Cloned so the load doesn't hold the read lock `set_model` waits on
+                    let path = model.borrow_and_update().clone();
+                    match path {
+                        Some(path) => match Voice::load(&path, threads) {
                             Ok(next_voice) => voice = Some(next_voice),
                             Err(e) => error(t!("error.tts_model"), e),
                         },
