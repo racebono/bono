@@ -7,6 +7,11 @@ on:
     release:
         types: [published]
     workflow_dispatch:
+        inputs:
+            nightly:
+                description: Publish as a nightly release
+                type: boolean
+                default: false
 
 permissions:
     contents: read
@@ -72,7 +77,7 @@ jobs:
             CMAKE_CUDA_ARCHITECTURES: "75-virtual;86-real;120-real"
             CMAKE_BUILD_PARALLEL_LEVEL: "2"
             # Nightlies carry their commit in the version (`0.1.0+abc1234`); releases don't.
-            BONO_COMMIT: ${{ github.event_name == 'schedule' && needs.changes.outputs.ref || '' }}
+            BONO_COMMIT: ${{ (github.event_name == 'schedule' || inputs.nightly) && needs.changes.outputs.ref || '' }}
         outputs:
             nightly-tag: ${{ steps.nightly.outputs.tag }}
         steps:
@@ -190,7 +195,7 @@ jobs:
 
             - name: Publish nightly release
               id: nightly
-              if: github.event_name == 'schedule'
+              if: github.event_name == 'schedule' || inputs.nightly
               env:
                   GH_TOKEN: ${{ github.token }}
                   GH_REPO: ${{ github.repository }}
@@ -216,7 +221,7 @@ jobs:
     notify:
         name: Notify website
         needs: build
-        if: github.event_name == 'schedule' || github.event_name == 'release'
+        if: github.event_name == 'schedule' || github.event_name == 'release' || inputs.nightly
         runs-on: ubuntu-slim
         permissions: {}
         steps:
@@ -226,8 +231,8 @@ jobs:
               env:
                   HOOK_URL: ${{ vars.RELEASES_HOOK_URL }}
                   HOOK_SECRET: ${{ secrets.RELEASES_HOOK_SECRET }}
-                  EVENT: ${{ github.event_name == 'schedule' && 'nightly' || 'release' }}
-                  TAG: ${{ github.event_name == 'schedule' && needs.build.outputs.nightly-tag || github.event.release.tag_name }}
+                  EVENT: ${{ (github.event_name == 'schedule' || inputs.nightly) && 'nightly' || 'release' }}
+                  TAG: ${{ (github.event_name == 'schedule' || inputs.nightly) && needs.build.outputs.nightly-tag || github.event.release.tag_name }}
               run: |
                   set -euo pipefail
                   if [ -z "$HOOK_URL" ] || [ -z "$HOOK_SECRET" ]; then
