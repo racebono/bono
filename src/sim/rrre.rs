@@ -614,7 +614,9 @@ fn scoring(
         .zip(remaining)
         .map(|(duration, remaining)| duration - remaining);
     session.time_remaining = remaining.into();
-    session.session_end_time = remaining.map(|remaining| time + remaining).into();
+    session.session_end_time = remaining
+        .map(|remaining| scoring_time(time + remaining))
+        .into();
     if shared.session_length_format != R3E_SESSION_LENGTH_TIME_BASED {
         session.max_laps = setting(shared.number_of_laps).into();
     }
@@ -653,7 +655,9 @@ fn scoring(
     match shared.session_length_format {
         // Minutes into the session
         R3E_SESSION_LENGTH_TIME_BASED => {
-            let at = |minutes: i64| elapsed.map(|elapsed| time - elapsed + minutes as f64 * 60.0);
+            let at = |minutes: i64| {
+                elapsed.map(|elapsed| scoring_time(time - elapsed + minutes as f64 * 60.0))
+            };
             session.pit_window_start_time = start.and_then(at).into();
             session.pit_window_end_time = end.and_then(at).into();
         }
@@ -676,6 +680,12 @@ fn scoring(
         })
         .collect();
     (session, standings)
+}
+
+/// Derived scoring timestamps mix the f64 clock with f32 durations. Discard their
+/// sub-millisecond noise so exact change detection can deduplicate scoring rows.
+fn scoring_time(time: f64) -> f64 {
+    (time * 1000.0).round() / 1000.0
 }
 
 fn standing(
@@ -709,7 +719,7 @@ fn standing(
     .map(str::to_owned)
     .into();
     out.lap_start_time = seconds(driver.lap_time_current_self)
-        .map(|into_lap| time - into_lap)
+        .map(|into_lap| scoring_time(time - into_lap))
         .into();
 
     // The game's sector times add up along the lap: the third is the lap's
@@ -1127,6 +1137,60 @@ mod tests {
             count("SELECT COUNT(*) FROM standings WHERE driver = 'Lena Fischer'"),
             1
         );
+    }
+
+    #[test]
+    fn scoring_deduplicates_float_derived_timestamps() {
+        use bono_sim::sql::{ScoringWriter, create_tables};
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let mut writer = ScoringWriter::new(&conn).unwrap();
+        let mut shared = shared(500.0, 0.0);
+        shared.pit_window_start = 10;
+        shared.pit_window_end = 20;
+
+        // Five scoring updates per second, with durations rounded to the game's
+        // f32 precision. The session deadline, pit window and lap starts stay fixed.
+        for step in 0..300 {
+            let time = 500.0 + step as f64 * 0.2;
+            shared.session_time_remaining = (3600.0 - time) as f32;
+            let mut drivers = shared.all_drivers_data_1;
+            for driver in &mut drivers[..2] {
+                driver.lap_time_current_self = (time - 460.0) as f32;
+            }
+            let (session, standings) = scoring(&shared, &drivers[..2], time);
+            assert_eq!(session.session_end_time.get(), Some(3600.0));
+            assert_eq!(session.pit_window_start_time.get(), Some(600.0));
+            assert_eq!(session.pit_window_end_time.get(), Some(1200.0));
+            assert_eq!(standings[0].lap_start_time.get(), Some(460.0));
+            writer.write(session, standings).unwrap();
+        }
+        let count = |table: &str| {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(count("session"), 1);
+        assert_eq!(count("standings"), 2);
+
+        // A changed deadline/window and a new lap must still be recorded.
+        shared.session_time_remaining = 3100.0;
+        shared.pit_window_start = 11;
+        shared.pit_window_end = 21;
+        let mut drivers = shared.all_drivers_data_1;
+        drivers[0].completed_laps += 1;
+        drivers[0].lap_time_current_self = 0.2;
+        drivers[1].lap_time_current_self = 100.0;
+        let (session, standings) = scoring(&shared, &drivers[..2], 560.0);
+        assert_eq!(session.session_end_time.get(), Some(3660.0));
+        assert_eq!(session.pit_window_start_time.get(), Some(720.0));
+        assert_eq!(session.pit_window_end_time.get(), Some(1320.0));
+        assert_eq!(standings[0].lap_start_time.get(), Some(559.8));
+        writer.write(session, standings).unwrap();
+        assert_eq!(count("session"), 2);
+        assert_eq!(count("standings"), 3);
     }
 
     #[test]
