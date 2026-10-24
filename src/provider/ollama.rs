@@ -242,19 +242,19 @@ impl Conversation {
                 other => bail!("Unexpected stop reason from Ollama: {other:?}"),
             };
 
-            // Except when it ended with tool calls that won't run (cut off): calls without their
-            // results would confuse the model later on
-            let said = !response.content.is_empty() || !calls.is_empty();
-            if said && (stop.is_none() || calls.is_empty()) {
+            // Keep the text, but omit calls that won't run: calls without their results would
+            // confuse the model later on
+            let said = !response.content.is_empty() || (stop.is_none() && !calls.is_empty());
+            if said {
                 let mut message = serde_json::json!({
                     "role": "assistant",
                     "content": response.content,
                 });
                 // Sent back as received
-                if !response.thinking.is_empty() {
+                if !response.thinking.is_empty() && (stop.is_none() || calls.is_empty()) {
                     message["thinking"] = response.thinking.into();
                 }
-                if !calls.is_empty() {
+                if stop.is_none() && !calls.is_empty() {
                     message["tool_calls"] = calls.clone().into();
                 }
                 self.body.messages.push(message);
@@ -1020,6 +1020,39 @@ mod tests {
         conversation.body.options.num_ctx = NonZeroU32::new(320).unwrap();
         let (reply, _) = send_streaming(&mut conversation, "Pit?").await.unwrap();
         assert_eq!(reply.stop, StopReason::ContextWindowExceeded);
+    }
+
+    #[tokio::test]
+    async fn keeps_text_from_cut_off_tool_turns() {
+        for spoken in ["Checking the gap.", ""] {
+            let (url, requests) = mock(vec![
+                stream(
+                    &[spoken],
+                    json!([{"function": {"name": "lookup", "arguments": {}}}]),
+                    "length",
+                ),
+                stream(&["Done."], Value::Null, "stop"),
+            ])
+            .await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut conversation = builder(&url, &calls).build(reqwest::Client::new()).unwrap();
+            let (reply, _) = send_streaming(&mut conversation, "Gap?").await.unwrap();
+            assert_eq!(reply.stop, StopReason::MaxTokens);
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                conversation.body.messages.len(),
+                if spoken.is_empty() { 2 } else { 3 }
+            );
+            send_streaming(&mut conversation, "And now?").await.unwrap();
+            let requests = requests.lock().unwrap();
+            let messages = requests[1].1["messages"].as_array().unwrap();
+            if !spoken.is_empty() {
+                assert_eq!(messages[2], json!({"role": "assistant", "content": spoken}));
+                assert_eq!(messages[3]["role"], "user");
+            } else {
+                assert_eq!(messages[2]["role"], "user");
+            }
+        }
     }
 
     #[tokio::test]

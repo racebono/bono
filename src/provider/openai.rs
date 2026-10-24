@@ -168,15 +168,15 @@ impl Conversation {
                 other => bail!("Unexpected stop reason from the model: {other:?}"),
             };
 
-            // Except when it ended with tool calls that won't run (cut off): a call without its
-            // result makes every later request fail
-            let said = !response.content.is_empty() || !calls.is_empty();
-            if said && (stop.is_none() || calls.is_empty()) {
+            // Keep the text, but omit calls that won't run: a call without its result makes
+            // every later request fail
+            let said = !response.content.is_empty() || (stop.is_none() && !calls.is_empty());
+            if said {
                 let mut message = serde_json::json!({
                     "role": "assistant",
                     "content": response.content,
                 });
-                if !calls.is_empty() {
+                if stop.is_none() && !calls.is_empty() {
                     message["tool_calls"] = calls
                         .iter()
                         .map(|call| {
@@ -995,6 +995,38 @@ mod tests {
             let compatible = body(url);
             assert_eq!(compatible["max_tokens"], 1024, "{url}");
             assert!(compatible.get("max_completion_tokens").is_none(), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn keeps_text_from_cut_off_tool_turns() {
+        for spoken in ["Checking the gap.", ""] {
+            let (url, requests) = mock(vec![
+                stream(vec![
+                    text(spoken),
+                    json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "t1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]}}]}),
+                    finish("length"),
+                ]),
+                stream(vec![text("Done."), finish("stop")]),
+            ]).await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut conversation = builder(&url, &calls).build(reqwest::Client::new()).unwrap();
+            let (reply, _) = send_streaming(&mut conversation, "Gap?").await.unwrap();
+            assert_eq!(reply.stop, StopReason::MaxTokens);
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                conversation.body.messages.len(),
+                if spoken.is_empty() { 2 } else { 3 }
+            );
+            send_streaming(&mut conversation, "And now?").await.unwrap();
+            let requests = requests.lock().unwrap();
+            let messages = requests[1].1["messages"].as_array().unwrap();
+            if !spoken.is_empty() {
+                assert_eq!(messages[2], json!({"role": "assistant", "content": spoken}));
+                assert_eq!(messages[3]["role"], "user");
+            } else {
+                assert_eq!(messages[2]["role"], "user");
+            }
         }
     }
 
