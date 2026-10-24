@@ -81,17 +81,10 @@ impl CodeCheck {
         if self.pending.is_none() {
             if let Some((installed, bundled)) = self.paths.clone() {
                 let (send, recv) = std::sync::mpsc::channel();
-                if std::thread::Builder::new()
-                    .name("plugin-hash".into())
-                    .spawn(move || {
-                        let _ = send.send(code_status(&installed, bundled.as_deref()));
-                    })
-                    .is_ok()
-                {
-                    self.pending = Some(recv);
-                } else {
-                    self.result = Some(PluginCodeStatus::Unavailable);
-                }
+                tokio::task::spawn_blocking(move || {
+                    let _ = send.send(code_status(&installed, bundled.as_deref()));
+                });
+                self.pending = Some(recv);
             }
         }
         status.code = self.result;
@@ -250,6 +243,8 @@ mod tests {
 
     #[test]
     fn pending_hash_check_does_not_wait_for_worker() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
         let game = tempfile::tempdir().unwrap();
         let dll = installed_dll(game.path());
         std::fs::create_dir_all(dll.parent().unwrap()).unwrap();

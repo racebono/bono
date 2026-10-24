@@ -192,13 +192,13 @@
     },
     "plugin.code_different": {
         "en": "Warning: the installed plugin differs from the bundled copy. Reinstall it to use the expected code.",
-        "es": "Aviso: el plugin instalado difiere de la copia incluida. Reinst?lalo para usar el c?digo esperado.",
-        "ca": "Av?s: el plugin instal?lat difereix de la c?pia inclosa. Reinstal?la?l per fer servir el codi esperat."
+        "es": "Aviso: el plugin instalado difiere de la copia incluida. Reinstálalo para usar el código esperado.",
+        "ca": "Avís: el plugin instal·lat difereix de la còpia inclosa. Reinstal·la'l per fer servir el codi esperat."
     },
     "plugin.code_unavailable": {
         "en": "Warning: the installed plugin could not be verified against the bundled copy.",
         "es": "Aviso: no se ha podido verificar el plugin instalado con la copia incluida.",
-        "ca": "Av?s: no s?ha pogut verificar el plugin instal?lat amb la c?pia inclosa."
+        "ca": "Avís: no s'ha pogut verificar el plugin instal·lat amb la còpia inclosa."
     },
     "plugin.disabled": {
         "en": "Disabled in the game's plugin settings",
