@@ -624,7 +624,7 @@ impl ConversationBuilder {
 
         let (reasoning_effort, chat_template_kwargs) = match self.effort.trim() {
             "" => (None, None),
-            "none" => (
+            "none" if !is_openai(&base_url) => (
                 Some("none".to_owned()),
                 Some(serde_json::json!({"enable_thinking": false})),
             ),
@@ -1019,6 +1019,20 @@ mod tests {
             requests[0].1["chat_template_kwargs"]["enable_thinking"],
             false
         );
+    }
+
+    #[test]
+    fn omits_chat_template_kwargs_for_openai() {
+        let mut builder = ConversationBuilder::new();
+        builder
+            .base_url("https://api.openai.com/v1/")
+            .api_key("test")
+            .effort("none");
+        let conversation = builder.build(reqwest::Client::new()).unwrap();
+        let body = serde_json::to_value(&conversation.body).unwrap();
+
+        assert_eq!(body["reasoning_effort"], "none");
+        assert!(body.get("chat_template_kwargs").is_none());
     }
 
     #[test]
