@@ -78,6 +78,8 @@ jobs:
             CMAKE_BUILD_PARALLEL_LEVEL: "2"
             # Nightlies carry their commit in the version (`0.1.0+abc1234`); releases don't.
             BONO_COMMIT: ${{ (github.event_name == 'schedule' || inputs.nightly) && needs.changes.outputs.ref || '' }}
+            # Compiled in via option_env!; without it account sign-in and Bono Cloud are disabled.
+            BONO_ACCOUNT_ORIGIN: ${{ vars.BONO_ACCOUNT_ORIGIN }}
         outputs:
             nightly-tag: ${{ steps.nightly.outputs.tag }}
         steps:
