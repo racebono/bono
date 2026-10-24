@@ -3629,6 +3629,28 @@ fn before(apex: f64, x: Option<f64>, length: f64) -> Option<f64> {
     Some((apex - x?).rem_euclid(length))
 }
 
+/// Index of the turn `query` names: an exact turn number ("T1", "1") wins over a label substring,
+/// so "T1" never resolves to "T10 ..." just because that one sorts first.
+fn find_turn(turns: &[Turn], query: &str) -> Option<usize> {
+    let key = query.trim().to_lowercase();
+    turns
+        .iter()
+        .position(|t| {
+            let number = t
+                .label
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_start_matches(['t', 'T']);
+            key.trim_start_matches('t') == number
+        })
+        .or_else(|| {
+            turns
+                .iter()
+                .position(|t| t.label.to_lowercase().contains(&key))
+        })
+}
+
 struct Turn {
     label: String,
     start: f64,
@@ -3892,16 +3914,7 @@ fn corner_detail(
     source: &str,
     out: &mut String,
 ) -> anyhow::Result<()> {
-    let key = turn.trim().to_lowercase();
-    let Some(k) = turns.iter().position(|t| {
-        let number = t
-            .label
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_start_matches(['t', 'T']);
-        key.trim_start_matches('t') == number || t.label.to_lowercase().contains(&key)
-    }) else {
+    let Some(k) = find_turn(turns, turn) else {
         bail!(
             "no such turn; turns are: {}",
             turns
@@ -4393,6 +4406,24 @@ mod tests {
         sys::{bono_session_info, bono_standing, bono_telemetry},
     };
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn find_turn_prefers_exact_number() {
+        let turns: Vec<_> = ["T10 Club", "T11 Abbey", "T1 Copse"]
+            .into_iter()
+            .map(|label| Turn {
+                label: label.into(),
+                start: 0.0,
+                apex: 0.0,
+                end: 0.0,
+            })
+            .collect();
+        assert_eq!(find_turn(&turns, "T1"), Some(2));
+        assert_eq!(find_turn(&turns, "1"), Some(2));
+        assert_eq!(find_turn(&turns, "t11"), Some(1));
+        assert_eq!(find_turn(&turns, "abbey"), Some(1));
+        assert_eq!(find_turn(&turns, "T7"), None);
+    }
 
     fn corner_trace(zones: &[(f64, f64)]) -> Trace {
         let d: Vec<_> = (0..=500).map(|i| i as f64 * 10.0).collect();
