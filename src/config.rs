@@ -424,7 +424,8 @@ impl<'de, const N: usize> Deserialize<'de> for ArrayStr<N> {
     where
         D: serde::Deserializer<'de>,
     {
-        let s = <&'de str>::deserialize(deserializer)?.as_bytes();
+        let value = String::deserialize(deserializer)?;
+        let s = value.as_bytes();
         let arr = s.as_array::<N>().ok_or_else(|| {
             let msg = format!("a {} byte{} UTF-8 string", N, if N == 1 { "" } else { "s" });
             let msg = msg.as_str();
@@ -754,6 +755,46 @@ settings! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn array_strings_accept_json_escapes_and_check_byte_length() {
+        for value in ["\\\"", "\n\t", "é"] {
+            let original = ArrayStr::<2>::from_str(value).unwrap();
+            let saved = serde_json::to_vec(&original).unwrap();
+            let loaded: ArrayStr<2> = serde_json::from_slice(&saved).unwrap();
+            assert_eq!(loaded, original);
+        }
+        assert!(serde_json::from_slice::<ArrayStr<2>>(br#""\u0065\u006e""#).is_ok());
+        assert!(serde_json::from_slice::<ArrayStr<2>>(br#""\n""#).is_err());
+    }
+
+    #[tokio::test]
+    async fn backslash_bindings_load_without_recovering_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut data = RawConfig::default();
+        data.talk_button
+            .set(Some(ConfigButton::Key(sdl3::keyboard::Scancode::Backslash)));
+        data.session_button
+            .set(Some(ConfigButton::Key(sdl3::keyboard::Scancode::Backslash)));
+        data.master_volume.set(0.5);
+        data.onboarding.set(3);
+        data.model.claude.api_key.set(Some("test-key".into()));
+        let contents = serde_json::to_vec_pretty(&data).unwrap();
+        save_config(&path, &contents).unwrap();
+        let loaded = load_config(&path).await.unwrap();
+        for button in [loaded.talk_button(), loaded.session_button()] {
+            assert!(matches!(
+                button,
+                Some(ConfigButton::Key(sdl3::keyboard::Scancode::Backslash))
+            ));
+        }
+        assert_eq!(*loaded.master_volume(), 0.5);
+        assert_eq!(*loaded.onboarding(), 3);
+        assert_eq!(loaded.model.claude.api_key().as_deref(), Some("test-key"));
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
     #[serde(rename_all = "lowercase")]
