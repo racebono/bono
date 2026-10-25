@@ -47,13 +47,15 @@ only uses it while Steam reports the game running. It is in WAL mode.
   of rows. The newest row per car is `MAX(id)` per `vehicle_id`.
 - `forecast` - LMU only: the game's weather forecast for every session of the event (practice,
   qualifying, warmup, race), read from LMU's local web API every 30 s and written as a whole set of
-  rows (same `session_time`) only when it changes. Columns: `session_time` (when it was read),
+  rows (same `generation`, the set's first row id) only when it changes. Columns: `generation`,
+  `session_time` (session clock when read, which can reset or stop),
   `session_type` (as in `session.session_type`), `session_fraction` (0 start, 0.25, 0.5, 0.75, 1 finish
   of that session), `sky` (0 clear, 1 light clouds, 2 partly cloudy, 3 mostly cloudy, 4 overcast, 5
   overcast with drizzle, 6 overcast with light rain; higher is wetter), `sky_text` (the game's own
   words, in the game's language), `rain_chance` (0-1), `temperature` (air, C), `humidity` (0-1),
-  `wind_speed` (m/s), `wind_direction` (N, NE, ... NW). The newest forecast is the rows with the
-  newest `session_time`. A point's time is `session_fraction * session.session_end_time`; tell the
+  `wind_speed` (m/s), `wind_direction` (N, NE, ... NW). Select the newest forecast with
+  `WHERE generation = (SELECT generation FROM forecast ORDER BY id DESC LIMIT 1)`.
+  A point's time is `session_fraction * session.session_end_time`; tell the
   pilot when as time from now (that time minus the session's current `session_time`), never as the
   fraction or the session clock.
 
@@ -240,8 +242,7 @@ SELECT w.* FROM telemetry_wheel w
 WHERE w.telemetry_id = (SELECT id FROM telemetry WHERE is_player = 1 ORDER BY id DESC LIMIT 1);
 
 -- when did a setting change (e.g. brake bias) this session
-SELECT lap, session_time, rear_brake_bias FROM (
-  SELECT lap, session_time, rear_brake_bias, LAG(rear_brake_bias) OVER (ORDER BY id) AS prev
-  FROM telemetry WHERE vehicle_id = :V AND id >= :S)
-WHERE rear_brake_bias IS NOT prev;
+SELECT c.session_time, c.rear_brake_bias, t.lap
+FROM car_state c JOIN telemetry t ON t.id = c.telemetry_id
+WHERE c.vehicle_id = :V AND c.telemetry_id >= :S ORDER BY c.id;
 ```
