@@ -1947,7 +1947,7 @@ fn cmd_stint(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
             "{name}: now {}, avg use {}/lap -> {laps_left:.1} laps from here (runs out ~lap {:.1})",
             show(now),
             show(per_lap),
-            lap_now.unwrap_or(0) as f64 + laps_left - frac
+            lap_now.unwrap_or(0) as f64 + frac + laps_left
         );
         Some(laps_left)
     };
@@ -2000,7 +2000,8 @@ fn cmd_stint(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
         say!(
             out,
             "LIMIT: {which} - {lim:.1} laps of range from the current position; last full lap you can complete is lap {}",
-            (lap_now.unwrap_or(0) as f64 + lim - frac) as i64
+            // Lap N spans [N, N + 1), so reaching N completes lap N - 1.
+            (lap_now.unwrap_or(0) as f64 + frac + lim).floor() as i64 - 1
         );
         match race_need(ctx, args, frac, avg_time)? {
             (None, source) => {
@@ -5122,6 +5123,63 @@ mod tests {
             fischer.starts_with("LAPS driver=\"Lena Fischer\""),
             "{fischer}"
         );
+    }
+
+    #[test]
+    fn stint_projects_absolute_laps_from_current_position() {
+        let (_dir, engineer) = race();
+        let conn = Connection::open(engineer.inner.path.clone()).unwrap();
+        let mut ctx = Ctx::new(&conn, &engineer.inner, None).unwrap();
+        let green = lap_table(&ctx, ctx.vehicle)
+            .unwrap()
+            .into_iter()
+            .filter(|lap| lap.green)
+            .collect::<Vec<_>>();
+        assert_eq!(green.len(), 3);
+        let avg_time = green.iter().map(|lap| lap.time.unwrap()).sum::<f64>() / 3.0;
+        let fuel_use = green.iter().map(|lap| lap.fuel_used.unwrap()).sum::<f64>() / 3.0;
+        let ve_use = green.iter().map(|lap| lap.ve_used.unwrap()).sum::<f64>() / 3.0;
+
+        // Exercise both limiting resources, including exact and near lap boundaries.
+        for which in ["fuel", "virtual energy"] {
+            for (frac, range, runs_out, last_full) in [
+                (0.8, 1.5, "12.3", 11),
+                (0.1, 1.5, "11.6", 10),
+                (0.8, 0.3, "11.1", 10),
+                (0.0, 1.5, "11.5", 10),
+                (0.5, 0.5, "11.0", 10),
+                (0.5, 0.49, "11.0", 9),
+            ] {
+                let fuel_range = if which == "fuel" { range } else { range + 5.0 };
+                let ve_range = if which == "virtual energy" {
+                    range
+                } else {
+                    range + 5.0
+                };
+                for (name, value) in [
+                    ("lap", Value::Integer(10)),
+                    ("lap_start_time", Value::Real(310.0 - frac * avg_time)),
+                    ("fuel", Value::Real(fuel_range * fuel_use)),
+                    ("virtual_energy", Value::Real(ve_range * ve_use)),
+                ] {
+                    let index = ctx.player.columns[name];
+                    ctx.player.values[index] = value;
+                }
+                let mut out = String::new();
+                cmd_stint(&ctx, &EngineerInput::command(Command::Stint), &mut out).unwrap();
+                let resource = out
+                    .lines()
+                    .find(|line| line.starts_with(&format!("{which}:")))
+                    .unwrap();
+                assert!(
+                    resource.contains(&format!("runs out ~lap {runs_out})")),
+                    "{out}"
+                );
+                assert!(out.contains(&format!(
+                    "LIMIT: {which} - {range:.1} laps of range from the current position; last full lap you can complete is lap {last_full}\n"
+                )), "{out}");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
