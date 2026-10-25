@@ -14,6 +14,20 @@ site and in the change description. Explain why background execution is not
 possible, the expected duration and user-visible impact, and how the blocking
 is bounded or mitigated. Convenience alone is not a justification.
 
+## Test features
+
+Run tests with the `cuda` and `vulkan` features disabled unless the changes
+involve those features or their backend behavior. Both are enabled by default,
+so use `cargo test -p bono --no-default-features` for ordinary application tests.
+If other features are needed, enable them explicitly with `--features` while
+keeping CUDA and Vulkan disabled.
+
+When changes involve CUDA or Vulkan, also run relevant tests with the affected
+feature explicitly enabled, for example
+`cargo test -p bono --no-default-features --features vulkan` (or `cuda`, or
+`cuda,vulkan` when both are involved). Report any missing SDK or hardware that
+prevents the relevant validation.
+
 ## Windows build and test paths
 
 Plan build and test commands for Windows path-length limits. Cargo's native
