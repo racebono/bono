@@ -3,9 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub fn main() -> Result<(), ureq::Error> {
+pub fn main() -> std::io::Result<()> {
     let out_dir = PathBuf::from(var_os("OUT_DIR").unwrap());
-    // Without it, any change to the package reruns this, downloading the header again
+    // Only rerun when a build input changes.
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-env-changed=BONO_COMMIT");
 
@@ -34,13 +34,9 @@ fn icon() {
         .expect("Unable to embed the executable's icon");
 }
 
-fn race_room(out_dir: &Path) -> Result<(), ureq::Error> {
-    let header = ureq::get(
-        "https://raw.githubusercontent.com/kwstudios-sweden/r3e-api/master/sample-c/src/r3e.h",
-    )
-    .call()?
-    .into_body()
-    .read_to_string()?;
+fn race_room(out_dir: &Path) -> std::io::Result<()> {
+    let header = "include/r3e/r3e.h";
+    println!("cargo::rerun-if-changed={header}");
 
     // The bindgen::Builder is the main entry point
     // to bindgen, and lets you build up options for
@@ -48,7 +44,7 @@ fn race_room(out_dir: &Path) -> Result<(), ureq::Error> {
     let bindings = bindgen::Builder::default()
         // The input header we would like to generate
         // bindings for.
-        .header_contents("r3e.h", &header)
+        .header(header)
         .allowlist_item("r3e_.*")
         .allowlist_item("R3E_.*")
         .prepend_enum_name(false)
