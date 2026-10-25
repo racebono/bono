@@ -5,6 +5,10 @@ $installer = Join-Path $env:RUNNER_TEMP "VulkanSDK-$version-Installer.exe"
 
 # The full prebuilt SDK includes glslc, which Whisper's Vulkan backend requires.
 Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe" -OutFile $installer
+$signature = Get-AuthenticodeSignature -LiteralPath $installer
+if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '(^|,\s*)CN="?LunarG, Inc\."?(,|$)') {
+    throw 'Vulkan SDK installer does not have a valid LunarG signature'
+}
 # Copy-only installation leaves system registration and the system PATH alone.
 $arguments = "--root `"$root`" --accept-licenses --default-answer --confirm-command install copy_only=1"
 $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
