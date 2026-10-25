@@ -98,6 +98,11 @@ impl Simulator for RaceRoom {
         }
 
         if self.reader.is_none() {
+            // Nothing is recording yet: don't serve a database left by an earlier app run.
+            if let Err(e) = try_remove_database(&self.dir) {
+                log::warn!("Couldn't remove RaceRoom's previous recording: {e}");
+                return None;
+            }
             self.reader = Some(Reader::start(self.dir.clone()));
         }
 
@@ -871,6 +876,36 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removes_previous_recording_before_starting_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::write(dir.path().join(format!("{DATABASE}{suffix}")), "old run").unwrap();
+        }
+        let mut sim = RaceRoom::new();
+        sim.dir = dir.path().to_path_buf();
+
+        assert!(sim.database(true).is_none());
+        assert!(sim.reader.is_some());
+        assert!(sim.live.is_none());
+        for suffix in ["", "-wal", "-shm"] {
+            assert!(!dir.path().join(format!("{DATABASE}{suffix}")).exists());
+        }
+    }
+
+    #[test]
+    fn does_not_start_reader_when_previous_recording_cannot_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory at the database path makes removal fail without relying on file locks.
+        std::fs::create_dir(dir.path().join(DATABASE)).unwrap();
+        let mut sim = RaceRoom::new();
+        sim.dir = dir.path().to_path_buf();
+
+        assert!(sim.database(true).is_none());
+        assert!(sim.reader.is_none());
+        assert!(sim.live.is_none());
+    }
 
     fn name(s: &str) -> [u8; 64] {
         let mut out = [0u8; 64];
