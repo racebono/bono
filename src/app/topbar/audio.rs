@@ -117,8 +117,13 @@ impl AudioTopbar {
         let config = config.get();
         self.microphone.get().is_none()
             || self.speaker.get().is_none()
-            || config.whisper_model().is_none()
+            || config
+                .whisper_model()
+                .as_ref()
+                .is_none_or(|path| !path.is_file())
+            || self.whisper.failed()
             || config.voices().is_empty()
+            || config.voices().values().any(|path| !voice_on_disk(path))
     }
 
     /// Called every frame, open or not: loads the speech to text model picked, and sets up what
@@ -767,5 +772,28 @@ mod hotplug_tests {
             )))
         );
         assert_eq!(resolve_device("Other microphone", &new), None);
+    }
+}
+
+/// Piper needs both the model and its sidecar configuration.
+fn voice_on_disk(path: &Utf8Path) -> bool {
+    path.is_file() && path.with_added_extension("json").is_file()
+}
+
+#[cfg(test)]
+mod model_files_tests {
+    use super::*;
+
+    #[test]
+    fn a_voice_needs_both_files_after_redownloading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(dir.path().join("voice.onnx")).unwrap();
+        assert!(!voice_on_disk(&path));
+        std::fs::write(&path, []).unwrap();
+        assert!(!voice_on_disk(&path));
+        std::fs::write(path.with_added_extension("json"), []).unwrap();
+        assert!(voice_on_disk(&path));
+        std::fs::remove_file(&path).unwrap();
+        assert!(!voice_on_disk(&path));
     }
 }

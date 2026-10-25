@@ -78,11 +78,7 @@ impl Voices {
         let Some((lang, name)) = self.setup else {
             return;
         };
-        if config.get().voices().contains_key(&lang) {
-            self.setup = None;
-            return;
-        }
-
+        let picked = config.get().voices().get(&lang).cloned();
         let Some(Some(catalog)) = self.catalog.update(rt) else {
             return;
         };
@@ -91,6 +87,13 @@ impl Voices {
             self.setup = None;
             return;
         };
+
+        if picked.as_ref().is_some_and(|path| {
+            super::voice_on_disk(path) && (!self.setup_started || path.as_path() != &*voice.path)
+        }) {
+            self.setup = None;
+            return;
+        }
 
         let on_disk = (catalog.on_disk.borrow().as_ref())
             .and_then(|on_disk| on_disk.get(voice.index).copied());
@@ -111,7 +114,7 @@ impl Voices {
     }
 
     /// Downloads the recommended voice for the app's language (`locale`) (again, if it failed),
-    /// and uses it once it's on disk, if that language has none by then.
+    /// and uses it once it's on disk, if that language has no voice files by then.
     pub fn setup(&mut self, locale: &str) {
         self.setup = recommended(locale);
         self.setup_started = false;
@@ -128,7 +131,9 @@ impl Voices {
             Some(Some(catalog)) => catalog,
         };
         let voice = find(&mut catalog.languages, lang, name)?;
-        if self.setup.is_none() && picked.is_some_and(|picked| picked != *voice.path) {
+        if self.setup.is_none()
+            && picked.is_some_and(|picked| picked != *voice.path && super::voice_on_disk(&picked))
+        {
             return None;
         }
 
@@ -161,7 +166,12 @@ impl Voices {
         };
 
         // Without any voice, the app's language is the one to get one for
-        let missing = config.get().voices().is_empty();
+        let missing = config.get().voices().is_empty()
+            || config
+                .get()
+                .voices()
+                .values()
+                .any(|path| !super::voice_on_disk(path));
         let locale = config.get().locale().clone();
         let suggested = ArrayStr::<2>::from_str(locale.split('-').next().unwrap_or_default());
 
@@ -408,20 +418,16 @@ impl Language {
 
                             row.col(|ui| {
                                 if on_disk {
-                                    let used =
-                                        config.voices().get(&code).map(|path| path.as_path())
-                                            == Some(&*voice.path);
-                                    ui.add_enabled_ui(!used, |ui| {
-                                        if ui.button(t!("audio.use")).clicked() {
-                                            config.set_voice(
-                                                rt,
-                                                code,
-                                                Some(voice.path.to_path_buf()),
-                                                synth,
-                                            );
-                                            updated = true;
-                                        }
-                                    });
+                                    // Allow selecting the configured voice again after a failed load.
+                                    if ui.button(t!("audio.use")).clicked() {
+                                        config.set_voice(
+                                            rt,
+                                            code,
+                                            Some(voice.path.to_path_buf()),
+                                            synth,
+                                        );
+                                        updated = true;
+                                    }
                                 } else if let Some(progress) = voice.progress() {
                                     egui::ProgressBar::new(progress as f32)
                                         .show_percentage()

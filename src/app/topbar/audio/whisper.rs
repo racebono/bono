@@ -107,14 +107,21 @@ impl Whisper {
 
     pub fn update(&mut self, rt: &Handle, config: &mut Config, ui: &mut egui::Ui) {
         let client = self.client.clone();
+        let failed = self.failed();
+        let mut reload = None;
         let catalog = self.catalog_mut(rt);
 
         let label = setup_label(
-            config.get().whisper_model().is_none(),
+            config
+                .get()
+                .whisper_model()
+                .as_ref()
+                .is_none_or(|path| !path.is_file())
+                || failed,
             t!("audio.speech_to_text"),
         );
-        ui.add_enabled_ui(catalog.is_some(), move |ui| {
-            ui.menu_button(label, move |ui| {
+        ui.add_enabled_ui(catalog.is_some(), |ui| {
+            ui.menu_button(label, |ui| {
                 config.maybe_update(|raw| {
                     raw.min_confidence
                         .edit(*raw.min_confidence(), |confidence| {
@@ -186,12 +193,14 @@ impl Whisper {
                                             if on_disk {
                                                 ui.add_enabled_ui(
                                                     config.whisper_model().as_ref()
-                                                        != Some(&model.path),
+                                                        != Some(&model.path)
+                                                        || failed,
                                                     |ui| {
                                                         if ui.button(t!("audio.use")).clicked() {
                                                             config
                                                                 .whisper_model
                                                                 .set(Some(model.path.clone()));
+                                                            reload = Some(model.path.clone());
                                                             updated = true;
                                                         }
                                                     },
@@ -215,6 +224,9 @@ impl Whisper {
                     });
             });
         });
+        if let Some(path) = reload {
+            self.set_model(path);
+        }
     }
 
     pub fn event(
@@ -350,6 +362,9 @@ impl Whisper {
     /// Called every frame: loads the model picked once it changes, and sets up the recommended
     /// one if the setup guide asked for it.
     pub fn poll(&mut self, rt: &Handle, config: &Config) {
+        if let Some(ctx) = &mut self.ctx {
+            ctx.update(rt);
+        }
         let picked = config.get().whisper_model().clone();
         if picked != self.loaded {
             match picked {
@@ -364,20 +379,22 @@ impl Whisper {
         if !self.setup {
             return;
         }
-        if config.get().whisper_model().is_some() {
-            self.setup = false;
-            return;
-        }
-
+        let picked = config.get().whisper_model().clone();
+        let usable = picked.as_ref().is_some_and(|path| path.is_file()) && !self.failed();
         let client = self.client.clone();
         let started = self.setup_started;
         let Some(model) = self.recommended(rt) else {
             return;
         };
+        if usable && (!started || picked.as_ref() != Some(&model.path)) {
+            self.setup = false;
+            return;
+        }
         match model.on_disk() {
             Some(true) => {
                 let path = model.path.clone();
-                config.update(|raw| raw.whisper_model.set(Some(path)));
+                config.update(|raw| raw.whisper_model.set(Some(path.clone())));
+                self.set_model(path);
                 self.setup = false;
             }
             Some(false) if !started => {
@@ -391,7 +408,7 @@ impl Whisper {
     }
 
     /// Downloads the recommended model (again, if it failed), and uses it once it's on disk, if
-    /// none is picked by then.
+    /// none is usable by then.
     pub fn setup(&mut self) {
         self.setup = true;
         self.setup_started = false;
@@ -401,16 +418,23 @@ impl Whisper {
     pub fn setup_item(&mut self, rt: &Handle, config: &Config) -> Option<SetupItem> {
         let picked = config.get().whisper_model().clone();
         let setup = self.setup;
+        let failed = self.failed();
         let model = match self.catalog.update(rt) {
             None => return picked.is_none().then_some(SetupItem::Loading),
             Some(None) => return picked.is_none().then_some(SetupItem::Unavailable),
             Some(Some(catalog)) => catalog.iter().find(|model| model.file == RECOMMENDED)?,
         };
-        if !setup && picked.as_ref().is_some_and(|picked| *picked != model.path) {
+        if !setup
+            && !failed
+            && picked
+                .as_ref()
+                .is_some_and(|picked| *picked != model.path && picked.is_file())
+        {
             return None;
         }
 
         let state = match (model.on_disk(), model.download()) {
+            (Some(true), _) if failed && picked.as_ref() == Some(&model.path) => SetupState::Failed,
             (Some(true), _) => SetupState::Ready,
             (_, Some(download)) => SetupState::Downloading(download.progress()),
             _ if model.failed() => SetupState::Failed,
@@ -427,6 +451,10 @@ impl Whisper {
         self.catalog_mut(rt)?
             .iter_mut()
             .find(|model| model.file == RECOMMENDED)
+    }
+
+    pub fn failed(&self) -> bool {
+        matches!(self.ctx, Some(MaybeDone::Done(None)))
     }
 
     pub fn set_model(&mut self, path: Arc<Utf8Path>) {

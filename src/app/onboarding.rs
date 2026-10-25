@@ -568,7 +568,7 @@ fn still_downloading(rt: &Handle, ui: &mut egui::Ui, config: &Config, audio: &mu
     }
 }
 
-/// What the guide downloads, and how far along each is. Returns whether those that failed are to
+/// What the guide downloads, and how far along each is. Returns whether missing or failed ones are to
 /// be tried again.
 fn downloads(ui: &mut egui::Ui, items: &[(&str, SetupItem)]) -> bool {
     egui::Grid::new("onboarding-downloads")
@@ -623,7 +623,7 @@ fn downloads(ui: &mut egui::Ui, items: &[(&str, SetupItem)]) -> bool {
         matches!(
             item,
             SetupItem::Found {
-                state: SetupState::Failed,
+                state: SetupState::Failed | SetupState::Missing,
                 ..
             }
         )
