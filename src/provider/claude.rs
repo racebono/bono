@@ -585,8 +585,8 @@ impl Conversation {
         // one was (once per request)
         let mut invalid_lease = None::<String>;
         let mut released = false;
-        // Each inference's identity: a retry of the same HTTP request keeps it, a new inference
-        // (e.g. after a lost answer) gets another
+        // Transport retries keep the identity because the inference may still be running.
+        // Retrying a server error starts a new inference: Cloud retains failed request IDs.
         let mut request_id = self.routing.as_ref().map(|_| new_request_id());
         // Whether the router already said this turn was started (once per request)
         let mut duplicate = false;
@@ -704,6 +704,9 @@ impl Conversation {
             }
 
             log::warn!("{error}, retrying");
+            if request_id.is_some() {
+                request_id = Some(new_request_id());
+            }
             tokio::time::sleep(retry_after.unwrap_or_else(|| backoff(attempt))).await;
             attempt += 1;
         }
