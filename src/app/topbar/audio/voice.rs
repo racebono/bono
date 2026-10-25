@@ -43,6 +43,7 @@ fn recommended(locale: &str) -> Option<(ArrayStr<2>, &'static str)> {
 
 pub struct Voices {
     catalog: MaybeDone<Option<Catalog>>,
+    pref_path: Arc<Utf8Path>,
     client: reqwest::Client,
     /// The setup guide asked for the recommended voice of a language (and which it is): it's
     /// downloaded, then used once it's on disk (unless another was picked meanwhile)
@@ -53,32 +54,47 @@ pub struct Voices {
 }
 
 impl Voices {
-    pub fn new(pref_path: &Arc<Utf8Path>, client: reqwest::Client) -> Self {
-        let pref_path = pref_path.clone();
-        let fetch_client = client.clone();
-
-        return Self {
-            client,
-            setup: None,
-            setup_started: false,
-            catalog: MaybeDone::spawn(async move {
-                let mut first_attempt = true;
-                loop {
-                    match Catalog::fetch(&pref_path, &fetch_client).await {
-                        Ok(catalog) => break Some(catalog),
-                        Err(e) => {
-                            // Report the startup failure once; keep retrying without more dialogs.
-                            if first_attempt {
-                                error(t!("error.tts_catalog"), e);
-                                first_attempt = false;
-                            } else {
-                                log::warn!("Failed to fetch the tts catalog: {e}");
-                            }
+    /// The startup request gets three retries; manual requests get none.
+    fn fetch_catalog(
+        pref_path: Arc<Utf8Path>,
+        client: reqwest::Client,
+        retries: usize,
+    ) -> MaybeDone<Option<Catalog>> {
+        MaybeDone::spawn(async move {
+            for attempt in 0..=retries {
+                match Catalog::fetch(&pref_path, &client).await {
+                    Ok(catalog) => return Some(catalog),
+                    Err(e) => {
+                        if attempt == 0 {
+                            error(t!("error.tts_catalog"), e);
+                        } else {
+                            log::warn!("Failed to fetch the tts catalog: {e}");
                         }
                     }
+                }
+                if attempt < retries {
                     tokio::time::sleep(Duration::from_secs(30)).await;
                 }
-            }),
+            }
+            None
+        })
+    }
+
+    fn retry_catalog(&mut self) {
+        if matches!(self.catalog, MaybeDone::Done(None)) {
+            self.catalog = Self::fetch_catalog(self.pref_path.clone(), self.client.clone(), 0);
+        }
+    }
+
+    pub fn new(pref_path: &Arc<Utf8Path>, client: reqwest::Client) -> Self {
+        let pref_path = pref_path.clone();
+
+        return Self {
+            client: client.clone(),
+            setup: None,
+            setup_started: false,
+            catalog: Self::fetch_catalog(pref_path.clone(), client.clone(), 3),
+            pref_path,
         };
     }
 
@@ -122,6 +138,7 @@ impl Voices {
     /// Downloads the recommended voice for the app's language (`locale`) (again, if it failed),
     /// and uses it once it's on disk, if that language has none by then.
     pub fn setup(&mut self, locale: &str) {
+        self.retry_catalog();
         self.setup = recommended(locale);
         self.setup_started = false;
     }
@@ -163,6 +180,25 @@ impl Voices {
         ui: &mut egui::Ui,
         synth: &mut Synthesizer,
     ) {
+        let pending = self.catalog.update(rt).is_none();
+        let failed = matches!(self.catalog, MaybeDone::Done(None));
+        if pending || failed {
+            ui.menu_button(
+                setup_label(config.get().voices().is_empty(), t!("audio.text_to_speech")),
+                |ui| {
+                    if ui
+                        .add_enabled(failed, egui::Button::new(t!("onboarding.retry")))
+                        .clicked()
+                    {
+                        self.retry_catalog();
+                    }
+                    if pending {
+                        ui.spinner();
+                    }
+                },
+            );
+            return;
+        }
         let client = &self.client;
         let catalog = match self.catalog.update(rt) {
             Some(Some(catalog)) => Some(catalog),
