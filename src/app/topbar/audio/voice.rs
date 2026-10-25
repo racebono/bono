@@ -62,12 +62,21 @@ impl Voices {
             setup: None,
             setup_started: false,
             catalog: MaybeDone::spawn(async move {
-                match Catalog::fetch(&pref_path, &fetch_client).await {
-                    Ok(catalog) => Some(catalog),
-                    Err(e) => {
-                        error(t!("error.tts_catalog"), e);
-                        None
+                let mut first_attempt = true;
+                loop {
+                    match Catalog::fetch(&pref_path, &fetch_client).await {
+                        Ok(catalog) => break Some(catalog),
+                        Err(e) => {
+                            // Report the startup failure once; keep retrying without more dialogs.
+                            if first_attempt {
+                                error(t!("error.tts_catalog"), e);
+                                first_attempt = false;
+                            } else {
+                                log::warn!("Failed to fetch the tts catalog: {e}");
+                            }
+                        }
                     }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
                 }
             }),
         };

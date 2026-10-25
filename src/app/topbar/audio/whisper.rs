@@ -87,12 +87,21 @@ impl Whisper {
             stream: None,
             talk_joystick: None,
             catalog: MaybeDone::spawn(async move {
-                match Model::fetch_catalog(&pref_path, &client).await {
-                    Ok(catalog) => Some(catalog),
-                    Err(e) => {
-                        error(t!("error.stt_catalog"), e);
-                        None
+                let mut first_attempt = true;
+                loop {
+                    match Model::fetch_catalog(&pref_path, &client).await {
+                        Ok(catalog) => break Some(catalog),
+                        Err(e) => {
+                            // Report the startup failure once; keep retrying without more dialogs.
+                            if first_attempt {
+                                error(t!("error.stt_catalog"), e);
+                                first_attempt = false;
+                            } else {
+                                log::warn!("Failed to fetch the stt catalog: {e}");
+                            }
+                        }
                     }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
                 }
             }),
             threads,
