@@ -1488,6 +1488,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routed_server_retries_use_new_inference_ids() {
+        for status in [503, 429] {
+            for continuation in [false, true] {
+                let mut responses = Vec::new();
+                if continuation {
+                    responses.push((200, synthetic("toolu_jev").to_string()));
+                }
+                // Exercise the entire retry budget, including after a tool result.
+                responses.extend([
+                    cloud_error(status, "temporarily_unavailable"),
+                    cloud_error(status, "temporarily_unavailable"),
+                    answer(),
+                ]);
+                let (url, requests) =
+                    mock_headers(responses, "x-should-retry: true\r\nretry-after: 0\r\n").await;
+                let account = signed_in(url, "access-1");
+                let (tools, calls) = engineer_tools();
+                let mut conversation = conversation(&account, tools);
+                conversation.set_routing_context(Some(routing_context()));
+                assert_eq!(conversation.send("Pit?".into()).await.unwrap().text, "Box.");
+                assert_eq!(calls.lock().unwrap().len(), usize::from(continuation));
+
+                let requests = requests.lock().unwrap();
+                let retries = &requests[usize::from(continuation)..];
+                assert_eq!(retries.len(), 3);
+                let keys = retries
+                    .iter()
+                    .map(|(head, _)| idempotency_key(head))
+                    .collect::<std::collections::HashSet<_>>();
+                assert_eq!(keys.len(), 3);
+                for (_, body) in retries {
+                    assert_eq!(body, &retries[0].1);
+                    assert_eq!(
+                        body["routing_turn"]["phase"],
+                        if continuation { "continue" } else { "start" }
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn server_retry_after_duplicate_recovery_uses_a_new_id() {
+        let (url, requests) = mock_headers(
+            vec![
+                cloud_error(503, "temporarily_unavailable"),
+                cloud_error(409, "duplicate_request"),
+                cloud_error(503, "temporarily_unavailable"),
+                answer(),
+            ],
+            "x-should-retry: true\r\nretry-after: 0\r\n",
+        )
+        .await;
+        let account = signed_in(url, "access-1");
+        let mut conversation = conversation(&account, Tools::default());
+        conversation.set_routing_context(Some(routing_context()));
+        assert_eq!(conversation.send("Pit?".into()).await.unwrap().text, "Box.");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        let keys = requests
+            .iter()
+            .map(|(head, _)| idempotency_key(head))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(keys.len(), 4);
+        for (index, (_, body)) in requests.iter().enumerate() {
+            assert_eq!(
+                body["routing_turn"]["id"],
+                requests[0].1["routing_turn"]["id"]
+            );
+            assert_eq!(
+                body["routing_turn"]["phase"],
+                if index < 2 { "start" } else { "continue" }
+            );
+            assert_eq!(body["messages"], requests[0].1["messages"]);
+        }
+    }
+
+    #[tokio::test]
     async fn a_turn_already_routed_carries_on_without_rerouting() {
         let (url, requests) = mock(vec![
             cloud_error(409, "routing_turn_conflict"),
