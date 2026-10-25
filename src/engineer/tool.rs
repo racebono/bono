@@ -726,7 +726,6 @@ struct Ctx<'a> {
     inner: &'a Inner,
     vehicle: i64,
     last_id: i64,
-    player_filter: String,
     /// The player's newest telemetry row, with its car_state values
     player: Row,
     scoring: OnceCell<Scoring>,
@@ -735,7 +734,7 @@ struct Ctx<'a> {
 
 impl<'a> Ctx<'a> {
     fn new(conn: &'a Connection, inner: &'a Inner, vehicle: Option<i64>) -> anyhow::Result<Self> {
-        let (vehicle, last_id, player_filter) = match vehicle {
+        let (vehicle, last_id) = match vehicle {
             None => {
                 let Some(row) = row(
                     conn,
@@ -751,7 +750,6 @@ impl<'a> Ctx<'a> {
                     row.i("vehicle_id")
                         .context("the player's row has no vehicle_id")?,
                     row.i("id").unwrap_or(0),
-                    "is_player = 1".to_owned(),
                 )
             }
             Some(vehicle) => {
@@ -763,7 +761,7 @@ impl<'a> Ctx<'a> {
                 else {
                     bail!("no rows for vehicle_id {vehicle}");
                 };
-                (vehicle, id, format!("vehicle_id = {vehicle}"))
+                (vehicle, id)
             }
         };
 
@@ -776,7 +774,6 @@ impl<'a> Ctx<'a> {
             inner,
             vehicle,
             last_id,
-            player_filter,
             player,
             scoring: OnceCell::new(),
             history_updated: Cell::new(false),
@@ -798,7 +795,7 @@ impl<'a> Ctx<'a> {
         let waited = waiting.elapsed();
         if !self.history_updated.get() {
             let started = Instant::now();
-            history.update(self.conn, &self.player_filter)?;
+            history.update(self.conn)?;
             log::debug!(
                 "Engineer history: waited {:.3}s for cache, scanned {} rows in {:.3}s",
                 waited.as_secs_f64(),
@@ -1322,8 +1319,6 @@ fn resolve_vehicle(ctx: &Ctx, text: &str) -> anyhow::Result<i64> {
 /// later call only reads the rows added since (a few thousand: milliseconds).
 #[derive(Default)]
 struct History {
-    /// What the player is (`is_player = 1`, or a chosen vehicle): another one starts over
-    filter: String,
     last_id: i64,
     /// (session_time, vehicle_id) of the row at `last_id`, to notice a recreated file
     last_row: Option<(Option<f64>, Option<i64>)>,
@@ -1349,14 +1344,8 @@ struct LapAggregate {
 impl History {
     const CHUNK: i64 = 200_000;
 
-    fn update(&mut self, conn: &Connection, filter: &str) -> anyhow::Result<()> {
+    fn update(&mut self, conn: &Connection) -> anyhow::Result<()> {
         self.scanned = 0;
-        if self.filter != filter {
-            *self = History {
-                filter: filter.to_owned(),
-                ..Default::default()
-            };
-        }
 
         // The cached boundary row must still be the same row (guards against a recreated file)
         if self.last_id > 0 {
@@ -1366,10 +1355,7 @@ impl History {
                 [self.last_id],
             )?;
             if r.map(|r| (r.f("session_time"), r.i("vehicle_id"))) != self.last_row {
-                *self = History {
-                    filter: filter.to_owned(),
-                    ..Default::default()
-                };
+                *self = History::default();
             }
         }
         if self.session_start_id == 0 {
@@ -1391,16 +1377,14 @@ impl History {
     }
 
     fn scan(&mut self, conn: &Connection, a: i64, b: i64) -> anyhow::Result<()> {
-        let player_rows = format!(
-            "SELECT id, session_time FROM telemetry WHERE {} AND id BETWEEN ? AND ? ORDER BY id",
-            self.filter
-        );
+        // Session boundaries belong to the real player, even when a command selects another car.
+        let player_rows = "SELECT id, session_time FROM telemetry WHERE is_player = 1 AND id BETWEEN ? AND ? ORDER BY id";
 
         let mut lo = a;
         while lo <= b {
             let hi = b.min(lo + Self::CHUNK - 1);
             let mut reset = None;
-            for r in rows(conn, &player_rows, params![lo, hi])? {
+            for r in rows(conn, player_rows, params![lo, hi])? {
                 let (Some(id), t) = (r.i("id"), r.f("session_time")) else {
                     continue;
                 };
@@ -5123,6 +5107,77 @@ mod tests {
             fischer.starts_with("LAPS driver=\"Lena Fischer\""),
             "{fischer}"
         );
+    }
+
+    #[test]
+    fn vehicle_selection_reuses_history() {
+        let (_dir, engineer) = race();
+        let conn = Connection::open(engineer.inner.path.clone()).unwrap();
+        let ctx = Ctx::new(&conn, &engineer.inner, None).unwrap();
+        let (last_id, session_start_id, player_t, laps) = {
+            let history = ctx.history().unwrap();
+            assert!(history.scanned > 0);
+            (
+                history.last_id,
+                history.session_start_id,
+                history.player_t,
+                history
+                    .laps
+                    .iter()
+                    .map(|(id, laps)| (*id, laps.len()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for vehicle in [Some(2), None, Some(1), Some(2), None] {
+            let ctx = Ctx::new(&conn, &engineer.inner, vehicle).unwrap();
+            let history = ctx.history().unwrap();
+            assert_eq!(history.scanned, 0);
+            assert_eq!(history.last_id, last_id);
+            assert_eq!(history.session_start_id, session_start_id);
+            assert_eq!(history.player_t, player_t);
+            assert_eq!(
+                history
+                    .laps
+                    .iter()
+                    .map(|(id, laps)| (*id, laps.len()))
+                    .collect::<Vec<_>>(),
+                laps
+            );
+        }
+    }
+
+    #[test]
+    fn selected_vehicle_uses_player_session_boundaries() {
+        let (_dir, engineer) = race();
+        let conn = Connection::open(engineer.inner.path.clone()).unwrap();
+        let ctx = Ctx::new(&conn, &engineer.inner, Some(2)).unwrap();
+        let last_id = ctx.history().unwrap().last_id;
+
+        // An opponent's clock alone must not clear the shared aggregates.
+        conn.execute(
+            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap) VALUES (2, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        let ctx = Ctx::new(&conn, &engineer.inner, Some(2)).unwrap();
+        {
+            let history = ctx.history().unwrap();
+            assert_eq!(history.scanned, 1);
+            assert_eq!(history.session_start_id, 1);
+            assert_eq!(history.laps(1).len(), 4);
+        }
+
+        // A real player reset is detected even while requesting the opponent.
+        conn.execute(
+            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap) VALUES (1, 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+        let ctx = Ctx::new(&conn, &engineer.inner, Some(2)).unwrap();
+        let history = ctx.history().unwrap();
+        assert_eq!(history.scanned, 1);
+        assert_eq!(history.session_start_id, last_id + 1);
+        assert_eq!(history.laps(1).len(), 1);
     }
 
     #[test]
