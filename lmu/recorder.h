@@ -19,6 +19,8 @@ typedef struct bono_lmu_recorder bono_lmu_recorder;
 // Starts recording into a new database in the folder `dir` (`len` UTF-16 units), replacing one left by an
 // earlier run. Null if it can't.
 bono_lmu_recorder* bono_lmu_open(const wchar_t* dir, size_t len);
+// Restarts a failed writer without deleting the recording.
+void bono_lmu_restart(bono_lmu_recorder* recorder);
 // Writes what's queued, stops recording and deletes the database.
 void bono_lmu_close(bono_lmu_recorder* recorder);
 // Deletes a database left in the folder `dir` (`len` UTF-16 units).
@@ -36,7 +38,7 @@ void bono_lmu_push_scoring(bono_lmu_recorder* recorder, bono_session_info_s* ses
                                bono_standing_s* standings, size_t count);
 // Deletes everything recorded so far, e.g. when a session ends.
 void bono_lmu_clear(bono_lmu_recorder* recorder);
-// Whether recording stopped on an error: nothing more is recorded until it's closed and opened again.
+// Whether recording stopped on an error: nothing more is recorded until it is restarted.
 bool bono_lmu_failed(bono_lmu_recorder* recorder);
 
 #ifdef __cplusplus

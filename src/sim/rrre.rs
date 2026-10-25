@@ -190,6 +190,10 @@ fn read(dir: &Path, stop: &AtomicBool) {
     let mut recorder = None::<Recorder>;
     let mut converter = Converter::default();
     let mut warned_version = false;
+    let mut retry_at = Instant::now();
+    let mut retry_delay = RETRY;
+    let mut warned_recorder = false;
+    let mut healthy_since = None::<Instant>;
 
     while !stop.load(Ordering::Relaxed) {
         if memory.is_none() {
@@ -215,28 +219,48 @@ fn read(dir: &Path, stop: &AtomicBool) {
             continue;
         }
 
-        let Some(update) = converter.convert(&snapshot, Instant::now()) else {
+        let now = Instant::now();
+        if recorder.as_ref().is_some_and(Recorder::failed) && healthy_since.take().is_some() {
+            retry_at = now + retry_delay;
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
+            if !warned_recorder {
+                log::error!("Recording RaceRoom stopped on an error, retrying with backoff");
+                warned_recorder = true;
+            }
+        }
+        if now < retry_at {
+            std::thread::sleep(POLL);
+            continue;
+        }
+
+        let Some(update) = converter.convert(&snapshot, now) else {
             std::thread::sleep(POLL);
             continue;
         };
 
-        // Stopped on an error: a new one starts over, rather than nothing being recorded until the
-        // game closes
-        if recorder.as_ref().is_some_and(Recorder::failed) {
-            log::error!("Recording RaceRoom stopped on an error, starting over");
-            recorder = None;
-        }
-
-        // Only once there's something to record, so menus leave no empty database
-        if recorder.is_none() {
-            match Recorder::new(dir, None) {
-                Ok(new) => recorder = Some(new),
-                Err(e) => {
+        // Only once there's something to record, so menus leave no empty database.
+        // A failed writer resumes the same recording, preserving earlier sessions.
+        if recorder.as_ref().is_none_or(Recorder::failed) {
+            let result = match &mut recorder {
+                Some(recorder) => recorder.restart(None),
+                None => Recorder::new(dir, None).map(|new| recorder = Some(new)),
+            };
+            if let Err(e) = result {
+                if !warned_recorder {
                     log::error!("Error starting to record RaceRoom: {e}");
-                    std::thread::sleep(RETRY);
-                    continue;
+                    warned_recorder = true;
                 }
+                retry_at = now + retry_delay;
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
+                std::thread::sleep(POLL);
+                continue;
             }
+            healthy_since = Some(now);
+        }
+        // Opening a writer thread isn't success yet: only reset after it stays alive.
+        if healthy_since.is_some_and(|since| now.duration_since(since) >= Duration::from_secs(60)) {
+            retry_delay = RETRY;
+            warned_recorder = false;
         }
         if let Some(recorder) = &recorder {
             record(recorder, update);

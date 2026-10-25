@@ -86,6 +86,30 @@ impl Recorder {
         // would mix two runs. If it's still open, it's emptied instead, once the writer has it
         let left_over = try_remove_database(&dir).is_err();
 
+        Self::start(dir, forecast, left_over)
+    }
+
+    /// Restarts a stopped writer without deleting earlier sessions.
+    pub fn restart(&mut self, forecast: Option<ForecastSource>) -> std::io::Result<()> {
+        if !self.failed() {
+            return Ok(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        *self = Self::start(
+            self.dir.clone(),
+            forecast,
+            self.shared.reset_pending.load(Ordering::Relaxed),
+        )?;
+        Ok(())
+    }
+
+    fn start(
+        dir: PathBuf,
+        forecast: Option<ForecastSource>,
+        left_over: bool,
+    ) -> std::io::Result<Self> {
         let settings = Settings::read(&dir.join(SETTINGS));
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue::default()),
@@ -94,26 +118,29 @@ impl Recorder {
             player_id: AtomicI64::new(-1),
             session_time: AtomicU64::new(0f64.to_bits()),
             failed: AtomicBool::new(false),
+            reset_pending: AtomicBool::new(left_over),
         });
 
-        let thread = std::thread::Builder::new().name("bono recorder".into()).spawn({
-            let shared = shared.clone();
-            let mut writer = Writer {
-                database: dir.join(DATABASE),
-                left_over,
-                settings_path: dir.join(SETTINGS),
-                clear_requests: settings.clear,
-                settings_modified: None,
-                next_settings_check: Instant::now() + SETTINGS_CHECK,
-                forecast,
-            };
-            move || {
-                let result = catch_unwind(AssertUnwindSafe(|| writer.run(&shared)));
-                if !matches!(result, Ok(Ok(()))) {
-                    shared.failed.store(true, Ordering::Relaxed);
+        let thread = std::thread::Builder::new()
+            .name("bono recorder".into())
+            .spawn({
+                let shared = shared.clone();
+                let mut writer = Writer {
+                    database: dir.join(DATABASE),
+                    left_over,
+                    settings_path: dir.join(SETTINGS),
+                    clear_requests: settings.clear,
+                    settings_modified: None,
+                    next_settings_check: Instant::now() + SETTINGS_CHECK,
+                    forecast,
+                };
+                move || {
+                    let result = catch_unwind(AssertUnwindSafe(|| writer.run(&shared)));
+                    if !matches!(result, Ok(Ok(()))) {
+                        shared.failed.store(true, Ordering::Relaxed);
+                    }
                 }
-            }
-        })?;
+            })?;
 
         Ok(Self {
             dir,
@@ -148,7 +175,11 @@ impl Recorder {
             return true;
         }
 
-        let frequency = self.shared.opponent_frequency.load(Ordering::Relaxed).max(1);
+        let frequency = self
+            .shared
+            .opponent_frequency
+            .load(Ordering::Relaxed)
+            .max(1);
         let updates = tracking.opponent_updates.entry(vehicle_id).or_default();
         let keep = *updates % frequency == 0;
         *updates = updates.wrapping_add(1);
@@ -265,6 +296,7 @@ struct Shared {
     /// The session time of the last scoring update (an `f64`), for when the forecast was read
     session_time: AtomicU64,
     failed: AtomicBool,
+    reset_pending: AtomicBool,
 }
 
 #[derive(Default)]
@@ -363,9 +395,11 @@ impl Writer {
         // blocking a commit. NORMAL sync is still corruption-safe in WAL mode and skips an fsync per frame
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        sql::create_tables(&conn)?;
         if self.left_over {
-            sql::clear_tables(&conn)?;
+            sql::recreate_tables(&conn)?;
+            shared.reset_pending.store(false, Ordering::Relaxed);
+        } else {
+            sql::create_tables(&conn)?;
         }
 
         let mut telemetry_writer = TelemetryWriter::new(&conn)?;
@@ -446,7 +480,8 @@ impl Writer {
         }
         self.next_settings_check = now + SETTINGS_CHECK;
 
-        let Ok(modified) = fs::metadata(&self.settings_path).and_then(|meta| meta.modified()) else {
+        let Ok(modified) = fs::metadata(&self.settings_path).and_then(|meta| meta.modified())
+        else {
             return false;
         };
         if self.settings_modified == Some(modified) {
@@ -522,8 +557,10 @@ mod tests {
         drop(recorder);
         let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
         let count = |table: &str| -> i64 {
-            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0))
-                .unwrap()
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
         };
         assert_eq!(count("session"), 1);
         assert_eq!(count("standings"), 2);
@@ -557,6 +594,33 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn restarting_a_failed_writer_preserves_earlier_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        // Forecast runs after queued scoring has committed.
+        let mut recorder =
+            Recorder::new(dir.path(), Some(Box::new(|_| panic!("forecast failed")))).unwrap();
+        recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !recorder.failed() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        recorder.restart(None).unwrap();
+        recorder.push_scoring(bono_session_info::default(), vec![standing(2, true, 0.0)]);
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        let vehicles = conn
+            .prepare("SELECT vehicle_id FROM standings ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(vehicles, [1, 2]);
     }
 
     #[test]
@@ -612,7 +676,9 @@ mod tests {
 
         let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
         let telemetry = conn
-            .query_row("SELECT count(*) FROM telemetry", [], |row| row.get::<_, i64>(0))
+            .query_row("SELECT count(*) FROM telemetry", [], |row| {
+                row.get::<_, i64>(0)
+            })
             .unwrap();
         assert_eq!(telemetry, 0);
         let vehicles = conn
@@ -630,7 +696,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DATABASE);
         let count = |conn: &rusqlite::Connection| {
-            conn.query_row("SELECT count(*) FROM standings", [], |row| row.get::<_, i64>(0))
+            conn.query_row("SELECT count(*) FROM standings", [], |row| {
+                row.get::<_, i64>(0)
+            })
         };
 
         let recorder = Recorder::new(dir.path(), None).unwrap();
@@ -649,7 +717,10 @@ mod tests {
             if count(&conn).is_ok_and(|rows| rows == 0) {
                 break;
             }
-            assert!(Instant::now() < deadline, "the last run's rows are still there");
+            assert!(
+                Instant::now() < deadline,
+                "the last run's rows are still there"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         drop((reader, recorder));
@@ -686,13 +757,17 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
-        let reader =
-            rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .unwrap();
+        let reader = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
         reader.busy_timeout(Duration::from_secs(1)).unwrap();
 
         loop {
-            let rows = reader.query_row("SELECT count(*) FROM standings", [], |row| row.get::<_, i64>(0));
+            let rows = reader.query_row("SELECT count(*) FROM standings", [], |row| {
+                row.get::<_, i64>(0)
+            });
             if rows.as_ref().is_ok_and(|rows| *rows == 1) {
                 break;
             }
