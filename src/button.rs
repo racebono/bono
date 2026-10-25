@@ -177,7 +177,7 @@ impl EventWatchCallback for ButtonWatcherCallback {
             Event::KeyDown {
                 scancode: Some(scancode),
                 ..
-            } => {
+            } if !scancode.name().is_empty() => {
                 let _ = self.send.send(Button::Key(scancode));
             }
             Event::JoyButtonDown {
@@ -213,7 +213,13 @@ mod scancode {
 
     #[inline]
     pub fn serialize<S: Serializer>(v: &Scancode, s: S) -> Result<S::Ok, S::Error> {
-        v.name().serialize(s)
+        let name = v.name();
+        // SDL has unnamed keys and duplicate names (Return and Return2).
+        if Scancode::from_name(name) == Some(*v) {
+            name.serialize(s)
+        } else {
+            v.to_i32().serialize(s)
+        }
     }
 
     #[inline]
@@ -221,9 +227,76 @@ mod scancode {
     where
         D: Deserializer<'de>,
     {
-        let name = <&'de str>::deserialize(d)?;
-        return Scancode::from_name(name).ok_or_else(|| {
-            <D::Error as serde::de::Error>::custom("expected a valid scancode name")
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum SavedScancode {
+            Name(String),
+            Code(i32),
+        }
+
+        let key = match SavedScancode::deserialize(d)? {
+            SavedScancode::Name(name) => Scancode::from_name(&name),
+            SavedScancode::Code(code) => Scancode::from_i32(code),
+        };
+        return key.ok_or_else(|| {
+            <D::Error as serde::de::Error>::custom("expected a valid scancode name or code")
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scancodes_round_trip_through_json() {
+        for code in 0..Scancode::Count.to_i32() {
+            let Some(key) = Scancode::from_i32(code) else {
+                continue;
+            };
+            let saved = serde_json::to_vec(&ConfigButton::Key(key)).unwrap();
+            let loaded: ConfigButton = serde_json::from_slice(&saved).unwrap();
+            assert!(
+                matches!(loaded, ConfigButton::Key(actual) if actual == key),
+                "{key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_legacy_key_names_and_rejects_invalid_keys() {
+        assert_eq!(
+            serde_json::to_value(ConfigButton::Key(Scancode::Backslash)).unwrap(),
+            serde_json::json!({"Key": "\\"})
+        );
+        for value in [
+            serde_json::json!({"Key": ""}),
+            serde_json::json!({"Key": "not a key"}),
+            serde_json::json!({"Key": -1}),
+        ] {
+            assert!(serde_json::from_value::<ConfigButton>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn watcher_ignores_unnamed_keys() {
+        let (send, mut recv) = tokio::sync::mpsc::unbounded_channel();
+        let mut watcher = ButtonWatcherCallback { send };
+        let unnamed = Scancode::Reserved;
+        assert!(unnamed.name().is_empty());
+        for key in [unnamed, Scancode::Backslash] {
+            watcher.callback(Event::KeyDown {
+                timestamp: 0,
+                window_id: 0,
+                keycode: None,
+                scancode: Some(key),
+                keymod: sdl3::keyboard::Mod::NOMOD,
+                repeat: false,
+                which: 0,
+                raw: 0,
+            });
+        }
+        assert_eq!(recv.try_recv().unwrap(), Button::Key(Scancode::Backslash));
+        assert!(recv.try_recv().is_err());
     }
 }
