@@ -1485,7 +1485,7 @@ mod tests {
             <bono_forecast_point as bono_sim::sql::Columns>::DEFINITIONS
         ))
         .unwrap();
-        bono_sim::sql::create_tables(&conn).unwrap();
+        bono_sim::sql::recreate_tables(&conn).unwrap();
         conn.execute(
             "INSERT INTO session (session_time, session_type) VALUES (0, 'race')",
             [],

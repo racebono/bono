@@ -33,6 +33,16 @@ pub unsafe extern "C" fn bono_lmu_open(dir: *const u16, len: usize) -> *mut LmuR
 }
 
 /// # Safety
+/// `recorder` must come from `bono_lmu_open`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bono_lmu_restart(recorder: *mut LmuRecorder) {
+    let recorder = unsafe { &mut (*recorder).0 };
+    guard((), || {
+        let _ = recorder.restart(Some(Box::new(forecast::fetch)));
+    })
+}
+
+/// # Safety
 /// `recorder` must come from `bono_lmu_open`, and isn't used afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bono_lmu_close(recorder: *mut LmuRecorder) {
