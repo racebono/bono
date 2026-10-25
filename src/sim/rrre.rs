@@ -98,6 +98,11 @@ impl Simulator for RaceRoom {
         }
 
         if self.reader.is_none() {
+            // Nothing is recording yet: don't serve a database left by an earlier app run.
+            if let Err(e) = try_remove_database(&self.dir) {
+                log::warn!("Couldn't remove RaceRoom's previous recording: {e}");
+                return None;
+            }
             self.reader = Some(Reader::start(self.dir.clone()));
         }
 
@@ -190,6 +195,10 @@ fn read(dir: &Path, stop: &AtomicBool) {
     let mut recorder = None::<Recorder>;
     let mut converter = Converter::default();
     let mut warned_version = false;
+    let mut retry_at = Instant::now();
+    let mut retry_delay = RETRY;
+    let mut warned_recorder = false;
+    let mut healthy_since = None::<Instant>;
 
     while !stop.load(Ordering::Relaxed) {
         if memory.is_none() {
@@ -215,28 +224,48 @@ fn read(dir: &Path, stop: &AtomicBool) {
             continue;
         }
 
-        let Some(update) = converter.convert(&snapshot, Instant::now()) else {
+        let now = Instant::now();
+        if recorder.as_ref().is_some_and(Recorder::failed) && healthy_since.take().is_some() {
+            retry_at = now + retry_delay;
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
+            if !warned_recorder {
+                log::error!("Recording RaceRoom stopped on an error, retrying with backoff");
+                warned_recorder = true;
+            }
+        }
+        if now < retry_at {
+            std::thread::sleep(POLL);
+            continue;
+        }
+
+        let Some(update) = converter.convert(&snapshot, now) else {
             std::thread::sleep(POLL);
             continue;
         };
 
-        // Stopped on an error: a new one starts over, rather than nothing being recorded until the
-        // game closes
-        if recorder.as_ref().is_some_and(Recorder::failed) {
-            log::error!("Recording RaceRoom stopped on an error, starting over");
-            recorder = None;
-        }
-
-        // Only once there's something to record, so menus leave no empty database
-        if recorder.is_none() {
-            match Recorder::new(dir, None) {
-                Ok(new) => recorder = Some(new),
-                Err(e) => {
+        // Only once there's something to record, so menus leave no empty database.
+        // A failed writer resumes the same recording, preserving earlier sessions.
+        if recorder.as_ref().is_none_or(Recorder::failed) {
+            let result = match &mut recorder {
+                Some(recorder) => recorder.restart(None),
+                None => Recorder::new(dir, None).map(|new| recorder = Some(new)),
+            };
+            if let Err(e) = result {
+                if !warned_recorder {
                     log::error!("Error starting to record RaceRoom: {e}");
-                    std::thread::sleep(RETRY);
-                    continue;
+                    warned_recorder = true;
                 }
+                retry_at = now + retry_delay;
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
+                std::thread::sleep(POLL);
+                continue;
             }
+            healthy_since = Some(now);
+        }
+        // Opening a writer thread isn't success yet: only reset after it stays alive.
+        if healthy_since.is_some_and(|since| now.duration_since(since) >= Duration::from_secs(60)) {
+            retry_delay = RETRY;
+            warned_recorder = false;
         }
         if let Some(recorder) = &recorder {
             record(recorder, update);
@@ -871,6 +900,36 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removes_previous_recording_before_starting_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::write(dir.path().join(format!("{DATABASE}{suffix}")), "old run").unwrap();
+        }
+        let mut sim = RaceRoom::new();
+        sim.dir = dir.path().to_path_buf();
+
+        assert!(sim.database(true).is_none());
+        assert!(sim.reader.is_some());
+        assert!(sim.live.is_none());
+        for suffix in ["", "-wal", "-shm"] {
+            assert!(!dir.path().join(format!("{DATABASE}{suffix}")).exists());
+        }
+    }
+
+    #[test]
+    fn does_not_start_reader_when_previous_recording_cannot_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory at the database path makes removal fail without relying on file locks.
+        std::fs::create_dir(dir.path().join(DATABASE)).unwrap();
+        let mut sim = RaceRoom::new();
+        sim.dir = dir.path().to_path_buf();
+
+        assert!(sim.database(true).is_none());
+        assert!(sim.reader.is_none());
+        assert!(sim.live.is_none());
+    }
 
     fn name(s: &str) -> [u8; 64] {
         let mut out = [0u8; 64];

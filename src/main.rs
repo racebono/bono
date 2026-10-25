@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use crate::{app::App, config::ArrayStr};
 use bono_i18n::t;
 use sdl3::{

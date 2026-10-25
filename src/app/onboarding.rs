@@ -622,10 +622,11 @@ fn downloads(ui: &mut egui::Ui, items: &[(&str, SetupItem)]) -> bool {
     let failed = items.iter().any(|(_, item)| {
         matches!(
             item,
-            SetupItem::Found {
-                state: SetupState::Failed | SetupState::Missing,
-                ..
-            }
+            SetupItem::Unavailable
+                | SetupItem::Found {
+                    state: SetupState::Failed | SetupState::Missing,
+                    ..
+                }
         )
     });
     failed && ui.button(t!("onboarding.retry")).clicked()

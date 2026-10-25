@@ -3,8 +3,8 @@
 //! `forecast`. The columns come from the headers' column lists (see `build.rs`).
 
 use crate::sys::{
-    bono_car_state, bono_forecast_point, bono_session_info, bono_standing,
-    bono_telemetry, bono_wheel_telemetry,
+    bono_car_state, bono_forecast_point, bono_session_info, bono_standing, bono_telemetry,
+    bono_wheel_telemetry,
 };
 use rusqlite::{Connection, PrepFlags, Statement};
 use std::collections::HashMap;
@@ -97,11 +97,25 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         standing = bono_standing::DEFINITIONS,
         forecast = bono_forecast_point::DEFINITIONS,
     ))?;
-    // A database left open by an older recorder can be reused after its rows are cleared.
-    if !conn.column_exists(None, "forecast", "generation")? {
-        conn.execute_batch("ALTER TABLE forecast ADD COLUMN generation INTEGER")?;
-    }
     Ok(())
+}
+
+/// Replaces a previous run's schema, including tables from older versions.
+pub fn recreate_tables(conn: &Connection) -> rusqlite::Result<()> {
+    let tables = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY rowid DESC")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let tx = conn.unchecked_transaction()?;
+    tx.pragma_update(None, "defer_foreign_keys", true)?;
+    for table in tables {
+        tx.execute(
+            &format!("DROP TABLE \"{}\"", table.replace('"', "\"\"")),
+            [],
+        )?;
+    }
+    create_tables(&tx)?;
+    tx.commit()
 }
 
 /// Deletes every row of every table.
@@ -122,7 +136,10 @@ pub fn clear_tables(conn: &Connection) -> rusqlite::Result<()> {
     // Checked at the commit instead, once they're all empty, whatever order they're in. Ends with it
     tx.pragma_update(None, "defer_foreign_keys", true)?;
     for table in tables {
-        tx.execute(&format!("DELETE FROM \"{}\"", table.replace('"', "\"\"")), [])?;
+        tx.execute(
+            &format!("DELETE FROM \"{}\"", table.replace('"', "\"\"")),
+            [],
+        )?;
     }
     tx.commit()?;
 
@@ -205,8 +222,10 @@ impl<'conn> TelemetryWriter<'conn> {
         }
 
         self.insert_state.raw_bind_parameter(1, telemetry_id)?;
-        self.insert_state.raw_bind_parameter(2, &telemetry.vehicle_id)?;
-        self.insert_state.raw_bind_parameter(3, &telemetry.session_time)?;
+        self.insert_state
+            .raw_bind_parameter(2, &telemetry.vehicle_id)?;
+        self.insert_state
+            .raw_bind_parameter(3, &telemetry.session_time)?;
         telemetry.state.bind(&mut self.insert_state, 4)?;
         self.insert_state.raw_execute()?;
         self.last_states.insert(vehicle, (telemetry.state, time));
@@ -330,6 +349,42 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn recreates_an_older_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE telemetry (id INTEGER PRIMARY KEY, obsolete REAL);
+             CREATE TABLE telemetry_wheel (telemetry_id INTEGER REFERENCES telemetry(id));
+             CREATE TABLE car_state (telemetry_id INTEGER REFERENCES telemetry(id));
+             CREATE TABLE session (id INTEGER PRIMARY KEY);
+             CREATE TABLE standings (id INTEGER PRIMARY KEY);
+             CREATE TABLE forecast (id INTEGER PRIMARY KEY);
+             INSERT INTO telemetry VALUES (1, 42);
+             INSERT INTO telemetry_wheel VALUES (1);
+             INSERT INTO car_state VALUES (1);",
+        )
+        .unwrap();
+        recreate_tables(&conn).unwrap();
+        assert!(!conn.column_exists(None, "telemetry", "obsolete").unwrap());
+        assert!(conn.column_exists(None, "forecast", "generation").unwrap());
+        let mut telemetry = TelemetryWriter::new(&conn).unwrap();
+        telemetry.write(&bono_telemetry::default()).unwrap();
+        ScoringWriter::new(&conn)
+            .unwrap()
+            .write(bono_session_info::default(), vec![bono_standing::default()])
+            .unwrap();
+        ForecastWriter::new(&conn)
+            .unwrap()
+            .write(vec![bono_forecast_point::default()])
+            .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM telemetry", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
     /// A weekend's worth of rows, cut down: with `telemetry` emptied first, every row of it
     /// scanned `car_state`, taking seconds here and minutes for a real weekend.
     #[test]
@@ -349,11 +404,17 @@ mod tests {
 
         let start = Instant::now();
         clear_tables(&conn).unwrap();
-        assert!(start.elapsed() < Duration::from_secs(2), "took {:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            start.elapsed()
+        );
 
         for table in ["telemetry", "telemetry_wheel", "car_state"] {
             let count = conn
-                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get::<_, i64>(0))
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
                 .unwrap();
             assert_eq!(count, 0, "{table}");
         }

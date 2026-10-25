@@ -556,7 +556,7 @@ namespace {
         // A recorder that stopped on an error is replaced, so a failure costs a session rather than the rest of
         // the run.
         void start_recording() {
-            if (_recorder && bono_lmu_failed(_recorder)) close();
+            if (_recorder && bono_lmu_failed(_recorder)) bono_lmu_restart(_recorder);
             if (_recorder) return;
             try {
                 const std::wstring dir = database_dir().native();

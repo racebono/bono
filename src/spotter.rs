@@ -115,6 +115,22 @@ impl Raised {
         }
     }
 
+    /// Preserve the occupied side when a clear replaces a pending three-wide call.
+    fn remaining_traffic(&self, older: &Raised) -> Option<Raised> {
+        if !self.supersedes(older) || older.text != "three wide" {
+            return None;
+        }
+        let text = match self.text {
+            "clear left" => "car right",
+            "clear right" => "car left",
+            _ => return None,
+        };
+        Some(Raised {
+            text,
+            ..older.clone()
+        })
+    }
+
     /// A traffic update replaces only the sides it describes; other urgent updates
     /// replace the older state in their category.
     fn supersedes(&self, older: &Raised) -> bool {
@@ -251,7 +267,14 @@ impl Spotter {
     }
 
     fn enqueue(queue: &mut VecDeque<(Raised, Instant)>, call: Raised, at: Instant) {
-        queue.retain(|(queued, _)| !call.supersedes(queued));
+        queue.retain_mut(|(queued, _)| {
+            if let Some(remaining) = call.remaining_traffic(queued) {
+                *queued = remaining;
+                true
+            } else {
+                !call.supersedes(queued)
+            }
+        });
         queue.push_back((call, at));
     }
 
@@ -329,6 +352,11 @@ impl Spotter {
         if let Some(Saying::Synthesizing { call, at, .. }) = &self.saying {
             let superseded = newer.is_some_and(|newer| newer.supersedes(call));
             if !call.valid_at(*at, now) || superseded {
+                if call.valid_at(*at, now)
+                    && let Some(remaining) = newer.and_then(|newer| newer.remaining_traffic(call))
+                {
+                    self.queue.push_front((remaining, *at));
+                }
                 self.saying = None;
             }
         }
@@ -1457,7 +1485,7 @@ mod tests {
             <bono_forecast_point as bono_sim::sql::Columns>::DEFINITIONS
         ))
         .unwrap();
-        bono_sim::sql::create_tables(&conn).unwrap();
+        bono_sim::sql::recreate_tables(&conn).unwrap();
         conn.execute(
             "INSERT INTO session (session_time, session_type) VALUES (0, 'race')",
             [],
@@ -1743,7 +1771,6 @@ mod tests {
             for (old, new) in [
                 ("car right", "clear right"),
                 ("still there left", "clear left"),
-                ("three wide", "clear right"),
                 ("car left", "clear all round"),
                 ("clear right", "car right"),
             ] {
@@ -1765,6 +1792,71 @@ mod tests {
                 };
                 spotter.discard_stale_synthesis(at, Some(&newer));
                 assert!(spotter.saying.is_none(), "{old} superseded by {new}");
+            }
+        }
+    }
+
+    #[test]
+    fn single_side_clear_preserves_remaining_queued_traffic() {
+        // The first car call has already left the queue for playback.
+        for (first, clear, remaining) in [
+            ("car left", "clear left", "car right"),
+            ("car right", "clear right", "car left"),
+        ] {
+            let mut queue: VecDeque<_> = queued(&[(first, true)]).into();
+            queue.pop_front();
+            let at = Instant::now();
+            for text in ["three wide", clear] {
+                Spotter::enqueue(
+                    &mut queue,
+                    Raised {
+                        text,
+                        number: None,
+                        urgent: true,
+                        session_time: 1.0,
+                    },
+                    at,
+                );
+            }
+            assert_eq!(
+                queue.iter().map(|(call, _)| call.text).collect::<Vec<_>>(),
+                [remaining, clear],
+            );
+        }
+    }
+
+    #[test]
+    fn single_side_clear_preserves_remaining_synthesizing_traffic() {
+        for completed in [false, true] {
+            for (clear, remaining) in [("clear left", "car right"), ("clear right", "car left")] {
+                let at = Instant::now();
+                let (mut spotter, send) = pending_call("three wide", true, at);
+                if completed {
+                    assert!(
+                        send.send(Ok(Speech {
+                            samples: vec![],
+                            sample_rate: 24000
+                        }))
+                        .is_ok()
+                    );
+                }
+                let newer = Raised {
+                    text: clear,
+                    number: None,
+                    urgent: true,
+                    session_time: 1.0,
+                };
+                spotter.discard_stale_synthesis(at, Some(&newer));
+                Spotter::enqueue(&mut spotter.queue, newer, at);
+                assert!(spotter.saying.is_none());
+                assert_eq!(
+                    spotter
+                        .queue
+                        .iter()
+                        .map(|(call, queued_at)| (call.text, *queued_at))
+                        .collect::<Vec<_>>(),
+                    [(remaining, at), (clear, at)],
+                );
             }
         }
     }

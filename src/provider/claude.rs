@@ -374,8 +374,11 @@ impl Conversation {
             + 1;
         let size =
             |this: &Self| -> anyhow::Result<usize> { Ok(this.request_size()? + question_bytes) };
+        // Leave a quarter of the envelope for the assistant and its tool results: history
+        // cannot be trimmed once a tool loop has started.
+        let turn_budget = limits.max_bytes - limits.max_bytes / 4;
         if target == limits.target
-            && size(self)? <= limits.max_bytes
+            && size(self)? <= turn_budget
             && self.body.messages.len() < limits.max_messages
         {
             return Ok(());
@@ -2089,6 +2092,63 @@ mod tests {
         );
         // Each long one gets about half of what the short one left
         assert!(json_len(&contents[1]).abs_diff(json_len(&contents[2])) <= 2);
+    }
+
+    #[tokio::test]
+    async fn reserves_room_for_tool_results_near_the_history_limit() {
+        struct Telemetry;
+
+        impl ToolHandler for Telemetry {
+            type Input = Value;
+
+            fn handle(
+                &self,
+                _: Value,
+            ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
+                async { Ok("x".repeat(10_000)) }
+            }
+        }
+
+        let (url, requests) = mock(vec![
+            message(
+                "tool_use",
+                json!([{"type": "tool_use", "id": "call", "name": "telemetry", "input": {}}]),
+            ),
+            message("end_turn", json!([{"type": "text", "text": "Answer"}])),
+        ])
+        .await;
+        let mut builder = ConversationBuilder::new();
+        builder
+            .api_key("test")
+            .base_url(&url)
+            .tool("telemetry", None, json!({"type": "object"}), Telemetry)
+            .history_limits(HistoryLimits {
+                max_bytes: 120_000,
+                max_messages: 100,
+                target: 0.5,
+            });
+        let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+        for _ in 0..2 {
+            conversation.body.messages.extend([
+                RequestMessage {
+                    role: "user",
+                    content: json!("Old question"),
+                },
+                RequestMessage {
+                    role: "assistant",
+                    content: json!([{"type": "text", "text": "x".repeat(58_000)}]),
+                },
+            ]);
+        }
+        assert!((116_000..120_000).contains(&conversation.request_size().unwrap()));
+
+        send(&mut conversation, "Telemetry?").await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert!(serde_json::to_vec(&requests[0]).unwrap().len() < 90_000);
+        let messages = requests[1]["messages"].as_array().unwrap();
+        let result = &messages.last().unwrap()["content"][0]["content"];
+        assert_eq!(result, &json!("x".repeat(10_000)));
+        assert!(serde_json::to_vec(&requests[1]).unwrap().len() <= 120_000);
     }
 
     #[tokio::test]

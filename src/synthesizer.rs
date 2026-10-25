@@ -16,8 +16,8 @@ use crate::{
     },
 };
 use anyhow::{Context, bail};
-use camino::{Utf8Path, Utf8PathBuf};
 use bono_i18n::t;
+use camino::{Utf8Path, Utf8PathBuf};
 use ort::{session::Session, value::Tensor};
 use sdl3::audio::{AudioFormat, AudioSpec, AudioStream, AudioStreamOwner};
 use serde::Deserialize;
@@ -221,48 +221,59 @@ impl SynthesizerInner {
         }
 
         loop {
-            match &mut stream {
-                Some(active) => match active.step(voice.as_mut()) {
-                    Step::Spoke => continue,
-                    Step::Done => {
-                        stream = None;
-                        continue;
-                    }
-                    Step::Waiting => {}
-                },
-                None => {
-                    if let Some(job) = waiting.pop_front() {
-                        stream = Stream::start(job, voice.as_ref());
-                        continue;
-                    }
-                }
-            }
-
-            // Waits for a voice, a job, or the transmission's text (or whoever plays it leaving)
-            let (text, output) = match &mut stream {
-                Some(Stream { text, output, .. }) => (Some(text), Some(&*output)),
-                None => (None, None),
+            // Check jobs between sentences, so one-shot calls can interrupt a long reply.
+            // Keep model changes ahead of jobs sent after them.
+            let job = if !model.has_changed().unwrap_or(true) {
+                jobs.try_recv().ok()
+            } else {
+                None
             };
-            let event = handle.block_on(async {
-                tokio::select! {
-                    // A voice first, for the jobs sent after it
-                    biased;
-                    res = model.changed() => res.ok().map(|()| Event::Model),
-                    job = jobs.recv() => job.map(Event::Job),
-                    text = async {
-                        match text {
-                            Some(text) => text.recv().await,
-                            None => std::future::pending().await,
+            let event = if let Some(job) = job {
+                Some(Event::Job(job))
+            } else {
+                match &mut stream {
+                    Some(active) => match active.step(voice.as_mut()) {
+                        Step::Spoke => continue,
+                        Step::Done => {
+                            stream = None;
+                            continue;
                         }
-                    } => Some(Event::Text(text)),
-                    () = async {
-                        match output {
-                            Some(output) => output.closed().await,
-                            None => std::future::pending().await,
+                        Step::Waiting => {}
+                    },
+                    None => {
+                        if let Some(job) = waiting.pop_front() {
+                            stream = Stream::start(job, voice.as_ref());
+                            continue;
                         }
-                    } => Some(Event::Stopped),
+                    }
                 }
-            });
+
+                // Waits for a voice, a job, or the transmission's text (or whoever plays it leaving)
+                let (text, output) = match &mut stream {
+                    Some(Stream { text, output, .. }) => (Some(text), Some(&*output)),
+                    None => (None, None),
+                };
+                handle.block_on(async {
+                    tokio::select! {
+                        // A voice first, for the jobs sent after it
+                        biased;
+                        res = model.changed() => res.ok().map(|()| Event::Model),
+                        job = jobs.recv() => job.map(Event::Job),
+                        text = async {
+                            match text {
+                                Some(text) => text.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        } => Some(Event::Text(text)),
+                        () = async {
+                            match output {
+                                Some(output) => output.closed().await,
+                                None => std::future::pending().await,
+                            }
+                        } => Some(Event::Stopped),
+                    }
+                })
+            };
 
             match event {
                 Some(Event::Model) => {
@@ -956,6 +967,48 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "timed out");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// Needs a Piper voice: `BONO_VOICE` is the path to its `.onnx`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn one_shot_interrupts_a_stream_with_pending_sentences() {
+        let model = std::env::var("BONO_VOICE").expect("BONO_VOICE isn't set");
+        let rt = Handle::current();
+        let inner = SynthesizerInner::new(rt.clone());
+        inner.set_model(Some(model.into()));
+        let mut synth = Synthesizer {
+            inner: BTreeMap::from([(crate::arrstr!("en"), inner)]),
+        };
+        let effects = Effects {
+            radio: 0.65,
+            beep_volume: 1.0,
+        };
+        let (input, mut output) = synth.stream(&rt, crate::arrstr!("en"), effects);
+        input.push("Copy. ".repeat(32));
+        drop(input);
+        assert!(!next(&mut output).await.unwrap().unwrap().samples.is_empty());
+
+        let call = synth.synthesize(
+            &rt,
+            crate::arrstr!("en"),
+            "Limiter, limiter.".into(),
+            effects,
+        );
+        let speech = tokio::time::timeout(Duration::from_secs(60), call)
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        assert!(!speech.samples.is_empty());
+
+        // The call must finish before all remaining sentences and the closing beep.
+        let mut ready = 0;
+        while let Poll::Ready(Some(speech)) = output.try_next() {
+            speech.unwrap();
+            ready += 1;
+        }
+        assert!(ready < 32, "the one-shot waited for the entire stream");
     }
 
     /// Needs a Piper voice: `BONO_VOICE` is the path to its `.onnx`.

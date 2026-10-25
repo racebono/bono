@@ -62,11 +62,44 @@ pub struct Whisper {
     /// never comes
     talk_joystick: Option<JoystickId>,
     catalog: MaybeDone<Option<Vec<Model>>>,
+    pref_path: Arc<Utf8Path>,
     threads: NonZeroUsize,
     client: reqwest::Client,
 }
 
 impl Whisper {
+    /// The startup request gets three retries; manual requests get none.
+    fn fetch_catalog(
+        pref_path: Arc<Utf8Path>,
+        client: reqwest::Client,
+        retries: usize,
+    ) -> MaybeDone<Option<Vec<Model>>> {
+        MaybeDone::spawn(async move {
+            for attempt in 0..=retries {
+                match Model::fetch_catalog(&pref_path, &client).await {
+                    Ok(catalog) => return Some(catalog),
+                    Err(e) => {
+                        if attempt == 0 {
+                            error(t!("error.stt_catalog"), e);
+                        } else {
+                            log::warn!("Failed to fetch the stt catalog: {e}");
+                        }
+                    }
+                }
+                if attempt < retries {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            }
+            None
+        })
+    }
+
+    fn retry_catalog(&mut self) {
+        if matches!(self.catalog, MaybeDone::Done(None)) {
+            self.catalog = Self::fetch_catalog(self.pref_path.clone(), self.client.clone(), 0);
+        }
+    }
+
     pub fn new(
         pref_path: &Arc<Utf8Path>,
         config: &RawConfig,
@@ -86,15 +119,8 @@ impl Whisper {
             setup_started: false,
             stream: None,
             talk_joystick: None,
-            catalog: MaybeDone::spawn(async move {
-                match Model::fetch_catalog(&pref_path, &client).await {
-                    Ok(catalog) => Some(catalog),
-                    Err(e) => {
-                        error(t!("error.stt_catalog"), e);
-                        None
-                    }
-                }
-            }),
+            catalog: Self::fetch_catalog(pref_path.clone(), client.clone(), 3),
+            pref_path,
             threads,
         };
 
@@ -108,9 +134,6 @@ impl Whisper {
     pub fn update(&mut self, rt: &Handle, config: &mut Config, ui: &mut egui::Ui) {
         let client = self.client.clone();
         let failed = self.failed();
-        let mut reload = None;
-        let catalog = self.catalog_mut(rt);
-
         let label = setup_label(
             config
                 .get()
@@ -120,6 +143,24 @@ impl Whisper {
                 || failed,
             t!("audio.speech_to_text"),
         );
+        let pending = self.catalog.update(rt).is_none();
+        let unavailable = matches!(self.catalog, MaybeDone::Done(None));
+        if pending || unavailable {
+            ui.menu_button(label, |ui| {
+                if ui
+                    .add_enabled(unavailable, egui::Button::new(t!("onboarding.retry")))
+                    .clicked()
+                {
+                    self.retry_catalog();
+                }
+                if pending {
+                    ui.spinner();
+                }
+            });
+            return;
+        }
+        let mut reload = None;
+        let catalog = self.catalog_mut(rt);
         ui.add_enabled_ui(catalog.is_some(), |ui| {
             ui.menu_button(label, |ui| {
                 config.maybe_update(|raw| {
@@ -410,6 +451,7 @@ impl Whisper {
     /// Downloads the recommended model (again, if it failed), and uses it once it's on disk, if
     /// none is usable by then.
     pub fn setup(&mut self) {
+        self.retry_catalog();
         self.setup = true;
         self.setup_started = false;
     }
