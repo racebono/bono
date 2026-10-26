@@ -416,8 +416,9 @@ impl AudioTopbar {
 
 pub struct DeviceSelector {
     open: Option<sdl3::audio::AudioDevice>,
-    /// Keep SDL's main-thread subsystem references until native close has finished on a worker.
-    retiring: Vec<(sdl3::audio::AudioDevice, tokio::sync::oneshot::Receiver<()>)>,
+    /// Devices closing on a worker, with the subsystem reference their forgotten handle held,
+    /// dropped once they're closed
+    retiring: Vec<(AudioSubsystem, tokio::sync::oneshot::Receiver<()>)>,
     /// The device picked, being opened in the background: until then, the one open stays
     opening: Option<OpeningDevice>,
     /// Devices removed while one is being opened: it may be one of them, by the time it's open
@@ -505,16 +506,22 @@ impl DeviceSelector {
     fn retire_open(&mut self) {
         if let Some(device) = self.open.take() {
             let id = device.id().id();
+            // The worker's close is the only one: sdl3's would close the ID again, which SDL
+            // doesn't document as allowed. Forgetting it keeps its subsystem reference counted
+            // until the close is done, released then by the stand-in below.
+            std::mem::forget(device);
+            // SAFETY: what sdl3's `AudioSubsystem::new_unchecked` does, which it allows once per
+            // one forgotten: it's a marker for a global count, and the forgotten one was counted.
+            const { assert!(size_of::<AudioSubsystem>() == 0) };
+            let forgotten = unsafe { std::ptr::read(&self.audio) };
             let done = in_background(move || unsafe { SDL_CloseAudioDevice(id) });
-            self.retiring.push((device, done));
+            self.retiring.push((forgotten, done));
         }
     }
 
     fn collect_retired(&mut self) {
         self.retiring
             .retain_mut(|(_, done)| matches!(done.try_recv(), Err(TryRecvError::Empty)));
-        // The Rust wrappers now close an already-invalid logical ID, which SDL treats as a
-        // no-op. No device thread remains to join. Their subsystem references stay on this thread.
     }
 
     fn begin_shutdown(&mut self) {
