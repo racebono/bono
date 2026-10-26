@@ -163,12 +163,13 @@ mod tests {
     }
 
     /// Sink whose writes block until opened, simulating a stalled stdout or
-    /// disk.
-    struct Stalled(Arc<(Mutex<bool>, Condvar)>, Shared);
+    /// disk. Signals `entered` each time a write starts waiting.
+    struct Stalled(Arc<(Mutex<bool>, Condvar)>, Shared, Sender<()>);
 
     impl Write for Stalled {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             let (open, cv) = &*self.0;
+            let _ = self.2.try_send(());
             drop(cv.wait_while(open.lock().unwrap(), |o| !*o).unwrap());
             self.1.write(buf)
         }
@@ -210,20 +211,24 @@ mod tests {
     fn full_queue_drops_without_blocking_and_reports_count() {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let out = Shared::default();
+        let (entered_tx, entered_rx) = channel::bounded(1);
         let logger = AsyncLogger::new(
             log::LevelFilter::Debug,
             2,
-            vec![Box::new(Stalled(gate.clone(), out.clone()))],
+            vec![Box::new(Stalled(gate.clone(), out.clone(), entered_tx))],
         )
         .unwrap();
-        // The writer stalls on its first flush; logging far past capacity must
-        // still return promptly and count the overflow.
+        // Wait until the writer is stuck in the sink so the queue cannot drain.
+        record(&logger, log::Level::Info, "line 0");
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Logging far past capacity must still return promptly and count the
+        // overflow: two lines fit in the queue, the rest are dropped.
         let start = std::time::Instant::now();
-        for i in 0..100 {
+        for i in 1..=100 {
             record(&logger, log::Level::Info, &format!("line {i}"));
         }
         assert!(start.elapsed() < Duration::from_secs(1));
-        assert!(logger.dropped.load(Ordering::Relaxed) > 0);
+        assert_eq!(logger.dropped.load(Ordering::Relaxed), 98);
 
         *gate.0.lock().unwrap() = true;
         gate.1.notify_all();
@@ -232,7 +237,7 @@ mod tests {
         logger.flush();
         let text = out.text();
         assert!(text.contains("line 0\n"), "{text}");
-        assert!(text.contains("dropped "), "{text}");
+        assert!(text.contains("dropped 98 "), "{text}");
         assert!(text.contains("after\n"), "{text}");
     }
 }
