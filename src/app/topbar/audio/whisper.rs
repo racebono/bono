@@ -30,7 +30,7 @@ use std::{
     num::{NonZero, NonZeroUsize},
     path::Path,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::runtime::Handle;
 use whisper_rs::{
@@ -57,6 +57,9 @@ pub struct Whisper {
     /// The setup's download was started: one that fails isn't started again until it's asked
     /// for again
     setup_started: bool,
+    /// When setup first found the recommended model ready to replace the picked one: it waits for
+    /// a check of the picked one's file started since, so a stale result doesn't replace it
+    replace_since: Option<Instant>,
     stream: Option<WhisperStream>,
     /// The joystick whose talk button started the recording: unplugging it means the release
     /// never comes
@@ -65,6 +68,7 @@ pub struct Whisper {
     pref_path: Arc<Utf8Path>,
     threads: NonZeroUsize,
     client: reqwest::Client,
+    files: super::ModelFiles,
 }
 
 impl Whisper {
@@ -105,6 +109,7 @@ impl Whisper {
         config: &RawConfig,
         client: reqwest::Client,
         threads: Option<NonZeroUsize>,
+        files: super::ModelFiles,
     ) -> Self {
         let pref_path = pref_path.clone();
         let threads = threads
@@ -117,11 +122,13 @@ impl Whisper {
             loaded: None,
             setup: false,
             setup_started: false,
+            replace_since: None,
             stream: None,
             talk_joystick: None,
             catalog: Self::fetch_catalog(pref_path.clone(), client.clone(), 3),
             pref_path,
             threads,
+            files,
         };
 
         if let Some(model) = config.whisper_model().clone() {
@@ -133,16 +140,22 @@ impl Whisper {
 
     pub fn update(&mut self, rt: &Handle, config: &mut Config, ui: &mut egui::Ui) {
         let client = self.client.clone();
+        let failed = self.failed();
         let label = setup_label(
-            config.get().whisper_model().is_none(),
+            config
+                .get()
+                .whisper_model()
+                .as_ref()
+                .is_none_or(|path| !self.files.is_file(path))
+                || failed,
             t!("audio.speech_to_text"),
         );
         let pending = self.catalog.update(rt).is_none();
-        let failed = matches!(self.catalog, MaybeDone::Done(None));
-        if pending || failed {
+        let unavailable = matches!(self.catalog, MaybeDone::Done(None));
+        if pending || unavailable {
             ui.menu_button(label, |ui| {
                 if ui
-                    .add_enabled(failed, egui::Button::new(t!("onboarding.retry")))
+                    .add_enabled(unavailable, egui::Button::new(t!("onboarding.retry")))
                     .clicked()
                 {
                     self.retry_catalog();
@@ -153,9 +166,10 @@ impl Whisper {
             });
             return;
         }
+        let mut reload = None;
         let catalog = self.catalog_mut(rt);
-        ui.add_enabled_ui(catalog.is_some(), move |ui| {
-            ui.menu_button(label, move |ui| {
+        ui.add_enabled_ui(catalog.is_some(), |ui| {
+            ui.menu_button(label, |ui| {
                 config.maybe_update(|raw| {
                     raw.min_confidence
                         .edit(*raw.min_confidence(), |confidence| {
@@ -227,12 +241,14 @@ impl Whisper {
                                             if on_disk {
                                                 ui.add_enabled_ui(
                                                     config.whisper_model().as_ref()
-                                                        != Some(&model.path),
+                                                        != Some(&model.path)
+                                                        || failed,
                                                     |ui| {
                                                         if ui.button(t!("audio.use")).clicked() {
                                                             config
                                                                 .whisper_model
                                                                 .set(Some(model.path.clone()));
+                                                            reload = Some(model.path.clone());
                                                             updated = true;
                                                         }
                                                     },
@@ -256,6 +272,11 @@ impl Whisper {
                     });
             });
         });
+        if let Some(path) = reload {
+            // A model picked by hand is what's used, whatever setup was getting
+            self.setup = false;
+            self.set_model(path);
+        }
     }
 
     pub fn event(
@@ -391,6 +412,9 @@ impl Whisper {
     /// Called every frame: loads the model picked once it changes, and sets up the recommended
     /// one if the setup guide asked for it.
     pub fn poll(&mut self, rt: &Handle, config: &Config) {
+        if let Some(ctx) = &mut self.ctx {
+            ctx.update(rt);
+        }
         let picked = config.get().whisper_model().clone();
         if picked != self.loaded {
             match picked {
@@ -405,20 +429,39 @@ impl Whisper {
         if !self.setup {
             return;
         }
-        if config.get().whisper_model().is_some() {
-            self.setup = false;
-            return;
-        }
-
+        let picked = config.get().whisper_model().clone();
+        // Wait until the picked model's file is checked before deciding to keep it
+        let on_disk = match picked.as_ref().map(|path| self.files.checked(path)) {
+            Some(None) => return,
+            Some(Some(on_disk)) => on_disk,
+            None => false,
+        };
+        let usable = on_disk && !self.failed();
         let client = self.client.clone();
         let started = self.setup_started;
         let Some(model) = self.recommended(rt) else {
             return;
         };
+        if usable && (!started || picked.as_ref() != Some(&model.path)) {
+            self.setup = false;
+            return;
+        }
         match model.on_disk() {
             Some(true) => {
                 let path = model.path.clone();
-                config.update(|raw| raw.whisper_model.set(Some(path)));
+                if let Some(picked) = picked.as_ref().filter(|picked| **picked != path) {
+                    let since = *self.replace_since.get_or_insert_with(Instant::now);
+                    match self.files.checked_since(picked, Some(since)) {
+                        None => return,
+                        Some(true) if !self.failed() => {
+                            self.setup = false;
+                            return;
+                        }
+                        Some(_) => {}
+                    }
+                }
+                config.update(|raw| raw.whisper_model.set(Some(path.clone())));
+                self.set_model(path);
                 self.setup = false;
             }
             Some(false) if !started => {
@@ -432,27 +475,43 @@ impl Whisper {
     }
 
     /// Downloads the recommended model (again, if it failed), and uses it once it's on disk, if
-    /// none is picked by then.
+    /// none is usable by then.
     pub fn setup(&mut self) {
         self.retry_catalog();
         self.setup = true;
         self.setup_started = false;
+        self.replace_since = None;
     }
 
     /// The recommended model, as the setup guide shows it: `None` if another is picked.
     pub fn setup_item(&mut self, rt: &Handle, config: &Config) -> Option<SetupItem> {
         let picked = config.get().whisper_model().clone();
         let setup = self.setup;
+        let failed = self.failed();
+        let unusable = failed
+            || picked
+                .as_ref()
+                .is_none_or(|picked| !self.files.is_file(picked));
         let model = match self.catalog.update(rt) {
-            None => return picked.is_none().then_some(SetupItem::Loading),
-            Some(None) => return picked.is_none().then_some(SetupItem::Unavailable),
+            None => return unusable.then_some(SetupItem::Loading),
+            Some(None) => return unusable.then_some(SetupItem::Unavailable),
             Some(Some(catalog)) => catalog.iter().find(|model| model.file == RECOMMENDED)?,
         };
-        if !setup && picked.as_ref().is_some_and(|picked| *picked != model.path) {
+        if !setup
+            && !failed
+            && picked
+                .as_ref()
+                .is_some_and(|picked| *picked != model.path && self.files.is_file(picked))
+        {
             return None;
         }
 
         let state = match (model.on_disk(), model.download()) {
+            (Some(true), _) if failed && picked.as_ref() == Some(&model.path) => SetupState::Failed,
+            // On disk but not used, and setup isn't going to: retrying uses it
+            (Some(true), _) if !setup && picked.as_ref() != Some(&model.path) => {
+                SetupState::Missing
+            }
             (Some(true), _) => SetupState::Ready,
             (_, Some(download)) => SetupState::Downloading(download.progress()),
             _ if model.failed() => SetupState::Failed,
@@ -469,6 +528,10 @@ impl Whisper {
         self.catalog_mut(rt)?
             .iter_mut()
             .find(|model| model.file == RECOMMENDED)
+    }
+
+    pub fn failed(&self) -> bool {
+        matches!(self.ctx, Some(MaybeDone::Done(None)))
     }
 
     pub fn set_model(&mut self, path: Arc<Utf8Path>) {
@@ -915,9 +978,9 @@ impl Model {
         *self.on_disk.borrow()
     }
 
-    /// The download under way, or done: `None` if there's none, or it failed.
+    /// The download under way: `None` if there's none, it failed, or it's done.
     pub fn download(&self) -> Option<&Download> {
-        self.download.as_ref().filter(|download| !download.failed())
+        (self.download.as_ref()).filter(|download| !download.failed() && !download.finished())
     }
 
     /// Whether the last download failed.
@@ -926,8 +989,8 @@ impl Model {
     }
 
     pub fn start_download(&mut self, client: &reqwest::Client) -> &mut Download {
-        // One that failed starts over
-        if self.failed() {
+        // One that failed starts over, as does one whose file went missing since
+        if self.failed() || self.download.as_ref().is_some_and(Download::finished) {
             self.download = None;
         }
         self.download.get_or_insert_with(|| {

@@ -21,7 +21,7 @@ use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::runtime::Handle;
 
@@ -51,6 +51,10 @@ pub struct Voices {
     /// The setup's download was started: one that fails isn't started again until it's asked
     /// for again
     setup_started: bool,
+    /// When setup first found the recommended voice ready to replace the picked one: it waits for
+    /// a check of the picked one's files started since, so a stale result doesn't replace it
+    replace_since: Option<Instant>,
+    files: super::ModelFiles,
 }
 
 impl Voices {
@@ -86,13 +90,19 @@ impl Voices {
         }
     }
 
-    pub fn new(pref_path: &Arc<Utf8Path>, client: reqwest::Client) -> Self {
+    pub fn new(
+        pref_path: &Arc<Utf8Path>,
+        client: reqwest::Client,
+        files: super::ModelFiles,
+    ) -> Self {
         let pref_path = pref_path.clone();
 
         return Self {
             client: client.clone(),
             setup: None,
             setup_started: false,
+            replace_since: None,
+            files,
             catalog: Self::fetch_catalog(pref_path.clone(), client.clone(), 3),
             pref_path,
         };
@@ -103,11 +113,7 @@ impl Voices {
         let Some((lang, name)) = self.setup else {
             return;
         };
-        if config.get().voices().contains_key(&lang) {
-            self.setup = None;
-            return;
-        }
-
+        let picked = config.get().voices().get(&lang).cloned();
         let Some(Some(catalog)) = self.catalog.update(rt) else {
             return;
         };
@@ -117,11 +123,37 @@ impl Voices {
             return;
         };
 
+        // Wait until the picked voice's files are checked before deciding to keep it
+        let on_disk = match picked.as_ref().map(|path| self.files.voice_checked(path)) {
+            Some(None) => return,
+            Some(Some(on_disk)) => on_disk,
+            None => false,
+        };
+        if on_disk
+            && picked
+                .as_ref()
+                .is_some_and(|path| !self.setup_started || path.as_path() != &*voice.path)
+        {
+            self.setup = None;
+            return;
+        }
+
         let on_disk = (catalog.on_disk.borrow().as_ref())
             .and_then(|on_disk| on_disk.get(voice.index).copied());
         match on_disk {
             Some(true) => {
                 let path = voice.path.to_path_buf();
+                if let Some(picked) = picked.as_ref().filter(|picked| **picked != path) {
+                    let since = *self.replace_since.get_or_insert_with(Instant::now);
+                    match self.files.voice_checked_since(picked, Some(since)) {
+                        None => return,
+                        Some(true) => {
+                            self.setup = None;
+                            return;
+                        }
+                        Some(false) => {}
+                    }
+                }
                 config.update(|raw| raw.set_voice(rt, lang, Some(path), synth));
                 self.setup = None;
             }
@@ -136,11 +168,12 @@ impl Voices {
     }
 
     /// Downloads the recommended voice for the app's language (`locale`) (again, if it failed),
-    /// and uses it once it's on disk, if that language has none by then.
+    /// and uses it once it's on disk, if that language has no voice files by then.
     pub fn setup(&mut self, locale: &str) {
         self.retry_catalog();
         self.setup = recommended(locale);
         self.setup_started = false;
+        self.replace_since = None;
     }
 
     /// The recommended voice for the app's language (`locale`), as the setup guide shows it:
@@ -148,19 +181,28 @@ impl Voices {
     pub fn setup_item(&mut self, rt: &Handle, config: &Config, locale: &str) -> Option<SetupItem> {
         let (lang, name) = self.setup.or_else(|| recommended(locale))?;
         let picked = config.get().voices().get(&lang).cloned();
+        let unusable = picked
+            .as_ref()
+            .is_none_or(|picked| !self.files.voice(picked));
         let catalog = match self.catalog.update(rt) {
-            None => return picked.is_none().then_some(SetupItem::Loading),
-            Some(None) => return picked.is_none().then_some(SetupItem::Unavailable),
+            None => return unusable.then_some(SetupItem::Loading),
+            Some(None) => return unusable.then_some(SetupItem::Unavailable),
             Some(Some(catalog)) => catalog,
         };
         let voice = find(&mut catalog.languages, lang, name)?;
-        if self.setup.is_none() && picked.is_some_and(|picked| picked != *voice.path) {
+        if self.setup.is_none()
+            && (picked.as_ref())
+                .is_some_and(|picked| *picked != *voice.path && self.files.voice(picked))
+        {
             return None;
         }
 
         let on_disk = (catalog.on_disk.borrow().as_ref())
             .and_then(|on_disk| on_disk.get(voice.index).copied());
+        let used = (picked.as_ref()).is_some_and(|picked| *picked == *voice.path);
         let state = match (on_disk, voice.progress()) {
+            // On disk but not used, and setup isn't going to: retrying uses it
+            (Some(true), _) if self.setup.is_none() && !used => SetupState::Missing,
             (Some(true), _) => SetupState::Ready,
             (_, Some(progress)) => SetupState::Downloading(progress),
             _ if voice.failed() => SetupState::Failed,
@@ -184,7 +226,11 @@ impl Voices {
         let failed = matches!(self.catalog, MaybeDone::Done(None));
         if pending || failed {
             ui.menu_button(
-                setup_label(config.get().voices().is_empty(), t!("audio.text_to_speech")),
+                setup_label(
+                    config.get().voices().is_empty()
+                        || (config.get().voices().values()).any(|path| !self.files.voice(path)),
+                    t!("audio.text_to_speech"),
+                ),
                 |ui| {
                     if ui
                         .add_enabled(failed, egui::Button::new(t!("onboarding.retry")))
@@ -206,10 +252,16 @@ impl Voices {
         };
 
         // Without any voice, the app's language is the one to get one for
-        let missing = config.get().voices().is_empty();
+        let missing = config.get().voices().is_empty()
+            || config
+                .get()
+                .voices()
+                .values()
+                .any(|path| !self.files.voice(path));
         let locale = config.get().locale().clone();
         let suggested = ArrayStr::<2>::from_str(locale.split('-').next().unwrap_or_default());
 
+        let mut picked = None;
         ui.add_enabled_ui(catalog.is_some(), |ui| {
             ui.menu_button(setup_label(missing, t!("audio.text_to_speech")), |ui| {
                 let Some(catalog) = catalog else {
@@ -235,12 +287,25 @@ impl Voices {
                             let label =
                                 setup_label(missing && Some(language.code) == suggested, label);
                             ui.menu_button(label, |ui| {
-                                language.update(rt, ui, client, config, on_disk.as_deref(), synth);
+                                if language.update(
+                                    rt,
+                                    ui,
+                                    client,
+                                    config,
+                                    on_disk.as_deref(),
+                                    synth,
+                                ) {
+                                    picked = Some(language.code);
+                                }
                             });
                         }
                     });
             });
         });
+        // A voice picked by hand is what's used, whatever setup was getting for its language
+        if picked.is_some_and(|lang| self.setup.is_some_and(|(setup, _)| setup == lang)) {
+            self.setup = None;
+        }
     }
 }
 
@@ -395,9 +460,10 @@ impl Language {
         config: &mut Config,
         on_disk: Option<&[bool]>,
         synth: &mut Synthesizer,
-    ) {
+    ) -> bool {
         let code = self.code;
         let voices = &mut self.voices;
+        let mut picked = false;
 
         egui_extras::TableBuilder::new(ui)
             .id_salt(("piper-voices", code))
@@ -453,20 +519,17 @@ impl Language {
 
                             row.col(|ui| {
                                 if on_disk {
-                                    let used =
-                                        config.voices().get(&code).map(|path| path.as_path())
-                                            == Some(&*voice.path);
-                                    ui.add_enabled_ui(!used, |ui| {
-                                        if ui.button(t!("audio.use")).clicked() {
-                                            config.set_voice(
-                                                rt,
-                                                code,
-                                                Some(voice.path.to_path_buf()),
-                                                synth,
-                                            );
-                                            updated = true;
-                                        }
-                                    });
+                                    // Allow selecting the configured voice again after a failed load.
+                                    if ui.button(t!("audio.use")).clicked() {
+                                        config.set_voice(
+                                            rt,
+                                            code,
+                                            Some(voice.path.to_path_buf()),
+                                            synth,
+                                        );
+                                        picked = true;
+                                        updated = true;
+                                    }
                                 } else if let Some(progress) = voice.progress() {
                                     egui::ProgressBar::new(progress as f32)
                                         .show_percentage()
@@ -481,6 +544,7 @@ impl Language {
                     return updated;
                 });
             });
+        picked
     }
 }
 
@@ -508,10 +572,10 @@ impl Voice {
     /// Download progress of both files, weighted by size: `None` if they aren't downloading, or
     /// either failed.
     fn progress(&self) -> Option<f64> {
-        if self.failed() {
+        let [model, config] = self.downloads.as_ref()?;
+        if self.failed() || (model.finished() && config.finished()) {
             return None;
         }
-        let [model, config] = self.downloads.as_ref()?;
         let (model_size, config_size) = (self.model_size as f64, self.config_size as f64);
         let total = (model_size + config_size).max(1.0);
         return Some((model.progress() * model_size + config.progress() * config_size) / total);
@@ -523,8 +587,8 @@ impl Voice {
     }
 
     fn start_download(&mut self, client: &reqwest::Client) {
-        // Both start over if either failed
-        if self.failed() {
+        // Both start over if either failed, or once done if their files went missing since
+        if self.failed() || (self.downloads.iter().flatten()).all(Download::finished) {
             self.downloads = None;
         }
         self.downloads.get_or_insert_with(|| {

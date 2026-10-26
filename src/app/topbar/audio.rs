@@ -15,9 +15,10 @@ use crate::{
     error,
     synthesizer::{Speech, Synthesizer, plays_on},
     task::Task,
+    updating,
 };
 use bono_i18n::t;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use sdl3::{
     AudioSubsystem,
     audio::{
@@ -35,9 +36,10 @@ use sdl3::{
     },
 };
 use std::{
+    collections::{HashMap, HashSet},
     ops::{Deref, DerefMut},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU32, Ordering},
     },
     time::{Duration, Instant},
@@ -78,6 +80,8 @@ pub struct AudioTopbar {
     pub speaker: DeviceSelector,
     pub whisper: Whisper,
     pub voices: Voices,
+    /// Whether the configured models are on disk
+    files: ModelFiles,
     pub test: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Speech>>>,
     /// The test speech's stream, kept until it's done playing (dropping it stops playback)
     test_playback: Option<AudioStreamOwner>,
@@ -98,11 +102,13 @@ impl AudioTopbar {
         config: &RawConfig,
         client: &reqwest::Client,
     ) -> Self {
+        let files = ModelFiles::new();
         Self {
             microphone: DeviceSelector::new(Kind::Recording, &ss.audio, config, Instant::now()),
             speaker: DeviceSelector::new(Kind::Playback, &ss.audio, config, Instant::now()),
-            whisper: Whisper::new(pref_path, config, client.clone(), None),
-            voices: Voices::new(pref_path, client.clone()),
+            whisper: Whisper::new(pref_path, config, client.clone(), None, files.clone()),
+            voices: Voices::new(pref_path, client.clone(), files.clone()),
+            files,
             test: None,
             test_playback: None,
             beep_playback: None,
@@ -117,8 +123,13 @@ impl AudioTopbar {
         let config = config.get();
         self.microphone.get().is_none()
             || self.speaker.get().is_none()
-            || config.whisper_model().is_none()
+            || config
+                .whisper_model()
+                .as_ref()
+                .is_none_or(|path| !self.files.is_file(path))
+            || self.whisper.failed()
             || config.voices().is_empty()
+            || config.voices().values().any(|path| !self.files.voice(path))
     }
 
     /// Called every frame, open or not: loads the speech to text model picked, and sets up what
@@ -767,5 +778,104 @@ mod hotplug_tests {
             )))
         );
         assert_eq!(resolve_device("Other microphone", &new), None);
+    }
+}
+
+/// Whether configured model files are on disk, checked off the UI thread: a path is asked about
+/// from the UI, and polled in the background from then on.
+#[derive(Clone)]
+pub struct ModelFiles {
+    asked: Arc<Mutex<HashSet<Utf8PathBuf>>>,
+    /// Whether each is a file, and when the check that found out started
+    found: tokio::sync::watch::Receiver<HashMap<Utf8PathBuf, (bool, Instant)>>,
+}
+
+impl ModelFiles {
+    pub fn new() -> Self {
+        let asked = Arc::new(Mutex::new(HashSet::<Utf8PathBuf>::new()));
+        let found = updating(Duration::from_millis(1234), HashMap::new(), {
+            let asked = asked.clone();
+            move |started| {
+                let paths = asked.lock().unwrap().iter().cloned().collect::<Vec<_>>();
+                async move {
+                    let mut found = HashMap::with_capacity(paths.len());
+                    for path in paths {
+                        let file = tokio::fs::metadata(&path)
+                            .await
+                            .is_ok_and(|metadata| metadata.is_file());
+                        found.insert(path, (file, started));
+                    }
+                    found
+                }
+            }
+        });
+        Self { asked, found }
+    }
+
+    /// Whether `path` is a file, as of the last check: `None` until it's been checked.
+    pub fn checked(&self, path: &Utf8Path) -> Option<bool> {
+        self.checked_since(path, None)
+    }
+
+    /// Like [`Self::checked`], but `None` until a check that started at or after `since`.
+    pub fn checked_since(&self, path: &Utf8Path, since: Option<Instant>) -> Option<bool> {
+        if let Some(&(file, started)) = self.found.borrow().get(path) {
+            if since.is_none_or(|since| started >= since) {
+                return Some(file);
+            }
+            return None;
+        }
+        self.asked.lock().unwrap().insert(path.to_path_buf());
+        None
+    }
+
+    /// Whether `path` is a file, assumed to be until it's been checked, so nothing is flagged
+    /// missing for the first moments.
+    pub fn is_file(&self, path: &Utf8Path) -> bool {
+        self.checked(path).unwrap_or(true)
+    }
+
+    /// Whether a voice's files are on disk: Piper needs both the model and its sidecar
+    /// configuration. `None` until they've been checked.
+    pub fn voice_checked(&self, path: &Utf8Path) -> Option<bool> {
+        self.voice_checked_since(path, None)
+    }
+
+    /// Like [`Self::voice_checked`], but `None` until a check that started at or after `since`.
+    pub fn voice_checked_since(&self, path: &Utf8Path, since: Option<Instant>) -> Option<bool> {
+        let model = self.checked_since(path, since);
+        let json = self.checked_since(&path.with_added_extension("json"), since);
+        Some(model? && json?)
+    }
+
+    /// Whether a voice's files are on disk, assumed to be until they've been checked.
+    pub fn voice(&self, path: &Utf8Path) -> bool {
+        self.voice_checked(path).unwrap_or(true)
+    }
+}
+
+#[cfg(test)]
+mod model_files_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_voice_needs_both_files_after_redownloading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(dir.path().join("voice.onnx")).unwrap();
+        let files = ModelFiles::new();
+        let mut found = files.found.clone();
+        let mut check = async || {
+            files.voice(&path);
+            found.changed().await.unwrap();
+            found.changed().await.unwrap();
+            files.voice(&path)
+        };
+        assert!(!check().await);
+        std::fs::write(&path, []).unwrap();
+        assert!(!check().await);
+        std::fs::write(path.with_added_extension("json"), []).unwrap();
+        assert!(check().await);
+        std::fs::remove_file(&path).unwrap();
+        assert!(!check().await);
     }
 }
