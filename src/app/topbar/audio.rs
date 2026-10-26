@@ -29,8 +29,9 @@ use sdl3::{
     get_error,
     sys::{
         audio::{
-            SDL_GetAudioPlaybackDevices, SDL_GetAudioRecordingDevices,
-            SDL_SetAudioStreamPutCallback,
+            SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, SDL_AUDIO_DEVICE_DEFAULT_RECORDING,
+            SDL_AudioDeviceID, SDL_CloseAudioDevice, SDL_GetAudioPlaybackDevices,
+            SDL_GetAudioRecordingDevices, SDL_OpenAudioDevice, SDL_SetAudioStreamPutCallback,
         },
         stdinc::SDL_free,
     },
@@ -40,7 +41,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -50,6 +51,7 @@ mod voice;
 mod whisper;
 
 const DELAY: Duration = Duration::from_secs(1);
+static DEVICE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Something the setup guide downloads, as it shows it.
 pub enum SetupItem {
@@ -96,6 +98,26 @@ pub struct AudioTopbar {
 }
 
 impl AudioTopbar {
+    /// Stop scheduling audio work before SDL teardown, retaining the subsystem until workers end.
+    pub fn begin_shutdown(&mut self) {
+        self.test = None;
+        self.transcription = None;
+        self.meter = None;
+        self.whisper.cancel_recording();
+        self.test_playback = None;
+        self.beep_playback = None;
+        self.microphone.begin_shutdown();
+        self.speaker.begin_shutdown();
+    }
+
+    pub fn shutdown_ready(&mut self) -> bool {
+        self.microphone.collect_retired();
+        self.speaker.collect_retired();
+        DEVICE_WORKERS.load(Ordering::Acquire) == 0
+            && self.microphone.retiring.is_empty()
+            && self.speaker.retiring.is_empty()
+    }
+
     pub fn new(
         pref_path: &Arc<Utf8Path>,
         ss: &Subsystems,
@@ -121,8 +143,8 @@ impl AudioTopbar {
     /// model, or no voice.
     pub fn needs_setup(&self, config: &Config) -> bool {
         let config = config.get();
-        self.microphone.get().is_none()
-            || self.speaker.get().is_none()
+        self.microphone.missing()
+            || self.speaker.missing()
             || config
                 .whisper_model()
                 .as_ref()
@@ -135,6 +157,11 @@ impl AudioTopbar {
     /// Called every frame, open or not: loads the speech to text model picked, and sets up what
     /// the setup guide asked for.
     pub fn poll(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer) {
+        if self.microphone.poll(Kind::Recording) {
+            // It listens to the new one
+            self.meter = None;
+        }
+        self.speaker.poll(Kind::Playback);
         self.whisper.poll(rt, config);
         self.voices.poll(rt, config, synth);
         self.play_test(config);
@@ -176,11 +203,9 @@ impl AudioTopbar {
 
     /// The microphone, to pick from a list (the setup guide's). Returns whether it changed.
     pub fn pick_microphone(&mut self, ss: &Subsystems, ui: &mut egui::Ui, config: &mut Config) {
-        let now = Instant::now();
-        if self.microphone.list(Kind::Recording, ss, ui, config, now) {
-            // It listens to the new one
-            self.meter = None;
-        }
+        // The meter listens to the new one once it's open (see `poll`)
+        self.microphone
+            .list(Kind::Recording, ss, ui, config, Instant::now());
     }
 
     /// The speaker, to pick from a list (the setup guide's).
@@ -339,19 +364,19 @@ impl AudioTopbar {
         true
     }
 
-    /// Retry only a missing device, preserving an already open device and the saved pick.
-    pub fn device_added(&mut self, recording: bool, audio: &AudioSubsystem, config: &RawConfig) {
+    /// Retry a missing device or one still being opened, preserving an already open device (until
+    /// the pick replaces it) and the saved pick.
+    pub fn device_added(&mut self, recording: bool, _audio: &AudioSubsystem, config: &RawConfig) {
         let (selector, kind) = if recording {
             (&mut self.microphone, Kind::Recording)
         } else {
             (&mut self.speaker, Kind::Playback)
         };
         selector.next = Instant::now();
-        if selector.open.is_none() {
-            selector.open = kind.open(audio, kind.config(config));
-            if recording {
-                self.meter = None;
-            }
+        // An open still in progress may have missed the new device: it's started again. The meter
+        // listens to it once it's open (see `poll`)
+        if selector.open.is_none() || selector.opening.is_some() {
+            selector.opening = Some(kind.open(kind.config(config)));
         }
     }
 
@@ -391,6 +416,15 @@ impl AudioTopbar {
 
 pub struct DeviceSelector {
     open: Option<sdl3::audio::AudioDevice>,
+    /// Devices closing on a worker, with the subsystem reference their forgotten handle held,
+    /// dropped once they're closed
+    retiring: Vec<(AudioSubsystem, tokio::sync::oneshot::Receiver<()>)>,
+    /// The device picked, being opened in the background: until then, the one open stays
+    opening: Option<OpeningDevice>,
+    /// Devices removed while one is being opened: it may be one of them, by the time it's open
+    gone: Vec<u32>,
+    /// To own the devices opened in the background
+    audio: AudioSubsystem,
     next: Instant,
     devices: Vec<(AudioDeviceID, Arc<str>)>,
 }
@@ -398,7 +432,11 @@ pub struct DeviceSelector {
 impl DeviceSelector {
     fn new(kind: Kind, audio: &AudioSubsystem, config: &RawConfig, now: Instant) -> Self {
         Self {
-            open: kind.open(audio, kind.config(config)),
+            open: None,
+            retiring: Vec::new(),
+            opening: Some(kind.open(kind.config(config))),
+            gone: Vec::new(),
+            audio: audio.clone(),
             next: now,
             devices: Vec::new(),
         }
@@ -409,27 +447,97 @@ impl DeviceSelector {
         self.open.as_ref()
     }
 
+    /// Whether no device is open, nor being opened.
+    fn missing(&self) -> bool {
+        self.open.is_none() && self.opening.is_none()
+    }
+
+    /// Uses the device opened in the background, once it is. Returns whether it changed.
+    fn poll(&mut self, kind: Kind) -> bool {
+        self.collect_retired();
+        let Some(opening) = &mut self.opening else {
+            return false;
+        };
+        let opened = match opening.try_recv() {
+            Ok(opened) => opened,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Closed) => Ok(None),
+        };
+        self.opening = None;
+        let gone = std::mem::take(&mut self.gone);
+        self.retire_open();
+        self.open = match opened {
+            // Unplugged before it got here: it's closed as it's dropped
+            Ok(Some(opened)) if gone.contains(&opened.0.0) => None,
+            Ok(Some(opened)) => Some(sdl3::audio::AudioDevice::new(
+                AudioDeviceID::Device(opened.into_id()),
+                self.audio.clone(),
+            )),
+            Ok(None) => None,
+            Err(e) => {
+                error(
+                    match kind {
+                        Kind::Playback => t!("error.open_speaker"),
+                        Kind::Recording => t!("error.open_microphone"),
+                    },
+                    e,
+                );
+                None
+            }
+        };
+        true
+    }
+
     /// The device `which` is gone: it's closed if it's the one open. Returns whether it was.
     fn removed(&mut self, which: u32) -> bool {
+        if self.opening.is_some() {
+            self.gone.push(which);
+        }
         let open = self
             .open
             .as_ref()
             .is_some_and(|open| open.id().id() == which);
         if open {
-            self.open = None;
+            self.retire_open();
         }
         open
+    }
+
+    fn retire_open(&mut self) {
+        if let Some(device) = self.open.take() {
+            let id = device.id().id();
+            // The worker's close is the only one: sdl3's would close the ID again, which SDL
+            // doesn't document as allowed. Forgetting it keeps its subsystem reference counted
+            // until the close is done, released then by the stand-in below.
+            std::mem::forget(device);
+            // SAFETY: what sdl3's `AudioSubsystem::new_unchecked` does, which it allows once per
+            // one forgotten: it's a marker for a global count, and the forgotten one was counted.
+            const { assert!(size_of::<AudioSubsystem>() == 0) };
+            let forgotten = unsafe { std::ptr::read(&self.audio) };
+            let done = in_background(move || unsafe { SDL_CloseAudioDevice(id) });
+            self.retiring.push((forgotten, done));
+        }
+    }
+
+    fn collect_retired(&mut self) {
+        self.retiring
+            .retain_mut(|(_, done)| matches!(done.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    fn begin_shutdown(&mut self) {
+        self.opening = None;
+        self.retire_open();
     }
 
     fn update<'a>(
         &'a mut self,
         kind: Kind,
-        ss: &Subsystems,
+        _ss: &Subsystems,
         ui: &mut egui::Ui,
         config: &mut Config,
         now: Instant,
     ) -> bool {
-        self.refresh(kind, ss, now);
+        self.refresh(kind, now);
 
         let mut test = false;
         config.maybe_update(|raw| {
@@ -438,12 +546,12 @@ impl DeviceSelector {
             // A sub-menu rather than a `ComboBox`: egui only tracks one open popup per viewport,
             // so opening a `ComboBox` popup would close the menu it lives in.
             let label = setup_label(
-                self.open.is_none(),
+                self.missing(),
                 format!("{}: {}", kind.label(), device.name()),
             );
             let updated = ui
                 .menu_button(label, |ui| {
-                    let updated = self.options(kind, ss, ui, &mut device);
+                    let updated = self.options(kind, ui, &mut device);
                     if kind == Kind::Playback {
                         ui.separator();
                         test = ui.button(t!("audio.test")).clicked();
@@ -467,17 +575,17 @@ impl DeviceSelector {
     fn list(
         &mut self,
         kind: Kind,
-        ss: &Subsystems,
+        _ss: &Subsystems,
         ui: &mut egui::Ui,
         config: &mut Config,
         now: Instant,
     ) -> bool {
-        self.refresh(kind, ss, now);
+        self.refresh(kind, now);
 
         let mut changed = false;
         config.maybe_update(|raw| {
             let mut device = kind.config(raw).clone();
-            changed = self.options(kind, ss, ui, &mut device);
+            changed = self.options(kind, ui, &mut device);
             if changed {
                 kind.set(raw, device);
             }
@@ -488,13 +596,7 @@ impl DeviceSelector {
 
     /// The system's default and every device, `device` the one picked: one picked is opened.
     /// Returns whether the pick changed.
-    fn options(
-        &mut self,
-        kind: Kind,
-        ss: &Subsystems,
-        ui: &mut egui::Ui,
-        device: &mut AudioDevice,
-    ) -> bool {
+    fn options(&mut self, kind: Kind, ui: &mut egui::Ui, device: &mut AudioDevice) -> bool {
         let mut updated = ui
             .selectable_value(device, AudioDevice::Default, t!("audio.system_default"))
             .clicked();
@@ -506,15 +608,16 @@ impl DeviceSelector {
         }
 
         if updated {
-            self.open = kind.open(&ss.audio, device);
+            // One still being opened isn't wanted any more: it's closed once it's open
+            self.opening = Some(kind.open(device));
         }
         updated
     }
 
     /// Lists the devices again, every `DELAY`.
-    fn refresh(&mut self, kind: Kind, ss: &Subsystems, now: Instant) {
+    fn refresh(&mut self, kind: Kind, now: Instant) {
         if now >= self.next {
-            self.update_devices(kind, ss);
+            self.update_devices(kind);
             self.next = match self.next.checked_add(DELAY) {
                 Some(next) => next.max(now),
                 None => now,
@@ -522,9 +625,9 @@ impl DeviceSelector {
         }
     }
 
-    fn update_devices(&mut self, kind: Kind, ss: &Subsystems) {
+    fn update_devices(&mut self, kind: Kind) {
         self.devices.clear();
-        if let Err(e) = kind.enumerate(&ss.audio, &mut self.devices) {
+        if let Err(e) = kind.enumerate(&mut self.devices) {
             log::error!("Error updating audio devices: {e}");
         }
     }
@@ -562,6 +665,12 @@ impl<CB> DerefMut for RecordingStream<CB> {
 }
 
 impl<CB> Drop for RecordingStream<CB> {
+    /// Blocks the UI thread, briefly: this must happen before sdl3 frees the callback, which is
+    /// dropped with the stream on the thread that owns it, and sdl3's streams can't be sent to
+    /// another (they hold the `!Send` `AudioSubsystem`). It waits for at most one callback call,
+    /// which only copies the little audio that's arrived since the last (microseconds of work).
+    /// Destroying the stream afterwards closes its own logical device, not the physical one,
+    /// which the picked device keeps open.
     fn drop(&mut self) {
         let _ = self.0.pause();
         // SDL calls the callback with the stream locked, and this locks it too: it waits for a
@@ -660,57 +769,55 @@ impl Kind {
         }
     }
 
-    pub fn open(
-        self,
-        audio: &AudioSubsystem,
-        device: &AudioDevice,
-    ) -> Option<sdl3::audio::AudioDevice> {
+    /// Opens `device` in the background: opening one can take the OS a while (WASAPI activates
+    /// it, a Bluetooth headset may wake up), which would freeze the UI. What's received is
+    /// [`DeviceSelector::poll`]ed.
+    fn open(self, device: &AudioDevice) -> OpeningDevice {
         log::debug!("{device:#?}");
-        // SDL IDs are transient: a reconnected device has a new ID. Resolve the saved
-        // name whenever opening, including a device that was absent at startup.
-        let resolved;
-        let device = match device {
-            AudioDevice::Default => None,
-            AudioDevice::Device(_, name) | AudioDevice::Unknown(name) => {
-                let mut devices = Vec::new();
-                if let Err(e) = self.enumerate(audio, &mut devices) {
-                    log::warn!("Couldn't resolve audio device: {e}");
-                    return None;
-                }
-                resolved = resolve_device(name, &devices)?;
-                Some(&resolved)
-            }
-        };
-
-        let res = match self {
-            Kind::Playback => {
-                sdl3::audio::AudioDevice::open_playback(audio, device, &AudioSpec::default())
-            }
-            Kind::Recording => {
-                sdl3::audio::AudioDevice::open_recording(audio, device, &RECORDING_SPEC)
-            }
-        };
-
-        match res {
-            Ok(device) => Some(device),
-            Err(e) => {
-                error(
-                    match self {
-                        Kind::Playback => t!("error.open_speaker"),
-                        Kind::Recording => t!("error.open_microphone"),
-                    },
-                    e,
-                );
-                None
-            }
-        }
+        let device = device.clone();
+        // Nobody may want it any more (another was picked meanwhile): it closes as it's dropped
+        in_background(move || self.open_raw(&device).map(|id| id.map(OpenedDevice)))
     }
 
-    pub fn enumerate(
-        self,
-        _audio: &AudioSubsystem,
-        dest: &mut Vec<(AudioDeviceID, Arc<str>)>,
-    ) -> Result<(), sdl3::Error> {
+    /// Opens `device`, on any thread: the SDL device functions used are thread safe, unlike
+    /// sdl3's `AudioSubsystem` (which the ID is wrapped with on the UI thread). `None` if it's
+    /// not plugged in.
+    fn open_raw(self, device: &AudioDevice) -> Result<Option<SDL_AudioDeviceID>, sdl3::Error> {
+        // SDL IDs are transient: a reconnected device has a new ID. Resolve the saved
+        // name whenever opening, including a device that was absent at startup.
+        let device = match device {
+            AudioDevice::Default => match self {
+                Kind::Playback => SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+                Kind::Recording => SDL_AUDIO_DEVICE_DEFAULT_RECORDING,
+            },
+            AudioDevice::Device(_, name) | AudioDevice::Unknown(name) => {
+                let mut devices = Vec::new();
+                if let Err(e) = self.enumerate(&mut devices) {
+                    log::warn!("Couldn't resolve audio device: {e}");
+                    return Ok(None);
+                }
+                match resolve_device(name, &devices) {
+                    Some(id) => id.id(),
+                    None => return Ok(None),
+                }
+            }
+        };
+
+        let spec: sdl3::sys::audio::SDL_AudioSpec = match self {
+            Kind::Playback => AudioSpec::default(),
+            Kind::Recording => RECORDING_SPEC,
+        }
+        .into();
+        let id = unsafe { SDL_OpenAudioDevice(device, &spec) };
+        if id.0 == 0 {
+            return Err(get_error());
+        }
+        Ok(Some(id))
+    }
+
+    /// The devices of this kind. It only copies SDL's list, which SDL keeps up to date on its own
+    /// threads: it's quick enough for the UI thread, which lists them every `DELAY`.
+    pub fn enumerate(self, dest: &mut Vec<(AudioDeviceID, Arc<str>)>) -> Result<(), sdl3::Error> {
         let get_devices = match self {
             Kind::Playback => SDL_GetAudioPlaybackDevices,
             Kind::Recording => SDL_GetAudioRecordingDevices,
@@ -742,6 +849,51 @@ impl Kind {
     }
 }
 
+/// A device being opened in the background: `None` if it's not plugged in.
+type OpeningDevice = tokio::sync::oneshot::Receiver<Result<Option<OpenedDevice>, sdl3::Error>>;
+
+/// A device opened in the background, closed if it's dropped before sdl3 is given it: whether
+/// on its thread (nobody waits for it) or in the channel (nobody received it).
+struct OpenedDevice(SDL_AudioDeviceID);
+
+impl OpenedDevice {
+    /// For sdl3 to close it instead.
+    fn into_id(self) -> SDL_AudioDeviceID {
+        let id = self.0;
+        std::mem::forget(self);
+        id
+    }
+}
+
+impl Drop for OpenedDevice {
+    fn drop(&mut self) {
+        let id = self.0;
+        // This value can be discarded from a result channel on the UI thread too.
+        drop(in_background(move || unsafe { SDL_CloseAudioDevice(id) }));
+    }
+}
+
+/// Runs `work` on its own thread, for its result to be received. If it's no longer wanted, it's
+/// dropped where it is: `T` must let go of what it holds then.
+fn in_background<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> tokio::sync::oneshot::Receiver<T> {
+    let (send, recv) = tokio::sync::oneshot::channel();
+    struct Worker;
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            DEVICE_WORKERS.fetch_sub(1, Ordering::Release);
+        }
+    }
+    DEVICE_WORKERS.fetch_add(1, Ordering::AcqRel);
+    let worker = Worker;
+    std::thread::spawn(move || {
+        let _worker = worker;
+        let _ = send.send(work());
+    });
+    recv
+}
+
 /// Match names only within the requested kind's current device inventory.
 fn resolve_device(name: &str, devices: &[(AudioDeviceID, Arc<str>)]) -> Option<AudioDeviceID> {
     devices
@@ -753,6 +905,61 @@ fn resolve_device(name: &str, devices: &[(AudioDeviceID, Arc<str>)]) -> Option<A
 #[cfg(test)]
 mod hotplug_tests {
     use super::*;
+
+    /// Tells when it's dropped, like a device that's closed.
+    struct Released(std::sync::mpsc::Sender<()>);
+
+    impl Drop for Released {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    #[test]
+    fn a_result_nobody_waits_for_is_let_go_of() {
+        let (gone, released) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let recv = in_background(move || {
+            wait.recv().unwrap();
+            Released(gone)
+        });
+        // Dropped while it's still working, like a device picked over one being opened
+        drop(recv);
+        go.send(()).unwrap();
+        assert_eq!(released.recv_timeout(Duration::from_secs(5)), Ok(()));
+    }
+
+    #[test]
+    fn a_result_nobody_received_is_let_go_of() {
+        let (gone, released) = std::sync::mpsc::channel();
+        let recv = in_background(move || Released(gone));
+        // Done, but picked over before the UI got to it
+        while recv.is_empty() {
+            std::thread::yield_now();
+        }
+        assert!(released.try_recv().is_err());
+        drop(recv);
+        assert_eq!(released.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn a_result_wanted_is_received_without_waiting_for_it() {
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let mut recv = in_background(move || {
+            wait.recv().unwrap();
+            7
+        });
+        assert_eq!(recv.try_recv(), Err(TryRecvError::Empty));
+        go.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match recv.try_recv() {
+                Ok(result) => break assert_eq!(result, 7),
+                Err(TryRecvError::Empty) if Instant::now() < deadline => std::thread::yield_now(),
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
 
     #[test]
     fn saved_name_resolves_to_the_current_id_after_reconnection() {

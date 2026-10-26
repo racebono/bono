@@ -38,6 +38,7 @@ mod topbar;
 pub struct App {
     state: AppState,
     ui: EguiCanvas,
+    closing: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl App {
@@ -71,8 +72,40 @@ impl App {
         let joysticks = Joysticks::new(&joystick);
         let event = sdl.event()?;
         let fonts = load_fonts()?;
+        // Initial Steam registry discovery and watcher creation can wait on the OS too.
+        let simulators = rt.spawn_blocking(ActiveSimulator::default);
 
-        let config = load_config(&pref_path).await?;
+        // Everything waited on happens before the window exists: SDL's init callback must return
+        // before the first frame, so a window opened earlier would show unresponsive meanwhile.
+        // It's all local (config and track cache files, the OS credential store), done at once
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?;
+        let account = async {
+            let origin = option_env!("BONO_ACCOUNT_ORIGIN")?;
+            match crate::account::Account::new(origin).await {
+                Ok(account) => {
+                    let restore = account.clone();
+                    rt.spawn(async move {
+                        if let Err(error) = restore.resume().await {
+                            log::warn!("Account restoration: {error}");
+                        }
+                    });
+                    Some(account)
+                }
+                Err(error) => {
+                    log::warn!("Account initialization: {error}");
+                    None
+                }
+            }
+        };
+        let (config, tracks, account) = tokio::join!(
+            load_config(&pref_path),
+            TrackSync::new(client.clone(), pref_path.as_std_path()),
+            account,
+        );
+        let config = config?;
+        let simulators = simulators.await?;
         let (width, height) = {
             let config = config.get();
             (*config.width(), *config.height())
@@ -95,35 +128,10 @@ impl App {
         };
 
         let pref_path = Arc::<Utf8Path>::from(pref_path);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
-        let tracks = TrackSync::new(client.clone(), pref_path.as_std_path());
-
-        let account = match option_env!("BONO_ACCOUNT_ORIGIN") {
-            Some(origin) => match crate::account::Account::new(origin).await {
-                Ok(account) => {
-                    let restore = account.clone();
-                    rt.spawn(async move {
-                        if let Err(error) = restore.resume().await {
-                            log::warn!("Account restoration: {error}");
-                        }
-                    });
-                    Some(account)
-                }
-                Err(error) => {
-                    log::warn!("Account initialization: {error}");
-                    None
-                }
-            },
-            None => None,
-        };
-
         let guard = config.get();
         let gui = Gui::new(&pref_path, &subsystems, &guard, &client, account.as_ref());
         let synth = Synthesizer::new(rt, &guard);
         let engineer = Engineer::new(client, account.clone());
-        let tracks = tracks.await;
         drop(guard);
 
         return Ok(Self {
@@ -133,7 +141,7 @@ impl App {
                 config,
                 gui,
                 synth,
-                simulators: ActiveSimulator::default(),
+                simulators,
                 applied_opponent_frequency: None,
                 tracks,
                 account,
@@ -141,10 +149,18 @@ impl App {
                 spotter: Spotter::new(),
             },
             ui,
+            closing: None,
         });
     }
 
     pub fn iterate(&mut self, rt: &Handle) -> AppResult {
+        if let Some(closing) = &self.closing {
+            return if closing.is_finished() && self.state.gui.topbar.audio.shutdown_ready() {
+                AppResult::Success
+            } else {
+                AppResult::Continue
+            };
+        }
         self.ui.run(|ctx| {
             // Must happen before the root `Ui` is built, since it copies the style on creation
             let text_scale = *self.state.config.get().text_scale();
@@ -172,10 +188,36 @@ impl App {
 
     /// The app is quitting: what the website holds for it is given back.
     pub fn quit(&mut self, rt: &Handle) {
-        self.state.engineer.quit(rt);
+        // Normal quits finish background cleanup before SDL asks us to dispose the UI.
+        // An OS-forced exit can skip the normal Quit event; start best-effort cleanup then too.
+        self.begin_quit(rt);
+    }
+
+    fn begin_quit(&mut self, rt: &Handle) {
+        if self.closing.is_some() {
+            return;
+        }
+        self.ui.painter.canvas.window_mut().hide();
+        self.state.gui.topbar.audio.begin_shutdown();
+        let engineer = self.state.engineer.quit(rt);
+        let simulators = self.state.simulators.shutdown();
+        let voices = std::mem::take(&mut self.state.synth.inner);
+        let speech = rt.spawn_blocking(move || drop(voices));
+        self.closing = Some(rt.spawn(async move {
+            let _ = tokio::join!(engineer, simulators, speech);
+            // Flushing has a bounded wait, so it belongs on a worker after cleanup logs finish.
+            let _ = tokio::task::spawn_blocking(|| log::logger().flush()).await;
+        }));
     }
 
     pub fn event(&mut self, rt: &Handle, event: Event) -> AppResult {
+        if matches!(event, Event::Quit { .. }) {
+            self.begin_quit(rt);
+            return AppResult::Continue;
+        }
+        if self.closing.is_some() {
+            return AppResult::Continue;
+        }
         self.state.joysticks.event(&event);
         match event {
             Event::AudioDeviceRemoved {

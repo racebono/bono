@@ -48,7 +48,8 @@ pub const RECORDING_SPEC: AudioSpec = AudioSpec {
 const RECOMMENDED: &str = "ggml-large-v3-turbo-q5_0.bin";
 
 pub struct Whisper {
-    ctx: Option<MaybeDone<Option<WhisperContext>>>,
+    /// Shared with the workers creating each recording's state; only ever freed on one
+    ctx: Option<MaybeDone<Option<Arc<WhisperContext>>>>,
     /// The model `ctx` is loaded from
     loaded: Option<Arc<Utf8Path>>,
     /// The setup guide asked for the recommended model: it's downloaded, then used once it's on
@@ -346,7 +347,7 @@ impl Whisper {
             return not_listening(NotListening::NoMicrophone);
         };
         let ctx = match self.ctx.as_mut().map(|ctx| ctx.update(rt)) {
-            Some(Some(Some(ctx))) => ctx,
+            Some(Some(Some(ctx))) => ctx.clone(),
             Some(None) => return not_listening(NotListening::Loading),
             Some(Some(None)) | None => return not_listening(NotListening::NoModel),
         };
@@ -365,13 +366,24 @@ impl Whisper {
             stream.resume()?;
             log::debug!("Started microphone recording");
 
+            // Creating the state allocates whisper's buffers (on the GPU too): a worker does it
+            // while the microphone records, and `finish` waits for it there
+            let (send_session, session) = oneshot::channel();
+            let threads = self.threads;
+            // Detached: this crate's `spawn_blocking` handle would cancel it once dropped
+            rt.spawn_blocking(move || {
+                let session = ctx.create_state().map(|state| WhisperSession {
+                    state,
+                    threads,
+                    multilingual: ctx.is_multilingual(),
+                });
+                // Unheard if the recording was dropped meanwhile: it's freed here then
+                let _ = send_session.send(session.map_err(Into::into));
+            });
+
             return Ok::<_, anyhow::Error>(WhisperStream {
                 recv,
-                session: WhisperSession {
-                    state: ctx.create_state()?,
-                    threads: self.threads,
-                    multilingual: ctx.is_multilingual(),
-                },
+                session: PendingSession(DropInBackground::new(session)),
                 stream,
             });
         };
@@ -420,7 +432,7 @@ impl Whisper {
             match picked {
                 Some(path) => self.set_model(path),
                 None => {
-                    self.ctx = None;
+                    drop_in_background(self.ctx.take());
                     self.loaded = None;
                 }
             }
@@ -536,12 +548,14 @@ impl Whisper {
 
     pub fn set_model(&mut self, path: Arc<Utf8Path>) {
         self.loaded = Some(path.clone());
+        // The model replaced (or still loading) is freed on a worker
+        drop_in_background(self.ctx.take());
         self.ctx = Some(MaybeDone::spawn_blocking(
             move || match WhisperContext::new_with_params(
                 path.as_os_str(),
                 WhisperContextParameters::default(),
             ) {
-                Ok(ctx) => Some(ctx),
+                Ok(ctx) => Some(Arc::new(ctx)),
                 Err(e) => {
                     error(t!("error.stt_model"), e);
                     None
@@ -602,7 +616,7 @@ fn talk(
 
 struct WhisperStream {
     recv: oneshot::Receiver<anyhow::Result<Vec<f32>>>,
-    session: WhisperSession,
+    session: PendingSession,
     stream: RecordingStream<Recorder>,
 }
 
@@ -612,19 +626,69 @@ impl WhisperStream {
     }
 }
 
+impl Drop for Whisper {
+    fn drop(&mut self) {
+        drop_in_background(self.ctx.take());
+    }
+}
+
+/// Frees `T` on a worker: whisper's model and state free large (GPU) buffers.
+fn drop_in_background<T: Send + 'static>(value: T) {
+    // Without a runtime (tests) there's no worker to free it on
+    if let Ok(rt) = Handle::try_current() {
+        // Not this crate's `spawn_blocking`: its handle aborts the task once dropped
+        rt.spawn_blocking(move || drop(value));
+    }
+}
+
+/// Owns `T`, and frees it with [`drop_in_background`] unless taken back.
+struct DropInBackground<T: Send + 'static>(Option<T>);
+
+impl<T: Send + 'static> DropInBackground<T> {
+    fn new(value: T) -> Self {
+        Self(Some(value))
+    }
+
+    fn into_inner(mut self) -> T {
+        self.0.take().expect("taken only once")
+    }
+}
+
+impl<T: Send + 'static> Drop for DropInBackground<T> {
+    fn drop(&mut self) {
+        drop_in_background(self.0.take());
+    }
+}
+
+/// The recording's [`WhisperSession`], while a worker creates it. Dropped, the session is freed
+/// on a worker, whether or not it's created yet.
+struct PendingSession(DropInBackground<oneshot::Receiver<anyhow::Result<WhisperSession>>>);
+
+impl PendingSession {
+    /// Blocks until the session is created: call it from a worker.
+    fn wait(self) -> anyhow::Result<WhisperSession> {
+        self.0.into_inner().recv()?
+    }
+}
+
 pub struct WhisperSession {
     state: WhisperState,
     threads: NonZeroUsize,
     multilingual: bool,
 }
 
-impl WhisperSession {
+impl PendingSession {
     fn finish(
-        mut self,
+        self,
         recv: oneshot::Receiver<anyhow::Result<Vec<f32>>>,
         mut stream: RecordingStream<Recorder>,
         config: Config,
     ) -> JoinHandle<anyhow::Result<Heard>> {
+        // Blocks the UI thread, briefly: sdl3's stream can't be sent to another thread (it holds
+        // the `!Send` `AudioSubsystem`), and the callback must be done with before it's freed.
+        // Pausing, flushing and locking each wait for at most one callback call; draining copies
+        // what arrived since the last one (a device buffer, milliseconds of audio). The
+        // transcription, the slow part, runs in the background.
         if let Err(e) = stream.pause() {
             return spawn(std::future::ready(Err(e.into())));
         }
@@ -642,6 +706,7 @@ impl WhisperSession {
         }
 
         return spawn_blocking(move || {
+            let mut session = self.wait()?;
             let samples = recv.recv()??;
             log::debug!("Sample count: {}", samples.len());
             if samples.len() < MIN_SAMPLES {
@@ -658,21 +723,21 @@ impl WhisperSession {
                 return Ok(Heard::NoVoice(None));
             }
             // The English-only model only hears English
-            if !self.multilingual && !voices.contains(&arrstr!("en")) {
+            if !session.multilingual && !voices.contains(&arrstr!("en")) {
                 return Ok(Heard::NoVoice(Some(arrstr!("en"))));
             }
 
-            self.state.pcm_to_mel(&samples, self.threads.get())?;
+            session.state.pcm_to_mel(&samples, session.threads.get())?;
             drop(samples);
 
             // Something said in a language without a voice is still transcribed: if it's no
             // words after all, it was noise
-            return Ok(match self.detect_language(&voices, min_confidence)? {
-                Spoken::Voiced(lang) => match self.speech_to_text(lang)? {
+            return Ok(match session.detect_language(&voices, min_confidence)? {
+                Spoken::Voiced(lang) => match session.speech_to_text(lang)? {
                     text if text.is_empty() => Heard::Nothing,
                     text => Heard::Question { text, lang },
                 },
-                Spoken::Unvoiced(lang) => match self.speech_to_text(lang)? {
+                Spoken::Unvoiced(lang) => match session.speech_to_text(lang)? {
                     text if text.is_empty() => Heard::Nothing,
                     text => Heard::Unvoiced { text, lang },
                 },
@@ -680,7 +745,9 @@ impl WhisperSession {
             });
         });
     }
+}
 
+impl WhisperSession {
     /// The language spoken, among `voices` (the languages with a voice) if it's one of them.
     fn detect_language(
         &mut self,
@@ -1202,6 +1269,51 @@ mod tests {
         assert_eq!(talk(Some(&button), &removed(8), Some(wheel)), Talk::Ignore);
         assert_eq!(talk(Some(&button), &removed(7), Some(None)), Talk::Ignore);
         assert_eq!(talk(Some(&button), &removed(7), None), Talk::Ignore);
+    }
+
+    /// Sends the thread it's dropped on.
+    struct DropThread(std::sync::mpsc::Sender<std::thread::ThreadId>);
+
+    impl Drop for DropThread {
+        fn drop(&mut self) {
+            let _ = self.0.send(std::thread::current().id());
+        }
+    }
+
+    #[test]
+    fn dropping_frees_on_a_worker() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (send, recv) = std::sync::mpsc::channel();
+        drop(DropInBackground::new(DropThread(send)));
+        let dropped_on = recv.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_ne!(dropped_on, std::thread::current().id());
+    }
+
+    #[test]
+    fn taking_back_doesnt_free() {
+        let (send, recv) = std::sync::mpsc::channel();
+        let value = DropInBackground::new(DropThread(send)).into_inner();
+        assert!(recv.try_recv().is_err());
+        drop(value);
+        assert_eq!(recv.try_recv().unwrap(), std::thread::current().id());
+    }
+
+    #[test]
+    fn a_pending_session_dropped_is_freed_on_a_worker() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (send, recv) = std::sync::mpsc::channel();
+        let (send_value, value) = oneshot::channel();
+        drop(DropInBackground::new(value));
+        // Created about when it's dropped: whichever worker is last frees it
+        std::thread::spawn(move || {
+            let _ = send_value.send(DropThread(send));
+        })
+        .join()
+        .unwrap();
+        let dropped_on = recv.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_ne!(dropped_on, std::thread::current().id());
     }
 
     /// Needs `BONO_WHISPER` (a whisper model) and `BONO_VOICE_EN`/`_ES` (Piper voices).

@@ -6,7 +6,7 @@
 //! the game running, and the plugin replaces it the next time the pilot drives.
 
 use crate::{
-    sim::{PluginStatus, Simulator, SimulatorInfo, SimulatorSettings},
+    sim::{PluginStatus, Simulator, SimulatorInfo, SimulatorSettings, probe::Probe},
     sqlite::{Database, pool::Pool},
     steam::{self},
     task::MaybeDone,
@@ -34,10 +34,16 @@ const MAX_OPEN: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 /// finish (an answer being written, say) before giving up on deleting it.
 const REMOVE_FOR: Duration = Duration::from_secs(60);
 const REMOVE_EVERY: Duration = Duration::from_secs(1);
+/// While the game runs, how often Steam's libraries and the plugin's folder are looked at again for
+/// the database.
+const LOOK_EVERY: Duration = Duration::from_secs(1);
 
 pub struct LeMansUltimate {
     /// The database the plugin is writing right now, read-only
     live: Option<Pool>,
+    /// Where the plugin's database is, if it's there, as last looked up in the background while
+    /// the game runs
+    ready: Probe<Option<PathBuf>>,
     /// Hands changes to settings.json to the task writing them, which makes them one at a time and
     /// in order (two "clear" requests at once would otherwise both read the same count). Started
     /// with the first change
@@ -46,7 +52,6 @@ pub struct LeMansUltimate {
 
 /// A change to settings.json in a folder, and what it's for (for the log, if it fails).
 struct SettingsChange {
-    folder: PathBuf,
     change: Box<dyn FnOnce(&mut Map<String, Value>) + Send>,
     purpose: &'static str,
 }
@@ -55,18 +60,9 @@ impl LeMansUltimate {
     pub fn new() -> Self {
         Self {
             live: None,
+            ready: Probe::new(LOOK_EVERY),
             settings: None,
         }
-    }
-
-    /// The game's folder, if it's installed.
-    fn install_dir(&self) -> Option<PathBuf> {
-        install_dir()
-    }
-
-    /// `UserData\bono`, if the game is installed.
-    fn folder(&mut self) -> Option<PathBuf> {
-        Some(self.install_dir()?.join("UserData").join(FOLDER))
     }
 
     /// Changes settings.json in the background, keeping what else is in it (the plugin acts on any
@@ -76,19 +72,16 @@ impl LeMansUltimate {
         purpose: &'static str,
         change: impl FnOnce(&mut Map<String, Value>) + Send + 'static,
     ) {
-        let Some(folder) = self.folder() else {
-            return;
-        };
-
         let settings = self.settings.get_or_insert_with(|| {
             let (send, mut recv) = mpsc::unbounded_channel::<SettingsChange>();
             tokio::spawn(async move {
-                while let Some(SettingsChange {
-                    folder,
-                    change,
-                    purpose,
-                }) = recv.recv().await
-                {
+                while let Some(SettingsChange { change, purpose }) = recv.recv().await {
+                    // Discovery reads Steam's library files, so it belongs on a worker too.
+                    let folder = tokio::task::spawn_blocking(|| {
+                        Some(install_dir()?.join("UserData").join(FOLDER))
+                    })
+                    .await;
+                    let Ok(Some(folder)) = folder else { continue };
                     if let Err(e) = write_settings(&folder, change).await {
                         log::error!("Error {purpose}: {e}");
                     }
@@ -98,7 +91,6 @@ impl LeMansUltimate {
         });
         // Only fails if the task panicked
         let _ = settings.send(SettingsChange {
-            folder,
             change: Box::new(change),
             purpose,
         });
@@ -115,19 +107,25 @@ impl Simulator for LeMansUltimate {
     /// The database the plugin is writing right now, or `None` when the game isn't installed, isn't
     /// running, or hasn't written one yet (the pilot hasn't loaded a session).
     fn database(&mut self, running: bool) -> Option<&Pool> {
-        let path = self
-            .folder()
-            .map(|folder| folder.join(DATABASE))
-            .filter(|path| running && path.is_file());
+        // Looked up in the background: finding the game searches Steam's libraries
+        let path = if running {
+            self.ready.get(database_path).cloned().flatten()
+        } else {
+            self.ready.reset();
+            None
+        };
 
         let Some(path) = path else {
             // The game closed: our connections close, and the file the plugin couldn't delete while
             // they were open goes
-            if let Some(pool) = self.live.take()
-                && !running
-                && let Some(dir) = pool.database().path().parent()
-            {
-                tokio::spawn(remove_when_closed(dir.to_owned(), pool));
+            if let Some(pool) = self.live.take() {
+                if !running && let Some(dir) = pool.database().path().parent() {
+                    tokio::spawn(remove_when_closed(dir.to_owned(), pool));
+                } else {
+                    // The database can disappear while the game still runs. Closing the last
+                    // pool reference joins its SQLite workers, so this branch needs a worker too.
+                    tokio::task::spawn_blocking(move || drop(pool));
+                }
             }
             return None;
         };
@@ -137,7 +135,10 @@ impl Simulator for LeMansUltimate {
             .as_ref()
             .is_some_and(|pool| pool.database().path() != &path)
         {
-            self.live = None;
+            // Closing joins the connections' threads: not on the UI thread
+            if let Some(pool) = self.live.take() {
+                tokio::task::spawn_blocking(move || drop(pool));
+            }
         }
         Some(self.live.get_or_insert_with(|| {
             Pool::new(Database::read_only(Arc::new(path)), MAX_IDLE, MAX_OPEN)
@@ -164,7 +165,14 @@ impl Simulator for LeMansUltimate {
     }
 
     fn plugin(&mut self) -> Option<MaybeDone<PluginStatus>> {
-        Some(MaybeDone::spawn(plugin::status(self.install_dir())))
+        Some(MaybeDone::spawn(async {
+            // Finding the game searches Steam's libraries
+            let install_dir = tokio::task::spawn_blocking(install_dir)
+                .await
+                .ok()
+                .flatten();
+            plugin::status(install_dir).await
+        }))
     }
 
     fn install_plugin(&mut self) -> MaybeDone<anyhow::Result<()>> {
@@ -230,6 +238,12 @@ async fn remove_when_closed(dir: PathBuf, pool: Pool) {
 /// The game's folder, if it's installed.
 fn install_dir() -> Option<PathBuf> {
     steam::app_install_dir(STEAM_APP_ID).filter(|dir| dir.is_dir())
+}
+
+/// The plugin's database, if the game is installed and the file is there. Blocks: searches
+/// Steam's libraries.
+fn database_path() -> Option<PathBuf> {
+    Some(install_dir()?.join("UserData").join(FOLDER).join(DATABASE)).filter(|path| path.is_file())
 }
 
 /// Changes settings.json in `folder`, keeping what else is in it.

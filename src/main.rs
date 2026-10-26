@@ -34,6 +34,7 @@ mod config;
 mod engineer;
 mod i18n;
 mod language;
+mod logger;
 mod provider;
 mod sim;
 mod spotter;
@@ -44,8 +45,81 @@ mod task;
 mod track;
 
 struct AppImpl {
-    app: MainThreadData<RefCell<App>>,
-    rt: Runtime,
+    app: MainThreadData<RefCell<Lifecycle>>,
+    rt: ManuallyDrop<Runtime>,
+}
+
+enum Lifecycle {
+    Loading(task::LocalTask<anyhow::Result<App>>),
+    Running(App),
+    Failed(StartupError),
+    Stopped,
+}
+
+/// Fatal startup errors still need a live, responsive window until the user dismisses them.
+struct StartupError {
+    ui: egui_sdl3::EguiCanvas,
+    message: String,
+}
+
+impl StartupError {
+    fn new(error: anyhow::Error) -> anyhow::Result<Self> {
+        let message = format!("{error:#}");
+        log::error!("{}: {message}", t!("error.initializing"));
+        let video = sdl3::init()?.video()?;
+        let window = video
+            .window(t!("error.initializing"), 640, 360)
+            .resizable()
+            .high_pixel_density()
+            .build()?;
+        Ok(Self {
+            ui: egui_sdl3::EguiCanvas::new(window),
+            message,
+        })
+    }
+
+    fn iterate(&mut self) -> AppResult {
+        let mut dismissed = false;
+        self.ui.run(|ctx| {
+            let mut ui = egui::Ui::new(
+                ctx.clone(),
+                egui::Id::new("startup-error"),
+                egui::UiBuilder::new()
+                    .layer_id(egui::LayerId::background())
+                    .max_rect(ctx.viewport_rect()),
+            );
+            egui::ScrollArea::vertical().show(&mut ui, |ui| {
+                ui.heading(t!("error.initializing"));
+                ui.label(&self.message);
+                dismissed = ui.button("OK").clicked();
+            });
+        });
+        self.ui.paint();
+        self.ui.present();
+        if dismissed {
+            AppResult::Failure
+        } else {
+            AppResult::Continue
+        }
+    }
+}
+
+impl Drop for AppImpl {
+    fn drop(&mut self) {
+        {
+            let _guard = self.rt.enter();
+            // SDL objects are disposed on their owning thread while their worker runtime is alive.
+            let _ = self.app.get_on_main_thread(|app| {
+                drop(std::mem::replace(
+                    &mut *app.borrow_mut(),
+                    Lifecycle::Stopped,
+                ));
+            });
+        }
+        // Normal shutdown has already awaited required work through App::iterate. Never join
+        // leftover runtime tasks on the UI thread (also covers an OS-forced early exit).
+        unsafe { ManuallyDrop::take(&mut self.rt) }.shutdown_background();
+    }
 }
 
 #[app_impl]
@@ -70,7 +144,26 @@ impl AppImpl {
         };
 
         let _guard = self.rt.enter();
-        return self.app.get(token).borrow_mut().iterate(self.rt.handle());
+        let mut state = self.app.get(token).borrow_mut();
+        if let Lifecycle::Loading(task) = &mut *state {
+            match task.update(self.rt.handle()) {
+                None => return AppResult::Continue,
+                Some(Ok(app)) => *state = Lifecycle::Running(app),
+                Some(Err(e)) => match StartupError::new(e) {
+                    Ok(screen) => *state = Lifecycle::Failed(screen),
+                    Err(e) => {
+                        log::error!("Unable to display startup error: {e}");
+                        return AppResult::Failure;
+                    }
+                },
+            }
+        }
+        match &mut *state {
+            Lifecycle::Running(app) => app.iterate(self.rt.handle()),
+            Lifecycle::Loading(_) => AppResult::Continue,
+            Lifecycle::Failed(screen) => screen.iterate(),
+            Lifecycle::Stopped => AppResult::Success,
+        }
     }
 
     fn app_event(&self, event: &SDL_Event) -> AppResult {
@@ -80,7 +173,27 @@ impl AppImpl {
 
         if !self.app.get_on_main_thread(|app| {
             let _guard = handle.enter();
-            result = app.borrow_mut().event(&handle, event);
+            result = match &mut *app.borrow_mut() {
+                Lifecycle::Running(app) => app.event(&handle, event),
+                Lifecycle::Loading(_) if matches!(event, Event::Quit { .. }) => AppResult::Success,
+                Lifecycle::Loading(_) => AppResult::Continue,
+                Lifecycle::Failed(screen) => {
+                    if matches!(
+                        event,
+                        Event::Quit { .. }
+                            | Event::Window {
+                                win_event: sdl3::event::WindowEvent::CloseRequested,
+                                ..
+                            }
+                    ) {
+                        AppResult::Failure
+                    } else {
+                        let _ = screen.ui.on_event(&event);
+                        AppResult::Continue
+                    }
+                }
+                Lifecycle::Stopped => AppResult::Success,
+            };
         }) {
             error_blocking(t!("error.title"), t!("error.handling_event"));
             return AppResult::Failure;
@@ -90,47 +203,61 @@ impl AppImpl {
     }
 
     fn app_quit(&self) {
+        let _guard = self.rt.enter();
         let Some(token) = MainThreadToken::get() else {
             return;
         };
-        self.app.get(token).borrow_mut().quit(self.rt.handle());
+        if let Lifecycle::Running(app) = &mut *self.app.get(token).borrow_mut() {
+            app.quit(self.rt.handle());
+        }
     }
 }
 
-fn setup_logger() -> Result<(), fern::InitError> {
-    let dispatch = fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "[{} {} {}] {}",
-                humantime::format_rfc3339_seconds(std::time::SystemTime::now()),
-                record.level(),
-                record.target(),
-                message
-            ))
-        })
-        .level(log::LevelFilter::Debug)
-        .chain(std::io::stdout());
-
-    // Log next to config.json rather than in the working directory, which may be
-    // read-only (e.g. `C:\Windows\System32` when started by a launcher).
-    let log_file = get_pref_path(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_NAME"))
-        .map_err(|e| e.to_string())
-        .and_then(|dir| fern::log_file(dir.join("output.log")).map_err(|e| e.to_string()));
-
-    match log_file {
-        Ok(file) => dispatch.chain(file).apply()?,
-        Err(e) => {
-            dispatch.apply()?;
-            log::warn!("Could not open log file, logging to stdout only: {e}");
+fn setup_logger() -> anyhow::Result<()> {
+    let level = log::LevelFilter::Debug;
+    let logger = logger::AsyncLogger::with_sinks(level, logger::QUEUE_CAPACITY, || {
+        use std::io::Write as _;
+        let mut sinks: Vec<Box<dyn std::io::Write + Send>> = vec![Box::new(std::io::stdout())];
+        // Discovery, directory creation and opening the log all run on the writer thread.
+        let log_file = get_pref_path(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_NAME"))
+            .map_err(|e| e.to_string())
+            .and_then(|dir| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join("output.log"))
+                    .map_err(|e| e.to_string())
+            });
+        match log_file {
+            Ok(file) => sinks.push(Box::new(file)),
+            Err(e) => {
+                // The writer never calls log: it may start before the global logger is installed.
+                let _ = writeln!(
+                    &mut sinks[0],
+                    "Could not open log file, logging to stdout only: {e}"
+                );
+            }
         }
-    }
+        sinks
+    })?;
+    log::set_boxed_logger(Box::new(logger))?;
+    log::set_max_level(level);
     Ok(())
 }
 
 fn init(token: MainThreadToken) -> anyhow::Result<AppImpl> {
     let rt = Runtime::new()?;
-    let app = MainThreadData::new(token, RefCell::new(rt.block_on(App::new(rt.handle()))?));
-    Ok(AppImpl { app, rt })
+    let handle = rt.handle().clone();
+    let _guard = rt.enter();
+    // SDL work stays on the main thread; each iteration only polls ready startup work.
+    // File and credential operations yield to workers instead of blocking event delivery.
+    let loading = task::LocalTask::spawn_local(async move { App::new(&handle).await });
+    let app = MainThreadData::new(token, RefCell::new(Lifecycle::Loading(loading)));
+    drop(_guard);
+    Ok(AppImpl {
+        app,
+        rt: ManuallyDrop::new(rt),
+    })
 }
 
 pub(crate) fn error(title: &'static str, message: impl Display) {

@@ -4,7 +4,7 @@
 //! recording is deleted once the game closes.
 
 use crate::{
-    sim::{Simulator, SimulatorInfo, SimulatorSettings},
+    sim::{Simulator, SimulatorInfo, SimulatorSettings, probe::Probe},
     sqlite::{Database, pool::Pool},
 };
 use bono_sim::{
@@ -20,10 +20,10 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    thread::JoinHandle,
     time::{Duration, Instant},
 };
 use sys::*;
+use tokio::sync::mpsc;
 
 const STEAM_APP_ID: u32 = 211500;
 
@@ -40,14 +40,28 @@ const RETRY: Duration = Duration::from_secs(1);
 /// Once the game closes, how long the database is left for the connections still reading it.
 const REMOVE_FOR: Duration = Duration::from_secs(60);
 const REMOVE_EVERY: Duration = Duration::from_secs(1);
+/// While the game runs, how often the recording's folder is looked at again: for the earlier
+/// recording to remove before reading, then for the new one.
+const LOOK_EVERY: Duration = Duration::from_secs(1);
 
 pub struct RaceRoom {
     /// Where the recording goes
     dir: PathBuf,
     /// Reading the game while it runs
     reader: Option<Reader>,
+    /// Set once the last stopped reader has let go of the recording
+    stopped: Option<Arc<AtomicBool>>,
+    /// Deleting the last stopped recording, cancelled when recording restarts so it can't delete
+    /// the new one
+    cleanup: Option<tokio::task::JoinHandle<()>>,
     /// The database being recorded, read-only
     live: Option<Pool>,
+    /// Hands changes to settings.json to the task writing them. Started with the first change
+    settings: Option<mpsc::UnboundedSender<SettingsChange>>,
+    /// Whether an earlier run's recording was removed (in the background), before reading
+    cleaned: Probe<bool>,
+    /// Whether the recording is there, as last looked up in the background since reading started
+    ready: Probe<bool>,
 }
 
 impl RaceRoom {
@@ -55,27 +69,68 @@ impl RaceRoom {
         Self {
             dir: std::env::temp_dir().join("bono").join("raceroom"),
             reader: None,
+            stopped: None,
+            cleanup: None,
             live: None,
+            settings: None,
+            cleaned: Probe::new(LOOK_EVERY),
+            ready: Probe::new(LOOK_EVERY),
         }
     }
 
-    /// Changes settings.json, keeping what else is in it: the recorder acts on any value that
-    /// changes.
-    fn update_settings(&self, change: impl FnOnce(&mut Map<String, Value>)) -> anyhow::Result<()> {
-        let path = self.dir.join(SETTINGS);
-        let mut settings = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Map<String, Value>>(&bytes).ok())
-            .unwrap_or_default();
-        change(&mut settings);
-
-        std::fs::create_dir_all(&self.dir)?;
-        // Written whole, so the recorder never reads half a file
-        let temp = path.with_extension("json.tmp");
-        std::fs::write(&temp, serde_json::to_vec_pretty(&settings)?)?;
-        std::fs::rename(&temp, &path)?;
-        Ok(())
+    /// Changes settings.json in the background, keeping what else is in it (the recorder acts on
+    /// any value that changes). The changes are made one at a time and in order, by a task started
+    /// with the first: two "clear" requests at once would otherwise both read the same count.
+    fn update_settings(
+        &mut self,
+        purpose: &'static str,
+        change: impl FnOnce(&mut Map<String, Value>) + Send + 'static,
+    ) {
+        let settings = self.settings.get_or_insert_with(|| {
+            let (send, mut recv) = mpsc::unbounded_channel::<SettingsChange>();
+            let dir = self.dir.clone();
+            tokio::spawn(async move {
+                while let Some(SettingsChange { change, purpose }) = recv.recv().await {
+                    if let Err(e) = write_settings(&dir, change).await {
+                        log::error!("Error {purpose}: {e}");
+                    }
+                }
+            });
+            send
+        });
+        // Only fails if the task panicked
+        let _ = settings.send(SettingsChange {
+            change: Box::new(change),
+            purpose,
+        });
     }
+}
+
+/// A change to settings.json, and what it's for (for the log, if it fails).
+struct SettingsChange {
+    change: Box<dyn FnOnce(&mut Map<String, Value>) + Send>,
+    purpose: &'static str,
+}
+
+/// Changes settings.json in `dir`, keeping what else is in it.
+async fn write_settings(
+    dir: &Path,
+    change: impl FnOnce(&mut Map<String, Value>),
+) -> anyhow::Result<()> {
+    let path = dir.join(SETTINGS);
+    let mut settings = tokio::fs::read(&path)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Map<String, Value>>(&bytes).ok())
+        .unwrap_or_default();
+    change(&mut settings);
+
+    tokio::fs::create_dir_all(dir).await?;
+    // Written whole, so the recorder never reads half a file
+    let temp = path.with_extension("json.tmp");
+    tokio::fs::write(&temp, serde_json::to_vec_pretty(&settings)?).await?;
+    tokio::fs::rename(&temp, &path).await?;
+    Ok(())
 }
 
 impl SimulatorInfo for RaceRoom {
@@ -89,25 +144,66 @@ impl Simulator for RaceRoom {
     /// call it does. Not running, the reader stops and the recording is deleted.
     fn database(&mut self, running: bool) -> Option<&Pool> {
         if !running {
-            // Stopped first, so the recorder writes what it has and lets go of the file
-            self.reader = None;
+            // Stopped without waiting: the recorder writes what it has and lets go of the file on
+            // its own thread, and nothing deletes or restarts the recording until it has.
+            if let Some(reader) = self.reader.take() {
+                self.stopped = Some(reader.stop());
+            }
+            self.cleaned.reset_when_idle();
+            self.ready.reset();
             if let Some(pool) = self.live.take() {
-                tokio::spawn(remove_when_closed(self.dir.clone(), pool));
+                let stopped = self.stopped.clone();
+                if let Some(old) = self.cleanup.replace(tokio::spawn(remove_when_closed(
+                    self.dir.clone(),
+                    pool,
+                    stopped,
+                ))) {
+                    old.abort();
+                }
             }
             return None;
         }
 
         if self.reader.is_none() {
-            // Nothing is recording yet: don't serve a database left by an earlier app run.
-            if let Err(e) = try_remove_database(&self.dir) {
-                log::warn!("Couldn't remove RaceRoom's previous recording: {e}");
+            // The previous reader is still finishing: try again on a later call
+            if self
+                .stopped
+                .as_ref()
+                .is_some_and(|done| !done.load(Ordering::Acquire))
+            {
+                return None;
+            }
+            self.stopped = None;
+            // Removed below instead, before the new recording starts. A removal already under way
+            // only stops at its next await, so try again on a later call until it has.
+            if let Some(cleanup) = &self.cleanup {
+                cleanup.abort();
+                if !cleanup.is_finished() {
+                    return None;
+                }
+                self.cleanup = None;
+            }
+            // Cleanup must complete before recording starts, and never runs on the UI thread.
+            let dir = self.dir.clone();
+            let cleaned = self.cleaned.get(move || {
+                try_remove_database(&dir)
+                    .inspect_err(|e| {
+                        log::warn!("Couldn't remove RaceRoom's previous recording: {e}")
+                    })
+                    .is_ok()
+            });
+            if cleaned != Some(&true) {
                 return None;
             }
             self.reader = Some(Reader::start(self.dir.clone()));
         }
 
         let path = self.dir.join(DATABASE);
-        if !path.is_file() {
+        let ready = self.ready.get({
+            let path = path.clone();
+            move || path.is_file()
+        });
+        if ready != Some(&true) {
             return None;
         }
         Some(self.live.get_or_insert_with(|| {
@@ -118,27 +214,32 @@ impl Simulator for RaceRoom {
     /// The recorder reads settings.json when it starts and whenever it changes.
     fn apply(&mut self, settings: &SimulatorSettings) {
         let frequency = settings.opponent_frequency.get();
-        if let Err(e) = self.update_settings(|json| {
-            json.insert("opponent_frequency".into(), frequency.into());
-        }) {
-            log::error!("Error passing the recording settings to RaceRoom's recorder: {e}");
-        }
+        self.update_settings(
+            "passing the recording settings to RaceRoom's recorder",
+            move |json| {
+                json.insert("opponent_frequency".into(), frequency.into());
+            },
+        );
     }
 
     /// The recorder clears its data when the "clear" count in settings.json changes.
     fn clear(&mut self) {
-        if let Err(e) = self.update_settings(|json| {
+        self.update_settings("asking RaceRoom's recorder to clear its data", |json| {
             let clear = json.get("clear").and_then(Value::as_i64).unwrap_or(0);
             json.insert("clear".into(), (clear + 1).into());
-        }) {
-            log::error!("Error asking RaceRoom's recorder to clear its data: {e}");
-        }
+        });
     }
 }
 
-/// Deletes the database in `dir` once nothing has it open.
-async fn remove_when_closed(dir: PathBuf, pool: Pool) {
+/// Deletes the database in `dir` once nothing has it open, after the reader that recorded it has
+/// stopped (`stopped`).
+async fn remove_when_closed(dir: PathBuf, pool: Pool, stopped: Option<Arc<AtomicBool>>) {
     drop(pool);
+    if let Some(stopped) = stopped {
+        while !stopped.load(Ordering::Acquire) {
+            tokio::time::sleep(REMOVE_EVERY).await;
+        }
+    }
 
     let mut waited = Duration::ZERO;
     loop {
@@ -159,33 +260,54 @@ async fn remove_when_closed(dir: PathBuf, pool: Pool) {
     }
 }
 
-/// The thread reading the game into the recorder, stopped when dropped.
+/// The thread reading the game into the recorder, told to stop when dropped. Never joined: it
+/// can be sleeping for up to [`RETRY`] and then closing the recorder, so callers on the UI thread
+/// watch [`Reader::stop`]'s flag instead.
 struct Reader {
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    /// Set by the thread once it has returned and dropped its recorder (or never started)
+    done: Arc<AtomicBool>,
 }
 
 impl Reader {
     fn start(dir: PathBuf) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let thread = std::thread::Builder::new()
+        let done = Arc::new(AtomicBool::new(false));
+        let spawned = std::thread::Builder::new()
             .name("bono raceroom".into())
             .spawn({
                 let stop = stop.clone();
-                move || read(&dir, &stop)
-            })
-            .inspect_err(|e| log::error!("Error starting RaceRoom's reader: {e}"))
-            .ok();
-        Self { stop, thread }
+                let done = SetOnDrop(done.clone());
+                move || {
+                    let _done = done;
+                    read(&dir, &stop);
+                }
+            });
+        if let Err(e) = spawned {
+            log::error!("Error starting RaceRoom's reader: {e}");
+            done.store(true, Ordering::Release);
+        }
+        Self { stop, done }
+    }
+
+    /// Tells the thread to stop without waiting, returning the flag set once it has.
+    fn stop(self) -> Arc<AtomicBool> {
+        self.done.clone()
     }
 }
 
 impl Drop for Reader {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+    }
+}
+
+/// Sets the flag when dropped, also when the thread panics.
+struct SetOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -1024,9 +1146,47 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU32;
 
-    #[test]
-    fn removes_previous_recording_before_starting_reader() {
+    async fn wait_for_reader(sim: &mut RaceRoom) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sim.reader.is_none() {
+                sim.database(true);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("reader never started after cleanup");
+    }
+
+    #[tokio::test]
+    async fn settings_changes_are_written_in_order_keeping_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SETTINGS), r#"{"other": true, "clear": 3}"#).unwrap();
+        let mut sim = RaceRoom::new();
+        sim.dir = dir.path().to_path_buf();
+
+        sim.clear();
+        sim.apply(&SimulatorSettings {
+            opponent_frequency: NonZeroU32::new(7).unwrap(),
+        });
+        sim.clear();
+        // Changes run in order, so this one runs once the others are written
+        let (done, wait) = tokio::sync::oneshot::channel();
+        sim.update_settings("test", move |_| {
+            let _ = done.send(());
+        });
+        wait.await.unwrap();
+
+        let json: Map<String, Value> =
+            serde_json::from_slice(&std::fs::read(dir.path().join(SETTINGS)).unwrap()).unwrap();
+        assert_eq!(json["clear"], 5);
+        assert_eq!(json["other"], true);
+        assert_eq!(json["opponent_frequency"], 7);
+    }
+
+    #[tokio::test]
+    async fn removes_previous_recording_before_starting_reader() {
         let dir = tempfile::tempdir().unwrap();
         for suffix in ["", "-wal", "-shm"] {
             std::fs::write(dir.path().join(format!("{DATABASE}{suffix}")), "old run").unwrap();
@@ -1034,25 +1194,131 @@ mod tests {
         let mut sim = RaceRoom::new();
         sim.dir = dir.path().to_path_buf();
 
+        // Removed in the background: nothing's served meanwhile
         assert!(sim.database(true).is_none());
-        assert!(sim.reader.is_some());
+        assert!(sim.reader.is_none());
+        while sim.reader.is_none() {
+            assert!(sim.database(true).is_none());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(sim.live.is_none());
         for suffix in ["", "-wal", "-shm"] {
             assert!(!dir.path().join(format!("{DATABASE}{suffix}")).exists());
         }
     }
 
-    #[test]
-    fn does_not_start_reader_when_previous_recording_cannot_be_removed() {
+    #[tokio::test]
+    async fn does_not_start_reader_when_previous_recording_cannot_be_removed() {
         let dir = tempfile::tempdir().unwrap();
         // A directory at the database path makes removal fail without relying on file locks.
         std::fs::create_dir(dir.path().join(DATABASE)).unwrap();
         let mut sim = RaceRoom::new();
         sim.dir = dir.path().to_path_buf();
 
-        assert!(sim.database(true).is_none());
+        for _ in 0..20 {
+            assert!(sim.database(true).is_none());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(sim.reader.is_none());
         assert!(sim.live.is_none());
+    }
+
+    /// A reader whose thread is still finishing until `done` is set.
+    fn finishing_reader() -> (Reader, Arc<AtomicBool>) {
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = Reader {
+            stop: Arc::new(AtomicBool::new(false)),
+            done: done.clone(),
+        };
+        (reader, done)
+    }
+
+    #[tokio::test]
+    async fn stopping_tells_the_reader_without_waiting_and_restarts_once_it_has_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = RaceRoom::new();
+        sim.dir = dir.path().to_path_buf();
+        let (reader, done) = finishing_reader();
+        let stop = reader.stop.clone();
+        sim.reader = Some(reader);
+
+        // Returns while the thread is still finishing
+        assert!(sim.database(false).is_none());
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(sim.reader.is_none());
+
+        // The old recorder may still have the file: it isn't removed nor recorded over yet
+        std::fs::write(dir.path().join(DATABASE), "old run").unwrap();
+        assert!(sim.database(true).is_none());
+        assert!(sim.reader.is_none());
+        assert!(dir.path().join(DATABASE).exists());
+
+        done.store(true, Ordering::Release);
+        assert!(sim.database(true).is_none());
+        wait_for_reader(&mut sim).await;
+        assert!(sim.reader.is_some());
+        assert!(sim.stopped.is_none());
+        assert!(!dir.path().join(DATABASE).exists());
+        sim.database(false);
+    }
+
+    #[test]
+    fn a_stopped_reader_flags_once_its_thread_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let reader = Reader::start(dir.path().to_path_buf());
+        let done = reader.stop();
+        let start = Instant::now();
+        while !done.load(Ordering::Acquire) {
+            assert!(start.elapsed() < RETRY * 5, "reader didn't stop");
+            std::thread::yield_now();
+        }
+    }
+
+    #[tokio::test]
+    async fn restarting_cancels_the_cleanup_of_the_last_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = RaceRoom::new();
+        sim.dir = dir.path().to_path_buf();
+        let cleanup = tokio::spawn(std::future::pending());
+        let aborted = cleanup.abort_handle();
+        sim.cleanup = Some(cleanup);
+
+        // Not started until the cleanup has actually stopped
+        assert!(sim.database(true).is_none());
+        assert!(sim.reader.is_none());
+        while !aborted.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert!(sim.database(true).is_none());
+        assert!(sim.cleanup.is_none());
+        wait_for_reader(&mut sim).await;
+        assert!(sim.reader.is_some());
+        sim.database(false);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removes_the_recording_only_after_the_reader_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DATABASE);
+        std::fs::write(&path, "recording").unwrap();
+        let pool = Pool::new(
+            Database::read_only(Arc::new(path.clone())),
+            MAX_IDLE,
+            MAX_OPEN,
+        );
+        let done = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(remove_when_closed(
+            dir.path().to_path_buf(),
+            pool,
+            Some(done.clone()),
+        ));
+
+        tokio::time::sleep(REMOVE_EVERY * 5).await;
+        assert!(path.exists());
+
+        done.store(true, Ordering::Release);
+        task.await.unwrap();
+        assert!(!path.exists());
     }
 
     fn name(s: &str) -> [u8; 64] {
