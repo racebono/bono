@@ -108,7 +108,7 @@ impl Drop for AppImpl {
         {
             let _guard = self.rt.enter();
             // SDL objects are disposed on their owning thread while their worker runtime is alive.
-            self.app.get_on_main_thread(|app| {
+            let _ = self.app.get_on_main_thread(|app| {
                 drop(std::mem::replace(
                     &mut *app.borrow_mut(),
                     Lifecycle::Stopped,
@@ -187,7 +187,7 @@ impl AppImpl {
                     ) {
                         AppResult::Failure
                     } else {
-                        screen.ui.on_event(&event);
+                        let _ = screen.ui.on_event(&event);
                         AppResult::Continue
                     }
                 }
