@@ -24,6 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 use sys::*;
+use tokio::sync::mpsc;
 
 const STEAM_APP_ID: u32 = 211500;
 
@@ -48,6 +49,8 @@ pub struct RaceRoom {
     reader: Option<Reader>,
     /// The database being recorded, read-only
     live: Option<Pool>,
+    /// Hands changes to settings.json to the task writing them. Started with the first change
+    settings: Option<mpsc::UnboundedSender<SettingsChange>>,
 }
 
 impl RaceRoom {
@@ -56,26 +59,63 @@ impl RaceRoom {
             dir: std::env::temp_dir().join("bono").join("raceroom"),
             reader: None,
             live: None,
+            settings: None,
         }
     }
 
-    /// Changes settings.json, keeping what else is in it: the recorder acts on any value that
-    /// changes.
-    fn update_settings(&self, change: impl FnOnce(&mut Map<String, Value>)) -> anyhow::Result<()> {
-        let path = self.dir.join(SETTINGS);
-        let mut settings = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Map<String, Value>>(&bytes).ok())
-            .unwrap_or_default();
-        change(&mut settings);
-
-        std::fs::create_dir_all(&self.dir)?;
-        // Written whole, so the recorder never reads half a file
-        let temp = path.with_extension("json.tmp");
-        std::fs::write(&temp, serde_json::to_vec_pretty(&settings)?)?;
-        std::fs::rename(&temp, &path)?;
-        Ok(())
+    /// Changes settings.json in the background, keeping what else is in it (the recorder acts on
+    /// any value that changes). The changes are made one at a time and in order, by a task started
+    /// with the first: two "clear" requests at once would otherwise both read the same count.
+    fn update_settings(
+        &mut self,
+        purpose: &'static str,
+        change: impl FnOnce(&mut Map<String, Value>) + Send + 'static,
+    ) {
+        let settings = self.settings.get_or_insert_with(|| {
+            let (send, mut recv) = mpsc::unbounded_channel::<SettingsChange>();
+            let dir = self.dir.clone();
+            tokio::spawn(async move {
+                while let Some(SettingsChange { change, purpose }) = recv.recv().await {
+                    if let Err(e) = write_settings(&dir, change).await {
+                        log::error!("Error {purpose}: {e}");
+                    }
+                }
+            });
+            send
+        });
+        // Only fails if the task panicked
+        let _ = settings.send(SettingsChange {
+            change: Box::new(change),
+            purpose,
+        });
     }
+}
+
+/// A change to settings.json, and what it's for (for the log, if it fails).
+struct SettingsChange {
+    change: Box<dyn FnOnce(&mut Map<String, Value>) + Send>,
+    purpose: &'static str,
+}
+
+/// Changes settings.json in `dir`, keeping what else is in it.
+async fn write_settings(
+    dir: &Path,
+    change: impl FnOnce(&mut Map<String, Value>),
+) -> anyhow::Result<()> {
+    let path = dir.join(SETTINGS);
+    let mut settings = tokio::fs::read(&path)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Map<String, Value>>(&bytes).ok())
+        .unwrap_or_default();
+    change(&mut settings);
+
+    tokio::fs::create_dir_all(dir).await?;
+    // Written whole, so the recorder never reads half a file
+    let temp = path.with_extension("json.tmp");
+    tokio::fs::write(&temp, serde_json::to_vec_pretty(&settings)?).await?;
+    tokio::fs::rename(&temp, &path).await?;
+    Ok(())
 }
 
 impl SimulatorInfo for RaceRoom {
@@ -118,21 +158,20 @@ impl Simulator for RaceRoom {
     /// The recorder reads settings.json when it starts and whenever it changes.
     fn apply(&mut self, settings: &SimulatorSettings) {
         let frequency = settings.opponent_frequency.get();
-        if let Err(e) = self.update_settings(|json| {
-            json.insert("opponent_frequency".into(), frequency.into());
-        }) {
-            log::error!("Error passing the recording settings to RaceRoom's recorder: {e}");
-        }
+        self.update_settings(
+            "passing the recording settings to RaceRoom's recorder",
+            move |json| {
+                json.insert("opponent_frequency".into(), frequency.into());
+            },
+        );
     }
 
     /// The recorder clears its data when the "clear" count in settings.json changes.
     fn clear(&mut self) {
-        if let Err(e) = self.update_settings(|json| {
+        self.update_settings("asking RaceRoom's recorder to clear its data", |json| {
             let clear = json.get("clear").and_then(Value::as_i64).unwrap_or(0);
             json.insert("clear".into(), (clear + 1).into());
-        }) {
-            log::error!("Error asking RaceRoom's recorder to clear its data: {e}");
-        }
+        });
     }
 }
 
@@ -900,6 +939,33 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU32;
+
+    #[tokio::test]
+    async fn settings_changes_are_written_in_order_keeping_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SETTINGS), r#"{"other": true, "clear": 3}"#).unwrap();
+        let mut sim = RaceRoom::new();
+        sim.dir = dir.path().to_path_buf();
+
+        sim.clear();
+        sim.apply(&SimulatorSettings {
+            opponent_frequency: NonZeroU32::new(7).unwrap(),
+        });
+        sim.clear();
+        // Changes run in order, so this one runs once the others are written
+        let (done, wait) = tokio::sync::oneshot::channel();
+        sim.update_settings("test", move |_| {
+            let _ = done.send(());
+        });
+        wait.await.unwrap();
+
+        let json: Map<String, Value> =
+            serde_json::from_slice(&std::fs::read(dir.path().join(SETTINGS)).unwrap()).unwrap();
+        assert_eq!(json["clear"], 5);
+        assert_eq!(json["other"], true);
+        assert_eq!(json["opponent_frequency"], 7);
+    }
 
     #[test]
     fn removes_previous_recording_before_starting_reader() {
