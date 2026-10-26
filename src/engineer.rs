@@ -842,22 +842,22 @@ impl Engineer {
 
     /// The app is quitting: Bono Cloud's lease is ended, waiting for the website a moment, as
     /// nothing will be left to after.
-    pub fn quit(&mut self, rt: &Handle) {
+    pub fn quit(&mut self, rt: &Handle) -> tokio::task::JoinHandle<()> {
         /// The longest the app waits on the website to quit
         const WAIT: Duration = Duration::from_secs(3);
 
         self.stop();
-        // Before the conversation goes: it would end the lease without waiting. Blocks the main
-        // thread on purpose, bounded by `WAIT`: no frame follows (`App::quit` hid the window),
-        // and the process ends next, so a background wait would be cut short
-        if let Some(lease) = self.session.as_ref().and_then(|s| s.lease.as_ref())
-            && rt
-                .block_on(async { tokio::time::timeout(WAIT, lease.end_and_wait()).await })
-                .is_err()
-        {
-            log::warn!("Gave up ending the Cloud session lease: it expires on its own");
-        }
-        self.session = None;
+        let session = self.session.take();
+        rt.spawn(async move {
+            if let Some(lease) = session.as_ref().and_then(|s| s.lease.as_ref())
+                && tokio::time::timeout(WAIT, lease.end_and_wait())
+                    .await
+                    .is_err()
+            {
+                log::warn!("Gave up ending the Cloud session lease: it expires on its own");
+            }
+            drop(session);
+        })
     }
 }
 

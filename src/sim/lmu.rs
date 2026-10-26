@@ -52,7 +52,6 @@ pub struct LeMansUltimate {
 
 /// A change to settings.json in a folder, and what it's for (for the log, if it fails).
 struct SettingsChange {
-    folder: PathBuf,
     change: Box<dyn FnOnce(&mut Map<String, Value>) + Send>,
     purpose: &'static str,
 }
@@ -66,16 +65,6 @@ impl LeMansUltimate {
         }
     }
 
-    /// The game's folder, if it's installed.
-    fn install_dir(&self) -> Option<PathBuf> {
-        install_dir()
-    }
-
-    /// `UserData\bono`, if the game is installed.
-    fn folder(&mut self) -> Option<PathBuf> {
-        Some(self.install_dir()?.join("UserData").join(FOLDER))
-    }
-
     /// Changes settings.json in the background, keeping what else is in it (the plugin acts on any
     /// value that changes). Does nothing if the game isn't installed.
     fn update_settings(
@@ -83,19 +72,16 @@ impl LeMansUltimate {
         purpose: &'static str,
         change: impl FnOnce(&mut Map<String, Value>) + Send + 'static,
     ) {
-        let Some(folder) = self.folder() else {
-            return;
-        };
-
         let settings = self.settings.get_or_insert_with(|| {
             let (send, mut recv) = mpsc::unbounded_channel::<SettingsChange>();
             tokio::spawn(async move {
-                while let Some(SettingsChange {
-                    folder,
-                    change,
-                    purpose,
-                }) = recv.recv().await
-                {
+                while let Some(SettingsChange { change, purpose }) = recv.recv().await {
+                    // Discovery reads Steam's library files, so it belongs on a worker too.
+                    let folder = tokio::task::spawn_blocking(|| {
+                        Some(install_dir()?.join("UserData").join(FOLDER))
+                    })
+                    .await;
+                    let Ok(Some(folder)) = folder else { continue };
                     if let Err(e) = write_settings(&folder, change).await {
                         log::error!("Error {purpose}: {e}");
                     }
@@ -105,7 +91,6 @@ impl LeMansUltimate {
         });
         // Only fails if the task panicked
         let _ = settings.send(SettingsChange {
-            folder,
             change: Box::new(change),
             purpose,
         });

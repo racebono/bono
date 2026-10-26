@@ -254,6 +254,13 @@ pub struct ActiveSimulator {
 }
 
 impl ActiveSimulator {
+    /// Joins watchers and closes idle database connections away from SDL's event thread.
+    pub fn shutdown(&mut self) -> tokio::task::JoinHandle<()> {
+        let simulators = std::mem::take(&mut self.simulators);
+        self.current = None;
+        tokio::task::spawn_blocking(move || drop(simulators))
+    }
+
     fn new(simulators: Vec<Box<Sim<dyn Simulator>>>) -> Self {
         let mut this = Self {
             simulators,

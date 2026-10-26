@@ -38,6 +38,7 @@ mod topbar;
 pub struct App {
     state: AppState,
     ui: EguiCanvas,
+    closing: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl App {
@@ -71,6 +72,8 @@ impl App {
         let joysticks = Joysticks::new(&joystick);
         let event = sdl.event()?;
         let fonts = load_fonts()?;
+        // Initial Steam registry discovery and watcher creation can wait on the OS too.
+        let simulators = rt.spawn_blocking(ActiveSimulator::default);
 
         // Everything waited on happens before the window exists: SDL's init callback must return
         // before the first frame, so a window opened earlier would show unresponsive meanwhile.
@@ -102,6 +105,7 @@ impl App {
             account,
         );
         let config = config?;
+        let simulators = simulators.await?;
         let (width, height) = {
             let config = config.get();
             (*config.width(), *config.height())
@@ -137,7 +141,7 @@ impl App {
                 config,
                 gui,
                 synth,
-                simulators: ActiveSimulator::default(),
+                simulators,
                 applied_opponent_frequency: None,
                 tracks,
                 account,
@@ -145,10 +149,18 @@ impl App {
                 spotter: Spotter::new(),
             },
             ui,
+            closing: None,
         });
     }
 
     pub fn iterate(&mut self, rt: &Handle) -> AppResult {
+        if let Some(closing) = &self.closing {
+            return if closing.is_finished() {
+                AppResult::Success
+            } else {
+                AppResult::Continue
+            };
+        }
         self.ui.run(|ctx| {
             // Must happen before the root `Ui` is built, since it copies the style on creation
             let text_scale = *self.state.config.get().text_scale();
@@ -176,15 +188,33 @@ impl App {
 
     /// The app is quitting: what the website holds for it is given back.
     pub fn quit(&mut self, rt: &Handle) {
-        // No frame comes after this, yet what follows waits: up to a few seconds for the website,
-        // then for worker threads (speech synthesis, databases) as the app is dropped. Hidden
-        // first, the app is seen to close at once instead of hanging. The waits can't move to the
-        // background: the process ends right after them, cutting them short
+        // Normal quits finish background cleanup before SDL asks us to dispose the UI.
+        // An OS-forced exit can skip the normal Quit event; start best-effort cleanup then too.
+        self.begin_quit(rt);
+    }
+
+    fn begin_quit(&mut self, rt: &Handle) {
+        if self.closing.is_some() {
+            return;
+        }
         self.ui.painter.canvas.window_mut().hide();
-        self.state.engineer.quit(rt);
+        let engineer = self.state.engineer.quit(rt);
+        let simulators = self.state.simulators.shutdown();
+        let voices = std::mem::take(&mut self.state.synth.inner);
+        let speech = rt.spawn_blocking(move || drop(voices));
+        self.closing = Some(rt.spawn(async move {
+            let _ = tokio::join!(engineer, simulators, speech);
+        }));
     }
 
     pub fn event(&mut self, rt: &Handle, event: Event) -> AppResult {
+        if matches!(event, Event::Quit { .. }) {
+            self.begin_quit(rt);
+            return AppResult::Continue;
+        }
+        if self.closing.is_some() {
+            return AppResult::Continue;
+        }
         self.state.joysticks.event(&event);
         match event {
             Event::AudioDeviceRemoved {

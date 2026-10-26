@@ -141,7 +141,7 @@ impl Simulator for RaceRoom {
             // Stopped first, so the recorder writes what it has and lets go of the file
             self.reader = None;
             // Looked at again next run: answers from this one are out of date
-            self.cleaned.reset();
+            self.cleaned.reset_when_idle();
             self.ready.reset();
             if let Some(pool) = self.live.take() {
                 tokio::spawn(remove_when_closed(self.dir.clone(), pool));

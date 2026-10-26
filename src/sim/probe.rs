@@ -33,7 +33,12 @@ impl<T: Send + 'static> Probe<T> {
         {
             // Finished, so this doesn't wait. A lookup that panicked leaves the last answer
             match unconstrained(handle).now_or_never() {
-                Some(Ok(value)) => self.value = Some(value),
+                Some(Ok(value)) => {
+                    self.value = Some(value);
+                    // Let the caller act on this result before another lookup can start. This
+                    // matters for one-shot work such as deleting a previous recording.
+                    return self.value.as_ref();
+                }
                 Some(Err(e)) => log::error!("Error looking at the disk: {e}"),
                 None => {}
             }
@@ -53,6 +58,19 @@ impl<T: Send + 'static> Probe<T> {
         self.looked = None;
         // Detached: it finishes on its own, and its answer is dropped
         self.pending = None;
+    }
+
+    /// Invalidates a destructive lookup without detaching work that could still mutate files.
+    /// Its eventual result can be consumed before a new user of those files starts.
+    pub fn reset_when_idle(&mut self) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return;
+        }
+        self.reset();
     }
 }
 
@@ -113,5 +131,27 @@ mod tests {
         probe.get(look);
         settle(&probe).await;
         assert_eq!(probe.get(look), Some(&"fresh"));
+    }
+
+    #[tokio::test]
+    async fn destructive_reset_keeps_in_flight_work_until_its_result_is_consumed() {
+        let (started_send, started) = tokio::sync::oneshot::channel();
+        let (finish, wait) = std::sync::mpsc::channel();
+        let mut probe = Probe::new(Duration::ZERO);
+        probe.get(move || {
+            let _ = started_send.send(());
+            wait.recv().unwrap();
+            true
+        });
+        started.await.unwrap();
+        probe.reset_when_idle();
+        assert_eq!(probe.get(|| panic!("cleanup overlapped")), None);
+        finish.send(()).unwrap();
+        settle(&probe).await;
+        // Even though another lookup is due, consuming success must not start another deletion.
+        assert_eq!(probe.get(|| panic!("cleanup restarted")), Some(&true));
+        assert!(probe.pending.is_none());
+        probe.reset_when_idle();
+        assert_eq!(probe.value, None);
     }
 }

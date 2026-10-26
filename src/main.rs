@@ -44,8 +44,33 @@ mod task;
 mod track;
 
 struct AppImpl {
-    app: MainThreadData<RefCell<App>>,
-    rt: Runtime,
+    app: MainThreadData<RefCell<Lifecycle>>,
+    rt: ManuallyDrop<Runtime>,
+}
+
+enum Lifecycle {
+    Loading(task::LocalTask<anyhow::Result<App>>),
+    Running(App),
+    Failed(task::Task<()>),
+    Stopped,
+}
+
+impl Drop for AppImpl {
+    fn drop(&mut self) {
+        {
+            let _guard = self.rt.enter();
+            // SDL objects are disposed on their owning thread while their worker runtime is alive.
+            self.app.get_on_main_thread(|app| {
+                drop(std::mem::replace(
+                    &mut *app.borrow_mut(),
+                    Lifecycle::Stopped,
+                ));
+            });
+        }
+        // Normal shutdown has already awaited required work through App::iterate. Never join
+        // leftover runtime tasks on the UI thread (also covers an OS-forced early exit).
+        unsafe { ManuallyDrop::take(&mut self.rt) }.shutdown_background();
+    }
 }
 
 #[app_impl]
@@ -70,7 +95,33 @@ impl AppImpl {
         };
 
         let _guard = self.rt.enter();
-        return self.app.get(token).borrow_mut().iterate(self.rt.handle());
+        let mut state = self.app.get(token).borrow_mut();
+        if let Lifecycle::Loading(task) = &mut *state {
+            match task.update(self.rt.handle()) {
+                None => return AppResult::Continue,
+                Some(Ok(app)) => *state = Lifecycle::Running(app),
+                Some(Err(e)) => {
+                    let title = t!("error.initializing");
+                    // Keep SDL alive until the worker's dialog is dismissed, without blocking
+                    // event delivery or racing process exit against presentation of the error.
+                    *state = Lifecycle::Failed(task::Task::spawn_blocking(move || {
+                        error_blocking(title, e);
+                    }));
+                }
+            }
+        }
+        match &mut *state {
+            Lifecycle::Running(app) => app.iterate(self.rt.handle()),
+            Lifecycle::Loading(_) => AppResult::Continue,
+            Lifecycle::Failed(dialog) => {
+                if dialog.update(self.rt.handle()).is_some() {
+                    AppResult::Failure
+                } else {
+                    AppResult::Continue
+                }
+            }
+            Lifecycle::Stopped => AppResult::Success,
+        }
     }
 
     fn app_event(&self, event: &SDL_Event) -> AppResult {
@@ -80,7 +131,13 @@ impl AppImpl {
 
         if !self.app.get_on_main_thread(|app| {
             let _guard = handle.enter();
-            result = app.borrow_mut().event(&handle, event);
+            result = match &mut *app.borrow_mut() {
+                Lifecycle::Running(app) => app.event(&handle, event),
+                Lifecycle::Loading(_) if matches!(event, Event::Quit { .. }) => AppResult::Success,
+                Lifecycle::Loading(_) => AppResult::Continue,
+                Lifecycle::Failed(_) => AppResult::Continue,
+                Lifecycle::Stopped => AppResult::Success,
+            };
         }) {
             error_blocking(t!("error.title"), t!("error.handling_event"));
             return AppResult::Failure;
@@ -90,10 +147,13 @@ impl AppImpl {
     }
 
     fn app_quit(&self) {
+        let _guard = self.rt.enter();
         let Some(token) = MainThreadToken::get() else {
             return;
         };
-        self.app.get(token).borrow_mut().quit(self.rt.handle());
+        if let Lifecycle::Running(app) = &mut *self.app.get(token).borrow_mut() {
+            app.quit(self.rt.handle());
+        }
     }
 }
 
@@ -129,11 +189,17 @@ fn setup_logger() -> Result<(), fern::InitError> {
 
 fn init(token: MainThreadToken) -> anyhow::Result<AppImpl> {
     let rt = Runtime::new()?;
-    // Blocks before the event loop on purpose: SDL needs the app back from its init callback, on
-    // the main thread, before any frame. `App::new` waits only on local files and the credential
-    // store, before its window opens, so nothing is seen unresponsive
-    let app = MainThreadData::new(token, RefCell::new(rt.block_on(App::new(rt.handle()))?));
-    Ok(AppImpl { app, rt })
+    let handle = rt.handle().clone();
+    let _guard = rt.enter();
+    // SDL work stays on the main thread; each iteration only polls ready startup work.
+    // File and credential operations yield to workers instead of blocking event delivery.
+    let loading = task::LocalTask::spawn_local(async move { App::new(&handle).await });
+    let app = MainThreadData::new(token, RefCell::new(Lifecycle::Loading(loading)));
+    drop(_guard);
+    Ok(AppImpl {
+        app,
+        rt: ManuallyDrop::new(rt),
+    })
 }
 
 pub(crate) fn error(title: &'static str, message: impl Display) {
