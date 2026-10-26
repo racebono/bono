@@ -2055,6 +2055,11 @@ fn cmd_stint(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
         );
     }
 
+    if let Some(me) = &sc.player {
+        for detail in service_details(me) {
+            say!(out, "{detail}");
+        }
+    }
     let (window, _) = pit_window(ctx)?;
     say!(
         out,
@@ -2500,6 +2505,7 @@ fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
         if me.s("pit_state") == Some("requested") {
             info.push("pit stop requested".into());
         }
+        info.extend(service_details(me));
         if let Some(finish) = me.text("finish_status").filter(|f| *f != "none") {
             alerts.push(finish.to_uppercase());
         }
@@ -2520,6 +2526,102 @@ fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
         }
     }
     Ok((alerts, info))
+}
+
+/// Optional scoring columns also work with recordings made before these fields existed.
+fn service_details(me: &Row) -> Vec<String> {
+    let mut info = Vec::new();
+    let mut penalties = Vec::new();
+    for (column, label) in [
+        ("penalty_stop_and_go_seconds", "stop-and-go seconds to stay"),
+        ("penalty_time_seconds", "time penalty seconds"),
+        (
+            "penalty_slow_down_seconds",
+            "slowdown seconds left to give back",
+        ),
+    ] {
+        if let Some(value) = me.f(column) {
+            penalties.push(format!("{label}: {value:.2}"));
+        }
+    }
+    for (column, label) in [
+        ("penalty_drive_through_active", "drive-through active"),
+        ("penalty_pit_stop_active", "pit-stop penalty active"),
+    ] {
+        if me.b(column) {
+            penalties.push(label.into());
+        }
+    }
+    if !penalties.is_empty() {
+        info.push(format!("penalty requirements: {}", penalties.join(", ")));
+    }
+    if let Some(kind) = me.text("penalty_type") {
+        let reason = me
+            .text("penalty_reason")
+            .map(telemetry_text)
+            .unwrap_or_else(|| "unknown".to_owned());
+        info.push(format!(
+            "reported penalty type {}, reason {reason} (reason applies only to this type)",
+            telemetry_text(kind)
+        ));
+    }
+    if let Some(state) = me.text("pit_state") {
+        info.push(format!("pit state {}", telemetry_text(state)));
+    }
+    let mut actions = Vec::new();
+    let mut choices = Vec::new();
+    if me.b("pit_service_preparing") {
+        actions.push("preparing");
+    }
+    for (service, label) in [
+        ("penalty", "serving penalty"),
+        ("driver_change", "driver change"),
+        ("refuel", "refueling"),
+        ("front_tires", "front tires"),
+        ("rear_tires", "rear tires"),
+        ("body_repair", "body repair"),
+        ("front_wing", "front wing"),
+        ("rear_wing", "rear wing"),
+        ("suspension", "suspension"),
+    ] {
+        if me.b(&format!("pit_service_{service}_active")) {
+            actions.push(label);
+        }
+        if let Some(value) = me.i(&format!("pit_service_{service}_selected")) {
+            choices.push(format!(
+                "{label}={}",
+                if value != 0 { "selected" } else { "unselected" }
+            ));
+        }
+    }
+    if !actions.is_empty() {
+        info.push(format!(
+            "crew actions: {}; serving penalty is not proof it is cleared",
+            actions.join(", ")
+        ));
+    }
+    if !choices.is_empty() {
+        info.push(format!(
+            "pit service intent only, not completed work: {}",
+            choices.join(", ")
+        ));
+    }
+    let times = [
+        "pit_total_duration",
+        "pit_elapsed_time",
+        "pit_min_duration_total",
+        "pit_min_duration_left",
+    ]
+    .iter()
+    .filter_map(|column| me.f(column).map(|v| format!("{column}={v:.2}s")))
+    .collect::<Vec<_>>();
+    if !times.is_empty() {
+        info.push(format!(
+            "pit progress snapshot: {}; countdown alone does not authorize leaving",
+            times.join(", ")
+        ));
+    }
+    info
 }
 
 // --------------------------------------------------------------------------- status
@@ -4441,6 +4543,30 @@ mod tests {
         sys::{bono_session_info, bono_standing, bono_telemetry},
     };
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn service_output_distinguishes_intent_actions_and_requirements() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE detail (penalty_stop_and_go_seconds REAL, penalty_slow_down_seconds REAL, penalty_type TEXT, penalty_reason TEXT, pit_state TEXT, pit_service_penalty_active INTEGER, pit_service_refuel_active INTEGER, pit_service_front_tires_active INTEGER, pit_service_front_tires_selected INTEGER, pit_service_refuel_selected INTEGER, pit_min_duration_left REAL); INSERT INTO detail VALUES (10, 2.5, 'stop_and_go', 'yellow_flag_overtake', 'stopped', 1, 1, 1, 1, 0, 0);").unwrap();
+        let me = row(&conn, "SELECT * FROM detail", []).unwrap().unwrap();
+        let text = service_details(&me).join("\n");
+        for expected in [
+            "stop-and-go seconds to stay: 10.00",
+            "slowdown seconds left to give back: 2.50",
+            "yellow_flag_overtake",
+            "serving penalty, refueling, front tires",
+            "front tires=selected",
+            "refueling=unselected",
+            "intent only, not completed work",
+            "not proof it is cleared",
+            "countdown alone does not authorize leaving",
+            "pit_min_duration_left=0.00s",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        let old = row(&conn, "SELECT 1 AS vehicle_id", []).unwrap().unwrap();
+        assert!(service_details(&old).is_empty());
+    }
 
     #[test]
     fn forecast_uses_newest_set_with_frozen_session_time() {

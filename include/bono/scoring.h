@@ -91,6 +91,37 @@
     X(i64, pit_stops, true)                                                                               \
     X(string, mandatory_pit_stop, true)      /* none, unserved_two_tires, unserved_four_tires, served */          \
     X(i64, penalties, true)                  /* outstanding */                                            \
+    X(string, penalty_type, true) /* reported penalty type; reason applies to this type only */ \
+    X(string, penalty_reason, true) /* normalized reason when known */ \
+    X(boolean, penalty_drive_through_active, true) /* pending; NULL when not reported or absent */ \
+    X(f64, penalty_stop_and_go_seconds, true) /* required stationary duration, seconds */ \
+    X(boolean, penalty_pit_stop_active, true) /* pending; NULL when not reported or absent */ \
+    X(f64, penalty_time_seconds, true) /* time adjustment, seconds */ \
+    X(f64, penalty_slow_down_seconds, true) /* time remaining to give back, seconds */ \
+    X(string, simulator_metadata, true) /* JSON object keyed by simulator identifier; source-specific codes/values, not portable semantics */ \
+    X(boolean, pit_service_preparing, true) /* crew preparing service */ \
+    X(boolean, pit_service_penalty_selected, true) /* requested work only; not completion */ \
+    X(boolean, pit_service_penalty_active, true) /* work currently underway; not completion */ \
+    X(boolean, pit_service_driver_change_selected, true) /* requested work only; not completion */ \
+    X(boolean, pit_service_driver_change_active, true) /* work currently underway; not completion */ \
+    X(boolean, pit_service_refuel_selected, true) /* requested work only; not completion */ \
+    X(boolean, pit_service_refuel_active, true) /* work currently underway; not completion */ \
+    X(boolean, pit_service_front_tires_selected, true) /* requested work only; not completion */ \
+    X(boolean, pit_service_front_tires_active, true) /* work currently underway; not completion */ \
+    X(boolean, pit_service_rear_tires_selected, true) /* requested work only; not completion */ \
+    X(boolean, pit_service_rear_tires_active, true) /* work currently underway; not completion */ \
+    X(boolean, pit_service_body_repair_selected, true) /* requested work only; not completion */ \
+    X(boolean, pit_service_body_repair_active, true) /* work currently underway; not completion */ \
+    X(boolean, pit_service_front_wing_selected, true) /* requested work only; not completion */ \
+    X(boolean, pit_service_front_wing_active, true) /* work currently underway; not completion */ \
+    X(boolean, pit_service_rear_wing_selected, true) /* requested work only; not completion */ \
+    X(boolean, pit_service_rear_wing_active, true) /* work currently underway; not completion */ \
+    X(boolean, pit_service_suspension_selected, true) /* requested work only; not completion */ \
+    X(boolean, pit_service_suspension_active, true) /* work currently underway; not completion */ \
+    X(f64, pit_total_duration, true) /* seconds; snapshot, not clearance to leave */ \
+    X(f64, pit_elapsed_time, true) /* seconds; snapshot, not clearance to leave */ \
+    X(f64, pit_min_duration_total, true) /* seconds; snapshot, not clearance to leave */ \
+    X(f64, pit_min_duration_left, true) /* seconds; snapshot, not clearance to leave */ \
     X(boolean, in_pits, true)                                                                             \
     X(string, pit_state, true)               /* none, requested, entering, stopped, exiting */            \
     X(boolean, in_garage, true)                                                                           \
