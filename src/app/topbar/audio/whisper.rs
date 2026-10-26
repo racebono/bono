@@ -508,6 +508,10 @@ impl Whisper {
 
         let state = match (model.on_disk(), model.download()) {
             (Some(true), _) if failed && picked.as_ref() == Some(&model.path) => SetupState::Failed,
+            // On disk but not used, and setup isn't going to: retrying uses it
+            (Some(true), _) if !setup && picked.as_ref() != Some(&model.path) => {
+                SetupState::Missing
+            }
             (Some(true), _) => SetupState::Ready,
             (_, Some(download)) => SetupState::Downloading(download.progress()),
             _ if model.failed() => SetupState::Failed,

@@ -191,14 +191,18 @@ impl Voices {
         };
         let voice = find(&mut catalog.languages, lang, name)?;
         if self.setup.is_none()
-            && picked.is_some_and(|picked| picked != *voice.path && self.files.voice(&picked))
+            && (picked.as_ref())
+                .is_some_and(|picked| *picked != *voice.path && self.files.voice(picked))
         {
             return None;
         }
 
         let on_disk = (catalog.on_disk.borrow().as_ref())
             .and_then(|on_disk| on_disk.get(voice.index).copied());
+        let used = (picked.as_ref()).is_some_and(|picked| *picked == *voice.path);
         let state = match (on_disk, voice.progress()) {
+            // On disk but not used, and setup isn't going to: retrying uses it
+            (Some(true), _) if self.setup.is_none() && !used => SetupState::Missing,
             (Some(true), _) => SetupState::Ready,
             (_, Some(progress)) => SetupState::Downloading(progress),
             _ if voice.failed() => SetupState::Failed,
