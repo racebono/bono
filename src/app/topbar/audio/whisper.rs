@@ -273,6 +273,8 @@ impl Whisper {
             });
         });
         if let Some(path) = reload {
+            // A model picked by hand is what's used, whatever setup was getting
+            self.setup = false;
             self.set_model(path);
         }
     }

@@ -257,6 +257,7 @@ impl Voices {
         let locale = config.get().locale().clone();
         let suggested = ArrayStr::<2>::from_str(locale.split('-').next().unwrap_or_default());
 
+        let mut picked = None;
         ui.add_enabled_ui(catalog.is_some(), |ui| {
             ui.menu_button(setup_label(missing, t!("audio.text_to_speech")), |ui| {
                 let Some(catalog) = catalog else {
@@ -282,12 +283,25 @@ impl Voices {
                             let label =
                                 setup_label(missing && Some(language.code) == suggested, label);
                             ui.menu_button(label, |ui| {
-                                language.update(rt, ui, client, config, on_disk.as_deref(), synth);
+                                if language.update(
+                                    rt,
+                                    ui,
+                                    client,
+                                    config,
+                                    on_disk.as_deref(),
+                                    synth,
+                                ) {
+                                    picked = Some(language.code);
+                                }
                             });
                         }
                     });
             });
         });
+        // A voice picked by hand is what's used, whatever setup was getting for its language
+        if picked.is_some_and(|lang| self.setup.is_some_and(|(setup, _)| setup == lang)) {
+            self.setup = None;
+        }
     }
 }
 
@@ -442,9 +456,10 @@ impl Language {
         config: &mut Config,
         on_disk: Option<&[bool]>,
         synth: &mut Synthesizer,
-    ) {
+    ) -> bool {
         let code = self.code;
         let voices = &mut self.voices;
+        let mut picked = false;
 
         egui_extras::TableBuilder::new(ui)
             .id_salt(("piper-voices", code))
@@ -508,6 +523,7 @@ impl Language {
                                             Some(voice.path.to_path_buf()),
                                             synth,
                                         );
+                                        picked = true;
                                         updated = true;
                                     }
                                 } else if let Some(progress) = voice.progress() {
@@ -524,6 +540,7 @@ impl Language {
                     return updated;
                 });
             });
+        picked
     }
 }
 
