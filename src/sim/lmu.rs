@@ -118,11 +118,14 @@ impl Simulator for LeMansUltimate {
         let Some(path) = path else {
             // The game closed: our connections close, and the file the plugin couldn't delete while
             // they were open goes
-            if let Some(pool) = self.live.take()
-                && !running
-                && let Some(dir) = pool.database().path().parent()
-            {
-                tokio::spawn(remove_when_closed(dir.to_owned(), pool));
+            if let Some(pool) = self.live.take() {
+                if !running && let Some(dir) = pool.database().path().parent() {
+                    tokio::spawn(remove_when_closed(dir.to_owned(), pool));
+                } else {
+                    // The database can disappear while the game still runs. Closing the last
+                    // pool reference joins its SQLite workers, so this branch needs a worker too.
+                    tokio::task::spawn_blocking(move || drop(pool));
+                }
             }
             return None;
         };
