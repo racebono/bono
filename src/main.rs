@@ -136,6 +136,10 @@ fn init(token: MainThreadToken) -> anyhow::Result<AppImpl> {
 pub(crate) fn error(title: &'static str, message: impl Display) {
     let message = message.to_string();
     log::error!("{title}: {message}");
+    // Tests run unattended; a modal dialog would pop up on screen and block.
+    if cfg!(test) {
+        return;
+    }
     std::thread::spawn(move || {
         let _ = show_simple_message_box(MessageBoxFlag::ERROR, title, &message, None);
     });
@@ -144,6 +148,9 @@ pub(crate) fn error(title: &'static str, message: impl Display) {
 pub(crate) fn error_blocking(title: &str, message: impl Display) {
     let message = message.to_string();
     log::error!("{title}: {message}");
+    if cfg!(test) {
+        return;
+    }
     let _ = show_simple_message_box(MessageBoxFlag::ERROR, title, &message, None);
 }
 
