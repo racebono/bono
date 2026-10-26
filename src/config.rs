@@ -43,12 +43,13 @@ impl Config {
         tokio::spawn(async move {
             while recv.changed().await.is_ok() {
                 let fut = async {
-                    let contents = {
-                        let raw = recv.borrow();
-                        serde_json::to_vec_pretty(&*raw)?
-                    };
+                    // Only clone under the lock: serializing there would stall the UI's writers
+                    let raw = recv.borrow_and_update().clone();
                     let path = path.clone();
-                    tokio::task::spawn_blocking(move || save_config(&path, &contents)).await??;
+                    tokio::task::spawn_blocking(move || {
+                        save_config(&path, &serde_json::to_vec_pretty(&raw)?)
+                    })
+                    .await??;
                     Ok::<_, anyhow::Error>(())
                 };
 
@@ -964,6 +965,28 @@ mod tests {
         let loaded: RawConfig = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(*loaded.master_volume(), 0.5);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_save_persists_latest_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let config = Config::new(&path).await.unwrap();
+        for volume in [0.1, 0.2, 0.3] {
+            config.update(|raw| raw.master_volume.set(volume));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let loaded = std::fs::read(&path).ok().and_then(|b| {
+                serde_json::from_slice::<RawConfig>(&b).ok()
+            });
+            if loaded.is_some_and(|l| *l.master_volume() == 0.3) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "latest config never saved");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[test]
