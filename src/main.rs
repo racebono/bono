@@ -34,6 +34,7 @@ mod config;
 mod engineer;
 mod i18n;
 mod language;
+mod logger;
 mod provider;
 mod sim;
 mod spotter;
@@ -212,32 +213,37 @@ impl AppImpl {
     }
 }
 
-fn setup_logger() -> Result<(), fern::InitError> {
-    let dispatch = fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "[{} {} {}] {}",
-                humantime::format_rfc3339_seconds(std::time::SystemTime::now()),
-                record.level(),
-                record.target(),
-                message
-            ))
-        })
-        .level(log::LevelFilter::Debug)
-        .chain(std::io::stdout());
+fn setup_logger() -> anyhow::Result<()> {
+    let mut sinks: Vec<Box<dyn std::io::Write + Send>> = vec![Box::new(std::io::stdout())];
 
     // Log next to config.json rather than in the working directory, which may be
     // read-only (e.g. `C:\Windows\System32` when started by a launcher).
     let log_file = get_pref_path(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_NAME"))
         .map_err(|e| e.to_string())
-        .and_then(|dir| fern::log_file(dir.join("output.log")).map_err(|e| e.to_string()));
-
-    match log_file {
-        Ok(file) => dispatch.chain(file).apply()?,
-        Err(e) => {
-            dispatch.apply()?;
-            log::warn!("Could not open log file, logging to stdout only: {e}");
+        .and_then(|dir| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("output.log"))
+                .map_err(|e| e.to_string())
+        });
+    let file_error = match log_file {
+        Ok(file) => {
+            sinks.push(Box::new(file));
+            None
         }
+        Err(e) => Some(e),
+    };
+
+    // Writes happen on a background thread so logging never blocks the UI
+    // thread on stdout or disk; see `logger`.
+    let level = log::LevelFilter::Debug;
+    let logger = logger::AsyncLogger::new(level, logger::QUEUE_CAPACITY, sinks)?;
+    log::set_boxed_logger(Box::new(logger))?;
+    log::set_max_level(level);
+
+    if let Some(e) = file_error {
+        log::warn!("Could not open log file, logging to stdout only: {e}");
     }
     Ok(())
 }
