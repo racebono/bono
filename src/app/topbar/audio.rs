@@ -343,7 +343,8 @@ impl AudioTopbar {
         true
     }
 
-    /// Retry only a missing device, preserving an already open device and the saved pick.
+    /// Retry a missing device or one still being opened, preserving an already open device (until
+    /// the pick replaces it) and the saved pick.
     pub fn device_added(&mut self, recording: bool, _audio: &AudioSubsystem, config: &RawConfig) {
         let (selector, kind) = if recording {
             (&mut self.microphone, Kind::Recording)
@@ -353,7 +354,7 @@ impl AudioTopbar {
         selector.next = Instant::now();
         // An open still in progress may have missed the new device: it's started again. The meter
         // listens to it once it's open (see `poll`)
-        if selector.open.is_none() {
+        if selector.open.is_none() || selector.opening.is_some() {
             selector.opening = Some(kind.open(kind.config(config)));
         }
     }
