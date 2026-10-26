@@ -18,6 +18,8 @@ use tokio::sync::{Mutex, watch};
 
 #[cfg(windows)]
 mod lmu;
+#[cfg(any(windows, test))]
+mod probe;
 #[cfg(windows)]
 mod rrre;
 
@@ -33,6 +35,8 @@ pub struct Sim<T: ?Sized = dyn Simulator> {
     /// Kept for its thread. Without Steam's key for the game (it's not installed), a sender kept
     /// so `running` stays false instead of closing
     _watcher: Result<AppWatcher, watch::Sender<bool>>,
+    /// Following the game again, started in the background by `ActiveSimulator::changed`
+    retrying: Option<tokio::task::JoinHandle<Option<AppWatcher>>>,
     simulator: T,
 }
 
@@ -60,6 +64,7 @@ impl<T> Sim<T> {
             running,
             track_data: Arc::new(Mutex::new(TrackData::new(T::TRACK_DATA_ID))),
             _watcher: watcher,
+            retrying: None,
             simulator,
         }
     }
@@ -80,11 +85,11 @@ where
         self.id
     }
 
-    /// The folder Steam installed the game in, if it's installed. Looks through Steam's libraries
-    /// on every call.
-    #[inline]
-    pub fn install_dir(&self) -> Option<PathBuf> {
-        steam::app_install_dir(self.app_id)
+    /// Looks for the folder Steam installed the game in, if it's installed, in the background:
+    /// it looks through Steam's libraries.
+    pub fn install_dir(&self) -> MaybeDone<Option<PathBuf>> {
+        let app_id = self.app_id;
+        MaybeDone::spawn_blocking(move || steam::app_install_dir(app_id))
     }
 
     /// Whether Steam reports the game running now.
@@ -280,20 +285,24 @@ impl ActiveSimulator {
     /// reported. Waits forever if no simulator can start or stop any more.
     pub async fn changed(&mut self) -> Option<&mut Sim<dyn Simulator>> {
         loop {
-            if self.last_watch_retry.elapsed() >= Duration::from_secs(2) {
+            // Opening Steam's registry key and starting a watch thread happen in the background
+            let due = self.last_watch_retry.elapsed() >= Duration::from_secs(2);
+            if due {
                 self.last_watch_retry = Instant::now();
-                for sim in &mut self.simulators {
-                    retry_watcher(&mut sim._watcher, &mut sim.running, || {
-                        let watcher = AppWatcher::new(sim.app_id).ok()?;
-                        let running = watcher.subscribe();
-                        Some((watcher, running))
-                    });
-                }
+            }
+            for sim in &mut self.simulators {
+                poll_retry(sim, due);
             }
             let next = self.pick();
             if next != self.current {
                 self.current = next;
                 break;
+            }
+
+            // A retry in flight is looked at again soon
+            let mut wait = Duration::from_secs(2).saturating_sub(self.last_watch_retry.elapsed());
+            if self.simulators.iter().any(|sim| sim.retrying.is_some()) {
+                wait = wait.min(Duration::from_millis(100));
             }
 
             // Closed channels aren't waited on: the next retry reconnects them.
@@ -304,9 +313,7 @@ impl ActiveSimulator {
                 .map(|sim| Box::pin(sim.running.changed()))
                 .collect::<Vec<_>>();
 
-            let retry = tokio::time::sleep(
-                Duration::from_secs(2).saturating_sub(self.last_watch_retry.elapsed()),
-            );
+            let retry = tokio::time::sleep(wait);
             tokio::select! {
                 _ = retry => {},
                 _ = async {
@@ -333,6 +340,35 @@ impl ActiveSimulator {
         self.current
             .filter(|&current| is_running(current))
             .or_else(|| (0..self.simulators.len()).find(|&i| is_running(i)))
+    }
+}
+
+/// Takes a finished background retry of following the game, and starts one if `due` and needed.
+/// Never waits for one.
+fn poll_retry(sim: &mut Sim<dyn Simulator>, due: bool) {
+    if sim.retrying.as_ref().is_some_and(|task| task.is_finished())
+        && let Some(task) = sim.retrying.take()
+    {
+        // Finished, so this doesn't wait
+        let next = futures::FutureExt::now_or_never(tokio::task::coop::unconstrained(task))
+            .and_then(Result::ok)
+            .flatten();
+        // A closed watcher being replaced already ended its thread, so dropping it doesn't wait
+        retry_watcher(&mut sim._watcher, &mut sim.running, || {
+            let watcher = next?;
+            let running = watcher.subscribe();
+            Some((watcher, running))
+        });
+    }
+
+    if due
+        && sim.retrying.is_none()
+        && (sim._watcher.is_err() || sim.running.has_changed().is_err())
+    {
+        let app_id = sim.app_id;
+        sim.retrying = Some(tokio::task::spawn_blocking(move || {
+            AppWatcher::new(app_id).ok()
+        }));
     }
 }
 
@@ -388,6 +424,7 @@ pub(crate) fn recording(pool: Pool) -> Box<Sim> {
         running,
         track_data: Arc::new(Mutex::new(TrackData::new("test".into()))),
         _watcher: Err(send),
+        retrying: None,
         simulator: Recording(pool),
     })
 }
@@ -447,6 +484,7 @@ mod tests {
             track_data: Arc::new(Mutex::new(TrackData::new(name.into()))),
             // Not the test's sender, so the test can close the channel
             _watcher: Err(watch::channel(false).0),
+            retrying: None,
             simulator: Fake,
         });
         (sim, send)

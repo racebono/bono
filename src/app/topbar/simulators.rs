@@ -34,6 +34,8 @@ pub struct SimulatorsTopbar {
 #[derive(Default)]
 struct Found {
     install_dir: Option<PathBuf>,
+    /// Looking through Steam's libraries for `install_dir`
+    dir_lookup: Option<MaybeDone<Option<PathBuf>>>,
     plugin: Option<PluginStatus>,
     lookup: Option<MaybeDone<PluginStatus>>,
 }
@@ -76,6 +78,7 @@ impl SimulatorsTopbar {
         {
             // Discard lookups started before the install completed.
             for found in &mut self.found {
+                found.dir_lookup = None;
                 found.lookup = None;
             }
             self.looked = None;
@@ -84,7 +87,9 @@ impl SimulatorsTopbar {
             self.found
                 .resize_with(simulators.simulators().count(), Found::default);
             for (sim, found) in simulators.simulators().zip(&mut self.found) {
-                found.install_dir = sim.install_dir();
+                if found.dir_lookup.is_none() {
+                    found.dir_lookup = Some(sim.install_dir());
+                }
                 if found.lookup.is_none() {
                     found.lookup = sim.plugin();
                 }
@@ -92,6 +97,14 @@ impl SimulatorsTopbar {
             self.looked = Some(Instant::now());
         }
         for found in &mut self.found {
+            if found
+                .dir_lookup
+                .as_mut()
+                .is_some_and(|lookup| lookup.update(rt).is_some())
+                && let Some(MaybeDone::Done(dir)) = found.dir_lookup.take()
+            {
+                found.install_dir = dir;
+            }
             if found
                 .lookup
                 .as_mut()

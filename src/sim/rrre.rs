@@ -4,7 +4,7 @@
 //! recording is deleted once the game closes.
 
 use crate::{
-    sim::{Simulator, SimulatorInfo, SimulatorSettings},
+    sim::{Simulator, SimulatorInfo, SimulatorSettings, probe::Probe},
     sqlite::{Database, pool::Pool},
 };
 use bono_sim::{
@@ -41,6 +41,9 @@ const RETRY: Duration = Duration::from_secs(1);
 /// Once the game closes, how long the database is left for the connections still reading it.
 const REMOVE_FOR: Duration = Duration::from_secs(60);
 const REMOVE_EVERY: Duration = Duration::from_secs(1);
+/// While the game runs, how often the recording's folder is looked at again: for the earlier
+/// recording to remove before reading, then for the new one.
+const LOOK_EVERY: Duration = Duration::from_secs(1);
 
 pub struct RaceRoom {
     /// Where the recording goes
@@ -51,6 +54,10 @@ pub struct RaceRoom {
     live: Option<Pool>,
     /// Hands changes to settings.json to the task writing them. Started with the first change
     settings: Option<mpsc::UnboundedSender<SettingsChange>>,
+    /// Whether an earlier run's recording was removed (in the background), before reading
+    cleaned: Probe<bool>,
+    /// Whether the recording is there, as last looked up in the background since reading started
+    ready: Probe<bool>,
 }
 
 impl RaceRoom {
@@ -60,6 +67,8 @@ impl RaceRoom {
             reader: None,
             live: None,
             settings: None,
+            cleaned: Probe::new(LOOK_EVERY),
+            ready: Probe::new(LOOK_EVERY),
         }
     }
 
@@ -131,6 +140,9 @@ impl Simulator for RaceRoom {
         if !running {
             // Stopped first, so the recorder writes what it has and lets go of the file
             self.reader = None;
+            // Looked at again next run: answers from this one are out of date
+            self.cleaned.reset();
+            self.ready.reset();
             if let Some(pool) = self.live.take() {
                 tokio::spawn(remove_when_closed(self.dir.clone(), pool));
             }
@@ -138,16 +150,28 @@ impl Simulator for RaceRoom {
         }
 
         if self.reader.is_none() {
-            // Nothing is recording yet: don't serve a database left by an earlier app run.
-            if let Err(e) = try_remove_database(&self.dir) {
-                log::warn!("Couldn't remove RaceRoom's previous recording: {e}");
+            // Nothing is recording yet: don't serve a database left by an earlier app run. Removed
+            // in the background, and tried again while it fails
+            let dir = self.dir.clone();
+            let cleaned = self.cleaned.get(move || {
+                try_remove_database(&dir)
+                    .inspect_err(|e| {
+                        log::warn!("Couldn't remove RaceRoom's previous recording: {e}")
+                    })
+                    .is_ok()
+            });
+            if cleaned != Some(&true) {
                 return None;
             }
             self.reader = Some(Reader::start(self.dir.clone()));
         }
 
         let path = self.dir.join(DATABASE);
-        if !path.is_file() {
+        let ready = self.ready.get({
+            let path = path.clone();
+            move || path.is_file()
+        });
+        if ready != Some(&true) {
             return None;
         }
         Some(self.live.get_or_insert_with(|| {
@@ -967,8 +991,8 @@ mod tests {
         assert_eq!(json["opponent_frequency"], 7);
     }
 
-    #[test]
-    fn removes_previous_recording_before_starting_reader() {
+    #[tokio::test]
+    async fn removes_previous_recording_before_starting_reader() {
         let dir = tempfile::tempdir().unwrap();
         for suffix in ["", "-wal", "-shm"] {
             std::fs::write(dir.path().join(format!("{DATABASE}{suffix}")), "old run").unwrap();
@@ -976,23 +1000,31 @@ mod tests {
         let mut sim = RaceRoom::new();
         sim.dir = dir.path().to_path_buf();
 
+        // Removed in the background: nothing's served meanwhile
         assert!(sim.database(true).is_none());
-        assert!(sim.reader.is_some());
+        assert!(sim.reader.is_none());
+        while sim.reader.is_none() {
+            assert!(sim.database(true).is_none());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(sim.live.is_none());
         for suffix in ["", "-wal", "-shm"] {
             assert!(!dir.path().join(format!("{DATABASE}{suffix}")).exists());
         }
     }
 
-    #[test]
-    fn does_not_start_reader_when_previous_recording_cannot_be_removed() {
+    #[tokio::test]
+    async fn does_not_start_reader_when_previous_recording_cannot_be_removed() {
         let dir = tempfile::tempdir().unwrap();
         // A directory at the database path makes removal fail without relying on file locks.
         std::fs::create_dir(dir.path().join(DATABASE)).unwrap();
         let mut sim = RaceRoom::new();
         sim.dir = dir.path().to_path_buf();
 
-        assert!(sim.database(true).is_none());
+        for _ in 0..20 {
+            assert!(sim.database(true).is_none());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(sim.reader.is_none());
         assert!(sim.live.is_none());
     }
