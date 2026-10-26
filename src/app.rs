@@ -72,7 +72,36 @@ impl App {
         let event = sdl.event()?;
         let fonts = load_fonts()?;
 
-        let config = load_config(&pref_path).await?;
+        // Everything waited on happens before the window exists: SDL's init callback must return
+        // before the first frame, so a window opened earlier would show unresponsive meanwhile.
+        // It's all local (config and track cache files, the OS credential store), done at once
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?;
+        let account = async {
+            let origin = option_env!("BONO_ACCOUNT_ORIGIN")?;
+            match crate::account::Account::new(origin).await {
+                Ok(account) => {
+                    let restore = account.clone();
+                    rt.spawn(async move {
+                        if let Err(error) = restore.resume().await {
+                            log::warn!("Account restoration: {error}");
+                        }
+                    });
+                    Some(account)
+                }
+                Err(error) => {
+                    log::warn!("Account initialization: {error}");
+                    None
+                }
+            }
+        };
+        let (config, tracks, account) = tokio::join!(
+            load_config(&pref_path),
+            TrackSync::new(client.clone(), pref_path.as_std_path()),
+            account,
+        );
+        let config = config?;
         let (width, height) = {
             let config = config.get();
             (*config.width(), *config.height())
@@ -95,35 +124,10 @@ impl App {
         };
 
         let pref_path = Arc::<Utf8Path>::from(pref_path);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
-        let tracks = TrackSync::new(client.clone(), pref_path.as_std_path());
-
-        let account = match option_env!("BONO_ACCOUNT_ORIGIN") {
-            Some(origin) => match crate::account::Account::new(origin).await {
-                Ok(account) => {
-                    let restore = account.clone();
-                    rt.spawn(async move {
-                        if let Err(error) = restore.resume().await {
-                            log::warn!("Account restoration: {error}");
-                        }
-                    });
-                    Some(account)
-                }
-                Err(error) => {
-                    log::warn!("Account initialization: {error}");
-                    None
-                }
-            },
-            None => None,
-        };
-
         let guard = config.get();
         let gui = Gui::new(&pref_path, &subsystems, &guard, &client, account.as_ref());
         let synth = Synthesizer::new(rt, &guard);
         let engineer = Engineer::new(client, account.clone());
-        let tracks = tracks.await;
         drop(guard);
 
         return Ok(Self {
@@ -172,6 +176,11 @@ impl App {
 
     /// The app is quitting: what the website holds for it is given back.
     pub fn quit(&mut self, rt: &Handle) {
+        // No frame comes after this, yet what follows waits: up to a few seconds for the website,
+        // then for worker threads (speech synthesis, databases) as the app is dropped. Hidden
+        // first, the app is seen to close at once instead of hanging. The waits can't move to the
+        // background: the process ends right after them, cutting them short
+        self.ui.painter.canvas.window_mut().hide();
         self.state.engineer.quit(rt);
     }
 

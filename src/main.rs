@@ -129,6 +129,9 @@ fn setup_logger() -> Result<(), fern::InitError> {
 
 fn init(token: MainThreadToken) -> anyhow::Result<AppImpl> {
     let rt = Runtime::new()?;
+    // Blocks before the event loop on purpose: SDL needs the app back from its init callback, on
+    // the main thread, before any frame. `App::new` waits only on local files and the credential
+    // store, before its window opens, so nothing is seen unresponsive
     let app = MainThreadData::new(token, RefCell::new(rt.block_on(App::new(rt.handle()))?));
     Ok(AppImpl { app, rt })
 }

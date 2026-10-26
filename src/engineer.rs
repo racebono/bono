@@ -847,7 +847,9 @@ impl Engineer {
         const WAIT: Duration = Duration::from_secs(3);
 
         self.stop();
-        // Before the conversation goes: it would end the lease without waiting
+        // Before the conversation goes: it would end the lease without waiting. Blocks the main
+        // thread on purpose, bounded by `WAIT`: no frame follows (`App::quit` hid the window),
+        // and the process ends next, so a background wait would be cut short
         if let Some(lease) = self.session.as_ref().and_then(|s| s.lease.as_ref())
             && rt
                 .block_on(async { tokio::time::timeout(WAIT, lease.end_and_wait()).await })

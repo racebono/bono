@@ -147,7 +147,10 @@ impl Simulator for LeMansUltimate {
             .as_ref()
             .is_some_and(|pool| pool.database().path() != &path)
         {
-            self.live = None;
+            // Closing joins the connections' threads: not on the UI thread
+            if let Some(pool) = self.live.take() {
+                tokio::task::spawn_blocking(move || drop(pool));
+            }
         }
         Some(self.live.get_or_insert_with(|| {
             Pool::new(Database::read_only(Arc::new(path)), MAX_IDLE, MAX_OPEN)
