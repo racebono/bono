@@ -535,10 +535,10 @@ impl Voice {
     /// Download progress of both files, weighted by size: `None` if they aren't downloading, or
     /// either failed.
     fn progress(&self) -> Option<f64> {
-        if self.failed() {
+        let [model, config] = self.downloads.as_ref()?;
+        if self.failed() || (model.finished() && config.finished()) {
             return None;
         }
-        let [model, config] = self.downloads.as_ref()?;
         let (model_size, config_size) = (self.model_size as f64, self.config_size as f64);
         let total = (model_size + config_size).max(1.0);
         return Some((model.progress() * model_size + config.progress() * config_size) / total);
@@ -550,8 +550,8 @@ impl Voice {
     }
 
     fn start_download(&mut self, client: &reqwest::Client) {
-        // Both start over if either failed
-        if self.failed() {
+        // Both start over if either failed, or once done if their files went missing since
+        if self.failed() || (self.downloads.iter().flatten()).all(Download::finished) {
             self.downloads = None;
         }
         self.downloads.get_or_insert_with(|| {

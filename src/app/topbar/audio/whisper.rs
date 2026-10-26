@@ -956,9 +956,9 @@ impl Model {
         *self.on_disk.borrow()
     }
 
-    /// The download under way, or done: `None` if there's none, or it failed.
+    /// The download under way: `None` if there's none, it failed, or it's done.
     pub fn download(&self) -> Option<&Download> {
-        self.download.as_ref().filter(|download| !download.failed())
+        (self.download.as_ref()).filter(|download| !download.failed() && !download.finished())
     }
 
     /// Whether the last download failed.
@@ -967,8 +967,8 @@ impl Model {
     }
 
     pub fn start_download(&mut self, client: &reqwest::Client) -> &mut Download {
-        // One that failed starts over
-        if self.failed() {
+        // One that failed starts over, as does one whose file went missing since
+        if self.failed() || self.download.as_ref().is_some_and(Download::finished) {
             self.download = None;
         }
         self.download.get_or_insert_with(|| {

@@ -344,6 +344,11 @@ impl Download {
         *self.progress.borrow()
     }
 
+    /// Whether the file was put in place.
+    pub fn finished(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+
     /// Whether it stopped before it was done (the error was already shown).
     pub fn failed(&self) -> bool {
         self.task.is_finished() && !self.done.load(Ordering::Acquire)
