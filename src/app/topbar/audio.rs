@@ -786,7 +786,8 @@ mod hotplug_tests {
 #[derive(Clone)]
 pub struct ModelFiles {
     asked: Arc<Mutex<HashSet<Utf8PathBuf>>>,
-    found: tokio::sync::watch::Receiver<HashMap<Utf8PathBuf, bool>>,
+    /// Whether each is a file, and when the check that found out started
+    found: tokio::sync::watch::Receiver<HashMap<Utf8PathBuf, (bool, Instant)>>,
 }
 
 impl ModelFiles {
@@ -794,7 +795,7 @@ impl ModelFiles {
         let asked = Arc::new(Mutex::new(HashSet::<Utf8PathBuf>::new()));
         let found = updating(Duration::from_millis(1234), HashMap::new(), {
             let asked = asked.clone();
-            move |_| {
+            move |started| {
                 let paths = asked.lock().unwrap().iter().cloned().collect::<Vec<_>>();
                 async move {
                     let mut found = HashMap::with_capacity(paths.len());
@@ -802,7 +803,7 @@ impl ModelFiles {
                         let file = tokio::fs::metadata(&path)
                             .await
                             .is_ok_and(|metadata| metadata.is_file());
-                        found.insert(path, file);
+                        found.insert(path, (file, started));
                     }
                     found
                 }
@@ -813,8 +814,16 @@ impl ModelFiles {
 
     /// Whether `path` is a file, as of the last check: `None` until it's been checked.
     pub fn checked(&self, path: &Utf8Path) -> Option<bool> {
-        if let Some(&file) = self.found.borrow().get(path) {
-            return Some(file);
+        self.checked_since(path, None)
+    }
+
+    /// Like [`Self::checked`], but `None` until a check that started at or after `since`.
+    pub fn checked_since(&self, path: &Utf8Path, since: Option<Instant>) -> Option<bool> {
+        if let Some(&(file, started)) = self.found.borrow().get(path) {
+            if since.is_none_or(|since| started >= since) {
+                return Some(file);
+            }
+            return None;
         }
         self.asked.lock().unwrap().insert(path.to_path_buf());
         None
@@ -829,8 +838,13 @@ impl ModelFiles {
     /// Whether a voice's files are on disk: Piper needs both the model and its sidecar
     /// configuration. `None` until they've been checked.
     pub fn voice_checked(&self, path: &Utf8Path) -> Option<bool> {
-        let model = self.checked(path);
-        let json = self.checked(&path.with_added_extension("json"));
+        self.voice_checked_since(path, None)
+    }
+
+    /// Like [`Self::voice_checked`], but `None` until a check that started at or after `since`.
+    pub fn voice_checked_since(&self, path: &Utf8Path, since: Option<Instant>) -> Option<bool> {
+        let model = self.checked_since(path, since);
+        let json = self.checked_since(&path.with_added_extension("json"), since);
         Some(model? && json?)
     }
 

@@ -21,7 +21,7 @@ use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::runtime::Handle;
 
@@ -51,6 +51,9 @@ pub struct Voices {
     /// The setup's download was started: one that fails isn't started again until it's asked
     /// for again
     setup_started: bool,
+    /// When setup first found the recommended voice ready to replace the picked one: it waits for
+    /// a check of the picked one's files started since, so a stale result doesn't replace it
+    replace_since: Option<Instant>,
     files: super::ModelFiles,
 }
 
@@ -98,6 +101,7 @@ impl Voices {
             client: client.clone(),
             setup: None,
             setup_started: false,
+            replace_since: None,
             files,
             catalog: Self::fetch_catalog(pref_path.clone(), client.clone(), 3),
             pref_path,
@@ -139,6 +143,17 @@ impl Voices {
         match on_disk {
             Some(true) => {
                 let path = voice.path.to_path_buf();
+                if let Some(picked) = picked.as_ref().filter(|picked| **picked != path) {
+                    let since = *self.replace_since.get_or_insert_with(Instant::now);
+                    match self.files.voice_checked_since(picked, Some(since)) {
+                        None => return,
+                        Some(true) => {
+                            self.setup = None;
+                            return;
+                        }
+                        Some(false) => {}
+                    }
+                }
                 config.update(|raw| raw.set_voice(rt, lang, Some(path), synth));
                 self.setup = None;
             }
@@ -158,6 +173,7 @@ impl Voices {
         self.retry_catalog();
         self.setup = recommended(locale);
         self.setup_started = false;
+        self.replace_since = None;
     }
 
     /// The recommended voice for the app's language (`locale`), as the setup guide shows it:

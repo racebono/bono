@@ -30,7 +30,7 @@ use std::{
     num::{NonZero, NonZeroUsize},
     path::Path,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::runtime::Handle;
 use whisper_rs::{
@@ -57,6 +57,9 @@ pub struct Whisper {
     /// The setup's download was started: one that fails isn't started again until it's asked
     /// for again
     setup_started: bool,
+    /// When setup first found the recommended model ready to replace the picked one: it waits for
+    /// a check of the picked one's file started since, so a stale result doesn't replace it
+    replace_since: Option<Instant>,
     stream: Option<WhisperStream>,
     /// The joystick whose talk button started the recording: unplugging it means the release
     /// never comes
@@ -119,6 +122,7 @@ impl Whisper {
             loaded: None,
             setup: false,
             setup_started: false,
+            replace_since: None,
             stream: None,
             talk_joystick: None,
             catalog: Self::fetch_catalog(pref_path.clone(), client.clone(), 3),
@@ -443,6 +447,17 @@ impl Whisper {
         match model.on_disk() {
             Some(true) => {
                 let path = model.path.clone();
+                if let Some(picked) = picked.as_ref().filter(|picked| **picked != path) {
+                    let since = *self.replace_since.get_or_insert_with(Instant::now);
+                    match self.files.checked_since(picked, Some(since)) {
+                        None => return,
+                        Some(true) if !self.failed() => {
+                            self.setup = false;
+                            return;
+                        }
+                        Some(_) => {}
+                    }
+                }
                 config.update(|raw| raw.whisper_model.set(Some(path.clone())));
                 self.set_model(path);
                 self.setup = false;
@@ -463,6 +478,7 @@ impl Whisper {
         self.retry_catalog();
         self.setup = true;
         self.setup_started = false;
+        self.replace_since = None;
     }
 
     /// The recommended model, as the setup guide shows it: `None` if another is picked.
