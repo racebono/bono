@@ -248,15 +248,19 @@ WHERE c.vehicle_id = :V AND c.telemetry_id >= :S ORDER BY c.id;
 ```
 
 
-## RaceRoom penalty and service detail
+## Portable penalty and pit-service detail
 
-Additional nullable `standings` columns (not supplied by LMU):
+These nullable `standings` columns describe shared concepts. Any simulator adapter can populate them; unsupported signals remain NULL. Current availability in RaceRoom does not restrict other adapters.
 
-- `penalty_type`: drive_through, stop_and_go, pit_stop, time_deduction, slow_down, disqualified; `penalty_reason_code` preserves the API reason scoped to that type, and `penalty_reason` decodes known valid reasons. Unknown codes remain available for review.
-- `penalty_drive_through`, `penalty_stop_and_go`, `penalty_pit_stop`, `penalty_time_deduction`, `penalty_slow_down`: per-type values, never counts. Drive-through is active at zero; stop-and-go is seconds to stay; slowdown is seconds left to give back. Negative sentinels become NULL (none pending or unavailable); NULL does not establish why a signal is absent. All simultaneous types are retained. Existing `penalties` still counts nonnegative per-type entries.
-- `pit_state`: none, requested, entering, stopped, exiting, for the player only.
-- `pit_menu_state`: JSON array of nullable integer states, indexed as preset, penalty, driver change, fuel, front tires, rear tires, body, front wing, rear wing, suspension, top button, bottom button. Actions: 0 unselected, 1 selected; preset/buttons: 1 selectable. These describe intent, not completed work.
-- `pit_action`: integer bitmask; 0 none, 1 preparing, 2 serving penalty, 4 driver change, 8 refueling, 16 front tires, 32 rear tires, 64 body, 128 front wing, 256 rear wing, 512 suspension. Preserve simultaneous bits. Serving is not proof a penalty has cleared.
-- `pit_total_duration`, `pit_elapsed_time`, `pit_min_duration_total`, `pit_min_duration_left`: seconds, including zero; unavailable/nonfinite values become NULL. Snapshots can change, and countdowns alone never authorize leaving.
+- `penalty_type`: drive_through, stop_and_go, pit_stop, time_deduction, slow_down, disqualified. `penalty_reason` is a normalized reason string, scoped to this reported type rather than all simultaneous penalties.
+- `penalty_drive_through_active`, `penalty_pit_stop_active`: nullable booleans for pending requirements. RaceRoom reports active at a nonnegative value, including zero, and cannot distinguish unavailable from absent at -1; both become NULL. Future adapters may explicitly report false when they know a requirement is absent.
+- `penalty_stop_and_go_seconds`: required stationary duration; `penalty_time_seconds`: time adjustment; `penalty_slow_down_seconds`: time remaining to give back. Never counts. Zero is valid; negative/unavailable/nonfinite source values become NULL. Existing `penalties` retains its outstanding count.
+- `pit_state`: none, requested, entering, stopped, exiting.
+- `pit_service_<service>_selected`: nullable boolean intent, not completed work. `<service>` is penalty, driver_change, refuel, front_tires, rear_tires, body_repair, front_wing, rear_wing, suspension. NULL is unknown, false explicitly unselected.
+- `pit_service_<service>_active`: nullable boolean for the same services currently underway; simultaneous actions are independent. `pit_service_preparing`: crew preparation. Serving a penalty does not establish it has cleared. RaceRoom currently supplies service signals for the player only.
+- `pit_total_duration`, `pit_elapsed_time`, `pit_min_duration_total`, `pit_min_duration_left`: seconds, including zero; snapshots can change and countdowns alone never authorize leaving.
+- `simulator_metadata`: JSON object keyed by stable simulator identifier. Optional raw codes, UI details and ambiguous source-specific values belong here, never in portable fields. RaceRoom uses `raceroom` with `penalty_type`, `penalty_reason`, `penalties` (per-type values), `pit_menu_state` (nullable native menu entries), and `pit_action` (native mask, including unknown bits). A future adapter uses its own namespace; consumers must not interpret one simulator's code as another's. RaceRoom menu preset/buttons are UI affordances and are kept only here. Unknown penalty codes remain preserved here even when normalization is impossible.
 
-All additions participate in scoring change detection so menu changes, countdowns and serving transitions are recorded even with unchanged penalty count. Engineer status/quick alerts and strategy expose the player detail; SQL exposes every car's penalty history. Existing rising-edge penalty announcements continue to depend only on the count, avoiding repeated calls for countdown changes. Live availability still needs validation for each car/session.
+Shared fields use named concepts and explicit units, with no requirement to adopt another simulator's enum values, menu order or bit assignments. Extend the shared schema with additional nullable service concepts when a new adapter needs them; use simulator metadata for details without an established portable meaning. Normal engineer output reads only shared fields. SQL can inspect metadata for source-specific diagnostics and post-race review.
+
+All additions participate in scoring change detection, retaining selection/progress/serving transitions even with an unchanged penalty count. Existing rising-edge penalty announcements still depend only on the count. Live availability requires validation by car/session.

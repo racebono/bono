@@ -2533,14 +2533,23 @@ fn service_details(me: &Row) -> Vec<String> {
     let mut info = Vec::new();
     let mut penalties = Vec::new();
     for (column, label) in [
-        ("penalty_drive_through", "drive-through active (API value)"),
-        ("penalty_stop_and_go", "stop-and-go seconds to stay"),
-        ("penalty_pit_stop", "pit-stop penalty (API value)"),
-        ("penalty_time_deduction", "time penalty seconds"),
-        ("penalty_slow_down", "slowdown seconds left to give back"),
+        ("penalty_stop_and_go_seconds", "stop-and-go seconds to stay"),
+        ("penalty_time_seconds", "time penalty seconds"),
+        (
+            "penalty_slow_down_seconds",
+            "slowdown seconds left to give back",
+        ),
     ] {
         if let Some(value) = me.f(column) {
             penalties.push(format!("{label}: {value:.2}"));
+        }
+    }
+    for (column, label) in [
+        ("penalty_drive_through_active", "drive-through active"),
+        ("penalty_pit_stop_active", "pit-stop penalty active"),
+    ] {
+        if me.b(column) {
+            penalties.push(label.into());
         }
     }
     if !penalties.is_empty() {
@@ -2550,7 +2559,7 @@ fn service_details(me: &Row) -> Vec<String> {
         let reason = me
             .text("penalty_reason")
             .map(telemetry_text)
-            .unwrap_or_else(|| format!("unknown (API code {})", int(me.i("penalty_reason_code"))));
+            .unwrap_or_else(|| "unknown".to_owned());
         info.push(format!(
             "reported penalty type {}, reason {reason} (reason applies only to this type)",
             telemetry_text(kind)
@@ -2559,72 +2568,41 @@ fn service_details(me: &Row) -> Vec<String> {
     if let Some(state) = me.text("pit_state") {
         info.push(format!("pit state {}", telemetry_text(state)));
     }
-    if let Some(action) = me.i("pit_action") {
-        let labels = [
-            (1, "preparing"),
-            (2, "serving penalty"),
-            (4, "driver change"),
-            (8, "refueling"),
-            (16, "front tires"),
-            (32, "rear tires"),
-            (64, "body repair"),
-            (128, "front wing"),
-            (256, "rear wing"),
-            (512, "suspension"),
-        ];
-        let mut actions = labels
-            .iter()
-            .filter(|(bit, _)| action & bit != 0)
-            .map(|(_, label)| (*label).to_owned())
-            .collect::<Vec<_>>();
-        if action & !1023 != 0 {
-            actions.push(format!("unknown bits {}", action & !1023));
+    let mut actions = Vec::new();
+    let mut choices = Vec::new();
+    if me.b("pit_service_preparing") {
+        actions.push("preparing");
+    }
+    for (service, label) in [
+        ("penalty", "serving penalty"),
+        ("driver_change", "driver change"),
+        ("refuel", "refueling"),
+        ("front_tires", "front tires"),
+        ("rear_tires", "rear tires"),
+        ("body_repair", "body repair"),
+        ("front_wing", "front wing"),
+        ("rear_wing", "rear wing"),
+        ("suspension", "suspension"),
+    ] {
+        if me.b(&format!("pit_service_{service}_active")) {
+            actions.push(label);
         }
-        if action == 0 {
-            actions.push("none".into());
+        if let Some(value) = me.i(&format!("pit_service_{service}_selected")) {
+            choices.push(format!(
+                "{label}={}",
+                if value != 0 { "selected" } else { "unselected" }
+            ));
         }
+    }
+    if !actions.is_empty() {
         info.push(format!(
-            "crew actions: {} (mask {action}); serving penalty is not proof it is cleared",
+            "crew actions: {}; serving penalty is not proof it is cleared",
             actions.join(", ")
         ));
     }
-    if let Some(menu) = me
-        .text("pit_menu_state")
-        .and_then(|text| serde_json::from_str::<Vec<Option<i64>>>(text).ok())
-    {
-        let names = [
-            "preset",
-            "penalty",
-            "driver change",
-            "fuel",
-            "front tires",
-            "rear tires",
-            "body",
-            "front wing",
-            "rear wing",
-            "suspension",
-            "top button",
-            "bottom button",
-        ];
-        let choices = names
-            .iter()
-            .enumerate()
-            .filter_map(|(i, name)| {
-                let value = menu.get(i).copied().flatten()?;
-                let meaning = if matches!(i, 0 | 10 | 11) {
-                    "selectable"
-                } else if value == 1 {
-                    "selected"
-                } else if value == 0 {
-                    "unselected"
-                } else {
-                    "API value"
-                };
-                Some(format!("{name}={meaning} ({value})"))
-            })
-            .collect::<Vec<_>>();
+    if !choices.is_empty() {
         info.push(format!(
-            "pit menu intent only, not completed work: {}",
+            "pit service intent only, not completed work: {}",
             choices.join(", ")
         ));
     }
@@ -4569,7 +4547,7 @@ mod tests {
     #[test]
     fn service_output_distinguishes_intent_actions_and_requirements() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE detail (penalty_stop_and_go REAL, penalty_slow_down REAL, penalty_type TEXT, penalty_reason TEXT, pit_state TEXT, pit_action INTEGER, pit_menu_state TEXT, pit_min_duration_left REAL); INSERT INTO detail VALUES (10, 2.5, 'stop_and_go', 'yellow_flag_overtake', 'stopped', 26, '[null,null,null,0,1,null,null,null,null,null,null,null]', 0);").unwrap();
+        conn.execute_batch("CREATE TABLE detail (penalty_stop_and_go_seconds REAL, penalty_slow_down_seconds REAL, penalty_type TEXT, penalty_reason TEXT, pit_state TEXT, pit_service_penalty_active INTEGER, pit_service_refuel_active INTEGER, pit_service_front_tires_active INTEGER, pit_service_front_tires_selected INTEGER, pit_service_refuel_selected INTEGER, pit_min_duration_left REAL); INSERT INTO detail VALUES (10, 2.5, 'stop_and_go', 'yellow_flag_overtake', 'stopped', 1, 1, 1, 1, 0, 0);").unwrap();
         let me = row(&conn, "SELECT * FROM detail", []).unwrap().unwrap();
         let text = service_details(&me).join("\n");
         for expected in [
@@ -4578,7 +4556,7 @@ mod tests {
             "yellow_flag_overtake",
             "serving penalty, refueling, front tires",
             "front tires=selected",
-            "fuel=unselected",
+            "refueling=unselected",
             "intent only, not completed work",
             "not proof it is cleared",
             "countdown alone does not authorize leaving",

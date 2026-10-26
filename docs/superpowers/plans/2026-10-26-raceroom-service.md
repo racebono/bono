@@ -14,3 +14,5 @@ Architecture: preserve per-driver penalty types, reason codes and type-specific 
 Validation constraint: live RaceRoom channel availability requires a running game and remains a separate manual check.
 
 Validation: shared recorder 9 passed; application CPU-only suite 229 passed, 16 ignored. Build required network access for ONNX Runtime. Existing compiler warnings remain. No live game was available for per-car/session validation.
+
+Follow-up: normalize source-specific menu indices and action bits into named nullable selected/active service booleans. Give penalty values explicit units and booleans for presence-only requirements. Retain raw values/reason codes and UI-only details under simulator_metadata.raceroom; future adapters use their own namespace and populate shared fields directly. Validate generic scoring persistence without RaceRoom metadata and rerun CPU-only suites.

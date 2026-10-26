@@ -349,6 +349,31 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    /// A future adapter can provide partial service/penalty data without RaceRoom codes.
+    #[test]
+    fn portable_service_fields_need_no_source_layout() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let mut writer = ScoringWriter::new(&conn).unwrap();
+        let mut car = bono_standing::default();
+        car.vehicle_id = Some(42).into();
+        car.penalty_drive_through_active = Some(false).into();
+        car.penalty_stop_and_go_seconds = Some(15.0).into();
+        car.pit_service_refuel_selected = Some(true).into();
+        car.pit_service_refuel_active = Some(false).into();
+        writer
+            .write(bono_session_info::default(), vec![car.clone()])
+            .unwrap();
+        car.pit_service_refuel_active = Some(true).into();
+        writer
+            .write(bono_session_info::default(), vec![car])
+            .unwrap();
+        let result: (i64, bool, f64, bool, bool, Option<bool>, Option<String>) = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM standings), penalty_drive_through_active, penalty_stop_and_go_seconds, pit_service_refuel_selected, pit_service_refuel_active, pit_service_front_tires_active, simulator_metadata FROM standings ORDER BY id DESC LIMIT 1", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).unwrap();
+        assert_eq!(result, (2, false, 15.0, true, true, None, None));
+    }
+
     #[test]
     fn recreates_an_older_schema() {
         let conn = Connection::open_in_memory().unwrap();

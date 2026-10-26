@@ -796,13 +796,23 @@ fn standing(
         .count() as i64,
     )
     .into();
-    out.penalty_drive_through = non_negative(penalties.drive_through).into();
-    out.penalty_stop_and_go = non_negative(penalties.stop_and_go).into();
-    out.penalty_pit_stop = non_negative(penalties.pit_stop).into();
-    out.penalty_time_deduction = non_negative(penalties.time_deduction).into();
-    out.penalty_slow_down = non_negative(penalties.slow_down).into();
+    out.penalty_drive_through_active = non_negative(penalties.drive_through).map(|_| true).into();
+    out.penalty_stop_and_go_seconds = non_negative(penalties.stop_and_go).into();
+    out.penalty_pit_stop_active = non_negative(penalties.pit_stop).map(|_| true).into();
+    out.penalty_time_seconds = non_negative(penalties.time_deduction).into();
+    out.penalty_slow_down_seconds = non_negative(penalties.slow_down).into();
     out.penalty_type = penalty_type(driver.penaltyType).map(str::to_owned).into();
-    out.penalty_reason_code = setting(driver.penaltyReason).into();
+    let mut source = serde_json::json!({
+        "penalty_type": setting(driver.penaltyType),
+        "penalty_reason": setting(driver.penaltyReason),
+        "penalties": {
+            "drive_through": non_negative(penalties.drive_through),
+            "stop_and_go": non_negative(penalties.stop_and_go),
+            "pit_stop": non_negative(penalties.pit_stop),
+            "time_deduction": non_negative(penalties.time_deduction),
+            "slow_down": non_negative(penalties.slow_down),
+        }
+    });
     out.penalty_reason = penalty_reason(driver.penaltyType, driver.penaltyReason)
         .map(str::to_owned)
         .into();
@@ -821,13 +831,29 @@ fn standing(
         }
         .map(str::to_owned)
         .into();
-        let menu = shared.pit_menu_state.map(setting);
-        out.pit_menu_state = menu
-            .iter()
-            .any(Option::is_some)
-            .then(|| serde_json::to_string(&menu).expect("integer menu states"))
-            .into();
-        out.pit_action = setting(shared.pit_action).into();
+        let menu = shared.pit_menu_state;
+        let action = setting(shared.pit_action);
+        source["pit_menu_state"] = serde_json::json!(menu.map(setting));
+        source["pit_action"] = serde_json::json!(action);
+        out.pit_service_preparing = action.map(|bits| bits & 1 != 0).into();
+        out.pit_service_penalty_selected = flag(menu[1]).into();
+        out.pit_service_penalty_active = action.map(|bits| bits & 2 != 0).into();
+        out.pit_service_driver_change_selected = flag(menu[2]).into();
+        out.pit_service_driver_change_active = action.map(|bits| bits & 4 != 0).into();
+        out.pit_service_refuel_selected = flag(menu[3]).into();
+        out.pit_service_refuel_active = action.map(|bits| bits & 8 != 0).into();
+        out.pit_service_front_tires_selected = flag(menu[4]).into();
+        out.pit_service_front_tires_active = action.map(|bits| bits & 16 != 0).into();
+        out.pit_service_rear_tires_selected = flag(menu[5]).into();
+        out.pit_service_rear_tires_active = action.map(|bits| bits & 32 != 0).into();
+        out.pit_service_body_repair_selected = flag(menu[6]).into();
+        out.pit_service_body_repair_active = action.map(|bits| bits & 64 != 0).into();
+        out.pit_service_front_wing_selected = flag(menu[7]).into();
+        out.pit_service_front_wing_active = action.map(|bits| bits & 128 != 0).into();
+        out.pit_service_rear_wing_selected = flag(menu[8]).into();
+        out.pit_service_rear_wing_active = action.map(|bits| bits & 256 != 0).into();
+        out.pit_service_suspension_selected = flag(menu[9]).into();
+        out.pit_service_suspension_active = action.map(|bits| bits & 512 != 0).into();
         out.pit_total_duration = non_negative(shared.pit_total_duration).into();
         out.pit_elapsed_time = non_negative(shared.pit_elapsed_time).into();
         out.pit_min_duration_total = non_negative(shared.pit_min_duration_total).into();
@@ -861,6 +887,7 @@ fn standing(
         out.under_yellow = flag(flags.yellow).into();
         out.in_garage = flag(shared.game_player_in_garage).into();
     }
+    out.simulator_metadata = Some(serde_json::json!({ "raceroom": source }).to_string()).into();
     out
 }
 
@@ -1174,11 +1201,11 @@ mod tests {
         driver.penaltyReason = 2;
         let out = standing(&shared, &driver, 500.0, true);
         assert_eq!(out.penalties.get(), Some(4));
-        assert_eq!(out.penalty_drive_through.get(), Some(0.0));
-        assert_eq!(out.penalty_stop_and_go.get(), Some(10.0));
-        assert_eq!(out.penalty_pit_stop.get(), None);
-        assert_eq!(out.penalty_time_deduction.get(), Some(5.0));
-        assert_eq!(out.penalty_slow_down.get(), Some(2.5));
+        assert_eq!(out.penalty_drive_through_active.get(), Some(true));
+        assert_eq!(out.penalty_stop_and_go_seconds.get(), Some(10.0));
+        assert_eq!(out.penalty_pit_stop_active.get(), None);
+        assert_eq!(out.penalty_time_seconds.get(), Some(5.0));
+        assert_eq!(out.penalty_slow_down_seconds.get(), Some(2.5));
         assert_eq!(out.penalty_reason.as_deref(), Some("pit_speeding"));
         for (kind, reason) in [
             (1, "cut_track_multiple"),
@@ -1197,7 +1224,12 @@ mod tests {
         let out = standing(&shared, &driver, 500.0, false);
         assert_eq!(out.penalty_type.as_deref(), None);
         assert_eq!(out.penalty_reason.as_deref(), None);
-        assert_eq!(out.penalty_reason_code.get(), Some(100));
+        assert!(
+            out.simulator_metadata
+                .as_deref()
+                .unwrap()
+                .contains("\"penalty_reason\":100")
+        );
         driver.penaltyType = -1;
         driver.penaltyReason = -1;
         driver.penalties = r3e_cut_track_penalties {
@@ -1209,8 +1241,13 @@ mod tests {
         };
         let out = standing(&shared, &driver, 500.0, false);
         assert_eq!(out.penalties.get(), Some(0));
-        assert_eq!(out.penalty_reason_code.get(), None);
-        assert_eq!(out.penalty_slow_down.get(), None);
+        assert!(
+            out.simulator_metadata
+                .as_deref()
+                .unwrap()
+                .contains("\"penalty_reason\":null")
+        );
+        assert_eq!(out.penalty_slow_down_seconds.get(), None);
         assert_eq!(non_negative(f32::NAN), None);
         assert_eq!(non_negative(f32::INFINITY), None);
         assert_eq!(penalty_reason(0, 0), None);
@@ -1239,8 +1276,8 @@ mod tests {
             let out = standing(&shared, &driver, 500.0 + step as f64, true);
             assert_eq!(out.pit_state.as_deref(), Some(state));
             assert_eq!(out.pit_elapsed_time.get(), None);
-            assert_eq!(out.pit_menu_state.as_deref(), None);
-            assert_eq!(out.pit_action.get(), None);
+            assert_eq!(out.pit_service_front_tires_selected.get(), None);
+            assert_eq!(out.pit_service_penalty_active.get(), None);
             writer
                 .write(bono_session_info::default(), vec![out])
                 .unwrap();
@@ -1253,12 +1290,12 @@ mod tests {
         shared.pit_min_duration_total = 20.0;
         shared.pit_min_duration_left = 0.0;
         let out = standing(&shared, &driver, 506.0, true);
-        assert_eq!(out.pit_action.get(), Some(26));
+        assert_eq!(out.pit_service_penalty_active.get(), Some(true));
         assert_eq!(out.pit_min_duration_left.get(), Some(0.0));
-        assert_eq!(
-            out.pit_menu_state.as_deref(),
-            Some("[null,null,null,null,1,null,null,null,null,null,null,null]")
-        );
+        assert_eq!(out.pit_service_front_tires_selected.get(), Some(true));
+        assert_eq!(out.pit_service_refuel_active.get(), Some(true));
+        assert_eq!(out.pit_service_front_tires_active.get(), Some(true));
+        assert_eq!(out.pit_service_rear_tires_active.get(), Some(false));
         writer
             .write(bono_session_info::default(), vec![out])
             .unwrap();
@@ -1285,13 +1322,13 @@ mod tests {
             )
             .unwrap();
         let (rows, count, elapsed, action, left): (i64, i64, f64, i64, f64) = conn.query_row(
-            "SELECT (SELECT COUNT(*) FROM standings), penalties, pit_elapsed_time, pit_action, pit_min_duration_left FROM standings ORDER BY id DESC LIMIT 1", [],
+            "SELECT (SELECT COUNT(*) FROM standings), penalties, pit_elapsed_time, pit_service_penalty_active, pit_min_duration_left FROM standings ORDER BY id DESC LIMIT 1", [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap();
         assert_eq!((rows, count, elapsed, action, left), (9, 1, 4.0, 0, 0.0));
         let opponent = standing(&shared, &driver, 509.0, false);
         assert_eq!(opponent.pit_state.as_deref(), None);
-        assert_eq!(opponent.pit_action.get(), None);
-        assert_eq!(opponent.pit_menu_state.as_deref(), None);
+        assert_eq!(opponent.pit_service_penalty_active.get(), None);
+        assert_eq!(opponent.pit_service_front_tires_selected.get(), None);
         shared.pit_state = -1;
         assert_eq!(
             standing(&shared, &driver, 510.0, true).pit_state.as_deref(),
