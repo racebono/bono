@@ -41,7 +41,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -51,6 +51,7 @@ mod voice;
 mod whisper;
 
 const DELAY: Duration = Duration::from_secs(1);
+static DEVICE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Something the setup guide downloads, as it shows it.
 pub enum SetupItem {
@@ -97,6 +98,26 @@ pub struct AudioTopbar {
 }
 
 impl AudioTopbar {
+    /// Stop scheduling audio work before SDL teardown, retaining the subsystem until workers end.
+    pub fn begin_shutdown(&mut self) {
+        self.test = None;
+        self.transcription = None;
+        self.meter = None;
+        self.whisper.cancel_recording();
+        self.test_playback = None;
+        self.beep_playback = None;
+        self.microphone.begin_shutdown();
+        self.speaker.begin_shutdown();
+    }
+
+    pub fn shutdown_ready(&mut self) -> bool {
+        self.microphone.collect_retired();
+        self.speaker.collect_retired();
+        DEVICE_WORKERS.load(Ordering::Acquire) == 0
+            && self.microphone.retiring.is_empty()
+            && self.speaker.retiring.is_empty()
+    }
+
     pub fn new(
         pref_path: &Arc<Utf8Path>,
         ss: &Subsystems,
@@ -395,6 +416,8 @@ impl AudioTopbar {
 
 pub struct DeviceSelector {
     open: Option<sdl3::audio::AudioDevice>,
+    /// Keep SDL's main-thread subsystem references until native close has finished on a worker.
+    retiring: Vec<(sdl3::audio::AudioDevice, tokio::sync::oneshot::Receiver<()>)>,
     /// The device picked, being opened in the background: until then, the one open stays
     opening: Option<OpeningDevice>,
     /// Devices removed while one is being opened: it may be one of them, by the time it's open
@@ -409,6 +432,7 @@ impl DeviceSelector {
     fn new(kind: Kind, audio: &AudioSubsystem, config: &RawConfig, now: Instant) -> Self {
         Self {
             open: None,
+            retiring: Vec::new(),
             opening: Some(kind.open(kind.config(config))),
             gone: Vec::new(),
             audio: audio.clone(),
@@ -429,6 +453,7 @@ impl DeviceSelector {
 
     /// Uses the device opened in the background, once it is. Returns whether it changed.
     fn poll(&mut self, kind: Kind) -> bool {
+        self.collect_retired();
         let Some(opening) = &mut self.opening else {
             return false;
         };
@@ -439,7 +464,7 @@ impl DeviceSelector {
         };
         self.opening = None;
         let gone = std::mem::take(&mut self.gone);
-        close_in_background(self.open.take());
+        self.retire_open();
         self.open = match opened {
             // Unplugged before it got here: it's closed as it's dropped
             Ok(Some(opened)) if gone.contains(&opened.0.0) => None,
@@ -472,9 +497,29 @@ impl DeviceSelector {
             .as_ref()
             .is_some_and(|open| open.id().id() == which);
         if open {
-            close_in_background(self.open.take());
+            self.retire_open();
         }
         open
+    }
+
+    fn retire_open(&mut self) {
+        if let Some(device) = self.open.take() {
+            let id = device.id().id();
+            let done = in_background(move || unsafe { SDL_CloseAudioDevice(id) });
+            self.retiring.push((device, done));
+        }
+    }
+
+    fn collect_retired(&mut self) {
+        self.retiring
+            .retain_mut(|(_, done)| matches!(done.try_recv(), Err(TryRecvError::Empty)));
+        // The Rust wrappers now close an already-invalid logical ID, which SDL treats as a
+        // no-op. No device thread remains to join. Their subsystem references stay on this thread.
+    }
+
+    fn begin_shutdown(&mut self) {
+        self.opening = None;
+        self.retire_open();
     }
 
     fn update<'a>(
@@ -815,24 +860,9 @@ impl OpenedDevice {
 
 impl Drop for OpenedDevice {
     fn drop(&mut self) {
-        unsafe { SDL_CloseAudioDevice(self.0) };
-    }
-}
-
-/// Closes `device` without the UI thread waiting for it: closing a device's last handle stops and
-/// joins SDL's thread for it, which waits for it to finish a buffer and the OS to let go of it.
-/// sdl3's handle can't be sent to another thread, so another to the same device is opened (quick
-/// with it open already) to be closed on one, and sdl3's only closes its own then.
-fn close_in_background(device: Option<sdl3::audio::AudioDevice>) {
-    let Some(device) = device else {
-        return;
-    };
-    let id = unsafe { SDL_OpenAudioDevice(device.id().id(), std::ptr::null()) };
-    drop(device);
-    // If that failed (it's unplugged, say), it was closed above
-    if id.0 != 0 {
-        let other = OpenedDevice(id);
-        std::thread::spawn(move || drop(other));
+        let id = self.0;
+        // This value can be discarded from a result channel on the UI thread too.
+        drop(in_background(move || unsafe { SDL_CloseAudioDevice(id) }));
     }
 }
 
@@ -842,7 +872,16 @@ fn in_background<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> tokio::sync::oneshot::Receiver<T> {
     let (send, recv) = tokio::sync::oneshot::channel();
+    struct Worker;
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            DEVICE_WORKERS.fetch_sub(1, Ordering::Release);
+        }
+    }
+    DEVICE_WORKERS.fetch_add(1, Ordering::AcqRel);
+    let worker = Worker;
     std::thread::spawn(move || {
+        let _worker = worker;
         let _ = send.send(work());
     });
     recv

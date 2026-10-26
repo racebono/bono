@@ -155,7 +155,7 @@ impl App {
 
     pub fn iterate(&mut self, rt: &Handle) -> AppResult {
         if let Some(closing) = &self.closing {
-            return if closing.is_finished() {
+            return if closing.is_finished() && self.state.gui.topbar.audio.shutdown_ready() {
                 AppResult::Success
             } else {
                 AppResult::Continue
@@ -198,6 +198,7 @@ impl App {
             return;
         }
         self.ui.painter.canvas.window_mut().hide();
+        self.state.gui.topbar.audio.begin_shutdown();
         let engineer = self.state.engineer.quit(rt);
         let simulators = self.state.simulators.shutdown();
         let voices = std::mem::take(&mut self.state.synth.inner);
