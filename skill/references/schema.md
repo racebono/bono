@@ -246,3 +246,17 @@ SELECT c.session_time, c.rear_brake_bias, t.lap
 FROM car_state c JOIN telemetry t ON t.id = c.telemetry_id
 WHERE c.vehicle_id = :V AND c.telemetry_id >= :S ORDER BY c.id;
 ```
+
+
+## RaceRoom penalty and service detail
+
+Additional nullable `standings` columns (not supplied by LMU):
+
+- `penalty_type`: drive_through, stop_and_go, pit_stop, time_deduction, slow_down, disqualified; `penalty_reason_code` preserves the API reason scoped to that type, and `penalty_reason` decodes known valid reasons. Unknown codes remain available for review.
+- `penalty_drive_through`, `penalty_stop_and_go`, `penalty_pit_stop`, `penalty_time_deduction`, `penalty_slow_down`: per-type values, never counts. Drive-through is active at zero; stop-and-go is seconds to stay; slowdown is seconds left to give back. Negative sentinels become NULL (none pending or unavailable); NULL does not establish why a signal is absent. All simultaneous types are retained. Existing `penalties` still counts nonnegative per-type entries.
+- `pit_state`: none, requested, entering, stopped, exiting, for the player only.
+- `pit_menu_state`: JSON array of nullable integer states, indexed as preset, penalty, driver change, fuel, front tires, rear tires, body, front wing, rear wing, suspension, top button, bottom button. Actions: 0 unselected, 1 selected; preset/buttons: 1 selectable. These describe intent, not completed work.
+- `pit_action`: integer bitmask; 0 none, 1 preparing, 2 serving penalty, 4 driver change, 8 refueling, 16 front tires, 32 rear tires, 64 body, 128 front wing, 256 rear wing, 512 suspension. Preserve simultaneous bits. Serving is not proof a penalty has cleared.
+- `pit_total_duration`, `pit_elapsed_time`, `pit_min_duration_total`, `pit_min_duration_left`: seconds, including zero; unavailable/nonfinite values become NULL. Snapshots can change, and countdowns alone never authorize leaving.
+
+All additions participate in scoring change detection so menu changes, countdowns and serving transitions are recorded even with unchanged penalty count. Engineer status/quick alerts and strategy expose the player detail; SQL exposes every car's penalty history. Existing rising-edge penalty announcements continue to depend only on the count, avoiding repeated calls for countdown changes. Live availability still needs validation for each car/session.

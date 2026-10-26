@@ -796,11 +796,42 @@ fn standing(
         .count() as i64,
     )
     .into();
+    out.penalty_drive_through = non_negative(penalties.drive_through).into();
+    out.penalty_stop_and_go = non_negative(penalties.stop_and_go).into();
+    out.penalty_pit_stop = non_negative(penalties.pit_stop).into();
+    out.penalty_time_deduction = non_negative(penalties.time_deduction).into();
+    out.penalty_slow_down = non_negative(penalties.slow_down).into();
+    out.penalty_type = penalty_type(driver.penaltyType).map(str::to_owned).into();
+    out.penalty_reason_code = setting(driver.penaltyReason).into();
+    out.penalty_reason = penalty_reason(driver.penaltyType, driver.penaltyReason)
+        .map(str::to_owned)
+        .into();
     out.in_pits = flag(driver.in_pitlane).into();
     out.lap_distance = non_negative(driver.lap_distance).into();
     out.fuel_fraction = non_negative(driver.virtual_energy).into();
 
     if is_player {
+        out.pit_state = match shared.pit_state {
+            0 => Some("none"),
+            1 => Some("requested"),
+            2 => Some("entering"),
+            3 => Some("stopped"),
+            4 => Some("exiting"),
+            _ => None,
+        }
+        .map(str::to_owned)
+        .into();
+        let menu = shared.pit_menu_state.map(setting);
+        out.pit_menu_state = menu
+            .iter()
+            .any(Option::is_some)
+            .then(|| serde_json::to_string(&menu).expect("integer menu states"))
+            .into();
+        out.pit_action = setting(shared.pit_action).into();
+        out.pit_total_duration = non_negative(shared.pit_total_duration).into();
+        out.pit_elapsed_time = non_negative(shared.pit_elapsed_time).into();
+        out.pit_min_duration_total = non_negative(shared.pit_min_duration_total).into();
+        out.pit_min_duration_left = non_negative(shared.pit_min_duration_left).into();
         out.control = match shared.control_type {
             R3E_CONTROL_PLAYER => Some("player"),
             R3E_CONTROL_AI => Some("ai"),
@@ -833,6 +864,72 @@ fn standing(
     out
 }
 
+/// Reasons are scoped to the reported type, not to all outstanding penalties.
+fn penalty_type(kind: i32) -> Option<&'static str> {
+    [
+        "drive_through",
+        "stop_and_go",
+        "pit_stop",
+        "time_deduction",
+        "slow_down",
+        "disqualified",
+    ]
+    .get(usize::try_from(kind).ok()?)
+    .copied()
+}
+
+fn penalty_reason(kind: i32, reason: i32) -> Option<&'static str> {
+    let reasons: &[&str] = match kind {
+        0 => &[
+            "invalid",
+            "cut_track",
+            "pit_speeding",
+            "false_start",
+            "ignored_blue",
+            "driving_too_slow",
+            "passed_before_green",
+            "passed_before_finish",
+            "passed_before_pit_entrance",
+            "ignored_slow_down",
+        ],
+        1 => &[
+            "invalid",
+            "cut_track_first",
+            "cut_track_multiple",
+            "yellow_flag_overtake",
+            "virtual_energy",
+        ],
+        2 => &["invalid", "ignored_pit_window"],
+        3 => &[
+            "invalid",
+            "mandatory_pit_stop_late",
+            "ignored_minimum_pit_duration",
+        ],
+        4 => &["invalid", "cut_track_first", "cut_track_multiple"],
+        5 => &[
+            "false_start",
+            "pit_speeding",
+            "wrong_way",
+            "entering_pits_under_red",
+            "exiting_pits_under_red",
+            "failed_driver_change",
+            "three_drive_throughs_in_lap",
+            "lapped_field_multiple_times",
+            "ignored_drive_through",
+            "ignored_stop_and_go",
+            "ignored_pit_stop",
+            "ignored_time_penalty",
+            "excessive_cutting",
+            "ignored_blue",
+        ],
+        _ => return None,
+    };
+    reasons
+        .get(usize::try_from(reason).ok()?)
+        .copied()
+        .filter(|reason| *reason != "invalid")
+}
+
 /// The heading of a car moving by (dx, dz): 0 along -z, as LMU's plugin has it.
 fn heading(dx: f64, dz: f64) -> f64 {
     (-dx).atan2(-dz)
@@ -840,7 +937,7 @@ fn heading(dx: f64, dz: f64) -> f64 {
 
 /// A value the game gives -1 (or any negative) for when it doesn't know.
 fn non_negative(value: f32) -> Option<f64> {
-    (value >= 0.0).then_some(value as f64)
+    (value.is_finite() && value >= 0.0).then_some(value as f64)
 }
 
 /// A time in seconds, -1 when not known.
@@ -1060,6 +1157,146 @@ mod tests {
         shared.all_drivers_data_1[0] = driver(3, "Lena Fischer", 1, z - 20.0);
         shared.all_drivers_data_1[1] = driver(7, "Ana Lopes", 2, z);
         shared
+    }
+
+    #[test]
+    fn detailed_penalties_preserve_values_and_type_scoped_reasons() {
+        let shared = shared(500.0, 0.0);
+        let mut driver = driver(7, "Ana", 2, 0.0);
+        driver.penalties = r3e_cut_track_penalties {
+            drive_through: 0.0,
+            stop_and_go: 10.0,
+            pit_stop: -1.0,
+            time_deduction: 5.0,
+            slow_down: 2.5,
+        };
+        driver.penaltyType = 0;
+        driver.penaltyReason = 2;
+        let out = standing(&shared, &driver, 500.0, true);
+        assert_eq!(out.penalties.get(), Some(4));
+        assert_eq!(out.penalty_drive_through.get(), Some(0.0));
+        assert_eq!(out.penalty_stop_and_go.get(), Some(10.0));
+        assert_eq!(out.penalty_pit_stop.get(), None);
+        assert_eq!(out.penalty_time_deduction.get(), Some(5.0));
+        assert_eq!(out.penalty_slow_down.get(), Some(2.5));
+        assert_eq!(out.penalty_reason.as_deref(), Some("pit_speeding"));
+        for (kind, reason) in [
+            (1, "cut_track_multiple"),
+            (2, "ignored_pit_window"),
+            (3, "ignored_minimum_pit_duration"),
+            (4, "cut_track_multiple"),
+            (5, "wrong_way"),
+        ] {
+            assert_eq!(
+                penalty_reason(kind, if kind == 2 { 1 } else { 2 }),
+                Some(reason)
+            );
+        }
+        driver.penaltyType = 99;
+        driver.penaltyReason = 100;
+        let out = standing(&shared, &driver, 500.0, false);
+        assert_eq!(out.penalty_type.as_deref(), None);
+        assert_eq!(out.penalty_reason.as_deref(), None);
+        assert_eq!(out.penalty_reason_code.get(), Some(100));
+        driver.penaltyType = -1;
+        driver.penaltyReason = -1;
+        driver.penalties = r3e_cut_track_penalties {
+            drive_through: -1.0,
+            stop_and_go: -1.0,
+            pit_stop: -1.0,
+            time_deduction: -1.0,
+            slow_down: -1.0,
+        };
+        let out = standing(&shared, &driver, 500.0, false);
+        assert_eq!(out.penalties.get(), Some(0));
+        assert_eq!(out.penalty_reason_code.get(), None);
+        assert_eq!(out.penalty_slow_down.get(), None);
+        assert_eq!(non_negative(f32::NAN), None);
+        assert_eq!(non_negative(f32::INFINITY), None);
+        assert_eq!(penalty_reason(0, 0), None);
+        assert_eq!(penalty_reason(5, 0), Some("false_start"));
+    }
+
+    #[test]
+    fn records_pit_transitions_menu_intent_and_serving_without_count_changes() {
+        use bono_sim::sql::{ScoringWriter, create_tables};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let mut writer = ScoringWriter::new(&conn).unwrap();
+        let mut shared = shared(500.0, 0.0);
+        let driver = driver(7, "Ana", 2, 0.0);
+        shared.pit_menu_state = [-1; 12];
+        shared.pit_total_duration = -1.0;
+        shared.pit_elapsed_time = -1.0;
+        shared.pit_min_duration_total = -1.0;
+        shared.pit_min_duration_left = -1.0;
+        shared.pit_action = -1;
+        for (step, state) in ["none", "requested", "entering", "stopped", "exiting"]
+            .into_iter()
+            .enumerate()
+        {
+            shared.pit_state = step as i32;
+            let out = standing(&shared, &driver, 500.0 + step as f64, true);
+            assert_eq!(out.pit_state.as_deref(), Some(state));
+            assert_eq!(out.pit_elapsed_time.get(), None);
+            assert_eq!(out.pit_menu_state.as_deref(), None);
+            assert_eq!(out.pit_action.get(), None);
+            writer
+                .write(bono_session_info::default(), vec![out])
+                .unwrap();
+        }
+        shared.pit_state = 3;
+        shared.pit_action = 2 | 8 | 16;
+        shared.pit_menu_state[4] = 1;
+        shared.pit_elapsed_time = 3.0;
+        shared.pit_total_duration = 10.0;
+        shared.pit_min_duration_total = 20.0;
+        shared.pit_min_duration_left = 0.0;
+        let out = standing(&shared, &driver, 506.0, true);
+        assert_eq!(out.pit_action.get(), Some(26));
+        assert_eq!(out.pit_min_duration_left.get(), Some(0.0));
+        assert_eq!(
+            out.pit_menu_state.as_deref(),
+            Some("[null,null,null,null,1,null,null,null,null,null,null,null]")
+        );
+        writer
+            .write(bono_session_info::default(), vec![out])
+            .unwrap();
+        // Menu-only change, then progress-only change, both persist with count still one.
+        shared.pit_menu_state[4] = 0;
+        writer
+            .write(
+                bono_session_info::default(),
+                vec![standing(&shared, &driver, 507.0, true)],
+            )
+            .unwrap();
+        shared.pit_elapsed_time = 4.0;
+        writer
+            .write(
+                bono_session_info::default(),
+                vec![standing(&shared, &driver, 508.0, true)],
+            )
+            .unwrap();
+        shared.pit_action = 0;
+        writer
+            .write(
+                bono_session_info::default(),
+                vec![standing(&shared, &driver, 509.0, true)],
+            )
+            .unwrap();
+        let (rows, count, elapsed, action, left): (i64, i64, f64, i64, f64) = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM standings), penalties, pit_elapsed_time, pit_action, pit_min_duration_left FROM standings ORDER BY id DESC LIMIT 1", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap();
+        assert_eq!((rows, count, elapsed, action, left), (9, 1, 4.0, 0, 0.0));
+        let opponent = standing(&shared, &driver, 509.0, false);
+        assert_eq!(opponent.pit_state.as_deref(), None);
+        assert_eq!(opponent.pit_action.get(), None);
+        assert_eq!(opponent.pit_menu_state.as_deref(), None);
+        shared.pit_state = -1;
+        assert_eq!(
+            standing(&shared, &driver, 510.0, true).pit_state.as_deref(),
+            None
+        );
     }
 
     #[test]

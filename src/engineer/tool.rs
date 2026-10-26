@@ -2055,6 +2055,11 @@ fn cmd_stint(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
         );
     }
 
+    if let Some(me) = &sc.player {
+        for detail in service_details(me) {
+            say!(out, "{detail}");
+        }
+    }
     let (window, _) = pit_window(ctx)?;
     say!(
         out,
@@ -2500,6 +2505,7 @@ fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
         if me.s("pit_state") == Some("requested") {
             info.push("pit stop requested".into());
         }
+        info.extend(service_details(me));
         if let Some(finish) = me.text("finish_status").filter(|f| *f != "none") {
             alerts.push(finish.to_uppercase());
         }
@@ -2520,6 +2526,124 @@ fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
         }
     }
     Ok((alerts, info))
+}
+
+/// Optional scoring columns also work with recordings made before these fields existed.
+fn service_details(me: &Row) -> Vec<String> {
+    let mut info = Vec::new();
+    let mut penalties = Vec::new();
+    for (column, label) in [
+        ("penalty_drive_through", "drive-through active (API value)"),
+        ("penalty_stop_and_go", "stop-and-go seconds to stay"),
+        ("penalty_pit_stop", "pit-stop penalty (API value)"),
+        ("penalty_time_deduction", "time penalty seconds"),
+        ("penalty_slow_down", "slowdown seconds left to give back"),
+    ] {
+        if let Some(value) = me.f(column) {
+            penalties.push(format!("{label}: {value:.2}"));
+        }
+    }
+    if !penalties.is_empty() {
+        info.push(format!("penalty requirements: {}", penalties.join(", ")));
+    }
+    if let Some(kind) = me.text("penalty_type") {
+        let reason = me
+            .text("penalty_reason")
+            .map(telemetry_text)
+            .unwrap_or_else(|| format!("unknown (API code {})", int(me.i("penalty_reason_code"))));
+        info.push(format!(
+            "reported penalty type {}, reason {reason} (reason applies only to this type)",
+            telemetry_text(kind)
+        ));
+    }
+    if let Some(state) = me.text("pit_state") {
+        info.push(format!("pit state {}", telemetry_text(state)));
+    }
+    if let Some(action) = me.i("pit_action") {
+        let labels = [
+            (1, "preparing"),
+            (2, "serving penalty"),
+            (4, "driver change"),
+            (8, "refueling"),
+            (16, "front tires"),
+            (32, "rear tires"),
+            (64, "body repair"),
+            (128, "front wing"),
+            (256, "rear wing"),
+            (512, "suspension"),
+        ];
+        let mut actions = labels
+            .iter()
+            .filter(|(bit, _)| action & bit != 0)
+            .map(|(_, label)| (*label).to_owned())
+            .collect::<Vec<_>>();
+        if action & !1023 != 0 {
+            actions.push(format!("unknown bits {}", action & !1023));
+        }
+        if action == 0 {
+            actions.push("none".into());
+        }
+        info.push(format!(
+            "crew actions: {} (mask {action}); serving penalty is not proof it is cleared",
+            actions.join(", ")
+        ));
+    }
+    if let Some(menu) = me
+        .text("pit_menu_state")
+        .and_then(|text| serde_json::from_str::<Vec<Option<i64>>>(text).ok())
+    {
+        let names = [
+            "preset",
+            "penalty",
+            "driver change",
+            "fuel",
+            "front tires",
+            "rear tires",
+            "body",
+            "front wing",
+            "rear wing",
+            "suspension",
+            "top button",
+            "bottom button",
+        ];
+        let choices = names
+            .iter()
+            .enumerate()
+            .filter_map(|(i, name)| {
+                let value = menu.get(i).copied().flatten()?;
+                let meaning = if matches!(i, 0 | 10 | 11) {
+                    "selectable"
+                } else if value == 1 {
+                    "selected"
+                } else if value == 0 {
+                    "unselected"
+                } else {
+                    "API value"
+                };
+                Some(format!("{name}={meaning} ({value})"))
+            })
+            .collect::<Vec<_>>();
+        info.push(format!(
+            "pit menu intent only, not completed work: {}",
+            choices.join(", ")
+        ));
+    }
+    let times = [
+        "pit_total_duration",
+        "pit_elapsed_time",
+        "pit_min_duration_total",
+        "pit_min_duration_left",
+    ]
+    .iter()
+    .filter_map(|column| me.f(column).map(|v| format!("{column}={v:.2}s")))
+    .collect::<Vec<_>>();
+    if !times.is_empty() {
+        info.push(format!(
+            "pit progress snapshot: {}; countdown alone does not authorize leaving",
+            times.join(", ")
+        ));
+    }
+    info
 }
 
 // --------------------------------------------------------------------------- status
@@ -4441,6 +4565,30 @@ mod tests {
         sys::{bono_session_info, bono_standing, bono_telemetry},
     };
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn service_output_distinguishes_intent_actions_and_requirements() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE detail (penalty_stop_and_go REAL, penalty_slow_down REAL, penalty_type TEXT, penalty_reason TEXT, pit_state TEXT, pit_action INTEGER, pit_menu_state TEXT, pit_min_duration_left REAL); INSERT INTO detail VALUES (10, 2.5, 'stop_and_go', 'yellow_flag_overtake', 'stopped', 26, '[null,null,null,0,1,null,null,null,null,null,null,null]', 0);").unwrap();
+        let me = row(&conn, "SELECT * FROM detail", []).unwrap().unwrap();
+        let text = service_details(&me).join("\n");
+        for expected in [
+            "stop-and-go seconds to stay: 10.00",
+            "slowdown seconds left to give back: 2.50",
+            "yellow_flag_overtake",
+            "serving penalty, refueling, front tires",
+            "front tires=selected",
+            "fuel=unselected",
+            "intent only, not completed work",
+            "not proof it is cleared",
+            "countdown alone does not authorize leaving",
+            "pit_min_duration_left=0.00s",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        let old = row(&conn, "SELECT 1 AS vehicle_id", []).unwrap().unwrap();
+        assert!(service_details(&old).is_empty());
+    }
 
     #[test]
     fn forecast_uses_newest_set_with_frozen_session_time() {

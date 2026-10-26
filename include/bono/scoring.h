@@ -91,6 +91,20 @@
     X(i64, pit_stops, true)                                                                               \
     X(string, mandatory_pit_stop, true)      /* none, unserved_two_tires, unserved_four_tires, served */          \
     X(i64, penalties, true)                  /* outstanding */                                            \
+    X(string, penalty_type, true) /* RaceRoom type; does not identify every simultaneous penalty */ \
+    X(i64, penalty_reason_code, true) /* RaceRoom code scoped by penalty_type */ \
+    X(string, penalty_reason, true) /* decoded reason when known */ \
+    X(f64, penalty_drive_through, true) /* active at zero; not a count */ \
+    X(f64, penalty_stop_and_go, true) /* seconds to stay */ \
+    X(f64, penalty_pit_stop, true) /* type-specific API value */ \
+    X(f64, penalty_time_deduction, true) /* seconds */ \
+    X(f64, penalty_slow_down, true) /* seconds left to give back */ \
+    X(string, pit_menu_state, true) /* JSON array of nullable API menu states, indices 0-11; intent only */ \
+    X(i64, pit_action, true) /* RaceRoom bitmask: preparing=1, penalty=2, driver=4, fuel=8, front/rear tires=16/32, body=64, wings=128/256, suspension=512 */ \
+    X(f64, pit_total_duration, true) /* seconds; reported snapshot, not clearance to leave */ \
+    X(f64, pit_elapsed_time, true) /* seconds; reported snapshot, not clearance to leave */ \
+    X(f64, pit_min_duration_total, true) /* seconds; reported snapshot, not clearance to leave */ \
+    X(f64, pit_min_duration_left, true) /* seconds; reported snapshot, not clearance to leave */ \
     X(boolean, in_pits, true)                                                                             \
     X(string, pit_state, true)               /* none, requested, entering, stopped, exiting */            \
     X(boolean, in_garage, true)                                                                           \
