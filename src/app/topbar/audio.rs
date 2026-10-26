@@ -396,6 +396,8 @@ pub struct DeviceSelector {
     open: Option<sdl3::audio::AudioDevice>,
     /// The device picked, being opened in the background: until then, the one open stays
     opening: Option<OpeningDevice>,
+    /// Devices removed while one is being opened: it may be one of them, by the time it's open
+    gone: Vec<u32>,
     /// To own the devices opened in the background
     audio: AudioSubsystem,
     next: Instant,
@@ -407,6 +409,7 @@ impl DeviceSelector {
         Self {
             open: None,
             opening: Some(kind.open(kind.config(config))),
+            gone: Vec::new(),
             audio: audio.clone(),
             next: now,
             devices: Vec::new(),
@@ -434,9 +437,12 @@ impl DeviceSelector {
             Err(TryRecvError::Closed) => Ok(None),
         };
         self.opening = None;
+        let gone = std::mem::take(&mut self.gone);
         self.open = match opened {
-            Ok(Some(id)) => Some(sdl3::audio::AudioDevice::new(
-                AudioDeviceID::Device(id),
+            // Unplugged before it got here: it's closed as it's dropped
+            Ok(Some(opened)) if gone.contains(&opened.0.0) => None,
+            Ok(Some(opened)) => Some(sdl3::audio::AudioDevice::new(
+                AudioDeviceID::Device(opened.into_id()),
                 self.audio.clone(),
             )),
             Ok(None) => None,
@@ -456,6 +462,9 @@ impl DeviceSelector {
 
     /// The device `which` is gone: it's closed if it's the one open. Returns whether it was.
     fn removed(&mut self, which: u32) -> bool {
+        if self.opening.is_some() {
+            self.gone.push(which);
+        }
         let open = self
             .open
             .as_ref()
@@ -712,15 +721,8 @@ impl Kind {
     fn open(self, device: &AudioDevice) -> OpeningDevice {
         log::debug!("{device:#?}");
         let device = device.clone();
-        in_background(
-            move || self.open_raw(&device),
-            // Nobody wants it any more: another was picked meanwhile
-            |opened| {
-                if let Ok(Some(id)) = opened {
-                    unsafe { SDL_CloseAudioDevice(id) };
-                }
-            },
-        )
+        // Nobody may want it any more (another was picked meanwhile): it closes as it's dropped
+        in_background(move || self.open_raw(&device).map(|id| id.map(OpenedDevice)))
     }
 
     /// Opens `device`, on any thread: the SDL device functions used are thread safe, unlike
@@ -794,19 +796,35 @@ impl Kind {
 }
 
 /// A device being opened in the background: `None` if it's not plugged in.
-type OpeningDevice = tokio::sync::oneshot::Receiver<Result<Option<SDL_AudioDeviceID>, sdl3::Error>>;
+type OpeningDevice = tokio::sync::oneshot::Receiver<Result<Option<OpenedDevice>, sdl3::Error>>;
 
-/// Runs `work` on its own thread, for its result to be received; `unwanted` gets it if it's no
-/// longer wanted (the receiver was dropped).
+/// A device opened in the background, closed if it's dropped before sdl3 is given it: whether
+/// on its thread (nobody waits for it) or in the channel (nobody received it).
+struct OpenedDevice(SDL_AudioDeviceID);
+
+impl OpenedDevice {
+    /// For sdl3 to close it instead.
+    fn into_id(self) -> SDL_AudioDeviceID {
+        let id = self.0;
+        std::mem::forget(self);
+        id
+    }
+}
+
+impl Drop for OpenedDevice {
+    fn drop(&mut self) {
+        unsafe { SDL_CloseAudioDevice(self.0) };
+    }
+}
+
+/// Runs `work` on its own thread, for its result to be received. If it's no longer wanted, it's
+/// dropped where it is: `T` must let go of what it holds then.
 fn in_background<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
-    unwanted: impl FnOnce(T) + Send + 'static,
 ) -> tokio::sync::oneshot::Receiver<T> {
     let (send, recv) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        if let Err(result) = send.send(work()) {
-            unwanted(result);
-        }
+        let _ = send.send(work());
     });
     recv
 }
@@ -823,33 +841,49 @@ fn resolve_device(name: &str, devices: &[(AudioDeviceID, Arc<str>)]) -> Option<A
 mod hotplug_tests {
     use super::*;
 
+    /// Tells when it's dropped, like a device that's closed.
+    struct Released(std::sync::mpsc::Sender<()>);
+
+    impl Drop for Released {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
     #[test]
-    fn a_result_nobody_wants_is_let_go_of() {
+    fn a_result_nobody_waits_for_is_let_go_of() {
         let (gone, released) = std::sync::mpsc::channel();
         let (go, wait) = std::sync::mpsc::channel::<()>();
-        let recv = in_background(
-            move || {
-                wait.recv().unwrap();
-                7
-            },
-            move |result| gone.send(result).unwrap(),
-        );
+        let recv = in_background(move || {
+            wait.recv().unwrap();
+            Released(gone)
+        });
         // Dropped while it's still working, like a device picked over one being opened
         drop(recv);
         go.send(()).unwrap();
-        assert_eq!(released.recv_timeout(Duration::from_secs(5)), Ok(7));
+        assert_eq!(released.recv_timeout(Duration::from_secs(5)), Ok(()));
+    }
+
+    #[test]
+    fn a_result_nobody_received_is_let_go_of() {
+        let (gone, released) = std::sync::mpsc::channel();
+        let recv = in_background(move || Released(gone));
+        // Done, but picked over before the UI got to it
+        while recv.is_empty() {
+            std::thread::yield_now();
+        }
+        assert!(released.try_recv().is_err());
+        drop(recv);
+        assert_eq!(released.try_recv(), Ok(()));
     }
 
     #[test]
     fn a_result_wanted_is_received_without_waiting_for_it() {
         let (go, wait) = std::sync::mpsc::channel::<()>();
-        let mut recv = in_background(
-            move || {
-                wait.recv().unwrap();
-                7
-            },
-            |_| panic!("it was wanted"),
-        );
+        let mut recv = in_background(move || {
+            wait.recv().unwrap();
+            7
+        });
         assert_eq!(recv.try_recv(), Err(TryRecvError::Empty));
         go.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
