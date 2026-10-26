@@ -684,6 +684,11 @@ impl PendingSession {
         mut stream: RecordingStream<Recorder>,
         config: Config,
     ) -> JoinHandle<anyhow::Result<Heard>> {
+        // Blocks the UI thread, briefly: sdl3's stream can't be sent to another thread (it holds
+        // the `!Send` `AudioSubsystem`), and the callback must be done with before it's freed.
+        // Pausing, flushing and locking each wait for at most one callback call; draining copies
+        // what arrived since the last one (a device buffer, milliseconds of audio). The
+        // transcription, the slow part, runs in the background.
         if let Err(e) = stream.pause() {
             return spawn(std::future::ready(Err(e.into())));
         }
