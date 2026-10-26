@@ -51,8 +51,56 @@ struct AppImpl {
 enum Lifecycle {
     Loading(task::LocalTask<anyhow::Result<App>>),
     Running(App),
-    Failed(task::Task<()>),
+    Failed(StartupError),
     Stopped,
+}
+
+/// Fatal startup errors still need a live, responsive window until the user dismisses them.
+struct StartupError {
+    ui: egui_sdl3::EguiCanvas,
+    message: String,
+}
+
+impl StartupError {
+    fn new(error: anyhow::Error) -> anyhow::Result<Self> {
+        let message = format!("{error:#}");
+        log::error!("{}: {message}", t!("error.initializing"));
+        let video = sdl3::init()?.video()?;
+        let window = video
+            .window(t!("error.initializing"), 640, 360)
+            .resizable()
+            .high_pixel_density()
+            .build()?;
+        Ok(Self {
+            ui: egui_sdl3::EguiCanvas::new(window),
+            message,
+        })
+    }
+
+    fn iterate(&mut self) -> AppResult {
+        let mut dismissed = false;
+        self.ui.run(|ctx| {
+            let mut ui = egui::Ui::new(
+                ctx.clone(),
+                egui::Id::new("startup-error"),
+                egui::UiBuilder::new()
+                    .layer_id(egui::LayerId::background())
+                    .max_rect(ctx.viewport_rect()),
+            );
+            egui::ScrollArea::vertical().show(&mut ui, |ui| {
+                ui.heading(t!("error.initializing"));
+                ui.label(&self.message);
+                dismissed = ui.button("OK").clicked();
+            });
+        });
+        self.ui.paint();
+        self.ui.present();
+        if dismissed {
+            AppResult::Failure
+        } else {
+            AppResult::Continue
+        }
+    }
 }
 
 impl Drop for AppImpl {
@@ -100,26 +148,19 @@ impl AppImpl {
             match task.update(self.rt.handle()) {
                 None => return AppResult::Continue,
                 Some(Ok(app)) => *state = Lifecycle::Running(app),
-                Some(Err(e)) => {
-                    let title = t!("error.initializing");
-                    // Keep SDL alive until the worker's dialog is dismissed, without blocking
-                    // event delivery or racing process exit against presentation of the error.
-                    *state = Lifecycle::Failed(task::Task::spawn_blocking(move || {
-                        error_blocking(title, e);
-                    }));
-                }
+                Some(Err(e)) => match StartupError::new(e) {
+                    Ok(screen) => *state = Lifecycle::Failed(screen),
+                    Err(e) => {
+                        log::error!("Unable to display startup error: {e}");
+                        return AppResult::Failure;
+                    }
+                },
             }
         }
         match &mut *state {
             Lifecycle::Running(app) => app.iterate(self.rt.handle()),
             Lifecycle::Loading(_) => AppResult::Continue,
-            Lifecycle::Failed(dialog) => {
-                if dialog.update(self.rt.handle()).is_some() {
-                    AppResult::Failure
-                } else {
-                    AppResult::Continue
-                }
-            }
+            Lifecycle::Failed(screen) => screen.iterate(),
             Lifecycle::Stopped => AppResult::Success,
         }
     }
@@ -135,7 +176,21 @@ impl AppImpl {
                 Lifecycle::Running(app) => app.event(&handle, event),
                 Lifecycle::Loading(_) if matches!(event, Event::Quit { .. }) => AppResult::Success,
                 Lifecycle::Loading(_) => AppResult::Continue,
-                Lifecycle::Failed(_) => AppResult::Continue,
+                Lifecycle::Failed(screen) => {
+                    if matches!(
+                        event,
+                        Event::Quit { .. }
+                            | Event::Window {
+                                win_event: sdl3::event::WindowEvent::CloseRequested,
+                                ..
+                            }
+                    ) {
+                        AppResult::Failure
+                    } else {
+                        screen.ui.on_event(&event);
+                        AppResult::Continue
+                    }
+                }
                 Lifecycle::Stopped => AppResult::Success,
             };
         }) {
