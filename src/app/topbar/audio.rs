@@ -439,6 +439,7 @@ impl DeviceSelector {
         };
         self.opening = None;
         let gone = std::mem::take(&mut self.gone);
+        close_in_background(self.open.take());
         self.open = match opened {
             // Unplugged before it got here: it's closed as it's dropped
             Ok(Some(opened)) if gone.contains(&opened.0.0) => None,
@@ -471,7 +472,7 @@ impl DeviceSelector {
             .as_ref()
             .is_some_and(|open| open.id().id() == which);
         if open {
-            self.open = None;
+            close_in_background(self.open.take());
         }
         open
     }
@@ -815,6 +816,23 @@ impl OpenedDevice {
 impl Drop for OpenedDevice {
     fn drop(&mut self) {
         unsafe { SDL_CloseAudioDevice(self.0) };
+    }
+}
+
+/// Closes `device` without the UI thread waiting for it: closing a device's last handle stops and
+/// joins SDL's thread for it, which waits for it to finish a buffer and the OS to let go of it.
+/// sdl3's handle can't be sent to another thread, so another to the same device is opened (quick
+/// with it open already) to be closed on one, and sdl3's only closes its own then.
+fn close_in_background(device: Option<sdl3::audio::AudioDevice>) {
+    let Some(device) = device else {
+        return;
+    };
+    let id = unsafe { SDL_OpenAudioDevice(device.id().id(), std::ptr::null()) };
+    drop(device);
+    // If that failed (it's unplugged, say), it was closed above
+    if id.0 != 0 {
+        let other = OpenedDevice(id);
+        std::thread::spawn(move || drop(other));
     }
 }
 
