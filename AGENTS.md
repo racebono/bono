@@ -14,6 +14,15 @@ site and in the change description. Explain why background execution is not
 possible, the expected duration and user-visible impact, and how the blocking
 is bounded or mitigated. Convenience alone is not a justification.
 
+## Rely only on documented library behavior
+
+Code must never rely on undocumented behavior of external libraries, crates,
+SDKs, or APIs. Depend only on behavior guaranteed by their documentation or
+public API contracts, not on behavior observed in testing, implementation
+details, or source code that is not part of the documented interface. If the
+required behavior is not documented, handle it explicitly in our own code or
+choose a documented alternative.
+
 ## Test features
 
 Run tests with the `cuda` and `vulkan` features disabled unless the changes
