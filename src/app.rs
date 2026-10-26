@@ -204,6 +204,8 @@ impl App {
         let speech = rt.spawn_blocking(move || drop(voices));
         self.closing = Some(rt.spawn(async move {
             let _ = tokio::join!(engineer, simulators, speech);
+            // Flushing has a bounded wait, so it belongs on a worker after cleanup logs finish.
+            let _ = tokio::task::spawn_blocking(|| log::logger().flush()).await;
         }));
     }
 

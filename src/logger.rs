@@ -45,11 +45,20 @@ impl AsyncLogger {
         capacity: usize,
         sinks: Vec<Box<dyn Write + Send>>,
     ) -> std::io::Result<Self> {
+        Self::with_sinks(level, capacity, move || sinks)
+    }
+
+    /// Opens the sinks on the writer thread, so even first-time file creation cannot stall startup.
+    pub(crate) fn with_sinks(
+        level: log::LevelFilter,
+        capacity: usize,
+        initialize: impl FnOnce() -> Vec<Box<dyn Write + Send>> + Send + 'static,
+    ) -> std::io::Result<Self> {
         let (tx, rx) = channel::bounded(capacity);
         let dropped: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
         thread::Builder::new()
             .name("logger".into())
-            .spawn(move || run_writer(rx, sinks, dropped))?;
+            .spawn(move || run_writer(rx, initialize(), dropped))?;
         Ok(Self { level, tx, dropped })
     }
 
@@ -186,6 +195,27 @@ mod tests {
                 .args(format_args!("{msg}"))
                 .build(),
         );
+    }
+
+    #[test]
+    fn sink_initialization_and_queued_records_run_on_the_writer_thread() {
+        let caller = thread::current().id();
+        let (started, worker) = channel::bounded(1);
+        let (release, wait) = channel::bounded(1);
+        let out = Shared::default();
+        let sink = out.clone();
+        let logger = AsyncLogger::with_sinks(log::LevelFilter::Debug, 16, move || {
+            started.send(thread::current().id()).unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            vec![Box::new(sink)]
+        })
+        .unwrap();
+        assert_ne!(worker.recv_timeout(Duration::from_secs(5)).unwrap(), caller);
+        // A stalled file open must not stop the caller from queuing a record.
+        record(&logger, log::Level::Info, "queued before open");
+        release.send(()).unwrap();
+        logger.flush();
+        assert!(out.text().contains("queued before open"));
     }
 
     #[test]
