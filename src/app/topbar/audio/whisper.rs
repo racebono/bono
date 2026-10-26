@@ -65,6 +65,7 @@ pub struct Whisper {
     pref_path: Arc<Utf8Path>,
     threads: NonZeroUsize,
     client: reqwest::Client,
+    files: super::ModelFiles,
 }
 
 impl Whisper {
@@ -105,6 +106,7 @@ impl Whisper {
         config: &RawConfig,
         client: reqwest::Client,
         threads: Option<NonZeroUsize>,
+        files: super::ModelFiles,
     ) -> Self {
         let pref_path = pref_path.clone();
         let threads = threads
@@ -122,6 +124,7 @@ impl Whisper {
             catalog: Self::fetch_catalog(pref_path.clone(), client.clone(), 3),
             pref_path,
             threads,
+            files,
         };
 
         if let Some(model) = config.whisper_model().clone() {
@@ -139,7 +142,7 @@ impl Whisper {
                 .get()
                 .whisper_model()
                 .as_ref()
-                .is_none_or(|path| !path.is_file())
+                .is_none_or(|path| !self.files.is_file(path))
                 || failed,
             t!("audio.speech_to_text"),
         );
@@ -421,7 +424,13 @@ impl Whisper {
             return;
         }
         let picked = config.get().whisper_model().clone();
-        let usable = picked.as_ref().is_some_and(|path| path.is_file()) && !self.failed();
+        // Wait until the picked model's file is checked before deciding to keep it
+        let on_disk = match picked.as_ref().map(|path| self.files.checked(path)) {
+            Some(None) => return,
+            Some(Some(on_disk)) => on_disk,
+            None => false,
+        };
+        let usable = on_disk && !self.failed();
         let client = self.client.clone();
         let started = self.setup_started;
         let Some(model) = self.recommended(rt) else {
@@ -461,16 +470,20 @@ impl Whisper {
         let picked = config.get().whisper_model().clone();
         let setup = self.setup;
         let failed = self.failed();
+        let unusable = failed
+            || picked
+                .as_ref()
+                .is_none_or(|picked| !self.files.is_file(picked));
         let model = match self.catalog.update(rt) {
-            None => return picked.is_none().then_some(SetupItem::Loading),
-            Some(None) => return picked.is_none().then_some(SetupItem::Unavailable),
+            None => return unusable.then_some(SetupItem::Loading),
+            Some(None) => return unusable.then_some(SetupItem::Unavailable),
             Some(Some(catalog)) => catalog.iter().find(|model| model.file == RECOMMENDED)?,
         };
         if !setup
             && !failed
             && picked
                 .as_ref()
-                .is_some_and(|picked| *picked != model.path && picked.is_file())
+                .is_some_and(|picked| *picked != model.path && self.files.is_file(picked))
         {
             return None;
         }

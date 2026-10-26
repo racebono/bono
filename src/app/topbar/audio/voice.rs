@@ -51,6 +51,7 @@ pub struct Voices {
     /// The setup's download was started: one that fails isn't started again until it's asked
     /// for again
     setup_started: bool,
+    files: super::ModelFiles,
 }
 
 impl Voices {
@@ -86,13 +87,18 @@ impl Voices {
         }
     }
 
-    pub fn new(pref_path: &Arc<Utf8Path>, client: reqwest::Client) -> Self {
+    pub fn new(
+        pref_path: &Arc<Utf8Path>,
+        client: reqwest::Client,
+        files: super::ModelFiles,
+    ) -> Self {
         let pref_path = pref_path.clone();
 
         return Self {
             client: client.clone(),
             setup: None,
             setup_started: false,
+            files,
             catalog: Self::fetch_catalog(pref_path.clone(), client.clone(), 3),
             pref_path,
         };
@@ -113,9 +119,17 @@ impl Voices {
             return;
         };
 
-        if picked.as_ref().is_some_and(|path| {
-            super::voice_on_disk(path) && (!self.setup_started || path.as_path() != &*voice.path)
-        }) {
+        // Wait until the picked voice's files are checked before deciding to keep it
+        let on_disk = match picked.as_ref().map(|path| self.files.voice_checked(path)) {
+            Some(None) => return,
+            Some(Some(on_disk)) => on_disk,
+            None => false,
+        };
+        if on_disk
+            && picked
+                .as_ref()
+                .is_some_and(|path| !self.setup_started || path.as_path() != &*voice.path)
+        {
             self.setup = None;
             return;
         }
@@ -151,14 +165,17 @@ impl Voices {
     pub fn setup_item(&mut self, rt: &Handle, config: &Config, locale: &str) -> Option<SetupItem> {
         let (lang, name) = self.setup.or_else(|| recommended(locale))?;
         let picked = config.get().voices().get(&lang).cloned();
+        let unusable = picked
+            .as_ref()
+            .is_none_or(|picked| !self.files.voice(picked));
         let catalog = match self.catalog.update(rt) {
-            None => return picked.is_none().then_some(SetupItem::Loading),
-            Some(None) => return picked.is_none().then_some(SetupItem::Unavailable),
+            None => return unusable.then_some(SetupItem::Loading),
+            Some(None) => return unusable.then_some(SetupItem::Unavailable),
             Some(Some(catalog)) => catalog,
         };
         let voice = find(&mut catalog.languages, lang, name)?;
         if self.setup.is_none()
-            && picked.is_some_and(|picked| picked != *voice.path && super::voice_on_disk(&picked))
+            && picked.is_some_and(|picked| picked != *voice.path && self.files.voice(&picked))
         {
             return None;
         }
@@ -189,7 +206,11 @@ impl Voices {
         let failed = matches!(self.catalog, MaybeDone::Done(None));
         if pending || failed {
             ui.menu_button(
-                setup_label(config.get().voices().is_empty(), t!("audio.text_to_speech")),
+                setup_label(
+                    config.get().voices().is_empty()
+                        || (config.get().voices().values()).any(|path| !self.files.voice(path)),
+                    t!("audio.text_to_speech"),
+                ),
                 |ui| {
                     if ui
                         .add_enabled(failed, egui::Button::new(t!("onboarding.retry")))
@@ -216,7 +237,7 @@ impl Voices {
                 .get()
                 .voices()
                 .values()
-                .any(|path| !super::voice_on_disk(path));
+                .any(|path| !self.files.voice(path));
         let locale = config.get().locale().clone();
         let suggested = ArrayStr::<2>::from_str(locale.split('-').next().unwrap_or_default());
 
