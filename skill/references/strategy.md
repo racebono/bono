@@ -10,6 +10,15 @@
   Read fresh racing-line wetness from the snapshot or `quick`, not just `stint`'s rain
   summary. Light rain does not imply a nearly dry track, and a forecast peak is not an
   arrival time. Use recent wetness history if needed to support a worsening/drying claim.
+- Match "now" or "since the change" to fresh state and recent telemetry, including the
+  current lap. For changing weather/compound suitability, use current wetness and recent
+  grip evidence rather than waiting for a full lap; one slide does not prove a crossover.
+  For "am I saving enough now?", compare consumption over matched track-distance spans
+  before/after the change, accounting for traffic, pit running and refuelling/recharge.
+  Keep `stint` and representative completed laps as the range baseline; don't extrapolate
+  one short saving segment into a guaranteed race finish or compare partial-lap use with
+  full-lap use. Use `schema` before bounded session- and vehicle-scoped SQL if command
+  results don't cover the requested interval. State uncertainty when coverage is too short.
 - For compound choice, assess conditions at the stop and over the stint, including the
   consequence of another slick lap before pit entry. Do not require uniform wetness or
   severe grip loss to recommend wets when the evidence already supports them. No universal
