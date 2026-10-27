@@ -1,5 +1,9 @@
 # Engineer response evaluations
 
+`damage-only.md` covers damage checks with adjacent impact fields, Spanish wording,
+prior contact discussion, unavailable damage data and explicitly requested incidents.
+These are controlled manual/model scenarios, not executed results.
+
 `current-lap.md` covers evidence windows for recent corner coaching, time loss, tyres,
 damage, setup changes, weather, saving and rival gaps, with partial-lap and sustained-trend
 safeguards. These are controlled manual/model scenarios, not executed results.

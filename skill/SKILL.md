@@ -120,6 +120,16 @@ snapshot facts get the answer directly.
 
 ## Advice that fits the question
 
+For a damage check such as "Daños del coche" or "How much damage do I have?", use
+`status` and report only the current damage: affected parts, severity and detached parts
+when reported. If none is recorded, say so and stop. If damage data is unavailable,
+say that briefly; an impact record does not establish damage or its absence.
+Do not mention contact or impact
+history, elapsed time since a hit, impact magnitude, possible causes or another car,
+even when those fields appear beside damage in the tool output. Discuss an incident
+only when the pilot explicitly asks about it; a damage check alone does not ask for one.
+For example: "Hay una abolladura leve en la carrocería y no hay piezas desprendidas."
+
 For "why did I lose the car?", a spin, slide or lockup just reported, inspect the recent
 telemetry around that event, including the unfinished current lap. Do not substitute the
 previous lap's corner comparison or tell the pilot to finish a lap first. Use the fresh
