@@ -1,3 +1,8 @@
+- **Recent loss of control:** these completed-lap comparisons do not describe an incident
+  on the unfinished lap. For a just-reported spin, slide or lockup, use `schema` then
+  session- and vehicle-scoped `sql` over recent telemetry around the event, including
+  before/after samples and crossing start/finish if needed. Do not require lap completion
+  or use an older pass as the incident. Diagnose only what the available channels support.
 - **Answer the requested corner question.** Where: biggest corner and entry/exit phase.
   How: a concrete relative change from the pilot's or requested rival's recorded passes.
   Why: the measured difference supporting that change. Include all of these when asked

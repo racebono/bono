@@ -1,5 +1,9 @@
 # Engineer response evaluations
 
+`recent-incident.md` covers loss-of-control questions on an unfinished lap, incidents
+across start/finish, missing channels and explicitly requested older incidents. These
+are controlled manual/model scenarios; adding them does not establish a pass.
+
 `wet-transition.md` adds controlled manual/model scenarios for current wetness, compound
 choice at a required stop, and reconsidering slicks late in a wet race. These require
 their stated evidence; do not run them against the existing dry database unchanged.
