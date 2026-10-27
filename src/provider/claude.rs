@@ -393,12 +393,20 @@ impl Conversation {
             .map(|(index, _)| index)
             .collect();
         let recent = starts.iter().rev().nth(3).copied().unwrap_or(0);
-        for message in &mut self.body.messages[0..recent] {
+        let mut first_edit = None;
+        for (index, message) in self.body.messages[0..recent].iter_mut().enumerate() {
             if message.role == "user" {
                 if let Some(text) = message.content.as_str() {
-                    message.content = serde_json::Value::String(strip_snapshot(text));
+                    let stripped = strip_snapshot(text);
+                    if stripped != text {
+                        message.content = serde_json::Value::String(stripped);
+                        first_edit.get_or_insert(index);
+                    }
                 }
             }
+        }
+        if let Some(index) = first_edit {
+            clear_thinking(&mut self.body.messages, index);
         }
         while size(self)? > (limits.max_bytes as f64 * target) as usize
             || self.body.messages.len() + 1 > (limits.max_messages as f64 * target) as usize
@@ -413,6 +421,7 @@ impl Conversation {
                 .map(|(index, _)| index);
             let Some(next) = next else { break };
             self.body.messages.drain(0..next);
+            clear_thinking(&mut self.body.messages, 0);
         }
         log::info!(
             "Bono Cloud: forgot {} older messages to stay within limits",
@@ -760,6 +769,28 @@ impl Conversation {
         let lease = self.lease_source.as_ref().map_or(0, |_| LEASE);
         Ok(serde_json::to_vec(&self.leased_request(None))?.len() + lease)
     }
+}
+
+/// A prefix edit invalidates thinking from that point onward, including redacted thinking.
+/// Called only between complete driver turns; tool calls and results are left untouched.
+fn clear_thinking(messages: &mut Vec<RequestMessage>, from: usize) {
+    let mut index = 0;
+    messages.retain_mut(|message| {
+        let affected = index >= from;
+        index += 1;
+        if affected && message.role == "assistant" {
+            if let Some(content) = message.content.as_array_mut() {
+                content.retain(|block| {
+                    !matches!(
+                        block["type"].as_str(),
+                        Some("thinking" | "redacted_thinking")
+                    )
+                });
+                return !content.is_empty();
+            }
+        }
+        true
+    });
 }
 
 /// Undoes a turn's changes to the history unless it's kept: on an error, a refusal, or the
@@ -1880,7 +1911,7 @@ mod tests {
     }
 
     #[test]
-    fn trims_complete_turns_and_keeps_signed_thinking() {
+    fn trims_complete_turns_and_clears_incompatible_thinking() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut conversation = conversation("http://localhost", &calls);
         conversation.history_limits = Some(HistoryLimits {
@@ -1898,6 +1929,7 @@ mod tests {
                     role: "assistant",
                     content: json!([
                         {"type": "thinking", "thinking": "thought", "signature": "signed"},
+                        {"type": "redacted_thinking", "data": "hidden"},
                         {"type": "tool_use", "id": "call", "name": "lookup", "input": {}}
                     ]),
                 },
@@ -1913,7 +1945,8 @@ mod tests {
                 },
             ]);
         }
-        let newest = serde_json::to_value(&conversation.body.messages[16..]).unwrap();
+        let mut newest = serde_json::to_value(&conversation.body.messages[16..]).unwrap();
+        newest[1]["content"].as_array_mut().unwrap().drain(0..2);
         conversation.prepare_history("Next?", 0.5).unwrap();
         assert_eq!(
             serde_json::to_value(&conversation.body.messages).unwrap(),
@@ -1923,6 +1956,66 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&conversation.body.messages).unwrap(),
             newest
+        );
+    }
+
+    #[test]
+    fn snapshot_edit_preserves_earlier_thinking_and_removes_empty_assistants() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation("http://localhost", &calls);
+        conversation.history_limits = Some(HistoryLimits {
+            max_bytes: 100_000,
+            max_messages: 100,
+            target: 0.5,
+        });
+        for index in 0..6 {
+            conversation.body.messages.extend([
+                RequestMessage {
+                    role: "user",
+                    content: json!(if index == 1 {
+                        "Question [BEGIN UNTRUSTED TELEMETRY SNAPSHOT]old[END UNTRUSTED TELEMETRY SNAPSHOT]"
+                    } else {
+                        "Question"
+                    }),
+                },
+                RequestMessage {
+                    role: "assistant",
+                    content: json!([
+                        {"type": "thinking", "thinking": "", "signature": "signed"},
+                        {"type": "redacted_thinking", "data": "hidden"}
+                    ]),
+                },
+            ]);
+        }
+        let original = serde_json::to_value(&conversation.body.messages).unwrap();
+        // No trim must preserve everything, including empty thinking text.
+        conversation.prepare_history("Next?", 0.5).unwrap();
+        assert_eq!(
+            serde_json::to_value(&conversation.body.messages).unwrap(),
+            original
+        );
+        // Force preparation without forcing whole-turn removal.
+        conversation.prepare_history("Next?", 0.25).unwrap();
+        let messages = serde_json::to_value(&conversation.body.messages).unwrap();
+        assert_eq!(
+            &messages.as_array().unwrap()[..2],
+            &original.as_array().unwrap()[..2]
+        );
+        assert_eq!(
+            messages[2]["content"],
+            "Question [telemetry snapshot omitted]"
+        );
+        assert_eq!(messages.as_array().unwrap().len(), 7);
+        assert!(
+            messages.as_array().unwrap()[3..]
+                .iter()
+                .all(|message| message["role"] == "user")
+        );
+        let cleaned = messages;
+        conversation.prepare_history("Next?", 0.25).unwrap();
+        assert_eq!(
+            serde_json::to_value(&conversation.body.messages).unwrap(),
+            cleaned
         );
     }
 
@@ -1954,6 +2047,192 @@ mod tests {
             serde_json::to_value(&conversation.body.messages[4..]).unwrap(),
             recent
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_trims_preserve_live_tool_loops_and_new_thinking() {
+        let signed = json!([
+            {"type": "thinking", "thinking": "", "signature": "signed"},
+            {"type": "redacted_thinking", "data": "hidden"},
+            {"type": "tool_use", "id": "call", "name": "lookup", "input": {}}
+        ]);
+        let answer = json!([
+            {"type": "thinking", "thinking": "", "signature": "answer-signature"},
+            {"type": "text", "text": "Answer"}
+        ]);
+        let responses = (0..12)
+            .flat_map(|_| {
+                [
+                    message("tool_use", signed.clone()),
+                    message("end_turn", answer.clone()),
+                ]
+            })
+            .collect();
+        let (url, requests) = mock(responses).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+        conversation.history_limits = Some(HistoryLimits {
+            max_bytes: 100_000,
+            max_messages: 9,
+            target: 0.5,
+        });
+        for _ in 0..12 {
+            assert_eq!(
+                send(&mut conversation, "Next?").await.unwrap().text,
+                "Answer"
+            );
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 12);
+        let requests = requests.lock().unwrap();
+        let mut trims = 0;
+        for (index, pair) in requests.chunks_exact(2).enumerate() {
+            let first = pair[0]["messages"].as_array().unwrap();
+            let live = pair[1]["messages"].as_array().unwrap();
+            assert_eq!(&live[..first.len()], first);
+            assert_eq!(live[first.len()]["content"], signed);
+            assert_eq!(live[first.len() + 1]["content"][0]["tool_use_id"], "call");
+            if index > 0 {
+                let previous = requests[index * 2 - 1]["messages"].as_array().unwrap();
+                if first.len() < previous.len() + 2 {
+                    trims += 1;
+                    assert!(first.iter().filter(|m| m["role"] == "assistant").all(|m| {
+                        m["content"].as_array().unwrap().iter().all(|block| {
+                            !matches!(
+                                block["type"].as_str(),
+                                Some("thinking" | "redacted_thinking")
+                            )
+                        })
+                    }));
+                } else {
+                    assert_eq!(&first[..previous.len()], previous);
+                    assert_eq!(first[previous.len()]["content"], answer);
+                }
+            }
+        }
+        assert!(trims >= 3);
+    }
+
+    #[tokio::test]
+    async fn trimmed_turn_rolls_back_on_error_refusal_and_cancellation() {
+        for failure in ["error", "refusal", "cancel"] {
+            let responses = match failure {
+                "error" => vec![(
+                    400,
+                    "",
+                    json!({"error": {"type": "invalid_request_error", "message": "invalid"}}),
+                )],
+                "refusal" => vec![message("refusal", json!([{"type": "text", "text": "No."}]))],
+                _ => vec![],
+            };
+            let (url, _) = mock(responses).await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut conversation = conversation(&url, &calls);
+            conversation.history_limits = Some(HistoryLimits {
+                max_bytes: 100_000,
+                max_messages: 4,
+                target: 0.5,
+            });
+            for _ in 0..2 {
+                conversation.body.messages.extend([
+                    RequestMessage {
+                        role: "user",
+                        content: json!("Old question"),
+                    },
+                    RequestMessage {
+                        role: "assistant",
+                        content: json!([
+                            {"type": "thinking", "thinking": "", "signature": "signed"},
+                            {"type": "text", "text": "Old answer"}
+                        ]),
+                    },
+                ]);
+            }
+            let original = serde_json::to_value(&conversation.body.messages).unwrap();
+            if failure == "cancel" {
+                assert!(
+                    timeout(
+                        Duration::from_millis(100),
+                        conversation.send("Next?".into())
+                    )
+                    .await
+                    .is_err()
+                );
+            } else {
+                let result = send(&mut conversation, "Next?").await;
+                if failure == "error" {
+                    assert!(result.is_err());
+                } else {
+                    assert_eq!(result.unwrap().stop, StopReason::Refusal);
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(&conversation.body.messages).unwrap(),
+                original,
+                "{failure}"
+            );
+            let (url, requests) = mock(vec![message(
+                "end_turn",
+                json!([{"type": "text", "text": "Recovered"}]),
+            )])
+            .await;
+            conversation.base_url = url;
+            assert_eq!(
+                send(&mut conversation, "Again?").await.unwrap().text,
+                "Recovered"
+            );
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                requests[0]["messages"][1]["content"],
+                json!([{"type": "text", "text": "Old answer"}])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn aggressive_trim_clears_thinking_before_retry() {
+        let (url, requests) = mock(vec![
+            (413, "", json!({"error": {"type": "request_too_large"}})),
+            message("end_turn", json!([{"type": "text", "text": "Answer"}])),
+        ])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+        conversation.history_limits = Some(HistoryLimits {
+            max_bytes: 100_000,
+            max_messages: 20,
+            target: 0.5,
+        });
+        for _ in 0..6 {
+            conversation.body.messages.extend([
+                RequestMessage {
+                    role: "user",
+                    content: json!("Old question"),
+                },
+                RequestMessage {
+                    role: "assistant",
+                    content: json!([
+                        {"type": "thinking", "thinking": "", "signature": "signed"},
+                        {"type": "redacted_thinking", "data": "hidden"},
+                        {"type": "text", "text": "Old answer"}
+                    ]),
+                },
+            ]);
+        }
+        assert_eq!(
+            send(&mut conversation, "Next?").await.unwrap().text,
+            "Answer"
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["messages"][1]["content"][0]["type"], "thinking");
+        let retried = requests[1]["messages"].as_array().unwrap();
+        assert_eq!(retried.len(), 5);
+        for assistant in retried.iter().filter(|m| m["role"] == "assistant") {
+            assert_eq!(
+                assistant["content"],
+                json!([{"type": "text", "text": "Old answer"}])
+            );
+        }
     }
 
     #[tokio::test]
