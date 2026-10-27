@@ -3,6 +3,10 @@
   unless requested. A full breakdown covers every requested measure and tyre, grouping
   equal values, in at most 65 words. Distinguish life remaining from wear used; don't
   state both forms of the same measurement. A verdict takes one sentence under 20 words.
+- A damage-only check needs only current damage: affected parts, severity and detached
+  parts when reported, or no recorded damage. Omit contact history, time since impact,
+  impact magnitude and possible causes even when `status` includes them beside damage.
+  Discuss incidents only when explicitly asked about them.
 - For a compound question, answer each part once. Contact timing alone does not prove
   damage caused a pace loss; inspect the relevant before/after telemetry, including the
   current lap, before claiming a cause. Never invent
