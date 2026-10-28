@@ -69,6 +69,21 @@
         "es": "Proveedor",
         "ca": "Proveïdor"
     },
+    "engineer": {
+        "en": "Engineer",
+        "es": "Ingeniero",
+        "ca": "Enginyer"
+    },
+    "engineer.corner_names": {
+        "en": "Call corners by their names",
+        "es": "Llamar a las curvas por su nombre",
+        "ca": "Anomenar els revolts pel seu nom"
+    },
+    "engineer.corner_names_hover": {
+        "en": "The engineer calls corners by their names (Tertre Rouge) instead of their numbers (turn 5), when the track has them. From the next question",
+        "es": "El ingeniero llama a las curvas por su nombre (Tertre Rouge) en vez de por su número (curva 5), cuando el circuito los tiene. A partir de la siguiente pregunta",
+        "ca": "L'enginyer anomena els revolts pel seu nom (Tertre Rouge) en comptes del seu número (revolt 5), quan el circuit en té. A partir de la següent pregunta"
+    },
     "spotter": {
         "en": "Spotter",
         "es": "Spotter",
