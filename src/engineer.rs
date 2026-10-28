@@ -954,7 +954,8 @@ impl Engineer {
 
 /// How the engineer calls corners: by number unless the pilot asked for their names
 const CORNERS_BY_NUMBER: &str = "Call corners by their number (\"turn 5\"), not their name, even \
-     when the track data has one, unless the pilot named the corner first.";
+     when the track data has one, unless the pilot named the corner first. If the pilot asks \
+     what a corner is called, tell them its name.";
 const CORNERS_BY_NAME: &str = "Call corners by their name (\"Tertre Rouge\") when the track data \
      has one, and by their number (\"turn 5\") only when it doesn't.";
 
