@@ -2,9 +2,9 @@ use crate::{
     app::{
         Subsystems,
         topbar::{
-            account::AccountTopbar, audio::AudioTopbar, provider::ProviderTopbar,
-            settings::SettingsTopbar, simulators::SimulatorsTopbar, spotter::SpotterTopbar,
-            volume::VolumeTopbar,
+            account::AccountTopbar, audio::AudioTopbar, engineer::EngineerTopbar,
+            provider::ProviderTopbar, settings::SettingsTopbar, simulators::SimulatorsTopbar,
+            spotter::SpotterTopbar, volume::VolumeTopbar,
         },
     },
     config::{Config, RawConfig, Setting},
@@ -23,6 +23,7 @@ use tokio::runtime::Handle;
 
 pub(super) mod account;
 pub(super) mod audio;
+mod engineer;
 mod provider;
 pub(super) mod settings;
 pub(super) mod simulators;
@@ -35,6 +36,7 @@ pub struct Topbar {
     pub audio: AudioTopbar,
     volume: VolumeTopbar,
     pub provider: ProviderTopbar,
+    engineer: EngineerTopbar,
     spotter: SpotterTopbar,
     simulators: SimulatorsTopbar,
     /// "Clear data" was clicked: asking before clearing
@@ -54,6 +56,7 @@ impl Topbar {
             settings: SettingsTopbar::default(),
             volume: VolumeTopbar,
             provider: ProviderTopbar::new(client, account),
+            engineer: EngineerTopbar,
             spotter: SpotterTopbar,
             simulators: SimulatorsTopbar::default(),
             confirm_clear: false,
@@ -118,6 +121,12 @@ impl Topbar {
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
                     .ui(ui, |ui| self.provider.update(rt, ui, config));
+
+                MenuButton::new(t!("engineer"))
+                    .config(
+                        MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
+                    )
+                    .ui(ui, |ui| self.engineer.update(ui, config));
 
                 MenuButton::new(t!("spotter"))
                     .config(

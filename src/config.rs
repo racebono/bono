@@ -286,6 +286,9 @@ settings! {
         pub spotter_volume: f32 = 1.0,
         pub beep_volume: f32 = 1.0,
         pub auto_session: bool = true,
+        /// Whether the engineer calls corners by their names (Tertre Rouge) rather than their
+        /// numbers (turn 5)
+        pub corner_names: bool = false,
         pub opponent_frequency: NonZeroU32 = NonZeroU32::new(5).unwrap(),
         /// Changed with `set_voice`, which loads the voice too
         voices: BTreeMap<ArrayStr<2>, Utf8PathBuf> = BTreeMap::new(),

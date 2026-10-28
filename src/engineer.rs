@@ -204,6 +204,9 @@ struct Session {
     db: PathBuf,
     /// The model settings it was started with: changing them starts over
     model: ModelConfig,
+    /// Whether corners are called by their names: the system prompt says how, so changing it
+    /// starts over too
+    corner_names: bool,
     /// The account's user id, when the conversation is the account's (Bono Cloud's): it ends
     /// once that account signs out
     user: Option<String>,
@@ -462,10 +465,18 @@ impl Engineer {
             .session
             .as_ref()
             .is_some_and(|s| s.model != config.get().model);
+        let corners_changed = self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.corner_names != *config.get().corner_names());
         if model_changed {
             self.notice(t!("engineer.new_model"));
         }
-        if self.new_session || model_changed || self.session.as_ref().is_none_or(|s| s.db != db) {
+        if self.new_session
+            || model_changed
+            || corners_changed
+            || self.session.as_ref().is_none_or(|s| s.db != db)
+        {
             match self.start(config, sim, pool) {
                 Ok(session) => self.session = Some(session),
                 Err(e) => {
@@ -885,6 +896,7 @@ impl Engineer {
             tool.clone(),
         );
         let model = config.get().model.clone();
+        let corner_names = *config.get().corner_names();
         // Taken before the conversation: if the account signs out meanwhile, it ends next frame
         let user = match model.provider() {
             ModelProvider::BonoCloud => match self.account.as_ref().map(Account::status) {
@@ -896,7 +908,7 @@ impl Engineer {
         let conversation = provider::conversation(
             &model,
             self.account.as_ref(),
-            self.skill.clone(),
+            system_prompt(&self.skill, corner_names),
             tools,
             self.client.clone(),
         )?;
@@ -906,6 +918,7 @@ impl Engineer {
         Ok(Session {
             db,
             model,
+            corner_names,
             user,
             lease: conversation.lease(),
             state: Arc::new(Mutex::new(SessionState {
@@ -937,6 +950,21 @@ impl Engineer {
             drop(session);
         })
     }
+}
+
+/// How the engineer calls corners: by number unless the pilot asked for their names
+const CORNERS_BY_NUMBER: &str = "Call corners by their number (\"turn 5\"), not their name, even \
+     when the track data has one, unless the pilot named the corner first.";
+const CORNERS_BY_NAME: &str = "Call corners by their name (\"Tertre Rouge\") when the track data \
+     has one, and by their number (\"turn 5\") only when it doesn't.";
+
+/// The skill's instructions with how to call corners.
+fn system_prompt(skill: &str, corner_names: bool) -> Arc<str> {
+    let corners = match corner_names {
+        true => CORNERS_BY_NAME,
+        false => CORNERS_BY_NUMBER,
+    };
+    format!("{skill}\n\n## Corners\n\n{corners}\n").into()
 }
 
 impl SessionState {
