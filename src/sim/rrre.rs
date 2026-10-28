@@ -507,9 +507,11 @@ struct Converter {
 #[derive(Clone, Copy, Default)]
 struct LapState {
     lap: i32,
-    /// When the lap started: set once, from the first read whose timer belongs to this lap
+    /// When the lap started: from the first read whose timer belongs to this lap
     start: Option<f64>,
-    /// When the lap before started
+    /// A later read agreed with `start`: a single mixed read can't have set it
+    confirmed: bool,
+    /// When the lap before started, if it was confirmed
     previous_start: Option<f64>,
 }
 
@@ -532,18 +534,29 @@ impl LapState {
     ) -> (Option<f64>, Option<bool>) {
         if lap != self.lap {
             // A lap back is another session: nothing before it counts
-            let previous_start = if lap > self.lap { self.start } else { None };
+            let previous_start = (lap > self.lap && self.confirmed)
+                .then_some(self.start)
+                .flatten();
             *self = LapState {
                 lap,
-                start: None,
                 previous_start,
+                ..LapState::default()
             };
         }
-        if self.start.is_none() {
-            self.start = into_lap.map(|into_lap| time - into_lap).filter(|start| {
-                self.previous_start
-                    .is_none_or(|previous| *start > previous + LAP_START_MIN_GAP)
-            });
+        let candidate = into_lap.map(|into_lap| time - into_lap).filter(|start| {
+            self.previous_start
+                .is_none_or(|previous| *start > previous + LAP_START_MIN_GAP)
+        });
+        if !self.confirmed
+            && let Some(candidate) = candidate
+        {
+            // Agreeing reads confirm it; a disagreeing one replaces an unconfirmed start
+            match self.start {
+                Some(start) if (candidate - start).abs() <= LAP_START_MIN_GAP => {
+                    self.confirmed = true
+                }
+                _ => self.start = Some(candidate),
+            }
         }
         // Until the timer is this lap's, and a moment after, the flag can still be the last lap's
         let settled = self
@@ -1892,7 +1905,8 @@ mod tests {
             )
         };
 
-        // Lap 3 started at 400 and went invalid
+        // Lap 3 started at 400 (two reads agree) and went invalid
+        assert_eq!(read(499.0, 3, 99.0, 0), (Some(3), Some(400.0), Some(true)));
         assert_eq!(read(500.0, 3, 100.0, 0), (Some(3), Some(400.0), Some(true)));
         // The timer resets before the count: still lap 3, still started at 400
         assert_eq!(read(500.1, 3, 0.05, 0), (Some(3), Some(400.0), Some(true)));
@@ -1906,6 +1920,12 @@ mod tests {
         assert_eq!(read(530.0, 4, 29.9, 1), (Some(4), Some(500.05), Some(false)));
         // The clock going back is a restart: its first lap starts over
         assert_eq!(read(10.0, 0, 5.0, 1), (Some(0), Some(5.0), Some(false)));
+
+        // A mixed first read (lap 0's count, lap 1's reset timer) isn't confirmed, so it doesn't
+        // hold back lap 1's real start
+        assert_eq!(read(20.0, 0, 0.5, 1).1, Some(19.5));
+        assert_eq!(read(20.25, 1, 0.75, 1).1, Some(19.5));
+        assert_eq!(read(30.0, 1, 10.5, 1), (Some(1), Some(19.5), Some(false)));
     }
 
     #[test]
