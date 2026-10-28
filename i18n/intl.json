@@ -680,6 +680,16 @@
         "es": "Cuánta seguridad necesita sobre el idioma en el que hablaste, entre los que tienen voz. Con menos seguridad en todos, lo que dijiste se ignora (p. ej. ruido)",
         "ca": "Quanta seguretat necessita sobre l'idioma en què has parlat, entre els que tenen veu. Amb menys seguretat en tots, el que has dit s'ignora (p. ex. soroll)"
     },
+    "audio.whisper_gpu": {
+        "en": "Use the GPU",
+        "es": "Usar la GPU",
+        "ca": "Fer servir la GPU"
+    },
+    "audio.whisper_gpu_hover": {
+        "en": "Speech to text runs on the graphics card, which is quicker unless the simulator keeps it busy. Off, it runs on the processor",
+        "es": "La voz a texto se ejecuta en la tarjeta gráfica, que es más rápida salvo que el simulador la tenga ocupada. Desactivado, se ejecuta en el procesador",
+        "ca": "La veu a text s'executa a la targeta gràfica, que és més ràpida tret que el simulador la tingui ocupada. Desactivat, s'executa al processador"
+    },
     "audio.model": {
         "en": "Model",
         "es": "Modelo",

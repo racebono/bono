@@ -293,6 +293,9 @@ settings! {
         /// Changed with `set_voice`, which loads the voice too
         voices: BTreeMap<ArrayStr<2>, Utf8PathBuf> = BTreeMap::new(),
         pub whisper_model: Option<Arc<Utf8Path>> = None,
+        /// Whether speech to text runs on the GPU, when Bono was built with a GPU backend. Off, it
+        /// stays off the GPU the simulator renders on
+        pub whisper_gpu: bool = true,
         pub text_scale: f32 = 1.3,
         pub min_confidence: f32 = 0.1,
         /// The setup guide's version the pilot last finished (or skipped): an older one shows it
