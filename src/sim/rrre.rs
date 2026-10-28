@@ -517,6 +517,9 @@ struct LapState {
 /// lap's timer, not yet reset).
 const LAP_START_MIN_GAP: f64 = 1.0;
 
+/// How long into a lap its validity flag can still be the last lap's.
+const LAP_VALIDITY_GRACE: f64 = 0.5;
+
 impl LapState {
     /// The lap's start and whether it's invalid, given a read of `lap`, its timer `into_lap` and
     /// its `invalid` flag at `time`.
@@ -542,8 +545,11 @@ impl LapState {
                     .is_none_or(|previous| *start > previous + LAP_START_MIN_GAP)
             });
         }
-        // Until the timer is this lap's, the flag can still be the last lap's
-        (self.start, self.start.and(invalid))
+        // Until the timer is this lap's, and a moment after, the flag can still be the last lap's
+        let settled = self
+            .start
+            .is_some_and(|start| time - start >= LAP_VALIDITY_GRACE);
+        (self.start, invalid.filter(|_| settled))
     }
 }
 
@@ -1892,8 +1898,10 @@ mod tests {
         assert_eq!(read(500.1, 3, 0.05, 0), (Some(3), Some(400.0), Some(true)));
         // The count before the timer and the flag: lap 4's start and validity aren't known yet
         assert_eq!(read(500.2, 4, 100.2, 0), (Some(4), None, None));
-        // Lap 4's own timer and flag
-        assert_eq!(read(500.3, 4, 0.25, 1), (Some(4), Some(500.05), Some(false)));
+        // Lap 4's own timer, but lap 3's flag still: not trusted yet
+        assert_eq!(read(500.3, 4, 0.25, 0), (Some(4), Some(500.05), None));
+        // Lap 4's own flag
+        assert_eq!(read(501.0, 4, 0.95, 1), (Some(4), Some(500.05), Some(false)));
         // Held for the rest of the lap, whatever the timer jitters to
         assert_eq!(read(530.0, 4, 29.9, 1), (Some(4), Some(500.05), Some(false)));
         // The clock going back is a restart: its first lap starts over
