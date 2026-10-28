@@ -393,12 +393,14 @@ impl Whisper {
             // while the microphone records, and `finish` waits for it there
             let (send_session, session) = oneshot::channel();
             let threads = self.threads;
+            let gpu = GPU_BACKEND && self.loaded_gpu;
             // Detached: this crate's `spawn_blocking` handle would cancel it once dropped
             rt.spawn_blocking(move || {
                 let start = Instant::now();
                 let session = ctx.create_state().map(|state| WhisperSession {
                     state,
                     threads,
+                    gpu,
                     multilingual: ctx.is_multilingual(),
                 });
                 log::debug!("Created whisper's state in {:?}", start.elapsed());
@@ -706,6 +708,8 @@ impl PendingSession {
 pub struct WhisperSession {
     state: WhisperState,
     threads: NonZeroUsize,
+    /// Whether the model was loaded to run on the GPU
+    gpu: bool,
     multilingual: bool,
 }
 
@@ -820,9 +824,14 @@ impl WhisperSession {
 
     /// What was said in `lang`: empty if it's no words.
     fn speech_to_text(&mut self, lang: ArrayStr<2>) -> anyhow::Result<String> {
-        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
-            beam_size: 5,
-            patience: -1.0,
+        // Beam search is more accurate, but several times the work: on the CPU, that's seconds
+        let mut params = FullParams::new(if self.gpu {
+            SamplingStrategy::BeamSearch {
+                beam_size: 5,
+                patience: -1.0,
+            }
+        } else {
+            SamplingStrategy::Greedy { best_of: 1 }
         });
 
         params.set_n_threads(c_int::try_from(self.threads.get()).unwrap_or(c_int::MAX));
@@ -1408,6 +1417,7 @@ mod tests {
             let mut session = WhisperSession {
                 state: ctx.create_state().unwrap(),
                 threads,
+                gpu: GPU_BACKEND,
                 multilingual: ctx.is_multilingual(),
             };
             session.state.pcm_to_mel(&samples, threads.get()).unwrap();
