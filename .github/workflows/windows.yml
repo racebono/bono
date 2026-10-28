@@ -207,7 +207,7 @@ jobs:
                   $date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
                   $tag = "nightly-$date-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
                   $notes = "Windows x86-64 nightly build from commit $env:BUILD_SHA.`n`nWorkflow: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
-                  gh release create "$tag" bono-windows-x86_64.zip --target "$env:BUILD_SHA" --title "Nightly $date ($env:GITHUB_RUN_ID.$env:GITHUB_RUN_ATTEMPT)" --notes "$notes" --prerelease --latest=false
+                  gh release create "$tag" bono-windows-x86_64.zip --target "$env:BUILD_SHA" --title "Nightly $date ($env:GITHUB_RUN_ID.$env:GITHUB_RUN_ATTEMPT)" --notes "$notes" --generate-notes --prerelease --latest=false
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                   "tag=$tag" >> $env:GITHUB_OUTPUT
 
