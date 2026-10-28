@@ -4502,6 +4502,9 @@ fn cmd_tyres(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
     for w in 0..4 {
         let part = |k: usize| {
             let total = build.total[k][w];
+            if build.net[k][w].is_none() {
+                return "no data".to_owned();
+            }
             if total <= 0.0 {
                 return "no rise".to_owned();
             }
