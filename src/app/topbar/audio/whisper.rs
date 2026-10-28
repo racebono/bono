@@ -44,6 +44,15 @@ pub const RECORDING_SPEC: AudioSpec = AudioSpec {
     format: Some(AudioFormat::f32_sys()),
 };
 
+/// Whether Bono was built with a backend that runs whisper on a GPU
+const GPU_BACKEND: bool = cfg!(any(
+    feature = "cuda",
+    feature = "hipblas",
+    feature = "intel-sycl",
+    feature = "vulkan",
+    target_vendor = "apple"
+));
+
 /// The model the setup guide downloads: it understands every language, and is quick on a GPU
 const RECOMMENDED: &str = "ggml-large-v3-turbo-q5_0.bin";
 
@@ -52,6 +61,8 @@ pub struct Whisper {
     ctx: Option<MaybeDone<Option<Arc<WhisperContext>>>>,
     /// The model `ctx` is loaded from
     loaded: Option<Arc<Utf8Path>>,
+    /// Whether `ctx` was loaded to run on the GPU
+    loaded_gpu: bool,
     /// The setup guide asked for the recommended model: it's downloaded, then used once it's on
     /// disk (unless another was picked meanwhile)
     setup: bool,
@@ -121,6 +132,7 @@ impl Whisper {
             client: client.clone(),
             ctx: None,
             loaded: None,
+            loaded_gpu: *config.whisper_gpu(),
             setup: false,
             setup_started: false,
             replace_since: None,
@@ -133,7 +145,7 @@ impl Whisper {
         };
 
         if let Some(model) = config.whisper_model().clone() {
-            this.set_model(model);
+            this.set_model(model, *config.whisper_gpu());
         }
 
         return this;
@@ -187,6 +199,17 @@ impl Whisper {
                             .changed()
                         })
                 });
+                // Without a GPU backend built in, it runs on the CPU either way
+                if GPU_BACKEND {
+                    // Changing it reloads the model, in `poll`
+                    config.maybe_update(|raw| {
+                        raw.whisper_gpu.edit(*raw.whisper_gpu(), |gpu| {
+                            ui.checkbox(gpu, t!("audio.whisper_gpu"))
+                                .on_hover_text(t!("audio.whisper_gpu_hover"))
+                                .changed()
+                        })
+                    });
+                }
                 ui.separator();
 
                 egui_extras::TableBuilder::new(ui)
@@ -276,7 +299,7 @@ impl Whisper {
         if let Some(path) = reload {
             // A model picked by hand is what's used, whatever setup was getting
             self.setup = false;
-            self.set_model(path);
+            self.set_model(path, *config.get().whisper_gpu());
         }
     }
 
@@ -372,11 +395,13 @@ impl Whisper {
             let threads = self.threads;
             // Detached: this crate's `spawn_blocking` handle would cancel it once dropped
             rt.spawn_blocking(move || {
+                let start = Instant::now();
                 let session = ctx.create_state().map(|state| WhisperSession {
                     state,
                     threads,
                     multilingual: ctx.is_multilingual(),
                 });
+                log::debug!("Created whisper's state in {:?}", start.elapsed());
                 // Unheard if the recording was dropped meanwhile: it's freed here then
                 let _ = send_session.send(session.map_err(Into::into));
             });
@@ -427,10 +452,13 @@ impl Whisper {
         if let Some(ctx) = &mut self.ctx {
             ctx.update(rt);
         }
-        let picked = config.get().whisper_model().clone();
-        if picked != self.loaded {
+        let (picked, gpu) = {
+            let config = config.get();
+            (config.whisper_model().clone(), *config.whisper_gpu())
+        };
+        if picked != self.loaded || (picked.is_some() && gpu != self.loaded_gpu) {
             match picked {
-                Some(path) => self.set_model(path),
+                Some(path) => self.set_model(path, gpu),
                 None => {
                     drop_in_background(self.ctx.take());
                     self.loaded = None;
@@ -473,7 +501,7 @@ impl Whisper {
                     }
                 }
                 config.update(|raw| raw.whisper_model.set(Some(path.clone())));
-                self.set_model(path);
+                self.set_model(path, *config.get().whisper_gpu());
                 self.setup = false;
             }
             Some(false) if !started => {
@@ -546,22 +574,26 @@ impl Whisper {
         matches!(self.ctx, Some(MaybeDone::Done(None)))
     }
 
-    pub fn set_model(&mut self, path: Arc<Utf8Path>) {
+    /// Loads `path`, to run on the GPU if `gpu` (and there's one).
+    pub fn set_model(&mut self, path: Arc<Utf8Path>, gpu: bool) {
         self.loaded = Some(path.clone());
+        self.loaded_gpu = gpu;
         // The model replaced (or still loading) is freed on a worker
         drop_in_background(self.ctx.take());
-        self.ctx = Some(MaybeDone::spawn_blocking(
-            move || match WhisperContext::new_with_params(
-                path.as_os_str(),
-                WhisperContextParameters::default(),
-            ) {
-                Ok(ctx) => Some(Arc::new(ctx)),
+        self.ctx = Some(MaybeDone::spawn_blocking(move || {
+            let mut params = WhisperContextParameters::default();
+            params.use_gpu(gpu);
+            match WhisperContext::new_with_params(path.as_os_str(), params) {
+                Ok(ctx) => {
+                    log::info!("Loaded {path} for speech to text (GPU: {gpu})");
+                    Some(Arc::new(ctx))
+                }
                 Err(e) => {
                     error(t!("error.stt_model"), e);
                     None
                 }
-            },
-        ));
+            }
+        }));
     }
 }
 
@@ -706,7 +738,9 @@ impl PendingSession {
         }
 
         return spawn_blocking(move || {
+            let start = Instant::now();
             let mut session = self.wait()?;
+            let waited = start.elapsed();
             let samples = recv.recv()??;
             log::debug!("Sample count: {}", samples.len());
             if samples.len() < MIN_SAMPLES {
@@ -727,12 +761,15 @@ impl PendingSession {
                 return Ok(Heard::NoVoice(Some(arrstr!("en"))));
             }
 
+            let mel = Instant::now();
             session.state.pcm_to_mel(&samples, session.threads.get())?;
             drop(samples);
-
+            let detect = Instant::now();
+            let spoken = session.detect_language(&voices, min_confidence)?;
+            let transcribe = Instant::now();
             // Something said in a language without a voice is still transcribed: if it's no
             // words after all, it was noise
-            return Ok(match session.detect_language(&voices, min_confidence)? {
+            let heard = match spoken {
                 Spoken::Voiced(lang) => match session.speech_to_text(lang)? {
                     text if text.is_empty() => Heard::Nothing,
                     text => Heard::Question { text, lang },
@@ -742,7 +779,16 @@ impl PendingSession {
                     text => Heard::Unvoiced { text, lang },
                 },
                 Spoken::Unclear => Heard::Nothing,
-            });
+            };
+            log::debug!(
+                "Speech to text took {:?}: waited {waited:?} for the state, {:?} for the mel, {:?} \
+                 detecting the language, {:?} transcribing",
+                start.elapsed(),
+                detect - mel,
+                transcribe - detect,
+                transcribe.elapsed(),
+            );
+            return Ok(heard);
         });
     }
 }
@@ -779,6 +825,7 @@ impl WhisperSession {
             patience: -1.0,
         });
 
+        params.set_n_threads(c_int::try_from(self.threads.get()).unwrap_or(c_int::MAX));
         params.set_language(Some(&lang));
         params.set_print_special(false);
         params.set_print_progress(false);
