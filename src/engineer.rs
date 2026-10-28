@@ -19,6 +19,7 @@ use crate::{
 use bono_i18n::t;
 use sdl3::audio::{AudioDevice, AudioStreamOwner};
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::Arc,
     task::Poll,
@@ -133,6 +134,69 @@ struct Playback {
     drain: Drain,
     /// Play the incomplete-answer tone once this speech has drained.
     tone_after_drain: bool,
+    sentences: SentenceQueue,
+}
+
+/// Input is always mono f32 at a fixed rate. SDL's queued bytes describe input
+/// consumption, not the physical speaker position (which includes device buffering).
+#[derive(Default)]
+struct SentenceQueue {
+    pieces: VecDeque<Speech>,
+    submitted: usize,
+    samples: usize,
+}
+
+impl SentenceQueue {
+    fn consumed(&mut self, queued: Option<i32>) {
+        let Some(queued) = queued.and_then(|n| usize::try_from(n).ok()) else {
+            return; // Unknown position: replay conservatively from the oldest retained sentence.
+        };
+        let mut consumed = self
+            .samples
+            .saturating_sub(queued.div_ceil(size_of::<f32>()));
+        while self.submitted > 0 {
+            let len = self.pieces.front().unwrap().samples.len();
+            if len > consumed {
+                break;
+            }
+            consumed -= len;
+            self.samples -= len;
+            self.submitted -= 1;
+            self.pieces.pop_front();
+        }
+    }
+
+    fn rewind(&mut self) {
+        self.submitted = 0;
+        self.samples = 0;
+    }
+
+    fn pending(&self) -> Option<&Speech> {
+        self.pieces.get(self.submitted)
+    }
+
+    fn submitted(&mut self) {
+        self.samples += self.pending().unwrap().samples.len();
+        self.submitted += 1;
+    }
+}
+
+impl Playback {
+    fn set_held(&mut self, held: bool) -> Result<(), sdl3::Error> {
+        let Some(stream) = &self.stream else {
+            return Ok(());
+        };
+        if held {
+            stream.pause()?;
+            self.sentences.consumed(stream.queued_bytes().ok());
+            stream.clear()?;
+            self.sentences.rewind();
+        } else {
+            stream.resume()?;
+        }
+        self.drain = Drain::new(Instant::now());
+        Ok(())
+    }
 }
 
 struct Session {
@@ -205,23 +269,17 @@ impl Engineer {
     }
 
     /// Pauses the answer being spoken (and holds one about to start) while the spotter speaks;
-    /// releasing it carries on from where it stopped.
+    /// releasing it restarts the first unfinished sentence.
     pub fn hold(&mut self, held: bool) {
         if std::mem::replace(&mut self.held, held) == held {
             return;
         }
 
-        if let Some(stream) = self
-            .playback
-            .as_ref()
-            .and_then(|playback| playback.stream.as_ref())
-        {
-            let result = match held {
-                true => stream.pause(),
-                false => stream.resume(),
-            };
+        if let Some(playback) = self.playback.as_mut() {
+            let result = playback.set_held(held);
             if let Err(e) = result {
                 log::warn!("Error holding the answer for the spotter: {e}");
+                self.playback = None;
             }
         }
     }
@@ -340,6 +398,7 @@ impl Engineer {
             done: false,
             drain: Drain::new(Instant::now()),
             tone_after_drain: false,
+            sentences: SentenceQueue::default(),
         });
     }
 
@@ -662,6 +721,7 @@ impl Engineer {
             done: false,
             drain: Drain::new(Instant::now()),
             tone_after_drain: false,
+            sentences: SentenceQueue::default(),
         });
         Some((lang, input))
     }
@@ -673,10 +733,19 @@ impl Engineer {
             return;
         };
 
-        while !playback.done {
-            let mut speech = match playback.speech.try_next() {
-                Poll::Pending => break,
-                Poll::Ready(Some(Ok(speech))) => speech,
+        if held {
+            return;
+        }
+        if let Some(stream) = &playback.stream {
+            playback.sentences.consumed(stream.queued_bytes().ok());
+        }
+
+        // Submit at most one sentence per frame, including when replaying. Synthesis
+        // stays on its worker and a long retained answer cannot monopolize the UI.
+        if !playback.done && playback.sentences.pending().is_none() {
+            let speech = match playback.speech.try_next() {
+                Poll::Pending => None,
+                Poll::Ready(Some(Ok(speech))) => Some(speech),
                 Poll::Ready(Some(Err(e))) => {
                     self.playback = None;
                     self.notice(t!("engineer.error_synthesizing", error = format!("{e:#}")));
@@ -691,25 +760,26 @@ impl Engineer {
                     {
                         log::warn!("Error flushing the answer's audio: {e}");
                     }
-                    break;
+                    None
                 }
             };
 
-            let gain = {
-                let config = config.get();
-                config.master_volume() * config.engineer_volume()
-            };
-            for sample in &mut speech.samples {
-                *sample *= gain;
+            if let Some(mut speech) = speech {
+                let gain = {
+                    let config = config.get();
+                    config.master_volume() * config.engineer_volume()
+                };
+                for sample in &mut speech.samples {
+                    *sample *= gain;
+                }
+                playback.sentences.pieces.push_back(speech);
             }
+        }
 
+        if let Some(speech) = playback.sentences.pending() {
             let played = match (&playback.stream, speaker) {
                 (Some(stream), _) => stream.put_data_f32(&speech.samples),
                 (None, Some(speaker)) => speech.start(speaker).and_then(|stream| {
-                    // Starts held while the spotter speaks
-                    if held {
-                        stream.pause()?;
-                    }
                     playback.stream = Some(stream);
                     Ok(())
                 }),
@@ -725,11 +795,19 @@ impl Engineer {
                 self.notice(t!("engineer.error_playing", error = e));
                 return;
             }
+            playback.sentences.submitted();
+            if playback.done && playback.sentences.pending().is_none() {
+                if let Some(stream) = &playback.stream
+                    && let Err(e) = stream.flush()
+                {
+                    log::warn!("Error flushing the resumed answer's audio: {e}");
+                }
+            }
         }
 
         // Once SDL has played all of it, the stream can go. A speaker that stops taking audio
         // without SDL saying it was removed doesn't keep it forever, holding up the spotter's calls
-        if !playback.done {
+        if !playback.done || playback.sentences.pending().is_some() {
             return;
         }
         let drained = match &playback.stream {
@@ -924,6 +1002,132 @@ mod tests {
     };
     use std::num::NonZeroUsize;
 
+    fn sentences(lengths: &[usize]) -> SentenceQueue {
+        let mut queue = SentenceQueue::default();
+        for (index, &len) in lengths.iter().enumerate() {
+            queue.pieces.push_back(Speech {
+                samples: vec![index as f32; len],
+                sample_rate: 22050,
+            });
+            queue.submitted();
+        }
+        queue
+    }
+
+    #[test]
+    fn resumes_first_unfinished_sentence() {
+        for (queued, remaining) in [(120, 3), (84, 3), (80, 2), (44, 2), (40, 1), (0, 0)] {
+            let mut queue = sentences(&[10, 10, 10]);
+            queue.consumed(Some(queued));
+            queue.rewind();
+            assert_eq!(queue.pieces.len(), remaining, "queued bytes: {queued}");
+            if remaining > 0 {
+                assert_eq!(queue.pending().unwrap().samples.len(), 10);
+                assert_eq!(queue.pending().unwrap().samples[0], (3 - remaining) as f32);
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_interruptions_preserve_unsubmitted_sentences() {
+        let mut queue = sentences(&[10, 20, 30]);
+        queue.consumed(Some(160)); // first sentence finished; second half spoken
+        queue.rewind();
+        queue.submitted(); // only the second sentence has been replayed so far
+        queue.consumed(Some(40));
+        queue.rewind();
+        assert_eq!(queue.pending().unwrap().samples, vec![1.0; 20]);
+        queue.submitted();
+        queue.consumed(Some(0));
+        queue.rewind();
+        assert_eq!(queue.pending().unwrap().samples, vec![2.0; 30]);
+    }
+
+    #[test]
+    fn unknown_positions_retain_audio_and_empty_pieces_do_not_stick() {
+        for queued in [None, Some(-1)] {
+            let mut queue = sentences(&[10, 20]);
+            queue.consumed(queued);
+            queue.rewind();
+            assert_eq!(queue.pieces.len(), 2);
+        }
+        let mut queue = sentences(&[0, 10, 0]);
+        queue.consumed(Some(40));
+        assert_eq!(queue.pieces.len(), 2);
+        queue.consumed(Some(0));
+        assert!(queue.pieces.is_empty());
+    }
+
+    #[test]
+    #[ignore = "run alone with SDL_AUDIO_DRIVER=dummy"]
+    fn completed_speech_replays_after_spotter_hold() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let sdl = sdl3::init().unwrap();
+        let audio = sdl.audio().unwrap();
+        let mut sentences = sentences(&[22050, 22050]);
+        let device = audio
+            .open_playback_device(&sentences.pieces[0].spec())
+            .unwrap();
+        let stream = device
+            .clone()
+            .open_device_stream(Some(&sentences.pieces[0].spec()))
+            .unwrap();
+        stream.pause().unwrap();
+        for speech in &sentences.pieces {
+            stream.put_data_f32(&speech.samples).unwrap();
+        }
+        stream.flush().unwrap();
+        // Simulate the first sentence having already drained from the stream.
+        stream.clear().unwrap();
+        stream.put_data_f32(&sentences.pieces[1].samples).unwrap();
+        sentences.consumed(stream.queued_bytes().ok());
+        assert_eq!(sentences.pieces.len(), 1);
+
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.playback = Some(Playback {
+            speech: SpeechOutput::ready(Speech::no_beep(1.0)),
+            stream: Some(stream),
+            done: true,
+            drain: Drain::new(Instant::now()),
+            tone_after_drain: false,
+            sentences,
+        });
+        engineer.hold(true);
+        engineer.hold(true);
+        engineer.play(&config, Some(&device));
+        let playback = engineer.playback.as_ref().unwrap();
+        assert_eq!(playback.sentences.submitted, 0);
+        assert_eq!(playback.stream.as_ref().unwrap().queued_bytes().unwrap(), 0);
+
+        engineer.hold(false);
+        engineer.play(&config, Some(&device));
+        let playback = engineer.playback.as_ref().unwrap();
+        playback.stream.as_ref().unwrap().pause().unwrap();
+        assert_eq!(playback.sentences.submitted, 1);
+        assert!(playback.stream.as_ref().unwrap().queued_bytes().unwrap() > 0);
+        assert_eq!(playback.sentences.pieces[0].samples[0], 1.0);
+        // A second interruption must retain the same unfinished sentence.
+        engineer.hold(true);
+        assert_eq!(
+            engineer
+                .playback
+                .as_ref()
+                .unwrap()
+                .sentences
+                .pending()
+                .unwrap()
+                .samples[0],
+            1.0
+        );
+        engineer.stop();
+        assert!(engineer.playback.is_none());
+    }
+
     #[test]
     fn incomplete_answers_preserve_speech_before_the_tone() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -947,6 +1151,7 @@ mod tests {
                 done: false,
                 drain: Drain::new(Instant::now()),
                 tone_after_drain: false,
+                sentences: SentenceQueue::default(),
             });
             let (_, text) = mpsc::unbounded_channel();
             engineer.answer(
