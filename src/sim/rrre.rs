@@ -494,6 +494,57 @@ struct Converter {
     event: Option<(i32, i32, i32)>,
     /// Each car's last position and heading, by slot: heading comes from how it moved
     cars: HashMap<i32, Motion>,
+    /// Each car's lap, by slot: when it started and whether it's still valid
+    laps: HashMap<i32, LapState>,
+    /// The session the laps are from: type and iteration
+    session: Option<(i32, i32)>,
+}
+
+/// A car's current lap, held steady across the reads. The game's lap count and lap timer don't
+/// change together at the line (nor within one read, which can mix two frames): a reset timer
+/// next to the old lap count would move the lap's start to the next lap's, and the last lap's
+/// invalid flag next to the new count would invalidate the new lap.
+#[derive(Clone, Copy, Default)]
+struct LapState {
+    lap: i32,
+    /// When the lap started: set once, from the first read whose timer belongs to this lap
+    start: Option<f64>,
+    /// When the lap before started
+    previous_start: Option<f64>,
+}
+
+/// How much later than the previous lap's start the next lap's must be (less is the previous
+/// lap's timer, not yet reset).
+const LAP_START_MIN_GAP: f64 = 1.0;
+
+impl LapState {
+    /// The lap's start and whether it's invalid, given a read of `lap`, its timer `into_lap` and
+    /// its `invalid` flag at `time`.
+    fn update(
+        &mut self,
+        lap: i32,
+        into_lap: Option<f64>,
+        invalid: Option<bool>,
+        time: f64,
+    ) -> (Option<f64>, Option<bool>) {
+        if lap != self.lap {
+            // A lap back is another session: nothing before it counts
+            let previous_start = if lap > self.lap { self.start } else { None };
+            *self = LapState {
+                lap,
+                start: None,
+                previous_start,
+            };
+        }
+        if self.start.is_none() {
+            self.start = into_lap.map(|into_lap| time - into_lap).filter(|start| {
+                self.previous_start
+                    .is_none_or(|previous| *start > previous + LAP_START_MIN_GAP)
+            });
+        }
+        // Until the timer is this lap's, the flag can still be the last lap's
+        (self.start, self.start.and(invalid))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -530,6 +581,12 @@ impl Converter {
         if new_event {
             self.cars.clear();
         }
+        // Another session, or its clock went back (a restart): its laps start over
+        let session = (shared.session_type, shared.session_iteration);
+        if new_event || self.session != Some(session) || dt.is_none() {
+            self.laps.clear();
+        }
+        self.session = Some(session);
 
         let count = (shared.num_cars.max(0) as usize).min(R3E_NUM_DRIVERS_MAX as usize);
         let drivers = shared.all_drivers_data_1;
@@ -545,14 +602,19 @@ impl Converter {
             out.vehicle_id = Some(slot as i64).into();
             out.session_time = Some(time).into();
             out.time_since_last_update = dt.into();
-            out.lap = Some(driver.completed_laps.max(0) as i64).into();
-            out.lap_start_time = seconds(driver.lap_time_current_self)
-                .map(|into_lap| time - into_lap)
-                .into();
+            let lap = driver.completed_laps.max(0);
+            let (lap_start, invalid) = self.laps.entry(slot).or_default().update(
+                lap,
+                seconds(driver.lap_time_current_self),
+                flag(driver.current_lap_valid).map(|valid| !valid),
+                time,
+            );
+            out.lap = Some(lap as i64).into();
+            out.lap_start_time = lap_start.into();
             out.lap_distance = non_negative(driver.lap_distance).into();
             out.sector = sector(driver.track_sector).into();
             out.in_pit_lane = flag(driver.in_pitlane).into();
-            out.lap_invalidated = flag(driver.current_lap_valid).map(|valid| !valid).into();
+            out.lap_invalidated = invalid.into();
             out.gap_to_place_ahead = seconds(driver.time_delta_front).into();
             out.gap_to_place_behind = seconds(driver.time_delta_behind).into();
 
@@ -589,7 +651,14 @@ impl Converter {
             Some(last) if now.duration_since(last) < SCORING_EVERY => None,
             _ => {
                 self.last_scoring = Some(now);
-                Some(scoring(shared, drivers, time))
+                let (session, mut standings) = scoring(shared, drivers, time);
+                // The lap starts the telemetry has, held steady across the line
+                for standing in &mut standings {
+                    let slot = standing.vehicle_id.get().map(|slot| slot as i32);
+                    let start = slot.and_then(|slot| self.laps.get(&slot)?.start);
+                    standing.lap_start_time = start.map(scoring_time).into();
+                }
+                Some((session, standings))
             }
         };
 
@@ -1790,6 +1859,45 @@ mod tests {
         writer.write(session, standings).unwrap();
         assert_eq!(count("session"), 2);
         assert_eq!(count("standings"), 3);
+    }
+
+    #[test]
+    fn lap_starts_and_validity_hold_steady_across_the_line() {
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        // Slot 3's lap, its timer and validity at `time`; what's recorded for it
+        let mut read = |time: f64, lap: i32, into_lap: f32, valid: i32| {
+            let mut shared = shared(time, 0.0);
+            let mut drivers = shared.all_drivers_data_1;
+            drivers[0].completed_laps = lap;
+            drivers[0].lap_time_current_self = into_lap;
+            drivers[0].current_lap_valid = valid;
+            shared.all_drivers_data_1 = drivers;
+            let update = converter.convert(&shared, start).unwrap();
+            let theirs = update
+                .telemetry
+                .iter()
+                .find(|t| t.vehicle_id.get() == Some(3))
+                .unwrap();
+            (
+                theirs.lap.get(),
+                theirs.lap_start_time.get(),
+                theirs.lap_invalidated.get(),
+            )
+        };
+
+        // Lap 3 started at 400 and went invalid
+        assert_eq!(read(500.0, 3, 100.0, 0), (Some(3), Some(400.0), Some(true)));
+        // The timer resets before the count: still lap 3, still started at 400
+        assert_eq!(read(500.1, 3, 0.05, 0), (Some(3), Some(400.0), Some(true)));
+        // The count before the timer and the flag: lap 4's start and validity aren't known yet
+        assert_eq!(read(500.2, 4, 100.2, 0), (Some(4), None, None));
+        // Lap 4's own timer and flag
+        assert_eq!(read(500.3, 4, 0.25, 1), (Some(4), Some(500.05), Some(false)));
+        // Held for the rest of the lap, whatever the timer jitters to
+        assert_eq!(read(530.0, 4, 29.9, 1), (Some(4), Some(500.05), Some(false)));
+        // The clock going back is a restart: its first lap starts over
+        assert_eq!(read(10.0, 0, 5.0, 1), (Some(0), Some(5.0), Some(false)));
     }
 
     #[test]
