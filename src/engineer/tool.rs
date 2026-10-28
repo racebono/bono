@@ -122,7 +122,7 @@ impl Engineer {
          rows), status (full snapshot of the player's car), laps, stint (range on fuel and \
          virtual energy against what the race needs), nearby (cars around in metres), field \
          (official standings), track (the circuit), corners (time gained or lost per corner, \
-         braking points), sql (custom read-only query), warm (build the history cache), schema \
+         braking points), tyres (tyre and brake temperatures per lap, their trend and where on          the lap the heat builds), sql (custom read-only query), warm (build the history cache), schema \
          (tables, units, SQL gotchas and detailed command/engineering reference). Topic advice is \
          returned with status, stint and corners; no separate lookup needed. The other fields are options of some \
          commands. Answers are plain text for you to interpret, not to read out."
@@ -136,7 +136,7 @@ impl Engineer {
                 "command": {
                     "type": "string",
                     "enum": ["quick", "status", "laps", "stint", "nearby", "field", "track",
-                             "corners", "sql", "warm", "schema"]
+                             "corners", "tyres", "sql", "warm", "schema"]
                 },
                 "vehicle": {
                     "type": "integer",
@@ -144,7 +144,7 @@ impl Engineer {
                 },
                 "last": {
                     "type": "integer",
-                    "description": "laps: only the last N laps."
+                    "description": "laps, tyres: only the last N laps (tyres: default 5)."
                 },
                 "of": {
                     "type": "string",
@@ -168,7 +168,7 @@ impl Engineer {
                 },
                 "lap": {
                     "type": "string",
-                    "description": "corners: the lap to analyse (default: the last complete lap)."
+                    "description": "corners, tyres: the lap to analyse (corners: the last complete lap; tyres: the current lap)."
                 },
                 "ref": {
                     "type": "string",
@@ -285,6 +285,7 @@ pub enum Command {
     Field,
     Track,
     Corners,
+    Tyres,
     Sql,
     Schema,
 }
@@ -381,6 +382,7 @@ fn run(
         Command::Field => cmd_field(&ctx, &mut out)?,
         Command::Track => cmd_track(&ctx, &mut out)?,
         Command::Corners => cmd_corners(&ctx, args, &mut out)?,
+        Command::Tyres => cmd_tyres(&ctx, args, &mut out)?,
         Command::Sql => cmd_sql(&ctx, args, &mut out)?,
         Command::Schema => out.push_str(schema),
     }
@@ -400,6 +402,10 @@ pub(super) fn topic_reference(command: Command) -> Option<(&'static str, &'stati
         Command::Corners => (
             "references/corners.md",
             include_str!("../../skill/references/corners.md"),
+        ),
+        Command::Tyres => (
+            "references/temperatures.md",
+            include_str!("../../skill/references/temperatures.md"),
         ),
         Command::Stint => (
             "references/strategy.md",
@@ -3856,10 +3862,8 @@ struct Measured {
     corner: CornerMetrics,
 }
 
-fn cmd_corners(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Result<()> {
-    let sc = ctx.scoring()?;
-    let me = ctx.vehicle;
-    let laps = lap_table(ctx, me)?;
+/// The lap's length in metres: the session's, or the furthest lap_distance the car has reached.
+fn lap_length(ctx: &Ctx, sc: &Scoring, vehicle: i64) -> anyhow::Result<f64> {
     let mut length = sc
         .session
         .as_ref()
@@ -3869,12 +3873,20 @@ fn cmd_corners(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Res
         length = scalar::<f64>(
             ctx.conn,
             "SELECT MAX(lap_distance) FROM telemetry WHERE vehicle_id = ? AND id >= ?",
-            params![me, ctx.session_start_id()?],
+            params![vehicle, ctx.session_start_id()?],
         )?;
     }
     let Some(length) = length.filter(|l| *l > 0.0) else {
         bail!("the lap length isn't known yet (no session data and no lap_distance)");
     };
+    Ok(length)
+}
+
+fn cmd_corners(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Result<()> {
+    let sc = ctx.scoring()?;
+    let me = ctx.vehicle;
+    let laps = lap_table(ctx, me)?;
+    let length = lap_length(ctx, sc, me)?;
 
     // The reference: another driver's best lap, a given lap, or the player's best valid lap
     let which = args.reference.as_deref().unwrap_or("best");
@@ -4153,6 +4165,381 @@ fn corner_detail(
         out,
         "(braking point = where the brake first goes past 10% and stays on; distances from the game's lap_distance. Advice from this is relative to the pilot's own laps, not a theoretical optimum.)"
     );
+    Ok(())
+}
+
+// --------------------------------------------------------------------------- tyres
+
+/// Laps `tyres` shows unless `last` says otherwise
+const TYRE_LAPS: usize = 5;
+/// What the car is doing when a temperature rises: braking, off the throttle (mid-corner,
+/// coasting) or at full throttle
+const PHASES: [&str; 3] = ["braking", "off throttle", "full throttle"];
+
+/// One wheel's temperatures over one lap, averaged (and the peaks) over all of its rows.
+#[derive(Clone, Copy, Default)]
+struct WheelHeat {
+    surface: Option<f64>,
+    peak: Option<f64>,
+    /// Surface strips: inner, middle, outer
+    strips: [Option<f64>; 3],
+    optimal: Option<f64>,
+    pressure: Option<f64>,
+    brake: Option<f64>,
+    brake_peak: Option<f64>,
+}
+
+impl WheelHeat {
+    fn is_empty(&self) -> bool {
+        self.surface.is_none() && self.brake.is_none() && self.strips.iter().all(Option::is_none)
+    }
+}
+
+/// The sims report a tyre's surface strips as left, centre and right of the car, not inside and
+/// outside: on a left wheel the outer strip is the left one.
+fn inner_middle_outer(wheel: usize, [l, c, r]: [Option<f64>; 3]) -> [Option<f64>; 3] {
+    if wheel % 2 == 0 { [r, c, l] } else { [l, c, r] }
+}
+
+const SURFACE_MEAN: &str = "(w.tire_surface_temperature_left + w.tire_surface_temperature_center \
+     + w.tire_surface_temperature_right) / 3.0";
+
+/// Each wheel's temperatures over one lap of one car.
+fn lap_heat(ctx: &Ctx, vehicle: i64, lap: &Lap) -> rusqlite::Result<[WheelHeat; 4]> {
+    let mut heat = [WheelHeat::default(); 4];
+    for r in rows(
+        ctx.conn,
+        &format!(
+            "SELECT w.wheel, AVG({SURFACE_MEAN}) AS surface, MAX({SURFACE_MEAN}) AS peak, \
+                    AVG(w.tire_surface_temperature_left) AS l, \
+                    AVG(w.tire_surface_temperature_center) AS c, \
+                    AVG(w.tire_surface_temperature_right) AS r, \
+                    AVG(w.tire_optimal_temperature) AS optimal, AVG(w.tire_pressure) AS pressure, \
+                    AVG(w.brake_temperature) AS brake, MAX(w.brake_temperature) AS brake_peak \
+             FROM telemetry t JOIN telemetry_wheel w ON w.telemetry_id = t.id \
+             WHERE t.vehicle_id = ? AND t.id BETWEEN ? AND ? GROUP BY w.wheel"
+        ),
+        params![vehicle, lap.first_id, lap.last_id],
+    )? {
+        let Some(wheel) = r.i("wheel").and_then(|w| usize::try_from(w).ok()) else {
+            continue;
+        };
+        let Some(h) = heat.get_mut(wheel) else {
+            continue;
+        };
+        *h = WheelHeat {
+            surface: r.f("surface"),
+            peak: r.f("peak"),
+            strips: inner_middle_outer(wheel, [r.f("l"), r.f("c"), r.f("r")]),
+            optimal: r.f("optimal"),
+            pressure: r.f("pressure"),
+            brake: r.f("brake"),
+            brake_peak: r.f("brake_peak"),
+        };
+    }
+    Ok(heat)
+}
+
+/// Stretches of the lap that temperature rises are put down to: one per turn (from its braking
+/// point to the next one's), or tenths of the lap without them.
+struct Segments {
+    length: f64,
+    bounds: Vec<f64>,
+    labels: Vec<String>,
+    source: &'static str,
+}
+
+impl Segments {
+    fn tenths(length: f64) -> Self {
+        let bounds = (0..10)
+            .map(|k| length * k as f64 / 10.0)
+            .collect::<Vec<_>>();
+        let labels = bounds
+            .iter()
+            .map(|a| format!("{a:.0}-{:.0} m", a + length / 10.0))
+            .collect();
+        Segments {
+            length,
+            bounds,
+            labels,
+            source: "tenths of the lap (no complete lap to find the turns on)",
+        }
+    }
+
+    fn index(&self, d: f64) -> usize {
+        let n = self.bounds.len();
+        (0..n)
+            .find(|&k| {
+                let span = match n {
+                    1 => self.length,
+                    _ => (self.bounds[(k + 1) % n] - self.bounds[k]).rem_euclid(self.length),
+                };
+                (d - self.bounds[k]).rem_euclid(self.length) < span
+            })
+            .unwrap_or(0)
+    }
+}
+
+/// How much each wheel's temperatures went up over a lap: every rise between consecutive samples,
+/// added up by what the car was doing and by stretch of track. Falls are left out, so heat that
+/// builds in one place shows there even if it's shed again on the next straight.
+/// Index 0 is the tyre's surface mean, 1 its brake.
+struct HeatBuild {
+    /// [kind][wheel]
+    total: [[f64; 4]; 2],
+    /// [kind][wheel][phase]
+    phases: [[[f64; 3]; 4]; 2],
+    /// [kind][segment][wheel]
+    segments: [Vec<[f64; 4]>; 2],
+    /// [kind][wheel]: the last sample minus the first
+    net: [[Option<f64>; 4]; 2],
+}
+
+fn heat_build(
+    ctx: &Ctx,
+    vehicle: i64,
+    lap: &Lap,
+    segments: &Segments,
+) -> rusqlite::Result<HeatBuild> {
+    let n = segments.bounds.len();
+    let mut build = HeatBuild {
+        total: [[0.0; 4]; 2],
+        phases: [[[0.0; 3]; 4]; 2],
+        segments: [vec![[0.0; 4]; n], vec![[0.0; 4]; n]],
+        net: [[None; 4]; 2],
+    };
+    let mut first: [[Option<f64>; 4]; 2] = [[None; 4]; 2];
+    let mut previous: [[Option<f64>; 4]; 2] = [[None; 4]; 2];
+
+    let mut stmt = ctx.conn.prepare(
+        "SELECT t.lap_distance, t.brake, t.throttle, w.wheel, w.tire_surface_temperature_left, \
+                w.tire_surface_temperature_center, w.tire_surface_temperature_right, \
+                w.brake_temperature \
+         FROM telemetry t JOIN telemetry_wheel w ON w.telemetry_id = t.id \
+         WHERE t.vehicle_id = ? AND t.id BETWEEN ? AND ? ORDER BY t.id, w.wheel",
+    )?;
+    let mut q = stmt.query(params![vehicle, lap.first_id, lap.last_id])?;
+    while let Some(r) = q.next()? {
+        let Some(wheel) = usize::try_from(r.get::<_, i64>(3)?).ok().filter(|w| *w < 4) else {
+            continue;
+        };
+        let d: Option<f64> = r.get(0)?;
+        let (brake, throttle): (Option<f64>, Option<f64>) = (r.get(1)?, r.get(2)?);
+        let strips: [Option<f64>; 3] = [r.get(4)?, r.get(5)?, r.get(6)?];
+        let surface = match strips {
+            [Some(l), Some(c), Some(r)] => Some((l + c + r) / 3.0),
+            _ => None,
+        };
+        let phase = match (brake, throttle) {
+            (Some(b), _) if b >= BRAKE_ON => Some(0),
+            (_, Some(t)) if t >= THROTTLE_ON => Some(2),
+            (None, None) => None,
+            _ => Some(1),
+        };
+        let segment = d.map(|d| segments.index(d));
+
+        for (k, now) in [surface, r.get::<_, Option<f64>>(7)?]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(now) = now else {
+                continue;
+            };
+            let first = *first[k][wheel].get_or_insert(now);
+            build.net[k][wheel] = Some(now - first);
+            if let Some(before) = previous[k][wheel]
+                && now > before
+            {
+                let rise = now - before;
+                build.total[k][wheel] += rise;
+                if let Some(phase) = phase {
+                    build.phases[k][wheel][phase] += rise;
+                }
+                if let Some(segment) = segment {
+                    build.segments[k][segment][wheel] += rise;
+                }
+            }
+            previous[k][wheel] = Some(now);
+        }
+    }
+    Ok(build)
+}
+
+fn cmd_tyres(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Result<()> {
+    let sc = ctx.scoring()?;
+    let me = ctx.vehicle;
+    let laps = lap_table(ctx, me)?;
+    let Some(current) = laps.last() else {
+        bail!("no laps recorded yet in this session");
+    };
+    let n = args.last.filter(|n| *n > 0).unwrap_or(TYRE_LAPS);
+    let shown = &laps[laps.len().saturating_sub(n)..];
+    let heat = shown
+        .iter()
+        .map(|lap| lap_heat(ctx, me, lap))
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if heat.iter().flatten().all(WheelHeat::is_empty) {
+        bail!(
+            "no tyre or brake temperatures recorded for {}",
+            sc.label(me)
+        );
+    }
+
+    say!(
+        out,
+        "TYRES {} - temperatures per lap (C), averaged over the lap: surface = mean of the three strips, I/M/O = inner/middle/outer strip, opt = the sim's optimum",
+        sc.label(me)
+    );
+    say!(
+        out,
+        "lap  wheel  surface avg/peak  I/M/O        vs opt  kPa    brake avg/peak  flags"
+    );
+    for (lap, heat) in shown.iter().zip(&heat) {
+        let mut flags = Vec::new();
+        if !lap.complete {
+            flags.push("IN-PROGRESS");
+        }
+        if lap.pit {
+            flags.push("PIT");
+        }
+        if lap.refuelled {
+            flags.push("REFUEL");
+        }
+        for (w, h) in heat.iter().enumerate() {
+            say!(
+                out,
+                "{:>3}  {:<5}  {:>16}  {:<11}  {:>6}  {:>5}  {:>14}  {}",
+                lap.lap,
+                WHEELS[w],
+                format!("{}/{}", fmt(h.surface, 0, ""), fmt(h.peak, 0, "")),
+                h.strips.map(|s| fmt(s, 0, "")).join("/"),
+                h.surface
+                    .zip(h.optimal)
+                    .map_or("-".into(), |(s, o)| format!("{:+.0}", s - o)),
+                fmt(h.pressure, 0, ""),
+                format!("{}/{}", fmt(h.brake, 0, ""), fmt(h.brake_peak, 0, "")),
+                if w == 0 {
+                    flags.join(",")
+                } else {
+                    String::new()
+                }
+            );
+        }
+    }
+
+    // The trend: the first complete green lap shown against the last
+    let green = shown
+        .iter()
+        .zip(&heat)
+        .filter(|(lap, _)| lap.green)
+        .collect::<Vec<_>>();
+    match (green.first(), green.last()) {
+        (Some((a, ha)), Some((b, hb))) if a.lap != b.lap => {
+            say!(out, "TREND L{} to L{} (complete green laps):", a.lap, b.lap);
+            let change = |x: Option<f64>, y: Option<f64>, unit: &str| {
+                x.zip(y)
+                    .map_or("-".into(), |(x, y)| format!("{:+.0}{unit}", y - x))
+            };
+            for w in 0..4 {
+                say!(
+                    out,
+                    "  {}: surface {}, peak {}, pressure {}, brake {}",
+                    WHEELS[w],
+                    change(ha[w].surface, hb[w].surface, " C"),
+                    change(ha[w].peak, hb[w].peak, " C"),
+                    change(ha[w].pressure, hb[w].pressure, " kPa"),
+                    change(ha[w].brake, hb[w].brake, " C"),
+                );
+            }
+        }
+        _ => {
+            say!(
+                out,
+                "TREND needs two complete green laps in the window (add `last` for more laps)"
+            );
+        }
+    }
+
+    // Where on the lap: the asked lap, the last complete one, or the current one
+    let lap = match args.lap.as_deref() {
+        Some(which) if which.trim().eq_ignore_ascii_case("current") => current,
+        Some(which) => pick_lap(&laps, which).context("no such lap in this session")?,
+        None => laps.iter().rfind(|lap| lap.complete).unwrap_or(current),
+    };
+    let length = lap_length(ctx, sc, me)?;
+    // The turns are found on a complete lap: this one, or else the last complete one
+    let turn_lap = std::iter::once(lap)
+        .chain(laps.iter().rev())
+        .find(|lap| lap.time.is_some());
+    let mut segments = Segments::tenths(length);
+    if let Some(turn_lap) = turn_lap {
+        let trace = Trace::new(ctx, me, turn_lap, length)?;
+        if trace.ok {
+            let (turns, source) = lap_turns(ctx, sc, &trace);
+            if !turns.is_empty() {
+                segments = Segments {
+                    length,
+                    bounds: trace.corner_bounds(&turns),
+                    labels: turns.into_iter().map(|t| t.label).collect(),
+                    source,
+                };
+            }
+        }
+    }
+    let build = heat_build(ctx, me, lap, &segments)?;
+
+    say!(
+        out,
+        "WHERE THE HEAT BUILDS lap {} ({}): each rise in temperature between samples, added up (C; falls left out), by what the car was doing and by turn (from its braking point to the next turn's) | turns from {}",
+        lap.lap,
+        if lap.complete {
+            fmt_lap(lap.time)
+        } else {
+            "so far".into()
+        },
+        segments.source
+    );
+    for w in 0..4 {
+        let part = |k: usize| {
+            let total = build.total[k][w];
+            if total <= 0.0 {
+                return "no rise".to_owned();
+            }
+            let phases = PHASES
+                .iter()
+                .zip(build.phases[k][w])
+                .filter(|(_, rise)| *rise > 0.0)
+                .map(|(name, rise)| format!("{name} {:.0}%", rise / total * 100.0))
+                .collect::<Vec<_>>();
+            let mut places = build.segments[k]
+                .iter()
+                .enumerate()
+                .map(|(s, rises)| (s, rises[w]))
+                .filter(|(_, rise)| *rise >= total * 0.1)
+                .collect::<Vec<_>>();
+            places.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+            let places = places
+                .iter()
+                .take(3)
+                .map(|(s, rise)| format!("{} +{rise:.0}", segments.labels[*s]))
+                .collect::<Vec<_>>();
+            format!(
+                "+{total:.0} (net {}) - {} - most in {}",
+                build.net[k][w].map_or("-".into(), |net| format!("{net:+.0}")),
+                if phases.is_empty() {
+                    "no pedal data".into()
+                } else {
+                    phases.join(", ")
+                },
+                if places.is_empty() {
+                    "no one place".into()
+                } else {
+                    places.join(", ")
+                }
+            )
+        };
+        say!(out, "  {} tyre {} | brake {}", WHEELS[w], part(0), part(1));
+    }
     Ok(())
 }
 
@@ -4954,9 +5341,22 @@ mod tests {
                 .into();
                 telemetry.fuel = Some(60.0 - t * 0.02).into();
                 telemetry.virtual_energy = Some(1.0 - t * 0.0005).into();
-                for wheel in &mut telemetry.wheels {
+                // Every tyre warms 2 C a lap; the front left also heats up under braking at
+                // 400-450 m, its brake leading, and sheds it again by 600 m
+                let braking_heat = match distance {
+                    d if (400.0..450.0).contains(&d) => (d - 400.0) / 5.0,
+                    d if (450.0..600.0).contains(&d) => 10.0 - (d - 450.0) / 15.0,
+                    _ => 0.0,
+                };
+                for (i, wheel) in telemetry.wheels.iter_mut().enumerate() {
+                    let heat = if i == 0 { braking_heat } else { 0.0 };
+                    let surface = 90.0 + lap as f64 * 2.0 + heat;
                     wheel.tire_wear = Some(1.0 - t * 0.0001).into();
-                    wheel.tire_surface_temperature_center = Some(90.0).into();
+                    wheel.tire_surface_temperature_left = Some(surface + 4.0).into();
+                    wheel.tire_surface_temperature_center = Some(surface).into();
+                    wheel.tire_surface_temperature_right = Some(surface - 4.0).into();
+                    wheel.tire_optimal_temperature = Some(85.0).into();
+                    wheel.brake_temperature = Some(300.0 + heat * 20.0).into();
                     wheel.tire_pressure = Some(170.0).into();
                 }
                 if recorder.wants_telemetry(vehicle, t, 10.0) {
@@ -5376,6 +5776,54 @@ mod tests {
         )
         .await;
         assert!(turn.starts_with("CORNER braking zone 1"), "{turn}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tyres_show_the_trend_and_where_the_heat_builds() {
+        let (_dir, engineer) = race();
+        let out = run(&engineer, serde_json::json!({"command": "tyres"})).await;
+        // The front left's outer (left) strip is the hottest
+        assert!(out.contains("  0  FL"), "{out}");
+        assert!(out.contains("TREND L0 to L2"), "{out}");
+        assert!(out.contains("  RR: surface +4 C"), "{out}");
+        let fl = out
+            .lines()
+            .find(|l| l.starts_with("  FL tyre"))
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(fl.contains("braking 90%"), "{fl}");
+        assert!(fl.contains("most in braking zone 1"), "{fl}");
+        let rr = out
+            .lines()
+            .find(|l| l.starts_with("  RR tyre"))
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(rr.contains("tyre no rise | brake no rise"), "{rr}");
+        assert!(out.contains("ENGINEERING REFERENCE"), "{out}");
+
+        let current = run(
+            &engineer,
+            serde_json::json!({"command": "tyres", "lap": "current", "last": 1}),
+        )
+        .await;
+        assert!(current.contains("(so far)"), "{current}");
+        assert!(current.contains("TREND needs two"), "{current}");
+    }
+
+    #[test]
+    fn surface_strips_read_inner_to_outer() {
+        let strips = [Some(1.0), Some(2.0), Some(3.0)];
+        assert_eq!(
+            inner_middle_outer(0, strips),
+            [Some(3.0), Some(2.0), Some(1.0)]
+        );
+        assert_eq!(inner_middle_outer(3, strips), strips);
+
+        let mut segments = Segments::tenths(1000.0);
+        assert_eq!(segments.index(0.0), 0);
+        assert_eq!(segments.index(999.0), 9);
+        segments.bounds = vec![900.0, 300.0];
+        assert_eq!(segments.index(950.0), 0);
+        assert_eq!(segments.index(100.0), 0);
+        assert_eq!(segments.index(300.0), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -28,6 +28,7 @@ doesn't cover the interval, query recent history; distinguish missing history fr
 | `field` | | official standings: class position, driver, laps, last/best lap, gaps, stops, penalties, status |
 | `corners` | `lap`, `ref` (a lap number or `best`), `ref_of` (a rival) | time gained/lost in every corner (entry: braking and turn-in; exit: traction and the straight after), braking point, minimum and exit speed, throttle back on; default last complete lap vs the best valid lap |
 | `corners` | `turn` (a number or part of its name) | one corner on every lap of the session: which lap was fastest through it and how it was driven, and how the last lap compares |
+| `tyres` | `last` (N laps, default 5), `lap` (a number, `best` or `current`) | per lap and wheel: surface temperature average/peak and inner/middle/outer, against the optimum, pressure, brake average/peak; the trend over complete green laps; where on a lap (default the last complete one) each tyre and brake gains its heat: braking, off throttle or full throttle, and which turns |
 | `track` | | the circuit: every turn (number, name, left/right, hairpin..wide) and straight with where it is, sectors, pit entry/exit, time lost to a pit stop / drive-through / stop-and-go per class |
 | `sql` | `query`, `limit` (rows, default 60) | escape hatch, read-only; prints how to scope to the current session |
 | `schema` | | the database's tables, columns, units and gotchas |
