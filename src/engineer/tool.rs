@@ -168,7 +168,7 @@ impl Engineer {
                 },
                 "lap": {
                     "type": "string",
-                    "description": "corners, tyres: the lap to analyse (corners: the last complete lap; tyres: the current lap)."
+                    "description": "corners, tyres: the lap to analyse (corners: the last complete lap; tyres: the last complete lap, or `current`)."
                 },
                 "ref": {
                     "type": "string",
