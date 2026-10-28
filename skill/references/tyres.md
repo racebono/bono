@@ -18,7 +18,7 @@
   long lefts" or another driving recommendation. An explicit request for figures gets
   grouped measurements, not an introduction, diagnosis, repeated values and conclusion.
 - For a recent temperature spike, lockup or brake complaint, use fresh `status` and,
-  when a trend or cause is requested, recent inputs and available wheel/brake channels.
+  when a trend or cause is requested, `tyres` (or recent inputs and wheel/brake channels).
   Don't wait for a completed lap or infer overheating's cause from one temperature.
   After contact, inspect damage changes and behaviour immediately before/after the hit;
   distinguish recorded damage from a demonstrated handling or pace effect. After a

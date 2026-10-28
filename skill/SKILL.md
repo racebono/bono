@@ -108,6 +108,10 @@ Keep completed laps as baselines for sustained pace, wear and consumption projec
   These comparisons require completed laps; they cannot diagnose a current-lap incident.
   For a corner just driven or current-lap time loss, use recent telemetry over the
   completed portion and a matched earlier pass instead of the default comparison.
+- `tyres`: tyre and brake temperatures per lap, their trend, and where on the lap the heat
+  builds (braking, mid-corner or full throttle; which turns). Use it, not the snapshot, for
+  why a tyre or brake is hot or cold or whether temperatures are settling; one reading
+  cannot show a cause. `last` N laps; `lap` (a number or `current`) for where the heat builds.
 - `track`: turns, sectors, pit entry/exit and pit/penalty time losses.
 - `schema`: units, SQL gotchas and command reference; call before custom `sql` queries.
 - `sql`: read-only `query`, `limit` default 60; scope telemetry to the current session's
