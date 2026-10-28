@@ -4378,7 +4378,15 @@ fn cmd_tyres(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
         .iter()
         .map(|lap| lap_heat(ctx, me, lap))
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if heat.iter().flatten().all(WheelHeat::is_empty) {
+    // Where the heat builds: on the lap: the asked lap, the last complete one, or the current one
+    let lap = match args.lap.as_deref() {
+        Some(which) if which.trim().eq_ignore_ascii_case("current") => current,
+        Some(which) => pick_lap(&laps, which).context("no such lap in this session")?,
+        None => laps.iter().rfind(|lap| lap.complete).unwrap_or(current),
+    };
+    if heat.iter().flatten().all(WheelHeat::is_empty)
+        && lap_heat(ctx, me, lap)?.iter().all(WheelHeat::is_empty)
+    {
         bail!(
             "no tyre or brake temperatures recorded for {}",
             sc.label(me)
@@ -4460,12 +4468,6 @@ fn cmd_tyres(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
         }
     }
 
-    // Where on the lap: the asked lap, the last complete one, or the current one
-    let lap = match args.lap.as_deref() {
-        Some(which) if which.trim().eq_ignore_ascii_case("current") => current,
-        Some(which) => pick_lap(&laps, which).context("no such lap in this session")?,
-        None => laps.iter().rfind(|lap| lap.complete).unwrap_or(current),
-    };
     let length = lap_length(ctx, sc, me)?;
     // The turns are found on a complete lap: this one, or else the last complete one
     let turn_lap = std::iter::once(lap)
