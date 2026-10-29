@@ -21,8 +21,8 @@ use std::{
     time::Duration,
 };
 
-/// Where the API is unless the config says otherwise: llama.cpp's `llama-server` on this PC.
-pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080/v1";
+/// Where the API is unless the config says otherwise: OpenAI's own.
+pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// The models the API at `base_url` (the default when `None`) serves.
 pub async fn models(
@@ -1174,10 +1174,11 @@ mod tests {
     async fn answers_from_a_local_server() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut builder = ConversationBuilder::new();
-        if let Ok(url) = std::env::var("OPENAI_BASE_URL") {
-            builder.base_url(url);
-        }
         builder
+            .base_url(
+                std::env::var("OPENAI_BASE_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:8080/v1".to_owned()),
+            )
             .model(std::env::var("OPENAI_MODEL").unwrap_or_default())
             .effort("none")
             .system("You are a race engineer. Use the lookup tool for anything about the car.")
