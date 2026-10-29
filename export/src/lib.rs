@@ -3,8 +3,9 @@
 //! vacuumed, then compressed page by page with zstd (see `vfs`). Read it with `open`: it's no
 //! longer a plain SQLite file.
 //!
-//! The export is checked against the snapshot before it's kept: every table's rows, every index,
-//! view and trigger, and the database's version numbers.
+//! The export is checked against the snapshot before it's kept: every table's rows, its columns'
+//! declarations (type, NOT NULL, default, primary key, generated), every index, view and trigger,
+//! and the database's version numbers. Tables' CHECK and foreign key constraints aren't compared.
 //!
 //! Everything here blocks, for as long as reading and writing the whole database takes (seconds
 //! for a race, more for a weekend): call it from a worker thread.
@@ -60,7 +61,7 @@ impl Step {
 /// Exports the database at `source` into `dest`, replacing it if it exists. `schema` is SQL run on
 /// the copy after it's moved onto bigger pages, for indexes that help reading it (empty for none).
 /// It may add tables, columns, indexes and the like, but the export fails if it removes or changes
-/// anything of the source's.
+/// anything of the source's that's checked (see the module's documentation).
 ///
 /// `source` is only read, so another process may keep writing it: the export has what it held
 /// when the export started. Temporary files go next to `dest`, and are gone when this returns.
@@ -222,6 +223,8 @@ struct Contents {
 struct Table {
     name: String,
     columns: Vec<String>,
+    /// Each column's `table_xinfo` row.
+    declarations: Vec<Declaration>,
     rows: u64,
     digest: [u64; 4],
 }
@@ -241,16 +244,13 @@ impl Contents {
 
         let mut tables = Vec::with_capacity(names.len());
         for name in names {
-            // `table_xinfo`, as `table_info` leaves out generated columns. Hidden ones (1) are only
-            // virtual tables', which aren't read
-            let columns = conn
-                .prepare("SELECT name FROM pragma_table_xinfo(?1) WHERE hidden != 1 ORDER BY cid")?
-                .query_map([&name], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let declarations = declarations(conn, &name)?;
+            let columns = declarations.iter().map(|d| d.0.clone()).collect::<Vec<_>>();
             let (rows, digest) = digest(conn, &name, &columns)?;
             tables.push(Table {
                 name,
                 columns,
+                declarations,
                 rows,
                 digest,
             });
@@ -280,6 +280,15 @@ impl Contents {
         for table in &self.tables {
             let (rows, digest) = digest(conn, &table.name, &table.columns)
                 .with_context(|| format!("couldn't read table {}", table.name))?;
+            let declarations = declarations(conn, &table.name)?;
+            for declaration in &table.declarations {
+                ensure!(
+                    declarations.contains(declaration),
+                    "table {}'s column {} changed",
+                    table.name,
+                    declaration.0
+                );
+            }
             ensure!(
                 rows == table.rows,
                 "table {} has {rows} rows instead of {}",
@@ -318,6 +327,29 @@ impl Contents {
         );
         Ok(())
     }
+}
+
+/// A column's name, type, NOT NULL, default and primary key, and whether it's generated (`hidden`).
+#[derive(PartialEq)]
+struct Declaration(String, String, bool, Option<String>, i64, i64);
+
+/// `table`'s columns, from `table_xinfo`, as `table_info` leaves out generated columns. Hidden ones
+/// (1) are only virtual tables', which aren't read.
+fn declarations(conn: &Connection, table: &str) -> rusqlite::Result<Vec<Declaration>> {
+    conn.prepare(
+        "SELECT name, type, \"notnull\", dflt_value, pk, hidden FROM pragma_table_xinfo(?1)          WHERE hidden != 1 ORDER BY cid",
+    )?
+    .query_map([table], |row| {
+        Ok(Declaration(
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+        ))
+    })?
+    .collect()
 }
 
 /// The number of rows in `table`, and a digest of their values in `columns` that doesn't depend
@@ -492,6 +524,10 @@ mod tests {
             (
                 "ALTER TABLE notes DROP COLUMN twice",
                 "couldn't read table notes",
+            ),
+            (
+                "CREATE TABLE w2 AS SELECT * FROM wheel; DROP TABLE wheel; ALTER TABLE w2 RENAME TO wheel",
+                "table wheel's column telemetry_id changed",
             ),
             ("PRAGMA user_version = 8", "user_version"),
         ] {
