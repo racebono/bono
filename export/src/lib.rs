@@ -1,5 +1,5 @@
 //! Exports a SQLite database into one small copy that's fast to read, for keeping: a snapshot of it,
-//! moved out of WAL mode onto 16 KiB pages, given extra indexes and the query planner's statistics,
+//! moved out of WAL mode onto 8 KiB pages, given extra indexes and the query planner's statistics,
 //! vacuumed, then compressed page by page with zstd (see `vfs`). Read it with `open`: it's no
 //! longer a plain SQLite file.
 //!
@@ -17,8 +17,9 @@ use rusqlite::{Connection, OpenFlags, config::DbConfig, types::ValueRef};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, fs::OpenOptions, path::Path, time::Duration};
 
-/// The export's page size. Bigger pages compress better, but every page read is decompressed whole.
-pub const PAGE_SIZE: i64 = 16384;
+/// The export's page size. Bigger pages compress better, but every page read is decompressed whole:
+/// on a real race, 8 KiB pages left it 2% bigger than 16 KiB ones, and most queries 15-25% faster.
+pub const PAGE_SIZE: i64 = 8192;
 /// The zstd level pages are compressed at. Decompressing is as fast at any level; compressing is
 /// slower the higher it is, and no smaller past 19 for pages this size.
 pub const LEVEL: i32 = 19;
