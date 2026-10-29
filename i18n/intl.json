@@ -1266,9 +1266,9 @@
         "ca": "URL:"
     },
     "provider.base_url_hover": {
-        "en": "The API's base, with its version, e.g. http://127.0.0.1:8080/v1. The API key comes from OPENAI_API_KEY",
-        "es": "La base de la API, con su versión, p. ej. http://127.0.0.1:8080/v1. La clave de la API se toma de OPENAI_API_KEY",
-        "ca": "La base de l'API, amb la seva versió, p. ex. http://127.0.0.1:8080/v1. La clau de l'API s'agafa d'OPENAI_API_KEY"
+        "en": "The API's base, with its version, e.g. http://127.0.0.1:8080/v1",
+        "es": "La base de la API, con su versión, p. ej. http://127.0.0.1:8080/v1",
+        "ca": "La base de l'API, amb la seva versió, p. ex. http://127.0.0.1:8080/v1"
     },
     "provider.api_key": {
         "en": "API key:",
@@ -1284,6 +1284,11 @@
         "en": "Your Claude API key, from platform.claude.com. ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN) when empty. Kept in the settings file, unencrypted",
         "es": "Tu clave de la API de Claude, de platform.claude.com. ANTHROPIC_API_KEY (o ANTHROPIC_AUTH_TOKEN) si está vacía. Se guarda en el archivo de ajustes, sin cifrar",
         "ca": "La teva clau de l'API de Claude, de platform.claude.com. ANTHROPIC_API_KEY (o ANTHROPIC_AUTH_TOKEN) si és buida. Es desa al fitxer de configuració, sense xifrar"
+    },
+    "provider.openai_api_key_hover": {
+        "en": "Your API key for the OpenAI-compatible server. OPENAI_API_KEY when empty; local servers may need no key. Kept in the settings file, unencrypted",
+        "es": "Tu clave de la API del servidor compatible con OpenAI. OPENAI_API_KEY si está vacía; los servidores locales pueden no necesitar clave. Se guarda en el archivo de ajustes, sin cifrar",
+        "ca": "La teva clau de l'API del servidor compatible amb OpenAI. OPENAI_API_KEY si és buida; els servidors locals poden no necessitar clau. Es desa al fitxer de configuració, sense xifrar"
     },
     "provider.workspace_id": {
         "en": "Workspace:",

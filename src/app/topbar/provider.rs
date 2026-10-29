@@ -75,6 +75,8 @@ pub struct ProviderTopbar {
     host: Option<String>,
     /// Claude's API key being typed, likewise
     api_key: Option<String>,
+    /// The OpenAI-compatible API key being typed, likewise
+    openai_api_key: Option<String>,
     /// Claude's workspace being typed, likewise
     workspace_id: Option<String>,
 }
@@ -116,6 +118,7 @@ impl ProviderTopbar {
             models: None,
             host: None,
             api_key: None,
+            openai_api_key: None,
             workspace_id: None,
         }
     }
@@ -251,6 +254,7 @@ impl ProviderTopbar {
                 ModelProvider::OpenAi => {
                     let openai = &mut raw.model.openai;
                     let mut changed = self.base_url(ui, openai);
+                    changed |= self.openai_api_key(ui, openai);
                     changed |= self.model(rt, ui, openai.model().clone(), &mut openai.model);
                     changed
                 }
@@ -370,6 +374,7 @@ impl ProviderTopbar {
 
     fn openai(&mut self, rt: &Handle, ui: &mut egui::Ui, config: &mut OpenAiConfig) -> bool {
         let mut changed = self.base_url(ui, config);
+        changed |= self.openai_api_key(ui, config);
         changed |= self.model(rt, ui, config.model().clone(), &mut config.model);
         changed |= pick(
             ui,
@@ -450,6 +455,23 @@ impl ProviderTopbar {
             t!("provider.api_key"),
             t!("provider.api_key_hint"),
             t!("provider.api_key_hover"),
+            true,
+        ) else {
+            return false;
+        };
+        config.api_key.set(api_key);
+        true
+    }
+
+    /// The OpenAI-compatible API's key.
+    fn openai_api_key(&mut self, ui: &mut egui::Ui, config: &mut OpenAiConfig) -> bool {
+        let Some(api_key) = text_field(
+            &mut self.openai_api_key,
+            ui,
+            config.api_key().clone(),
+            t!("provider.api_key"),
+            "OPENAI_API_KEY",
+            t!("provider.openai_api_key_hover"),
             true,
         ) else {
             return false;
@@ -796,7 +818,14 @@ fn location(model: &ModelConfig, account: Option<&Account>) -> Option<String> {
             })
         }
         ModelProvider::Ollama => model.ollama.host().clone(),
-        ModelProvider::OpenAi => model.openai.base_url().clone(),
+        ModelProvider::OpenAi => {
+            let openai = &model.openai;
+            (openai.base_url().is_some() || openai.api_key().is_some()).then(|| {
+                let base_url = openai.base_url().as_deref().unwrap_or_default();
+                let api_key = openai.api_key().as_deref().unwrap_or_default();
+                format!("{base_url}\n{api_key}")
+            })
+        }
     }
 }
 
