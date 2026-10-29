@@ -241,8 +241,10 @@ impl Contents {
 
         let mut tables = Vec::with_capacity(names.len());
         for name in names {
+            // `table_xinfo`, as `table_info` leaves out generated columns. Hidden ones (1) are only
+            // virtual tables', which aren't read
             let columns = conn
-                .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?
+                .prepare("SELECT name FROM pragma_table_xinfo(?1) WHERE hidden != 1 ORDER BY cid")?
                 .query_map([&name], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let (rows, digest) = digest(conn, &name, &columns)?;
@@ -391,14 +393,14 @@ mod tests {
              CREATE TABLE telemetry (id INTEGER PRIMARY KEY, vehicle_id INTEGER, speed REAL, name TEXT);
              CREATE TABLE wheel (telemetry_id INTEGER, wheel INTEGER, temp REAL,
                  PRIMARY KEY (telemetry_id, wheel)) WITHOUT ROWID;
-             CREATE TABLE notes (body BLOB, n);
+             CREATE TABLE notes (body BLOB, n, twice GENERATED ALWAYS AS (n * 2) STORED);
              CREATE INDEX notes_by_n ON notes (n);
              CREATE VIEW fast AS SELECT * FROM telemetry WHERE speed > 50;
              WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
              INSERT INTO telemetry SELECT i, i % 20, i * 0.25, 'car ' || (i % 20) FROM n;
              INSERT INTO wheel SELECT id, w, speed + w FROM telemetry,
                  (SELECT 0 AS w UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3);
-             INSERT INTO notes VALUES (x'00ff', 1), (x'00ff', 1), (NULL, 2.5), ('text', -0.0);",
+             INSERT INTO notes (body, n) VALUES (x'00ff', 1), (x'00ff', 1), (NULL, 2.5), ('text', -0.0);",
         )
         .unwrap();
         (path, conn)
@@ -485,6 +487,10 @@ mod tests {
             ),
             (
                 "ALTER TABLE notes RENAME COLUMN n TO m",
+                "couldn't read table notes",
+            ),
+            (
+                "ALTER TABLE notes DROP COLUMN twice",
                 "couldn't read table notes",
             ),
             ("PRAGMA user_version = 8", "user_version"),

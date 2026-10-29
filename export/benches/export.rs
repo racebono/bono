@@ -4,7 +4,8 @@
 //! - `EXPORT_BENCH_DB`: a recording (`telemetry.db`) to export. Without it, a race of
 //!   `EXPORT_BENCH_MINUTES` (default 10) is made up, in the recorder's schema. Its values are
 //!   smooth curves, which compress differently from a real car's.
-//! - `EXPORT_BENCH_DIR`: where the copies go (default: in Cargo's target folder).
+//! - `EXPORT_BENCH_DIR`: where the copies go, in a folder of their own deleted afterwards (default:
+//!   Cargo's target folder).
 //!
 //! Each query is timed on a new connection (first run: nothing in SQLite's cache yet, though the
 //! files likely are in the OS's), then as the best of 5 more.
@@ -18,12 +19,16 @@ use std::{
 };
 
 fn main() -> anyhow::Result<()> {
-    let dir = match std::env::var_os("EXPORT_BENCH_DIR") {
+    let base = match std::env::var_os("EXPORT_BENCH_DIR") {
         Some(dir) => PathBuf::from(dir),
-        None => Path::new(env!("CARGO_TARGET_TMPDIR")).join("export-bench"),
+        None => PathBuf::from(env!("CARGO_TARGET_TMPDIR")),
     };
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(&base)?;
+    // A folder of its own, deleted when done: nothing else in `base` is touched
+    let temp = tempfile::Builder::new()
+        .prefix("export-bench-")
+        .tempdir_in(&base)?;
+    let dir = temp.path();
 
     let source = match std::env::var_os("EXPORT_BENCH_DB") {
         Some(path) => PathBuf::from(path),
