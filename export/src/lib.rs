@@ -39,7 +39,7 @@ pub enum Step {
     PageSize,
     /// The caller's schema changes and indexes.
     Schema,
-    /// The query planner's statistics (`ANALYZE`).
+    /// The query planner's statistics (`ANALYZE`), but for `sqlite_stat4`'s samples.
     Statistics,
     /// Vacuumed once more, after the steps that grew it.
     Vacuum,
@@ -134,7 +134,10 @@ pub fn export_with(
     tx.commit()?;
     after(Step::Schema, &work)?;
 
-    conn.execute_batch("ANALYZE")?;
+    // Only `sqlite_stat1`'s: with `sqlite_stat4`'s samples, SQLite plans a statement again whenever
+    // a value bound to it is compared with an indexed column, which made looking rows up by id about
+    // 2.5 times slower (see the benchmark)
+    conn.execute_batch("ANALYZE; DROP TABLE IF EXISTS sqlite_stat4;")?;
     after(Step::Statistics, &work)?;
 
     conn.execute_batch("VACUUM")?;
@@ -480,7 +483,8 @@ mod tests {
             .query_row(
                 "SELECT (SELECT count(*) FROM wheel),
                     EXISTS (SELECT 1 FROM sqlite_schema WHERE name = 'telemetry_by_vehicle'),
-                    EXISTS (SELECT 1 FROM sqlite_schema WHERE name = 'sqlite_stat1'),
+                    EXISTS (SELECT 1 FROM sqlite_schema WHERE name = 'sqlite_stat1')
+                        AND NOT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = 'sqlite_stat4'),
                     (SELECT user_version FROM pragma_user_version)",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
