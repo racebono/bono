@@ -217,14 +217,19 @@ fn workload(conn: &Connection) -> rusqlite::Result<Vec<(&'static str, Duration)>
     })?;
 
     let mut random = Lcg(42);
+    // The recording's own cars: simulators number them as they like
+    let vehicles = conn
+        .prepare("SELECT DISTINCT vehicle_id FROM car_state WHERE vehicle_id IS NOT NULL")?
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     time("500 cars' states", &mut || {
         let mut stmt = conn.prepare(
             "SELECT * FROM car_state WHERE vehicle_id = ? AND telemetry_id <= ? \
              ORDER BY telemetry_id DESC LIMIT 1",
         )?;
-        for _ in 0..500 {
+        for _ in 0..if vehicles.is_empty() { 0 } else { 500 } {
             let (vehicle, id) = (
-                random.below(20) as i64,
+                vehicles[random.below(vehicles.len() as u64) as usize],
                 random.below(player.0 as u64) as i64,
             );
             stmt.query_map(params![vehicle, id], |_| Ok(()))?
