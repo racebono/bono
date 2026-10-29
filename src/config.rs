@@ -681,8 +681,8 @@ settings! {
     /// A model behind an OpenAI-compatible API.
     #[derive(Debug, PartialEq)]
     pub struct OpenAiConfig {
-        /// The API's base, with its version, e.g. `http://127.0.0.1:8080/v1`: llama.cpp's
-        /// `llama-server` on this PC when `None`
+        /// The API's base, with its version, e.g. `http://127.0.0.1:8080/v1`: OpenAI's own
+        /// when `None`
         pub base_url: Option<String> = None,
         /// Sent as a bearer token: `OPENAI_API_KEY` when `None` (local servers need none)
         pub api_key: Option<String> = None,
