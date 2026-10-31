@@ -14,7 +14,7 @@
 
 use rusqlite::ffi;
 use std::{
-    cell::RefCell,
+    cell::Cell,
     collections::HashMap,
     ffi::{CStr, c_char, c_int, c_void},
     sync::{Mutex, OnceLock},
@@ -88,13 +88,13 @@ pub fn register() -> rusqlite::Result<()> {
 
 thread_local! {
     /// Why the last file this thread opened couldn't be, for `take_error`.
-    static ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+    static ERROR: Cell<Option<String>> = const { Cell::new(None) };
 }
 
 /// Why the last database this thread tried to open through the VFS couldn't be, which SQLite only
 /// reports as "unable to open database file".
 pub(crate) fn take_error() -> Option<String> {
-    ERROR.with_borrow_mut(Option::take)
+    ERROR.take()
 }
 
 /// `url` without what can hold credentials, for messages: its query (a presigned URL's signature)
