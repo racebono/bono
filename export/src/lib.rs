@@ -1,7 +1,7 @@
 //! Exports a SQLite database into one small copy that's fast to read, for keeping: a snapshot of it,
 //! moved out of WAL mode onto 8 KiB pages, given extra indexes and the query planner's statistics,
-//! vacuumed, then compressed page by page with zstd (see `vfs`). Read it with `open`: it's no
-//! longer a plain SQLite file.
+//! vacuumed, then compressed page by page with zstd (see `vfs`). Read it with `open`, or over
+//! HTTP(S) with `open_url`: it's no longer a plain SQLite file.
 //!
 //! The export is checked against the snapshot before it's kept: every table's rows, its columns'
 //! declarations (type, NOT NULL, default, primary key, generated), every index, view and trigger,
@@ -11,6 +11,7 @@
 //! for a race, more for a weekend): call it from a worker thread.
 
 pub mod vfs;
+pub mod web;
 
 use anyhow::{Context, bail, ensure};
 use rusqlite::{Connection, OpenFlags, config::DbConfig, types::ValueRef};
@@ -188,6 +189,40 @@ pub fn open(path: &Path) -> anyhow::Result<Connection> {
     )
     .with_context(|| format!("couldn't open {}", path.display()))?;
     conn.pragma_update(None, "cache_size", -CACHE_KIB)?;
+    Ok(conn)
+}
+
+/// Opens a database `export` made, read-only, from `url` on a server answering range requests (S3,
+/// R2, a CDN, a presigned URL to one...): only the pages queries read are downloaded (see `web`).
+/// The file mustn't change while it's open. Every query blocks for as long as its requests take, on
+/// top of reading: run them on a worker thread.
+pub fn open_url(url: &str) -> anyhow::Result<Connection> {
+    vfs::register()?;
+    web::register()?;
+    let mut uri = format!(
+        "file:{}?vfs={}&mode=ro&immutable=1&outer_cache_size=-{CACHE_KIB}&web_url=",
+        web::FILENAME,
+        vfs::VFS
+    );
+    vfs::escape(&mut uri, url);
+    // Its query can hold credentials: messages leave it out
+    let shown = url.split(['?', '#']).next().unwrap_or(url);
+    web::take_error();
+    let conn = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    // Not SQLite's message, which repeats the URI
+    .map_err(|e| match (web::take_error(), e.sqlite_error()) {
+        (Some(why), _) => anyhow::anyhow!(why),
+        (None, Some(e)) => anyhow::anyhow!("{e}"),
+        (None, None) => e.into(),
+    })
+    .with_context(|| format!("couldn't open {shown}"))?;
+    conn.pragma_update(None, "cache_size", -CACHE_KIB)?;
+    check_format(&conn)?;
     Ok(conn)
 }
 

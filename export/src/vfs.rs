@@ -103,7 +103,7 @@ pub fn uri(path: &Path) -> std::io::Result<String> {
 }
 
 /// Percent-encodes what a URI filename's path can't hold as is.
-fn escape(uri: &mut String, name: &str) {
+pub(crate) fn escape(uri: &mut String, name: &str) {
     for byte in name.bytes() {
         match byte {
             b'%' | b'?' | b'#' | b'/' | b'\\' | b'&' | b'=' | 0..=b' ' | 0x7f.. => {

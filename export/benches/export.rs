@@ -6,13 +6,24 @@
 //!   smooth curves, which compress differently from a real car's.
 //! - `EXPORT_BENCH_DIR`: where the copies go, in a folder of their own deleted afterwards (default:
 //!   Cargo's target folder).
+//! - `EXPORT_BENCH_LATENCY_MS`: how long the local HTTP server waits before each answer (default
+//!   30, a nearby region's round trip).
 //!
 //! Each query is timed on a new connection (first run: nothing in SQLite's cache yet, though the
-//! files likely are in the OS's), then as the best of 5 more.
+//! files likely are in the OS's), then as the best of 5 more. Then the final database and the
+//! export are read over HTTP, from a local server answering range requests: each query once, on a
+//! new connection, with the requests it took and the bytes they carried. The server has no
+//! bandwidth limit: at 100 Mbit/s, each MiB adds 0.08 s.
+
+// Only part of it is used here
+#[allow(dead_code)]
+#[path = "../tests/serve/mod.rs"]
+mod serve;
 
 use bono_export::Step;
 use bono_sim::sql;
 use rusqlite::{Connection, OpenFlags, params, types::Value};
+use serve::Server;
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -98,9 +109,10 @@ fn main() -> anyhow::Result<()> {
             )?)
         }
     };
+    let local = || (0, 0);
     let mut first = Vec::new();
     for (name, path, _, _) in &stages {
-        first.push(workload(&open(name, path)?)?);
+        first.push(workload(&open(name, path)?, &local)?);
     }
     // Stages take turns, so none is timed only while the OS is busy with the files just written
     let conns = stages
@@ -109,11 +121,11 @@ fn main() -> anyhow::Result<()> {
         .collect::<anyhow::Result<Vec<_>>>()?;
     let mut best = conns
         .iter()
-        .map(workload)
+        .map(|conn| workload(conn, &local))
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for _ in 0..4 {
         for (best, conn) in best.iter_mut().zip(&conns) {
-            for (b, (_, t)) in best.iter_mut().zip(workload(conn)?) {
+            for (b, (_, t, _)) in best.iter_mut().zip(workload(conn, &local)?) {
                 b.1 = b.1.min(t);
             }
         }
@@ -121,24 +133,98 @@ fn main() -> anyhow::Result<()> {
 
     println!();
     print!("| Step |");
-    for (query, _) in &first[0] {
+    for (query, ..) in &first[0] {
         print!(" {query} |");
     }
     println!();
     println!("|---{}|", "|---:".repeat(first[0].len()));
     for (((name, ..), first), best) in stages.iter().zip(&first).zip(&best) {
         print!("| {name} |");
-        for ((_, first), (_, best)) in first.iter().zip(best) {
+        for ((_, first, _), (_, best, _)) in first.iter().zip(best) {
             print!(" {} / {} |", ms(*first), ms(*best));
         }
         println!();
     }
     println!("\n(milliseconds: first run on a new connection / best of 5 more)");
+
+    let latency = std::env::var("EXPORT_BENCH_LATENCY_MS")
+        .ok()
+        .map(|ms| ms.parse())
+        .transpose()?
+        .unwrap_or(30);
+    let server = Server::start(dir.to_owned(), Duration::from_millis(latency));
+    let counts = || server.counts();
+    println!();
+    print!("| Over HTTP, {latency} ms away | open |");
+    for (query, ..) in &first[0] {
+        print!(" {query} |");
+    }
+    println!(" all |");
+    println!("|---{}|", "|---:".repeat(first[0].len() + 2));
+    for step in [Step::Vacuum, Step::Compress] {
+        let name = format!("{step:?}.db");
+        let (start, before) = (Instant::now(), counts());
+        let conn = if step == Step::Compress {
+            bono_export::open_url(&server.url(&name))?
+        } else {
+            plain_over_http(&server.url(&name))?
+        };
+        // Opening reads the schema
+        conn.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))?;
+        let opened = counts();
+        print!(
+            "| {step:?} | {} |",
+            fetched(start.elapsed(), (opened.0 - before.0, opened.1 - before.1))
+        );
+        for (_, took, counted) in workload(&conn, &counts)? {
+            print!(" {} |", fetched(took, counted));
+        }
+        let after = counts();
+        println!(
+            " {} req, {:.1} of {:.1} MiB |",
+            after.0 - before.0,
+            mib(after.1 - before.1),
+            mib(dir.join(&name).metadata()?.len())
+        );
+    }
+    println!("\n(each query once, in turn on one new connection: milliseconds, requests, MiB)");
     Ok(())
 }
 
 fn ms(d: Duration) -> String {
     format!("{:.2}", d.as_secs_f64() * 1000.0)
+}
+
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+fn fetched(took: Duration, (requests, bytes): (u64, u64)) -> String {
+    format!(
+        "{:.0} ms, {requests}, {:.1}",
+        took.as_secs_f64() * 1000.0,
+        mib(bytes)
+    )
+}
+
+/// A plain database at `url`, read through the web VFS.
+fn plain_over_http(url: &str) -> anyhow::Result<Connection> {
+    bono_export::web::register()?;
+    let mut uri = format!(
+        "file:{}?vfs={}&mode=ro&immutable=1&web_url=",
+        bono_export::web::FILENAME,
+        bono_export::web::VFS
+    );
+    for c in url.chars() {
+        match c {
+            '%' | '?' | '#' | '&' | '=' => uri.push_str(&format!("%{:02X}", c as u8)),
+            _ => uri.push(c),
+        }
+    }
+    Ok(Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )?)
 }
 
 fn size_with_wal(path: &Path) -> std::io::Result<u64> {
@@ -147,14 +233,24 @@ fn size_with_wal(path: &Path) -> std::io::Result<u64> {
     Ok(path.metadata()?.len() + std::fs::metadata(wal).map_or(0, |m| m.len()))
 }
 
+/// A query's name, how long it took, and the requests and bytes it took over HTTP.
+type Timed = (&'static str, Duration, (u64, u64));
+
 /// The app's queries on a recording: finding the player, listing laps, and reading laps, cars'
 /// states and single rows (see `src/engineer/tool.rs` and `src/spotter.rs`).
-fn workload(conn: &Connection) -> rusqlite::Result<Vec<(&'static str, Duration)>> {
+///
+/// Each query's time, and how much `counts` (requests and bytes, over HTTP) went up meanwhile.
+fn workload(conn: &Connection, counts: &dyn Fn() -> (u64, u64)) -> rusqlite::Result<Vec<Timed>> {
     let mut times = Vec::new();
     let mut time = |name, f: &mut dyn FnMut() -> rusqlite::Result<()>| {
-        let start = Instant::now();
+        let (start, before) = (Instant::now(), counts());
         f()?;
-        times.push((name, start.elapsed()));
+        let after = counts();
+        times.push((
+            name,
+            start.elapsed(),
+            (after.0 - before.0, after.1 - before.1),
+        ));
         Ok::<_, rusqlite::Error>(())
     };
 

@@ -9,9 +9,12 @@ publish = false
 # `vendor` (see `vendor/README.md`) rather than loaded as an extension.
 [dependencies]
 anyhow = "1.0.104"
+log = "0.4.34"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 sha2 = "0.10"
 tempfile = "3.27.0"
+# Without gzip: a range of a compressed response isn't the file's
+ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
 zstd-sys = "2.0.15"
 
 [build-dependencies]
