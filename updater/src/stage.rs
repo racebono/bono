@@ -26,7 +26,7 @@ pub struct Bundle {
     pub identity: Identity,
     pub files: BTreeMap<String, String>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Ready {
     pub generation: String,
     pub identity: Identity,
@@ -119,6 +119,27 @@ pub fn restore(root: &Path, installed: &Identity) -> anyhow::Result<Option<Ready
     let installable = ready(root, installed)?;
     cleanup(root, durable.as_ref())?;
     Ok(installable)
+}
+
+/// Caller holds the update lock. Unchanged generations were already validated; only hash a
+/// bundle again when its durable pointer changes. Installation always revalidates every file.
+pub fn refresh(
+    root: &Path,
+    installed: &Identity,
+    known: Option<&Ready>,
+) -> anyhow::Result<Option<Ready>> {
+    let durable: Option<Ready> = if root.join("ready.json").exists() {
+        Some(read_json(&root.join("ready.json"))?)
+    } else {
+        None
+    };
+    if let Some(known) = known
+        .filter(|known| Some(*known) == durable.as_ref() && known.identity.newer_than(installed))
+    {
+        generation_path(root, known)?;
+        return Ok(Some(known.clone()));
+    }
+    restore(root, installed)
 }
 
 pub fn generation_path(root: &Path, ready: &Ready) -> anyhow::Result<PathBuf> {

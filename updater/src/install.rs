@@ -297,17 +297,27 @@ fn rollback(directory: &Path, op: &Operation, journal: &mut Journal) -> anyhow::
                 continue;
             }
             fs::create_dir_all(target.parent().unwrap())?;
-            fs::copy(directory.join("backup").join(name), &target)?;
-            fs::OpenOptions::new()
-                .write(true)
-                .open(target)?
-                .sync_all()?;
+            replace_file(&directory.join("backup").join(name), &target)?;
         } else if target.exists() {
             fs::remove_file(target)?;
         }
     }
     journal.phase = "rolled_back".into();
     write_json(&directory.join("journal.json"), journal)
+}
+
+/// Replace an entry instead of truncating its inode: unrelated hard links retain their bytes.
+fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
+    use std::io::Write;
+    no_links(source)?;
+    no_links(target)?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(target.parent().context("Missing target parent")?)?;
+    std::io::copy(&mut fs::File::open(source)?, &mut temporary)?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(target).map_err(|e| e.error)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -332,11 +342,7 @@ fn apply_tracking(
             no_links(&target)?;
             if new.contains(name) {
                 fs::create_dir_all(target.parent().unwrap())?;
-                fs::copy(source.join(name), &target)?;
-                fs::OpenOptions::new()
-                    .write(true)
-                    .open(&target)?
-                    .sync_all()?;
+                replace_file(&source.join(name), &target)?;
             } else if target.exists() {
                 fs::remove_file(target)?;
             }
@@ -613,6 +619,34 @@ mod tests {
                 .unwrap()
                 .contains(RECOVERY)
         );
+    }
+
+    #[test]
+    fn installation_preserves_unrelated_hard_link_contents() {
+        let (temp, op, dir) = fixture();
+        let unrelated = temp.path().join("unrelated-runtime.dll");
+        fs::hard_link(op.destination.join("runtime.dll"), &unrelated).unwrap();
+        apply(&dir, &op).unwrap();
+        assert_eq!(fs::read_to_string(&unrelated).unwrap(), "old");
+        assert_eq!(
+            fs::read_to_string(op.destination.join("runtime.dll")).unwrap(),
+            "new"
+        );
+    }
+
+    #[test]
+    fn rollback_preserves_unrelated_hard_link_contents() {
+        let (temp, op, dir) = fixture();
+        let source = op.root.join(&op.ready.generation).join("bundle");
+        let bundle: Bundle = read_json(&source.join(BUNDLE)).unwrap();
+        let mut journal = backup(&dir, &op, &bundle).unwrap();
+        let target = op.destination.join("runtime.dll");
+        fs::write(&target, "partly installed").unwrap();
+        let unrelated = temp.path().join("unrelated-runtime.dll");
+        fs::hard_link(&target, &unrelated).unwrap();
+        rollback(&dir, &op, &mut journal).unwrap();
+        assert_eq!(fs::read_to_string(unrelated).unwrap(), "partly installed");
+        assert_eq!(fs::read_to_string(target).unwrap(), "old");
     }
 
     #[cfg(unix)]

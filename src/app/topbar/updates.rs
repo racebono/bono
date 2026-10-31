@@ -31,7 +31,6 @@ pub struct Updates {
     error: Option<String>,
     notice: Option<String>,
     next_check: Instant,
-    reload_pending: bool,
     next_load: Instant,
     progress: Arc<AtomicU64>,
     downloading: bool,
@@ -47,7 +46,7 @@ impl Updates {
         let supported =
             cfg!(all(target_os = "windows", target_arch = "x86_64")) && identity.valid();
         let root = pref_path.join("updates").into_std_path_buf();
-        let operation = supported.then(|| load_staged(root.clone(), identity.clone()));
+        let operation = supported.then(|| load_staged(root.clone(), identity.clone(), None));
         Self {
             identity,
             supported,
@@ -58,7 +57,6 @@ impl Updates {
             error: None,
             notice: None,
             next_check: Instant::now(),
-            reload_pending: supported,
             next_load: Instant::now() + Duration::from_secs(5),
             progress: Arc::new(AtomicU64::new(0)),
             downloading: false,
@@ -73,7 +71,6 @@ impl Updates {
             match result {
                 Ok(Completed::Loaded(ready, message)) => {
                     self.ready = ready;
-                    self.reload_pending = false;
                     self.error = None;
                     match message {
                         Some(Ok(_)) => self.notice = Some(t!("updates.finished").to_owned()),
@@ -84,22 +81,23 @@ impl Updates {
                 Ok(Completed::Checked(candidate)) => self.candidate = candidate,
                 Ok(Completed::Downloaded(ready)) => {
                     self.ready = Some(ready);
-                    self.reload_pending = false;
                 }
                 Ok(Completed::InstallPrepared) => self.quit = true,
                 Err(error) => self.error = Some(format!("{error:#}")),
             }
-            // Start the cooldown at completion: even a slow failing restore must leave room
-            // for release checks, rather than immediately starting another local retry.
-            if self.reload_pending {
-                self.next_load = Instant::now() + Duration::from_secs(5);
-            }
+            // Cool down from completion, leaving room for checks even after a slow refresh.
+            self.next_load = Instant::now() + Duration::from_secs(5);
         }
-        if self.supported && self.reload_pending {
-            if self.operation.is_none() && Instant::now() >= self.next_load {
-                self.operation = Some(load_staged(self.root.clone(), self.identity.clone()));
-                self.next_load = Instant::now() + Duration::from_secs(5);
-            }
+        if self.supported
+            && !self.quit
+            && self.operation.is_none()
+            && Instant::now() >= self.next_load
+        {
+            self.operation = Some(load_staged(
+                self.root.clone(),
+                self.identity.clone(),
+                self.ready.clone(),
+            ));
         }
         if self.supported
             && self.operation.is_none()
@@ -228,10 +226,14 @@ impl Updates {
     }
 }
 
-fn load_staged(root: PathBuf, identity: Identity) -> Task<anyhow::Result<Completed>> {
+fn load_staged(
+    root: PathBuf,
+    identity: Identity,
+    known: Option<Ready>,
+) -> Task<anyhow::Result<Completed>> {
     Task::spawn_blocking(move || {
         let _guard = bono_updater::lock(&root)?;
-        let ready = bono_updater::stage::restore(&root, &identity)?;
+        let ready = bono_updater::stage::refresh(&root, &identity, known.as_ref())?;
         let result_path = root.join("result.json");
         let message = if result_path.exists() {
             // A corrupt old result must not hide an otherwise valid offline-installable bundle.
@@ -291,7 +293,6 @@ mod tests {
         };
         updates.supported = true;
         updates.root = root.clone();
-        updates.reload_pending = true;
         updates.operation = None;
         updates.next_load = Instant::now();
         updates.next_check = Instant::now() + Duration::from_secs(3600);
@@ -309,8 +310,7 @@ mod tests {
         finish(&mut updates, rt.handle());
         assert!(updates.ready.is_none());
         assert!(updates.error.is_some());
-        assert!(updates.reload_pending);
-        // Local retry cooldown must not suppress online discovery after a failed restore.
+        // Local refresh cooldown must not suppress online discovery after a failed restore.
         updates.next_check = Instant::now();
         updates.poll(rt.handle());
         assert!(updates.next_check > Instant::now() + Duration::from_secs(60));
@@ -320,15 +320,12 @@ mod tests {
         updates.poll(rt.handle());
         finish(&mut updates, rt.handle());
         assert_eq!(updates.ready.as_ref().unwrap().generation, saved.generation);
-        assert!(!updates.reload_pending);
         assert!(updates.error.is_none());
         fs::write(root.join("result.json"), "corrupt result").unwrap();
-        updates.reload_pending = true;
         updates.next_load = Instant::now();
         updates.poll(rt.handle());
         finish(&mut updates, rt.handle());
         assert!(updates.ready.is_some());
-        assert!(!updates.reload_pending);
         assert!(
             updates
                 .error
@@ -336,5 +333,35 @@ mod tests {
                 .unwrap()
                 .contains("previous update result")
         );
+        // Another instance promotes a replacement and removes our previously cached generation.
+        let replacement = Ready {
+            generation: "generation-replacement".into(),
+            identity: Identity {
+                channel: "stable".into(),
+                tag: "v3.0.0".into(),
+            },
+        };
+        fs::rename(
+            root.join(&saved.generation),
+            root.join(&replacement.generation),
+        )
+        .unwrap();
+        let replacement_bundle = root.join(&replacement.generation).join("bundle");
+        bono_updater::write_json(
+            &replacement_bundle.join(bono_updater::BUNDLE),
+            &bono_updater::stage::manifest(&replacement_bundle, replacement.identity.clone())
+                .unwrap(),
+        )
+        .unwrap();
+        bono_updater::write_json(&root.join("ready.json"), &replacement).unwrap();
+        updates.next_load = Instant::now();
+        updates.poll(rt.handle());
+        finish(&mut updates, rt.handle());
+        assert_eq!(updates.ready.as_ref(), Some(&replacement));
+        fs::remove_file(root.join("ready.json")).unwrap();
+        updates.next_load = Instant::now();
+        updates.poll(rt.handle());
+        finish(&mut updates, rt.handle());
+        assert!(updates.ready.is_none());
     }
 }
