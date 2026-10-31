@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bono-updater = { path = "updater" }
 base64 = "0.22"
 keyring = { version = "3.6.3", features = [
     "windows-native",
@@ -165,7 +166,7 @@ all-languages = [
 ]
 
 [workspace]
-members = ["xtask", "sim", "lmu", "i18n", "phonemizer"]
+members = ["xtask", "sim", "lmu", "i18n", "phonemizer", "updater"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "io-util", "test-util"] }

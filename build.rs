@@ -8,6 +8,12 @@ pub fn main() -> Result<(), ureq::Error> {
     // Without it, any change to the package reruns this, downloading the header again
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-env-changed=BONO_COMMIT");
+    println!("cargo::rerun-if-env-changed=BONO_RELEASE_CHANNEL");
+    println!("cargo::rerun-if-env-changed=BONO_RELEASE_TAG");
+    let channel = var("BONO_RELEASE_CHANNEL").unwrap_or_else(|_| "development".into());
+    let tag = var("BONO_RELEASE_TAG").unwrap_or_default();
+    println!("cargo::rustc-env=BONO_RELEASE_CHANNEL={channel}");
+    println!("cargo::rustc-env=BONO_RELEASE_TAG={tag}");
 
     // The app's version, with the commit as build metadata (`0.1.0+abc1234`) in nightly builds,
     // which set `BONO_COMMIT`

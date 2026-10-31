@@ -1624,5 +1624,75 @@
         "en": "With no game running the engineer can't tell you about your race yet: start one, and ask away.",
         "es": "Sin ningún juego en marcha el ingeniero aún no puede hablarte de tu carrera: inicia uno y pregunta.",
         "ca": "Sense cap joc en marxa l'enginyer encara no et pot parlar de la cursa: inicia'n un i pregunta."
+    },
+    "updates.title": {
+        "en": "App updates",
+        "es": "Actualizaciones de la app",
+        "ca": "Actualitzacions de l’app"
+    },
+    "updates.available": {
+        "en": "Update available",
+        "es": "Actualización disponible",
+        "ca": "Actualització disponible"
+    },
+    "updates.stable": {
+        "en": "Stable channel",
+        "es": "Canal estable",
+        "ca": "Canal estable"
+    },
+    "updates.nightly": {
+        "en": "Nightly channel",
+        "es": "Canal nightly",
+        "ca": "Canal nightly"
+    },
+    "updates.development": {
+        "en": "Development build",
+        "es": "Compilación de desarrollo",
+        "ca": "Compilació de desenvolupament"
+    },
+    "updates.unsupported": {
+        "en": "In-app updates require an official Windows x86-64 build.",
+        "es": "Las actualizaciones requieren una compilación oficial de Windows x86-64.",
+        "ca": "Les actualitzacions requereixen una compilació oficial de Windows x86-64."
+    },
+    "updates.check": {
+        "en": "Check for updates",
+        "es": "Buscar actualizaciones",
+        "ca": "Cerca actualitzacions"
+    },
+    "updates.download": {
+        "en": "Download {version}",
+        "es": "Descargar {version}",
+        "ca": "Descarrega {version}"
+    },
+    "updates.install": {
+        "en": "Install downloaded {version}",
+        "es": "Instalar {version} descargada",
+        "ca": "Instal·la {version} descarregada"
+    },
+    "updates.restart_notice": {
+        "en": "Installing will close and restart Bono.",
+        "es": "La instalación cerrará y reiniciará Bono.",
+        "ca": "La instal·lació tancarà i reiniciarà Bono."
+    },
+    "updates.validating": {
+        "en": "Downloading and validating the full bundle…",
+        "es": "Descargando y validando el paquete completo…",
+        "ca": "Descarregant i validant el paquet complet…"
+    },
+    "updates.working": {
+        "en": "Checking or preparing update…",
+        "es": "Buscando o preparando la actualización…",
+        "ca": "Cercant o preparant l’actualització…"
+    },
+    "updates.current": {
+        "en": "No newer release is available on this channel.",
+        "es": "No hay una versión más reciente en este canal.",
+        "ca": "No hi ha cap versió més recent en aquest canal."
+    },
+    "updates.finished": {
+        "en": "Update operation completed.",
+        "es": "La actualización ha finalizado.",
+        "ca": "L’actualització ha finalitzat."
     }
 }

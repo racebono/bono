@@ -51,7 +51,7 @@ async fn dist() -> anyhow::Result<()> {
     // 1. Build the game and its phonemizer in release, and on Windows the Le Mans Ultimate plugin
     let mut packages = vec!["--package", "bono", "--package", "bono-phonemizer"];
     if cfg!(windows) {
-        packages.extend(["--package", "bono-lmu"]);
+        packages.extend(["--package", "bono-lmu", "--package", "bono-updater"]);
     }
 
     let status = tokio::process::Command::new(&cargo)
@@ -92,6 +92,11 @@ async fn dist() -> anyhow::Result<()> {
 
     // 6. Windows app-local runtimes and the LMU plugin (for the game's Plugins folder)
     if cfg!(windows) {
+        tokio::fs::copy(
+            release.join("bono-updater.exe"),
+            dist.join("bono-updater.exe"),
+        )
+        .await?;
         let cuda = env::var_os("CUDA_PATH")
             .map(PathBuf::from)
             .ok_or_else(|| anyhow::anyhow!("CUDA_PATH is required to package CUDA runtime DLLs"))?;
@@ -105,6 +110,22 @@ async fn dist() -> anyhow::Result<()> {
         runtime::copy_platform_runtimes(&release, &dist)?;
     }
 
+    tokio::fs::copy(root.join("LICENSE"), dist.join("LICENSE")).await?;
+    tokio::fs::copy(
+        root.join("updater/RECOVERY.txt"),
+        dist.join("UPDATE-README.txt"),
+    )
+    .await?;
+    let identity = bono_updater::release::Identity {
+        channel: env::var("BONO_RELEASE_CHANNEL").unwrap_or_else(|_| "development".into()),
+        tag: env::var("BONO_RELEASE_TAG").unwrap_or_default(),
+    };
+    let bundle_root = dist.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let bundle = bono_updater::stage::manifest(&bundle_root, identity)?;
+        bono_updater::write_json(&bundle_root.join(bono_updater::BUNDLE), &bundle)
+    })
+    .await??;
     println!("packaged into {}", dist.display());
     Ok(())
 }

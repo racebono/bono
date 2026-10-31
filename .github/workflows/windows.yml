@@ -82,7 +82,7 @@ jobs:
             # Compiled in via option_env!; without it account sign-in and Bono Cloud are disabled.
             BONO_ACCOUNT_ORIGIN: ${{ vars.BONO_ACCOUNT_ORIGIN }}
         outputs:
-            nightly-tag: ${{ steps.nightly.outputs.tag }}
+            nightly-tag: ${{ steps.identity.outputs.tag }}
         steps:
             - uses: actions/checkout@v6
               with:
@@ -168,6 +168,33 @@ jobs:
                   # Release runs are scoped to refs/tags/*, so caches they save can never be restored.
                   save-if: ${{ github.event_name != 'release' }}
 
+            - name: Identify release channel
+              id: identity
+              env:
+                  IS_NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly }}
+                  IS_RELEASE: ${{ github.event_name == 'release' }}
+                  IS_PRERELEASE: ${{ github.event.release.prerelease }}
+                  RELEASE_TAG: ${{ github.event.release.tag_name }}
+              run: |
+                  if ($env:IS_NIGHTLY -eq 'true') {
+                    $date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
+                    $tag = "nightly-$date-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+                    "BONO_RELEASE_CHANNEL=nightly" >> $env:GITHUB_ENV
+                  } elseif ($env:IS_RELEASE -eq 'true') {
+                    if ($env:IS_PRERELEASE -eq 'true') { throw 'Only stable releases may trigger a release build; use the nightly workflow input for nightlies' }
+                    $tag = $env:RELEASE_TAG
+                    $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+                    if ($tag -notmatch '^v?\d+\.\d+\.\d+$' -or $tag.TrimStart('v') -ne $version) {
+                      throw "Stable tag $tag must match Cargo version $version"
+                    }
+                    "BONO_RELEASE_CHANNEL=stable" >> $env:GITHUB_ENV
+                  } else {
+                    $tag = ''
+                    "BONO_RELEASE_CHANNEL=development" >> $env:GITHUB_ENV
+                  }
+                  "BONO_RELEASE_TAG=$tag" >> $env:GITHUB_ENV
+                  "tag=$tag" >> $env:GITHUB_OUTPUT
+
             - name: Build distribution
               run: |
                   # whisper's nested Vulkan CMake build exceeds MSVC's MAX_PATH limit
@@ -185,8 +212,9 @@ jobs:
 
             - name: Package Windows distribution
               run: |
-                  Copy-Item LICENSE dist
                   Compress-Archive -Path dist/* -DestinationPath bono-windows-x86_64.zip
+                  $hash = (Get-FileHash -LiteralPath bono-windows-x86_64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+                  "$hash  bono-windows-x86_64.zip" | Set-Content -Encoding ascii bono-windows-x86_64.zip.sha256
 
             - name: Upload build artifact
               uses: actions/upload-artifact@v6
@@ -205,9 +233,9 @@ jobs:
                   BUILD_SHA: ${{ needs.changes.outputs.ref }}
               run: |
                   $date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
-                  $tag = "nightly-$date-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+                  $tag = $env:BONO_RELEASE_TAG
                   $notes = "Windows x86-64 nightly build from commit $env:BUILD_SHA.`n`nWorkflow: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
-                  gh release create "$tag" bono-windows-x86_64.zip --target "$env:BUILD_SHA" --title "Nightly $date ($env:GITHUB_RUN_ID.$env:GITHUB_RUN_ATTEMPT)" --notes "$notes" --generate-notes --prerelease --latest=false
+                  gh release create "$tag" bono-windows-x86_64.zip bono-windows-x86_64.zip.sha256 --target "$env:BUILD_SHA" --title "Nightly $date ($env:GITHUB_RUN_ID.$env:GITHUB_RUN_ATTEMPT)" --notes "$notes" --generate-notes --prerelease --latest=false
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                   "tag=$tag" >> $env:GITHUB_OUTPUT
 
@@ -218,7 +246,7 @@ jobs:
                   GH_REPO: ${{ github.repository }}
                   RELEASE_TAG: ${{ github.event.release.tag_name }}
               run: |
-                  gh release upload "$env:RELEASE_TAG" bono-windows-x86_64.zip --clobber
+                  gh release upload "$env:RELEASE_TAG" bono-windows-x86_64.zip bono-windows-x86_64.zip.sha256 --clobber
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     notify:

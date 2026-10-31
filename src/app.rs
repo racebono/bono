@@ -183,6 +183,9 @@ impl App {
 
         self.ui.paint();
         self.ui.present();
+        if self.state.gui.topbar.updates.take_quit() {
+            self.begin_quit(rt);
+        }
         AppResult::Continue
     }
 
