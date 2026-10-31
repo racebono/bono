@@ -342,6 +342,8 @@ impl AppState {
                 heard,
             );
         }
+        let audio = &self.gui.topbar.audio;
+        self.engineer.set_pilot_talking(audio.recording() || audio.transcribing());
         self.engineer.update(
             rt,
             self.simulators.current().is_some(),

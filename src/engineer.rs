@@ -112,6 +112,8 @@ pub struct Engineer {
     held: bool,
     /// Times in a row nothing was understood on the radio
     misheard: u32,
+    /// The pilot is talking on the radio, or being transcribed: scheduled requests wait
+    pilot_talking: bool,
 }
 
 /// A question being answered.
@@ -125,6 +127,8 @@ struct Turn {
     entry: Option<usize>,
     /// The scheduled request it answers, when the pilot didn't just ask
     scheduled: Option<u32>,
+    /// Whether it's spoken (there's a voice)
+    voiced: bool,
 }
 
 /// Speech played as it's synthesized.
@@ -138,6 +142,9 @@ struct Playback {
     drain: Drain,
     /// Play the incomplete-answer tone once this speech has drained.
     tone_after_drain: bool,
+    /// The scheduled request it answers, and whether it was answered: it's done once all of the
+    /// answer is played
+    scheduled: Option<(u32, bool)>,
     sentences: SentenceQueue,
 }
 
@@ -253,6 +260,7 @@ impl Engineer {
             playback: None,
             held: false,
             misheard: 0,
+            pilot_talking: false,
         }
     }
 
@@ -278,6 +286,12 @@ impl Engineer {
     #[inline]
     pub fn language(&self) -> ArrayStr<2> {
         self.last_lang
+    }
+
+    /// Whether the pilot is talking on the radio (or what they said is being transcribed), for
+    /// scheduled requests to wait for them.
+    pub fn set_pilot_talking(&mut self, talking: bool) {
+        self.pilot_talking = talking;
     }
 
     /// Pauses the answer being spoken (and holds one about to start) while the spotter speaks;
@@ -416,6 +430,7 @@ impl Engineer {
             done: false,
             drain: Drain::new(Instant::now()),
             tone_after_drain: false,
+            scheduled: None,
             sentences: SentenceQueue::default(),
         });
     }
@@ -530,6 +545,12 @@ impl Engineer {
 
         // What the model writes goes straight to the synthesizer, and to the chat
         let speech = self.speak(rt, config, synth, lang);
+        let voiced = speech.is_some();
+        if let (Some(id), Some(playback)) = (scheduled, &mut self.playback)
+            && voiced
+        {
+            playback.scheduled = Some((id, false));
+        }
         let lang = speech.as_ref().map_or(lang, |(lang, _)| *lang);
         let speech = speech.map(|(_, speech)| speech);
         let (chat, text) = mpsc::unbounded_channel();
@@ -578,7 +599,17 @@ impl Engineer {
             text,
             entry: None,
             scheduled,
+            voiced,
         });
+    }
+
+    /// The scheduled request `id` was answered: it's done.
+    fn scheduled_done(&mut self, id: u32) {
+        if let Some(session) = &self.session {
+            (session.schedule.lock())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(id);
+        }
     }
 
     /// Asks the first scheduled request that's due, if any, telling the chat about the ones
@@ -681,17 +712,22 @@ impl Engineer {
             {
                 match result {
                     Ok(reply) => {
-                        // Answered: it's done. Otherwise (cut off, refused, unsaid, or failed)
-                        // it's asked again once the engineer's free
+                        // Answered: it's done once it's all been said (without a voice, now).
+                        // Otherwise (cut off, refused, unsaid, its speech failed, or the pilot
+                        // talked over it) it's asked again once the engineer's free
                         let answered =
                             matches!(reply.stop, StopReason::EndTurn | StopReason::StopSequence)
                                 && !reply.text.trim().is_empty();
-                        if answered
-                            && let (Some(id), Some(session)) = (turn.scheduled, &self.session)
-                        {
-                            (session.schedule.lock())
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .remove(id);
+                        if let Some(id) = turn.scheduled {
+                            let speech = (self.playback.as_mut())
+                                .filter(|p| p.scheduled == Some((id, false)));
+                            match speech {
+                                Some(speech) => {
+                                    speech.scheduled = answered.then_some((id, true));
+                                }
+                                None if answered && !turn.voiced => self.scheduled_done(id),
+                                None => {}
+                            }
                         }
                         self.answer(rt, config, synth, reply, turn)
                     }
@@ -714,6 +750,7 @@ impl Engineer {
         if self.turn.is_none()
             && self.playback.is_none()
             && !self.held
+            && !self.pilot_talking
             && !self.new_session
             && !stale
         {
@@ -837,6 +874,7 @@ impl Engineer {
             done: false,
             drain: Drain::new(Instant::now()),
             tone_after_drain: false,
+            scheduled: None,
             sentences: SentenceQueue::default(),
         });
         Some((lang, input))
@@ -937,7 +975,11 @@ impl Engineer {
             Drained::Playing => {}
             Drained::Done => {
                 let tone = playback.tone_after_drain;
+                let scheduled = playback.scheduled;
                 self.playback = None;
+                if let Some((id, true)) = scheduled {
+                    self.scheduled_done(id);
+                }
                 if tone {
                     self.no_beep();
                 }
@@ -1245,6 +1287,7 @@ mod tests {
             done: true,
             drain: Drain::new(Instant::now()),
             tone_after_drain: false,
+            scheduled: None,
             sentences,
         });
         engineer.hold(true);
@@ -1301,6 +1344,7 @@ mod tests {
                 done: false,
                 drain: Drain::new(Instant::now()),
                 tone_after_drain: false,
+                scheduled: None,
                 sentences: SentenceQueue::default(),
             });
             let (_, text) = mpsc::unbounded_channel();
@@ -1320,6 +1364,7 @@ mod tests {
                     text,
                     entry: None,
                     scheduled: None,
+                    voiced: false,
                 },
             );
             let playback = engineer.playback.as_mut().unwrap();
@@ -1372,6 +1417,7 @@ mod tests {
                 text: receiver,
                 entry: None,
                 scheduled: None,
+                voiced: false,
             };
             engineer.answer(
                 rt,
