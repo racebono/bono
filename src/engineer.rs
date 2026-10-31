@@ -317,8 +317,14 @@ impl Engineer {
     /// Starts a new conversation with the next question: the engineer forgets what was said.
     pub fn new_session(&mut self) {
         self.stop();
-        if let Some(lease) = self.session.as_ref().and_then(|s| s.lease.as_ref()) {
-            lease.end();
+        if let Some(session) = &self.session {
+            if let Some(lease) = &session.lease {
+                lease.end();
+            }
+            // What was scheduled is forgotten too
+            (session.schedule.lock())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
         }
         self.new_session = true;
         self.notice(t!("engineer.new_session"));
@@ -486,9 +492,8 @@ impl Engineer {
             || corners_changed
             || self.session.as_ref().is_none_or(|s| s.db != db)
         {
-            // A new session asked for forgets what was scheduled too
             let schedule = (self.session.as_ref())
-                .filter(|s| !self.new_session && s.db == db)
+                .filter(|s| s.db == db)
                 .map(|s| s.schedule.clone());
             match self.start(config, sim, pool, schedule) {
                 Ok(session) => self.session = Some(session),
@@ -676,8 +681,14 @@ impl Engineer {
             {
                 match result {
                     Ok(reply) => {
-                        // Answered: it's done. Otherwise it's asked again once the engineer's free
-                        if let (Some(id), Some(session)) = (turn.scheduled, &self.session) {
+                        // Answered: it's done. Otherwise (cut off, refused, unsaid, or failed)
+                        // it's asked again once the engineer's free
+                        let answered =
+                            matches!(reply.stop, StopReason::EndTurn | StopReason::StopSequence)
+                                && !reply.text.trim().is_empty();
+                        if answered
+                            && let (Some(id), Some(session)) = (turn.scheduled, &self.session)
+                        {
                             (session.schedule.lock())
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .remove(id);
@@ -695,7 +706,8 @@ impl Engineer {
             }
         }
 
-        if self.turn.is_none() && self.playback.is_none() && !self.held {
+        // Not into a conversation about to start over: the pilot's next question starts it
+        if self.turn.is_none() && self.playback.is_none() && !self.held && !self.new_session {
             self.ask_scheduled(rt, config, synth);
         }
 

@@ -40,10 +40,10 @@ struct Request {
     /// The pilot's request, as the model wrote it down
     text: String,
     trigger: Trigger,
-    /// The game session it was set in, and the player's session time then: a request from another
-    /// session (or before a restart) has nothing to be about
+    /// The game session it was set in, and the latest session time the player was seen at since:
+    /// a request from another session (or before a restart) has nothing to be about
     game: Option<GameKey>,
-    set_at: f64,
+    seen: f64,
     state: State,
     /// The condition's failures in a row
     errors: u32,
@@ -147,26 +147,53 @@ impl Schedule {
         self.requests.len() != len
     }
 
-    /// The waiting requests, to check without holding the lock.
-    fn waiting(&self) -> Vec<(u32, Trigger, Option<GameKey>, f64)> {
+    /// Forgets every request: the pilot started over.
+    pub fn clear(&mut self) {
+        self.requests.clear();
+    }
+
+    fn waiting_len(&self) -> usize {
         (self.requests.iter())
             .filter(|r| r.state == State::Waiting)
-            .map(|r| (r.id, r.trigger.clone(), r.game.clone(), r.set_at))
+            .count()
+    }
+
+    /// The requests to check, without holding the lock: the waiting ones' triggers, and whether
+    /// the due ones still belong to the session (`None` trigger).
+    fn to_check(&self) -> Vec<Check> {
+        (self.requests.iter())
+            .filter(|r| r.state != State::Expired)
+            .map(|r| Check {
+                id: r.id,
+                trigger: (r.state == State::Waiting).then(|| r.trigger.clone()),
+                game: r.game.clone(),
+                seen: r.seen,
+            })
             .collect()
     }
 
-    fn apply(&mut self, outcomes: Vec<(u32, Outcome)>) {
+    /// The outcomes of a check, the player seen at session time `time`.
+    fn apply(&mut self, time: f64, outcomes: Vec<(u32, Outcome)>) {
         for (id, outcome) in outcomes {
-            // Cancelled meanwhile, or no longer waiting
+            // Cancelled meanwhile, or expired already
             let Some(request) =
-                (self.requests.iter_mut()).find(|r| r.id == id && r.state == State::Waiting)
+                (self.requests.iter_mut()).find(|r| r.id == id && r.state != State::Expired)
             else {
                 continue;
             };
+            if outcome == Outcome::Expired {
+                request.state = State::Expired;
+                continue;
+            }
+            request.seen = request.seen.max(time);
+            // Due meanwhile: only its session is checked
+            if request.state != State::Waiting {
+                continue;
+            }
             match outcome {
                 Outcome::Pending => request.errors = 0,
                 Outcome::Met => request.state = State::Met,
-                Outcome::Expired => request.state = State::Expired,
+                Outcome::Expired => unreachable!(),
                 Outcome::Error(error) => {
                     request.errors += 1;
                     if request.errors >= MAX_ERRORS {
@@ -176,6 +203,14 @@ impl Schedule {
             }
         }
     }
+}
+
+/// A request to check: its trigger, unless it's due already.
+struct Check {
+    id: u32,
+    trigger: Option<Trigger>,
+    game: Option<GameKey>,
+    seen: f64,
 }
 
 fn lock(schedule: &Mutex<Schedule>) -> MutexGuard<'_, Schedule> {
@@ -188,16 +223,16 @@ pub async fn watch(schedule: Arc<Mutex<Schedule>>, pool: Pool) {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        let waiting = lock(&schedule).waiting();
-        if waiting.is_empty() {
+        let checks = lock(&schedule).to_check();
+        if checks.is_empty() {
             continue;
         }
         let checked = async {
             let conn = pool.get().await?;
-            conn.run(move |conn| check(conn, &waiting)).await
+            conn.run(move |conn| check(conn, &checks)).await
         };
         match checked.await {
-            Ok(outcomes) => lock(&schedule).apply(outcomes),
+            Ok((time, outcomes)) => lock(&schedule).apply(time, outcomes),
             // The recorder is busy, or the player isn't in the car: the next poll tries again
             Err(e) => log::debug!("Error checking the engineer's schedule: {e:#}"),
         }
@@ -235,39 +270,47 @@ impl Now {
     }
 }
 
-/// Each waiting request's outcome now. `Err` when where the player is can't be read: nothing is
-/// decided then.
-fn check(
-    conn: &Connection,
-    waiting: &[(u32, Trigger, Option<GameKey>, f64)],
-) -> anyhow::Result<Vec<(u32, Outcome)>> {
+/// The player's session time now, and each request's outcome. `Err` when where the player is
+/// can't be read: nothing is decided then.
+fn check(conn: &Connection, checks: &[Check]) -> anyhow::Result<(f64, Vec<(u32, Outcome)>)> {
     let now = Now::read(conn)?.context("no player telemetry")?;
-    Ok(waiting
+    let outcomes = checks
         .iter()
-        .map(|(id, trigger, game, set_at)| {
-            // A new session, or the same one restarted
-            if *game != now.game || now.time < set_at - 1.0 {
-                return (*id, Outcome::Expired);
-            }
-            let outcome = match trigger {
-                Trigger::Time(at) => match now.time >= *at {
-                    true => Outcome::Met,
-                    false => Outcome::Pending,
-                },
-                Trigger::Lap(lap) => match now.lap >= *lap {
-                    true => Outcome::Met,
-                    false => Outcome::Pending,
-                },
-                Trigger::When(query) => match condition(conn, query) {
-                    Ok(true) => Outcome::Met,
-                    Ok(false) => Outcome::Pending,
-                    Err(e) if busy(&e) => Outcome::Pending,
-                    Err(e) => Outcome::Error(format!("{e:#}")),
-                },
-            };
-            (*id, outcome)
-        })
-        .collect())
+        .map(
+            |Check {
+                 id,
+                 trigger,
+                 game,
+                 seen,
+             }| {
+                // A new session, or the same one restarted
+                if *game != now.game || now.time < seen - 1.0 {
+                    return (*id, Outcome::Expired);
+                }
+                let Some(trigger) = trigger else {
+                    return (*id, Outcome::Pending);
+                };
+                let outcome = match trigger {
+                    Trigger::Time(at) => match now.time >= *at {
+                        true => Outcome::Met,
+                        false => Outcome::Pending,
+                    },
+                    Trigger::Lap(lap) => match now.lap >= *lap {
+                        true => Outcome::Met,
+                        false => Outcome::Pending,
+                    },
+                    Trigger::When(query) => match condition(conn, query) {
+                        Ok(true) => Outcome::Met,
+                        Ok(false) => Outcome::Pending,
+                        Err(e) if busy(&e) => Outcome::Pending,
+                        Err(e) => Outcome::Error(format!("{e:#}")),
+                    },
+                };
+                (*id, outcome)
+            },
+        )
+        .collect();
+    Ok((now.time, outcomes))
 }
 
 /// The logger is mid-write: not the condition's fault.
@@ -450,7 +493,7 @@ impl ScheduleTool {
             (None, None, None, Some(query)) => Asked::When(query),
             _ => bail!("add needs exactly one of `in_seconds`, `in_laps`, `at_lap` or `when`"),
         };
-        if lock(&self.schedule).waiting().len() >= MAX_WAITING {
+        if lock(&self.schedule).waiting_len() >= MAX_WAITING {
             bail!("{MAX_WAITING} requests are already scheduled: cancel one first");
         }
 
@@ -485,7 +528,7 @@ impl ScheduleTool {
         };
 
         let mut schedule = lock(&self.schedule);
-        if schedule.waiting().len() >= MAX_WAITING {
+        if schedule.waiting_len() >= MAX_WAITING {
             bail!("{MAX_WAITING} requests are already scheduled: cancel one first");
         }
         schedule.next_id += 1;
@@ -496,7 +539,7 @@ impl ScheduleTool {
             text,
             trigger,
             game: now.game,
-            set_at: now.time,
+            seen: now.time,
             state: State::Waiting,
             errors: 0,
             attempts: 0,
@@ -605,10 +648,10 @@ mod tests {
     }
 
     async fn check_now(tool: &ScheduleTool) {
-        let waiting = lock(&tool.schedule).waiting();
+        let checks = lock(&tool.schedule).to_check();
         let conn = tool.pool.get().await.unwrap();
-        let outcomes = conn.run(move |conn| check(conn, &waiting)).await.unwrap();
-        lock(&tool.schedule).apply(outcomes);
+        let (time, outcomes) = conn.run(move |conn| check(conn, &checks)).await.unwrap();
+        lock(&tool.schedule).apply(time, outcomes);
     }
 
     /// The recorder writes on its own thread: waits for the player's row at `t`.
@@ -725,7 +768,7 @@ mod tests {
         assert_eq!(lock(&schedule).next(), None);
 
         // Fakes the trigger being met: asked, at most twice
-        lock(&schedule).apply(vec![(1, Outcome::Met)]);
+        lock(&schedule).apply(150.0, vec![(1, Outcome::Met)]);
         for _ in 0..MAX_ATTEMPTS {
             let Some(Next::Ask {
                 id, prompt, failed, ..
@@ -743,12 +786,12 @@ mod tests {
 
         // A condition failing is given up, once it's failed for a while
         for _ in 1..MAX_ERRORS {
-            lock(&schedule).apply(vec![(2, Outcome::Error("broken".into()))]);
+            lock(&schedule).apply(150.0, vec![(2, Outcome::Error("broken".into()))]);
         }
-        lock(&schedule).apply(vec![(2, Outcome::Pending)]);
+        lock(&schedule).apply(150.0, vec![(2, Outcome::Pending)]);
         for _ in 0..MAX_ERRORS {
             assert_eq!(lock(&schedule).next(), None);
-            lock(&schedule).apply(vec![(2, Outcome::Error("broken".into()))]);
+            lock(&schedule).apply(150.0, vec![(2, Outcome::Error("broken".into()))]);
         }
         let Some(Next::Ask { failed, prompt, .. }) = lock(&schedule).next() else {
             panic!("not told");
@@ -756,20 +799,55 @@ mod tests {
         assert!(failed && prompt.contains("broken"), "{prompt}");
         assert!(lock(&schedule).remove(2));
 
-        // Another session: whatever was waiting is dropped
-        tool.run(add(serde_json::json!({"request": "later", "in_laps": 1})))
-            .await
-            .unwrap();
+        // Another session: whatever was waiting is dropped, and whatever was due but not asked yet
+        for request in ["later", "due"] {
+            tool.run(add(serde_json::json!({"request": request, "in_laps": 1})))
+                .await
+                .unwrap();
+        }
+        lock(&schedule).apply(150.0, vec![(4, Outcome::Met)]);
         drive(&recorder, "practice", 5.0);
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            check_now(&tool).await;
-            if let Some(next) = lock(&schedule).next() {
-                assert_eq!(next, Next::Expired("later".into()));
-                break;
-            }
+        while !(lock(&schedule).requests.iter()).all(|r| r.state == State::Expired) {
             assert!(Instant::now() < deadline, "never expired");
             tokio::time::sleep(Duration::from_millis(20)).await;
+            check_now(&tool).await;
         }
+        assert_eq!(lock(&schedule).next(), Some(Next::Expired("later".into())));
+        assert_eq!(lock(&schedule).next(), Some(Next::Expired("due".into())));
+        assert_eq!(lock(&schedule).next(), None);
+    }
+
+    #[test]
+    fn a_restarted_session_expires_requests_set_at_its_start() {
+        let mut schedule = Schedule::default();
+        schedule.requests.push(Request {
+            id: 1,
+            text: "in five minutes".into(),
+            trigger: Trigger::Time(300.0),
+            game: None,
+            seen: 0.0,
+            state: State::Waiting,
+            errors: 0,
+            attempts: 0,
+        });
+        schedule.apply(200.0, vec![(1, Outcome::Pending)]);
+        let checks = schedule.to_check();
+        assert_eq!(checks[0].seen, 200.0);
+        // Back at the start of the same session
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE telemetry (id INTEGER PRIMARY KEY, is_player, session_time, lap);
+             CREATE TABLE session (id INTEGER PRIMARY KEY, track, session_type, session_number);
+             INSERT INTO telemetry VALUES (1, 1, 10.0, 0);",
+        )
+        .unwrap();
+        let (time, outcomes) = check(&conn, &checks).unwrap();
+        assert_eq!(outcomes, vec![(1, Outcome::Expired)]);
+        schedule.apply(time, outcomes);
+        assert_eq!(
+            schedule.next(),
+            Some(Next::Expired("in five minutes".into()))
+        );
     }
 }
