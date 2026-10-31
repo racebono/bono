@@ -706,8 +706,17 @@ impl Engineer {
             }
         }
 
-        // Not into a conversation about to start over: the pilot's next question starts it
-        if self.turn.is_none() && self.playback.is_none() && !self.held && !self.new_session {
+        // Not into a conversation about to start over (asked for, full, or with other settings):
+        // the pilot's next question starts it
+        let stale = self.session.as_ref().is_some_and(|s| {
+            s.model != config.get().model || s.corner_names != *config.get().corner_names()
+        });
+        if self.turn.is_none()
+            && self.playback.is_none()
+            && !self.held
+            && !self.new_session
+            && !stale
+        {
             self.ask_scheduled(rt, config, synth);
         }
 

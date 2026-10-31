@@ -505,7 +505,11 @@ impl ScheduleTool {
                 )?;
                 let trigger = match asked {
                     Asked::InSeconds(s) => Trigger::Time(now.time + s),
-                    Asked::InLaps(laps) => Trigger::Lap(now.lap + laps),
+                    Asked::InLaps(laps) => Trigger::Lap(
+                        now.lap
+                            .checked_add(laps)
+                            .context("`in_laps` is too large")?,
+                    ),
                     Asked::AtLap(lap) if lap > now.lap => Trigger::Lap(lap),
                     Asked::AtLap(lap) => {
                         bail!("the player is already on lap {} (asked for {lap})", now.lap)
@@ -710,6 +714,7 @@ mod tests {
         for bad in [
             serde_json::json!({"at_lap": 1}),
             serde_json::json!({"in_laps": 0}),
+            serde_json::json!({"in_laps": i64::MAX}),
             serde_json::json!({"in_seconds": -5}),
             serde_json::json!({"in_laps": 1, "at_lap": 5}),
             serde_json::json!({}),
