@@ -100,6 +100,11 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Indexes for reading a recording once it's exported (see `bono-export`), which a recording does
+/// without to keep writing cheap: a car's rows in a range of ids, as the engineer reads laps.
+pub const EXPORT_SCHEMA: &str =
+    "CREATE INDEX IF NOT EXISTS telemetry_by_vehicle ON telemetry (vehicle_id);";
+
 /// Replaces a previous run's schema, including tables from older versions.
 pub fn recreate_tables(conn: &Connection) -> rusqlite::Result<()> {
     let tables = conn

@@ -1,0 +1,26 @@
+[package]
+name = "bono-export"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Exports a SQLite database into one small, read-only copy, its pages compressed with
+# sqlite_zstd_vfs (https://github.com/mlin/sqlite_zstd_vfs). The VFS is built into the program from
+# `vendor` (see `vendor/README.md`) rather than loaded as an extension.
+[dependencies]
+anyhow = "1.0.104"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+sha2 = "0.10"
+tempfile = "3.27.0"
+zstd-sys = "2.0.15"
+
+[build-dependencies]
+cc = "1.2"
+
+[dev-dependencies]
+bono-sim = { path = "../sim" }
+
+# Each step's size and read speed: `cargo bench -p bono-export`, see the file
+[[bench]]
+name = "export"
+harness = false

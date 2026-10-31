@@ -165,7 +165,7 @@ all-languages = [
 ]
 
 [workspace]
-members = ["xtask", "sim", "lmu", "i18n", "phonemizer"]
+members = ["xtask", "sim", "lmu", "i18n", "phonemizer", "export"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "io-util", "test-util"] }
