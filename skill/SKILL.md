@@ -91,8 +91,14 @@ not a partial lap against a full lap. Label findings as "so far" when appropriat
 unfinished portions and missing channels cannot establish a full-lap result or a cause.
 Keep completed laps as baselines for sustained pace, wear and consumption projections.
 
-- `status`: full car check, tyre wear, brakes, damage, settings, sectors, penalties.
-  Use it for an overall tyre check: temperatures alone do not establish tyre condition.
+- `quick`: the attached snapshot's facts, read from the newest frame: lap, sector, delta,
+  position, gaps, session clock, weather, forecast, track location, cars within 60 m, fuel,
+  virtual energy, battery, tyre centre temperatures against optimal, pressures and alerts.
+  Its only engine reading is an overheating alert; it has no oil or brake temperatures, wear or
+  tyre condition: use `status`.
+- `status`: full car check, tyre wear, all tyre temperatures, brakes, engine oil and water
+  temperatures, damage, settings, sectors, penalties. Use it for an overall tyre check or
+  whether tyres are in their window: temperatures alone do not establish tyre condition.
 - `laps`: times, validity, pit/contact flags, usage and wear; `last` N, `of` rival name/id.
 - `stint`: fuel/virtual energy range versus race remaining, pace, wear, forecast. Derive
   race length from the session; override `race_laps_left` or `race_time_left` in seconds
