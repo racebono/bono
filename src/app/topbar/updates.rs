@@ -31,6 +31,8 @@ pub struct Updates {
     error: Option<String>,
     notice: Option<String>,
     next_check: Instant,
+    reload_pending: bool,
+    next_load: Instant,
     progress: Arc<AtomicU64>,
     downloading: bool,
     quit: bool,
@@ -45,24 +47,7 @@ impl Updates {
         let supported =
             cfg!(all(target_os = "windows", target_arch = "x86_64")) && identity.valid();
         let root = pref_path.join("updates").into_std_path_buf();
-        let operation = supported.then(|| {
-            let root = root.clone();
-            let identity = identity.clone();
-            Task::spawn_blocking(move || {
-                let _guard = bono_updater::lock(&root)?;
-                let ready = bono_updater::stage::ready(&root, &identity)?;
-                // Only remove obsolete generations once a durable ready pointer has been read successfully.
-                bono_updater::stage::cleanup(&root, ready.as_ref())?;
-                let result_path = root.join("result.json");
-                let message = if result_path.exists() {
-                    let result: Result<String, String> = bono_updater::read_json(&result_path)?;
-                    Some(result)
-                } else {
-                    None
-                };
-                Ok(Completed::Loaded(ready, message))
-            })
-        });
+        let operation = supported.then(|| load_staged(root.clone(), identity.clone()));
         Self {
             identity,
             supported,
@@ -73,6 +58,8 @@ impl Updates {
             error: None,
             notice: None,
             next_check: Instant::now(),
+            reload_pending: supported,
+            next_load: Instant::now() + Duration::from_secs(5),
             progress: Arc::new(AtomicU64::new(0)),
             downloading: false,
             quit: false,
@@ -86,6 +73,8 @@ impl Updates {
             match result {
                 Ok(Completed::Loaded(ready, message)) => {
                     self.ready = ready;
+                    self.reload_pending = false;
+                    self.error = None;
                     match message {
                         Some(Ok(_)) => self.notice = Some(t!("updates.finished").to_owned()),
                         Some(Err(error)) => self.error = Some(error),
@@ -93,9 +82,23 @@ impl Updates {
                     }
                 }
                 Ok(Completed::Checked(candidate)) => self.candidate = candidate,
-                Ok(Completed::Downloaded(ready)) => self.ready = Some(ready),
+                Ok(Completed::Downloaded(ready)) => {
+                    self.ready = Some(ready);
+                    self.reload_pending = false;
+                }
                 Ok(Completed::InstallPrepared) => self.quit = true,
                 Err(error) => self.error = Some(format!("{error:#}")),
+            }
+            // Start the cooldown at completion: even a slow failing restore must leave room
+            // for release checks, rather than immediately starting another local retry.
+            if self.reload_pending {
+                self.next_load = Instant::now() + Duration::from_secs(5);
+            }
+        }
+        if self.supported && self.reload_pending {
+            if self.operation.is_none() && Instant::now() >= self.next_load {
+                self.operation = Some(load_staged(self.root.clone(), self.identity.clone()));
+                self.next_load = Instant::now() + Duration::from_secs(5);
             }
         }
         if self.supported
@@ -222,5 +225,116 @@ impl Updates {
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
+    }
+}
+
+fn load_staged(root: PathBuf, identity: Identity) -> Task<anyhow::Result<Completed>> {
+    Task::spawn_blocking(move || {
+        let _guard = bono_updater::lock(&root)?;
+        let ready = bono_updater::stage::restore(&root, &identity)?;
+        let result_path = root.join("result.json");
+        let message = if result_path.exists() {
+            // A corrupt old result must not hide an otherwise valid offline-installable bundle.
+            Some(
+                bono_updater::read_json::<Result<String, String>>(&result_path).unwrap_or_else(
+                    |error| Err(format!("Unable to read previous update result: {error:#}")),
+                ),
+            )
+        } else {
+            None
+        };
+        Ok(Completed::Loaded(ready, message))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn retries_staged_restore_after_another_instance_releases_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("updates");
+        let bundle = root.join("generation-saved/bundle");
+        for name in [
+            "bono.exe",
+            "bono-updater.exe",
+            "runtime.dll",
+            "assets/a",
+            "plugins/bono_lmu.dll",
+            "phonemizer/bono-phonemizer.exe",
+        ] {
+            let path = bundle.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "payload").unwrap();
+        }
+        let saved = Ready {
+            generation: "generation-saved".into(),
+            identity: Identity {
+                channel: "stable".into(),
+                tag: "v2.0.0".into(),
+            },
+        };
+        bono_updater::write_json(
+            &bundle.join(bono_updater::BUNDLE),
+            &bono_updater::stage::manifest(&bundle, saved.identity.clone()).unwrap(),
+        )
+        .unwrap();
+        bono_updater::write_json(&root.join("ready.json"), &saved).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _entered = rt.enter();
+        let mut updates = Updates::new(camino::Utf8Path::from_path(temp.path()).unwrap());
+        updates.identity = Identity {
+            channel: "stable".into(),
+            tag: "v1.0.0".into(),
+        };
+        updates.supported = true;
+        updates.root = root.clone();
+        updates.reload_pending = true;
+        updates.operation = None;
+        updates.next_load = Instant::now();
+        updates.next_check = Instant::now() + Duration::from_secs(3600);
+        let guard = bono_updater::lock(&root).unwrap();
+        fn finish(updates: &mut Updates, rt: &Handle) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while updates.operation.is_some() {
+                assert!(Instant::now() < deadline);
+                updates.poll(rt);
+                std::thread::sleep(Duration::from_millis(1)); // Test worker only; never a UI callback.
+            }
+        }
+        updates.poll(rt.handle());
+        updates.next_load = Instant::now() - Duration::from_secs(10);
+        finish(&mut updates, rt.handle());
+        assert!(updates.ready.is_none());
+        assert!(updates.error.is_some());
+        assert!(updates.reload_pending);
+        // Local retry cooldown must not suppress online discovery after a failed restore.
+        updates.next_check = Instant::now();
+        updates.poll(rt.handle());
+        assert!(updates.next_check > Instant::now() + Duration::from_secs(60));
+        finish(&mut updates, rt.handle());
+        drop(guard);
+        updates.next_load = Instant::now();
+        updates.poll(rt.handle());
+        finish(&mut updates, rt.handle());
+        assert_eq!(updates.ready.as_ref().unwrap().generation, saved.generation);
+        assert!(!updates.reload_pending);
+        assert!(updates.error.is_none());
+        fs::write(root.join("result.json"), "corrupt result").unwrap();
+        updates.reload_pending = true;
+        updates.next_load = Instant::now();
+        updates.poll(rt.handle());
+        finish(&mut updates, rt.handle());
+        assert!(updates.ready.is_some());
+        assert!(!updates.reload_pending);
+        assert!(
+            updates
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("previous update result")
+        );
     }
 }

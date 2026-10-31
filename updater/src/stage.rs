@@ -108,6 +108,19 @@ pub fn ready(root: &Path, installed: &Identity) -> anyhow::Result<Option<Ready>>
     Ok(Some(ready))
 }
 
+/// Restore installable state under the update lock. Cleanup follows the durable pointer,
+/// even when that generation belongs to another channel or is no longer newer than this build.
+pub fn restore(root: &Path, installed: &Identity) -> anyhow::Result<Option<Ready>> {
+    let durable: Option<Ready> = if root.join("ready.json").exists() {
+        Some(read_json(&root.join("ready.json"))?)
+    } else {
+        None
+    };
+    let installable = ready(root, installed)?;
+    cleanup(root, durable.as_ref())?;
+    Ok(installable)
+}
+
 pub fn generation_path(root: &Path, ready: &Ready) -> anyhow::Result<PathBuf> {
     safe_path(&ready.generation)?;
     ensure!(
@@ -504,5 +517,43 @@ mod tests {
         assert!(lock(temp.path()).is_err());
         drop(guard);
         assert!(lock(temp.path()).is_ok());
+    }
+
+    #[test]
+    fn restoring_another_channel_preserves_durable_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let stable = Identity {
+            channel: "stable".into(),
+            tag: "v2.0.0".into(),
+        };
+        let staged = promote(
+            root,
+            downloaded(root, stable.clone(), false),
+            stable.clone(),
+        )
+        .unwrap();
+        let nightly = Identity {
+            channel: "nightly".into(),
+            tag: "nightly-2026-10-31-1-1".into(),
+        };
+        assert!(restore(root, &nightly).unwrap().is_none());
+        assert!(root.join(&staged.generation).exists());
+        assert_eq!(
+            read_json::<Ready>(&root.join("ready.json"))
+                .unwrap()
+                .generation,
+            staged.generation
+        );
+        let old_stable = Identity {
+            channel: "stable".into(),
+            tag: "v1.0.0".into(),
+        };
+        assert_eq!(
+            restore(root, &old_stable).unwrap().unwrap().generation,
+            staged.generation
+        );
+        assert!(restore(root, &stable).unwrap().is_none());
+        assert!(root.join(&staged.generation).exists());
     }
 }

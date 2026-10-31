@@ -130,6 +130,18 @@ fn real_helper_installs_and_restarts_after_parent_exit() {
     if restarted_fixture() {
         return;
     }
+    post_exit_install(false);
+}
+
+#[test]
+fn restarts_original_app_after_pre_backup_failure() {
+    if restarted_fixture() {
+        return;
+    }
+    post_exit_install(true);
+}
+
+fn post_exit_install(fail_before_backup: bool) {
     let (temp, op, directory) = fixture();
     // The test harness acts as the new Bono: on restart its tests simply write a marker and exit.
     let source = op.root.join(&op.ready.generation).join("bundle");
@@ -137,6 +149,16 @@ fn real_helper_installs_and_restarts_after_parent_exit() {
     write_json(
         &source.join(BUNDLE),
         &stage::manifest(&source, op.ready.identity.clone()).unwrap(),
+    )
+    .unwrap();
+    fs::copy(
+        std::env::current_exe().unwrap(),
+        op.destination.join("bono.exe"),
+    )
+    .unwrap();
+    write_json(
+        &op.destination.join(BUNDLE),
+        &stage::manifest(&op.destination, op.installed.clone()).unwrap(),
     )
     .unwrap();
     write_json(&op.root.join("ready.json"), &op.ready).unwrap();
@@ -173,6 +195,9 @@ fn real_helper_installs_and_restarts_after_parent_exit() {
         fs::read_to_string(op.destination.join("runtime.dll")).unwrap(),
         "old"
     );
+    if fail_before_backup {
+        fs::remove_file(source.join("assets/a")).unwrap();
+    }
     drop(parent.0.stdin.take()); // Let the original process exit normally.
     while helper.0.try_wait().unwrap().is_none() {
         assert!(start.elapsed() < Duration::from_secs(30));
@@ -180,8 +205,8 @@ fn real_helper_installs_and_restarts_after_parent_exit() {
     }
     let result: Result<String, String> =
         bono_updater::read_json(&op.root.join("result.json")).unwrap();
-    result.unwrap();
-    assert!(helper.0.wait().unwrap().success());
+    assert_eq!(result.is_err(), fail_before_backup);
+    assert_eq!(helper.0.wait().unwrap().success(), !fail_before_backup);
     while !marker.exists()
         || fs::OpenOptions::new()
             .write(true)
@@ -194,12 +219,23 @@ fn real_helper_installs_and_restarts_after_parent_exit() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    stage::validate_bundle(&op.destination, &op.ready.identity).unwrap();
+    stage::validate_bundle(
+        &op.destination,
+        if fail_before_backup {
+            &op.installed
+        } else {
+            &op.ready.identity
+        },
+    )
+    .unwrap();
     assert_eq!(
         fs::read_to_string(op.destination.join("runtime.dll")).unwrap(),
-        "new"
+        if fail_before_backup { "old" } else { "new" }
     );
-    assert!(!op.root.join("ready.json").exists());
+    assert_eq!(op.root.join("ready.json").exists(), fail_before_backup);
+    if fail_before_backup {
+        assert!(!directory.join("journal.json").exists());
+    }
     assert!(!directory.join("pending.json").exists());
     assert!(bono_updater::lock(&op.root).is_ok());
 }

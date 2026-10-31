@@ -85,6 +85,7 @@ fn owned(bundle: &Bundle) -> anyhow::Result<BTreeSet<String>> {
 
 /// Validate everything that can fail before the app closes, including writing beside the executable.
 fn preflight(directory: &Path, op: &Operation) -> anyhow::Result<()> {
+    no_links(&op.destination.join(POINTER))?;
     let source = validate_operation(directory, op)?;
     stage::validate_bundle(&source, &op.ready.identity)?;
     let current: Bundle = read_json(&op.destination.join(BUNDLE))?;
@@ -186,14 +187,7 @@ pub fn prepare(
         .open(directory.join(RECOVERY))?
         .sync_all()?;
     write_json(&directory.join("operation.json"), &op)?;
-    fs::write(
-        op.destination.join(POINTER),
-        format!(
-            "If Bono cannot start after an interrupted update, run:\r\n{}\r\n\r\nThis restores the previous installation and restarts Bono. Errors are saved to {}.\r\n",
-            directory.join(RECOVERY).display(),
-            root.join("result.json").display()
-        ),
-    )?;
+    write_pointer(&op.destination, &directory, root)?;
     // Reserve the handoff before releasing the lock: other app instances must not replace
     // this operation or clean up its staged generation before the helper takes ownership.
     write_json(&directory.join("pending.json"), &true)?;
@@ -205,6 +199,24 @@ pub fn prepare(
         }
     }
     result
+}
+
+fn write_pointer(destination: &Path, directory: &Path, root: &Path) -> anyhow::Result<()> {
+    use std::io::Write;
+    let pointer = destination.join(POINTER);
+    no_links(&pointer)?;
+    // Replace the directory entry atomically instead of opening/truncating it. Even if the
+    // entry is swapped for a link after validation, persist does not write through that link.
+    let mut temporary = tempfile::NamedTempFile::new_in(destination)?;
+    temporary.write_all(format!(
+            "If Bono cannot start after an interrupted update, run:\r\n{}\r\n\r\nThis restores the previous installation and restarts Bono. Errors are saved to {}.\r\n",
+            directory.join(RECOVERY).display(),
+            root.join("result.json").display()
+        ).as_bytes())?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(pointer).map_err(|e| e.error)?;
+    Ok(())
 }
 
 fn wait_for_helper(directory: &Path) -> anyhow::Result<()> {
@@ -298,11 +310,21 @@ fn rollback(directory: &Path, op: &Operation, journal: &mut Journal) -> anyhow::
     write_json(&directory.join("journal.json"), journal)
 }
 
+#[cfg(test)]
 fn apply(directory: &Path, op: &Operation) -> anyhow::Result<()> {
+    apply_tracking(directory, op, &mut false)
+}
+
+fn apply_tracking(
+    directory: &Path,
+    op: &Operation,
+    mutation_started: &mut bool,
+) -> anyhow::Result<()> {
     preflight(directory, op)?;
     let source = validate_operation(directory, op)?;
     let bundle = stage::validate_bundle(&source, &op.ready.identity)?;
     let mut journal = backup(directory, op, &bundle)?;
+    *mutation_started = true;
     let result = (|| -> anyhow::Result<()> {
         let new = owned(&bundle)?;
         for name in journal.files.keys() {
@@ -378,6 +400,8 @@ pub fn run_helper(directory: &Path, parent: Option<u32>) -> anyhow::Result<()> {
     validate_operation(directory, &op)?;
     // Publish the result under the lock, then release it before the restarted app loads its cache.
     let guard = crate::lock_raw(&op.root)?;
+    let mut parent_exited = false;
+    let mut mutation_started = false;
     let result = (|| -> anyhow::Result<()> {
         if let Some(pid) = parent {
             #[cfg(windows)]
@@ -391,7 +415,8 @@ pub fn run_helper(directory: &Path, parent: Option<u32>) -> anyhow::Result<()> {
             write_json(&directory.join("ack.json"), &Result::<(), String>::Ok(()))?;
             #[cfg(windows)]
             process.wait()?;
-            apply(directory, &op)?;
+            parent_exited = true;
+            apply_tracking(directory, &op, &mut mutation_started)?;
         } else if directory.join("journal.json").exists() {
             let mut journal: Journal = read_json(&directory.join("journal.json"))?;
             if journal.phase == "applying" {
@@ -425,8 +450,11 @@ pub fn run_helper(directory: &Path, parent: Option<u32>) -> anyhow::Result<()> {
     // Publish the result before spawning Bono. A failed install that rolled back is also safe
     // to restart; a timeout or failed rollback must not launch another app instance.
     let restart = result.is_ok()
-        || read_json::<Journal>(&directory.join("journal.json"))
-            .is_ok_and(|journal| journal.phase == "rolled_back");
+        // No destination mutations happen before the backup journal is published. Once the
+        // parent has exited, preflight/backup failures without a journal can restart the old app.
+        || (parent_exited && (!mutation_started
+            || read_json::<Journal>(&directory.join("journal.json"))
+                .is_ok_and(|journal| journal.phase == "rolled_back")));
     let _ = fs::remove_file(directory.join("pending.json"));
     drop(guard);
     if restart {
@@ -570,6 +598,32 @@ mod tests {
         write_json(&dir.join("pending.json"), &true).unwrap();
         assert!(crate::lock(&op.root).is_err());
         assert!(crate::lock_raw(&op.root).is_ok());
+    }
+
+    #[test]
+    fn recovery_pointer_replacement_does_not_truncate_linked_file() {
+        let (temp, op, dir) = fixture();
+        let unrelated = temp.path().join("unrelated.txt");
+        fs::write(&unrelated, "preserve").unwrap();
+        fs::hard_link(&unrelated, op.destination.join(POINTER)).unwrap();
+        write_pointer(&op.destination, &dir, &op.root).unwrap();
+        assert_eq!(fs::read_to_string(&unrelated).unwrap(), "preserve");
+        assert!(
+            fs::read_to_string(op.destination.join(POINTER))
+                .unwrap()
+                .contains(RECOVERY)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_pointer_rejects_symlinks() {
+        let (temp, op, dir) = fixture();
+        let unrelated = temp.path().join("unrelated.txt");
+        fs::write(&unrelated, "preserve").unwrap();
+        std::os::unix::fs::symlink(&unrelated, op.destination.join(POINTER)).unwrap();
+        assert!(write_pointer(&op.destination, &dir, &op.root).is_err());
+        assert_eq!(fs::read_to_string(unrelated).unwrap(), "preserve");
     }
     #[cfg(windows)]
     #[test]
