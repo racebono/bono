@@ -110,8 +110,12 @@ fn says_why_it_cant_open_one() {
     let message = format!("{error:#}");
     assert!(message.contains("404"), "{message}");
     assert!(!message.contains("secret"), "{message}");
-    // The HTTP client's own errors too
+    // A user's password, and the HTTP client's own errors too
+    let with_password = server
+        .url("missing.db")
+        .replace("http://", "http://user:secret@");
     for url in [
+        &with_password,
         "/missing.db?signature=secret",
         "/missing.db?signature=secret#fragment",
     ] {

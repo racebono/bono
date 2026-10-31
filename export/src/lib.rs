@@ -205,8 +205,8 @@ pub fn open_url(url: &str) -> anyhow::Result<Connection> {
         vfs::VFS
     );
     vfs::escape(&mut uri, url);
-    // Its query can hold credentials: messages leave it out
-    let shown = url.split(['?', '#']).next().unwrap_or(url);
+    // Messages leave out what can hold credentials
+    let shown = web::shown(url);
     web::take_error();
     let conn = Connection::open_with_flags(
         uri,

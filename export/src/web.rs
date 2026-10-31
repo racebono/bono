@@ -97,9 +97,19 @@ pub(crate) fn take_error() -> Option<String> {
     ERROR.with_borrow_mut(Option::take)
 }
 
-/// `url` without its query, which can hold credentials (a presigned URL's signature), for messages.
-fn shown(url: &str) -> &str {
-    url.split(['?', '#']).next().unwrap_or(url)
+/// `url` without what can hold credentials, for messages: its query (a presigned URL's signature)
+/// and fragment, and its user and password.
+pub(crate) fn shown(url: &str) -> String {
+    let url = url.split(['?', '#']).next().unwrap_or(url);
+    userinfo(url).map_or_else(|| url.to_owned(), |info| url.replacen(info, "", 1))
+}
+
+/// `url`'s `user:password@`, if it has one.
+fn userinfo(url: &str) -> Option<&str> {
+    let start = url.find("://")? + 3;
+    let authority = url[start..].split(['/', '?', '#']).next()?;
+    let end = authority.rfind('@')? + 1;
+    Some(&authority[..end])
 }
 
 /// What the VFS gives SQLite for each open file. Files that aren't a database read over HTTP are
@@ -166,13 +176,18 @@ impl Remote {
         Ok(remote)
     }
 
-    /// `text` (an HTTP client's error) without the URL's query, which can hold credentials.
+    /// `text` (an HTTP client's error) without what of the URL can hold credentials (see `shown`).
     fn redact(&self, text: &str) -> String {
-        let text = text.replace(&self.url, shown(&self.url));
-        match self.url.split_once('?') {
-            Some((_, query)) if !query.is_empty() => text.replace(query, "..."),
-            _ => text,
+        let mut text = text.replace(&self.url, &shown(&self.url));
+        if let Some((_, query)) = self.url.split_once('?')
+            && !query.is_empty()
+        {
+            text = text.replace(query, "...");
         }
+        if let Some(info) = userinfo(&self.url) {
+            text = text.replace(info, "");
+        }
+        text
     }
 
     /// Bytes `first..=last` of the file.
