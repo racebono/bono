@@ -114,7 +114,11 @@ fn serve(
             .and_then(|r| {
                 let (from, to) = r.split_once('-')?;
                 let from: u64 = from.parse().ok()?;
-                let to = to.parse().map_or(size - 1, |to: u64| to.min(size - 1));
+                // Nothing to give of an empty file: 416
+                let Some(end) = size.checked_sub(1) else {
+                    return Some((1, 0));
+                };
+                let to = to.parse().map_or(end, |to: u64| to.min(end));
                 Some((from, to))
             });
         let (status, from, to) = match span {

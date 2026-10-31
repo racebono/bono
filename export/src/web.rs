@@ -145,6 +145,11 @@ impl Remote {
             .timeout_global(Some(Duration::from_secs(60)))
             .build()
             .into();
+        // A fragment isn't sent, and the client leaves it out of its errors, which `redact` matches
+        let url = match url.split_once('#') {
+            Some((url, _)) => url.to_owned(),
+            None => url,
+        };
         let mut remote = Self {
             url,
             agent,
@@ -164,7 +169,7 @@ impl Remote {
     /// `text` (an HTTP client's error) without the URL's query, which can hold credentials.
     fn redact(&self, text: &str) -> String {
         let text = text.replace(&self.url, shown(&self.url));
-        match self.url.split_once(['?', '#']) {
+        match self.url.split_once('?') {
             Some((_, query)) if !query.is_empty() => text.replace(query, "..."),
             _ => text,
         }

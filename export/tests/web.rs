@@ -111,11 +111,17 @@ fn says_why_it_cant_open_one() {
     assert!(message.contains("404"), "{message}");
     assert!(!message.contains("secret"), "{message}");
     // The HTTP client's own errors too
-    let error = bono_export::open_url("/missing.db?signature=secret")
-        .err()
-        .unwrap();
-    let message = format!("{error:#}");
-    assert!(!message.contains("secret"), "{message}");
+    for url in [
+        "/missing.db?signature=secret",
+        "/missing.db?signature=secret#fragment",
+    ] {
+        let message = format!("{:#}", bono_export::open_url(url).err().unwrap());
+        assert!(!message.contains("secret"), "{message}");
+    }
+
+    // An empty file isn't a database
+    std::fs::write(dir.path().join("empty.db"), b"").unwrap();
+    assert!(bono_export::open_url(&server.url("empty.db")).is_err());
 
     server.ranges.store(false, Ordering::Relaxed);
     let message = format!(
