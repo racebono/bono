@@ -17,6 +17,7 @@ use crate::{
     task::Task,
 };
 use bono_i18n::t;
+use schedule::{Next, Schedule, ScheduleTool};
 use sdl3::audio::{AudioDevice, AudioStreamOwner};
 use std::{
     collections::VecDeque,
@@ -32,6 +33,7 @@ use tokio::{
 use tool::{Engineer as EngineerTool, SCHEMA, SKILL, instructions};
 
 mod routing;
+mod schedule;
 mod tool;
 
 /// One line of the conversation, as the chat shows it.
@@ -121,6 +123,8 @@ struct Turn {
     text: mpsc::UnboundedReceiver<String>,
     /// The chat entry it's written into, once it says something
     entry: Option<usize>,
+    /// The scheduled request it answers, when the pilot didn't just ask
+    scheduled: Option<u32>,
 }
 
 /// Speech played as it's synthesized.
@@ -213,6 +217,11 @@ struct Session {
     /// Bono Cloud's session lease, ended without waiting for the conversation
     lease: Option<Lease>,
     state: Arc<Mutex<SessionState>>,
+    /// The requests the pilot wants answered later. Kept when the conversation starts over for
+    /// another model or corner setting, as each request says all it's about
+    schedule: Arc<std::sync::Mutex<Schedule>>,
+    /// Checks the schedule's triggers until the session ends (dropped, it stops)
+    _watch: crate::task::JoinHandle<()>,
 }
 
 struct SessionState {
@@ -477,7 +486,11 @@ impl Engineer {
             || corners_changed
             || self.session.as_ref().is_none_or(|s| s.db != db)
         {
-            match self.start(config, sim, pool) {
+            // A new session asked for forgets what was scheduled too
+            let schedule = (self.session.as_ref())
+                .filter(|s| !self.new_session && s.db == db)
+                .map(|s| s.schedule.clone());
+            match self.start(config, sim, pool, schedule) {
                 Ok(session) => self.session = Some(session),
                 Err(e) => {
                     self.notice(t!("engineer.error_starting", error = format!("{e:#}")));
@@ -488,6 +501,20 @@ impl Engineer {
             self.new_session = false;
         }
 
+        self.send(rt, config, synth, question, lang, None);
+    }
+
+    /// Sends `question` to the session's conversation, and speaks the answer in `lang` as it's
+    /// written. `scheduled`: the request it asks again, rather than the pilot's question.
+    fn send(
+        &mut self,
+        rt: &Handle,
+        config: &Config,
+        synth: &mut Synthesizer,
+        question: String,
+        lang: ArrayStr<2>,
+        scheduled: Option<u32>,
+    ) {
         let Some(session) = &self.session else {
             return;
         };
@@ -506,8 +533,13 @@ impl Engineer {
             state.follow_game_session(auto_session).await;
             // Bono Cloud's router picks the first telemetry command, from the skill's documents
             // and the session's state as they are now: a snapshot would stop it routing. Other
-            // providers get a snapshot with the new question only.
+            // providers get a snapshot with the new question only. A scheduled request isn't a
+            // driver question for the router: Claude answers it.
             let question = match cloud {
+                true if scheduled.is_some() => {
+                    state.conversation.set_routing_context(None);
+                    question
+                }
                 true => {
                     let session = match routing::session(&state.pool).await {
                         Ok(session) => Some(session),
@@ -540,7 +572,47 @@ impl Engineer {
             lang,
             text,
             entry: None,
+            scheduled,
         });
+    }
+
+    /// Asks the first scheduled request that's due, if any, telling the chat about the ones
+    /// dropped. Only while the engineer is free: it waits for the pilot's answers, and the spotter.
+    fn ask_scheduled(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer) {
+        let Some(schedule) = self.session.as_ref().map(|s| s.schedule.clone()) else {
+            return;
+        };
+        loop {
+            // Never held while anything else is done
+            let next = schedule
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .next();
+            match next {
+                None => return,
+                Some(Next::Expired(request)) => {
+                    self.notice(t!("engineer.scheduled_expired", request = request));
+                }
+                Some(Next::GaveUp(request)) => {
+                    self.notice(t!("engineer.scheduled_gave_up", request = request));
+                }
+                Some(Next::Ask {
+                    id,
+                    request,
+                    prompt,
+                    failed,
+                }) => {
+                    self.notice(match failed {
+                        true => t!("engineer.scheduled_failed", request = &request),
+                        false => t!("engineer.scheduled_due", request = &request),
+                    });
+                    // In the language it was asked in
+                    let lang = self.languages.detect(&request).unwrap_or(self.last_lang);
+                    self.send(rt, config, synth, prompt, lang, Some(id));
+                    return;
+                }
+            }
+        }
     }
 
     /// Called every frame: answers come in, are synthesized and played. `sim_running`: whether a
@@ -603,7 +675,15 @@ impl Engineer {
                 && let Some(turn) = self.turn.take()
             {
                 match result {
-                    Ok(reply) => self.answer(rt, config, synth, reply, turn),
+                    Ok(reply) => {
+                        // Answered: it's done. Otherwise it's asked again once the engineer's free
+                        if let (Some(id), Some(session)) = (turn.scheduled, &self.session) {
+                            (session.schedule.lock())
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(id);
+                        }
+                        self.answer(rt, config, synth, reply, turn)
+                    }
                     Err(e) => {
                         if let Some(entry) = turn.entry {
                             self.chat[entry].detail = Some(t!("engineer.detail_cut_off").into());
@@ -613,6 +693,10 @@ impl Engineer {
                     }
                 }
             }
+        }
+
+        if self.turn.is_none() && self.playback.is_none() && !self.held {
+            self.ask_scheduled(rt, config, synth);
         }
 
         self.play(config, speaker);
@@ -886,14 +970,28 @@ impl Engineer {
         });
     }
 
-    fn start(&self, config: &Config, sim: &'static str, pool: Pool) -> anyhow::Result<Session> {
+    /// A session on `pool`'s database, with `schedule` (or a new one).
+    fn start(
+        &self,
+        config: &Config,
+        sim: &'static str,
+        pool: Pool,
+        schedule: Option<Arc<std::sync::Mutex<Schedule>>>,
+    ) -> anyhow::Result<Session> {
         let tool = EngineerTool::new(pool.clone(), self.schema.clone());
+        let schedule = schedule.unwrap_or_default();
         let mut tools = Tools::default();
         tools.insert(
             EngineerTool::NAME,
             Some(EngineerTool::description()),
             EngineerTool::input_schema(),
             tool.clone(),
+        );
+        tools.insert(
+            ScheduleTool::NAME,
+            Some(ScheduleTool::description()),
+            ScheduleTool::input_schema(),
+            ScheduleTool::new(schedule.clone(), pool.clone()),
         );
         let model = config.get().model.clone();
         let corner_names = *config.get().corner_names();
@@ -921,6 +1019,8 @@ impl Engineer {
             corner_names,
             user,
             lease: conversation.lease(),
+            _watch: crate::task::spawn(schedule::watch(schedule.clone(), pool.clone())),
+            schedule,
             state: Arc::new(Mutex::new(SessionState {
                 conversation,
                 tool,
@@ -1198,6 +1298,7 @@ mod tests {
                     lang: arrstr!("en"),
                     text,
                     entry: None,
+                    scheduled: None,
                 },
             );
             let playback = engineer.playback.as_mut().unwrap();
@@ -1249,6 +1350,7 @@ mod tests {
                 lang: arrstr!("en"),
                 text: receiver,
                 entry: None,
+                scheduled: None,
             };
             engineer.answer(
                 rt,
