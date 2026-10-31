@@ -21,6 +21,14 @@ enum Completed {
     InstallPrepared,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OperationKind {
+    Refresh,
+    Check,
+    Download,
+    Install,
+}
+
 pub struct Updates {
     identity: Identity,
     supported: bool,
@@ -29,6 +37,9 @@ pub struct Updates {
     candidate: Option<Candidate>,
     ready: Option<Ready>,
     error: Option<String>,
+    error_kind: Option<OperationKind>,
+    refresh_error: Option<String>,
+    operation_kind: OperationKind,
     notice: Option<String>,
     next_check: Instant,
     next_load: Instant,
@@ -55,6 +66,9 @@ impl Updates {
             candidate: None,
             ready: None,
             error: None,
+            error_kind: None,
+            refresh_error: None,
+            operation_kind: OperationKind::Refresh,
             notice: None,
             next_check: Instant::now(),
             next_load: Instant::now() + Duration::from_secs(5),
@@ -68,13 +82,18 @@ impl Updates {
         if let Some(result) = self.operation.as_mut().and_then(|task| task.update(rt)) {
             self.operation = None;
             self.downloading = false;
+            let kind = self.operation_kind;
+            if result.is_ok() && kind != OperationKind::Refresh && self.error_kind == Some(kind) {
+                self.error = None;
+                self.error_kind = None;
+            }
             match result {
                 Ok(Completed::Loaded(ready, message)) => {
                     self.ready = ready;
-                    self.error = None;
+                    self.refresh_error = None;
                     match message {
                         Some(Ok(_)) => self.notice = Some(t!("updates.finished").to_owned()),
-                        Some(Err(error)) => self.error = Some(error),
+                        Some(Err(error)) => self.refresh_error = Some(error),
                         None => (),
                     }
                 }
@@ -83,7 +102,14 @@ impl Updates {
                     self.ready = Some(ready);
                 }
                 Ok(Completed::InstallPrepared) => self.quit = true,
-                Err(error) => self.error = Some(format!("{error:#}")),
+                Err(error) => {
+                    if kind == OperationKind::Refresh {
+                        self.refresh_error = Some(format!("{error:#}"));
+                    } else {
+                        self.error = Some(format!("{error:#}"));
+                        self.error_kind = Some(kind);
+                    }
+                }
             }
             // Cool down from completion, leaving room for checks even after a slow refresh.
             self.next_load = Instant::now() + Duration::from_secs(5);
@@ -93,6 +119,7 @@ impl Updates {
             && self.operation.is_none()
             && Instant::now() >= self.next_load
         {
+            self.operation_kind = OperationKind::Refresh;
             self.operation = Some(load_staged(
                 self.root.clone(),
                 self.identity.clone(),
@@ -109,6 +136,7 @@ impl Updates {
     }
 
     fn check(&mut self) {
+        self.operation_kind = OperationKind::Check;
         self.next_check = Instant::now() + Duration::from_secs(6 * 60 * 60);
         let identity = self.identity.clone();
         let root = self.root.clone();
@@ -164,6 +192,7 @@ impl Updates {
                     .clicked()
                 {
                     self.error = None;
+                    self.operation_kind = OperationKind::Download;
                     self.downloading = true;
                     self.progress.store(0, Ordering::Relaxed);
                     let root = self.root.clone();
@@ -186,6 +215,7 @@ impl Updates {
                 .clicked()
             {
                 self.error = None;
+                self.operation_kind = OperationKind::Install;
                 let root = self.root.clone();
                 let installed = self.identity.clone();
                 self.operation = Some(Task::spawn_blocking(move || {
@@ -214,11 +244,14 @@ impl Updates {
                 ui.label(t!("updates.working"));
             }
             ui.ctx().request_repaint_after(Duration::from_millis(100));
-        } else if !self.available() && self.error.is_none() {
+        } else if !self.available() && self.error.is_none() && self.refresh_error.is_none() {
             ui.label(t!("updates.current"));
         }
         if let Some(notice) = &self.notice {
             ui.label(notice);
+        }
+        if let Some(error) = &self.refresh_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
         }
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
@@ -309,7 +342,7 @@ mod tests {
         updates.next_load = Instant::now() - Duration::from_secs(10);
         finish(&mut updates, rt.handle());
         assert!(updates.ready.is_none());
-        assert!(updates.error.is_some());
+        assert!(updates.refresh_error.is_some());
         // Local refresh cooldown must not suppress online discovery after a failed restore.
         updates.next_check = Instant::now();
         updates.poll(rt.handle());
@@ -320,7 +353,27 @@ mod tests {
         updates.poll(rt.handle());
         finish(&mut updates, rt.handle());
         assert_eq!(updates.ready.as_ref().unwrap().generation, saved.generation);
-        assert!(updates.error.is_none());
+        assert!(updates.refresh_error.is_none());
+        assert!(updates.error.is_some()); // A refresh must preserve the failed check.
+        // Successful operations clear only errors from the same source.
+        for kind in [
+            OperationKind::Check,
+            OperationKind::Download,
+            OperationKind::Install,
+        ] {
+            updates.error = Some("operation failed".into());
+            updates.error_kind = Some(kind);
+            updates.next_load = Instant::now();
+            updates.poll(rt.handle());
+            finish(&mut updates, rt.handle());
+            assert_eq!(updates.error.as_deref(), Some("operation failed"));
+            updates.operation_kind = OperationKind::Check;
+            updates.operation = Some(Task::spawn(async { Ok(Completed::Checked(None)) }));
+            finish(&mut updates, rt.handle());
+            assert_eq!(updates.error.is_none(), kind == OperationKind::Check);
+        }
+        updates.error = None;
+        updates.error_kind = None;
         fs::write(root.join("result.json"), "corrupt result").unwrap();
         updates.next_load = Instant::now();
         updates.poll(rt.handle());
@@ -328,7 +381,7 @@ mod tests {
         assert!(updates.ready.is_some());
         assert!(
             updates
-                .error
+                .refresh_error
                 .as_ref()
                 .unwrap()
                 .contains("previous update result")
