@@ -110,6 +110,12 @@ fn says_why_it_cant_open_one() {
     let message = format!("{error:#}");
     assert!(message.contains("404"), "{message}");
     assert!(!message.contains("secret"), "{message}");
+    // The HTTP client's own errors too
+    let error = bono_export::open_url("/missing.db?signature=secret")
+        .err()
+        .unwrap();
+    let message = format!("{error:#}");
+    assert!(!message.contains("secret"), "{message}");
 
     server.ranges.store(false, Ordering::Relaxed);
     let message = format!(

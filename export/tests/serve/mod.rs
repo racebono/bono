@@ -138,8 +138,9 @@ fn serve(
             head += &format!("Content-Range: bytes {from}-{to}/{size}\r\n");
         }
         head += "\r\n";
+        // Counted before it can be read, so a query done reading is counted in full
+        bytes.fetch_add(length, Ordering::Relaxed);
         stream.write_all(head.as_bytes())?;
         stream.write_all(&body)?;
-        bytes.fetch_add(length, Ordering::Relaxed);
     }
 }

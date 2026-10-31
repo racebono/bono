@@ -161,6 +161,15 @@ impl Remote {
         Ok(remote)
     }
 
+    /// `text` (an HTTP client's error) without the URL's query, which can hold credentials.
+    fn redact(&self, text: &str) -> String {
+        let text = text.replace(&self.url, shown(&self.url));
+        match self.url.split_once(['?', '#']) {
+            Some((_, query)) if !query.is_empty() => text.replace(query, "..."),
+            _ => text,
+        }
+    }
+
     /// Bytes `first..=last` of the file.
     fn get(&self, first: u64, last: u64) -> Result<Got, String> {
         let mut attempt = 1;
@@ -185,7 +194,7 @@ impl Remote {
             .get(&self.url)
             .header("Range", format!("bytes={first}-{last}"))
             .call()
-            .map_err(|e| (e.to_string(), true))?;
+            .map_err(|e| (self.redact(&e.to_string()), true))?;
         let status = response.status();
         if status == 200 {
             return Err(("the server doesn't answer range requests".into(), false));
@@ -235,7 +244,7 @@ impl Remote {
             // One more, as reaching the limit is an error
             .limit(to - from + 2)
             .read_to_vec()
-            .map_err(|e| (e.to_string(), true))?;
+            .map_err(|e| (self.redact(&e.to_string()), true))?;
         if data.len() as u64 != to - from + 1 {
             return Err(("the response was cut short".into(), true));
         }
