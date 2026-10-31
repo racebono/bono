@@ -1,0 +1,19 @@
+Bono updates
+
+Open Settings > App updates to check your installed stable or nightly channel.
+Download an update first. Once downloaded and validated, select Install downloaded
+update to close Bono, replace its bundle, and restart. Downloading never installs.
+An existing downloaded update is retained until its replacement is fully validated.
+Keep the entire bundle together, including bono-updater.exe and bono-bundle.json.
+
+If an interrupted installation prevents Bono from starting, open
+BONO-UPDATE-RECOVERY.txt in this folder and run the exact recovery executable it
+names. The standalone helper restores the previous bundle and restarts Bono.
+Do not delete the per-user updates/recovery folder during an installation.
+Failures and recovery instructions are retained in updates/result.json under
+Bono's preference directory (%APPDATA%/bono/bono on Windows).
+If the installation directory is not writable, move the full bundle to a folder
+you own before updating. The updater does not request administrator privileges.
+
+App updates do not install simulator plugins into the game's folders. Use the
+Simulators menu after updating Bono if the bundled simulator plugin has changed.

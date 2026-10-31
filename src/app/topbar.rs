@@ -28,9 +28,11 @@ mod provider;
 pub(super) mod settings;
 pub(super) mod simulators;
 mod spotter;
+mod updates;
 pub(super) mod volume;
 
 pub struct Topbar {
+    pub updates: updates::Updates,
     pub account: AccountTopbar,
     settings: SettingsTopbar,
     pub audio: AudioTopbar,
@@ -52,6 +54,7 @@ impl Topbar {
         account: Option<&crate::account::Account>,
     ) -> Self {
         Self {
+            updates: updates::Updates::new(pref_path),
             account: AccountTopbar::default(),
             settings: SettingsTopbar::default(),
             volume: VolumeTopbar,
@@ -84,6 +87,7 @@ impl Topbar {
     ) -> bool {
         self.audio.poll(rt, config, synth);
         self.account.poll(rt);
+        self.updates.poll(rt);
 
         // Every menu with something in it that isn't set up yet
         let settings_setup = config.get().talk_button().is_none();
@@ -98,7 +102,12 @@ impl Topbar {
                     .config(
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
-                    .ui(ui, |ui| self.settings.update(rt, ss, ui, config));
+                    .ui(ui, |ui| {
+                        let guide = self.settings.update(rt, ss, ui, config);
+                        ui.separator();
+                        ui.menu_button(t!("updates.title"), |ui| self.updates.ui(ui));
+                        guide
+                    });
                 guide = settings.as_ref().is_some_and(|settings| settings.inner);
                 if settings.is_none() {
                     self.settings.closed();
@@ -148,6 +157,10 @@ impl Topbar {
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
                     .ui(ui, |ui| self.account.update(ui, account));
+
+                if self.updates.available() {
+                    ui.menu_button(t!("updates.available"), |ui| self.updates.ui(ui));
+                }
 
                 let simulator = simulators.current();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

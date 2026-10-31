@@ -46,6 +46,30 @@ Speech recognition and synthesis run locally. With a remote language-model endpo
 
 ## Troubleshooting
 
+### Updating Bono
+
+Official Windows x86-64 builds check their installed channel in the background:
+stable builds offer newer stable releases and nightlies offer newer nightlies.
+Open **Settings > App updates** to check manually. Choose **Download** first;
+after the full bundle has been validated, choose **Install downloaded** to close
+and restart Bono with the update. Downloading does not install automatically.
+Downloaded updates survive app restarts and can be installed offline. A failed
+replacement download preserves the previously downloaded version.
+
+The installation folder must be writable. User settings, models and credentials
+are preserved. If an interrupted installation prevents Bono from starting,
+follow `BONO-UPDATE-RECOVERY.txt` in the installation folder to run the preserved
+standalone recovery helper. Source builds and other platforms do not offer
+in-app installation. Older distributions without this updater must first be
+replaced manually with a distribution that includes it.
+
+For a packaged smoke test, launch an older official build with a newer release
+on the same channel: download, close/reopen Bono, disconnect the network, then
+install and confirm the new version restarts. Before installing, try downloading
+a still newer build with an interrupted connection and verify the previous
+download remains installable. Keep a backup test installation when exercising
+interrupted-install recovery.
+
 ### Speech recognition is very slow while driving
 
 Whisper runs on the same GPU as your simulator. With VSync off (or no frame-rate cap), the simulator renders as many frames as it can and keeps the GPU fully busy, so transcribing a question can take 10–30 seconds instead of about one. Enable VSync or cap the frame rate in the simulator to leave the GPU some headroom. Alternatively, untick **Use the GPU** in the Speech To Text menu to run Whisper on the CPU instead.
