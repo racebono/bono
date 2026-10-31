@@ -440,7 +440,11 @@ mod tests {
         assert!(skill("corners").instructions.contains("ref_of"));
         assert!(skill("quick").description.contains("snapshot"));
         // Quick and status are told apart by what each command's output actually has
-        assert!(skill("quick").description.contains("no oil or brake temperatures"));
+        assert!(
+            skill("quick")
+                .description
+                .contains("no oil or brake temperatures")
+        );
         assert!(skill("status").description.contains("engine oil and water"));
     }
 
