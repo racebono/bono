@@ -229,6 +229,8 @@ pub struct Conversation {
     usage: BTreeMap<String, Usage>,
     /// The driver turn Bono Cloud's router is told about, if it's told
     routing: Option<Routing>,
+    /// Added after every turn's tool results (see [`Model::set_tool_result_note`])
+    result_note: Option<Arc<str>>,
 }
 
 /// A driver turn, for Bono Cloud's router (see [`routing`]).
@@ -336,6 +338,10 @@ impl Model for Conversation {
     #[inline]
     fn usage(&self) -> &BTreeMap<String, Usage> {
         &self.usage
+    }
+
+    fn set_tool_result_note(&mut self, note: Option<Arc<str>>) {
+        self.result_note = note;
     }
 }
 
@@ -544,6 +550,7 @@ impl Conversation {
             .await;
 
             // Together, too: the request that carries them back must still fit
+            let note = self.result_note.clone();
             if let Some(limits) = self.history_limits {
                 let mut contents = results
                     .iter_mut()
@@ -551,7 +558,7 @@ impl Conversation {
                     .collect::<Vec<_>>();
                 self.body.messages.push(RequestMessage {
                     role: "user",
-                    content: serde_json::to_value(&results)?,
+                    content: tool_results(&results, note.as_deref())?,
                 });
                 let size = self.request_size();
                 self.body.messages.pop();
@@ -563,7 +570,7 @@ impl Conversation {
 
             self.body.messages.push(RequestMessage {
                 role: "user",
-                content: serde_json::to_value(results)?,
+                content: tool_results(&results, note.as_deref())?,
             });
         }
 
@@ -769,6 +776,16 @@ impl Conversation {
         let lease = self.lease_source.as_ref().map_or(0, |_| LEASE);
         Ok(serde_json::to_vec(&self.leased_request(None))?.len() + lease)
     }
+}
+
+/// The content of the message carrying `results` back, with `note` after them: the API takes text
+/// in that message once every tool result is in.
+fn tool_results(results: &[ResultBody], note: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    let mut content = serde_json::to_value(results)?;
+    if let (Some(note), Some(blocks)) = (note, content.as_array_mut()) {
+        blocks.push(serde_json::json!({"type": "text", "text": note}));
+    }
+    Ok(content)
 }
 
 /// A prefix edit invalidates thinking from that point onward, including redacted thinking.
@@ -1326,6 +1343,7 @@ impl ConversationBuilder {
             tools: self.tools,
             usage: BTreeMap::new(),
             routing: None,
+            result_note: None,
         });
     }
 }
@@ -3031,6 +3049,48 @@ mod tests {
         assert_eq!(result["type"], "tool_result");
         assert_eq!(result["tool_use_id"], "t1");
         assert_eq!(result["content"], "looked up \"gap\"");
+    }
+
+    #[tokio::test]
+    async fn notes_come_last_after_tool_results() {
+        let calls_two = json!([
+            {"type": "tool_use", "id": "t1", "name": "lookup", "input": {"what": "gap"}},
+            {"type": "tool_use", "id": "t2", "name": "lookup", "input": {"what": "fuel"}}
+        ]);
+        let (url, requests) = mock(vec![
+            message("tool_use", calls_two),
+            message("end_turn", json!([{"type": "text", "text": "Due decimi."}])),
+            message(
+                "tool_use",
+                json!([{"type": "tool_use", "id": "t3", "name": "lookup", "input": {}}]),
+            ),
+            message("end_turn", json!([{"type": "text", "text": "Fine."}])),
+        ])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+
+        let note = "[Reply in Italian, the pilot's language.]";
+        conversation.set_tool_result_note(Some(note.into()));
+        send(&mut conversation, "Distacco?").await.unwrap();
+        // Every result first, as the API requires, then the note, kept in the history
+        {
+            let requests = requests.lock().unwrap();
+            let content = &requests[1]["messages"][2]["content"];
+            assert_eq!(content[0]["tool_use_id"], "t1");
+            assert_eq!(content[1]["tool_use_id"], "t2");
+            assert_eq!(content[2], json!({"type": "text", "text": note}));
+            assert_eq!(content.as_array().unwrap().len(), 3);
+        }
+        assert_eq!(conversation.body.messages[2].content[2]["text"], note);
+
+        // Without one, the results go alone
+        conversation.set_tool_result_note(None);
+        send(&mut conversation, "And now?").await.unwrap();
+        let requests = requests.lock().unwrap();
+        let content = &requests[3]["messages"][6]["content"];
+        assert_eq!(content[0]["tool_use_id"], "t3");
+        assert_eq!(content.as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -74,6 +74,20 @@ impl LanguageDetector {
             Detector::None | Detector::Loading(_) => None,
         }
     }
+
+    /// Whether [`Self::detect`] tells languages apart: when it does, a question it can't place
+    /// is too short or ambiguous to be in any language in particular ("Positions.").
+    pub fn is_ready(&self) -> bool {
+        matches!(self.detector, Detector::Ready(_))
+    }
+}
+
+/// What the model is told at the end of a question in the language with `code`, and after the
+/// question's tool results: the voice speaks the answer in that language, whatever the
+/// telemetry, the skill's examples or earlier answers are in.
+pub fn reply_note(code: ArrayStr<2>) -> String {
+    let language = name(code).unwrap_or_else(|| code.to_string());
+    format!("[Reply in {language}, the pilot's language.]")
 }
 
 /// The English name of the language with `code` (as the voices have it), if it's one of those
@@ -154,6 +168,18 @@ mod tests {
         let one = BTreeMap::from([(arrstr!("en"), Utf8PathBuf::from("en.onnx"))]);
         detector.update(rt, &one);
         assert_eq!(detector.detect("¿Cuánto combustible me queda?"), None);
+    }
+
+    #[test]
+    fn notes_the_language_to_reply_in() {
+        assert_eq!(
+            reply_note(arrstr!("it")),
+            "[Reply in Italian, the pilot's language.]"
+        );
+        assert_eq!(
+            reply_note(arrstr!("xx")),
+            "[Reply in xx, the pilot's language.]"
+        );
     }
 
     #[test]

@@ -328,7 +328,7 @@ impl Engineer {
         match heard {
             Heard::Question { text, lang } => {
                 self.misheard = 0;
-                self.ask(rt, sim, config, synth, text, lang);
+                self.ask(rt, sim, config, synth, text, Some(lang));
             }
             Heard::TooShort => {}
             Heard::Unvoiced { text, lang } => {
@@ -424,8 +424,12 @@ impl Engineer {
         question: String,
     ) {
         let lang = match self.languages.detect(&question) {
-            Some(lang) => lang,
-            None => self.last_lang,
+            Some(lang) => Some(lang),
+            // Too short or ambiguous for any language in particular ("Positions."): the one the
+            // pilot was speaking
+            None if self.languages.is_ready() => Some(self.last_lang),
+            // Nothing to tell languages apart with: the model goes by the question
+            None => None,
         };
         self.ask(rt, sim, config, synth, question, lang);
     }
@@ -433,6 +437,10 @@ impl Engineer {
     /// The pilot asked something on the radio: it's sent to the model, with the running
     /// simulator's telemetry, and the answer is spoken as the model writes it. An answer still on its way, or
     /// being spoken, is dropped: the pilot talked over it.
+    ///
+    /// `lang`: the language it was asked in, which the model is told to answer in (the voice
+    /// speaks the answer in it); `None` if it isn't known, for the model to go by the question,
+    /// spoken in the last language the pilot used.
     pub fn ask(
         &mut self,
         rt: &Handle,
@@ -440,9 +448,11 @@ impl Engineer {
         config: &Config,
         synth: &mut Synthesizer,
         question: String,
-        lang: ArrayStr<2>,
+        lang: Option<ArrayStr<2>>,
     ) {
         self.stop();
+        let known = lang.is_some();
+        let lang = lang.unwrap_or(self.last_lang);
         self.last_lang = lang;
         self.chat.push(ChatEntry {
             speaker: Speaker::Pilot,
@@ -500,6 +510,9 @@ impl Engineer {
         let speech = self.speak(rt, config, synth, lang);
         let lang = speech.as_ref().map_or(lang, |(lang, _)| *lang);
         let speech = speech.map(|(_, speech)| speech);
+        // Told last, after the question (and its snapshot) and after each tool result: by the
+        // answer, the skill, the telemetry and often earlier answers are all in English
+        let note: Option<Arc<str>> = known.then(|| language::reply_note(lang).into());
         let (chat, text) = mpsc::unbounded_channel();
         let task = Task::spawn(async move {
             let mut state = state.lock().await;
@@ -522,6 +535,11 @@ impl Engineer {
                 }
                 false => state.tool.question_with_snapshot(question).await,
             };
+            let question = match &note {
+                Some(note) => format!("{question}\n\n{note}"),
+                None => question,
+            };
+            state.conversation.set_tool_result_note(note);
             let mut on_text = |text: &str| {
                 if let Some(speech) = &speech {
                     speech.push(text);
@@ -1275,6 +1293,8 @@ mod tests {
 
     /// A typed question answered the way the app does it: `ask_text`, then `update` every frame
     /// until the answer is in. Needs `ANTHROPIC_API_KEY` and `EVAL_DB` (a recorded race).
+    /// `EVAL_LANG` (e.g. `it`) asks them as if heard on the radio in that language instead: with
+    /// no voices installed, typed questions aren't told apart.
     #[test]
     #[ignore]
     fn answers_like_the_app() {
@@ -1304,9 +1324,16 @@ mod tests {
 
         let questions = std::env::var("EVAL_QUESTIONS")
             .unwrap_or_else(|_| "how are the tyres?|where am I losing time?".into());
+        let lang = std::env::var("EVAL_LANG")
+            .ok()
+            .map(|lang| ArrayStr::from_str(&lang).expect("EVAL_LANG isn't a language code"));
         for question in questions.split('|') {
             let start = std::time::Instant::now();
-            engineer.ask_text(rt, Some(&mut sim), &config, &mut synth, question.to_owned());
+            let (running, asked) = (Some(&mut *sim), question.to_owned());
+            match lang {
+                Some(lang) => engineer.ask(rt, running, &config, &mut synth, asked, Some(lang)),
+                None => engineer.ask_text(rt, running, &config, &mut synth, asked),
+            }
             while engineer.is_thinking() {
                 assert!(
                     start.elapsed() < std::time::Duration::from_secs(120),
