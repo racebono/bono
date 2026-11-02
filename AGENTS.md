@@ -49,6 +49,10 @@ including the 260-character limit in some native build tools. `cargo check` and
   directory, unique to this checkout. Use it consistently for build, check, test,
   and packaging commands so they reuse the same artifacts. Respect sandbox write
   permissions when choosing the location.
+- Prefer a short symlink to the current worktree whenever possible and run
+  build/test commands through that path. Verify that it targets this worktree,
+  not another checkout. If symlinks are unavailable or native tools resolve
+  them back to the long path, use another suitable short-path arrangement.
 - For example, in PowerShell, if `D:\bt\bono-t3` is writable and reserved for this
   checkout:
 
@@ -65,8 +69,24 @@ including the 260-character limit in some native build tools. `cargo check` and
   in Whisper's Vulkan build; do not switch to MSBuild to work around a failure.
 - If a path-length error remains, inspect the failing path. A short target
   directory does not shorten dependency source/cache or checkout paths; use a
-  shorter checkout or Cargo cache location when those paths are the cause.
+  shorter checkout or Cargo cache location when the symlink does not help.
   Do not assume Windows long-path support fixes every native tool's limits.
 - Retry the affected command with the shorter paths before treating the error
   as a code regression. Report any remaining environment blocker and which
   checks actually completed; do not claim tests passed when compilation failed.
+
+## Clean up temporary build paths
+
+Track temporary build directories, Cargo target/cache directories, and short
+symlinks created for the task. Reuse them while the work is active, then remove
+them after end-to-end work finishes and before the T3 thread settles (including
+when handing back failed or blocked work). If the thread will resume for checks
+or follow-up work, retain needed paths until that work finishes, then clean up
+immediately before the final handback.
+
+Before cleanup, ensure no build, test, packaging, or background process still
+uses those paths. Verify each absolute path and remove only task-owned temporary
+artifacts; preserve shared caches, existing user directories, deliverables, and
+the worktree itself. Remove symlinks as links without traversing or deleting
+their targets. Report any cleanup that could not be completed and the remaining
+paths in the final handback.
