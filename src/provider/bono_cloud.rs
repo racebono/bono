@@ -699,6 +699,11 @@ impl Model for Conversation {
             }
         });
     }
+
+    /// Also after the results of the router's call, which Claude reads without having made it.
+    fn set_tool_result_note(&mut self, note: Option<Arc<str>>) {
+        self.inner.set_tool_result_note(note);
+    }
 }
 
 impl Drop for Conversation {
@@ -1451,6 +1456,27 @@ mod tests {
             assert_eq!(history[3]["content"], claude_call["content"]);
             assert_eq!(history[4]["content"][0]["tool_use_id"], "toolu_claude");
         }
+    }
+
+    /// Claude reads the router's call and its (English) result without having made it: the
+    /// pilot's language follows the result, the last thing before the answer.
+    #[tokio::test]
+    async fn notes_the_language_after_the_routers_results() {
+        let (url, requests) = mock(vec![(200, synthetic("toolu_jev").to_string()), answer()]).await;
+        let account = signed_in(url, "access-1");
+        let (tools, _) = engineer_tools();
+        let mut conversation = conversation(&account, tools);
+        conversation.set_routing_context(Some(routing_context()));
+        let note = "[Reply in Italian, the pilot's language.]";
+        conversation.set_tool_result_note(Some(note.into()));
+
+        conversation.send("Situazione meteo".into()).await.unwrap();
+        let requests = requests.lock().unwrap();
+        let history = requests[1].1["messages"].as_array().unwrap();
+        let results = history[2]["content"].as_array().unwrap();
+        assert_eq!(results[0]["tool_use_id"], "toolu_jev");
+        assert_eq!(results[1], json!({"type": "text", "text": note}));
+        assert_eq!(results.len(), 2);
     }
 
     #[tokio::test]
