@@ -89,6 +89,18 @@ jobs:
                   ref: ${{ needs.changes.outputs.ref }}
                   persist-credentials: false
 
+            # Stable builds look for updates by comparing their version with the latest release's
+            # tag: one that doesn't match would keep offering itself as an update.
+            - name: Check release version
+              if: github.event_name == 'release'
+              env:
+                  TAG: ${{ github.event.release.tag_name }}
+              run: |
+                  $version = (Select-String -LiteralPath Cargo.toml -Pattern '^version = "(.+)"$' | Select-Object -First 1).Matches[0].Groups[1].Value
+                  if ($env:TAG -cnotin @($version, "v$version")) {
+                    throw "Release tag $env:TAG doesn't match the app's version $version"
+                  }
+
             - name: Set up LMU plugin SDK
               env:
                   GH_TOKEN: ${{ secrets.LMU_SDK_READ_TOKEN }}

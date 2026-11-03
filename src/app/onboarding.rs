@@ -124,6 +124,10 @@ impl Onboarding {
         self.step = Some(Step::Welcome);
     }
 
+    pub fn is_open(&self) -> bool {
+        self.step.is_some()
+    }
+
     pub fn update(
         &mut self,
         rt: &Handle,
