@@ -76,7 +76,8 @@ struct GitHubRelease {
     draft: bool,
     prerelease: bool,
     target_commitish: String,
-    created_at: String,
+    /// Unset while a draft
+    published_at: Option<String>,
     assets: Vec<GitHubAsset>,
 }
 
@@ -139,23 +140,33 @@ fn pick_stable(latest: &GitHubRelease, current: &str) -> anyhow::Result<Option<R
 
 /// The newest nightly, unless it's the one built from `commit`.
 fn pick_nightly(releases: &[GitHubRelease], commit: &str) -> anyhow::Result<Option<Release>> {
-    let mut newest = None::<(SystemTime, &GitHubRelease, Release)>;
+    let mut newest = None::<(SystemTime, Release)>;
+    // When this build's nightly came out, if it's there: whether or not it's complete, nothing
+    // older is newer
+    let mut own = None::<SystemTime>;
     for github in releases {
         if github.draft || !github.prerelease || !github.tag_name.starts_with("nightly-") {
+            continue;
+        }
+        let Some(published) = github.published_at.as_deref() else {
+            continue;
+        };
+        let published = humantime::parse_rfc3339(published)
+            .with_context(|| format!("Unexpected release date {published:?}"))?;
+        if github.target_commitish.eq_ignore_ascii_case(commit) {
+            own = own.max(Some(published));
             continue;
         }
         let Some(release) = github.release() else {
             continue;
         };
-        let created = humantime::parse_rfc3339(&github.created_at)
-            .with_context(|| format!("Unexpected release date {:?}", github.created_at))?;
-        if newest.as_ref().is_none_or(|(time, ..)| created > *time) {
-            newest = Some((created, github, release));
+        if newest.as_ref().is_none_or(|(time, _)| published > *time) {
+            newest = Some((published, release));
         }
     }
     Ok(newest
-        .filter(|(_, github, _)| !github.target_commitish.eq_ignore_ascii_case(commit))
-        .map(|(.., release)| release))
+        .filter(|(time, _)| own.is_none_or(|own| *time > own))
+        .map(|(_, release)| release))
 }
 
 /// The URL of the page after this one, from a `Link` header.
@@ -458,7 +469,11 @@ try {
 }
 # For the version opened to claim
 $lock.Dispose()
-Start-Process -FilePath (Join-Path $target 'bono.exe') -WorkingDirectory $target
+# Start-Process would take brackets in the paths for wildcards
+$start = New-Object Diagnostics.ProcessStartInfo -Property @{
+    FileName = Join-Path $target 'bono.exe'; WorkingDirectory = $target; UseShellExecute = $true
+}
+$null = [Diagnostics.Process]::Start($start)
 "#;
 
 #[cfg(windows)]
@@ -547,7 +562,7 @@ mod tests {
             draft: false,
             prerelease,
             target_commitish: commit.into(),
-            created_at: created.into(),
+            published_at: Some(created.into()),
             assets: ASSET.into_iter().map(asset).collect(),
         }
     }
@@ -557,7 +572,7 @@ mod tests {
         let json = |digest: &str| {
             format!(
                 r#"{{"tag_name":"v1.2.3","name":"","draft":false,"prerelease":false,
-                "target_commitish":"master","created_at":"2026-11-03T04:45:29Z","body":"notes",
+                "target_commitish":"master","published_at":"2026-11-03T04:45:29Z","body":"notes",
                 "assets":[{{"name":"bono-windows-x86_64.zip","state":"uploaded","size":7,
                 "browser_download_url":"https://example.com/a.zip","digest":{digest},"id":1}}]}}"#
             )
@@ -639,6 +654,15 @@ mod tests {
         assert_eq!(newest.name, "Release nightly-2026-11-03-3-1");
         assert_eq!(newest.sha256, "abc");
         assert_eq!(pick_nightly(&releases, "CCC").unwrap(), None);
+
+        // This build's nightly, newest but still uploading: nothing older is newer
+        let mut own = releases.to_vec();
+        own[1].assets[0].state = "open".into();
+        assert_eq!(pick_nightly(&own, "ccc").unwrap(), None);
+        // A draft isn't out yet
+        own[2].published_at = None;
+        let newest = pick_nightly(&own, "zzz").unwrap().unwrap();
+        assert_eq!(newest.tag, "nightly-2026-11-01-1-1");
 
         // One still uploading doesn't count
         let mut uploading = releases.to_vec();
@@ -817,7 +841,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn installer_waits_for_the_app_then_replaces_it() {
         let dir = tempfile::tempdir().unwrap();
-        let install = dir.path().join("bono app");
+        // PowerShell takes brackets for wildcards in places
+        let install = dir.path().join("bono [app]");
         let staging = Staging::at(&install);
         let release = staged("v0.2.0");
         unpacked(&staging, &release);
