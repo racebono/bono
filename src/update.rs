@@ -345,16 +345,18 @@ impl Staging {
     /// Starts installing `release`, once unpacked, as soon as the process `pid` (this app)
     /// exits, then opens the new version. Returns once the installer is waiting.
     pub async fn install(&self, release: &Release, pid: u32) -> anyhow::Result<()> {
-        self.installer(release, RETRIES).start(pid).await
+        self.installer(release, RETRIES, true).start(pid).await
     }
 
-    fn installer(&self, release: &Release, retries: u32) -> Installer {
+    fn installer(&self, release: &Release, retries: u32, breakaway: bool) -> Installer {
         Installer {
             source: self.ready(release),
             target: self.install.clone(),
             backup: self.dir.join("backup"),
             failed: self.dir.join(FAILED),
+            lock: self.dir.join(LOCK),
             retries,
+            breakaway,
         }
     }
 }
@@ -380,7 +382,12 @@ struct Installer {
     backup: PathBuf,
     /// Where it says what went wrong, if it failed
     failed: PathBuf,
+    /// The app's claim on the installation's updates, which it takes over
+    lock: PathBuf,
     retries: u32,
+    /// Leaves the app's job, if it's in one, which may end its processes with it: the installer
+    /// could be stopped halfway. A job that doesn't allow that fails the start
+    breakaway: bool,
 }
 
 /// The installer: waits for the app to exit, puts the new version in place and opens it.
@@ -391,6 +398,8 @@ struct Installer {
 /// version opens again, still offering the new one, and the installer says what went wrong.
 /// Anything else in the installation's folder stays. Moves are retried while something still has
 /// the file or folder open. Paths come in through the environment, so they need no quoting.
+///
+/// Its lock is `File::try_lock`'s: both lock the file's first byte, so they exclude each other.
 #[cfg(windows)]
 const INSTALLER: &str = r#"
 $ErrorActionPreference = 'Stop'
@@ -405,12 +414,21 @@ $source = $env:BONO_UPDATE_SOURCE
 $target = $env:BONO_UPDATE_TARGET
 $backup = $env:BONO_UPDATE_BACKUP
 $retries = [int]$env:BONO_UPDATE_RETRIES
-function Move-Retrying($from, $to) {
+function Retrying($action) {
     for ($try = 1; ; $try++) {
-        try { Move-Item -LiteralPath $from -Destination $to; return }
+        try { return & $action }
         catch { if ($try -ge $retries) { throw }; Start-Sleep -Seconds 1 }
     }
 }
+function Move-Retrying($from, $to) {
+    Retrying { Move-Item -LiteralPath $from -Destination $to }
+}
+
+# The app's claim on the installation's updates passes to the installer, so no Bono opened
+# meanwhile removes what it moves. The app's lock goes once the system notices it exited. If
+# another Bono has claimed them instead, it's left alone, with the new version still to install
+$lock = [IO.File]::Open($env:BONO_UPDATE_LOCK, 'OpenOrCreate', 'ReadWrite', 'ReadWrite')
+Retrying { $lock.Lock(0, 1) }
 
 $moved = New-Object System.Collections.ArrayList
 try {
@@ -436,8 +454,10 @@ try {
             if ($replaced) { Move-Retrying (Join-Path $backup $name) $new }
         } catch { $failure += "`n" + $_.Exception.Message }
     }
-    [IO.File]::WriteAllText($env:BONO_UPDATE_FAILED, $failure)
+    try { [IO.File]::WriteAllText($env:BONO_UPDATE_FAILED, $failure) } catch {}
 }
+# For the version opened to claim
+$lock.Dispose()
 Start-Process -FilePath (Join-Path $target 'bono.exe') -WorkingDirectory $target
 "#;
 
@@ -467,21 +487,19 @@ impl Installer {
             .env("BONO_UPDATE_TARGET", &self.target)
             .env("BONO_UPDATE_BACKUP", &self.backup)
             .env("BONO_UPDATE_FAILED", &self.failed)
+            .env("BONO_UPDATE_LOCK", &self.lock)
             .env("BONO_UPDATE_RETRIES", self.retries.to_string())
             .current_dir(&self.target)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
-        // Out of the app's job, if it's in one that ends its processes with it. A job that doesn't
-        // allow that fails the start
-        let mut child = match command
-            .creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB)
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(_) => (command.creation_flags(CREATE_NO_WINDOW).spawn())
-                .context("Unable to start the installer")?,
+        let breakaway = match self.breakaway {
+            true => CREATE_BREAKAWAY_FROM_JOB,
+            false => 0,
         };
+        let mut child = (command.creation_flags(CREATE_NO_WINDOW | breakaway))
+            .spawn()
+            .context("Unable to start the installer. If Bono was started by another program, start it by itself")?;
 
         let stdout = child.stdout.take().context("No installer output")?;
         let mut stdout = tokio::io::BufReader::new(stdout);
@@ -811,7 +829,10 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let installing = staging.install(&release, app.id()).await;
+        // Tests may run in a job that doesn't let it leave
+        let installing = (staging.installer(&release, RETRIES, false))
+            .start(app.id())
+            .await;
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         let early = std::fs::read_to_string(install.join("changed.txt")).unwrap() != "old";
         app.kill().unwrap();
@@ -856,7 +877,7 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let installing = staging.installer(&release, 2).start(app.id()).await;
+        let installing = staging.installer(&release, 2, false).start(app.id()).await;
         app.kill().unwrap();
         app.wait().unwrap();
         installing.unwrap();
@@ -876,6 +897,38 @@ mod tests {
         assert_eq!(read(&staging.ready(&release).join("changed.txt")), "new");
     }
 
+    /// Another Bono claimed the installation's updates: the installer leaves it alone.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn installer_yields_to_another_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let install = dir.path().join("bono app");
+        let staging = Staging::at(&install);
+        let release = staged("v0.2.0");
+        unpacked(&staging, &release);
+        installed(&install);
+        let other = Staging::at(&install);
+        other.claim().unwrap();
+
+        let mut app = std::process::Command::new(system("ping.exe"))
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let installing = staging.installer(&release, 2, false).start(app.id()).await;
+        app.kill().unwrap();
+        app.wait().unwrap();
+        installing.unwrap();
+        // It gives up after its retries
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        assert_eq!(
+            std::fs::read_to_string(install.join("changed.txt")).unwrap(),
+            "old"
+        );
+        assert!(staging.ready(&release).join(EXE).exists());
+        assert!(!staging.dir.join("backup").exists());
+    }
+
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread")]
     async fn installer_fails_for_a_missing_app() {
@@ -888,6 +941,7 @@ mod tests {
         gone.wait().unwrap();
         let pid = gone.id();
         drop(gone);
-        assert!(staging.install(&staged("v0.2.0"), pid).await.is_err());
+        let installer = staging.installer(&staged("v0.2.0"), RETRIES, false);
+        assert!(installer.start(pid).await.is_err());
     }
 }

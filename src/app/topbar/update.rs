@@ -43,6 +43,8 @@ pub struct UpdateTopbar {
     state: State,
     /// What last went wrong, besides a check or a download (which says so itself)
     error: Option<String>,
+    /// How the last installation failed, shown until another is tried
+    failure: Option<String>,
     /// The check at startup offers a new version in a popup
     startup: bool,
     popup: bool,
@@ -63,6 +65,7 @@ impl UpdateTopbar {
             staging,
             state: State::Unsupported,
             error: None,
+            failure: None,
             startup: true,
             popup: false,
         };
@@ -136,7 +139,7 @@ impl UpdateTopbar {
                     let startup = std::mem::replace(&mut self.startup, false);
                     if let Some(failure) = failure {
                         log::error!("The last update failed to install: {failure}");
-                        self.error = Some(t!("update.install_failed", error = failure));
+                        self.failure = Some(t!("update.install_failed", error = failure));
                     }
                     match (result, known) {
                         (Ok((None, _)), _) => State::UpToDate,
@@ -289,7 +292,7 @@ impl UpdateTopbar {
                 });
             }
         }
-        if let Some(error) = &self.error {
+        for error in [&self.failure, &self.error].into_iter().flatten() {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
         if matches!(
@@ -319,6 +322,7 @@ impl UpdateTopbar {
                 if let (Some(staging), State::Ready(release)) = (&self.staging, &self.state) {
                     let (staging, release) = (staging.clone(), release.clone());
                     self.error = None;
+                    self.failure = None;
                     let install = release.clone();
                     self.state = State::Installing(
                         release,
