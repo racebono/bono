@@ -1624,5 +1624,110 @@
         "en": "With no game running the engineer can't tell you about your race yet: start one, and ask away.",
         "es": "Sin ningún juego en marcha el ingeniero aún no puede hablarte de tu carrera: inicia uno y pregunta.",
         "ca": "Sense cap joc en marxa l'enginyer encara no et pot parlar de la cursa: inicia'n un i pregunta."
+    },
+    "update": {
+        "en": "Update",
+        "es": "Actualizar",
+        "ca": "Actualitza"
+    },
+    "update.current": {
+        "en": "This is Bono {version} ({channel}).",
+        "es": "Esta es la versión {version} de Bono ({channel}).",
+        "ca": "Aquesta és la versió {version} de Bono ({channel})."
+    },
+    "update.stable": {
+        "en": "stable",
+        "es": "estable",
+        "ca": "estable"
+    },
+    "update.nightly": {
+        "en": "nightly",
+        "es": "nightly",
+        "ca": "nightly"
+    },
+    "update.unsupported": {
+        "en": "This build can't update itself.",
+        "es": "Esta compilación no se puede actualizar sola.",
+        "ca": "Aquesta compilació no es pot actualitzar sola."
+    },
+    "update.checking": {
+        "en": "Checking for a new version…",
+        "es": "Buscando una versión nueva…",
+        "ca": "S'està cercant una versió nova…"
+    },
+    "update.check_failed": {
+        "en": "Couldn't check for a new version: {error}",
+        "es": "No se ha podido buscar una versión nueva: {error}",
+        "ca": "No s'ha pogut cercar una versió nova: {error}"
+    },
+    "update.up_to_date": {
+        "en": "You have the latest version.",
+        "es": "Tienes la última versión.",
+        "ca": "Tens la darrera versió."
+    },
+    "update.available": {
+        "en": "A new version is available: {version}",
+        "es": "Hay una versión nueva disponible: {version}",
+        "ca": "Hi ha una versió nova disponible: {version}"
+    },
+    "update.download": {
+        "en": "Download ({size})",
+        "es": "Descargar ({size})",
+        "ca": "Baixa ({size})"
+    },
+    "update.downloading": {
+        "en": "Downloading {version}…",
+        "es": "Descargando {version}…",
+        "ca": "S'està baixant {version}…"
+    },
+    "update.unpacking": {
+        "en": "Preparing {version}…",
+        "es": "Preparando {version}…",
+        "ca": "S'està preparant {version}…"
+    },
+    "update.ready": {
+        "en": "{version} is ready to install.",
+        "es": "{version} está lista para instalarse.",
+        "ca": "{version} està a punt per instal·lar-se."
+    },
+    "update.ready_hover": {
+        "en": "A new version is ready to install",
+        "es": "Hay una versión nueva lista para instalarse",
+        "ca": "Hi ha una versió nova a punt per instal·lar-se"
+    },
+    "update.install_note": {
+        "en": "Bono will close, install it and open again. Your settings, models and voices are kept.",
+        "es": "Bono se cerrará, la instalará y volverá a abrirse. Se conservan tus ajustes, modelos y voces.",
+        "ca": "Bono es tancarà, la instal·larà i es tornarà a obrir. Es conserven la configuració, els models i les veus."
+    },
+    "update.install": {
+        "en": "Install and restart",
+        "es": "Instalar y reiniciar",
+        "ca": "Instal·la i reinicia"
+    },
+    "update.installing": {
+        "en": "Installing…",
+        "es": "Instalando…",
+        "ca": "S'està instal·lant…"
+    },
+    "update.check": {
+        "en": "Check again",
+        "es": "Volver a buscar",
+        "ca": "Torna a cercar"
+    },
+    "update.popup_title": {
+        "en": "New version available",
+        "es": "Nueva versión disponible",
+        "ca": "Nova versió disponible"
+    },
+    "update.popup_body": {
+        "en": "{version} is available (you have {current}). Download it now? You can install it from the Update menu once it's downloaded.",
+        "es": "{version} está disponible (tienes la {current}). ¿Quieres descargarla ahora? Cuando se haya descargado, podrás instalarla desde el menú Actualizar.",
+        "ca": "{version} està disponible (tens la {current}). Vols baixar-la ara? Quan s'hagi baixat, podràs instal·lar-la des del menú Actualitza."
+    },
+    "update.later": {
+        "en": "Not now",
+        "es": "Ahora no",
+        "ca": "Ara no"
     }
 }

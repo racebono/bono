@@ -497,6 +497,8 @@ impl Gui {
             engineer,
             account,
         );
+        // Not over the setup guide
+        (self.topbar.update).popup(ui.ctx(), self.onboarding.is_open());
         question
     }
 

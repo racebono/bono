@@ -43,6 +43,7 @@ mod steam;
 mod synthesizer;
 mod task;
 mod track;
+mod update;
 
 struct AppImpl {
     app: MainThreadData<RefCell<Lifecycle>>,
