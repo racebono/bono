@@ -225,6 +225,8 @@ namespace {
         std::optional<std::string> model;
         std::optional<std::string> championship;
         std::optional<std::string> terrain[4];
+        // Whose it is: another car can take over a slot before its next telemetry update.
+        std::optional<std::string> vehicle;
     };
 
     std::optional<std::string> championship(IP_VehicleChampionship value) {
@@ -547,6 +549,10 @@ namespace {
         // when the game starts. It lives in UserData\bono, where the app and the skill's scripts look
         // for it while the game runs, holds a whole weekend, and is deleted when the game closes.
         void StartSession() override {
+            {
+                std::lock_guard lock(_contexts_mutex);
+                _contexts.clear();
+            }
             start_recording();
         }
 
@@ -583,6 +589,7 @@ namespace {
                 for (std::size_t i = 0; i < std::size(context.terrain); ++i) {
                     context.terrain[i] = text(info.mWheel[i].mTerrainName);
                 }
+                context.vehicle = text(info.mVehicleName);
             }
             bono_telemetry_s telemetry;
             convert(info, telemetry);
@@ -607,15 +614,18 @@ namespace {
                 {
                     std::lock_guard lock(_contexts_mutex);
                     const auto context = _contexts.find(info.mVehicle[i].mID);
-                    if (context != _contexts.end()) {
+                    if (context != _contexts.end() && context->second.vehicle == text(info.mVehicle[i].mVehicleName)) {
                         standing.front_tire_compound_name = context->second.front_compound;
                         standing.rear_tire_compound_name = context->second.rear_compound;
                         standing.vehicle_model = context->second.model;
                         standing.championship = context->second.championship;
-                        standing.terrain_front_left = context->second.terrain[0];
-                        standing.terrain_front_right = context->second.terrain[1];
-                        standing.terrain_rear_left = context->second.terrain[2];
-                        standing.terrain_rear_right = context->second.terrain[3];
+                        // The player's only: every car's would add a row at every kerb.
+                        if (info.mVehicle[i].mIsPlayer) {
+                            standing.terrain_front_left = context->second.terrain[0];
+                            standing.terrain_front_right = context->second.terrain[1];
+                            standing.terrain_rear_left = context->second.terrain[2];
+                            standing.terrain_rear_right = context->second.terrain[3];
+                        }
                     }
                 }
                 standings.push_back(std::move(standing));

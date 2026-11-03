@@ -498,8 +498,8 @@ struct Converter {
     laps: HashMap<i32, LapState>,
     /// The session the laps are from: type and iteration
     session: Option<(i32, i32)>,
-    /// Where the player's car last pointed, kept while it's too slow to tell
-    player_heading: Option<f64>,
+    /// The car the player's data is about, and where it last pointed, kept while it can't be told
+    player_heading: Option<(i32, f64)>,
 }
 
 /// A car's current lap, held steady across the reads. The game's lap count and lap timer don't
@@ -669,10 +669,17 @@ impl Converter {
 
             if slot == player_slot {
                 player_telemetry(shared, &mut out);
-                if let Some(heading) = body_heading(player.velocity, player.local_velocity) {
-                    self.player_heading = Some(heading);
+                let orientation = shared.car_orientation;
+                let level = orientation.pitch.abs() as f64 <= MAX_LEVEL_TILT
+                    && orientation.roll.abs() as f64 <= MAX_LEVEL_TILT;
+                if self.player_heading.is_some_and(|(car, _)| car != slot) {
+                    self.player_heading = None;
                 }
-                out.heading = self.player_heading.into();
+                if level && let Some(body) = body_heading(player.velocity, player.local_velocity) {
+                    self.player_heading = Some((slot, body));
+                }
+                // Before the body's known, how it moved is the best there is
+                out.heading = self.player_heading.map(|(_, body)| body).or(heading).into();
             }
             telemetry.push(out);
         }
@@ -784,10 +791,6 @@ fn player_telemetry(shared: &r3e_shared, out: &mut bono_telemetry) {
     state.abs = setting(shared.abs_setting).into();
     state.engine_map = setting(shared.engine_map_setting).into();
     state.engine_braking = setting(shared.engine_brake_setting).into();
-    state.steering_wheel_range = Some(shared.steer_wheel_range_degrees)
-        .filter(|degrees| *degrees > 0)
-        .map(f64::from)
-        .into();
     state.engine_max_rpm = positive(shared.max_engine_rps)
         .map(|rps| rps * 60.0 / std::f64::consts::TAU)
         .into();
@@ -843,19 +846,33 @@ fn player_telemetry(shared: &r3e_shared, out: &mut bono_telemetry) {
     state.aerodynamics_damage = damaged(damage.aerodynamics).into();
     state.suspension_damage = damaged(damage.suspension).into();
 
-    let (tires, brakes) = (shared.tire_temp, shared.brake_temp);
-    // Limits belong to the compound and the brake, so per axle: the left wheel's speaks for both
-    let (front, rear) = (R3E_TIRE_FRONT_LEFT as usize, R3E_TIRE_REAR_LEFT as usize);
-    state.front_tire_cold_temperature = non_negative(tires[front].cold_temp).into();
-    state.front_tire_hot_temperature = non_negative(tires[front].hot_temp).into();
-    state.rear_tire_cold_temperature = non_negative(tires[rear].cold_temp).into();
-    state.rear_tire_hot_temperature = non_negative(tires[rear].hot_temp).into();
-    state.front_brake_cold_temperature = non_negative(brakes[front].cold_temp).into();
-    state.front_brake_optimal_temperature = non_negative(brakes[front].optimal_temp).into();
-    state.front_brake_hot_temperature = non_negative(brakes[front].hot_temp).into();
-    state.rear_brake_cold_temperature = non_negative(brakes[rear].cold_temp).into();
-    state.rear_brake_optimal_temperature = non_negative(brakes[rear].optimal_temp).into();
-    state.rear_brake_hot_temperature = non_negative(brakes[rear].hot_temp).into();
+    // Limits belong to the compound and the brake, so per axle: either wheel's speaks for both.
+    // The game only documents them for a car the player drives.
+    if shared.control_type == R3E_CONTROL_PLAYER {
+        let axle = |values: [f32; 2]| positive(values[0]).or(positive(values[1]));
+        let (tires, brakes) = (shared.tire_temp, shared.brake_temp);
+        let tire = |wheel: usize, get: fn(&r3e_tire_temp) -> f32| {
+            axle([get(&tires[wheel]), get(&tires[wheel + 1])])
+        };
+        let brake = |wheel: usize, get: fn(&r3e_brake_temp) -> f32| {
+            axle([get(&brakes[wheel]), get(&brakes[wheel + 1])])
+        };
+        let (front, rear) = (R3E_TIRE_FRONT_LEFT as usize, R3E_TIRE_REAR_LEFT as usize);
+        state.front_tire_cold_temperature = tire(front, |t| t.cold_temp).into();
+        state.front_tire_hot_temperature = tire(front, |t| t.hot_temp).into();
+        state.rear_tire_cold_temperature = tire(rear, |t| t.cold_temp).into();
+        state.rear_tire_hot_temperature = tire(rear, |t| t.hot_temp).into();
+        state.front_brake_cold_temperature = brake(front, |b| b.cold_temp).into();
+        state.front_brake_optimal_temperature = brake(front, |b| b.optimal_temp).into();
+        state.front_brake_hot_temperature = brake(front, |b| b.hot_temp).into();
+        state.rear_brake_cold_temperature = brake(rear, |b| b.cold_temp).into();
+        state.rear_brake_optimal_temperature = brake(rear, |b| b.optimal_temp).into();
+        state.rear_brake_hot_temperature = brake(rear, |b| b.hot_temp).into();
+        state.steering_wheel_range = Some(shared.steer_wheel_range_degrees)
+            .filter(|degrees| *degrees > 0)
+            .map(f64::from)
+            .into();
+    }
 
     let (deflection, camber) = (player.suspension_deflection, player.camber);
     let (suspension_velocity, grip, dirt, flatspot) = (
@@ -1295,9 +1312,14 @@ fn endless(activations: i64) -> bool {
 /// Below this speed (m/s), a velocity's direction is noise.
 const MIN_DIRECTION_SPEED: f64 = 1.0;
 
+/// How far a car may pitch or roll (radians) for its velocity to tell where it points: the
+/// calculation below takes it as level, and is out by more the further it tilts while sliding.
+const MAX_LEVEL_TILT: f64 = 0.35;
+
 /// Where the car body points, from its velocity in the world and relative to itself: travel
-/// direction less the angle the car travels at relative to its nose. The game documents both
-/// vectors, but not the axes and signs of its Euler angles. `None` when it's too slow to tell.
+/// direction less the angle the car travels at relative to its nose. The game gives both vectors
+/// and the local axes, but not the axes and signs of its Euler angles. Takes the world as a
+/// rotation of those axes. `None` when it's too slow to tell.
 fn body_heading(world: r3e_vec3_f64, local: r3e_vec3_f64) -> Option<f64> {
     // Local axes: +x left, +z back
     let (forward, right) = (-local.z, -local.x);
@@ -2137,6 +2159,38 @@ mod tests {
         assert!(close(held.unwrap(), 0.0));
         assert!(close(course.unwrap(), PI));
         assert_eq!(read(3.0, vec3(0.0, 0.0), vec3(0.0, 0.0)), (held, None));
+
+        // Steeply banked, it holds too; another car's data doesn't inherit it
+        let mut banked = shared(4.0, 0.0);
+        let mut player = banked.player;
+        player.velocity = vec3(-30.0, 0.0);
+        player.local_velocity = vec3(0.0, -30.0);
+        banked.player = player;
+        banked.car_orientation.roll = 0.5;
+        let mut converter = Converter {
+            player_heading: Some((7, 0.25)),
+            last_time: Some(3.0),
+            session: Some((R3E_SESSION_RACE, 1)),
+            ..Converter::default()
+        };
+        let update = converter.convert(&banked, start).unwrap();
+        let mine = update
+            .telemetry
+            .iter()
+            .find(|t| t.vehicle_id.get() == Some(7));
+        assert_eq!(mine.unwrap().heading.get(), Some(0.25));
+        let mut other = Converter {
+            player_heading: Some((3, 0.25)),
+            last_time: Some(3.0),
+            session: Some((R3E_SESSION_RACE, 1)),
+            ..Converter::default()
+        };
+        let update = other.convert(&banked, start).unwrap();
+        let mine = update
+            .telemetry
+            .iter()
+            .find(|t| t.vehicle_id.get() == Some(7));
+        assert_eq!(mine.unwrap().heading.get(), None);
     }
 
     #[test]
@@ -2156,6 +2210,7 @@ mod tests {
         tires[0].cold_temp = 70.0;
         tires[0].hot_temp = 110.0;
         tires[2].cold_temp = -1.0;
+        tires[3].cold_temp = 75.0;
         shared.tire_temp = tires;
         let mut player = shared.player;
         player.current_downforce = 5000.0;
@@ -2215,7 +2270,8 @@ mod tests {
         assert_eq!(state.push_to_pass_charged.get(), Some(false));
         assert_eq!(state.push_to_pass_activations_left.get(), Some(3));
         assert_eq!(state.front_tire_cold_temperature.get(), Some(70.0));
-        assert_eq!(state.rear_tire_cold_temperature.get(), None);
+        // The other wheel of the axle speaks for one that doesn't report
+        assert_eq!(state.rear_tire_cold_temperature.get(), Some(75.0));
         assert_eq!(mine.wheels[1].tire_flatspot.get(), Some(true));
         assert_eq!(mine.wheels[2].tire_flatspot.get(), None);
         assert_eq!(mine.wheels[1].tire_grip.get(), Some(0.8f32 as f64));

@@ -85,7 +85,7 @@
     X(f64, vehicle_length, true) \
     X(string, front_tire_compound_name, true) /* the simulator's name, car-specific */ \
     X(string, rear_tire_compound_name, true) \
-    X(string, terrain_front_left, true) /* the simulator's material name under each tire */ \
+    X(string, terrain_front_left, true) /* the simulator's material name under each of the player's tires: others' would add a row at every kerb */ \
     X(string, terrain_front_right, true) \
     X(string, terrain_rear_left, true) \
     X(string, terrain_rear_right, true) \
@@ -102,7 +102,7 @@
     X(f64, last_sector_3, true)                                                                           \
     X(f64, best_lap_time, true)                                                                           \
     X(f64, best_lap_sector_1, true)          /* sector 1 of the best lap */                               \
-    X(f64, best_lap_sector_2, true) /* sector 2 alone of the best lap, not cumulative */ \
+    X(f64, best_lap_sector_2, true) /* sector 2 alone of the best lap; LMU's source taken as cumulative like its other sector 2 times, unverified */ \
     X(f64, best_sector_1, true)              /* best sector 1 of any lap */                               \
     X(f64, best_sectors_1_and_2, true)       /* best combined sectors 1 and 2 of any lap */               \
     X(f64, current_sector_1, true)           /* sector times of the lap in progress */                    \

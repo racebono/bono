@@ -2473,6 +2473,9 @@ fn cmd_field(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
 
 /// Alerts (what changes what the pilot must do right now) and info (context, only when it bears
 /// on the question) from the scoring tables.
+/// How far over the pit speed limit (m/s) a car must be, for a limiter holding it at the limit.
+const PIT_SPEED_MARGIN: f64 = 0.5;
+
 /// Rules, overtaking systems and tire condition, each only where the simulator reports it.
 fn car_rules_and_condition(
     p: &Row,
@@ -2483,9 +2486,14 @@ fn car_rules_and_condition(
     info: &mut Vec<String>,
 ) {
     let limit = session.and_then(|s| s.f("pit_speed_limit"));
-    if let Some(limit) = limit {
-        // Only the pit lane has this limit
-        if p.b("in_pit_lane") && p.f("speed").is_some_and(|speed| speed > limit) {
+    if let Some(limit) = limit
+        && p.b("in_pit_lane")
+    {
+        // Only the pit lane has this limit, and a limiter holds the car right at it
+        if p.b("is_player")
+            && p.f("speed")
+                .is_some_and(|speed| speed > limit + PIT_SPEED_MARGIN)
+        {
             alerts.push(format!(
                 "OVER THE PIT SPEED LIMIT ({} km/h, limit {} km/h)",
                 kmh(p.f("speed")),
@@ -2495,38 +2503,35 @@ fn car_rules_and_condition(
         info.push(format!("pit speed limit {} km/h", kmh(Some(limit))));
     }
     if p.b("next_lap_invalidated") {
-        alerts.push("NEXT LAP ALSO INVALID".into());
+        info.push("next lap already invalid too".into());
     }
     if p.b("previous_lap_invalidated") {
         info.push("previous lap invalid".into());
     }
-    if let Some(points) = p.i("incident_points") {
+    if let Some(points) = p.i("incident_points").filter(|points| *points > 0) {
         let max = session.and_then(|s| s.i("max_incident_points"));
         info.push(match max {
             Some(max) => format!("incident points {points}/{max}"),
             None => format!("incident points {points}"),
         });
     }
-    if let Some(warnings) = p.i("cut_track_warnings") {
+    if let Some(warnings) = p.i("cut_track_warnings").filter(|warnings| *warnings > 0) {
         info.push(format!("track cut warnings {warnings}"));
     }
     if p.b("drs_equipped") {
+        // Whether any activation is left, not whether it can be used right here
         let left = match (
             p.b("drs_activations_unlimited"),
             p.i("drs_activations_left"),
+            p.i("drs_available"),
         ) {
-            (true, _) => "unlimited".to_owned(),
-            (_, Some(left)) => left.to_string(),
-            _ => "unknown".to_owned(),
+            (true, _, _) => "unlimited".to_owned(),
+            (_, Some(left), _) => left.to_string(),
+            (_, None, Some(0)) => "none".to_owned(),
+            (_, None, Some(_)) => "some".to_owned(),
+            (_, None, None) => "unknown".to_owned(),
         };
-        info.push(format!(
-            "DRS {}, activations left {left}",
-            if p.b("drs_available") {
-                "available"
-            } else {
-                "unavailable"
-            }
-        ));
+        info.push(format!("DRS activations left: {left}"));
     }
     if p.b("push_to_pass_equipped") {
         let mut parts = Vec::new();
@@ -2581,14 +2586,6 @@ fn car_rules_and_condition(
 fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let sc = ctx.scoring()?;
     let (mut alerts, mut info) = (Vec::new(), Vec::new());
-    car_rules_and_condition(
-        &ctx.player,
-        sc.session.as_ref(),
-        sc.player.as_ref(),
-        &ctx.wheels(ctx.player_id())?,
-        &mut alerts,
-        &mut info,
-    );
     if let Some(s) = &sc.session {
         if let Some(fcy) = s.text("full_course_yellow").filter(|f| *f != "none") {
             alerts.push(format!("FULL COURSE YELLOW ({fcy})"));
@@ -2644,6 +2641,14 @@ fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
             }
         }
     }
+    car_rules_and_condition(
+        &ctx.player,
+        sc.session.as_ref(),
+        sc.player.as_ref(),
+        &ctx.wheels(ctx.player_id())?,
+        &mut alerts,
+        &mut info,
+    );
     Ok((alerts, info))
 }
 

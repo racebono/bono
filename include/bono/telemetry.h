@@ -148,7 +148,7 @@
     X(i64, brake_migration_max) \
     X(i64, front_anti_roll_bar_max) \
     X(i64, rear_anti_roll_bar_max) \
-    X(f64, steering_wheel_range) /* degrees, physical, full left to full right */ \
+    X(f64, steering_wheel_range) /* physical; RaceRoom: degrees, full left to full right; LMU: unit and span not documented */ \
     X(f64, engine_max_rpm) /* rev limit, not the best shift point */ \
     X(i64, max_gears) /* forward gears */ \
     X(boolean, speed_limiter_available) \

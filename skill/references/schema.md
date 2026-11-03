@@ -104,10 +104,11 @@ positions from telemetry.
   separate rule systems: never add them up or treat one as the other.
 - **`heading`** is where the car body points and **`course`** where it travels; they differ in a
   slide and by half a turn when reversing. RaceRoom opponents only report motion, so their `heading`
-  is their last direction of travel. A RaceRoom player's stays at its last value below 1 m/s, and
-  is NULL until the car first moves in a session.
+  is their last direction of travel. A RaceRoom player's stays at its last value below 1 m/s or
+  when steeply tilted, and is the last direction of travel until the body's heading is first known.
 - **Downforce**: `total_downforce` is the whole car. `front_downforce` and `rear_downforce` are
-  NULL where the simulator doesn't split it (RaceRoom).
+  NULL where the simulator doesn't split it (RaceRoom). In an older RaceRoom recording without a
+  `total_downforce` column, `front_downforce` holds the whole car's: never read it as the front axle.
 - **`pit_speed_limit`** only applies in the pit lane: compare it with `speed` only while
   `in_pit_lane = 1`.
 - **Ids** (`track_id`, `layout_id`, `vehicle_model_id`, `vehicle_class_id`, `team_id`,
@@ -159,7 +160,7 @@ lateral + right, vertical + up. Pitch + nose up, yaw + turning right, roll + lea
 | Inputs | `throttle`, `brake`, `clutch` (0-1), `steering` (-1 left .. 1 right), `*_filtered` (after aids), `steering_shaft_torque` (Nm) | |
 | Powertrain | `gear` (-1 R, 0 N), `engine_rpm`, `engine_torque`, `clutch_rpm`, `engine_water_temperature`, `engine_oil_temperature`, `engine_overheating`, `turbo_boost_pressure`, `anti_stall_active`; in `car_state`: `ignition`, `engine_max_rpm`, `max_gears`, `engine_braking` | |
 | Energy | `fuel` (L), `virtual_energy`, `battery_charge` (0-1), `state_of_charge`, `regeneration_power` (kW), `electric_motor_torque/rpm/temperature/water_temperature`, `electric_motor_state` (0 n/a, 1 inactive, 2 propulsion, 3 regen), `lift_and_coast_progress` | |
-| Aids / setup | `traction_control_active`, `abs_active`, `speed_limiter_active`; in `car_state`: `traction_control`, `traction_control_slip`, `traction_control_cut`, `abs`, `engine_map`, `brake_migration`, `rear_brake_bias`, `front_anti_roll_bar`, `rear_anti_roll_bar`, `speed_limiter_on`, `headlights`, `wipers`, `front_tire_compound`, `rear_tire_compound`, `scheduled_pit_stops`, `traction_control_max`, `traction_control_slip_max`, `traction_control_cut_max`, `abs_max`, `engine_map_max`, `brake_migration_max`, `front_anti_roll_bar_max`, `rear_anti_roll_bar_max`, `steering_wheel_range` (degrees, physical, lock to lock), `speed_limiter_available` | a setting change is a new `car_state` row |
+| Aids / setup | `traction_control_active`, `abs_active`, `speed_limiter_active`; in `car_state`: `traction_control`, `traction_control_slip`, `traction_control_cut`, `abs`, `engine_map`, `brake_migration`, `rear_brake_bias`, `front_anti_roll_bar`, `rear_anti_roll_bar`, `speed_limiter_on`, `headlights`, `wipers`, `front_tire_compound`, `rear_tire_compound`, `scheduled_pit_stops`, `traction_control_max`, `traction_control_slip_max`, `traction_control_cut_max`, `abs_max`, `engine_map_max`, `brake_migration_max`, `front_anti_roll_bar_max`, `rear_anti_roll_bar_max`, `steering_wheel_range` (physical; degrees lock to lock in RaceRoom, not documented by LMU), `speed_limiter_available` | a setting change is a new `car_state` row |
 | Overtaking | `rear_flap_active` (DRS engaged), `push_to_pass_active_time_left`, `push_to_pass_cooldown_left` (s); in `car_state`: `drs_equipped`, `drs_available`, `drs_activations_left` (NULL when unlimited), `drs_activations_unlimited`, `drs_activations_total`, `push_to_pass_equipped`, `push_to_pass_charged` (NULL without a charge cycle), `push_to_pass_engaged`, `push_to_pass_activations_left`, `push_to_pass_activations_total` | NULL on cars without the system or where it isn't reported |
 | Rules (in `car_state`) | `incident_points`, `cut_track_warnings`, `next_lap_invalidated`, `previous_lap_invalidated` | |
 | Tire and brake limits (in `car_state`) | `front/rear_tire_radius` (m, static, not rolling), `front/rear_tire_cold_temperature`, `front/rear_tire_hot_temperature`, `front/rear_brake_cold_temperature`, `front/rear_brake_optimal_temperature`, `front/rear_brake_hot_temperature` (C) | |
@@ -217,14 +218,14 @@ C = compared (a change adds a row); S = snapshot (stored with each row, never tr
 | `driver` C, `vehicle` C, `vehicle_class` C, `team` C | names as the game shows them; several classes = multiclass race |
 | `vehicle_model` C, `championship` C, `vehicle_model_id` C, `vehicle_class_id` C, `team_id` C, `manufacturer_id` C, `car_number` C, `vehicle_width` C, `vehicle_length` C | identity and size, where reported; size is in the simulator's unit |
 | `front_tire_compound_name` C, `rear_tire_compound_name` C | the simulator's compound name, opponents too where reported |
-| `terrain_front_left/front_right/rear_left/rear_right` C | material name under each tire, simulator-specific, updated at scoring rate |
+| `terrain_front_left/front_right/rear_left/rear_right` C | material name under each tire, player only, simulator-specific, updated at scoring rate |
 | `position` C (overall, 1-based), `class_position` C, `qualifying_position` C | without `class_position`, rank by `position` among cars of the same `vehicle_class` |
 | `laps_completed` C, `sector` C (0-based) | |
 | `mandatory_pit_stop` C | none, unserved_two_tires, unserved_four_tires, served (not reported by LMU) |
 | `finish_status` C | none, finished, dnf, dnq (did not qualify), dns (did not start), disqualified |
 | `lap_start_time` C | session time the current lap started |
 | `last_lap_time` C, `last_sector_1/2/3` C | the last completed lap and its sectors |
-| `best_lap_time` C, `best_lap_sector_1` C, `best_lap_sector_2` C (sector 2 alone), `best_sector_1` C, `best_sectors_1_and_2` C | best lap, and best sector 1 / sectors 1+2 of any lap |
+| `best_lap_time` C, `best_lap_sector_1` C, `best_lap_sector_2` C (sector 2 alone; LMU's conversion is unverified), `best_sector_1` C, `best_sectors_1_and_2` C | best lap, and best sector 1 / sectors 1+2 of any lap |
 | `current_sector_1/2` C | sectors of the lap in progress |
 | `laps_behind_leader` C, `laps_behind_next` C | |
 | `pit_stops` C, `penalties` C (outstanding) | |

@@ -72,9 +72,7 @@ fn parse(body: &str, session_time: f64) -> Vec<bono_forecast_point> {
             point.sky_text = text("WNV_SKY").map(str::to_owned).into();
             point.rain_chance = number("WNV_RAIN_CHANCE").map(|rain| rain / 100.0).into();
             point.temperature = number("WNV_TEMPERATURE").into();
-            point.humidity = number("WNV_HUMIDITY")
-                .map(|humidity| humidity / 100.0)
-                .into();
+            point.humidity = number("WNV_HUMIDITY").map(|humidity| humidity / 100.0).into();
             // In m/s (the game shows 1 as 3.6 km/h)
             point.wind_speed = number("WNV_WINDSPEED").into();
             point.wind_direction = number("WNV_WINDDIRECTION")
