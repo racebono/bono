@@ -1744,5 +1744,25 @@
         "en": "Cancelling…",
         "es": "Cancelando…",
         "ca": "S'està cancel·lant…"
+    },
+    "update.unpack_failed": {
+        "en": "Couldn't prepare the new version: {error}",
+        "es": "No se ha podido preparar la nueva versión: {error}",
+        "ca": "No s'ha pogut preparar la versió nova: {error}"
+    },
+    "update.start_failed": {
+        "en": "Couldn't start installing: {error}",
+        "es": "No se ha podido empezar a instalar: {error}",
+        "ca": "No s'ha pogut començar a instal·lar: {error}"
+    },
+    "update.failed_title": {
+        "en": "Update not installed",
+        "es": "Actualización no instalada",
+        "ca": "Actualització no instal·lada"
+    },
+    "update.ok": {
+        "en": "OK",
+        "es": "Aceptar",
+        "ca": "D'acord"
     }
 }

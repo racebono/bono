@@ -32,8 +32,12 @@ enum State {
     Unpacking(Release, Task<anyhow::Result<()>>),
     Ready(Release),
     Installing(Release, Task<anyhow::Result<()>>),
-    /// The app is closing for the installer: whether it's been asked to
-    Restarting(bool),
+    /// The app is closing for the installer: whether it's been asked to, and whether asking
+    /// failed (said once)
+    Restarting {
+        asked: bool,
+        failed: bool,
+    },
 }
 
 /// The "Update" menu: this version, and a newer one to download and install.
@@ -48,6 +52,8 @@ pub struct UpdateTopbar {
     /// The check at startup offers a new version in a popup
     startup: bool,
     popup: bool,
+    /// The last installation's failure is shown in a popup
+    failure_popup: bool,
 }
 
 impl UpdateTopbar {
@@ -68,6 +74,7 @@ impl UpdateTopbar {
             failure: None,
             startup: true,
             popup: false,
+            failure_popup: false,
         };
         this.check();
         this
@@ -140,6 +147,7 @@ impl UpdateTopbar {
                     if let Some(failure) = failure {
                         log::error!("The last update failed to install: {failure}");
                         self.failure = Some(t!("update.install_failed", error = failure));
+                        self.failure_popup = true;
                     }
                     match (result, known) {
                         (Ok((None, _)), _) => State::UpToDate,
@@ -166,7 +174,10 @@ impl UpdateTopbar {
                     }
                 }
             },
-            State::Downloading(release, download) if download.finished() => {
+            // It may have finished as it was cancelled
+            State::Downloading(release, download) | State::Cancelling(release, download)
+                if download.finished() =>
+            {
                 let staging = self.staging.clone().unwrap();
                 let unpack = release.clone();
                 State::Unpacking(
@@ -174,10 +185,11 @@ impl UpdateTopbar {
                     Task::spawn_blocking(move || staging.unpack(&unpack)),
                 )
             }
-            // The download said what went wrong
-            State::Downloading(release, download) if download.failed() => State::Available(release),
-            // Downloading it again before this one's cleaned up would share its files
-            State::Cancelling(release, download) if download.failed() || download.finished() => {
+            // The download said what went wrong. Downloading it again before a cancelled one's
+            // cleaned up would share its files
+            State::Downloading(release, download) | State::Cancelling(release, download)
+                if download.failed() =>
+            {
                 State::Available(release)
             }
             State::Unpacking(release, mut task) => match task.update(rt) {
@@ -185,33 +197,42 @@ impl UpdateTopbar {
                 Some(Ok(())) => State::Ready(release),
                 Some(Err(e)) => {
                     log::error!("Unpacking the update: {e:#}");
-                    self.error = Some(format!("{e:#}"));
+                    self.error = Some(t!("update.unpack_failed", error = format!("{e:#}")));
                     State::Available(release)
                 }
             },
             State::Installing(release, mut task) => match task.update(rt) {
                 None => State::Installing(release, task),
-                Some(Ok(())) => State::Restarting(false),
+                Some(Ok(())) => State::Restarting {
+                    asked: false,
+                    failed: false,
+                },
                 Some(Err(e)) => {
                     log::error!("Installing the update: {e:#}");
-                    self.error = Some(format!("{e:#}"));
+                    self.error = Some(t!("update.start_failed", error = format!("{e:#}")));
                     State::Ready(release)
                 }
             },
             // The installer goes on once the app has closed
-            State::Restarting(false) => {
-                match ss
-                    .event
-                    .push_event(sdl3::event::Event::Quit { timestamp: 0 })
-                {
-                    Ok(()) => State::Restarting(true),
-                    // Tried again next frame
-                    Err(e) => {
+            State::Restarting {
+                asked: false,
+                failed,
+            } => match (ss.event).push_event(sdl3::event::Event::Quit { timestamp: 0 }) {
+                Ok(()) => State::Restarting {
+                    asked: true,
+                    failed,
+                },
+                // Tried again next frame
+                Err(e) => {
+                    if !failed {
                         log::error!("Unable to close for the update: {e}");
-                        State::Restarting(false)
+                    }
+                    State::Restarting {
+                        asked: false,
+                        failed: true,
                     }
                 }
-            }
+            },
             state => state,
         };
     }
@@ -285,7 +306,7 @@ impl UpdateTopbar {
                     action = Some(Action::Install);
                 }
             }
-            State::Installing(..) | State::Restarting(_) => {
+            State::Installing(..) | State::Restarting { .. } => {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(t!("update.installing"));
@@ -336,13 +357,30 @@ impl UpdateTopbar {
         }
     }
 
-    /// At startup, offers a new version to download, once nothing else is in the way (`hold`).
+    /// At startup, says the last installation failed, or offers a new version to download, once
+    /// nothing else is in the way (`hold`).
     pub fn popup(&mut self, ctx: &egui::Context, hold: bool) {
+        if hold {
+            return;
+        }
+        if let (true, Some(failure)) = (self.failure_popup, &self.failure) {
+            let modal = egui::Modal::new(egui::Id::new("update failed")).show(ctx, |ui| {
+                ui.set_max_width(360.0);
+                ui.heading(t!("update.failed_title"));
+                ui.label(failure);
+                ui.add_space(8.0);
+                ui.button(t!("update.ok")).clicked()
+            });
+            if modal.inner || modal.should_close() {
+                self.failure_popup = false;
+            }
+            return;
+        }
         let State::Available(release) = &self.state else {
             self.popup = false;
             return;
         };
-        if !self.popup || hold {
+        if !self.popup {
             return;
         }
         let modal = egui::Modal::new(egui::Id::new("update available")).show(ctx, |ui| {

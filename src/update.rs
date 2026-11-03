@@ -258,16 +258,19 @@ impl Staging {
             return Ok(());
         }
         std::fs::create_dir_all(&self.dir)?;
-        let file = std::fs::File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.dir.join(LOCK))?;
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(t!("update.locked")),
-            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
-        }
+        let mut options = std::fs::File::options();
+        options.create(true).truncate(false).write(true);
+        // Open without sharing: no one else can open it while it's open
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, 0);
+        let file = match options.open(self.dir.join(LOCK)) {
+            Ok(file) => file,
+            // ERROR_SHARING_VIOLATION: another Bono, or the installer, has it open
+            Err(e) if cfg!(windows) && e.raw_os_error() == Some(32) => {
+                anyhow::bail!(t!("update.locked"))
+            }
+            Err(e) => return Err(e.into()),
+        };
         // Only one check runs at a time
         let _ = self.lock.set(file);
         Ok(())
@@ -398,8 +401,6 @@ struct Installer {
 /// version opens again, still offering the new one, and the installer says what went wrong.
 /// Anything else in the installation's folder stays. Moves are retried while something still has
 /// the file or folder open. Paths come in through the environment, so they need no quoting.
-///
-/// Its lock is `File::try_lock`'s: both lock the file's first byte, so they exclude each other.
 #[cfg(windows)]
 const INSTALLER: &str = r#"
 $ErrorActionPreference = 'Stop'
@@ -424,11 +425,10 @@ function Move-Retrying($from, $to) {
     Retrying { Move-Item -LiteralPath $from -Destination $to }
 }
 
-# The app's claim on the installation's updates passes to the installer, so no Bono opened
-# meanwhile removes what it moves. The app's lock goes once the system notices it exited. If
-# another Bono has claimed them instead, it's left alone, with the new version still to install
-$lock = [IO.File]::Open($env:BONO_UPDATE_LOCK, 'OpenOrCreate', 'ReadWrite', 'ReadWrite')
-Retrying { $lock.Lock(0, 1) }
+# The app's claim on the installation's updates, its lock file open without sharing, passes to the
+# installer, so no Bono opened meanwhile removes what it moves. If another Bono has claimed them
+# instead, it's left alone, with the new version still to install
+$lock = Retrying { [IO.File]::Open($env:BONO_UPDATE_LOCK, 'OpenOrCreate', 'ReadWrite', 'None') }
 
 $moved = New-Object System.Collections.ArrayList
 try {
