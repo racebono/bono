@@ -379,9 +379,11 @@ impl Download {
             fn drop(&mut self) {
                 unsafe { ManuallyDrop::drop(&mut self.file) };
                 if let Some(path) = self.temp_path.take() {
-                    if let Err(e) = tokio::task::block_in_place(move || std::fs::remove_file(path))
-                    {
-                        error(t!("error.removing_temporary"), e);
+                    match tokio::task::block_in_place(move || std::fs::remove_file(path)) {
+                        // Cancelled as it was being put in place, which then went on
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => error(t!("error.removing_temporary"), e),
+                        Ok(()) => {}
                     }
                 }
             }

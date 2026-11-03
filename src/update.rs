@@ -432,8 +432,13 @@ function Retrying($action) {
         catch { if ($try -ge $retries) { throw }; Start-Sleep -Seconds 1 }
     }
 }
+# A single rename, which fails as a whole. Move-Item would move a folder's contents one by one
+# when the folder can't be renamed, and into the destination if it's there
 function Move-Retrying($from, $to) {
-    Retrying { Move-Item -LiteralPath $from -Destination $to }
+    Retrying {
+        if ([IO.Directory]::Exists($from)) { [IO.Directory]::Move($from, $to) }
+        else { [IO.File]::Move($from, $to) }
+    }
 }
 
 # The app's claim on the installation's updates, its lock file open without sharing, passes to the
@@ -821,6 +826,7 @@ mod tests {
     fn installed(install: &Path) {
         std::fs::create_dir_all(install.join("assets")).unwrap();
         std::fs::write(install.join("assets/old.txt"), "old").unwrap();
+        std::fs::write(install.join("assets/a.txt"), "a").unwrap();
         std::fs::write(install.join("changed.txt"), "old").unwrap();
         std::fs::write(install.join("kept.txt"), "kept").unwrap();
         std::fs::copy(system("hostname.exe"), install.join(EXE)).unwrap();
@@ -914,6 +920,12 @@ mod tests {
         assert_eq!(read(&install.join("changed.txt")), "old");
         assert_eq!(read(&install.join("assets/old.txt")), "old");
         assert_eq!(read(&install.join("kept.txt")), "kept");
+        // Nothing of a folder that couldn't be moved went
+        assert_eq!(read(&install.join("assets/a.txt")), "a");
+        assert_eq!(
+            std::fs::read_dir(install.join("assets")).unwrap().count(),
+            2
+        );
         let old_exe = std::fs::metadata(system("hostname.exe")).unwrap().len();
         assert_eq!(std::fs::metadata(install.join(EXE)).unwrap().len(), old_exe);
         assert!(!staging.take_failure().unwrap().is_empty());
