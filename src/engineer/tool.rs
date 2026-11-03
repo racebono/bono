@@ -2473,9 +2473,122 @@ fn cmd_field(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
 
 /// Alerts (what changes what the pilot must do right now) and info (context, only when it bears
 /// on the question) from the scoring tables.
+/// Rules, overtaking systems and tire condition, each only where the simulator reports it.
+fn car_rules_and_condition(
+    p: &Row,
+    session: Option<&Row>,
+    me: Option<&Row>,
+    wheels: &BTreeMap<usize, Row>,
+    alerts: &mut Vec<String>,
+    info: &mut Vec<String>,
+) {
+    let limit = session.and_then(|s| s.f("pit_speed_limit"));
+    if let Some(limit) = limit {
+        // Only the pit lane has this limit
+        if p.b("in_pit_lane") && p.f("speed").is_some_and(|speed| speed > limit) {
+            alerts.push(format!(
+                "OVER THE PIT SPEED LIMIT ({} km/h, limit {} km/h)",
+                kmh(p.f("speed")),
+                kmh(Some(limit))
+            ));
+        }
+        info.push(format!("pit speed limit {} km/h", kmh(Some(limit))));
+    }
+    if p.b("next_lap_invalidated") {
+        alerts.push("NEXT LAP ALSO INVALID".into());
+    }
+    if p.b("previous_lap_invalidated") {
+        info.push("previous lap invalid".into());
+    }
+    if let Some(points) = p.i("incident_points") {
+        let max = session.and_then(|s| s.i("max_incident_points"));
+        info.push(match max {
+            Some(max) => format!("incident points {points}/{max}"),
+            None => format!("incident points {points}"),
+        });
+    }
+    if let Some(warnings) = p.i("cut_track_warnings") {
+        info.push(format!("track cut warnings {warnings}"));
+    }
+    if p.b("drs_equipped") {
+        let left = match (
+            p.b("drs_activations_unlimited"),
+            p.i("drs_activations_left"),
+        ) {
+            (true, _) => "unlimited".to_owned(),
+            (_, Some(left)) => left.to_string(),
+            _ => "unknown".to_owned(),
+        };
+        info.push(format!(
+            "DRS {}, activations left {left}",
+            if p.b("drs_available") {
+                "available"
+            } else {
+                "unavailable"
+            }
+        ));
+    }
+    if p.b("push_to_pass_equipped") {
+        let mut parts = Vec::new();
+        if p.b("push_to_pass_engaged") {
+            parts.push("engaged".to_owned());
+        }
+        match p.i("push_to_pass_charged") {
+            Some(0) => parts.push("charging".to_owned()),
+            Some(_) => parts.push("charged".to_owned()),
+            None => {}
+        }
+        if let Some(left) = p.i("push_to_pass_activations_left") {
+            parts.push(format!("{left} left"));
+        }
+        if let Some(wait) = p.f("push_to_pass_cooldown_left").filter(|wait| *wait > 0.0) {
+            parts.push(format!("cooldown {wait:.0}s"));
+        }
+        if !parts.is_empty() {
+            info.push(format!("push to pass: {}", parts.join(", ")));
+        }
+    }
+    let flatspots = wheels
+        .iter()
+        .filter(|(_, r)| r.b("tire_flatspot"))
+        .map(|(w, _)| WHEELS[*w])
+        .collect::<Vec<_>>();
+    if !flatspots.is_empty() {
+        info.push(format!("flat spot {}", flatspots.join(",")));
+    }
+    let dirty = wheels
+        .iter()
+        .filter(|(_, r)| r.f("tire_dirt").is_some_and(|dirt| dirt >= 0.25))
+        .map(|(w, _)| WHEELS[*w])
+        .collect::<Vec<_>>();
+    if !dirty.is_empty() {
+        info.push(format!("dirty tires {}", dirty.join(",")));
+    }
+    if let Some(me) = me
+        && let (Some(front), Some(rear)) = (
+            me.text("front_tire_compound_name"),
+            me.text("rear_tire_compound_name"),
+        )
+    {
+        info.push(format!(
+            "compounds front {} rear {}",
+            telemetry_text(front),
+            telemetry_text(rear)
+        ));
+    }
+}
+
 fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let sc = ctx.scoring()?;
     let (mut alerts, mut info) = (Vec::new(), Vec::new());
+    car_rules_and_condition(
+        &ctx.player,
+        sc.session.as_ref(),
+        sc.player.as_ref(),
+        &ctx.wheels(ctx.player_id())?,
+        &mut alerts,
+        &mut info,
+    );
     if let Some(s) = &sc.session {
         if let Some(fcy) = s.text("full_course_yellow").filter(|f| *f != "none") {
             alerts.push(format!("FULL COURSE YELLOW ({fcy})"));

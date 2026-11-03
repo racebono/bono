@@ -18,6 +18,7 @@
 #include <new>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -55,6 +56,10 @@ static void convert(const TelemInfoV01& in, bono_telemetry_s& out) {
     out.pitch = std::atan2(-in.mOri[1].z, std::hypot(in.mOri[0].z, in.mOri[2].z));
     out.roll = std::atan2(in.mOri[1].x, std::hypot(in.mOri[0].x, in.mOri[2].x));
     out.speed = std::hypot(in.mLocalVel.x, in.mLocalVel.y, in.mLocalVel.z);
+    // The car's velocity in world coordinates gives the direction of travel, in heading's convention.
+    const double world_x = in.mOri[0].x * in.mLocalVel.x + in.mOri[0].y * in.mLocalVel.y + in.mOri[0].z * in.mLocalVel.z;
+    const double world_z = in.mOri[2].x * in.mLocalVel.x + in.mOri[2].y * in.mLocalVel.y + in.mOri[2].z * in.mLocalVel.z;
+    if (std::hypot(world_x, world_z) > 1.0) out.course = std::atan2(-world_x, -world_z);
     out.velocity_longitudinal = -in.mLocalVel.z;
     out.velocity_lateral = -in.mLocalVel.x;
     out.velocity_vertical = in.mLocalVel.y;
@@ -110,6 +115,21 @@ static void convert(const TelemInfoV01& in, bono_telemetry_s& out) {
     out.state.abs = in.mABS;
     out.abs_active = in.mABSActive;
     out.state.engine_map = in.mMotorMap;
+    out.state.traction_control_max = in.mTCMax;
+    out.state.traction_control_slip_max = in.mTCSlipMax;
+    out.state.traction_control_cut_max = in.mTCCutMax;
+    out.state.abs_max = in.mABSMax;
+    out.state.engine_map_max = in.mMotorMapMax;
+    out.state.brake_migration_max = in.mMigrationMax;
+    out.state.front_anti_roll_bar_max = in.mFrontAntiSwayMax;
+    out.state.rear_anti_roll_bar_max = in.mRearAntiSwayMax;
+    if (in.mPhysicalSteeringWheelRange > 0) out.state.steering_wheel_range = in.mPhysicalSteeringWheelRange;
+    if (in.mEngineMaxRPM > 0) out.state.engine_max_rpm = in.mEngineMaxRPM;
+    out.state.max_gears = in.mMaxGears;
+    out.state.speed_limiter_available = in.mSpeedLimiterAvailable != 0;
+    // In centimeters; none reported is 0.
+    if (in.mWheel[0].mStaticUndeflectedRadius > 0) out.state.front_tire_radius = in.mWheel[0].mStaticUndeflectedRadius / 100.0;
+    if (in.mWheel[2].mStaticUndeflectedRadius > 0) out.state.rear_tire_radius = in.mWheel[2].mStaticUndeflectedRadius / 100.0;
     out.state.brake_migration = in.mMigration;
     out.state.rear_brake_bias = in.mRearBrakeBias;
     out.state.front_anti_roll_bar = in.mFrontAntiSway;
@@ -128,6 +148,7 @@ static void convert(const TelemInfoV01& in, bono_telemetry_s& out) {
     out.front_ride_height = in.mFrontRideHeight;
     out.rear_ride_height = in.mRearRideHeight;
     out.drag = in.mDrag;
+    out.total_downforce = in.mFrontDownforce + in.mRearDownforce;
     out.front_downforce = in.mFrontDownforce;
     out.rear_downforce = in.mRearDownforce;
     out.front_flap_active = in.mFrontFlapActivated != 0;
@@ -195,6 +216,34 @@ namespace {
         const std::size_t length = strnlen(chars, N);
         if (length == 0) return std::nullopt;
         return std::string(chars, length);
+    }
+
+    // The telemetry-only text about a car, kept for its next standing: telemetry structs have no strings.
+    struct CarContext {
+        std::optional<std::string> front_compound;
+        std::optional<std::string> rear_compound;
+        std::optional<std::string> model;
+        std::optional<std::string> championship;
+        std::optional<std::string> terrain[4];
+    };
+
+    std::optional<std::string> championship(IP_VehicleChampionship value) {
+        switch (value) {
+            case IP_VehicleChampionship::WEC_2023:
+                return "WEC 2023";
+            case IP_VehicleChampionship::WEC_2024:
+                return "WEC 2024";
+            case IP_VehicleChampionship::WEC_2025:
+                return "WEC 2025";
+            case IP_VehicleChampionship::WEC_2026:
+                return "WEC 2026";
+            case IP_VehicleChampionship::ELMS_2025:
+                return "ELMS 2025";
+            case IP_VehicleChampionship::ELMS_2026:
+                return "ELMS 2026";
+            default:
+                return std::nullopt;
+        }
     }
 
     // LMU reports times it does not have yet as 0 or -1.
@@ -373,6 +422,7 @@ namespace {
         out.last_sector_3 = difference(in.mLastLapTime, in.mLastSector2);
         out.best_lap_time = time_or_null(in.mBestLapTime);
         out.best_lap_sector_1 = time_or_null(in.mBestLapSector1);
+        out.best_lap_sector_2 = difference(in.mBestLapSector2, in.mBestLapSector1);
         out.best_sector_1 = time_or_null(in.mBestSector1);
         out.best_sectors_1_and_2 = time_or_null(in.mBestSector2);
         out.current_sector_1 = time_or_null(in.mCurSector1);
@@ -504,6 +554,8 @@ namespace {
         // weekend's data goes, while the practice, qualifying and race of this one stay together.
         void Load() override {
             if (_recorder) bono_lmu_clear(_recorder);
+            std::lock_guard lock(_contexts_mutex);
+            _contexts.clear();
         }
 
         // In case the plugin missed the session starting.
@@ -521,6 +573,17 @@ namespace {
             if (!_recorder) return;
             const double speed = std::hypot(info.mLocalVel.x, info.mLocalVel.y, info.mLocalVel.z);
             if (!bono_lmu_wants_telemetry(_recorder, info.mID, info.mElapsedTime, speed)) return;
+            {
+                std::lock_guard lock(_contexts_mutex);
+                CarContext& context = _contexts[info.mID];
+                context.front_compound = text(info.mFrontTireCompoundName);
+                context.rear_compound = text(info.mRearTireCompoundName);
+                context.model = text(info.mVehicleModel);
+                context.championship = championship(info.mVehicleChampionship);
+                for (std::size_t i = 0; i < std::size(context.terrain); ++i) {
+                    context.terrain[i] = text(info.mWheel[i].mTerrainName);
+                }
+            }
             bono_telemetry_s telemetry;
             convert(info, telemetry);
             bono_lmu_push_telemetry(_recorder, &telemetry);
@@ -540,7 +603,22 @@ namespace {
             std::vector<bono_standing_s> standings;
             standings.reserve(static_cast<std::size_t>(std::max(info.mNumVehicles, 0L)));
             for (long i = 0; i < info.mNumVehicles; ++i) {
-                standings.push_back(convert(info.mVehicle[i], info.mCurrentET));
+                bono_standing_s standing = convert(info.mVehicle[i], info.mCurrentET);
+                {
+                    std::lock_guard lock(_contexts_mutex);
+                    const auto context = _contexts.find(info.mVehicle[i].mID);
+                    if (context != _contexts.end()) {
+                        standing.front_tire_compound_name = context->second.front_compound;
+                        standing.rear_tire_compound_name = context->second.rear_compound;
+                        standing.vehicle_model = context->second.model;
+                        standing.championship = context->second.championship;
+                        standing.terrain_front_left = context->second.terrain[0];
+                        standing.terrain_front_right = context->second.terrain[1];
+                        standing.terrain_rear_left = context->second.terrain[2];
+                        standing.terrain_rear_right = context->second.terrain[3];
+                    }
+                }
+                standings.push_back(std::move(standing));
             }
             // Moves them out, leaving them empty.
             bono_lmu_push_scoring(_recorder, &session, standings.data(), standings.size());
@@ -577,6 +655,8 @@ namespace {
         bono_lmu_recorder* _recorder = nullptr;
         std::mutex _weather_mutex;
         std::optional<Weather> _weather;
+        std::mutex _contexts_mutex;
+        std::unordered_map<long, CarContext> _contexts;
     };
 }  // namespace
 

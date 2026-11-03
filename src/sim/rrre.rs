@@ -498,6 +498,8 @@ struct Converter {
     laps: HashMap<i32, LapState>,
     /// The session the laps are from: type and iteration
     session: Option<(i32, i32)>,
+    /// Where the player's car last pointed, kept while it's too slow to tell
+    player_heading: Option<f64>,
 }
 
 /// A car's current lap, held steady across the reads. The game's lap count and lap timer don't
@@ -604,6 +606,7 @@ impl Converter {
         let session = (shared.session_type, shared.session_iteration);
         if new_event || self.session != Some(session) || dt.is_none() {
             self.laps.clear();
+            self.player_heading = None;
         }
         self.session = Some(session);
 
@@ -659,9 +662,17 @@ impl Converter {
                 self.cars.insert(slot, Motion { x, z, heading });
             }
             out.heading = heading.into();
+            // Opponents only have how they moved
+            out.course = heading
+                .filter(|_| driver.car_speed > MIN_DIRECTION_SPEED as f32)
+                .into();
 
             if slot == player_slot {
                 player_telemetry(shared, &mut out);
+                if let Some(heading) = body_heading(player.velocity, player.local_velocity) {
+                    self.player_heading = Some(heading);
+                }
+                out.heading = self.player_heading.into();
             }
             telemetry.push(out);
         }
@@ -698,9 +709,9 @@ fn player_telemetry(shared: &r3e_shared, out: &mut bono_telemetry) {
     out.position_x = Some(position.x).into();
     out.position_y = Some(position.y).into();
     out.position_z = Some(position.z).into();
-    if velocity.x.hypot(velocity.z) > 1.0 {
-        out.heading = Some(heading(velocity.x, velocity.z)).into();
-    }
+    out.course = (velocity.x.hypot(velocity.z) > MIN_DIRECTION_SPEED)
+        .then(|| heading(velocity.x, velocity.z))
+        .into();
     let orientation = shared.car_orientation;
     out.pitch = Some(orientation.pitch as f64).into();
     out.roll = Some(orientation.roll as f64).into();
@@ -750,20 +761,65 @@ fn player_telemetry(shared: &r3e_shared, out: &mut bono_telemetry) {
         .map(|percent| percent / 100.0)
         .into();
     out.speed_limiter_active = flag(shared.pit_limiter).into();
+    out.total_mass = positive(shared.total_mass).into();
+    let (drs, ptp) = (shared.drs, shared.push_to_pass);
+    out.rear_flap_active = flag(drs.engaged).into();
+    out.push_to_pass_active_time_left = non_negative(ptp.engaged_time_left).into();
+    out.push_to_pass_cooldown_left = non_negative(ptp.wait_time_left).into();
 
     out.front_third_spring_deflection =
         Some(player.third_spring_suspension_deflection_front).into();
     out.rear_third_spring_deflection = Some(player.third_spring_suspension_deflection_rear).into();
+    out.front_third_spring_velocity = Some(player.third_spring_suspension_velocity_front).into();
+    out.rear_third_spring_velocity = Some(player.third_spring_suspension_velocity_rear).into();
     out.front_wing_height = Some(player.front_wing_height).into();
     let ride_height = player.ride_height;
     out.front_ride_height = Some((ride_height[0] + ride_height[1]) / 2.0).into();
     out.rear_ride_height = Some((ride_height[2] + ride_height[3]) / 2.0).into();
-    out.front_downforce = Some(player.current_downforce).into();
+    // The whole car's: the game doesn't split it between the axles
+    out.total_downforce = Some(player.current_downforce).into();
 
     let state = &mut out.state;
     state.traction_control = setting(shared.traction_control_setting).into();
     state.abs = setting(shared.abs_setting).into();
     state.engine_map = setting(shared.engine_map_setting).into();
+    state.engine_braking = setting(shared.engine_brake_setting).into();
+    state.steering_wheel_range = Some(shared.steer_wheel_range_degrees)
+        .filter(|degrees| *degrees > 0)
+        .map(f64::from)
+        .into();
+    state.engine_max_rpm = positive(shared.max_engine_rps)
+        .map(|rps| rps * 60.0 / std::f64::consts::TAU)
+        .into();
+    state.max_gears = setting(shared.num_gears).into();
+    state.drs_equipped = flag(drs.equipped).into();
+    state.drs_available = flag(drs.available).into();
+    let drs_left = setting(drs.numActivationsLeft);
+    state.drs_activations_left = drs_left.filter(|left| !endless(*left)).into();
+    state.drs_activations_unlimited = drs_left.map(endless).into();
+    state.drs_activations_total = setting(shared.drs_numActivationsTotal).into();
+    // Exists (1), or for some systems charging (2) or charged (3)
+    state.push_to_pass_equipped = flag(ptp.available).into();
+    state.push_to_pass_charged = match ptp.available {
+        2 => Some(false),
+        3 => Some(true),
+        _ => None,
+    }
+    .into();
+    state.push_to_pass_engaged = flag(ptp.engaged).into();
+    state.push_to_pass_activations_left = setting(ptp.amount_left)
+        .filter(|left| !endless(*left))
+        .into();
+    state.push_to_pass_activations_total = setting(shared.ptp_numActivationsTotal).into();
+    state.incident_points = setting(shared.incident_points).into();
+    state.cut_track_warnings = setting(shared.cut_track_warnings).into();
+    state.next_lap_invalidated = match shared.lap_valid_state {
+        0 | 1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+    .into();
+    state.previous_lap_invalidated = flag(shared.prev_lap_valid).map(|valid| !valid).into();
     state.rear_brake_bias = non_negative(shared.brake_bias).into();
     state.speed_limiter_on = flag(shared.pit_limiter).into();
     state.headlights = Some(shared.headlights)
@@ -787,12 +843,36 @@ fn player_telemetry(shared: &r3e_shared, out: &mut bono_telemetry) {
     state.aerodynamics_damage = damaged(damage.aerodynamics).into();
     state.suspension_damage = damaged(damage.suspension).into();
 
+    let (tires, brakes) = (shared.tire_temp, shared.brake_temp);
+    // Limits belong to the compound and the brake, so per axle: the left wheel's speaks for both
+    let (front, rear) = (R3E_TIRE_FRONT_LEFT as usize, R3E_TIRE_REAR_LEFT as usize);
+    state.front_tire_cold_temperature = non_negative(tires[front].cold_temp).into();
+    state.front_tire_hot_temperature = non_negative(tires[front].hot_temp).into();
+    state.rear_tire_cold_temperature = non_negative(tires[rear].cold_temp).into();
+    state.rear_tire_hot_temperature = non_negative(tires[rear].hot_temp).into();
+    state.front_brake_cold_temperature = non_negative(brakes[front].cold_temp).into();
+    state.front_brake_optimal_temperature = non_negative(brakes[front].optimal_temp).into();
+    state.front_brake_hot_temperature = non_negative(brakes[front].hot_temp).into();
+    state.rear_brake_cold_temperature = non_negative(brakes[rear].cold_temp).into();
+    state.rear_brake_optimal_temperature = non_negative(brakes[rear].optimal_temp).into();
+    state.rear_brake_hot_temperature = non_negative(brakes[rear].hot_temp).into();
+
     let (deflection, camber) = (player.suspension_deflection, player.camber);
+    let (suspension_velocity, grip, dirt, flatspot) = (
+        player.suspension_velocity,
+        shared.tire_grip,
+        shared.tire_dirt,
+        shared.tire_flatspot,
+    );
     let (tire_temp, brake_temp) = (shared.tire_temp, shared.brake_temp);
     let (pressure, wear, load) = (shared.tire_pressure, shared.tire_wear, shared.tire_load);
     let (rps, material) = (shared.tire_rps, shared.tire_on_mtrl);
     for (i, wheel) in out.wheels.iter_mut().enumerate() {
         wheel.suspension_deflection = Some(deflection[i]).into();
+        wheel.suspension_velocity = Some(suspension_velocity[i]).into();
+        wheel.tire_grip = non_negative(grip[i]).into();
+        wheel.tire_dirt = non_negative(dirt[i]).into();
+        wheel.tire_flatspot = flag(flatspot[i]).into();
         wheel.ride_height = Some(ride_height[i]).into();
         wheel.camber = Some(camber[i]).into();
         wheel.brake_temperature = non_negative(brake_temp[i].current_temp).into();
@@ -824,6 +904,10 @@ fn scoring(
         false => format!("{track} - {layout}"),
     };
     session.track = Some(track).into();
+    session.track_id = setting(shared.track_id).map(|id| id.to_string()).into();
+    session.layout_id = setting(shared.layout_id).map(|id| id.to_string()).into();
+    session.pit_speed_limit = positive(shared.session_pit_speed_limit).into();
+    session.max_incident_points = setting(shared.max_incident_points).into();
     session.track_length = non_negative(shared.layout_length).into();
     session.session_type = match shared.session_type {
         R3E_SESSION_PRACTICE => Some("practice"),
@@ -943,7 +1027,26 @@ fn standing(
         .filter(|class| *class >= 0)
         .map(|class| format!("class {class}"))
         .into();
+    let id = |value: i32| setting(value).map(|id| id.to_string());
+    out.vehicle_model_id = id(info.model_id).into();
+    out.vehicle_class_id = id(info.class_id).into();
+    out.team_id = id(info.team_id).into();
+    out.manufacturer_id = id(info.manufacturer_id).into();
+    out.car_number = id(info.car_number).into();
+    out.vehicle_width = positive(info.car_width).into();
+    out.vehicle_length = positive(info.car_length).into();
+    out.front_tire_compound_name = compound_name(driver.tire_type_front, driver.tire_subtype_front)
+        .map(str::to_owned)
+        .into();
+    out.rear_tire_compound_name = compound_name(driver.tire_type_rear, driver.tire_subtype_rear)
+        .map(str::to_owned)
+        .into();
+    out.drs_active = flag(driver.drs_state).into();
+    out.push_to_pass_active = flag(driver.ptp_state).into();
     out.position = setting(driver.place).into();
+    out.class_position = Some(driver.place_class as i64)
+        .filter(|place| *place > 0)
+        .into();
     out.laps_completed = setting(driver.completed_laps).into();
     out.sector = sector(driver.track_sector).into();
     out.finish_status = match driver.finish_status {
@@ -979,6 +1082,7 @@ fn standing(
     out.last_sector_3 = split(previous, 2).into();
     out.best_lap_time = seconds(best[2]).into();
     out.best_lap_sector_1 = split(best, 0).into();
+    out.best_lap_sector_2 = split(best, 1).into();
     out.current_sector_1 = split(current, 0).into();
     out.current_sector_2 = split(current, 1).into();
 
@@ -1167,6 +1271,45 @@ fn penalty_reason(kind: i32, reason: i32) -> Option<&'static str> {
         .filter(|reason| *reason != "invalid")
 }
 
+/// A compound's name: its subtype, or its older type for cars that have none.
+fn compound_name(kind: i32, subtype: i32) -> Option<&'static str> {
+    match subtype {
+        R3E_TIRE_SUBTYPE_PRIMARY => Some("primary"),
+        R3E_TIRE_SUBTYPE_ALTERNATE => Some("alternate"),
+        R3E_TIRE_SUBTYPE_SOFT => Some("soft"),
+        R3E_TIRE_SUBTYPE_MEDIUM => Some("medium"),
+        R3E_TIRE_SUBTYPE_HARD => Some("hard"),
+        _ => match kind {
+            R3E_TIRE_TYPE_OPTION => Some("option"),
+            R3E_TIRE_TYPE_PRIME => Some("prime"),
+            _ => None,
+        },
+    }
+}
+
+/// Endless activations start at the largest int and may count down from there.
+fn endless(activations: i64) -> bool {
+    activations >= i32::MAX as i64 / 2
+}
+
+/// Below this speed (m/s), a velocity's direction is noise.
+const MIN_DIRECTION_SPEED: f64 = 1.0;
+
+/// Where the car body points, from its velocity in the world and relative to itself: travel
+/// direction less the angle the car travels at relative to its nose. The game documents both
+/// vectors, but not the axes and signs of its Euler angles. `None` when it's too slow to tell.
+fn body_heading(world: r3e_vec3_f64, local: r3e_vec3_f64) -> Option<f64> {
+    // Local axes: +x left, +z back
+    let (forward, right) = (-local.z, -local.x);
+    if world.x.hypot(world.z) <= MIN_DIRECTION_SPEED || forward.hypot(right) <= MIN_DIRECTION_SPEED
+    {
+        return None;
+    }
+    let body = heading(world.x, world.z) - right.atan2(forward);
+    // Within -pi to pi
+    Some(body.sin().atan2(body.cos()))
+}
+
 /// The heading of a car moving by (dx, dz): 0 along -z, as LMU's plugin has it.
 fn heading(dx: f64, dz: f64) -> f64 {
     (-dx).atan2(-dz)
@@ -1175,6 +1318,11 @@ fn heading(dx: f64, dz: f64) -> f64 {
 /// A value the game gives -1 (or any negative) for when it doesn't know.
 fn non_negative(value: f32) -> Option<f64> {
     (value.is_finite() && value >= 0.0).then_some(value as f64)
+}
+
+/// A size or similar, where zero or less isn't known.
+fn positive(value: f32) -> Option<f64> {
+    (value.is_finite() && value > 0.0).then_some(value as f64)
 }
 
 /// A time in seconds, -1 when not known.
@@ -1747,7 +1895,9 @@ mod tests {
         assert_eq!(mine.lap.get(), Some(3));
         assert_eq!(mine.sector.get(), Some(1));
         assert_eq!(mine.lap_invalidated.get(), Some(false));
-        assert_eq!(mine.heading.get(), Some(0.0));
+        // Travelling along -z, nose slightly right of that as it slides to its left
+        assert!((mine.heading.get().unwrap() - 2f64.atan2(50.0)).abs() < 1e-12);
+        assert_eq!(mine.course.get(), Some(0.0));
         assert_eq!(mine.speed.get(), Some(50.0));
         // Lateral is + right, as LMU's plugin has it
         assert_eq!(mine.velocity_longitudinal.get(), Some(50.0));
@@ -1915,9 +2065,15 @@ mod tests {
         // Lap 4's own timer, but lap 3's flag still: not trusted yet
         assert_eq!(read(500.3, 4, 0.25, 0), (Some(4), Some(500.05), None));
         // Lap 4's own flag
-        assert_eq!(read(501.0, 4, 0.95, 1), (Some(4), Some(500.05), Some(false)));
+        assert_eq!(
+            read(501.0, 4, 0.95, 1),
+            (Some(4), Some(500.05), Some(false))
+        );
         // Held for the rest of the lap, whatever the timer jitters to
-        assert_eq!(read(530.0, 4, 29.9, 1), (Some(4), Some(500.05), Some(false)));
+        assert_eq!(
+            read(530.0, 4, 29.9, 1),
+            (Some(4), Some(500.05), Some(false))
+        );
         // The clock going back is a restart: its first lap starts over
         assert_eq!(read(10.0, 0, 5.0, 1), (Some(0), Some(5.0), Some(false)));
 
@@ -1926,6 +2082,182 @@ mod tests {
         assert_eq!(read(20.0, 0, 0.5, 1).1, Some(19.5));
         assert_eq!(read(20.25, 1, 0.75, 1).1, Some(19.5));
         assert_eq!(read(30.0, 1, 10.5, 1), (Some(1), Some(19.5), Some(false)));
+    }
+
+    fn vec3(x: f64, z: f64) -> r3e_vec3_f64 {
+        r3e_vec3_f64 { x, y: 0.0, z }
+    }
+
+    #[test]
+    fn heading_is_where_the_body_points() {
+        use std::f64::consts::{FRAC_PI_2, PI};
+        let close = |a: f64, b: f64| (a - b).sin().abs() < 1e-9 && (a - b).cos() > 0.0;
+        // Driving forward along each cardinal: -z, -x (right of it), +z, +x
+        for (world, expected) in [
+            (vec3(0.0, -30.0), 0.0),
+            (vec3(-30.0, 0.0), FRAC_PI_2),
+            (vec3(0.0, 30.0), PI),
+            (vec3(30.0, 0.0), -FRAC_PI_2),
+        ] {
+            let heading = body_heading(world, vec3(0.0, -30.0)).unwrap();
+            assert!(close(heading, expected), "{heading} {expected}");
+            assert!(heading.abs() <= PI);
+        }
+        // Reversing along +z: the nose still points along -z
+        let reversing = body_heading(vec3(0.0, 5.0), vec3(0.0, 5.0)).unwrap();
+        assert!(close(reversing, 0.0), "{reversing}");
+        // Sliding sideways to its right while travelling along -z: nose towards +x
+        let sliding = body_heading(vec3(0.0, -20.0), vec3(-20.0, 0.0)).unwrap();
+        assert!(close(sliding, -FRAC_PI_2), "{sliding}");
+        // Across the wrap: stays within range
+        let wrapped = body_heading(vec3(0.0, 30.0), vec3(1.0, -30.0)).unwrap();
+        assert!(wrapped.abs() <= PI && close(wrapped, PI + 1f64.atan2(30.0)));
+        // Stationary: not known
+        assert_eq!(body_heading(vec3(0.0, 0.5), vec3(0.0, 0.5)), None);
+
+        // Reversing, then stopped: the player's heading holds, course goes
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        let mut read = |time: f64, world, local| {
+            let mut shared = shared(time, 0.0);
+            let mut player = shared.player;
+            player.velocity = world;
+            player.local_velocity = local;
+            shared.player = player;
+            let update = converter.convert(&shared, start).unwrap();
+            let mine = update
+                .telemetry
+                .into_iter()
+                .find(|t| t.vehicle_id.get() == Some(7))
+                .unwrap();
+            (mine.heading.get(), mine.course.get())
+        };
+        assert_eq!(read(1.0, vec3(0.0, 0.0), vec3(0.0, 0.0)), (None, None));
+        let (held, course) = read(2.0, vec3(0.0, 5.0), vec3(0.0, 5.0));
+        assert!(close(held.unwrap(), 0.0));
+        assert!(close(course.unwrap(), PI));
+        assert_eq!(read(3.0, vec3(0.0, 0.0), vec3(0.0, 0.0)), (held, None));
+    }
+
+    #[test]
+    fn records_rules_conditions_and_identity() {
+        let mut shared = shared(500.0, 0.0);
+        shared.session_pit_speed_limit = 16.67;
+        shared.max_incident_points = -1;
+        shared.incident_points = 4;
+        shared.cut_track_warnings = 2;
+        shared.lap_valid_state = 2;
+        shared.prev_lap_valid = 0;
+        shared.total_mass = 1300.0;
+        shared.tire_flatspot = [0, 1, -1, 0];
+        shared.tire_grip = [1.0, 0.8, -1.0, 1.0];
+        shared.tire_dirt = [0.0, 0.5, -1.0, 0.0];
+        let mut tires = shared.tire_temp;
+        tires[0].cold_temp = 70.0;
+        tires[0].hot_temp = 110.0;
+        tires[2].cold_temp = -1.0;
+        shared.tire_temp = tires;
+        let mut player = shared.player;
+        player.current_downforce = 5000.0;
+        player.suspension_velocity = [0.1, -0.1, 0.2, -0.2];
+        shared.player = player;
+        shared.drs = r3e_drs {
+            equipped: 1,
+            available: 1,
+            numActivationsLeft: i32::MAX - 2,
+            engaged: 1,
+        };
+        shared.drs_numActivationsTotal = -1;
+        shared.push_to_pass = r3e_push_to_pass {
+            available: 2,
+            engaged: 0,
+            amount_left: 3,
+            engaged_time_left: -1.0,
+            wait_time_left: 4.0,
+        };
+        let mut drivers = shared.all_drivers_data_1;
+        drivers[0].tire_subtype_front = R3E_TIRE_SUBTYPE_SOFT;
+        drivers[0].tire_subtype_rear = -1;
+        drivers[0].tire_type_rear = R3E_TIRE_TYPE_PRIME;
+        drivers[0].place_class = 1;
+        drivers[0].ptp_state = 1;
+        drivers[0].drs_state = -1;
+        drivers[0].driver_info.car_number = 44;
+        drivers[0].driver_info.model_id = -1;
+        drivers[0].driver_info.car_width = -1.0;
+        drivers[0].driver_info.car_length = 4.5;
+        shared.all_drivers_data_1 = drivers;
+
+        let update = Converter::default()
+            .convert(&shared, Instant::now())
+            .unwrap();
+        let mine = update
+            .telemetry
+            .iter()
+            .find(|t| t.vehicle_id.get() == Some(7))
+            .unwrap();
+        // The whole car's downforce is never taken for the front axle's
+        assert_eq!(mine.total_downforce.get(), Some(5000.0));
+        assert_eq!(mine.front_downforce.get(), None);
+        assert_eq!(mine.rear_downforce.get(), None);
+        assert_eq!(mine.total_mass.get(), Some(1300.0));
+        assert_eq!(mine.rear_flap_active.get(), Some(true));
+        assert_eq!(mine.push_to_pass_cooldown_left.get(), Some(4.0));
+        assert_eq!(mine.push_to_pass_active_time_left.get(), None);
+        let state = &mine.state;
+        assert_eq!(state.incident_points.get(), Some(4));
+        assert_eq!(state.cut_track_warnings.get(), Some(2));
+        assert_eq!(state.next_lap_invalidated.get(), Some(true));
+        assert_eq!(state.previous_lap_invalidated.get(), Some(true));
+        assert_eq!(state.drs_activations_left.get(), None);
+        assert_eq!(state.drs_activations_unlimited.get(), Some(true));
+        assert_eq!(state.push_to_pass_equipped.get(), Some(true));
+        assert_eq!(state.push_to_pass_charged.get(), Some(false));
+        assert_eq!(state.push_to_pass_activations_left.get(), Some(3));
+        assert_eq!(state.front_tire_cold_temperature.get(), Some(70.0));
+        assert_eq!(state.rear_tire_cold_temperature.get(), None);
+        assert_eq!(mine.wheels[1].tire_flatspot.get(), Some(true));
+        assert_eq!(mine.wheels[2].tire_flatspot.get(), None);
+        assert_eq!(mine.wheels[1].tire_grip.get(), Some(0.8f32 as f64));
+        assert_eq!(mine.wheels[1].tire_dirt.get(), Some(0.5));
+        assert_eq!(mine.wheels[3].suspension_velocity.get(), Some(-0.2));
+        // A flat spot isn't a puncture
+        assert_eq!(mine.wheels[1].tire_flat.get(), None);
+
+        let (session, standings) = update.scoring.unwrap();
+        assert_eq!(session.pit_speed_limit.get(), Some(16.67f32 as f64));
+        assert_eq!(session.max_incident_points.get(), None);
+        assert_eq!(session.track_id.as_deref(), Some("1"));
+        let theirs = standings
+            .iter()
+            .find(|s| s.vehicle_id.get() == Some(3))
+            .unwrap();
+        assert_eq!(theirs.front_tire_compound_name.as_deref(), Some("soft"));
+        assert_eq!(theirs.rear_tire_compound_name.as_deref(), Some("prime"));
+        assert_eq!(theirs.class_position.get(), Some(1));
+        assert_eq!(theirs.push_to_pass_active.get(), Some(true));
+        assert_eq!(theirs.drs_active.get(), None);
+        assert_eq!(theirs.car_number.as_deref(), Some("44"));
+        assert_eq!(theirs.vehicle_model_id.as_deref(), None);
+        assert_eq!(theirs.vehicle_class_id.as_deref(), Some("1703"));
+        assert_eq!(theirs.vehicle_width.get(), None);
+        assert_eq!(theirs.vehicle_length.get(), Some(4.5));
+        // Sector 2 alone, not cumulative
+        assert_eq!(theirs.best_lap_sector_2.get(), Some(35.0));
+
+        // This lap invalid, the next one fine; the last lap's verdict unknown
+        shared.lap_valid_state = 1;
+        shared.prev_lap_valid = -1;
+        let update = Converter::default()
+            .convert(&shared, Instant::now())
+            .unwrap();
+        let mine = update
+            .telemetry
+            .iter()
+            .find(|t| t.vehicle_id.get() == Some(7))
+            .unwrap();
+        assert_eq!(mine.state.next_lap_invalidated.get(), Some(false));
+        assert_eq!(mine.state.previous_lap_invalidated.get(), None);
     }
 
     #[test]

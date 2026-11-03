@@ -43,7 +43,8 @@
     X(f64, position_x)                                                                                   \
     X(f64, position_y)                                                                                   \
     X(f64, position_z)                                                                                   \
-    X(f64, heading)                                                                                      \
+    X(f64, heading) /* radians the car body points: 0 along world -z, + turning right; see the schema guide for opponents */ \
+    X(f64, course) /* radians of the direction of travel, same convention; NULL below 1 m/s */ \
     X(f64, pitch)                                                                                        \
     X(f64, roll)                                                                                         \
     X(f64, speed)                                                                                        \
@@ -80,6 +81,7 @@
     X(f64, turbo_boost_pressure)                                                                         \
     X(boolean, anti_stall_active)                                                                        \
     /* Fuel, energy and hybrid */                                                                        \
+    X(f64, total_mass) /* kg: car, fuel and penalty weight, so it changes as fuel burns */ \
     X(f64, fuel)                            /* liters */                                                 \
     X(f64, virtual_energy)                                                                               \
     X(f64, battery_charge)                  /* fraction */                                               \
@@ -95,13 +97,18 @@
     X(boolean, traction_control_active)                                                                  \
     X(boolean, abs_active)                                                                               \
     X(boolean, speed_limiter_active)                                                                     \
+    X(f64, push_to_pass_active_time_left) /* seconds */ \
+    X(f64, push_to_pass_cooldown_left) /* seconds until it can be used again */ \
     /* Chassis and aerodynamics */                                                                       \
     X(f64, front_third_spring_deflection)                                                                \
     X(f64, rear_third_spring_deflection)                                                                 \
+    X(f64, front_third_spring_velocity) /* m/s, sign as reported by the simulator */ \
+    X(f64, rear_third_spring_velocity) \
     X(f64, front_wing_height)                                                                            \
     X(f64, front_ride_height)                                                                            \
     X(f64, rear_ride_height)                                                                             \
     X(f64, drag)                            /* N */                                                      \
+    X(f64, total_downforce) /* N, whole car; never a front or rear component */ \
     X(f64, front_downforce)                 /* N */                                                      \
     X(f64, rear_downforce)                  /* N */                                                      \
     X(boolean, front_flap_active)                                                                        \
@@ -131,6 +138,49 @@
     X(i64, front_tire_compound)             /* index of the compound for this car */                     \
     X(i64, rear_tire_compound)                                                                           \
     X(i64, scheduled_pit_stops)                                                                          \
+    X(i64, engine_braking) /* setting, as reported by the simulator */ \
+    /* Range of each control: the highest value the car reports, which does not prove every step differs */ \
+    X(i64, traction_control_max) \
+    X(i64, traction_control_slip_max) \
+    X(i64, traction_control_cut_max) \
+    X(i64, abs_max) \
+    X(i64, engine_map_max) \
+    X(i64, brake_migration_max) \
+    X(i64, front_anti_roll_bar_max) \
+    X(i64, rear_anti_roll_bar_max) \
+    X(f64, steering_wheel_range) /* degrees, physical, full left to full right */ \
+    X(f64, engine_max_rpm) /* rev limit, not the best shift point */ \
+    X(i64, max_gears) /* forward gears */ \
+    X(boolean, speed_limiter_available) \
+    /* Tire and brake limits, per axle */ \
+    X(f64, front_tire_radius) /* meters, static and undeflected: not the rolling radius */ \
+    X(f64, rear_tire_radius) \
+    X(f64, front_tire_cold_temperature) /* Celsius, below this is too cold */ \
+    X(f64, front_tire_hot_temperature) /* above this is too hot */ \
+    X(f64, rear_tire_cold_temperature) \
+    X(f64, rear_tire_hot_temperature) \
+    X(f64, front_brake_cold_temperature) \
+    X(f64, front_brake_optimal_temperature) \
+    X(f64, front_brake_hot_temperature) \
+    X(f64, rear_brake_cold_temperature) \
+    X(f64, rear_brake_optimal_temperature) \
+    X(f64, rear_brake_hot_temperature) \
+    /* Overtaking systems */ \
+    X(boolean, drs_equipped) /* fitted and allowed; engaged is rear_flap_active */ \
+    X(boolean, drs_available) /* an activation is left */ \
+    X(i64, drs_activations_left) /* NULL when unlimited or unknown */ \
+    X(boolean, drs_activations_unlimited) \
+    X(i64, drs_activations_total) /* per lap */ \
+    X(boolean, push_to_pass_equipped) \
+    X(boolean, push_to_pass_charged) /* NULL on cars without a charge cycle; false while charging */ \
+    X(boolean, push_to_pass_engaged) \
+    X(i64, push_to_pass_activations_left) \
+    X(i64, push_to_pass_activations_total) \
+    /* Rules */ \
+    X(i64, incident_points) /* not the same thing as track cuts */ \
+    X(i64, cut_track_warnings) \
+    X(boolean, next_lap_invalidated) /* this lap counts against the next one too; the current lap is telemetry.lap_invalidated */ \
+    X(boolean, previous_lap_invalidated) \
     /* Fuel */                                                                                           \
     X(f64, fuel_capacity)                   /* liters */                                                 \
     X(f64, fuel_per_lap)                    /* liters, the simulator's own estimate */                   \
@@ -160,6 +210,7 @@
 #define SIM_WHEEL_TELEMETRY_COLUMNS(X)                                                                   \
     /* Suspension and brakes */                                                                          \
     X(f64, suspension_deflection)                                                                        \
+    X(f64, suspension_velocity) /* m/s, sign as reported by the simulator */ \
     X(f64, suspension_force)                /* pushrod load, N */                                       \
     X(f64, ride_height)                                                                                  \
     X(f64, wheel_vertical_position)         /* relative to the car */                                   \
@@ -192,6 +243,9 @@
     X(f64, tire_vertical_deflection)                                                                     \
     X(i64, tire_compound)                                                                                \
     X(i64, tire_compound_type)                                                                           \
+    X(f64, tire_grip) /* 0-1, the simulator's own figure, not a physical grip model */ \
+    X(f64, tire_dirt) /* 0-1 */ \
+    X(boolean, tire_flatspot) /* distinct from tire_flat, a puncture */ \
     X(boolean, tire_flat)                                                                                \
     X(boolean, wheel_detached)
 // clang-format on

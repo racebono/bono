@@ -1,8 +1,8 @@
 //! The conversation with the engineer, and a text box to ask it questions by typing.
 
 use crate::engineer::{Engineer, Speaker};
-use egui::RichText;
 use bono_i18n::t;
+use egui::RichText;
 
 #[derive(Default)]
 pub struct Chat {

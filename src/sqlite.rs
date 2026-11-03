@@ -51,9 +51,7 @@ impl Database {
         let (send, recv) = tokio::sync::oneshot::channel();
         let handle = std::thread::Builder::new()
             .name("sqlite thread".into())
-            .spawn(move || {
-                worker(path, flags, send)
-            })?;
+            .spawn(move || worker(path, flags, send))?;
 
         let conn = recv.await??;
         return Ok(Connection {

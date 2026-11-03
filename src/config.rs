@@ -984,13 +984,16 @@ mod tests {
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let loaded = std::fs::read(&path).ok().and_then(|b| {
-                serde_json::from_slice::<RawConfig>(&b).ok()
-            });
+            let loaded = std::fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<RawConfig>(&b).ok());
             if loaded.is_some_and(|l| *l.master_volume() == 0.3) {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "latest config never saved");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "latest config never saved"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }

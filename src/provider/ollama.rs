@@ -3,8 +3,8 @@
 use super::{Model, ModelOption, Reply, StopReason, ToolHandler, Tools, Usage, text::TextSink};
 use crate::config::OllamaConfig;
 use anyhow::{Context, bail};
-use futures::future::{BoxFuture, join_all};
 use bono_i18n::t;
+use futures::future::{BoxFuture, join_all};
 use reqwest::{
     StatusCode,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
