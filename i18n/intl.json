@@ -1729,5 +1729,20 @@
         "en": "Not now",
         "es": "Ahora no",
         "ca": "Ara no"
+    },
+    "update.locked": {
+        "en": "Bono is also running from this folder. Close it to update this one.",
+        "es": "Bono también se está ejecutando desde esta carpeta. Ciérralo para actualizar este.",
+        "ca": "Bono també s'està executant des d'aquesta carpeta. Tanca'l per actualitzar aquest."
+    },
+    "update.install_failed": {
+        "en": "The last update couldn't be installed, so this version was kept: {error}",
+        "es": "No se ha podido instalar la última actualización, así que se ha mantenido esta versión: {error}",
+        "ca": "No s'ha pogut instal·lar la darrera actualització, així que s'ha mantingut aquesta versió: {error}"
+    },
+    "update.cancelling": {
+        "en": "Cancelling…",
+        "es": "Cancelando…",
+        "ca": "S'està cancel·lant…"
     }
 }

@@ -11,10 +11,12 @@
 
 use crate::{Download, DownloadDigest};
 use anyhow::Context as _;
+use bono_i18n::t;
 use reqwest::{StatusCode, header};
 use serde::Deserialize;
 use std::{
     path::{Path, PathBuf},
+    sync::OnceLock,
     time::SystemTime,
 };
 
@@ -64,7 +66,7 @@ pub struct Release {
     /// The archive's size, in bytes
     pub size: u64,
     url: String,
-    sha256: Option<String>,
+    sha256: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -90,7 +92,7 @@ struct GitHubAsset {
 }
 
 impl GitHubRelease {
-    /// The release, if it has this platform's build in full.
+    /// The release, if it has this platform's build in full, with its digest to check it by.
     fn release(&self) -> Option<Release> {
         let asset = (self.assets.iter())
             .find(|asset| Some(asset.name.as_str()) == ASSET && asset.state == "uploaded")?;
@@ -107,8 +109,8 @@ impl GitHubRelease {
             size: asset.size,
             url: asset.browser_download_url.clone(),
             sha256: (asset.digest.as_deref())
-                .and_then(|digest| digest.strip_prefix("sha256:"))
-                .map(str::to_owned),
+                .and_then(|digest| digest.strip_prefix("sha256:"))?
+                .to_owned(),
         })
     }
 }
@@ -207,10 +209,19 @@ pub async fn check(client: &reqwest::Client) -> anyhow::Result<Option<Release>> 
     pick_nightly(&releases, commit)
 }
 
+/// Held by the app updating an installation, so another one running from it leaves its
+/// downloads alone.
+const LOCK: &str = "lock";
+/// What went wrong with the last installation, written by the installer
+const FAILED: &str = "install-failed.txt";
+/// How many times the installer tries to move a file or folder still in use, a second apart
+const RETRIES: u32 = 30;
+
 /// Where downloads are kept, and the installation they replace.
 pub struct Staging {
     install: PathBuf,
     dir: PathBuf,
+    lock: OnceLock<std::fs::File>,
 }
 
 impl Staging {
@@ -220,12 +231,10 @@ impl Staging {
     }
 
     fn at(install: &Path) -> Self {
-        // Without a trailing separator, which would escape the quote around it on the
-        // installer's command line
-        let install = install.components().collect::<PathBuf>();
         Self {
+            install: install.to_owned(),
             dir: install.join("update"),
-            install,
+            lock: OnceLock::new(),
         }
     }
 
@@ -241,6 +250,43 @@ impl Staging {
         self.dir.join(&release.tag)
     }
 
+    /// Takes the installation's updates for this app, for as long as it runs. Another app
+    /// running from the same folder would remove what this one downloads, and keep the installer
+    /// from moving files it has open. Blocks.
+    pub fn claim(&self) -> anyhow::Result<()> {
+        if self.lock.get().is_some() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        let file = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.dir.join(LOCK))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(t!("update.locked")),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+        // Only one check runs at a time
+        let _ = self.lock.set(file);
+        Ok(())
+    }
+
+    /// What went wrong with the last installation, if it failed, said only once. Blocks.
+    pub fn take_failure(&self) -> Option<String> {
+        let path = self.dir.join(FAILED);
+        let failure = match std::fs::read_to_string(&path) {
+            Ok(failure) => failure,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => e.to_string(),
+        };
+        if let Err(e) = std::fs::remove_file(&path) {
+            log::warn!("Unable to remove {}: {e}", path.display());
+        }
+        Some(failure.trim().to_owned())
+    }
+
     /// Starts downloading `release`'s archive.
     pub fn download(&self, client: &reqwest::Client, release: &Release) -> Download {
         let request = client
@@ -250,7 +296,7 @@ impl Staging {
             request,
             self.zip(release),
             Some(release.size),
-            release.sha256.clone().map(DownloadDigest::Sha256),
+            Some(DownloadDigest::Sha256(release.sha256.clone())),
         )
     }
 
@@ -287,7 +333,7 @@ impl Staging {
         let ready = latest.map(|release| self.ready(release));
         for entry in entries.flatten() {
             let path = entry.path();
-            if Some(&path) != ready.as_ref() {
+            if Some(&path) != ready.as_ref() && entry.file_name() != LOCK {
                 if let Err(e) = remove(&path) {
                     log::warn!("Unable to remove {}: {e}", path.display());
                 }
@@ -299,13 +345,17 @@ impl Staging {
     /// Starts installing `release`, once unpacked, as soon as the process `pid` (this app)
     /// exits, then opens the new version. Returns once the installer is waiting.
     pub async fn install(&self, release: &Release, pid: u32) -> anyhow::Result<()> {
-        install(
-            &self.ready(release),
-            &self.install,
-            &self.dir.join("install.log"),
-            pid,
-        )
-        .await
+        self.installer(release, RETRIES).start(pid).await
+    }
+
+    fn installer(&self, release: &Release, retries: u32) -> Installer {
+        Installer {
+            source: self.ready(release),
+            target: self.install.clone(),
+            backup: self.dir.join("backup"),
+            failed: self.dir.join(FAILED),
+            retries,
+        }
     }
 }
 
@@ -322,12 +372,25 @@ fn remove(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// The installer: waits for the app to exit, copies the new version over the installation and
-/// opens it. Files the new version doesn't have are left alone: the installation's folder may
-/// hold more than the app. Copying is retried while a file is still in use. `bono.exe` goes
-/// last, only once everything else is in place: if anything fails, the old version opens again,
-/// still offering to install the new one. Paths come in through the environment, so they need
-/// no quoting.
+/// Puts an unpacked version (`source`) in place of the installation's (`target`).
+struct Installer {
+    source: PathBuf,
+    target: PathBuf,
+    /// Where what's replaced goes, on the installation's drive
+    backup: PathBuf,
+    /// Where it says what went wrong, if it failed
+    failed: PathBuf,
+    retries: u32,
+}
+
+/// The installer: waits for the app to exit, puts the new version in place and opens it.
+///
+/// Each file and folder at the top of the new version replaces the installation's by renaming,
+/// all on the same drive: nothing is copied, so nothing is left half written. What it replaces
+/// is moved aside first. If anything fails, everything moved goes back where it was, so the old
+/// version opens again, still offering the new one, and the installer says what went wrong.
+/// Anything else in the installation's folder stays. Moves are retried while something still has
+/// the file or folder open. Paths come in through the environment, so they need no quoting.
 #[cfg(windows)]
 const INSTALLER: &str = r#"
 $ErrorActionPreference = 'Stop'
@@ -337,67 +400,112 @@ $null = $app.Handle
 [Console]::Out.WriteLine('waiting')
 [Console]::Out.Flush()
 $app.WaitForExit()
-$ErrorActionPreference = 'Continue'
+
 $source = $env:BONO_UPDATE_SOURCE
 $target = $env:BONO_UPDATE_TARGET
-# Robocopy fails with an exit code of 8 or more
-robocopy $source $target /E /XF bono.exe /R:30 /W:1 /NP ('/LOG:' + $env:BONO_UPDATE_LOG) | Out-Null
-if ($LASTEXITCODE -lt 8) {
-    robocopy $source $target bono.exe /R:30 /W:1 /NP ('/LOG+:' + $env:BONO_UPDATE_LOG) | Out-Null
+$backup = $env:BONO_UPDATE_BACKUP
+$retries = [int]$env:BONO_UPDATE_RETRIES
+function Move-Retrying($from, $to) {
+    for ($try = 1; ; $try++) {
+        try { Move-Item -LiteralPath $from -Destination $to; return }
+        catch { if ($try -ge $retries) { throw }; Start-Sleep -Seconds 1 }
+    }
+}
+
+$moved = New-Object System.Collections.ArrayList
+try {
+    if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force }
+    $null = New-Item -ItemType Directory -Path $backup
+    # bono.exe last
+    foreach ($entry in Get-ChildItem -LiteralPath $source -Force | Sort-Object { $_.Name -eq 'bono.exe' }) {
+        $name = $entry.Name
+        $old = Join-Path $target $name
+        $replaced = Test-Path -LiteralPath $old
+        if ($replaced) { Move-Retrying $old (Join-Path $backup $name) }
+        $null = $moved.Add(@($name, $replaced))
+        Move-Retrying $entry.FullName $old
+    }
+} catch {
+    $failure = $_.Exception.Message
+    for ($i = $moved.Count - 1; $i -ge 0; $i--) {
+        $name, $replaced = $moved[$i]
+        $new = Join-Path $target $name
+        $staged = Join-Path $source $name
+        try {
+            if (-not (Test-Path -LiteralPath $staged)) { Move-Retrying $new $staged }
+            if ($replaced) { Move-Retrying (Join-Path $backup $name) $new }
+        } catch { $failure += "`n" + $_.Exception.Message }
+    }
+    [IO.File]::WriteAllText($env:BONO_UPDATE_FAILED, $failure)
 }
 Start-Process -FilePath (Join-Path $target 'bono.exe') -WorkingDirectory $target
 "#;
 
 #[cfg(windows)]
-async fn install(source: &Path, target: &Path, log: &Path, pid: u32) -> anyhow::Result<()> {
-    use base64::Engine as _;
-    use tokio::io::AsyncBufReadExt as _;
+impl Installer {
+    async fn start(self, pid: u32) -> anyhow::Result<()> {
+        use base64::Engine as _;
+        use tokio::io::AsyncBufReadExt as _;
 
-    /// How long PowerShell may take to start waiting for the app
-    const START: std::time::Duration = std::time::Duration::from_secs(30);
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        /// How long PowerShell may take to start waiting for the app
+        const START: std::time::Duration = std::time::Duration::from_secs(30);
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
-    // An encoded command needs no quoting either
-    let script = (INSTALLER.encode_utf16())
-        .flat_map(u16::to_le_bytes)
-        .collect::<Vec<_>>();
-    let system = std::env::var_os("SystemRoot").context("SystemRoot isn't set")?;
-    let mut child = tokio::process::Command::new(
-        Path::new(&system).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
-    )
-    .args(["-NoProfile", "-NonInteractive", "-EncodedCommand"])
-    .arg(base64::engine::general_purpose::STANDARD.encode(script))
-    .env("BONO_UPDATE_PID", pid.to_string())
-    .env("BONO_UPDATE_SOURCE", source)
-    .env("BONO_UPDATE_TARGET", target)
-    .env("BONO_UPDATE_LOG", log)
-    .current_dir(target)
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::null())
-    .creation_flags(CREATE_NO_WINDOW)
-    .spawn()
-    .context("Unable to start the installer")?;
+        // An encoded command needs no quoting either
+        let script = (INSTALLER.encode_utf16())
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let system = std::env::var_os("SystemRoot").context("SystemRoot isn't set")?;
+        let powershell = Path::new(&system).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let mut command = tokio::process::Command::new(powershell);
+        command
+            .args(["-NoProfile", "-NonInteractive", "-EncodedCommand"])
+            .arg(base64::engine::general_purpose::STANDARD.encode(script))
+            .env("BONO_UPDATE_PID", pid.to_string())
+            .env("BONO_UPDATE_SOURCE", &self.source)
+            .env("BONO_UPDATE_TARGET", &self.target)
+            .env("BONO_UPDATE_BACKUP", &self.backup)
+            .env("BONO_UPDATE_FAILED", &self.failed)
+            .env("BONO_UPDATE_RETRIES", self.retries.to_string())
+            .current_dir(&self.target)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        // Out of the app's job, if it's in one that ends its processes with it. A job that doesn't
+        // allow that fails the start
+        let mut child = match command
+            .creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => (command.creation_flags(CREATE_NO_WINDOW).spawn())
+                .context("Unable to start the installer")?,
+        };
 
-    let mut stdout = tokio::io::BufReader::new(child.stdout.take().context("No installer output")?);
-    let mut line = String::new();
-    match tokio::time::timeout(START, stdout.read_line(&mut line)).await {
-        Ok(Ok(_)) if line.trim() == "waiting" => Ok(()),
-        result => {
-            // It mustn't install later, unasked
-            let _ = child.start_kill();
-            match result {
-                Ok(Err(e)) => Err(e).context("Unable to start the installer"),
-                Err(_) => anyhow::bail!("The installer didn't start in {START:?}"),
-                Ok(Ok(_)) => anyhow::bail!("The installer didn't start"),
+        let stdout = child.stdout.take().context("No installer output")?;
+        let mut stdout = tokio::io::BufReader::new(stdout);
+        let mut line = String::new();
+        match tokio::time::timeout(START, stdout.read_line(&mut line)).await {
+            Ok(Ok(_)) if line.trim() == "waiting" => Ok(()),
+            result => {
+                // It mustn't install later, unasked
+                let _ = child.start_kill();
+                match result {
+                    Ok(Err(e)) => Err(e).context("Unable to start the installer"),
+                    Err(_) => anyhow::bail!("The installer didn't start in {START:?}"),
+                    Ok(Ok(_)) => anyhow::bail!("The installer didn't start"),
+                }
             }
         }
     }
 }
 
 #[cfg(not(windows))]
-async fn install(_: &Path, _: &Path, _: &Path, _: u32) -> anyhow::Result<()> {
-    anyhow::bail!("Updates can't be installed on this platform")
+impl Installer {
+    async fn start(self, _: u32) -> anyhow::Result<()> {
+        anyhow::bail!("Updates can't be installed on this platform")
+    }
 }
 
 #[cfg(test)]
@@ -428,11 +536,15 @@ mod tests {
 
     #[test]
     fn parses_github_releases() {
-        let json = r#"{"tag_name":"v1.2.3","name":"","draft":false,"prerelease":false,
-            "target_commitish":"master","created_at":"2026-11-03T04:45:29Z","body":"notes",
-            "assets":[{"name":"bono-windows-x86_64.zip","state":"uploaded","size":7,
-            "browser_download_url":"https://example.com/a.zip","digest":null,"id":1}]}"#;
-        let github = serde_json::from_str::<GitHubRelease>(json).unwrap();
+        let json = |digest: &str| {
+            format!(
+                r#"{{"tag_name":"v1.2.3","name":"","draft":false,"prerelease":false,
+                "target_commitish":"master","created_at":"2026-11-03T04:45:29Z","body":"notes",
+                "assets":[{{"name":"bono-windows-x86_64.zip","state":"uploaded","size":7,
+                "browser_download_url":"https://example.com/a.zip","digest":{digest},"id":1}}]}}"#
+            )
+        };
+        let github = serde_json::from_str::<GitHubRelease>(&json(r#""sha256:abc""#)).unwrap();
         if ASSET.is_none() {
             return assert_eq!(github.release(), None);
         }
@@ -441,7 +553,13 @@ mod tests {
             (release.tag.as_str(), release.name.as_str()),
             ("v1.2.3", "v1.2.3")
         );
-        assert_eq!((release.size, release.sha256), (7, None));
+        assert_eq!((release.size, release.sha256.as_str()), (7, "abc"));
+
+        // Without a digest to check it by, it isn't offered
+        for digest in ["null", r#""md5:abc""#] {
+            let github = serde_json::from_str::<GitHubRelease>(&json(digest)).unwrap();
+            assert_eq!(github.release(), None);
+        }
     }
 
     #[test]
@@ -501,7 +619,7 @@ mod tests {
         let newest = pick_nightly(&releases, "aaa").unwrap().unwrap();
         assert_eq!(newest.tag, "nightly-2026-11-03-3-1");
         assert_eq!(newest.name, "Release nightly-2026-11-03-3-1");
-        assert_eq!(newest.sha256.as_deref(), Some("abc"));
+        assert_eq!(newest.sha256, "abc");
         assert_eq!(pick_nightly(&releases, "CCC").unwrap(), None);
 
         // One still uploading doesn't count
@@ -528,9 +646,7 @@ mod tests {
         let releases = response.json::<Vec<GitHubRelease>>().await.unwrap();
         let newest = pick_nightly(&releases, "").unwrap();
         if ASSET.is_some() {
-            let newest = newest.expect("no nightly");
-            println!("{newest:?}");
-            assert!(newest.sha256.is_some());
+            println!("{:?}", newest.expect("no nightly"));
         }
         let response = github(&client, &format!("{RELEASES}/latest"))
             .send()
@@ -565,7 +681,7 @@ mod tests {
             name: name.into(),
             size: 0,
             url: String::new(),
-            sha256: None,
+            sha256: String::new(),
         }
     }
 
@@ -575,7 +691,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staging = Staging::at(dir.path());
         let release = staged("v0.2.0");
-        std::fs::create_dir_all(&staging.dir).unwrap();
+        staging.claim().unwrap();
 
         let mut zip = zip::ZipWriter::new(std::fs::File::create(staging.zip(&release)).unwrap());
         let options = zip::write::SimpleFileOptions::default()
@@ -597,10 +713,11 @@ mod tests {
         );
         assert!(!staging.zip(&release).exists() && !staging.partial(&release).exists());
 
+        // The lock stays
         assert!(staging.tidy(Some(&release)));
-        assert_eq!(std::fs::read_dir(&staging.dir).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&staging.dir).unwrap().count(), 2);
         assert!(!staging.tidy(Some(&staged("v0.3.0"))));
-        assert_eq!(std::fs::read_dir(&staging.dir).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&staging.dir).unwrap().count(), 1);
         assert!(!staging.tidy(None));
     }
 
@@ -619,77 +736,144 @@ mod tests {
     }
 
     #[test]
-    fn install_folder_has_no_trailing_separator() {
-        let base = std::env::temp_dir().join("bono app");
-        let mut trailing = base.clone().into_os_string();
-        trailing.push(std::path::MAIN_SEPARATOR_STR);
-        assert_eq!(Staging::at(Path::new(&trailing)).install, base);
+    fn one_app_updates_an_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Staging::at(dir.path());
+        first.claim().unwrap();
+        first.claim().unwrap();
+        assert!(Staging::at(dir.path()).claim().is_err());
+        drop(first);
+        Staging::at(dir.path()).claim().unwrap();
     }
 
-    /// The real installer: it waits for the app to exit before copying the new version over the
-    /// installation, keeps files it doesn't replace, and opens the new version.
+    #[test]
+    fn failure_is_said_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = Staging::at(dir.path());
+        assert_eq!(staging.take_failure(), None);
+        std::fs::create_dir_all(&staging.dir).unwrap();
+        std::fs::write(staging.dir.join(FAILED), "Access denied\r\n").unwrap();
+        assert_eq!(staging.take_failure().as_deref(), Some("Access denied"));
+        assert_eq!(staging.take_failure(), None);
+    }
+
+    #[cfg(windows)]
+    fn system(exe: &str) -> PathBuf {
+        Path::new(&std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join(exe)
+    }
+
+    /// An unpacked version, with something that opens and exits by itself for the app
+    #[cfg(windows)]
+    fn unpacked(staging: &Staging, release: &Release) {
+        let ready = staging.ready(release);
+        std::fs::create_dir_all(ready.join("assets")).unwrap();
+        std::fs::write(ready.join("assets/new.txt"), "new").unwrap();
+        std::fs::write(ready.join("changed.txt"), "new").unwrap();
+        std::fs::copy(system("whoami.exe"), ready.join(EXE)).unwrap();
+    }
+
+    /// An installed version, with a file the new one doesn't have
+    #[cfg(windows)]
+    fn installed(install: &Path) {
+        std::fs::create_dir_all(install.join("assets")).unwrap();
+        std::fs::write(install.join("assets/old.txt"), "old").unwrap();
+        std::fs::write(install.join("changed.txt"), "old").unwrap();
+        std::fs::write(install.join("kept.txt"), "kept").unwrap();
+        std::fs::copy(system("hostname.exe"), install.join(EXE)).unwrap();
+    }
+
+    #[cfg(windows)]
+    async fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// The real installer waits for the app to exit, puts the new version in place, keeps what
+    /// it doesn't replace, and opens the new version.
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn installer_waits_for_the_app_then_copies() {
+    async fn installer_waits_for_the_app_then_replaces_it() {
         let dir = tempfile::tempdir().unwrap();
         let install = dir.path().join("bono app");
         let staging = Staging::at(&install);
         let release = staged("v0.2.0");
-        let ready = staging.ready(&release);
-        std::fs::create_dir_all(ready.join("assets")).unwrap();
-        std::fs::write(ready.join("assets/new.txt"), "new").unwrap();
-        std::fs::write(ready.join("changed.txt"), "new").unwrap();
-        // Something that opens and exits by itself, standing in for the app
-        let system = std::env::var_os("SystemRoot").unwrap();
-        let whoami = Path::new(&system).join(r"System32\whoami.exe");
-        std::fs::copy(&whoami, ready.join(EXE)).unwrap();
-        std::fs::write(install.join("changed.txt"), "old").unwrap();
-        std::fs::write(install.join("kept.txt"), "kept").unwrap();
+        unpacked(&staging, &release);
+        installed(&install);
 
         // Standing in for the running app
-        let mut app = std::process::Command::new(Path::new(&system).join(r"System32\ping.exe"))
+        let mut app = std::process::Command::new(system("ping.exe"))
             .args(["-n", "60", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
         let installing = staging.install(&release, app.id()).await;
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let early = install.join(EXE).exists();
+        let early = std::fs::read_to_string(install.join("changed.txt")).unwrap() != "old";
         app.kill().unwrap();
         app.wait().unwrap();
         installing.unwrap();
-        assert!(!early, "copied before the app exited");
+        assert!(!early, "installed before the app exited");
 
-        let copied = install.join(EXE);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while !(copied.exists() && install.join("changed.txt").exists()) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "nothing was installed"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        // Robocopy may still be finishing
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        loop {
-            let done = std::fs::read_to_string(install.join("changed.txt")).unwrap() == "new"
-                && install.join("assets/new.txt").exists()
-                && std::fs::metadata(&copied).unwrap().len()
-                    == std::fs::metadata(&whoami).unwrap().len();
-            if done {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the install didn't finish"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        assert_eq!(
-            std::fs::read_to_string(install.join("kept.txt")).unwrap(),
-            "kept"
-        );
-        assert!(staging.dir.join("install.log").exists());
+        // bono.exe goes last
+        let new_exe = std::fs::metadata(system("whoami.exe")).unwrap().len();
+        wait_for("the install didn't finish", || {
+            std::fs::metadata(install.join(EXE)).is_ok_and(|exe| exe.len() == new_exe)
+        })
+        .await;
+        let read = |path: &str| std::fs::read_to_string(install.join(path)).unwrap();
+        assert_eq!(read("changed.txt"), "new");
+        assert_eq!(read("assets/new.txt"), "new");
+        assert!(!install.join("assets/old.txt").exists());
+        assert_eq!(read("kept.txt"), "kept");
+        assert_eq!(staging.take_failure(), None);
+    }
+
+    /// When something can't be replaced, the installer puts everything back and says so.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn installer_rolls_back_a_failed_install() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let install = dir.path().join("bono app");
+        let staging = Staging::at(&install);
+        let release = staged("v0.2.0");
+        unpacked(&staging, &release);
+        installed(&install);
+        // Open without sharing, so its folder can't be moved
+        let held = std::fs::File::options()
+            .read(true)
+            .share_mode(0)
+            .open(install.join("assets/old.txt"))
+            .unwrap();
+
+        let mut app = std::process::Command::new(system("ping.exe"))
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let installing = staging.installer(&release, 2).start(app.id()).await;
+        app.kill().unwrap();
+        app.wait().unwrap();
+        installing.unwrap();
+        let failed = staging.dir.join(FAILED);
+        wait_for("the installer didn't fail", || failed.exists()).await;
+        drop(held);
+
+        let read = |path: &Path| std::fs::read_to_string(path).unwrap();
+        assert_eq!(read(&install.join("changed.txt")), "old");
+        assert_eq!(read(&install.join("assets/old.txt")), "old");
+        assert_eq!(read(&install.join("kept.txt")), "kept");
+        let old_exe = std::fs::metadata(system("hostname.exe")).unwrap().len();
+        assert_eq!(std::fs::metadata(install.join(EXE)).unwrap().len(), old_exe);
+        assert!(!staging.take_failure().unwrap().is_empty());
+        // Still ready to install
+        assert!(staging.tidy(Some(&release)));
+        assert_eq!(read(&staging.ready(&release).join("changed.txt")), "new");
     }
 
     #[cfg(windows)]
@@ -697,8 +881,7 @@ mod tests {
     async fn installer_fails_for_a_missing_app() {
         let dir = tempfile::tempdir().unwrap();
         let staging = Staging::at(dir.path());
-        let system = std::env::var_os("SystemRoot").unwrap();
-        let mut gone = std::process::Command::new(Path::new(&system).join(r"System32\whoami.exe"))
+        let mut gone = std::process::Command::new(system("whoami.exe"))
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();

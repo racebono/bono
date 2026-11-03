@@ -12,18 +12,28 @@ use tokio::runtime::Handle;
 /// The color of the sign on the menu once a new version is ready to install
 const READY_COLOR: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
 
+/// What a check found: how the last installation failed, if it did, and the newest version on
+/// this build's channel, if it's newer, with whether it's downloaded.
+type Checked = (Option<String>, anyhow::Result<(Option<Release>, bool)>);
+
 enum State {
     Unsupported,
-    Checking(Task<anyhow::Result<(Option<Release>, bool)>>),
+    Checking {
+        task: Task<Checked>,
+        /// The newer version known before, and whether it's downloaded, kept if the check fails
+        known: Option<(Release, bool)>,
+    },
     CheckFailed(String),
     UpToDate,
     Available(Release),
     Downloading(Release, Download),
+    /// The download was told to stop, and is cleaning up
+    Cancelling(Release, Download),
     Unpacking(Release, Task<anyhow::Result<()>>),
     Ready(Release),
     Installing(Release, Task<anyhow::Result<()>>),
-    /// The app is closing for the installer
-    Restarting,
+    /// The app is closing for the installer: whether it's been asked to
+    Restarting(bool),
 }
 
 /// The "Update" menu: this version, and a newer one to download and install.
@@ -31,7 +41,7 @@ pub struct UpdateTopbar {
     client: reqwest::Client,
     staging: Option<Arc<Staging>>,
     state: State,
-    /// What last went wrong unpacking or installing (a failed download says so itself)
+    /// What last went wrong, besides a check or a download (which says so itself)
     error: Option<String>,
     /// The check at startup offers a new version in a popup
     startup: bool,
@@ -64,14 +74,31 @@ impl UpdateTopbar {
         let Some(staging) = self.staging.clone() else {
             return;
         };
+        let known = match &self.state {
+            State::Available(release) => Some((release.clone(), false)),
+            State::Ready(release) => Some((release.clone(), true)),
+            _ => None,
+        };
         let client = self.client.clone();
         self.error = None;
-        self.state = State::Checking(Task::spawn(async move {
-            let latest = update::check(&client).await?;
-            let tidy = latest.clone();
-            let ready = tokio::task::spawn_blocking(move || staging.tidy(tidy.as_ref())).await?;
-            Ok((latest, ready))
-        }));
+        let task = Task::spawn(async move {
+            let claim = staging.clone();
+            let claimed =
+                tokio::task::spawn_blocking(move || claim.claim().map(|()| claim.take_failure()));
+            let failure = match claimed.await.map_err(anyhow::Error::from) {
+                Ok(Ok(failure)) => failure,
+                Ok(Err(e)) | Err(e) => return (None, Err(e)),
+            };
+            let checked = async {
+                let latest = update::check(&client).await?;
+                let tidy = latest.clone();
+                let ready =
+                    tokio::task::spawn_blocking(move || staging.tidy(tidy.as_ref())).await?;
+                Ok((latest, ready))
+            };
+            (failure, checked.await)
+        });
+        self.state = State::Checking { task, known };
     }
 
     fn download(&mut self) {
@@ -103,20 +130,35 @@ impl UpdateTopbar {
     pub fn poll(&mut self, rt: &Handle, ss: &Subsystems) {
         let state = std::mem::replace(&mut self.state, State::Unsupported);
         self.state = match state {
-            State::Checking(mut task) => match task.update(rt) {
-                None => State::Checking(task),
-                Some(result) => {
+            State::Checking { mut task, known } => match task.update(rt) {
+                None => State::Checking { task, known },
+                Some((failure, result)) => {
                     let startup = std::mem::replace(&mut self.startup, false);
-                    match result {
-                        Ok((None, _)) => State::UpToDate,
-                        Ok((Some(release), true)) => State::Ready(release),
-                        Ok((Some(release), false)) => {
+                    if let Some(failure) = failure {
+                        log::error!("The last update failed to install: {failure}");
+                        self.error = Some(t!("update.install_failed", error = failure));
+                    }
+                    match (result, known) {
+                        (Ok((None, _)), _) => State::UpToDate,
+                        (Ok((Some(release), true)), _) => State::Ready(release),
+                        (Ok((Some(release), false)), _) => {
                             self.popup = startup;
                             State::Available(release)
                         }
-                        Err(e) => {
+                        (Err(e), known) => {
                             log::warn!("Checking for updates: {e:#}");
-                            State::CheckFailed(format!("{e:#}"))
+                            let error = t!("update.check_failed", error = format!("{e:#}"));
+                            match known {
+                                // What was known still holds
+                                Some((release, ready)) => {
+                                    self.error = Some(error);
+                                    match ready {
+                                        true => State::Ready(release),
+                                        false => State::Available(release),
+                                    }
+                                }
+                                None => State::CheckFailed(error),
+                            }
                         }
                     }
                 }
@@ -131,6 +173,10 @@ impl UpdateTopbar {
             }
             // The download said what went wrong
             State::Downloading(release, download) if download.failed() => State::Available(release),
+            // Downloading it again before this one's cleaned up would share its files
+            State::Cancelling(release, download) if download.failed() || download.finished() => {
+                State::Available(release)
+            }
             State::Unpacking(release, mut task) => match task.update(rt) {
                 None => State::Unpacking(release, task),
                 Some(Ok(())) => State::Ready(release),
@@ -142,22 +188,27 @@ impl UpdateTopbar {
             },
             State::Installing(release, mut task) => match task.update(rt) {
                 None => State::Installing(release, task),
-                Some(Ok(())) => {
-                    // The installer goes on once the app has closed
-                    if let Err(e) = ss
-                        .event
-                        .push_event(sdl3::event::Event::Quit { timestamp: 0 })
-                    {
-                        log::error!("Unable to close for the update: {e}");
-                    }
-                    State::Restarting
-                }
+                Some(Ok(())) => State::Restarting(false),
                 Some(Err(e)) => {
                     log::error!("Installing the update: {e:#}");
                     self.error = Some(format!("{e:#}"));
                     State::Ready(release)
                 }
             },
+            // The installer goes on once the app has closed
+            State::Restarting(false) => {
+                match ss
+                    .event
+                    .push_event(sdl3::event::Event::Quit { timestamp: 0 })
+                {
+                    Ok(()) => State::Restarting(true),
+                    // Tried again next frame
+                    Err(e) => {
+                        log::error!("Unable to close for the update: {e}");
+                        State::Restarting(false)
+                    }
+                }
+            }
             state => state,
         };
     }
@@ -186,17 +237,14 @@ impl UpdateTopbar {
             State::Unsupported => {
                 ui.label(t!("update.unsupported"));
             }
-            State::Checking(_) => {
+            State::Checking { .. } => {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(t!("update.checking"));
                 });
             }
             State::CheckFailed(error) => {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    t!("update.check_failed", error = error),
-                );
+                ui.colored_label(ui.visuals().error_fg_color, error);
             }
             State::UpToDate => {
                 ui.label(t!("update.up_to_date"));
@@ -215,6 +263,12 @@ impl UpdateTopbar {
                     action = Some(Action::Cancel);
                 }
             }
+            State::Cancelling(..) => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(t!("update.cancelling"));
+                });
+            }
             State::Unpacking(release, _) => {
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -228,7 +282,7 @@ impl UpdateTopbar {
                     action = Some(Action::Install);
                 }
             }
-            State::Installing(..) | State::Restarting => {
+            State::Installing(..) | State::Restarting(_) => {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(t!("update.installing"));
@@ -252,10 +306,14 @@ impl UpdateTopbar {
             Some(Action::Check) => self.check(),
             Some(Action::Download) => self.download(),
             Some(Action::Cancel) => {
-                // Dropping the download stops it and removes what it got
-                if let State::Downloading(release, _) = &self.state {
-                    self.state = State::Available(release.clone());
-                }
+                let state = std::mem::replace(&mut self.state, State::Unsupported);
+                self.state = match state {
+                    State::Downloading(release, download) => {
+                        download.cancel();
+                        State::Cancelling(release, download)
+                    }
+                    state => state,
+                };
             }
             Some(Action::Install) => {
                 if let (Some(staging), State::Ready(release)) = (&self.staging, &self.state) {

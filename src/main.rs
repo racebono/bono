@@ -488,6 +488,12 @@ impl Download {
     pub fn failed(&self) -> bool {
         self.task.is_finished() && !self.done.load(Ordering::Acquire)
     }
+
+    /// Stops it, removing what it got. It may take a moment: it's stopped once it's `failed` (or
+    /// `finished`, if it was just done).
+    pub fn cancel(&self) {
+        self.task.abort();
+    }
 }
 
 impl Drop for Download {
