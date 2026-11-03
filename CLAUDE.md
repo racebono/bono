@@ -8,3 +8,5 @@ current worktree whenever possible. Follow its temporary-build-path cleanup
 requirements after end-to-end work and before the T3 thread settles: stop using
 task-owned temporary build/target/cache paths, remove them and any temporary
 symlinks safely without deleting their targets, and report any remaining paths.
+Never mention specific results (observed incidents, dates, quoted answers or
+pass/fail outcomes) in the skill files under `skill/`.

@@ -90,3 +90,11 @@ artifacts; preserve shared caches, existing user directories, deliverables, and
 the worktree itself. Remove symlinks as links without traversing or deleting
 their targets. Report any cleanup that could not be completed and the remaining
 paths in the final handback.
+
+## Keep specific results out of the skill
+
+Never mention specific results in the skill files under `skill/`, including its
+references and evals. Do not cite observed incidents, dates, sessions, quoted
+model answers, or pass/fail outcomes from real or test runs. Describe the
+behavior to follow and the scenarios to evaluate in general terms; record
+specific results in commit messages, pull requests, or issues instead.
