@@ -29,6 +29,14 @@ The first-run setup guide walks through:
 
 Reopen the guide from Settings at any time. Start your simulator, enter a session, and ask questions such as “How many laps of fuel do I have?” or “What was my last lap time?” You can also type in the chat. Voice recognition requires a Whisper model; spoken replies require a Piper voice and the phonemizer helper.
 
+## Updates
+
+Packaged Windows builds update themselves from this repository's GitHub releases. A stable build follows stable releases; a nightly build follows nightlies. The **Update** menu shows the running version and whether a newer one is available. At launch, a newer version is offered in a popup.
+
+Downloading and installing are separate steps. **Download** fetches the release's `bono-windows-x86_64.zip`, checks its size and SHA-256, and unpacks it into the installation's `update/` folder. The Update menu then shows a sign. **Install and restart** closes Bono, puts the new version in place and opens it again. Each file and folder at the top of the new version replaces the installation's by renaming, after moving the old one to `update/backup/`. If anything can't be replaced, everything moved goes back, the old version opens, and the Update menu says what went wrong. Other files in the installation folder stay. Settings, Whisper models and Piper voices live in the per-user preference directory, so every version keeps them. The installation folder must be writable, and only one running Bono per installation can update it. Installing needs Bono to be able to start an installer that outlives it, which some programs that launch others prevent; start Bono by itself then. Development builds don't update themselves.
+
+A stable build is newer when its release tag (`v0.2.0` or `0.2.0`) is a higher version than the running app's Cargo version. Releasing therefore requires bumping `version` in `Cargo.toml` first, and the release workflow refuses tags that don't match it. A nightly is the most recently published `nightly-*` prerelease that has its zip, unless the running app's own nightly was published at the same time or later. A release whose zip is still uploading, or whose zip has no SHA-256 digest on GitHub, isn't offered.
+
 ## Language-model providers
 
 Choose the provider and model in the Provider menu. The model must support tool calls so the engineer can query telemetry.

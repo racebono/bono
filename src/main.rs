@@ -43,6 +43,7 @@ mod steam;
 mod synthesizer;
 mod task;
 mod track;
+mod update;
 
 struct AppImpl {
     app: MainThreadData<RefCell<Lifecycle>>,
@@ -378,9 +379,11 @@ impl Download {
             fn drop(&mut self) {
                 unsafe { ManuallyDrop::drop(&mut self.file) };
                 if let Some(path) = self.temp_path.take() {
-                    if let Err(e) = tokio::task::block_in_place(move || std::fs::remove_file(path))
-                    {
-                        error(t!("error.removing_temporary"), e);
+                    match tokio::task::block_in_place(move || std::fs::remove_file(path)) {
+                        // Cancelled as it was being put in place, which then went on
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => error(t!("error.removing_temporary"), e),
+                        Ok(()) => {}
                     }
                 }
             }
@@ -486,6 +489,12 @@ impl Download {
     /// Whether it stopped before it was done (the error was already shown).
     pub fn failed(&self) -> bool {
         self.task.is_finished() && !self.done.load(Ordering::Acquire)
+    }
+
+    /// Stops it, removing what it got. It may take a moment: it's stopped once it's `failed` (or
+    /// `finished`, if it was just done).
+    pub fn cancel(&self) {
+        self.task.abort();
     }
 }
 

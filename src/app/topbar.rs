@@ -4,7 +4,7 @@ use crate::{
         topbar::{
             account::AccountTopbar, audio::AudioTopbar, engineer::EngineerTopbar,
             provider::ProviderTopbar, settings::SettingsTopbar, simulators::SimulatorsTopbar,
-            spotter::SpotterTopbar, volume::VolumeTopbar,
+            spotter::SpotterTopbar, update::UpdateTopbar, volume::VolumeTopbar,
         },
     },
     config::{Config, RawConfig, Setting},
@@ -28,6 +28,7 @@ mod provider;
 pub(super) mod settings;
 pub(super) mod simulators;
 mod spotter;
+pub(super) mod update;
 pub(super) mod volume;
 
 pub struct Topbar {
@@ -39,6 +40,7 @@ pub struct Topbar {
     engineer: EngineerTopbar,
     spotter: SpotterTopbar,
     simulators: SimulatorsTopbar,
+    pub update: UpdateTopbar,
     /// "Clear data" was clicked: asking before clearing
     confirm_clear: bool,
 }
@@ -59,6 +61,7 @@ impl Topbar {
             engineer: EngineerTopbar,
             spotter: SpotterTopbar,
             simulators: SimulatorsTopbar::default(),
+            update: UpdateTopbar::new(client),
             confirm_clear: false,
             audio: AudioTopbar::new(pref_path, ss, config, client),
         }
@@ -84,6 +87,7 @@ impl Topbar {
     ) -> bool {
         self.audio.poll(rt, config, synth);
         self.account.poll(rt);
+        self.update.poll(rt, ss);
 
         // Every menu with something in it that isn't set up yet
         let settings_setup = config.get().talk_button().is_none();
@@ -148,6 +152,16 @@ impl Topbar {
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
                     .ui(ui, |ui| self.account.update(ui, account));
+
+                let label = self.update.label();
+                let (update, _) = MenuButton::new(label)
+                    .config(
+                        MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
+                    )
+                    .ui(ui, |ui| self.update.update(ui));
+                if self.update.ready() {
+                    update.on_hover_text(t!("update.ready_hover"));
+                }
 
                 let simulator = simulators.current();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
