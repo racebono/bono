@@ -17,7 +17,8 @@ use std::fmt::Write;
 const LIMITS: &str = "Routing limits: a routed call has no arguments, only `command`. Leave the \
 question to Claude when answering it needs any option, a named rival or other car, a specific \
 lap or corner, a different race length, a radius, custom SQL, more than one command's answer, or \
-when it's ambiguous, a follow-up that depends on earlier answers, or a radio check.";
+when it's ambiguous, a follow-up that depends on earlier answers, a radio check, or a request to be \
+told, reminded or warned later (a current reading doesn't answer it).";
 
 /// One command's documents, before they're fitted to the website's limits.
 #[derive(Debug, Clone, PartialEq, Eq)]

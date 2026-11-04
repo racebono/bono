@@ -1075,6 +1075,26 @@
         "es": "El simulador se ha detenido: la sesión ha terminado",
         "ca": "El simulador s'ha aturat: la sessió s'ha acabat"
     },
+    "engineer.scheduled_due": {
+        "en": "Scheduled request: {request}",
+        "es": "Petición programada: {request}",
+        "ca": "Petició programada: {request}"
+    },
+    "engineer.scheduled_failed": {
+        "en": "A scheduled request can no longer be checked: {request}",
+        "es": "Ya no se puede comprobar una petición programada: {request}",
+        "ca": "Ja no es pot comprovar una petició programada: {request}"
+    },
+    "engineer.scheduled_expired": {
+        "en": "Scheduled request dropped, the session changed: {request}",
+        "es": "Petición programada descartada, la sesión ha cambiado: {request}",
+        "ca": "Petició programada descartada, la sessió ha canviat: {request}"
+    },
+    "engineer.scheduled_gave_up": {
+        "en": "Scheduled request dropped, it couldn't be answered: {request}",
+        "es": "Petición programada descartada, no se ha podido responder: {request}",
+        "ca": "Petició programada descartada, no s'ha pogut respondre: {request}"
+    },
     "engineer.signed_out": {
         "en": "You signed out of your Bono account: the Bono Cloud conversation ended",
         "es": "Has cerrado la sesión de tu cuenta de Bono: la conversación con Bono Cloud ha terminado",
