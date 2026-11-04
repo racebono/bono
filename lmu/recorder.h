@@ -30,13 +30,13 @@ void bono_lmu_remove_database(const wchar_t* dir, size_t len);
 // it to bono_lmu_push_telemetry (opponents are only kept at every Nth update). `speed` in m/s.
 bool bono_lmu_wants_telemetry(bono_lmu_recorder* recorder, int64_t vehicle_id, double session_time,
                                   double speed);
-// Queues a telemetry update. Fills in is_player, and lap_distance from the scoring updates.
+// Queues a telemetry update. Fills in is_player, lap_distance from the scoring updates, and incident_points.
 void bono_lmu_push_telemetry(bono_lmu_recorder* recorder, const bono_telemetry_s* telemetry);
 // Queues a scoring update, moving `session` and the `count` standings out: they're left empty (every field
-// NULL).
+// NULL). Fills in max_incident_points, and each standing's car_number and class_position.
 void bono_lmu_push_scoring(bono_lmu_recorder* recorder, bono_session_info_s* session,
                                bono_standing_s* standings, size_t count);
-// Deletes everything recorded so far, e.g. when a session ends.
+// Deletes everything recorded so far, e.g. when a session ends, and forgets what's kept to fill those in.
 void bono_lmu_clear(bono_lmu_recorder* recorder);
 // Whether recording stopped on an error: nothing more is recorded until it is restarted.
 bool bono_lmu_failed(bono_lmu_recorder* recorder);

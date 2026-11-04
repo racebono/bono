@@ -56,6 +56,8 @@
     X(i64, track_grip_level, true)           /* as reported by the simulator */                           \
     X(i64, track_limits_steps_per_penalty, true)                                                          \
     X(i64, track_limits_steps_per_point, true)                                                            \
+    X(f64, pit_speed_limit, true) /* m/s; applies in the pit lane only */ \
+    X(f64, max_incident_points, true) /* points to a penalty or limit; see car_state.incident_points */ \
     X(string, pit_window_status, true)       /* the player's: disabled, closed, open, stopped, completed */   \
     X(i64, pit_window_start_lap, true)       /* the window, in laps-based sessions */                       \
     X(i64, pit_window_end_lap, true)                                                                      \
@@ -70,7 +72,13 @@
     X(string, vehicle, true)                                                                              \
     X(string, vehicle_class, true)                                                                        \
     X(string, team, true)                                                                                 \
+    X(string, car_number, true) /* text: 007 is not 7 */ \
+    X(f64, vehicle_width, true) /* meters; see the assumption where a simulator fills it */ \
+    X(f64, vehicle_length, true) \
+    X(string, front_tire_compound_name, true) /* the simulator's name, car-specific */ \
+    X(string, rear_tire_compound_name, true) \
     X(i64, position, true)                   /* overall, 1-based */                                       \
+    X(i64, class_position, true) /* within its class, 1-based: reported by the simulator, or calculated from position and vehicle_class */ \
     X(i64, qualifying_position, true)                                                                     \
     X(i64, laps_completed, true)                                                                          \
     X(i64, sector, true)                     /* zero-based, as in telemetry */                            \
@@ -82,6 +90,7 @@
     X(f64, last_sector_3, true)                                                                           \
     X(f64, best_lap_time, true)                                                                           \
     X(f64, best_lap_sector_1, true)          /* sector 1 of the best lap */                               \
+    X(f64, best_lap_sector_2, true) /* sector 2 alone of the best lap; LMU's source is cumulative, though its SDK doesn't say so */ \
     X(f64, best_sector_1, true)              /* best sector 1 of any lap */                               \
     X(f64, best_sectors_1_and_2, true)       /* best combined sectors 1 and 2 of any lap */               \
     X(f64, current_sector_1, true)           /* sector times of the lap in progress */                    \
@@ -135,6 +144,7 @@
     X(boolean, scored, true)                                                                              \
     X(boolean, headlights, true)                                                                          \
     X(boolean, drs_active, true)                                                                          \
+    X(boolean, push_to_pass_active, true) \
     X(i64, attack_mode, true)                /* as reported by the simulator */                           \
     X(f64, time_behind_leader, false)                                                                     \
     X(f64, time_behind_next, false)                                                                       \

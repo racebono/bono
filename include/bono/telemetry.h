@@ -43,7 +43,8 @@
     X(f64, position_x)                                                                                   \
     X(f64, position_y)                                                                                   \
     X(f64, position_z)                                                                                   \
-    X(f64, heading)                                                                                      \
+    X(f64, heading) /* radians the car body points: 0 along world -z, + turning right; see the schema guide for opponents */ \
+    X(f64, course) /* radians of the direction of travel, same convention; NULL below 1 m/s */ \
     X(f64, pitch)                                                                                        \
     X(f64, roll)                                                                                         \
     X(f64, speed)                                                                                        \
@@ -95,6 +96,8 @@
     X(boolean, traction_control_active)                                                                  \
     X(boolean, abs_active)                                                                               \
     X(boolean, speed_limiter_active)                                                                     \
+    X(f64, push_to_pass_active_time_left) /* seconds */ \
+    X(f64, push_to_pass_cooldown_left) /* seconds until it can be used again */ \
     /* Chassis and aerodynamics */                                                                       \
     X(f64, front_third_spring_deflection)                                                                \
     X(f64, rear_third_spring_deflection)                                                                 \
@@ -102,6 +105,7 @@
     X(f64, front_ride_height)                                                                            \
     X(f64, rear_ride_height)                                                                             \
     X(f64, drag)                            /* N */                                                      \
+    X(f64, total_downforce) /* N, whole car; never a front or rear component */ \
     X(f64, front_downforce)                 /* N */                                                      \
     X(f64, rear_downforce)                  /* N */                                                      \
     X(boolean, front_flap_active)                                                                        \
@@ -128,9 +132,30 @@
     X(boolean, speed_limiter_on)                                                                         \
     X(boolean, headlights)                                                                               \
     X(i64, wipers)                                                                                       \
-    X(i64, front_tire_compound)             /* index of the compound for this car */                     \
-    X(i64, rear_tire_compound)                                                                           \
     X(i64, scheduled_pit_stops)                                                                          \
+    X(f64, steering_wheel_range) /* physical; RaceRoom: degrees, full left to full right; LMU: unit and span not documented */ \
+    X(f64, engine_max_rpm) /* rev limit, not the best shift point */ \
+    X(i64, max_gears) /* forward gears */ \
+    /* The highest value of each control, which does not prove every step differs */ \
+    X(i64, traction_control_max) \
+    X(i64, traction_control_slip_max) \
+    X(i64, traction_control_cut_max) \
+    X(i64, abs_max) \
+    X(i64, engine_map_max) \
+    X(i64, brake_migration_max) \
+    X(i64, front_anti_roll_bar_max) \
+    X(i64, rear_anti_roll_bar_max) \
+    X(boolean, drs_equipped) /* fitted and allowed; engaged is rear_flap_active */ \
+    X(boolean, drs_available) /* an activation is left, not that it can be used right here */ \
+    X(i64, drs_activations_left) /* this lap; NULL when unlimited or unknown */ \
+    X(boolean, drs_activations_unlimited) \
+    X(i64, drs_activations_total) \
+    X(f64, incident_points) /* points against the limit, can be fractional. RaceRoom: its incident points. LMU: track-limit points, as it has no collision penalties */ \
+    X(boolean, push_to_pass_equipped) \
+    X(boolean, push_to_pass_charged) /* NULL on cars without a charge cycle; false while charging */ \
+    X(boolean, push_to_pass_engaged) \
+    X(i64, push_to_pass_activations_left) /* NULL when unlimited or unknown */ \
+    X(i64, push_to_pass_activations_total) \
     /* Fuel */                                                                                           \
     X(f64, fuel_capacity)                   /* liters */                                                 \
     X(f64, fuel_per_lap)                    /* liters, the simulator's own estimate */                   \
@@ -166,6 +191,7 @@
     X(f64, camber)                                                                                       \
     X(f64, toe)                                                                                          \
     X(f64, brake_temperature)                                                                            \
+    X(f64, brake_optimal_temperature) /* Celsius */ \
     X(f64, brake_pressure)                                                                               \
     /* Wheel and contact patch */                                                                        \
     X(f64, rotation_speed)                  /* rad/s */                                                 \
@@ -177,7 +203,7 @@
     X(f64, longitudinal_force)                                                                           \
     X(f64, tire_load)                                                                                    \
     X(f64, sliding_fraction)                /* fraction of the contact patch that is sliding */         \
-    X(i64, surface_type)                    /* 0 dry, 1 wet, 2 grass, 3 dirt, 4 gravel, 5 rumble strip, 6 special */ \
+    X(i64, surface_type)                    /* 0 dry (RaceRoom: paved, wetness unknown), 1 wet, 2 grass, 3 dirt, 4 gravel, 5 rumble strip, 6 special */ \
     /* Tire */                                                                                           \
     X(f64, tire_pressure)                                                                                \
     X(f64, tire_surface_temperature_left)                                                                \
@@ -190,7 +216,7 @@
     X(f64, tire_optimal_temperature)        /* unit as reported by the simulator */                     \
     X(f64, tire_wear)                       /* fraction worn */                                         \
     X(f64, tire_vertical_deflection)                                                                     \
-    X(i64, tire_compound)                                                                                \
+    X(i64, tire_compound) /* index of the compound for this car */ \
     X(i64, tire_compound_type)                                                                           \
     X(boolean, tire_flat)                                                                                \
     X(boolean, wheel_detached)
