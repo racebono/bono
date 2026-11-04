@@ -150,7 +150,6 @@
     X(i64, drs_activations_left) /* this lap; NULL when unlimited or unknown */ \
     X(boolean, drs_activations_unlimited) \
     X(i64, drs_activations_total) \
-    X(boolean, previous_lap_invalidated) /* reported by the simulator, or estimated from lap_invalidated; NULL when not known */ \
     X(boolean, push_to_pass_equipped) \
     X(boolean, push_to_pass_charged) /* NULL on cars without a charge cycle; false while charging */ \
     X(boolean, push_to_pass_engaged) \

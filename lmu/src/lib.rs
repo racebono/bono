@@ -18,13 +18,11 @@ use std::{
 mod car_numbers;
 mod class_positions;
 mod forecast;
-mod previous_laps;
 
 use car_numbers::CarNumbers;
-use previous_laps::PreviousLaps;
 
 /// What `bono_lmu_recorder*` points to.
-pub struct LmuRecorder(Recorder, Arc<CarNumbers>, PreviousLaps);
+pub struct LmuRecorder(Recorder, Arc<CarNumbers>);
 
 /// What the recorder's writer thread reads from the web API now and then.
 fn web_api(numbers: Arc<CarNumbers>) -> ForecastSource {
@@ -42,11 +40,7 @@ pub unsafe extern "C" fn bono_lmu_open(dir: *const u16, len: usize) -> *mut LmuR
     guard(std::ptr::null_mut(), || {
         let numbers = Arc::new(CarNumbers::default());
         match Recorder::new(dir, Some(web_api(numbers.clone()))) {
-            Ok(recorder) => Box::into_raw(Box::new(LmuRecorder(
-                recorder,
-                numbers,
-                PreviousLaps::default(),
-            ))),
+            Ok(recorder) => Box::into_raw(Box::new(LmuRecorder(recorder, numbers))),
             Err(_) => std::ptr::null_mut(),
         }
     })
@@ -56,7 +50,7 @@ pub unsafe extern "C" fn bono_lmu_open(dir: *const u16, len: usize) -> *mut LmuR
 /// `recorder` must come from `bono_lmu_open`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bono_lmu_restart(recorder: *mut LmuRecorder) {
-    let LmuRecorder(recorder, numbers, _) = unsafe { &mut *recorder };
+    let LmuRecorder(recorder, numbers) = unsafe { &mut *recorder };
     guard((), || {
         let _ = recorder.restart(Some(web_api(numbers.clone())));
     })
@@ -105,12 +99,9 @@ pub unsafe extern "C" fn bono_lmu_push_telemetry(
     recorder: *const LmuRecorder,
     telemetry: *const bono_telemetry,
 ) {
-    let LmuRecorder(recorder, _, previous_laps) = unsafe { &*recorder };
-    let mut telemetry = unsafe { *telemetry };
-    guard((), || {
-        previous_laps.fill(&mut telemetry);
-        recorder.push_telemetry(&telemetry)
-    })
+    let recorder = unsafe { &(*recorder).0 };
+    let telemetry = unsafe { &*telemetry };
+    guard((), || recorder.push_telemetry(telemetry))
 }
 
 /// # Safety
@@ -124,7 +115,7 @@ pub unsafe extern "C" fn bono_lmu_push_scoring(
     standings: *mut bono_standing,
     count: usize,
 ) {
-    let LmuRecorder(recorder, numbers, _) = unsafe { &*recorder };
+    let LmuRecorder(recorder, numbers) = unsafe { &*recorder };
     let session = std::mem::take(unsafe { &mut *session });
     let standings = match count {
         0 => Vec::new(),
@@ -145,11 +136,8 @@ pub unsafe extern "C" fn bono_lmu_push_scoring(
 /// `recorder` must come from `bono_lmu_open`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bono_lmu_clear(recorder: *const LmuRecorder) {
-    let LmuRecorder(recorder, _, previous_laps) = unsafe { &*recorder };
-    guard((), || {
-        previous_laps.clear();
-        recorder.clear()
-    })
+    let recorder = unsafe { &(*recorder).0 };
+    guard((), || recorder.clear())
 }
 
 /// # Safety

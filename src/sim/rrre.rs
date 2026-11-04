@@ -788,7 +788,6 @@ fn player_telemetry(shared: &r3e_shared, out: &mut bono_telemetry) {
         .map(|rps| rps * 60.0 / std::f64::consts::TAU)
         .into();
     state.max_gears = setting(shared.num_gears).into();
-    state.previous_lap_invalidated = flag(shared.prev_lap_valid).map(|valid| !valid).into();
     let drs = shared.drs;
     state.drs_equipped = flag(drs.equipped).into();
     state.drs_available = flag(drs.available).into();
@@ -2170,7 +2169,6 @@ mod tests {
         shared.drs_numActivationsTotal = 8;
         shared.tire_subtype_front = R3E_TIRE_SUBTYPE_SOFT;
         shared.tire_subtype_rear = -1;
-        shared.prev_lap_valid = 0;
         let mut brakes = shared.brake_temp;
         brakes[1].optimal_temp = 550.0;
         brakes[3].optimal_temp = -1.0;
@@ -2239,7 +2237,6 @@ mod tests {
         ] {
             assert_eq!(mine.wheels[wheel].tire_compound.get(), compound);
         }
-        assert_eq!(mine.state.previous_lap_invalidated.get(), Some(true));
         // The game doesn't report the range of any control
         assert_eq!(mine.state.traction_control_max.get(), None);
         assert_eq!(mine.state.abs_max.get(), None);
@@ -2284,7 +2281,6 @@ mod tests {
             engaged: -1,
         };
         shared.drs_numActivationsTotal = -1;
-        shared.prev_lap_valid = -1;
         // No system, and a system with endless uses
         shared.push_to_pass.available = -1;
         shared.push_to_pass.amount_left = i32::MAX - 2;
@@ -2299,7 +2295,6 @@ mod tests {
             .unwrap();
         assert_eq!(mine.state.steering_wheel_range.get(), None);
         assert_eq!(mine.state.drs_equipped.get(), None);
-        assert_eq!(mine.state.previous_lap_invalidated.get(), None);
         assert_eq!(mine.state.drs_available.get(), None);
         assert_eq!(mine.state.drs_activations_left.get(), None);
         assert_eq!(mine.state.drs_activations_unlimited.get(), Some(true));
