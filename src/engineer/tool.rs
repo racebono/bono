@@ -2471,8 +2471,6 @@ fn cmd_field(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Alerts (what changes what the pilot must do right now) and info (context, only when it bears
-/// on the question) from the scoring tables.
 /// How far over the pit speed limit (m/s) a car must be, for a limiter holding it at the limit.
 const PIT_SPEED_MARGIN: f64 = 0.5;
 
@@ -2583,6 +2581,8 @@ fn car_rules_and_condition(
     }
 }
 
+/// Alerts (what changes what the pilot must do right now) and info (context, only when it bears
+/// on the question) from the scoring tables.
 fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let sc = ctx.scoring()?;
     let (mut alerts, mut info) = (Vec::new(), Vec::new());
@@ -5047,6 +5047,69 @@ fn cmd_sql(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `car_rules_and_condition` says for a player row with these columns.
+    fn rules(columns: &str) -> (Vec<String>, Vec<String>) {
+        let conn = Connection::open_in_memory().unwrap();
+        let p = row(&conn, &format!("SELECT {columns}"), [])
+            .unwrap()
+            .unwrap();
+        let session = row(
+            &conn,
+            "SELECT 16.67 AS pit_speed_limit, NULL AS max_incident_points",
+            [],
+        )
+        .unwrap()
+        .unwrap();
+        let (mut alerts, mut info) = (Vec::new(), Vec::new());
+        car_rules_and_condition(
+            &p,
+            Some(&session),
+            None,
+            &BTreeMap::new(),
+            &mut alerts,
+            &mut info,
+        );
+        (alerts, info)
+    }
+
+    #[test]
+    fn pit_speed_alert_is_only_for_the_player_over_the_limit_in_the_pit_lane() {
+        let over = |columns: &str| {
+            rules(columns)
+                .0
+                .iter()
+                .any(|alert| alert.contains("PIT SPEED"))
+        };
+        assert!(over("1 AS is_player, 1 AS in_pit_lane, 20.0 AS speed"));
+        // A limiter holding the car at the limit
+        assert!(!over("1 AS is_player, 1 AS in_pit_lane, 17.0 AS speed"));
+        // Fast outside the pit lane, or another car
+        assert!(!over("1 AS is_player, 0 AS in_pit_lane, 80.0 AS speed"));
+        assert!(!over("0 AS is_player, 1 AS in_pit_lane, 20.0 AS speed"));
+        // The limit only comes up in the pit lane
+        assert!(rules("1 AS is_player, 0 AS in_pit_lane").1.is_empty());
+    }
+
+    #[test]
+    fn rules_say_nothing_about_what_is_zero_or_unknown() {
+        assert!(
+            rules("0 AS incident_points, 0 AS cut_track_warnings, NULL AS drs_equipped")
+                .1
+                .is_empty()
+        );
+        let (_, info) = rules("2 AS incident_points, 1 AS next_lap_invalidated");
+        assert!(info.contains(&"incident points 2".to_owned()), "{info:?}");
+        assert!(
+            info.iter().any(|line| line.contains("next lap")),
+            "{info:?}"
+        );
+        // Fitted, with nothing known about what's left: not "unavailable"
+        let (_, info) = rules("1 AS drs_equipped, NULL AS drs_available");
+        assert_eq!(info, ["DRS activations left: unknown"]);
+        let (_, info) = rules("1 AS drs_equipped, 0 AS drs_available");
+        assert_eq!(info, ["DRS activations left: none"]);
+    }
     use crate::sqlite::Database;
     use bono_sim::{
         recorder::{DATABASE, Recorder},

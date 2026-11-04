@@ -103,8 +103,8 @@ positions from telemetry.
   Skip all of these when choosing a lap to compare against. Incident points and track cuts are
   separate rule systems: never add them up or treat one as the other.
 - **`heading`** is where the car body points and **`course`** where it travels; they differ in a
-  slide and by half a turn when reversing. RaceRoom opponents only report motion, so their `heading`
-  is their last direction of travel. A RaceRoom player's stays at its last value below 1 m/s, is
+  slide and by half a turn when reversing. RaceRoom doesn't document the axes and signs of its orientation
+  angles, so bono doesn't use them and an opponent's `heading` is its last direction of travel. A RaceRoom player's stays at its last value below 1 m/s, is
   slightly out when a banked car slides, and is the last direction of travel until first known.
 - **Downforce**: `total_downforce` is the whole car. `front_downforce` and `rear_downforce` are
   NULL where the simulator doesn't split it (RaceRoom). In an older RaceRoom recording without a

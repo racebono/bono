@@ -662,7 +662,7 @@ impl Converter {
                 self.cars.insert(slot, Motion { x, z, heading });
             }
             out.heading = heading.into();
-            // Opponents only have how they moved
+            // How they moved: the axes and signs of their reported orientation aren't documented
             out.course = heading
                 .filter(|_| driver.car_speed > MIN_DIRECTION_SPEED as f32)
                 .into();
