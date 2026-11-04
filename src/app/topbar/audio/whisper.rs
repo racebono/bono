@@ -29,7 +29,10 @@ use std::{
     mem::MaybeUninit,
     num::{NonZero, NonZeroUsize},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::runtime::Handle;
@@ -573,6 +576,7 @@ impl Whisper {
                     Some(Arc::new(WhisperModel {
                         ctx,
                         session: SessionCache::default(),
+                        latest: AtomicU64::new(0),
                         threads,
                         gpu: GPU_BACKEND && gpu,
                     }))
@@ -670,6 +674,10 @@ impl<T: Send + 'static> DropInBackground<T> {
         Self(Some(value))
     }
 
+    fn as_ref(&self) -> &T {
+        self.0.as_ref().expect("taken only once")
+    }
+
     fn into_inner(mut self) -> T {
         self.0.take().expect("taken only once")
     }
@@ -685,6 +693,7 @@ impl<T: Send + 'static> Drop for DropInBackground<T> {
 struct WhisperModel {
     ctx: WhisperContext,
     session: SessionCache<WhisperSession>,
+    latest: AtomicU64,
     threads: NonZeroUsize,
     gpu: bool,
 }
@@ -712,8 +721,14 @@ impl<T> SessionCache<T> {
             *cached = Some(create()?);
         }
         let result = use_session(cached.as_mut().unwrap());
-        // Recovery after a partial library failure isn't guaranteed. Retry with a new state.
-        if result.is_err() {
+        // Retry after processing failures. Invalid UTF-8 is only a text conversion error,
+        // after inference succeeded, so the state remains reusable.
+        if result.as_ref().is_err_and(|error| {
+            !matches!(
+                error.downcast_ref::<whisper_rs::WhisperError>(),
+                Some(whisper_rs::WhisperError::InvalidUtf8 { .. })
+            )
+        }) {
             *cached = None;
         }
         result
@@ -738,6 +753,14 @@ impl PendingSession {
         mut stream: RecordingStream<Recorder>,
         config: Config,
     ) -> JoinHandle<anyhow::Result<Heard>> {
+        // Supersede queued workers even if capture shutdown below fails. Aborting a started
+        // blocking task alone cannot stop it from using the session.
+        let ticket = self
+            .0
+            .as_ref()
+            .latest
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         // Blocks the UI thread, briefly: sdl3's stream can't be sent to another thread (it holds
         // the `!Send` `AudioSubsystem`), and the callback must be done with before it's freed.
         // Pausing, flushing and locking each wait for at most one callback call; draining copies
@@ -782,6 +805,7 @@ impl PendingSession {
             }
             model.session.run(
                 || {
+                    anyhow::ensure!(model.latest.load(Ordering::Relaxed) == ticket, "Superseded recording");
                     let start = Instant::now();
                     let state = model.ctx.create_state()?;
                     log::debug!("Created whisper's state in {:?}", start.elapsed());
@@ -793,11 +817,17 @@ impl PendingSession {
                     })
                 },
                 |session| {
+                    if model.latest.load(Ordering::Relaxed) != ticket {
+                        return Ok(Heard::Nothing);
+                    }
                     let waited = start.elapsed();
                     let mel = Instant::now();
                     session.state.pcm_to_mel(&samples, session.threads.get())?;
                     let detect = Instant::now();
                     let spoken = session.detect_language(&voices, min_confidence)?;
+                    if model.latest.load(Ordering::Relaxed) != ticket {
+                        return Ok(Heard::Nothing);
+                    }
                     let transcribe = Instant::now();
                     // Something said in a language without a voice is still transcribed: if it's no
                     // words after all, it was noise
@@ -1435,6 +1465,28 @@ mod tests {
                 .is_err()
         );
         assert_eq!(cache.run(|| Ok(42), |state| Ok(*state)).unwrap(), 42);
+    }
+
+    #[test]
+    fn text_conversion_errors_retain_the_session() {
+        let cache = SessionCache::default();
+        let failed: anyhow::Result<()> = cache.run(
+            || Ok(42),
+            |_| {
+                let invalid = vec![0xff];
+                Err(
+                    whisper_rs::WhisperError::from(std::str::from_utf8(&invalid).unwrap_err())
+                        .into(),
+                )
+            },
+        );
+        assert!(failed.is_err());
+        assert_eq!(
+            cache
+                .run(|| panic!("healthy state retained"), |state| Ok(*state))
+                .unwrap(),
+            42
+        );
     }
 
     #[test]
