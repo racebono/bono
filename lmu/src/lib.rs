@@ -26,7 +26,10 @@ use track_limits::TrackLimits;
 /// What `bono_lmu_recorder*` points to.
 pub struct LmuRecorder(Recorder, Arc<CarNumbers>, TrackLimits);
 
-/// What the recorder's writer thread reads from the web API now and then.
+/// What the recorder's writer thread reads from the web API now and then. Closing the recorder waits
+/// for the writer on the game's thread, so a hung web API can hold the game's exit for both requests'
+/// timeouts, 6 s at most. They need the writer's own thread as nothing else should wait on them, and
+/// the wait only happens if the API stops answering just as the game closes.
 fn web_api(numbers: Arc<CarNumbers>) -> ForecastSource {
     Box::new(move |session_time| {
         numbers.refresh();
@@ -147,8 +150,9 @@ pub unsafe extern "C" fn bono_lmu_push_scoring(
 /// `recorder` must come from `bono_lmu_open`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bono_lmu_clear(recorder: *const LmuRecorder) {
-    let LmuRecorder(recorder, _, track_limits) = unsafe { &*recorder };
+    let LmuRecorder(recorder, numbers, track_limits) = unsafe { &*recorder };
     guard((), || {
+        numbers.clear();
         track_limits.clear();
         recorder.clear()
     })

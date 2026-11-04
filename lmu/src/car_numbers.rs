@@ -42,6 +42,14 @@ impl CarNumbers {
         self.update(&body);
     }
 
+    /// Forgets every car, for a new event.
+    pub fn clear(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
     fn update(&self, body: &str) {
         let cars = parse(body);
         if !cars.is_empty() {

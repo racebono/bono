@@ -2556,7 +2556,7 @@ fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
 /// A car's incident points against the limit, when it has any.
 fn incident_line(points: Option<f64>, max: Option<f64>) -> Option<String> {
     let points = points.filter(|points| *points > 0.0)?;
-    Some(match max {
+    Some(match max.filter(|max| *max > 0.0) {
         Some(max) => format!("incident points {points} of {max}"),
         None => format!("incident points {points}"),
     })
@@ -4970,6 +4970,10 @@ mod tests {
         assert_eq!(
             incident_line(Some(0.75), None).as_deref(),
             Some("incident points 0.75")
+        );
+        assert_eq!(
+            incident_line(Some(4.0), Some(0.0)).as_deref(),
+            Some("incident points 4")
         );
     }
 

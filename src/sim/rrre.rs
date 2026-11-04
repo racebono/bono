@@ -599,13 +599,12 @@ impl Converter {
         let event = (shared.track_id, shared.layout_id, shared.event_index);
         let new_event = self.event.is_some_and(|last| last != event);
         self.event = Some(event);
-        if new_event {
-            self.cars.clear();
-        }
         // Another session, or its clock went back (a restart): its laps start over
         let session = (shared.session_type, shared.session_iteration);
         if new_event || self.session != Some(session) || dt.is_none() {
             self.laps.clear();
+            // Cars are moved between sessions: that's not how they're heading
+            self.cars.clear();
             self.player_heading = None;
         }
         self.session = Some(session);
@@ -708,7 +707,7 @@ impl Converter {
 fn player_telemetry(shared: &r3e_shared, out: &mut bono_telemetry) {
     let player = shared.player;
 
-    // The player's own position and heading are exact
+    // The player's own position is exact
     let (position, velocity) = (player.position, player.velocity);
     out.position_x = Some(position.x).into();
     out.position_y = Some(position.y).into();
@@ -2154,6 +2153,34 @@ mod tests {
             .iter()
             .find(|t| t.vehicle_id.get() == Some(7));
         assert_eq!(mine.unwrap().heading.get(), None);
+    }
+
+    #[test]
+    fn a_new_session_forgets_how_cars_moved() {
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        let read = |converter: &mut Converter, time: f64, iteration: i32, z: f32| {
+            let mut shared = shared(time, z);
+            shared.session_iteration = iteration;
+            let mut player = shared.player;
+            player.velocity = vec3(0.0, 0.0);
+            player.local_velocity = vec3(0.0, 0.0);
+            shared.player = player;
+            let update = converter.convert(&shared, start).unwrap();
+            let heading = |slot| {
+                let car = update
+                    .telemetry
+                    .iter()
+                    .find(|t| t.vehicle_id.get() == Some(slot));
+                car.unwrap().heading.get()
+            };
+            (heading(7), heading(3))
+        };
+        read(&mut converter, 500.0, 1, 0.0);
+        // Moving within a session is a heading
+        assert_eq!(read(&mut converter, 500.5, 1, -5.0), (Some(0.0), Some(0.0)));
+        // Parked somewhere else for the next one isn't
+        assert_eq!(read(&mut converter, 501.0, 2, 100.0), (None, None));
     }
 
     #[test]

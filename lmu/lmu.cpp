@@ -115,14 +115,15 @@ static void convert(const TelemInfoV01& in, bono_telemetry_s& out) {
     out.state.abs = in.mABS;
     out.abs_active = in.mABSActive;
     out.state.engine_map = in.mMotorMap;
-    out.state.traction_control_max = in.mTCMax;
-    out.state.traction_control_slip_max = in.mTCSlipMax;
-    out.state.traction_control_cut_max = in.mTCCutMax;
-    out.state.abs_max = in.mABSMax;
-    out.state.engine_map_max = in.mMotorMapMax;
-    out.state.brake_migration_max = in.mMigrationMax;
-    out.state.front_anti_roll_bar_max = in.mFrontAntiSwayMax;
-    out.state.rear_anti_roll_bar_max = in.mRearAntiSwayMax;
+    // 0 is also what's reported for cars with no such control, or AI cars whose controls aren't known.
+    if (in.mTCMax > 0) out.state.traction_control_max = in.mTCMax;
+    if (in.mTCSlipMax > 0) out.state.traction_control_slip_max = in.mTCSlipMax;
+    if (in.mTCCutMax > 0) out.state.traction_control_cut_max = in.mTCCutMax;
+    if (in.mABSMax > 0) out.state.abs_max = in.mABSMax;
+    if (in.mMotorMapMax > 0) out.state.engine_map_max = in.mMotorMapMax;
+    if (in.mMigrationMax > 0) out.state.brake_migration_max = in.mMigrationMax;
+    if (in.mFrontAntiSwayMax > 0) out.state.front_anti_roll_bar_max = in.mFrontAntiSwayMax;
+    if (in.mRearAntiSwayMax > 0) out.state.rear_anti_roll_bar_max = in.mRearAntiSwayMax;
     if (in.mPhysicalSteeringWheelRange > 0) out.state.steering_wheel_range = in.mPhysicalSteeringWheelRange;
     if (in.mEngineMaxRPM > 0) out.state.engine_max_rpm = in.mEngineMaxRPM;
     out.state.max_gears = in.mMaxGears;
