@@ -669,13 +669,10 @@ impl Converter {
 
             if slot == player_slot {
                 player_telemetry(shared, &mut out);
-                let orientation = shared.car_orientation;
-                let level = orientation.pitch.abs() as f64 <= MAX_LEVEL_TILT
-                    && orientation.roll.abs() as f64 <= MAX_LEVEL_TILT;
                 if self.player_heading.is_some_and(|(car, _)| car != slot) {
                     self.player_heading = None;
                 }
-                if level && let Some(body) = body_heading(player.velocity, player.local_velocity) {
+                if let Some(body) = body_heading(player.velocity, player.local_velocity) {
                     self.player_heading = Some((slot, body));
                 }
                 // Before the body's known, how it moved is the best there is
@@ -1312,14 +1309,11 @@ fn endless(activations: i64) -> bool {
 /// Below this speed (m/s), a velocity's direction is noise.
 const MIN_DIRECTION_SPEED: f64 = 1.0;
 
-/// How far a car may pitch or roll (radians) for its velocity to tell where it points: the
-/// calculation below takes it as level, and is out by more the further it tilts while sliding.
-const MAX_LEVEL_TILT: f64 = 0.35;
-
 /// Where the car body points, from its velocity in the world and relative to itself: travel
 /// direction less the angle the car travels at relative to its nose. The game gives both vectors
 /// and the local axes, but not the axes and signs of its Euler angles. Takes the world as a
-/// rotation of those axes. `None` when it's too slow to tell.
+/// rotation of those axes about the vertical, so it's slightly out when a tilted car slides. `None`
+/// when it's too slow to tell.
 fn body_heading(world: r3e_vec3_f64, local: r3e_vec3_f64) -> Option<f64> {
     // Local axes: +x left, +z back
     let (forward, right) = (-local.z, -local.x);
@@ -2160,7 +2154,7 @@ mod tests {
         assert!(close(course.unwrap(), PI));
         assert_eq!(read(3.0, vec3(0.0, 0.0), vec3(0.0, 0.0)), (held, None));
 
-        // Steeply banked, it holds too; another car's data doesn't inherit it
+        // Turning while banked, the heading follows; another car's data doesn't inherit it
         let mut banked = shared(4.0, 0.0);
         let mut player = banked.player;
         player.velocity = vec3(-30.0, 0.0);
@@ -2178,14 +2172,20 @@ mod tests {
             .telemetry
             .iter()
             .find(|t| t.vehicle_id.get() == Some(7));
-        assert_eq!(mine.unwrap().heading.get(), Some(0.25));
+        assert!(close(mine.unwrap().heading.get().unwrap(), FRAC_PI_2));
+
+        let mut stopped = shared(4.0, 0.0);
+        let mut player = stopped.player;
+        player.velocity = vec3(0.0, 0.0);
+        player.local_velocity = vec3(0.0, 0.0);
+        stopped.player = player;
         let mut other = Converter {
             player_heading: Some((3, 0.25)),
             last_time: Some(3.0),
             session: Some((R3E_SESSION_RACE, 1)),
             ..Converter::default()
         };
-        let update = other.convert(&banked, start).unwrap();
+        let update = other.convert(&stopped, start).unwrap();
         let mine = update
             .telemetry
             .iter()
