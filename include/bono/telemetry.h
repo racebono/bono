@@ -189,7 +189,7 @@
     X(f64, longitudinal_force)                                                                           \
     X(f64, tire_load)                                                                                    \
     X(f64, sliding_fraction)                /* fraction of the contact patch that is sliding */         \
-    X(i64, surface_type)                    /* 0 dry, 1 wet, 2 grass, 3 dirt, 4 gravel, 5 rumble strip, 6 special */ \
+    X(i64, surface_type)                    /* 0 dry (RaceRoom: paved, wetness unknown), 1 wet, 2 grass, 3 dirt, 4 gravel, 5 rumble strip, 6 special */ \
     /* Tire */                                                                                           \
     X(f64, tire_pressure)                                                                                \
     X(f64, tire_surface_temperature_left)                                                                \

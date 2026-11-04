@@ -162,7 +162,7 @@ lateral + right, vertical + up. Pitch + nose up, yaw + turning right, roll + lea
 `lateral/longitudinal_patch_velocity`, `lateral/longitudinal_ground_velocity`,
 `lateral_force`, `longitudinal_force`, `tire_load` (N), `sliding_fraction` (share of the contact
 patch sliding - high values = tyre overworked), `surface_type` (0 dry, 1 wet, 2 grass, 3 dirt,
-4 gravel, 5 kerb, 6 special), `tire_pressure` (kPa), `tire_surface_temperature_left/center/right`,
+4 gravel, 5 kerb, 6 special; in RaceRoom 0 means paved with wetness unknown), `tire_pressure` (kPa), `tire_surface_temperature_left/center/right`,
 `tire_inner_temperature_left/center/right`, `tire_carcass_temperature`, `tire_optimal_temperature`,
 `tire_wear`, `tire_vertical_deflection`, `tire_compound`, `tire_compound_type`, `tire_flat`,
 `wheel_detached`.
