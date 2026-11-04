@@ -158,7 +158,7 @@ lateral + right, vertical + up. Pitch + nose up, yaw + turning right, roll + lea
 ## 4. Column guide - `telemetry_wheel`
 
 `suspension_deflection`, `suspension_force` (N), `ride_height`, `wheel_vertical_position`, `camber`,
-`toe` (rad), `brake_temperature` (C), `brake_pressure`, `rotation_speed` (rad/s),
+`toe` (rad), `brake_temperature` (C), `brake_optimal_temperature` (C; RaceRoom's player only for now, NULL on LMU), `brake_pressure`, `rotation_speed` (rad/s),
 `lateral/longitudinal_patch_velocity`, `lateral/longitudinal_ground_velocity`,
 `lateral_force`, `longitudinal_force`, `tire_load` (N), `sliding_fraction` (share of the contact
 patch sliding - high values = tyre overworked), `surface_type` (0 dry, 1 wet, 2 grass, 3 dirt,

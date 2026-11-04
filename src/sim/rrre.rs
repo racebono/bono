@@ -840,6 +840,10 @@ fn player_telemetry(shared: &r3e_shared, out: &mut bono_telemetry) {
         wheel.ride_height = Some(ride_height[i]).into();
         wheel.camber = Some(camber[i]).into();
         wheel.brake_temperature = non_negative(brake_temp[i].current_temp).into();
+        // The game only documents it for a car the player drives
+        if shared.control_type == R3E_CONTROL_PLAYER {
+            wheel.brake_optimal_temperature = positive(brake_temp[i].optimal_temp).into();
+        }
         wheel.rotation_speed = Some(rps[i] as f64).into();
         wheel.tire_load = non_negative(load[i]).into();
         wheel.surface_type = surface(material[i]).into();
@@ -2145,6 +2149,10 @@ mod tests {
         player.current_downforce = 5000.0;
         shared.player = player;
         shared.drs.engaged = 1;
+        let mut brakes = shared.brake_temp;
+        brakes[1].optimal_temp = 550.0;
+        brakes[3].optimal_temp = -1.0;
+        shared.brake_temp = brakes;
         shared.ptp_numActivationsTotal = -1;
         shared.push_to_pass = r3e_push_to_pass {
             available: 2,
@@ -2185,6 +2193,8 @@ mod tests {
         assert_eq!(mine.front_downforce.get(), None);
         assert_eq!(mine.rear_downforce.get(), None);
         assert_eq!(mine.rear_flap_active.get(), Some(true));
+        assert_eq!(mine.wheels[1].brake_optimal_temperature.get(), Some(550.0));
+        assert_eq!(mine.wheels[3].brake_optimal_temperature.get(), None);
         assert_eq!(mine.push_to_pass_cooldown_left.get(), Some(4.0));
         assert_eq!(mine.push_to_pass_active_time_left.get(), None);
         assert_eq!(mine.state.push_to_pass_equipped.get(), Some(true));
@@ -2243,6 +2253,7 @@ mod tests {
             .find(|t| t.vehicle_id.get() == Some(7))
             .unwrap();
         assert_eq!(mine.state.steering_wheel_range.get(), None);
+        assert_eq!(mine.wheels[1].brake_optimal_temperature.get(), None);
         assert_eq!(mine.state.push_to_pass_equipped.get(), None);
         assert_eq!(mine.state.push_to_pass_charged.get(), None);
         assert_eq!(mine.state.push_to_pass_activations_left.get(), None);

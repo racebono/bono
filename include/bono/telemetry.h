@@ -187,6 +187,7 @@
     X(f64, camber)                                                                                       \
     X(f64, toe)                                                                                          \
     X(f64, brake_temperature)                                                                            \
+    X(f64, brake_optimal_temperature) /* Celsius */ \
     X(f64, brake_pressure)                                                                               \
     /* Wheel and contact patch */                                                                        \
     X(f64, rotation_speed)                  /* rad/s */                                                 \
