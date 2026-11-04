@@ -142,7 +142,6 @@ static void convert(const TelemInfoV01& in, bono_telemetry_s& out) {
     out.front_ride_height = in.mFrontRideHeight;
     out.rear_ride_height = in.mRearRideHeight;
     out.drag = in.mDrag;
-    out.total_downforce = in.mFrontDownforce + in.mRearDownforce;
     out.front_downforce = in.mFrontDownforce;
     out.rear_downforce = in.mRearDownforce;
     out.front_flap_active = in.mFrontFlapActivated != 0;

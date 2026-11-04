@@ -104,8 +104,9 @@ positions from telemetry.
   orientation angles, so bono doesn't use them and an opponent's `heading` is its last direction of
   travel. A RaceRoom player's stays at its last value below 1 m/s, is slightly out when a banked car
   slides, and is the last direction of travel until first known.
-- **Downforce**: `total_downforce` is the whole car. `front_downforce` and `rear_downforce` are
-  NULL where the simulator doesn't split it (RaceRoom). In an older RaceRoom recording without a
+- **Downforce**: `total_downforce` is the whole car, RaceRoom only for now and NULL on LMU.
+  `front_downforce` and `rear_downforce` are NULL where the simulator doesn't split it (RaceRoom), and
+  a 0 from LMU means it isn't reported rather than no downforce. In an older RaceRoom recording without a
   `total_downforce` column, `front_downforce` holds the whole car's: never read it as the front axle.
 - **`engine_max_rpm`** is the rev limit, not the best shift point.
 - **`in_pit_lane`** covers the pit lane, which normally straddles the start/finish line, so both
