@@ -992,6 +992,10 @@ fn standing(
     out.car_number = setting(info.car_number)
         .map(|number| number.to_string())
         .into();
+    // Assumed to be meters: the API gives no unit, and one live session's car (1.78 by 4.13) only
+    // makes sense in meters. Whether the values differ between car models is still unconfirmed.
+    out.vehicle_width = positive(info.car_width).into();
+    out.vehicle_length = positive(info.car_length).into();
     out.front_tire_compound_name = compound_name(driver.tire_type_front, driver.tire_subtype_front)
         .map(str::to_owned)
         .into();
@@ -2156,6 +2160,10 @@ mod tests {
         drivers[0].ptp_state = 1;
         drivers[1].ptp_state = -1;
         drivers[0].driver_info.car_number = 44;
+        drivers[0].driver_info.car_width = 1.75;
+        drivers[0].driver_info.car_length = 4.5;
+        drivers[1].driver_info.car_width = -1.0;
+        drivers[1].driver_info.car_length = 0.0;
         drivers[1].driver_info.car_number = -1;
         shared.all_drivers_data_1 = drivers;
 
@@ -2191,11 +2199,15 @@ mod tests {
             .find(|s| s.vehicle_id.get() == Some(3))
             .unwrap();
         assert_eq!(theirs.car_number.as_deref(), Some("44"));
+        assert_eq!(theirs.vehicle_width.get(), Some(1.75));
+        assert_eq!(theirs.vehicle_length.get(), Some(4.5));
         let me = standings
             .iter()
             .find(|s| s.vehicle_id.get() == Some(7))
             .unwrap();
         assert_eq!(me.car_number.as_deref(), None);
+        assert_eq!(me.vehicle_width.get(), None);
+        assert_eq!(me.vehicle_length.get(), None);
         assert_eq!(me.push_to_pass_active.get(), None);
         assert_eq!(theirs.push_to_pass_active.get(), Some(true));
         assert_eq!(theirs.front_tire_compound_name.as_deref(), Some("soft"));

@@ -203,6 +203,7 @@ C = compared (a change adds a row); S = snapshot (stored with each row, never tr
 | `vehicle_id` C, `is_player` C | same id as `telemetry.vehicle_id` |
 | `driver` C, `vehicle` C, `vehicle_class` C, `team` C | names as the game shows them; several classes = multiclass race |
 | `car_number` C | race number as text (`007` is not `7`); in LMU it comes from the game's web API, so it can be NULL for up to about 30 s after a car appears |
+| `vehicle_width` C, `vehicle_length` C | meters, RaceRoom only for now; its API gives no unit, so meters is an assumption, and differences between car models are unconfirmed |
 | `front_tire_compound_name` C, `rear_tire_compound_name` C | the simulator's compound name, opponents too where reported |
 | `position` C (overall, 1-based), `qualifying_position` C | class position = rank by `position` among cars of the same `vehicle_class` |
 | `laps_completed` C, `sector` C (0-based) | |
