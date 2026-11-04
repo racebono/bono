@@ -147,6 +147,11 @@
     X(i64, brake_migration_max) \
     X(i64, front_anti_roll_bar_max) \
     X(i64, rear_anti_roll_bar_max) \
+    X(boolean, drs_equipped) /* fitted and allowed; engaged is rear_flap_active */ \
+    X(boolean, drs_available) /* an activation is left, not that it can be used right here */ \
+    X(i64, drs_activations_left) /* this lap; NULL when unlimited or unknown */ \
+    X(boolean, drs_activations_unlimited) \
+    X(i64, drs_activations_total) \
     X(boolean, push_to_pass_equipped) \
     X(boolean, push_to_pass_charged) /* NULL on cars without a charge cycle; false while charging */ \
     X(boolean, push_to_pass_engaged) \

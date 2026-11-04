@@ -788,6 +788,15 @@ fn player_telemetry(shared: &r3e_shared, out: &mut bono_telemetry) {
         .map(|rps| rps * 60.0 / std::f64::consts::TAU)
         .into();
     state.max_gears = setting(shared.num_gears).into();
+    let drs = shared.drs;
+    state.drs_equipped = flag(drs.equipped).into();
+    state.drs_available = flag(drs.available).into();
+    // Endless activations start at the largest int and may count down from there
+    let drs_left = setting(drs.numActivationsLeft);
+    let endless = |left: i64| left >= i32::MAX as i64 / 2;
+    state.drs_activations_left = drs_left.filter(|left| !endless(*left)).into();
+    state.drs_activations_unlimited = drs_left.map(endless).into();
+    state.drs_activations_total = setting(shared.drs_numActivationsTotal).into();
     // Exists (1), or for some systems charging (2) or charged (3)
     state.push_to_pass_equipped = flag(ptp.available).into();
     state.push_to_pass_charged = match ptp.available {
@@ -2148,7 +2157,13 @@ mod tests {
         let mut player = shared.player;
         player.current_downforce = 5000.0;
         shared.player = player;
-        shared.drs.engaged = 1;
+        shared.drs = r3e_drs {
+            equipped: 1,
+            available: 0,
+            numActivationsLeft: 2,
+            engaged: 1,
+        };
+        shared.drs_numActivationsTotal = 8;
         let mut brakes = shared.brake_temp;
         brakes[1].optimal_temp = 550.0;
         brakes[3].optimal_temp = -1.0;
@@ -2193,6 +2208,11 @@ mod tests {
         assert_eq!(mine.front_downforce.get(), None);
         assert_eq!(mine.rear_downforce.get(), None);
         assert_eq!(mine.rear_flap_active.get(), Some(true));
+        assert_eq!(mine.state.drs_equipped.get(), Some(true));
+        assert_eq!(mine.state.drs_available.get(), Some(false));
+        assert_eq!(mine.state.drs_activations_left.get(), Some(2));
+        assert_eq!(mine.state.drs_activations_unlimited.get(), Some(false));
+        assert_eq!(mine.state.drs_activations_total.get(), Some(8));
         assert_eq!(mine.wheels[1].brake_optimal_temperature.get(), Some(550.0));
         assert_eq!(mine.wheels[3].brake_optimal_temperature.get(), None);
         assert_eq!(mine.push_to_pass_cooldown_left.get(), Some(4.0));
@@ -2240,6 +2260,14 @@ mod tests {
         // Not the player's car: the range isn't documented for it
         shared.control_type = R3E_CONTROL_AI;
         shared.session_pit_speed_limit = -1.0;
+        // Endless activations, counted down a little, and nothing else known
+        shared.drs = r3e_drs {
+            equipped: -1,
+            available: -1,
+            numActivationsLeft: i32::MAX - 2,
+            engaged: -1,
+        };
+        shared.drs_numActivationsTotal = -1;
         // No system, and a system with endless uses
         shared.push_to_pass.available = -1;
         shared.push_to_pass.amount_left = i32::MAX - 2;
@@ -2253,6 +2281,11 @@ mod tests {
             .find(|t| t.vehicle_id.get() == Some(7))
             .unwrap();
         assert_eq!(mine.state.steering_wheel_range.get(), None);
+        assert_eq!(mine.state.drs_equipped.get(), None);
+        assert_eq!(mine.state.drs_available.get(), None);
+        assert_eq!(mine.state.drs_activations_left.get(), None);
+        assert_eq!(mine.state.drs_activations_unlimited.get(), Some(true));
+        assert_eq!(mine.state.drs_activations_total.get(), None);
         assert_eq!(mine.wheels[1].brake_optimal_temperature.get(), None);
         assert_eq!(mine.state.push_to_pass_equipped.get(), None);
         assert_eq!(mine.state.push_to_pass_charged.get(), None);
