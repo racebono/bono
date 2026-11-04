@@ -1753,32 +1753,56 @@ fn race_need(
     frac: f64,
     avg_time: Option<f64>,
 ) -> anyhow::Result<(Option<f64>, String)> {
-    if let Some(left) = args.race_laps_left {
-        return Ok((
-            Some((left - frac).max(0.0)),
-            format!("pilot says {} laps left incl. this one", g(left)),
-        ));
-    }
-
     let sc = ctx.scoring()?;
     let s = sc.session.as_ref();
-    let now = ctx.player.f("session_time").unwrap_or(0.0);
-    if s.is_none() && args.race_time_left.is_none() {
+    if let Some(left) = args.race_laps_left
+        && (!left.is_finite() || left < 0.0)
+    {
+        bail!("race_laps_left must be finite and nonnegative, got {left}");
+    }
+    if let Some(t) = args.race_time_left
+        && !(t.is_finite() && (0.0..=MAX_RACE_TIME_LEFT).contains(&t))
+    {
+        bail!("race_time_left must be between 0 and {MAX_RACE_TIME_LEFT} seconds, got {t}");
+    }
+    let kind = s.and_then(|s| s.text("session_type"));
+    if !matches!(
+        kind,
+        Some("race" | "practice" | "qualifying" | "warmup" | "test")
+    ) {
+        return Ok((None, "session type unknown: cannot distinguish remaining-race distance from a future race plan".into()));
+    }
+    // An explicit race length outside a race plans a new race from its start.
+    // The current run's lap progress, leader phase and lap cap do not belong to it.
+    let future_race = kind != Some("race");
+    if let Some(left) = args.race_laps_left {
         return Ok((
-            None,
-            "unknown (no session data): ask the pilot or pass race_laps_left / race_time_left"
-                .into(),
+            Some((left - if future_race { 0.0 } else { frac }).max(0.0)),
+            if future_race {
+                format!(
+                    "pilot says {} laps for a future race, from its start",
+                    g(left)
+                )
+            } else {
+                format!("pilot says {} laps left incl. this one", g(left))
+            },
         ));
     }
 
-    let note = s
-        .and_then(|s| s.text("session_type"))
-        .filter(|kind| *kind != "race" && args.race_time_left.is_none())
-        .map(|kind| format!("this is {kind}, not a race"));
+    let now = ctx.player.f("session_time").unwrap_or(0.0);
+    let is_race = !future_race;
+    if !is_race && args.race_time_left.is_none() {
+        return Ok((
+            None,
+            "not a race session: ask the pilot for race_laps_left / race_time_left".into(),
+        ));
+    }
 
     let mut needs = Vec::<(f64, String)>::new();
     if let (Some(max_laps), Some(me)) = (
-        s.and_then(|s| s.i("max_laps")).filter(|n| *n != 0),
+        s.filter(|_| is_race)
+            .and_then(|s| s.i("max_laps"))
+            .filter(|n| *n > 0),
         &sc.player,
     ) && let Some(completed) = me.i("laps_completed")
     {
@@ -1787,10 +1811,27 @@ fn race_need(
         needs.push((n.max(0.0), format!("{max_laps} lap race")));
     }
 
-    if let Some(t) = args.race_time_left
-        && !(t.is_finite() && (0.0..=MAX_RACE_TIME_LEFT).contains(&t))
-    {
-        bail!("race_time_left must be between 0 and {MAX_RACE_TIME_LEFT} seconds, got {t}");
+    if future_race && let Some(duration) = args.race_time_left {
+        let Some(avg) = avg_time.filter(|t| t.is_finite() && *t > 0.0) else {
+            return Ok((
+                None,
+                "future race: no measured lap time to project its duration".into(),
+            ));
+        };
+        // Planning assumption: run full laps at the measured pace, finishing at the
+        // first crossing after time expires. No current-run leader timing is used.
+        let laps = if duration > 0.0 {
+            (duration / avg).floor() + 1.0
+        } else {
+            0.0
+        };
+        return Ok((
+            Some(laps),
+            format!(
+                "{} future race (pilot), from its start at measured pace, including the finish crossing after time expires; future leader pace unknown",
+                clock(duration)
+            ),
+        ));
     }
     let time_left = args
         .race_time_left
@@ -1846,15 +1887,66 @@ fn race_need(
     else {
         return Ok((
             None,
-            note.unwrap_or_else(|| {
-                "unknown: ask the pilot or pass race_laps_left / race_time_left".into()
-            }),
+            "unknown: ask the pilot or pass race_laps_left / race_time_left".into(),
         ));
     };
-    let note = note
-        .map(|note| format!("; NOTE {note}"))
-        .unwrap_or_default();
-    Ok((Some(need), format!("{source}{note}")))
+    Ok((Some(need), source))
+}
+
+/// Fuel for the remaining distance, using measured consumption only. Tank space and
+/// virtual energy are separate constraints; extra fuel does not replenish virtual energy.
+fn fuel_conclusion(
+    out: &mut String,
+    need: f64,
+    fuel_use: Option<f64>,
+    fuel: Option<f64>,
+    capacity: Option<f64>,
+    ve_laps: Option<f64>,
+) {
+    let valid = |v: &f64| v.is_finite() && *v >= 0.0;
+    let Some(per_lap) = fuel_use.filter(|v| v.is_finite() && *v > 0.0) else {
+        say!(
+            out,
+            "fuel needed: unknown (no measured consumption); litres to add: unknown"
+        );
+        return;
+    };
+    let required = need * per_lap;
+    say!(
+        out,
+        "fuel needed to finish: {required:.2} L at measured {per_lap:.2} L/lap (no safety margin)"
+    );
+    if let Some(fuel) = fuel.filter(valid) {
+        let add = (required - fuel).max(0.0);
+        say!(out, "litres to add: {add:.2} L (current fuel {fuel:.2} L)");
+    } else {
+        say!(out, "litres to add: unknown (current fuel unavailable)");
+    }
+    if let Some(capacity) = capacity.filter(|v| v.is_finite() && *v > 0.0) {
+        if required > capacity {
+            say!(
+                out,
+                "tank capacity: {capacity:.2} L; required fuel exceeds one tank by {:.2} L: refuelling stop needed at this consumption",
+                required - capacity
+            );
+        } else {
+            say!(
+                out,
+                "tank capacity: {capacity:.2} L; required fuel fits in one tank"
+            );
+        }
+    } else {
+        say!(
+            out,
+            "tank capacity: unknown; cannot confirm required fuel fits"
+        );
+    }
+    if ve_laps.is_some_and(|range| range < need) {
+        say!(
+            out,
+            "virtual-energy limit: insufficient to finish at measured consumption; adding fuel alone does not resolve this limit"
+        );
+    }
 }
 
 fn cmd_stint(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Result<()> {
@@ -1923,7 +2015,10 @@ fn cmd_stint(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
                        per_lap: Option<f64>,
                        as_pct: bool|
      -> Option<f64> {
-        let (Some(now), Some(per_lap)) = (now, per_lap.filter(|p| *p != 0.0)) else {
+        let (Some(now), Some(per_lap)) = (
+            now.filter(|v| v.is_finite() && *v >= 0.0),
+            per_lap.filter(|v| v.is_finite() && *v > 0.0),
+        ) else {
             say!(out, "{name}: no data");
             return None;
         };
@@ -1949,19 +2044,19 @@ fn cmd_stint(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
         green
             .iter()
             .filter_map(|l| l.ve_used)
-            .filter(|v| *v > 0.0)
+            .filter(|v| v.is_finite() && *v > 0.0)
             .collect(),
     );
     let fuel_use = average(
         green
             .iter()
             .filter_map(|l| l.fuel_used)
-            .filter(|v| *v > 0.0)
+            .filter(|v| v.is_finite() && *v > 0.0)
             .collect(),
     );
     let ve = p.f("virtual_energy");
     let ve_laps = match ve {
-        Some(ve) if ve != 0.0 => project("virtual energy", Some(ve), ve_use, ve <= 1.0),
+        Some(ve) => project("virtual energy", Some(ve), ve_use, ve <= 1.0),
         _ => None,
     };
     let fuel_laps = project("fuel", p.f("fuel"), fuel_use, false);
@@ -1993,11 +2088,32 @@ fn cmd_stint(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
             // Lap N spans [N, N + 1), so reaching N completes lap N - 1.
             (lap_now.unwrap_or(0) as f64 + frac + lim).floor() as i64 - 1
         );
-        match race_need(ctx, args, frac, avg_time)? {
-            (None, source) => {
-                say!(out, "race length: {source}");
-            }
-            (Some(need), source) => {
+    }
+    match race_need(ctx, args, frac, avg_time)? {
+        (None, source) => {
+            say!(out, "race length: {source}");
+        }
+        (Some(need), source) => {
+            let planning = ctx
+                .scoring()?
+                .session
+                .as_ref()
+                .and_then(|s| s.text("session_type"))
+                .is_some_and(|kind| kind != "race");
+            fuel_conclusion(
+                out,
+                need,
+                fuel_use,
+                p.f("fuel"),
+                p.f("fuel_capacity"),
+                if planning { None } else { ve_laps },
+            );
+            if planning {
+                say!(
+                    out,
+                    "race plan: {source} -> {need:.1} full laps from the planned start; litres to add compares against the current tank, future starting virtual energy unknown"
+                );
+            } else if let Some((_, lim)) = limit {
                 let margin = lim - need;
                 let short = match margin >= 0.0 {
                     true => String::new(),
@@ -2009,6 +2125,11 @@ fn cmd_stint(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resul
                 say!(
                     out,
                     "race: {source} -> you need {need:.1} laps incl. the rest of this one, margin {margin:+.2} laps{short}"
+                );
+            } else {
+                say!(
+                    out,
+                    "race: {source} -> you need {need:.1} laps incl. the rest of this one; range unknown"
                 );
             }
         }
@@ -2339,17 +2460,69 @@ fn cmd_nearby(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Resu
     Ok(())
 }
 
+/// Compare official gaps to their common leader. Never turn a lap deficit into
+/// seconds or substitute zero for missing scoring data.
+fn gap_to_player(car: &Row, player: Option<&Row>) -> String {
+    let Some(player) = player else {
+        return "unknown".into();
+    };
+    if car.i("vehicle_id").is_some() && car.i("vehicle_id") == player.i("vehicle_id") {
+        return "YOU".into();
+    }
+    let laps_down = |r: &Row| {
+        if r.i("position") == Some(1) {
+            Some(0)
+        } else {
+            r.i("laps_behind_leader").filter(|n| *n >= 0)
+        }
+    };
+    let (Some(car_laps), Some(player_laps)) = (laps_down(car), laps_down(player)) else {
+        return "unknown".into();
+    };
+    let delta = i128::from(car_laps) - i128::from(player_laps);
+    if delta != 0 {
+        return format!(
+            "{} lap(s) {}",
+            delta.abs(),
+            if delta < 0 { "ahead" } else { "behind" }
+        );
+    }
+    let time_down = |r: &Row| {
+        if r.i("position") == Some(1) {
+            Some(0.0)
+        } else {
+            r.f("time_behind_leader")
+                .filter(|t| t.is_finite() && *t >= 0.0)
+        }
+    };
+    match time_down(car).zip(time_down(player)) {
+        Some((car, player)) => {
+            let delta = car - player;
+            if delta == 0.0 {
+                "level (0.0s)".into()
+            } else {
+                format!(
+                    "{:.1}s {}",
+                    delta.abs(),
+                    if delta < 0.0 { "ahead" } else { "behind" }
+                )
+            }
+        }
+        None => "unknown".into(),
+    }
+}
+
 fn cmd_field(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     let sc = ctx.scoring()?;
     let frame = ctx.frame()?;
     if !sc.cars.is_empty() {
         say!(
             out,
-            "FIELD (official standings; gaps are from each car's last scoring row, up to a sector old)"
+            "FIELD (official standings; gaps use each car's last scoring row and may be stale; gap->YOU compares gaps to the leader, not physical track distance)"
         );
         say!(
             out,
-            " P  cls  car  driver               class        laps  last lap   best lap   gap->next  pits pen  status"
+            " P  cls  car  driver               class        laps  last lap   best lap   gap->next          gap->YOU  pits pen  status"
         );
         for r in sc.order() {
             let vehicle = r.i("vehicle_id").unwrap_or(-1);
@@ -2382,13 +2555,14 @@ fn cmd_field(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
             } else {
                 ""
             };
+            let player_gap = gap_to_player(r, sc.cars.get(&ctx.vehicle));
             let status = match status.is_empty() {
                 true => "on track".into(),
                 false => status.join(", "),
             };
             say!(
                 out,
-                "{:>2}  {:>3}  {vehicle:>3}  {:<20} {:<12} {:>4}  {:>9}  {:>9}  {gap:>9}  {:>4} {:>3}  {status}{tag}",
+                "{:>2}  {:>3}  {vehicle:>3}  {:<20} {:<12} {:>4}  {:>9}  {:>9}  {gap:>9}  {player_gap:>16}  {:>4} {:>3}  {status}{tag}",
                 r.i("position").map_or("?".into(), |p| p.to_string()),
                 sc.class_position(r).map_or("-".into(), |p| p.to_string()),
                 telemetry_text(r.text("driver").unwrap_or("-")),
@@ -4592,7 +4766,7 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
 
     say!(
         out,
-        "QUICK lap {} S{} | delta {}{} | {}/{} | gap ahead {}s ({}) behind {}s ({}){}",
+        "QUICK lap {} S{} | delta {}{} | {}/{} | gap ahead {}s ({}) behind {}s ({}){} | player session_time {}s",
         int(p.i("lap")),
         p.i("sector").unwrap_or(0) + 1,
         fmt(p.f("delta_best"), 2, "s"),
@@ -4611,7 +4785,8 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
             " | data {age:.0}s old{}",
             if age > 10.0 { " STALE" } else { "" }
         ))
-        .unwrap_or_default()
+        .unwrap_or_default(),
+        fmt(now, 1, "")
     );
     if let Some(line) = sc.session_line(now) {
         say!(out, "SESSION {line}");
@@ -5229,6 +5404,18 @@ mod tests {
     async fn every_question_attaches_the_exact_quick_output() {
         let (_dir, engineer) = race();
         let quick = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        let conn = Connection::open(engineer.inner.path.clone()).unwrap();
+        let anchor = conn
+            .query_row(
+                "SELECT session_time FROM telemetry WHERE is_player = 1 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, f64>(0),
+            )
+            .unwrap();
+        assert!(
+            quick.contains(&format!("player session_time {anchor:.1}s")),
+            "{quick}"
+        );
         // Include non-urgent questions: deciding which extra tools are needed belongs
         // to the model, not a keyword filter that might omit useful current context.
         for question in ["Car right?", "Compare my last three laps", "Hello!\nTyres?"] {
@@ -5759,6 +5946,237 @@ mod tests {
     }
 
     #[test]
+    fn stint_reports_measured_fuel_and_independent_limits() {
+        let (_dir, engineer) = race();
+        let conn = Connection::open(engineer.inner.path.clone()).unwrap();
+        let mut ctx = Ctx::new(&conn, &engineer.inner, None).unwrap();
+        for (name, value) in [
+            ("lap_start_time", 310.0),
+            ("fuel", 5.0),
+            ("fuel_capacity", 15.0),
+            ("fuel_per_lap", 9.0), // Game estimate must not replace measured 2 L/lap.
+            ("virtual_energy", 0.15),
+        ] {
+            let index = ctx.player.columns[name];
+            ctx.player.values[index] = Value::Real(value);
+        }
+        let mut args = EngineerInput::command(Command::Stint);
+        args.race_laps_left = Some(10.0);
+        let mut out = String::new();
+        cmd_stint(&ctx, &args, &mut out).unwrap();
+        assert!(
+            out.contains(
+                "fuel needed to finish: 20.00 L at measured 2.00 L/lap (no safety margin)"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("litres to add: 15.00 L (current fuel 5.00 L)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("required fuel exceeds one tank by 5.00 L"),
+            "{out}"
+        );
+        assert!(
+            out.contains("adding fuel alone does not resolve this limit"),
+            "{out}"
+        );
+        let index = ctx.player.columns["virtual_energy"];
+        ctx.player.values[index] = Value::Real(0.0);
+        let mut out = String::new();
+        cmd_stint(&ctx, &args, &mut out).unwrap();
+        assert!(out.contains("LIMIT: virtual energy - 0.0 laps"), "{out}");
+
+        let mut out = String::new();
+        fuel_conclusion(
+            &mut out,
+            10.0,
+            Some(2.0),
+            Some(25.0),
+            Some(60.0),
+            Some(12.0),
+        );
+        assert!(out.contains("litres to add: 0.00 L"), "{out}");
+        assert!(out.contains("required fuel fits in one tank"), "{out}");
+        assert!(!out.contains("virtual-energy limit:"), "{out}");
+        let mut out = String::new();
+        fuel_conclusion(&mut out, 10.0, None, Some(5.0), Some(60.0), None);
+        assert!(out.contains("no measured consumption"), "{out}");
+        assert!(out.contains("litres to add: unknown"), "{out}");
+        let mut out = String::new();
+        fuel_conclusion(&mut out, 10.0, Some(2.0), None, None, None);
+        assert!(out.contains("current fuel unavailable"), "{out}");
+        assert!(out.contains("tank capacity: unknown"), "{out}");
+    }
+
+    #[test]
+    fn nonrace_stint_requires_explicit_race_length() {
+        let (_dir, engineer) = race();
+        let conn = Connection::open(engineer.inner.path.clone()).unwrap();
+        for kind in ["practice", "qualifying"] {
+            // Even a populated lap cap/clock belongs to this session, not a future race.
+            conn.execute("UPDATE session SET session_type = ?, max_laps = 1", [kind])
+                .unwrap();
+            let ctx = Ctx::new(&conn, &engineer.inner, None).unwrap();
+            let mut args = EngineerInput::command(Command::Stint);
+            let mut out = String::new();
+            cmd_stint(&ctx, &args, &mut out).unwrap();
+            assert!(out.contains("race length: not a race session"), "{out}");
+            assert!(!out.contains("race:"), "{out}");
+            assert!(!out.contains("fuel needed to finish:"), "{out}");
+            assert!(!out.contains("SHORT:"), "{out}");
+
+            args.race_laps_left = Some(10.0);
+            let (need, source) = race_need(&ctx, &args, 0.1, Some(100.0)).unwrap();
+            assert_eq!(need, Some(10.0));
+            assert!(source.contains("pilot says"), "{source}");
+            args.race_laps_left = None;
+            args.race_time_left = Some(500.0);
+            let (need, source) = race_need(&ctx, &args, 0.1, Some(100.0)).unwrap();
+            assert_eq!(need, Some(6.0));
+            assert!(source.contains("(pilot)"), "{source}");
+        }
+        conn.execute(
+            "UPDATE session SET session_type = 'race', max_laps = 10",
+            [],
+        )
+        .unwrap();
+        let ctx = Ctx::new(&conn, &engineer.inner, None).unwrap();
+        let (need, source) = race_need(
+            &ctx,
+            &EngineerInput::command(Command::Stint),
+            0.1,
+            Some(100.0),
+        )
+        .unwrap();
+        assert_eq!(need, Some(6.9));
+        assert_eq!(source, "10 lap race");
+    }
+
+    #[test]
+    fn future_race_plan_ignores_current_run_and_leader_progress() {
+        let (_dir, engineer) = race();
+        let conn = Connection::open(engineer.inner.path.clone()).unwrap();
+        let mut args = EngineerInput::command(Command::Stint);
+        for kind in ["practice", "qualifying"] {
+            conn.execute("UPDATE session SET session_type = ?, max_laps = 1", [kind])
+                .unwrap();
+            for progress in [0.0, 0.25, 0.9] {
+                // Leader phase and pace belong to the present run, not the future race.
+                conn.execute(
+                    "UPDATE standings SET position = 1, last_lap_time = 37 WHERE vehicle_id = 2",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE telemetry SET lap_start_time = 293 WHERE vehicle_id = 2",
+                    [],
+                )
+                .unwrap();
+                let ctx = Ctx::new(&conn, &engineer.inner, None).unwrap();
+                args.race_time_left = Some(500.0);
+                let (need, source) = race_need(&ctx, &args, progress, Some(100.0)).unwrap();
+                assert_eq!(need, Some(6.0));
+                assert!(source.contains("future race"), "{source}");
+                args.race_time_left = Some(499.0);
+                assert_eq!(
+                    race_need(&ctx, &args, progress, Some(100.0)).unwrap().0,
+                    Some(5.0)
+                );
+                assert_eq!(race_need(&ctx, &args, progress, None).unwrap().0, None);
+                args.race_time_left = None;
+                args.race_laps_left = Some(10.0);
+                assert_eq!(
+                    race_need(&ctx, &args, progress, Some(100.0)).unwrap().0,
+                    Some(10.0)
+                );
+                args.race_laps_left = None;
+            }
+            args.race_time_left = Some(500.0);
+            let ctx = Ctx::new(&conn, &engineer.inner, None).unwrap();
+            let mut out = String::new();
+            cmd_stint(&ctx, &args, &mut out).unwrap();
+            assert!(out.contains("race plan:"), "{out}");
+            assert!(!out.contains("SHORT:"), "{out}");
+            assert!(!out.contains("incl. the rest of this one"), "{out}");
+            assert!(!out.contains("virtual-energy limit:"), "{out}");
+        }
+    }
+
+    #[test]
+    fn race_plan_preserves_uncertainty_without_session_type() {
+        let (_dir, engineer) = race();
+        let conn = Connection::open(engineer.inner.path.clone()).unwrap();
+        for kind in [None, Some("unknown")] {
+            conn.execute("UPDATE session SET session_type = ?", [kind])
+                .unwrap();
+            let ctx = Ctx::new(&conn, &engineer.inner, None).unwrap();
+            for progress in [0.0, 0.5, 0.9] {
+                for (laps, duration) in [(Some(10.0), None), (None, Some(500.0))] {
+                    let mut args = EngineerInput::command(Command::Stint);
+                    args.race_laps_left = laps;
+                    args.race_time_left = duration;
+                    let (need, source) = race_need(&ctx, &args, progress, Some(100.0)).unwrap();
+                    assert_eq!(need, None);
+                    assert!(source.contains("session type unknown"), "{source}");
+                }
+            }
+        }
+        conn.execute("DELETE FROM session", []).unwrap();
+        let ctx = Ctx::new(&conn, &engineer.inner, None).unwrap();
+        let mut args = EngineerInput::command(Command::Stint);
+        args.race_laps_left = Some(10.0);
+        assert_eq!(race_need(&ctx, &args, 0.5, Some(100.0)).unwrap().0, None);
+        args.race_laps_left = None;
+        args.race_time_left = Some(500.0);
+        assert_eq!(race_need(&ctx, &args, 0.5, Some(100.0)).unwrap().0, None);
+    }
+
+    #[test]
+    fn field_gaps_are_relative_to_player_and_preserve_unknowns() {
+        let conn = Connection::open_in_memory().unwrap();
+        let standing = |vehicle: i64, position: i64, laps: Option<i64>, time: Option<f64>| {
+            row(&conn, "SELECT ? AS vehicle_id, ? AS position, ? AS laps_behind_leader, ? AS time_behind_leader", params![vehicle, position, laps, time]).unwrap().unwrap()
+        };
+        let player = standing(2, 2, Some(0), Some(12.0));
+        assert_eq!(gap_to_player(&player, Some(&player)), "YOU");
+        let leader = standing(1, 1, None, None);
+        assert_eq!(gap_to_player(&leader, Some(&player)), "12.0s ahead");
+        let behind = standing(3, 3, Some(0), Some(15.5));
+        assert_eq!(gap_to_player(&behind, Some(&player)), "3.5s behind");
+        assert_eq!(gap_to_player(&player, Some(&behind)), "3.5s ahead");
+        let lapped = standing(4, 4, Some(2), None);
+        assert_eq!(gap_to_player(&lapped, Some(&player)), "2 lap(s) behind");
+        assert_eq!(gap_to_player(&player, Some(&lapped)), "2 lap(s) ahead");
+        let level = standing(5, 5, Some(0), Some(12.0));
+        assert_eq!(gap_to_player(&level, Some(&player)), "level (0.0s)");
+        assert_eq!(gap_to_player(&leader, None), "unknown");
+        for missing in [
+            standing(3, 3, None, Some(15.5)),
+            standing(3, 3, Some(0), None),
+            standing(3, 3, Some(-1), Some(15.5)),
+            standing(3, 3, Some(0), Some(f64::INFINITY)),
+            standing(3, 3, Some(0), Some(-1.0)),
+        ] {
+            assert_eq!(gap_to_player(&missing, Some(&player)), "unknown");
+        }
+
+        let (_dir, engineer) = race();
+        let conn = Connection::open(engineer.inner.path.clone()).unwrap();
+        conn.execute("UPDATE standings SET laps_behind_leader = 0, time_behind_leader = 3.5 WHERE vehicle_id = 2", []).unwrap();
+        let ctx = Ctx::new(&conn, &engineer.inner, None).unwrap();
+        let mut out = String::new();
+        cmd_field(&ctx, &mut out).unwrap();
+        assert!(out.contains("gap->YOU"), "{out}");
+        let opponent = out
+            .lines()
+            .find(|line| line.contains("Lena Fischer"))
+            .unwrap();
+        assert!(opponent.contains("3.5s behind"), "{out}");
+    }
+
+    #[test]
     fn stint_projects_absolute_laps_from_current_position() {
         let (_dir, engineer) = race();
         let conn = Connection::open(engineer.inner.path.clone()).unwrap();
@@ -6039,6 +6457,47 @@ mod evals {
         sqlite::Database,
     };
     use std::{num::NonZeroUsize, sync::Mutex as StdMutex, time::Instant};
+
+    /// Stdio adapter for performance evaluations against an actual telemetry database.
+    /// Blocking stdin belongs to this standalone test thread; no UI thread is running.
+    #[test]
+    #[ignore = "requires EVAL_DB and a JSON-line caller"]
+    fn live_tool_bridge() {
+        use std::io::{BufRead, Write};
+        let db = PathBuf::from(std::env::var("EVAL_DB").expect("EVAL_DB isn't set"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let four = NonZeroUsize::new(4).unwrap();
+        let pool = Pool::new(Database::read_only(Arc::new(db)), four, four);
+        let tool = Engineer::new(pool.clone(), SCHEMA.into());
+        let _entered = runtime.enter();
+        for line in std::io::stdin().lock().lines() {
+            let line = line.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let start = Instant::now();
+            let response = if request["op"] == "metadata" {
+                serde_json::json!({
+                    "system": instructions(SKILL.to_owned()),
+                    "tool": {"name": Engineer::NAME, "description": Engineer::description(), "input_schema": Engineer::input_schema()},
+                    "routing": runtime.block_on(super::super::routing::session(&pool)).ok()
+                        .and_then(|session| super::super::routing::context(&super::super::routing::skill_docs(&Engineer::input_schema()), Some(session)))
+                })
+            } else {
+                let result = match EngineerInput::deserialize(&request["input"]) {
+                    Ok(input) => runtime.block_on(tool.run(input)),
+                    Err(e) => Err(e.into()),
+                };
+                match result {
+                    Ok(result) => serde_json::json!({"result": result}),
+                    Err(e) => serde_json::json!({"result": format!("ERROR: {e:#}"), "error": true}),
+                }
+            };
+            println!(
+                "EVAL_BRIDGE {}",
+                serde_json::json!({"response": response, "elapsed": start.elapsed().as_secs_f64()})
+            );
+            std::io::stdout().flush().unwrap();
+        }
+    }
 
     /// The tool, recording every call and what it answered.
     #[derive(Clone)]

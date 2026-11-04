@@ -31,6 +31,7 @@ use tokio::{
 };
 use tool::{Engineer as EngineerTool, SCHEMA, SKILL, instructions};
 
+mod radio;
 mod routing;
 mod tool;
 
@@ -228,7 +229,7 @@ struct SessionState {
 
 impl Engineer {
     pub fn new(client: reqwest::Client, account: Option<Account>) -> Self {
-        let routing = routing::skill_docs(SKILL, &EngineerTool::input_schema()).into();
+        let routing = routing::skill_docs(&EngineerTool::input_schema()).into();
         Self {
             client,
             account,
@@ -459,6 +460,16 @@ impl Engineer {
             text: question.clone(),
             detail: None,
         });
+
+        // A bounded, whole-utterance match needs neither telemetry nor a network request.
+        // Speech synthesis still uses the normal background streaming pipeline.
+        // Select text after resolving the voice, as the model-backed path does.
+        let reply_lang = self.voice(config, lang).unwrap_or(lang);
+        if known && let Some(text) = radio::reply(&question, &reply_lang) {
+            self.reply(text.into(), None);
+            self.say(rt, config, synth, text, reply_lang);
+            return;
+        }
 
         let database = sim.and_then(|sim| Some((sim.id(), sim.database()?.clone())));
         let Some((sim, pool)) = database else {

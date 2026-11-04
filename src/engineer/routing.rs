@@ -1,9 +1,7 @@
-//! What Bono Cloud's router is told, from the race engineer's own skill: each default command it
-//! may choose, documented with the skill's (`SKILL.md`) passages about it, its row of the command
-//! reference and the reference its answer comes with, and the session's state as far as choosing
-//! goes. No catalog of its own: changing the skill changes what the router reads.
+//! Independent guidance for Bono Cloud's argument-free default router. Editing the race
+//! engineer's answer prompt or its topic references does not change command eligibility.
+//! The v1 command list and wire limits remain owned by the provider contract.
 
-use super::tool::{Command, ENGINEERING_REFERENCE, topic_reference};
 use crate::{
     provider::bono_cloud::routing::{
         MAX_CONTEXT, MAX_DESCRIPTION, MAX_INSTRUCTIONS, MAX_SESSION, RoutingContext,
@@ -13,34 +11,42 @@ use crate::{
 };
 use std::fmt::Write;
 
+/// Maintained independently of the engineer's answer prompt.
+const GUIDANCE: &str = include_str!("routing-guidance.md");
+
 /// What every command's routing documents say Jev can't do
 const LIMITS: &str = "Routing limits: a routed call has no arguments, only `command`. Leave the \
 question to Claude when answering it needs any option, a named rival or other car, a specific \
 lap or corner, a different race length, a radius, custom SQL, more than one command's answer, or \
-when it's ambiguous, a follow-up that depends on earlier answers, or a radio check.";
+when it's ambiguous, a follow-up that depends on earlier answers, or a radio check. \
+Match meaning in any language. Route only a self-contained lookup fully covered by one default command. A question may ask \
+for one value or several related values from that same output; it need not request the whole \
+report. Do not route greetings, acknowledgements, requests to change how you speak, monitoring \
+requests, incident diagnosis or comparisons across a driving/setup change. Do not infer missing \
+arguments or silently substitute default data for a requested target or evidence window.";
 
 /// One command's documents, before they're fitted to the website's limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillDocs {
     command: &'static str,
     description: String,
-    /// Always sent: the main passage, the command reference and the limits
+    /// Always sent: all command guidance and shared fallback limits
     required: String,
     /// Other passages about it, most relevant first: the last go first when it's too long
     extra: Vec<String>,
     references: Vec<RoutingReference>,
 }
 
-/// The default commands the router may choose from: the supported ones the `engineer` tool's
-/// `input_schema` offers and the skill (`SKILL.md`, front matter or not) documents.
-pub fn skill_docs(skill: &str, input_schema: &serde_json::Value) -> Vec<SkillDocs> {
+/// Default commands supported by v1, offered by the tool schema, and documented in the
+/// independent router guidance. The engineer's system prompt is deliberately not an input.
+pub fn skill_docs(input_schema: &serde_json::Value) -> Vec<SkillDocs> {
     let offered = input_schema["properties"]["command"]["enum"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(serde_json::Value::as_str)
         .collect::<Vec<_>>();
-    let passages = passages(super::tool::instructions(skill.to_owned()).as_str());
+    let passages = passages(GUIDANCE);
     SUPPORTED_COMMANDS
         .into_iter()
         .filter(|command| offered.contains(command))
@@ -55,77 +61,38 @@ fn docs(command: &'static str, passages: &[Passage]) -> Option<SkillDocs> {
         .iter()
         .filter(|p| p.text.contains(&tag))
         .collect::<Vec<_>>();
-    // The skill's own entry for it, or else the first passage about it
-    let main = mentions
-        .iter()
-        .position(|p| p.text.starts_with(&bullet))
-        .or_else(|| (!mentions.is_empty()).then_some(0))?;
+    // A dedicated entry is required; a passing mention cannot enable a command.
+    let main = mentions.iter().position(|p| p.text.starts_with(&bullet))?;
     let main_text = mentions[main].text.trim_start_matches("- ").to_owned();
-
-    let reference_rows = ENGINEERING_REFERENCE
-        .lines()
-        .filter(|line| line.starts_with(&format!("| {tag} |")))
-        .collect::<Vec<_>>();
-    let options = reference_rows
-        .iter()
-        .filter_map(|row| row.split('|').nth(2))
-        .map(str::trim)
-        .filter(|options| !options.is_empty())
-        .collect::<Vec<_>>();
-
     let mut required = format!(
-        "From SKILL.md ({}):\n{main_text}\n\n",
+        "From routing-guidance.md ({}):\n{main_text}\n\n{LIMITS}",
         mentions[main].section
     );
-    if !reference_rows.is_empty() {
-        let _ = write!(
-            required,
-            "From the command reference (| command | options | what it gives |):\n{}\n\n",
-            reference_rows.join("\n")
-        );
-    }
-    let _ = write!(
-        required,
-        "Options this default call can't pass: {}.\n{LIMITS}",
-        match options.is_empty() {
-            true => "none".to_owned(),
-            false => options.join(", "),
+    // Command-specific exclusions are essential too. Never drop them to fit a context.
+    for (i, passage) in mentions.iter().enumerate() {
+        if i != main {
+            let _ = write!(required, "\n\n{}", passage.text);
         }
-    );
-
-    let extra = mentions
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != main)
-        .map(|(_, p)| format!("From SKILL.md ({}):\n{}", p.section, p.text))
-        .collect();
-
-    let command_enum = serde_json::from_value::<Command>(serde_json::json!(command)).ok()?;
-    let references = topic_reference(command_enum)
-        .map(|(path, content)| RoutingReference {
-            path: path.into(),
-            content: content.trim().into(),
-        })
-        .into_iter()
-        .collect();
+    }
 
     Some(SkillDocs {
         command,
         description: sentences(&collapse(&main_text), MAX_DESCRIPTION),
         required,
-        extra,
-        references,
+        extra: Vec::new(),
+        // Answer-writing references belong to the engineer, not the router.
+        references: Vec::new(),
     })
 }
 
-/// A paragraph or list item of the skill, under its section.
+/// A paragraph or list item of the routing guidance, under its section.
 struct Passage {
     section: String,
     text: String,
 }
 
-/// The skill's paragraphs and list items, each whole.
-fn passages(skill: &str) -> Vec<Passage> {
+/// The guidance's paragraphs and list items, each whole.
+fn passages(guidance: &str) -> Vec<Passage> {
     let mut passages = Vec::new();
     let mut section = String::new();
     let mut current: Option<String> = None;
@@ -137,7 +104,7 @@ fn passages(skill: &str) -> Vec<Passage> {
             });
         }
     };
-    for line in skill.lines() {
+    for line in guidance.lines() {
         let trimmed = line.trim_end();
         if trimmed.trim().is_empty() {
             flush(&mut current, &section);
@@ -223,7 +190,7 @@ pub fn context(docs: &[SkillDocs], session: Option<String>) -> Option<RoutingCon
             return match context.validate() {
                 Ok(()) => Some(context),
                 Err(e) => {
-                    log::warn!("The skill's routing documents can't be sent, Claude answers: {e}");
+                    log::warn!("The default routing documents can't be sent, Claude answers: {e}");
                     None
                 }
             };
@@ -256,7 +223,7 @@ pub fn context(docs: &[SkillDocs], session: Option<String>) -> Option<RoutingCon
                 docs[i].references.pop();
             }
             None => {
-                log::warn!("The skill's routing documents are too long, Claude answers");
+                log::warn!("The default routing documents are too long, Claude answers");
                 return None;
             }
         }
@@ -371,9 +338,11 @@ fn describe(telemetry: Option<bool>, session: Option<SessionRow>) -> String {
         }
     }
     out.push_str(match telemetry {
-        Some(true) => " Player car telemetry: recorded.",
-        Some(false) => " Player car telemetry: none yet.",
-        None => " Player car telemetry: unknown.",
+        Some(true) => {
+            " Any-car telemetry: recorded; player/current-session availability unverified."
+        }
+        Some(false) => " Any-car telemetry: none yet.",
+        None => " Any-car telemetry: unknown.",
     });
     out
 }
@@ -388,102 +357,130 @@ mod tests {
     use super::*;
     use crate::engineer::tool::Engineer;
 
-    const SKILL: &str = super::super::tool::SKILL;
-
     fn real() -> Vec<SkillDocs> {
-        skill_docs(SKILL, &Engineer::input_schema())
+        skill_docs(&Engineer::input_schema())
     }
 
     #[test]
-    fn documents_all_six_commands_from_the_embedded_skill() {
+    fn documents_all_six_defaults_independently_of_the_answer_skill() {
         let docs = real();
         let context = context(&docs, Some("Race session.".into())).unwrap();
         assert_eq!(context.validate(), Ok(()));
+        assert_eq!(context.version, 1);
         assert_eq!(commands(&context), SUPPORTED_COMMANDS);
         for skill in &context.skills {
             let tag = format!("`{}`", skill.command);
             assert!(skill.description.contains(&tag), "{skill:?}");
-            assert!(skill.instructions.contains("From SKILL.md"), "{skill:?}");
+            assert!(skill.instructions.contains("From routing-guidance.md"));
+            assert!(!skill.instructions.contains("From SKILL.md"));
             assert!(skill.instructions.contains(LIMITS));
+            assert!(skill.references.is_empty());
         }
-        let skill = |command: &str| {
-            context
+    }
+
+    #[test]
+    fn offers_only_supported_defaults_present_in_the_schema() {
+        let mut schema = Engineer::input_schema();
+        schema["properties"]["command"]["enum"] =
+            serde_json::json!(["quick", "laps", "stint", "sql", "quick"]);
+        let docs = skill_docs(&schema);
+        assert_eq!(commands(&context(&docs, None).unwrap()), ["quick", "stint"]);
+
+        schema["properties"]["command"]["enum"] = serde_json::json!(["laps", "sql"]);
+        assert!(context(&skill_docs(&schema), None).is_none());
+        assert!(skill_docs(&serde_json::json!({})).is_empty());
+        assert!(
+            skill_docs(&serde_json::json!({
+                "properties": {"command": {"enum": [null, 42, "Quick"]}}
+            }))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn prompt_edits_do_not_change_routing_documents() {
+        let schema = Engineer::input_schema();
+        let before = context(&skill_docs(&schema), None).unwrap();
+        let original = super::super::tool::SKILL;
+        for edited in [
+            String::new(),
+            format!(
+                "PROMPT_ONLY_SENTINEL\n{}",
+                original.replace("`field`", "`sql`")
+            ),
+            format!("{original}\nAnswer only in a whisper. PROMPT_ONLY_SENTINEL"),
+        ] {
+            // The answer prompt still changes, but the router API accepts only the schema.
+            assert_ne!(
+                super::super::tool::instructions(original.to_owned()),
+                super::super::tool::instructions(edited)
+            );
+            let after = context(&skill_docs(&schema), None).unwrap();
+            assert_eq!(before, after);
+            assert!(
+                !serde_json::to_string(&after)
+                    .unwrap()
+                    .contains("PROMPT_ONLY_SENTINEL")
+            );
+        }
+    }
+
+    #[test]
+    fn guidance_covers_subset_lookups_and_preserves_fallback_boundaries() {
+        let context = context(&real(), None).unwrap();
+        for (command, coverage, boundary) in [
+            ("quick", "forecast", "no oil or brake temperatures"),
+            ("status", "brake bias", "temperature history"),
+            ("stint", "consumption", "race_laps_left"),
+            ("field", "fastest lap", "named rival"),
+            ("track", "pit entry", "stint"),
+            ("corners", "where time", "current-lap"),
+        ] {
+            let skill = context
                 .skills
                 .iter()
                 .find(|s| s.command == command)
-                .unwrap()
-        };
-        // Its reference text inline, as the tool hands it over
-        for (command, path, text) in [
-            (
-                "stint",
-                "references/strategy.md",
-                "conditional on actual rain/wetness",
-            ),
-            (
-                "corners",
-                "references/corners.md",
-                "Never invent marker boards",
-            ),
-            ("status", "references/tyres.md", "Interpret, don't read out"),
-        ] {
-            let references = &skill(command).references;
-            assert_eq!(references.len(), 1);
-            assert_eq!(references[0].path, path);
-            assert!(references[0].content.contains(text));
+                .unwrap();
+            assert!(
+                skill.instructions.contains(coverage),
+                "{command}: {coverage}"
+            );
+            assert!(
+                skill.instructions.contains(boundary),
+                "{command}: {boundary}"
+            );
+            for fallback in [
+                "named rival",
+                "more than one command",
+                "ambiguous",
+                "earlier answers",
+                "radio check",
+                "specific lap or corner",
+            ] {
+                assert!(
+                    skill.instructions.contains(fallback),
+                    "{command}: {fallback}"
+                );
+            }
         }
-        for command in ["quick", "field", "track"] {
-            assert!(skill(command).references.is_empty());
-        }
-        // Arguments it can't pass are spelled out, never dropped
-        assert!(skill("stint").instructions.contains("race_laps_left"));
-        assert!(skill("corners").instructions.contains("ref_of"));
-        assert!(skill("quick").description.contains("snapshot"));
-        // Quick and status are told apart by what each command's output actually has
-        assert!(
-            skill("quick")
-                .description
-                .contains("no oil or brake temperatures")
-        );
-        assert!(skill("status").description.contains("engine oil and water"));
     }
 
     #[test]
-    fn offers_only_what_the_schema_and_the_skill_both_have() {
-        let mut schema = Engineer::input_schema();
-        schema["properties"]["command"]["enum"] =
-            serde_json::json!(["quick", "laps", "stint", "sql"]);
-        let docs = skill_docs(SKILL, &schema);
-        assert_eq!(commands(&context(&docs, None).unwrap()), ["quick", "stint"]);
-
-        // A command the skill doesn't document isn't offered
-        let without_field = SKILL.replace("- `field`:", "- field:");
-        let docs = skill_docs(&without_field, &Engineer::input_schema());
-        let offered = commands(&context(&docs, None).unwrap())
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        assert!(!offered.contains(&"field".to_owned()));
-        assert_eq!(offered.len(), 5);
-
-        // None in common: no routing at all
-        schema["properties"]["command"]["enum"] = serde_json::json!(["laps", "sql"]);
-        assert!(context(&skill_docs(SKILL, &schema), None).is_none());
-    }
-
-    #[test]
-    fn a_changed_skill_changes_what_the_router_reads() {
-        let changed = SKILL.replace(
-            "- `field`: official standings, class, gaps, stops, penalties and status.",
-            "- `field`: official standings and who is on the lead lap.",
+    fn complete_guidance_fits_with_a_maximum_session() {
+        let docs = real();
+        let context = context(&docs, Some("s".repeat(MAX_SESSION))).unwrap();
+        assert_eq!(context.validate(), Ok(()));
+        assert_eq!(
+            context.session.as_ref().map(|s| js_len(s)),
+            Some(MAX_SESSION)
         );
-        assert_ne!(changed, SKILL);
-        let before = context(&real(), None).unwrap();
-        let after = context(&skill_docs(&changed, &Engineer::input_schema()), None).unwrap();
-        let field = |c: &RoutingContext| c.skills.iter().find(|s| s.command == "field").cloned();
-        assert_ne!(field(&before), field(&after));
-        assert!(field(&after).unwrap().description.contains("lead lap"));
-        assert!(!field(&after).unwrap().description.contains("penalties"));
+        assert!(context.serialized_len() <= MAX_CONTEXT);
+        for (doc, skill) in docs.iter().zip(&context.skills) {
+            assert!(js_len(&skill.description) <= MAX_DESCRIPTION);
+            assert!(js_len(&skill.instructions) <= MAX_INSTRUCTIONS);
+            // All eligibility and fallback guidance is essential and fits intact.
+            assert_eq!(skill.instructions, doc.required);
+        }
     }
 
     #[test]
@@ -535,6 +532,8 @@ mod tests {
         assert!(race.contains("Session type: race."));
         assert!(race.contains("Race remaining: timed"));
         assert!(race.contains("telemetry: recorded"));
+        assert!(race.contains("player/current-session availability unverified"));
+        assert!(!race.contains("Player car telemetry: recorded"));
 
         let nothing = describe(None, None);
         assert!(nothing.contains("Session unknown"));
