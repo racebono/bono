@@ -115,21 +115,9 @@ static void convert(const TelemInfoV01& in, bono_telemetry_s& out) {
     out.state.abs = in.mABS;
     out.abs_active = in.mABSActive;
     out.state.engine_map = in.mMotorMap;
-    out.state.traction_control_max = in.mTCMax;
-    out.state.traction_control_slip_max = in.mTCSlipMax;
-    out.state.traction_control_cut_max = in.mTCCutMax;
-    out.state.abs_max = in.mABSMax;
-    out.state.engine_map_max = in.mMotorMapMax;
-    out.state.brake_migration_max = in.mMigrationMax;
-    out.state.front_anti_roll_bar_max = in.mFrontAntiSwayMax;
-    out.state.rear_anti_roll_bar_max = in.mRearAntiSwayMax;
     if (in.mPhysicalSteeringWheelRange > 0) out.state.steering_wheel_range = in.mPhysicalSteeringWheelRange;
     if (in.mEngineMaxRPM > 0) out.state.engine_max_rpm = in.mEngineMaxRPM;
     out.state.max_gears = in.mMaxGears;
-    out.state.speed_limiter_available = in.mSpeedLimiterAvailable != 0;
-    // In centimeters; none reported is 0.
-    if (in.mWheel[0].mStaticUndeflectedRadius > 0) out.state.front_tire_radius = in.mWheel[0].mStaticUndeflectedRadius / 100.0;
-    if (in.mWheel[2].mStaticUndeflectedRadius > 0) out.state.rear_tire_radius = in.mWheel[2].mStaticUndeflectedRadius / 100.0;
     out.state.brake_migration = in.mMigration;
     out.state.rear_brake_bias = in.mRearBrakeBias;
     out.state.front_anti_roll_bar = in.mFrontAntiSway;
@@ -222,31 +210,9 @@ namespace {
     struct CarContext {
         std::optional<std::string> front_compound;
         std::optional<std::string> rear_compound;
-        std::optional<std::string> model;
-        std::optional<std::string> championship;
-        std::optional<std::string> terrain[4];
         // Whose it is: another car can take over a slot before its next telemetry update.
         std::optional<std::string> vehicle;
     };
-
-    std::optional<std::string> championship(IP_VehicleChampionship value) {
-        switch (value) {
-            case IP_VehicleChampionship::WEC_2023:
-                return "WEC 2023";
-            case IP_VehicleChampionship::WEC_2024:
-                return "WEC 2024";
-            case IP_VehicleChampionship::WEC_2025:
-                return "WEC 2025";
-            case IP_VehicleChampionship::WEC_2026:
-                return "WEC 2026";
-            case IP_VehicleChampionship::ELMS_2025:
-                return "ELMS 2025";
-            case IP_VehicleChampionship::ELMS_2026:
-                return "ELMS 2026";
-            default:
-                return std::nullopt;
-        }
-    }
 
     // LMU reports times it does not have yet as 0 or -1.
     std::optional<double> time_or_null(double seconds) {
@@ -584,11 +550,6 @@ namespace {
                 CarContext& context = _contexts[info.mID];
                 context.front_compound = text(info.mFrontTireCompoundName);
                 context.rear_compound = text(info.mRearTireCompoundName);
-                context.model = text(info.mVehicleModel);
-                context.championship = championship(info.mVehicleChampionship);
-                for (std::size_t i = 0; i < std::size(context.terrain); ++i) {
-                    context.terrain[i] = text(info.mWheel[i].mTerrainName);
-                }
                 context.vehicle = text(info.mVehicleName);
             }
             bono_telemetry_s telemetry;
@@ -617,15 +578,6 @@ namespace {
                     if (context != _contexts.end() && context->second.vehicle == text(info.mVehicle[i].mVehicleName)) {
                         standing.front_tire_compound_name = context->second.front_compound;
                         standing.rear_tire_compound_name = context->second.rear_compound;
-                        standing.vehicle_model = context->second.model;
-                        standing.championship = context->second.championship;
-                        // The player's only: every car's would add a row at every kerb.
-                        if (info.mVehicle[i].mIsPlayer) {
-                            standing.terrain_front_left = context->second.terrain[0];
-                            standing.terrain_front_right = context->second.terrain[1];
-                            standing.terrain_rear_left = context->second.terrain[2];
-                            standing.terrain_rear_right = context->second.terrain[3];
-                        }
                     }
                 }
                 standings.push_back(std::move(standing));

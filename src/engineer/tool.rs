@@ -2471,116 +2471,6 @@ fn cmd_field(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// How far over the pit speed limit (m/s) a car must be, for a limiter holding it at the limit.
-const PIT_SPEED_MARGIN: f64 = 0.5;
-
-/// Rules, overtaking systems and tire condition, each only where the simulator reports it.
-fn car_rules_and_condition(
-    p: &Row,
-    session: Option<&Row>,
-    me: Option<&Row>,
-    wheels: &BTreeMap<usize, Row>,
-    alerts: &mut Vec<String>,
-    info: &mut Vec<String>,
-) {
-    let limit = session.and_then(|s| s.f("pit_speed_limit"));
-    if let Some(limit) = limit
-        && p.b("in_pit_lane")
-    {
-        // Only the pit lane has this limit, and a limiter holds the car right at it
-        if p.b("is_player")
-            && p.f("speed")
-                .is_some_and(|speed| speed > limit + PIT_SPEED_MARGIN)
-        {
-            alerts.push(format!(
-                "OVER THE PIT SPEED LIMIT ({} km/h, limit {} km/h)",
-                kmh(p.f("speed")),
-                kmh(Some(limit))
-            ));
-        }
-        info.push(format!("pit speed limit {} km/h", kmh(Some(limit))));
-    }
-    if p.b("next_lap_invalidated") {
-        info.push("next lap already invalid too".into());
-    }
-    if p.b("previous_lap_invalidated") {
-        info.push("previous lap invalid".into());
-    }
-    if let Some(points) = p.i("incident_points").filter(|points| *points > 0) {
-        let max = session.and_then(|s| s.i("max_incident_points"));
-        info.push(match max {
-            Some(max) => format!("incident points {points}/{max}"),
-            None => format!("incident points {points}"),
-        });
-    }
-    if let Some(warnings) = p.i("cut_track_warnings").filter(|warnings| *warnings > 0) {
-        info.push(format!("track cut warnings {warnings}"));
-    }
-    if p.b("drs_equipped") {
-        // Whether any activation is left, not whether it can be used right here
-        let left = match (
-            p.b("drs_activations_unlimited"),
-            p.i("drs_activations_left"),
-            p.i("drs_available"),
-        ) {
-            (true, _, _) => "unlimited".to_owned(),
-            (_, Some(left), _) => left.to_string(),
-            (_, None, Some(0)) => "none".to_owned(),
-            (_, None, Some(_)) => "some".to_owned(),
-            (_, None, None) => "unknown".to_owned(),
-        };
-        info.push(format!("DRS activations left: {left}"));
-    }
-    if p.b("push_to_pass_equipped") {
-        let mut parts = Vec::new();
-        if p.b("push_to_pass_engaged") {
-            parts.push("engaged".to_owned());
-        }
-        match p.i("push_to_pass_charged") {
-            Some(0) => parts.push("charging".to_owned()),
-            Some(_) => parts.push("charged".to_owned()),
-            None => {}
-        }
-        if let Some(left) = p.i("push_to_pass_activations_left") {
-            parts.push(format!("{left} left"));
-        }
-        if let Some(wait) = p.f("push_to_pass_cooldown_left").filter(|wait| *wait > 0.0) {
-            parts.push(format!("cooldown {wait:.0}s"));
-        }
-        if !parts.is_empty() {
-            info.push(format!("push to pass: {}", parts.join(", ")));
-        }
-    }
-    let flatspots = wheels
-        .iter()
-        .filter(|(_, r)| r.b("tire_flatspot"))
-        .map(|(w, _)| WHEELS[*w])
-        .collect::<Vec<_>>();
-    if !flatspots.is_empty() {
-        info.push(format!("flat spot {}", flatspots.join(",")));
-    }
-    let dirty = wheels
-        .iter()
-        .filter(|(_, r)| r.f("tire_dirt").is_some_and(|dirt| dirt >= 0.25))
-        .map(|(w, _)| WHEELS[*w])
-        .collect::<Vec<_>>();
-    if !dirty.is_empty() {
-        info.push(format!("dirty tires {}", dirty.join(",")));
-    }
-    if let Some(me) = me
-        && let (Some(front), Some(rear)) = (
-            me.text("front_tire_compound_name"),
-            me.text("rear_tire_compound_name"),
-        )
-    {
-        info.push(format!(
-            "compounds front {} rear {}",
-            telemetry_text(front),
-            telemetry_text(rear)
-        ));
-    }
-}
-
 /// Alerts (what changes what the pilot must do right now) and info (context, only when it bears
 /// on the question) from the scoring tables.
 fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
@@ -2609,6 +2499,16 @@ fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
         }
     }
     if let Some(me) = &sc.player {
+        if let (Some(front), Some(rear)) = (
+            me.text("front_tire_compound_name"),
+            me.text("rear_tire_compound_name"),
+        ) {
+            info.push(format!(
+                "compounds front {} rear {}",
+                telemetry_text(front),
+                telemetry_text(rear)
+            ));
+        }
         if me.s("flag") == Some("blue") {
             alerts.push("BLUE FLAG shown to you".into());
         }
@@ -2641,14 +2541,6 @@ fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
             }
         }
     }
-    car_rules_and_condition(
-        &ctx.player,
-        sc.session.as_ref(),
-        sc.player.as_ref(),
-        &ctx.wheels(ctx.player_id())?,
-        &mut alerts,
-        &mut info,
-    );
     Ok((alerts, info))
 }
 
@@ -5047,69 +4939,6 @@ fn cmd_sql(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// What `car_rules_and_condition` says for a player row with these columns.
-    fn rules(columns: &str) -> (Vec<String>, Vec<String>) {
-        let conn = Connection::open_in_memory().unwrap();
-        let p = row(&conn, &format!("SELECT {columns}"), [])
-            .unwrap()
-            .unwrap();
-        let session = row(
-            &conn,
-            "SELECT 16.67 AS pit_speed_limit, NULL AS max_incident_points",
-            [],
-        )
-        .unwrap()
-        .unwrap();
-        let (mut alerts, mut info) = (Vec::new(), Vec::new());
-        car_rules_and_condition(
-            &p,
-            Some(&session),
-            None,
-            &BTreeMap::new(),
-            &mut alerts,
-            &mut info,
-        );
-        (alerts, info)
-    }
-
-    #[test]
-    fn pit_speed_alert_is_only_for_the_player_over_the_limit_in_the_pit_lane() {
-        let over = |columns: &str| {
-            rules(columns)
-                .0
-                .iter()
-                .any(|alert| alert.contains("PIT SPEED"))
-        };
-        assert!(over("1 AS is_player, 1 AS in_pit_lane, 20.0 AS speed"));
-        // A limiter holding the car at the limit
-        assert!(!over("1 AS is_player, 1 AS in_pit_lane, 17.0 AS speed"));
-        // Fast outside the pit lane, or another car
-        assert!(!over("1 AS is_player, 0 AS in_pit_lane, 80.0 AS speed"));
-        assert!(!over("0 AS is_player, 1 AS in_pit_lane, 20.0 AS speed"));
-        // The limit only comes up in the pit lane
-        assert!(rules("1 AS is_player, 0 AS in_pit_lane").1.is_empty());
-    }
-
-    #[test]
-    fn rules_say_nothing_about_what_is_zero_or_unknown() {
-        assert!(
-            rules("0 AS incident_points, 0 AS cut_track_warnings, NULL AS drs_equipped")
-                .1
-                .is_empty()
-        );
-        let (_, info) = rules("2 AS incident_points, 1 AS next_lap_invalidated");
-        assert!(info.contains(&"incident points 2".to_owned()), "{info:?}");
-        assert!(
-            info.iter().any(|line| line.contains("next lap")),
-            "{info:?}"
-        );
-        // Fitted, with nothing known about what's left: not "unavailable"
-        let (_, info) = rules("1 AS drs_equipped, NULL AS drs_available");
-        assert_eq!(info, ["DRS activations left: unknown"]);
-        let (_, info) = rules("1 AS drs_equipped, 0 AS drs_available");
-        assert_eq!(info, ["DRS activations left: none"]);
-    }
     use crate::sqlite::Database;
     use bono_sim::{
         recorder::{DATABASE, Recorder},

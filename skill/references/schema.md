@@ -98,27 +98,16 @@ positions from telemetry.
 - **Lap times are not stored in telemetry** (the game's own are in `standings`). From telemetry,
   lap N's time = `lap_start_time` of lap N+1 minus `lap_start_time` of lap N for the same vehicle. The current lap's elapsed time is `session_time - lap_start_time`.
 - **`lap_invalidated`** is the current lap's state; a lap was invalid if it was 1 at any point
-  during it (`MAX(lap_invalidated)` per lap). `car_state.next_lap_invalidated` says the next lap
-  is already spoiled too, and `previous_lap_invalidated` is the simulator's verdict on the last lap.
-  Skip all of these when choosing a lap to compare against. Incident points and track cuts are
-  separate rule systems: never add them up or treat one as the other.
+  during it (`MAX(lap_invalidated)` per lap).
 - **`heading`** is where the car body points and **`course`** where it travels; they differ in a
-  slide and by half a turn when reversing. RaceRoom doesn't document the axes and signs of its orientation
-  angles, so bono doesn't use them and an opponent's `heading` is its last direction of travel. A RaceRoom player's stays at its last value below 1 m/s, is
-  slightly out when a banked car slides, and is the last direction of travel until first known.
+  slide and by half a turn when reversing. RaceRoom doesn't document the axes and signs of its
+  orientation angles, so bono doesn't use them and an opponent's `heading` is its last direction of
+  travel. A RaceRoom player's stays at its last value below 1 m/s, is slightly out when a banked car
+  slides, and is the last direction of travel until first known.
 - **Downforce**: `total_downforce` is the whole car. `front_downforce` and `rear_downforce` are
   NULL where the simulator doesn't split it (RaceRoom). In an older RaceRoom recording without a
   `total_downforce` column, `front_downforce` holds the whole car's: never read it as the front axle.
-- **`pit_speed_limit`** only applies in the pit lane: compare it with `speed` only while
-  `in_pit_lane = 1`.
-- **Ids** (`track_id`, `layout_id`, `vehicle_model_id`, `vehicle_class_id`, `team_id`,
-  `manufacturer_id`) are the simulator's own, stored as text, and don't compare across simulators.
-  They identify a car but aren't names. `vehicle_id` can be reused by another car, so read identity
-  from the car's newest `standings` row.
-- **Control maximums** (`*_max`) give the car's range, not proof that every step changes anything.
-  `engine_max_rpm` is the rev limit, not the best shift point. `total_mass` includes fuel and
-  penalty weight. `tire_grip` is the simulator's own figure, and `tire_flatspot` is not `tire_flat`
-  (a puncture).
+- **`engine_max_rpm`** is the rev limit, not the best shift point.
 - **`in_pit_lane`** covers the pit lane, which normally straddles the start/finish line, so both
   the in-lap and the out-lap show it. A refuel shows as fuel/virtual energy *increasing*.
 - **`tire_wear`**: the schema comment says "fraction worn", but LMU reports fraction *remaining*
@@ -158,27 +147,23 @@ lateral + right, vertical + up. Pitch + nose up, yaw + turning right, roll + lea
 | Timing | `session_time`, `time_since_last_update`, `lap`, `lap_start_time`, `lap_distance` (metres from the start/finish line; in LMU estimated from the last scoring update plus speed x time, so it can be a few metres out and jumps back to the scoring value about five times a second; empty before a car's first scoring update), `sector` (0-based), `in_pit_lane`, `lap_invalidated`, `delta_best` (s vs best lap, + = slower), `gap_to_car_ahead`, `gap_to_car_behind`, `gap_to_place_ahead`, `gap_to_place_behind`; in `car_state`: `track_limits_steps` (accumulated track-limit points x steps-per-point) | |
 | Motion | `position_x/y/z`, `heading`, `course`, `pitch`, `roll`, `speed` (m/s; x3.6 = km/h), `velocity_longitudinal/lateral/vertical`, `acceleration_longitudinal/lateral/vertical` (m/s^2; /9.81 = g), `pitch_rate`, `yaw_rate`, `roll_rate`, `*_acceleration` | |
 | Inputs | `throttle`, `brake`, `clutch` (0-1), `steering` (-1 left .. 1 right), `*_filtered` (after aids), `steering_shaft_torque` (Nm) | |
-| Powertrain | `gear` (-1 R, 0 N), `engine_rpm`, `engine_torque`, `clutch_rpm`, `engine_water_temperature`, `engine_oil_temperature`, `engine_overheating`, `turbo_boost_pressure`, `anti_stall_active`; in `car_state`: `ignition`, `engine_max_rpm`, `max_gears`, `engine_braking` | |
+| Powertrain | `gear` (-1 R, 0 N), `engine_rpm`, `engine_torque`, `clutch_rpm`, `engine_water_temperature`, `engine_oil_temperature`, `engine_overheating`, `turbo_boost_pressure`, `anti_stall_active`; in `car_state`: `ignition`, `engine_max_rpm`, `max_gears` | |
 | Energy | `fuel` (L), `virtual_energy`, `battery_charge` (0-1), `state_of_charge`, `regeneration_power` (kW), `electric_motor_torque/rpm/temperature/water_temperature`, `electric_motor_state` (0 n/a, 1 inactive, 2 propulsion, 3 regen), `lift_and_coast_progress` | |
-| Aids / setup | `traction_control_active`, `abs_active`, `speed_limiter_active`; in `car_state`: `traction_control`, `traction_control_slip`, `traction_control_cut`, `abs`, `engine_map`, `brake_migration`, `rear_brake_bias`, `front_anti_roll_bar`, `rear_anti_roll_bar`, `speed_limiter_on`, `headlights`, `wipers`, `front_tire_compound`, `rear_tire_compound`, `scheduled_pit_stops`, `traction_control_max`, `traction_control_slip_max`, `traction_control_cut_max`, `abs_max`, `engine_map_max`, `brake_migration_max`, `front_anti_roll_bar_max`, `rear_anti_roll_bar_max`, `steering_wheel_range` (physical; degrees lock to lock in RaceRoom, not documented by LMU), `speed_limiter_available` | a setting change is a new `car_state` row |
-| Overtaking | `rear_flap_active` (DRS engaged), `push_to_pass_active_time_left`, `push_to_pass_cooldown_left` (s); in `car_state`: `drs_equipped`, `drs_available`, `drs_activations_left` (NULL when unlimited), `drs_activations_unlimited`, `drs_activations_total`, `push_to_pass_equipped`, `push_to_pass_charged` (NULL without a charge cycle), `push_to_pass_engaged`, `push_to_pass_activations_left`, `push_to_pass_activations_total` | NULL on cars without the system or where it isn't reported |
-| Rules (in `car_state`) | `incident_points`, `cut_track_warnings`, `next_lap_invalidated`, `previous_lap_invalidated` | |
-| Tire and brake limits (in `car_state`) | `front/rear_tire_radius` (m, static, not rolling), `front/rear_tire_cold_temperature`, `front/rear_tire_hot_temperature`, `front/rear_brake_cold_temperature`, `front/rear_brake_optimal_temperature`, `front/rear_brake_hot_temperature` (C) | |
-| Aero / chassis | `front_third_spring_deflection`, `rear_third_spring_deflection`, `front_third_spring_velocity`, `rear_third_spring_velocity` (m/s), `front_wing_height`, `front_ride_height`, `rear_ride_height`, `drag`, `total_downforce`, `front_downforce`, `rear_downforce` (N), `total_mass` (kg), `front_flap_active`, `rear_flap_active`; in `car_state`: `rear_flap_status` | |
+| Aids / setup | `traction_control_active`, `abs_active`, `speed_limiter_active`; in `car_state`: `traction_control`, `traction_control_slip`, `traction_control_cut`, `abs`, `engine_map`, `brake_migration`, `rear_brake_bias`, `front_anti_roll_bar`, `rear_anti_roll_bar`, `speed_limiter_on`, `headlights`, `wipers`, `front_tire_compound`, `rear_tire_compound`, `scheduled_pit_stops`, `steering_wheel_range` (physical; degrees lock to lock in RaceRoom, not documented by LMU) | a setting change is a new `car_state` row |
+| Aero / chassis | `front_third_spring_deflection`, `rear_third_spring_deflection`, `front_wing_height`, `front_ride_height`, `rear_ride_height`, `drag`, `total_downforce`, `front_downforce`, `rear_downforce` (N), `front_flap_active`, `rear_flap_active`; in `car_state`: `rear_flap_status` | |
 | Fuel (in `car_state`) | `fuel_capacity` (L), `fuel_per_lap` (L, the sim's own estimate), `virtual_energy_per_lap` (fraction of a full tank, the sim's estimate) | LMU only reports the capacity |
 | Damage (all in `car_state`) | `engine_damage`, `transmission_damage`, `aerodynamics_damage`, `suspension_damage` (0 none - 1 destroyed; not reported by LMU), `parts_detached`, `dent_severity_0..7` (8 locations; 0 none, 1 some, 2 more), `last_impact_time` (session time), `last_impact_magnitude`, `last_impact_position_x/y/z` | a new impact = `last_impact_time` changes |
 
 ## 4. Column guide - `telemetry_wheel`
 
-`suspension_deflection`, `suspension_velocity` (m/s), `suspension_force` (N), `ride_height`, `wheel_vertical_position`, `camber`,
+`suspension_deflection`, `suspension_force` (N), `ride_height`, `wheel_vertical_position`, `camber`,
 `toe` (rad), `brake_temperature` (C), `brake_pressure`, `rotation_speed` (rad/s),
 `lateral/longitudinal_patch_velocity`, `lateral/longitudinal_ground_velocity`,
 `lateral_force`, `longitudinal_force`, `tire_load` (N), `sliding_fraction` (share of the contact
 patch sliding - high values = tyre overworked), `surface_type` (0 dry, 1 wet, 2 grass, 3 dirt,
 4 gravel, 5 kerb, 6 special), `tire_pressure` (kPa), `tire_surface_temperature_left/center/right`,
 `tire_inner_temperature_left/center/right`, `tire_carcass_temperature`, `tire_optimal_temperature`,
-`tire_wear`, `tire_vertical_deflection`, `tire_compound`, `tire_compound_type`, `tire_grip` (0-1), `tire_dirt`
-(0-1), `tire_flatspot`, `tire_flat`,
+`tire_wear`, `tire_vertical_deflection`, `tire_compound`, `tire_compound_type`, `tire_flat`,
 `wheel_detached`.
 
 ## 5. Column guide - `session`
@@ -188,8 +173,7 @@ C = compared (a change adds a row); S = snapshot (stored with each row, never tr
 | Columns | Notes |
 |---|---|
 | `session_time` S, `time_remaining` S, `time_of_day` S | clock at the moment of the row |
-| `track` C, `track_id` C, `layout_id` C, `track_length` C (m) | |
-| `pit_speed_limit` C (m/s), `max_incident_points` C | NULL where not reported |
+| `track` C, `track_length` C (m) | |
 | `session_type` C, `session_number` C | test, practice, qualifying, warmup, race; number is 1-based within the type (practice 2) |
 | `phase` C | before_start, reconnaissance, grid_walk, formation_lap, countdown, green, full_course_yellow, stopped (red flag), over, paused |
 | `session_end_time` C | session time at which the session ends; NULL if not timed |
@@ -216,10 +200,8 @@ C = compared (a change adds a row); S = snapshot (stored with each row, never tr
 | `session_time` S | when the row was written |
 | `vehicle_id` C, `is_player` C | same id as `telemetry.vehicle_id` |
 | `driver` C, `vehicle` C, `vehicle_class` C, `team` C | names as the game shows them; several classes = multiclass race |
-| `vehicle_model` C, `championship` C, `vehicle_model_id` C, `vehicle_class_id` C, `team_id` C, `manufacturer_id` C, `car_number` C, `vehicle_width` C, `vehicle_length` C | identity and size, where reported; size is in the simulator's unit |
 | `front_tire_compound_name` C, `rear_tire_compound_name` C | the simulator's compound name, opponents too where reported |
-| `terrain_front_left/front_right/rear_left/rear_right` C | material name under each tire, player only, simulator-specific, updated at scoring rate |
-| `position` C (overall, 1-based), `class_position` C, `qualifying_position` C | without `class_position`, rank by `position` among cars of the same `vehicle_class` |
+| `position` C (overall, 1-based), `qualifying_position` C | class position = rank by `position` among cars of the same `vehicle_class` |
 | `laps_completed` C, `sector` C (0-based) | |
 | `mandatory_pit_stop` C | none, unserved_two_tires, unserved_four_tires, served (not reported by LMU) |
 | `finish_status` C | none, finished, dnf, dnq (did not qualify), dns (did not start), disqualified |
@@ -233,7 +215,7 @@ C = compared (a change adds a row); S = snapshot (stored with each row, never tr
 | `control` C | player, ai, remote, replay |
 | `phase` C | the car's own phase: the session phases plus after_formation, under_yellow, under_blue |
 | `flag` C | green or blue (blue = being lapped, let the faster car by) |
-| `under_yellow` C, `lap_counts` C, `lap_time_counts` C, `scored` C, `headlights` C, `drs_active` C, `push_to_pass_active` C, `attack_mode` C | |
+| `under_yellow` C, `lap_counts` C, `lap_time_counts` C, `scored` C, `headlights` C, `drs_active` C, `attack_mode` C | |
 | `time_behind_leader` S, `time_behind_next` S | seconds, at the moment of the row |
 | `lap_distance` S, `time_into_lap` S, `estimated_lap_time` S | metres around the lap, etc. |
 | `fuel_fraction` S | fuel or battery left, 0-1 (other cars too) |

@@ -20,8 +20,6 @@
     X(f64, time_remaining, false)                                                                         \
     X(f64, time_of_day, false)               /* as reported by the simulator */                          \
     X(string, track, true)                                                                                \
-    X(string, track_id, true) /* the simulator's stable id, as text; only comparable within one simulator */ \
-    X(string, layout_id, true) \
     X(f64, track_length, true)               /* meters */                                                \
     X(string, session_type, true)            /* test, practice, qualifying, warmup, race */              \
     X(i64, session_number, true)             /* 1-based within its type, e.g. the second practice */     \
@@ -58,8 +56,6 @@
     X(i64, track_grip_level, true)           /* as reported by the simulator */                           \
     X(i64, track_limits_steps_per_penalty, true)                                                          \
     X(i64, track_limits_steps_per_point, true)                                                            \
-    X(f64, pit_speed_limit, true) /* m/s; applies in the pit lane only */ \
-    X(i64, max_incident_points, true) \
     X(string, pit_window_status, true)       /* the player's: disabled, closed, open, stopped, completed */   \
     X(i64, pit_window_start_lap, true)       /* the window, in laps-based sessions */                       \
     X(i64, pit_window_end_lap, true)                                                                      \
@@ -74,23 +70,9 @@
     X(string, vehicle, true)                                                                              \
     X(string, vehicle_class, true)                                                                        \
     X(string, team, true)                                                                                 \
-    X(string, vehicle_model, true) /* model name, when the simulator gives one */ \
-    X(string, championship, true) \
-    X(string, vehicle_model_id, true) /* the simulator's stable ids, as text; only comparable within one simulator */ \
-    X(string, vehicle_class_id, true) \
-    X(string, team_id, true) \
-    X(string, manufacturer_id, true) \
-    X(string, car_number, true) /* text: 007 is not 7 */ \
-    X(f64, vehicle_width, true) /* as reported by the simulator */ \
-    X(f64, vehicle_length, true) \
     X(string, front_tire_compound_name, true) /* the simulator's name, car-specific */ \
     X(string, rear_tire_compound_name, true) \
-    X(string, terrain_front_left, true) /* the simulator's material name under each of the player's tires: others' would add a row at every kerb */ \
-    X(string, terrain_front_right, true) \
-    X(string, terrain_rear_left, true) \
-    X(string, terrain_rear_right, true) \
     X(i64, position, true)                   /* overall, 1-based */                                       \
-    X(i64, class_position, true) /* within its class, 1-based, as reported by the simulator */ \
     X(i64, qualifying_position, true)                                                                     \
     X(i64, laps_completed, true)                                                                          \
     X(i64, sector, true)                     /* zero-based, as in telemetry */                            \
@@ -156,7 +138,6 @@
     X(boolean, scored, true)                                                                              \
     X(boolean, headlights, true)                                                                          \
     X(boolean, drs_active, true)                                                                          \
-    X(boolean, push_to_pass_active, true) \
     X(i64, attack_mode, true)                /* as reported by the simulator */                           \
     X(f64, time_behind_leader, false)                                                                     \
     X(f64, time_behind_next, false)                                                                       \
