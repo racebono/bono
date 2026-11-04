@@ -852,6 +852,8 @@ fn scoring(
         false => format!("{track} - {layout}"),
     };
     session.track = Some(track).into();
+    session.pit_speed_limit = positive(shared.session_pit_speed_limit).into();
+    session.max_incident_points = setting(shared.max_incident_points).into();
     session.track_length = non_negative(shared.layout_length).into();
     session.session_type = match shared.session_type {
         R3E_SESSION_PRACTICE => Some("practice"),
@@ -2116,6 +2118,8 @@ mod tests {
         player.current_downforce = 5000.0;
         shared.player = player;
         shared.drs.engaged = 1;
+        shared.session_pit_speed_limit = 16.67;
+        shared.max_incident_points = 25;
         let mut drivers = shared.all_drivers_data_1;
         drivers[0].tire_subtype_front = R3E_TIRE_SUBTYPE_SOFT;
         drivers[0].tire_subtype_rear = -1;
@@ -2140,7 +2144,9 @@ mod tests {
         assert_eq!(mine.state.max_gears.get(), Some(6));
         assert_eq!(mine.state.steering_wheel_range.get(), Some(540.0));
 
-        let (_, standings) = update.scoring.unwrap();
+        let (session, standings) = update.scoring.unwrap();
+        assert_eq!(session.pit_speed_limit.get(), Some(16.67f32 as f64));
+        assert_eq!(session.max_incident_points.get(), Some(25));
         let theirs = standings
             .iter()
             .find(|s| s.vehicle_id.get() == Some(3))
@@ -2153,6 +2159,8 @@ mod tests {
 
         // Not the player's car: the range isn't documented for it
         shared.control_type = R3E_CONTROL_AI;
+        shared.session_pit_speed_limit = -1.0;
+        shared.max_incident_points = -1;
         let update = Converter::default()
             .convert(&shared, Instant::now())
             .unwrap();
@@ -2162,6 +2170,9 @@ mod tests {
             .find(|t| t.vehicle_id.get() == Some(7))
             .unwrap();
         assert_eq!(mine.state.steering_wheel_range.get(), None);
+        let (session, _) = update.scoring.unwrap();
+        assert_eq!(session.pit_speed_limit.get(), None);
+        assert_eq!(session.max_incident_points.get(), None);
     }
 
     #[test]

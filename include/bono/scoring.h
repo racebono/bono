@@ -56,6 +56,8 @@
     X(i64, track_grip_level, true)           /* as reported by the simulator */                           \
     X(i64, track_limits_steps_per_penalty, true)                                                          \
     X(i64, track_limits_steps_per_point, true)                                                            \
+    X(f64, pit_speed_limit, true) /* m/s; applies in the pit lane only */ \
+    X(i64, max_incident_points, true) /* not the same thing as track limits */ \
     X(string, pit_window_status, true)       /* the player's: disabled, closed, open, stopped, completed */   \
     X(i64, pit_window_start_lap, true)       /* the window, in laps-based sessions */                       \
     X(i64, pit_window_end_lap, true)                                                                      \

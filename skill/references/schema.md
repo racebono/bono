@@ -191,6 +191,7 @@ C = compared (a change adds a row); S = snapshot (stored with each row, never tr
 | `track_wetness_min/max/average` C (0-1, on the racing line), `track_grip_level` C | |
 | `pit_window_status` C | the player's pit window: disabled, closed, open, stopped (stop in progress), completed; not reported by LMU |
 | `pit_window_start_lap` C, `pit_window_end_lap` C, `pit_window_start_time` C, `pit_window_end_time` C | when the window is open: laps in lap-based races, session time (s) in timed ones |
+| `pit_speed_limit` C (m/s, pit lane only), `max_incident_points` C | RaceRoom only for now; NULL on LMU. Incident points are not track limits |
 | `track_limits_steps_per_penalty` C, `track_limits_steps_per_point` C | compare with `car_state.track_limits_steps`: points left before a penalty = (per_penalty - steps) / per_point |
 
 ## 6. Column guide - `standings`
