@@ -745,6 +745,56 @@ mod tests {
             .join(exe)
     }
 
+    #[cfg(windows)]
+    fn hidden_command(exe: &str) -> std::process::Command {
+        use std::os::windows::process::CommandExt as _;
+
+        let mut command = std::process::Command::new(system(exe));
+        // These console programs stand in for the GUI app during installer tests.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    }
+
+    /// A self-exiting stand-in that ShellExecute can launch without opening a console.
+    #[cfg(windows)]
+    fn gui_stand_in(exe: &str, destination: &Path) {
+        let mut image = std::fs::read(system(exe)).unwrap();
+        // Microsoft's PE format: e_lfanew points to the four-byte PE signature,
+        // followed by a 20-byte COFF header. Subsystem is at optional-header offset 68
+        // in both PE32 and PE32+. Only the temporary copy is changed.
+        // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format
+        assert_eq!(&image[..2], b"MZ");
+        let pe = u32::from_le_bytes(image[0x3c..0x40].try_into().unwrap()) as usize;
+        assert_eq!(&image[pe..pe + 4], b"PE\0\0");
+        let optional = pe + 4 + 20;
+        let magic = u16::from_le_bytes(image[optional..optional + 2].try_into().unwrap());
+        assert!(matches!(magic, 0x10b | 0x20b));
+        let subsystem = optional + 68;
+        assert_eq!(&image[subsystem..subsystem + 2], &3u16.to_le_bytes());
+        image[subsystem..subsystem + 2].copy_from_slice(&2u16.to_le_bytes());
+        std::fs::write(destination, image).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gui_stand_ins_exit_successfully() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join(EXE);
+        for source in ["whoami.exe", "hostname.exe"] {
+            gui_stand_in(source, &exe);
+            // No console-suppression flags: the GUI subsystem must suffice on its own.
+            assert!(
+                std::process::Command::new(&exe)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+
     /// An unpacked version, with something that opens and exits by itself for the app
     #[cfg(windows)]
     fn unpacked(staging: &Staging, release: &Release) {
@@ -752,7 +802,7 @@ mod tests {
         std::fs::create_dir_all(ready.join("assets")).unwrap();
         std::fs::write(ready.join("assets/new.txt"), "new").unwrap();
         std::fs::write(ready.join("changed.txt"), "new").unwrap();
-        std::fs::copy(system("whoami.exe"), ready.join(EXE)).unwrap();
+        gui_stand_in("whoami.exe", &ready.join(EXE));
     }
 
     /// An installed version, with a file the new one doesn't have
@@ -763,7 +813,7 @@ mod tests {
         std::fs::write(install.join("assets/a.txt"), "a").unwrap();
         std::fs::write(install.join("changed.txt"), "old").unwrap();
         std::fs::write(install.join("kept.txt"), "kept").unwrap();
-        std::fs::copy(system("hostname.exe"), install.join(EXE)).unwrap();
+        gui_stand_in("hostname.exe", &install.join(EXE));
     }
 
     #[cfg(windows)]
@@ -789,7 +839,7 @@ mod tests {
         installed(&install);
 
         // Standing in for the running app
-        let mut app = std::process::Command::new(system("ping.exe"))
+        let mut app = hidden_command("ping.exe")
             .args(["-n", "60", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
@@ -837,7 +887,7 @@ mod tests {
             .open(install.join("assets/old.txt"))
             .unwrap();
 
-        let mut app = std::process::Command::new(system("ping.exe"))
+        let mut app = hidden_command("ping.exe")
             .args(["-n", "60", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
@@ -881,7 +931,7 @@ mod tests {
         let other = Staging::at(&install);
         other.claim().unwrap();
 
-        let mut app = std::process::Command::new(system("ping.exe"))
+        let mut app = hidden_command("ping.exe")
             .args(["-n", "60", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
@@ -905,7 +955,7 @@ mod tests {
     async fn installer_fails_for_a_missing_app() {
         let dir = tempfile::tempdir().unwrap();
         let staging = Staging::at(dir.path());
-        let mut gone = std::process::Command::new(system("whoami.exe"))
+        let mut gone = hidden_command("whoami.exe")
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
