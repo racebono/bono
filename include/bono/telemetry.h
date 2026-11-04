@@ -150,6 +150,7 @@
     X(i64, drs_activations_left) /* this lap; NULL when unlimited or unknown */ \
     X(boolean, drs_activations_unlimited) \
     X(i64, drs_activations_total) \
+    X(f64, incident_points) /* points against the limit, can be fractional. RaceRoom: its incident points. LMU: track-limit points, as it has no collision penalties */ \
     X(boolean, push_to_pass_equipped) \
     X(boolean, push_to_pass_charged) /* NULL on cars without a charge cycle; false while charging */ \
     X(boolean, push_to_pass_engaged) \

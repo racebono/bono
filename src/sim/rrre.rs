@@ -788,6 +788,9 @@ fn player_telemetry(shared: &r3e_shared, out: &mut bono_telemetry) {
         .map(|rps| rps * 60.0 / std::f64::consts::TAU)
         .into();
     state.max_gears = setting(shared.num_gears).into();
+    state.incident_points = setting(shared.incident_points)
+        .map(|points| points as f64)
+        .into();
     let drs = shared.drs;
     state.drs_equipped = flag(drs.equipped).into();
     state.drs_available = flag(drs.available).into();
@@ -885,7 +888,9 @@ fn scoring(
     };
     session.track = Some(track).into();
     session.pit_speed_limit = positive(shared.session_pit_speed_limit).into();
-    session.max_incident_points = setting(shared.max_incident_points).into();
+    session.max_incident_points = setting(shared.max_incident_points)
+        .map(|points| points as f64)
+        .into();
     session.track_length = non_negative(shared.layout_length).into();
     session.session_type = match shared.session_type {
         R3E_SESSION_PRACTICE => Some("practice"),
@@ -2183,6 +2188,7 @@ mod tests {
         };
         shared.session_pit_speed_limit = 16.67;
         shared.max_incident_points = 25;
+        shared.incident_points = 4;
         let mut drivers = shared.all_drivers_data_1;
         drivers[0].tire_subtype_front = R3E_TIRE_SUBTYPE_SOFT;
         drivers[0].tire_subtype_rear = -1;
@@ -2229,6 +2235,7 @@ mod tests {
         assert_eq!(mine.state.push_to_pass_activations_total.get(), None);
         assert!((mine.state.engine_max_rpm.get().unwrap() - 6000.0).abs() < 1e-3);
         assert_eq!(mine.state.max_gears.get(), Some(6));
+        assert_eq!(mine.state.incident_points.get(), Some(4.0));
         for (wheel, compound) in [
             (0, Some(R3E_TIRE_SUBTYPE_SOFT as i64)),
             (1, Some(R3E_TIRE_SUBTYPE_SOFT as i64)),
@@ -2245,7 +2252,7 @@ mod tests {
 
         let (session, standings) = update.scoring.unwrap();
         assert_eq!(session.pit_speed_limit.get(), Some(16.67f32 as f64));
-        assert_eq!(session.max_incident_points.get(), Some(25));
+        assert_eq!(session.max_incident_points.get(), Some(25.0));
         let theirs = standings
             .iter()
             .find(|s| s.vehicle_id.get() == Some(3))
@@ -2285,6 +2292,7 @@ mod tests {
         shared.push_to_pass.available = -1;
         shared.push_to_pass.amount_left = i32::MAX - 2;
         shared.max_incident_points = -1;
+        shared.incident_points = -1;
         let update = Converter::default()
             .convert(&shared, Instant::now())
             .unwrap();
@@ -2295,6 +2303,7 @@ mod tests {
             .unwrap();
         assert_eq!(mine.state.steering_wheel_range.get(), None);
         assert_eq!(mine.state.drs_equipped.get(), None);
+        assert_eq!(mine.state.incident_points.get(), None);
         assert_eq!(mine.state.drs_available.get(), None);
         assert_eq!(mine.state.drs_activations_left.get(), None);
         assert_eq!(mine.state.drs_activations_unlimited.get(), Some(true));

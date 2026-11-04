@@ -2528,6 +2528,15 @@ fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     }
 
     let steps = ctx.player.i("track_limits_steps");
+    // Simulators with track-limit steps get the fuller line below, from the same offences
+    if steps.is_none()
+        && let Some(line) = incident_line(
+            ctx.player.f("incident_points"),
+            sc.session.as_ref().and_then(|s| s.f("max_incident_points")),
+        )
+    {
+        info.push(line);
+    }
     match sc.track_limits(steps) {
         Some((steps, per_penalty, points_left)) if steps != 0 => info.push(format!(
             "track limits: {steps} of {per_penalty} steps, {points_left} more point(s) to a penalty"
@@ -2542,6 +2551,15 @@ fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
         }
     }
     Ok((alerts, info))
+}
+
+/// A car's incident points against the limit, when it has any.
+fn incident_line(points: Option<f64>, max: Option<f64>) -> Option<String> {
+    let points = points.filter(|points| *points > 0.0)?;
+    Some(match max {
+        Some(max) => format!("incident points {points} of {max}"),
+        None => format!("incident points {points}"),
+    })
 }
 
 /// Optional scoring columns also work with recordings made before these fields existed.
@@ -4940,6 +4958,21 @@ fn cmd_sql(ctx: &Ctx, args: &EngineerInput, out: &mut String) -> anyhow::Result<
 mod tests {
     use super::*;
     use crate::sqlite::Database;
+
+    #[test]
+    fn incident_points_are_only_mentioned_when_there_are_some() {
+        assert_eq!(incident_line(None, Some(25.0)), None);
+        assert_eq!(incident_line(Some(0.0), Some(25.0)), None);
+        assert_eq!(
+            incident_line(Some(4.0), Some(25.0)).as_deref(),
+            Some("incident points 4 of 25")
+        );
+        assert_eq!(
+            incident_line(Some(0.75), None).as_deref(),
+            Some("incident points 0.75")
+        );
+    }
+
     use bono_sim::{
         recorder::{DATABASE, Recorder},
         sys::{bono_session_info, bono_standing, bono_telemetry},
