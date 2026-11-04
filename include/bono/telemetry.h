@@ -138,6 +138,15 @@
     X(f64, steering_wheel_range) /* physical; RaceRoom: degrees, full left to full right; LMU: unit and span not documented */ \
     X(f64, engine_max_rpm) /* rev limit, not the best shift point */ \
     X(i64, max_gears) /* forward gears */ \
+    /* The highest value of each control, which does not prove every step differs */ \
+    X(i64, traction_control_max) \
+    X(i64, traction_control_slip_max) \
+    X(i64, traction_control_cut_max) \
+    X(i64, abs_max) \
+    X(i64, engine_map_max) \
+    X(i64, brake_migration_max) \
+    X(i64, front_anti_roll_bar_max) \
+    X(i64, rear_anti_roll_bar_max) \
     X(boolean, push_to_pass_equipped) \
     X(boolean, push_to_pass_charged) /* NULL on cars without a charge cycle; false while charging */ \
     X(boolean, push_to_pass_engaged) \

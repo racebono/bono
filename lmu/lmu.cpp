@@ -115,6 +115,14 @@ static void convert(const TelemInfoV01& in, bono_telemetry_s& out) {
     out.state.abs = in.mABS;
     out.abs_active = in.mABSActive;
     out.state.engine_map = in.mMotorMap;
+    out.state.traction_control_max = in.mTCMax;
+    out.state.traction_control_slip_max = in.mTCSlipMax;
+    out.state.traction_control_cut_max = in.mTCCutMax;
+    out.state.abs_max = in.mABSMax;
+    out.state.engine_map_max = in.mMotorMapMax;
+    out.state.brake_migration_max = in.mMigrationMax;
+    out.state.front_anti_roll_bar_max = in.mFrontAntiSwayMax;
+    out.state.rear_anti_roll_bar_max = in.mRearAntiSwayMax;
     if (in.mPhysicalSteeringWheelRange > 0) out.state.steering_wheel_range = in.mPhysicalSteeringWheelRange;
     if (in.mEngineMaxRPM > 0) out.state.engine_max_rpm = in.mEngineMaxRPM;
     out.state.max_gears = in.mMaxGears;

@@ -2194,6 +2194,10 @@ mod tests {
         assert_eq!(mine.state.push_to_pass_activations_total.get(), None);
         assert!((mine.state.engine_max_rpm.get().unwrap() - 6000.0).abs() < 1e-3);
         assert_eq!(mine.state.max_gears.get(), Some(6));
+        // The game doesn't report the range of any control
+        assert_eq!(mine.state.traction_control_max.get(), None);
+        assert_eq!(mine.state.abs_max.get(), None);
+        assert_eq!(mine.state.engine_map_max.get(), None);
         assert_eq!(mine.state.steering_wheel_range.get(), Some(540.0));
 
         let (session, standings) = update.scoring.unwrap();
