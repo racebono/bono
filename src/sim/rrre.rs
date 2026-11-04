@@ -766,6 +766,9 @@ fn player_telemetry(shared: &r3e_shared, out: &mut bono_telemetry) {
         .into();
     out.speed_limiter_active = flag(shared.pit_limiter).into();
     out.rear_flap_active = flag(shared.drs.engaged).into();
+    let ptp = shared.push_to_pass;
+    out.push_to_pass_active_time_left = non_negative(ptp.engaged_time_left).into();
+    out.push_to_pass_cooldown_left = non_negative(ptp.wait_time_left).into();
 
     out.front_third_spring_deflection =
         Some(player.third_spring_suspension_deflection_front).into();
@@ -785,6 +788,19 @@ fn player_telemetry(shared: &r3e_shared, out: &mut bono_telemetry) {
         .map(|rps| rps * 60.0 / std::f64::consts::TAU)
         .into();
     state.max_gears = setting(shared.num_gears).into();
+    // Exists (1), or for some systems charging (2) or charged (3)
+    state.push_to_pass_equipped = flag(ptp.available).into();
+    state.push_to_pass_charged = match ptp.available {
+        2 => Some(false),
+        3 => Some(true),
+        _ => None,
+    }
+    .into();
+    state.push_to_pass_engaged = flag(ptp.engaged).into();
+    state.push_to_pass_activations_left = setting(ptp.amount_left)
+        .filter(|left| *left < i32::MAX as i64 / 2)
+        .into();
+    state.push_to_pass_activations_total = setting(shared.ptp_numActivationsTotal).into();
     // The game only documents it for a car the player drives
     if shared.control_type == R3E_CONTROL_PLAYER {
         state.steering_wheel_range = Some(shared.steer_wheel_range_degrees)
@@ -983,6 +999,7 @@ fn standing(
         .map(str::to_owned)
         .into();
     out.drs_active = flag(driver.drs_state).into();
+    out.push_to_pass_active = flag(driver.ptp_state).into();
     out.position = setting(driver.place).into();
     out.laps_completed = setting(driver.completed_laps).into();
     out.sector = sector(driver.track_sector).into();
@@ -2121,6 +2138,14 @@ mod tests {
         player.current_downforce = 5000.0;
         shared.player = player;
         shared.drs.engaged = 1;
+        shared.ptp_numActivationsTotal = -1;
+        shared.push_to_pass = r3e_push_to_pass {
+            available: 2,
+            engaged: 0,
+            amount_left: 3,
+            engaged_time_left: -1.0,
+            wait_time_left: 4.0,
+        };
         shared.session_pit_speed_limit = 16.67;
         shared.max_incident_points = 25;
         let mut drivers = shared.all_drivers_data_1;
@@ -2128,6 +2153,8 @@ mod tests {
         drivers[0].tire_subtype_rear = -1;
         drivers[0].tire_type_rear = R3E_TIRE_TYPE_PRIME;
         drivers[0].drs_state = -1;
+        drivers[0].ptp_state = 1;
+        drivers[1].ptp_state = -1;
         drivers[0].driver_info.car_number = 44;
         drivers[1].driver_info.car_number = -1;
         shared.all_drivers_data_1 = drivers;
@@ -2145,6 +2172,13 @@ mod tests {
         assert_eq!(mine.front_downforce.get(), None);
         assert_eq!(mine.rear_downforce.get(), None);
         assert_eq!(mine.rear_flap_active.get(), Some(true));
+        assert_eq!(mine.push_to_pass_cooldown_left.get(), Some(4.0));
+        assert_eq!(mine.push_to_pass_active_time_left.get(), None);
+        assert_eq!(mine.state.push_to_pass_equipped.get(), Some(true));
+        assert_eq!(mine.state.push_to_pass_charged.get(), Some(false));
+        assert_eq!(mine.state.push_to_pass_engaged.get(), Some(false));
+        assert_eq!(mine.state.push_to_pass_activations_left.get(), Some(3));
+        assert_eq!(mine.state.push_to_pass_activations_total.get(), None);
         assert!((mine.state.engine_max_rpm.get().unwrap() - 6000.0).abs() < 1e-3);
         assert_eq!(mine.state.max_gears.get(), Some(6));
         assert_eq!(mine.state.steering_wheel_range.get(), Some(540.0));
@@ -2162,6 +2196,8 @@ mod tests {
             .find(|s| s.vehicle_id.get() == Some(7))
             .unwrap();
         assert_eq!(me.car_number.as_deref(), None);
+        assert_eq!(me.push_to_pass_active.get(), None);
+        assert_eq!(theirs.push_to_pass_active.get(), Some(true));
         assert_eq!(theirs.front_tire_compound_name.as_deref(), Some("soft"));
         assert_eq!(theirs.rear_tire_compound_name.as_deref(), Some("prime"));
         assert_eq!(theirs.drs_active.get(), None);
@@ -2171,6 +2207,9 @@ mod tests {
         // Not the player's car: the range isn't documented for it
         shared.control_type = R3E_CONTROL_AI;
         shared.session_pit_speed_limit = -1.0;
+        // No system, and a system with endless uses
+        shared.push_to_pass.available = -1;
+        shared.push_to_pass.amount_left = i32::MAX - 2;
         shared.max_incident_points = -1;
         let update = Converter::default()
             .convert(&shared, Instant::now())
@@ -2181,6 +2220,9 @@ mod tests {
             .find(|t| t.vehicle_id.get() == Some(7))
             .unwrap();
         assert_eq!(mine.state.steering_wheel_range.get(), None);
+        assert_eq!(mine.state.push_to_pass_equipped.get(), None);
+        assert_eq!(mine.state.push_to_pass_charged.get(), None);
+        assert_eq!(mine.state.push_to_pass_activations_left.get(), None);
         let (session, _) = update.scoring.unwrap();
         assert_eq!(session.pit_speed_limit.get(), None);
         assert_eq!(session.max_incident_points.get(), None);

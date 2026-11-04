@@ -96,6 +96,8 @@
     X(boolean, traction_control_active)                                                                  \
     X(boolean, abs_active)                                                                               \
     X(boolean, speed_limiter_active)                                                                     \
+    X(f64, push_to_pass_active_time_left) /* seconds */ \
+    X(f64, push_to_pass_cooldown_left) /* seconds until it can be used again */ \
     /* Chassis and aerodynamics */                                                                       \
     X(f64, front_third_spring_deflection)                                                                \
     X(f64, rear_third_spring_deflection)                                                                 \
@@ -136,6 +138,11 @@
     X(f64, steering_wheel_range) /* physical; RaceRoom: degrees, full left to full right; LMU: unit and span not documented */ \
     X(f64, engine_max_rpm) /* rev limit, not the best shift point */ \
     X(i64, max_gears) /* forward gears */ \
+    X(boolean, push_to_pass_equipped) \
+    X(boolean, push_to_pass_charged) /* NULL on cars without a charge cycle; false while charging */ \
+    X(boolean, push_to_pass_engaged) \
+    X(i64, push_to_pass_activations_left) /* NULL when unlimited or unknown */ \
+    X(i64, push_to_pass_activations_total) \
     /* Fuel */                                                                                           \
     X(f64, fuel_capacity)                   /* liters */                                                 \
     X(f64, fuel_per_lap)                    /* liters, the simulator's own estimate */                   \

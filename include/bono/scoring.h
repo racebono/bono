@@ -141,6 +141,7 @@
     X(boolean, scored, true)                                                                              \
     X(boolean, headlights, true)                                                                          \
     X(boolean, drs_active, true)                                                                          \
+    X(boolean, push_to_pass_active, true) \
     X(i64, attack_mode, true)                /* as reported by the simulator */                           \
     X(f64, time_behind_leader, false)                                                                     \
     X(f64, time_behind_next, false)                                                                       \

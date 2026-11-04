@@ -151,6 +151,7 @@ lateral + right, vertical + up. Pitch + nose up, yaw + turning right, roll + lea
 | Energy | `fuel` (L), `virtual_energy`, `battery_charge` (0-1), `state_of_charge`, `regeneration_power` (kW), `electric_motor_torque/rpm/temperature/water_temperature`, `electric_motor_state` (0 n/a, 1 inactive, 2 propulsion, 3 regen), `lift_and_coast_progress` | |
 | Aids / setup | `traction_control_active`, `abs_active`, `speed_limiter_active`; in `car_state`: `traction_control`, `traction_control_slip`, `traction_control_cut`, `abs`, `engine_map`, `brake_migration`, `rear_brake_bias`, `front_anti_roll_bar`, `rear_anti_roll_bar`, `speed_limiter_on`, `headlights`, `wipers`, `front_tire_compound`, `rear_tire_compound`, `scheduled_pit_stops`, `steering_wheel_range` (physical; degrees lock to lock in RaceRoom, not documented by LMU) | a setting change is a new `car_state` row |
 | Aero / chassis | `front_third_spring_deflection`, `rear_third_spring_deflection`, `front_wing_height`, `front_ride_height`, `rear_ride_height`, `drag`, `total_downforce`, `front_downforce`, `rear_downforce` (N), `front_flap_active`, `rear_flap_active`; in `car_state`: `rear_flap_status` | |
+| Push to pass | `push_to_pass_active_time_left`, `push_to_pass_cooldown_left` (s); in `car_state`: `push_to_pass_equipped`, `push_to_pass_charged` (NULL without a charge cycle), `push_to_pass_engaged`, `push_to_pass_activations_left` (NULL when unlimited or unknown), `push_to_pass_activations_total` | RaceRoom's player only for now; NULL on LMU, whose `standings.attack_mode` is separate |
 | Fuel (in `car_state`) | `fuel_capacity` (L), `fuel_per_lap` (L, the sim's own estimate), `virtual_energy_per_lap` (fraction of a full tank, the sim's estimate) | LMU only reports the capacity |
 | Damage (all in `car_state`) | `engine_damage`, `transmission_damage`, `aerodynamics_damage`, `suspension_damage` (0 none - 1 destroyed; not reported by LMU), `parts_detached`, `dent_severity_0..7` (8 locations; 0 none, 1 some, 2 more), `last_impact_time` (session time), `last_impact_magnitude`, `last_impact_position_x/y/z` | a new impact = `last_impact_time` changes |
 
@@ -217,7 +218,7 @@ C = compared (a change adds a row); S = snapshot (stored with each row, never tr
 | `control` C | player, ai, remote, replay |
 | `phase` C | the car's own phase: the session phases plus after_formation, under_yellow, under_blue |
 | `flag` C | green or blue (blue = being lapped, let the faster car by) |
-| `under_yellow` C, `lap_counts` C, `lap_time_counts` C, `scored` C, `headlights` C, `drs_active` C, `attack_mode` C | |
+| `under_yellow` C, `lap_counts` C, `lap_time_counts` C, `scored` C, `headlights` C, `drs_active` C, `push_to_pass_active` C (RaceRoom only for now), `attack_mode` C | |
 | `time_behind_leader` S, `time_behind_next` S | seconds, at the moment of the row |
 | `lap_distance` S, `time_into_lap` S, `estimated_lap_time` S | metres around the lap, etc. |
 | `fuel_fraction` S | fuel or battery left, 0-1 (other cars too) |
