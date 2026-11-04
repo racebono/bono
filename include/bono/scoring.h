@@ -78,6 +78,7 @@
     X(string, front_tire_compound_name, true) /* the simulator's name, car-specific */ \
     X(string, rear_tire_compound_name, true) \
     X(i64, position, true)                   /* overall, 1-based */                                       \
+    X(i64, class_position, true) /* within its class, 1-based: reported by the simulator, or calculated from position and vehicle_class */ \
     X(i64, qualifying_position, true)                                                                     \
     X(i64, laps_completed, true)                                                                          \
     X(i64, sector, true)                     /* zero-based, as in telemetry */                            \

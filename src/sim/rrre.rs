@@ -1005,6 +1005,9 @@ fn standing(
     out.drs_active = flag(driver.drs_state).into();
     out.push_to_pass_active = flag(driver.ptp_state).into();
     out.position = setting(driver.place).into();
+    out.class_position = Some(driver.place_class as i64)
+        .filter(|place| *place > 0)
+        .into();
     out.laps_completed = setting(driver.completed_laps).into();
     out.sector = sector(driver.track_sector).into();
     out.finish_status = match driver.finish_status {
@@ -2160,6 +2163,8 @@ mod tests {
         drivers[0].ptp_state = 1;
         drivers[1].ptp_state = -1;
         drivers[0].driver_info.car_number = 44;
+        drivers[0].place_class = 2;
+        drivers[1].place_class = -1;
         drivers[0].driver_info.car_width = 1.75;
         drivers[0].driver_info.car_length = 4.5;
         drivers[1].driver_info.car_width = -1.0;
@@ -2199,6 +2204,7 @@ mod tests {
             .find(|s| s.vehicle_id.get() == Some(3))
             .unwrap();
         assert_eq!(theirs.car_number.as_deref(), Some("44"));
+        assert_eq!(theirs.class_position.get(), Some(2));
         assert_eq!(theirs.vehicle_width.get(), Some(1.75));
         assert_eq!(theirs.vehicle_length.get(), Some(4.5));
         let me = standings
@@ -2206,6 +2212,7 @@ mod tests {
             .find(|s| s.vehicle_id.get() == Some(7))
             .unwrap();
         assert_eq!(me.car_number.as_deref(), None);
+        assert_eq!(me.class_position.get(), None);
         assert_eq!(me.vehicle_width.get(), None);
         assert_eq!(me.vehicle_length.get(), None);
         assert_eq!(me.push_to_pass_active.get(), None);

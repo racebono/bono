@@ -16,6 +16,7 @@ use std::{
 };
 
 mod car_numbers;
+mod class_positions;
 mod forecast;
 
 use car_numbers::CarNumbers;
@@ -126,6 +127,7 @@ pub unsafe extern "C" fn bono_lmu_push_scoring(
     guard((), move || {
         let mut standings = standings;
         numbers.fill(&mut standings);
+        class_positions::fill(&mut standings);
         recorder.push_scoring(session, standings)
     })
 }
