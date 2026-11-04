@@ -60,6 +60,8 @@ try {
 $lock.Dispose()
 # Start-Process would take brackets in the paths for wildcards
 $start = New-Object Diagnostics.ProcessStartInfo -Property @{
-    FileName = Join-Path $target 'bono.exe'; WorkingDirectory = $target; UseShellExecute = $true
+    FileName = Join-Path $target 'bono.exe'; WorkingDirectory = $target
+    # Launch directly so console-based test stand-ins don't open terminal windows.
+    UseShellExecute = $false; CreateNoWindow = $true
 }
 $null = [Diagnostics.Process]::Start($start)

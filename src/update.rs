@@ -745,6 +745,17 @@ mod tests {
             .join(exe)
     }
 
+    #[cfg(windows)]
+    fn hidden_command(exe: &str) -> std::process::Command {
+        use std::os::windows::process::CommandExt as _;
+
+        let mut command = std::process::Command::new(system(exe));
+        // These console programs stand in for the GUI app during installer tests.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    }
+
     /// An unpacked version, with something that opens and exits by itself for the app
     #[cfg(windows)]
     fn unpacked(staging: &Staging, release: &Release) {
@@ -789,7 +800,7 @@ mod tests {
         installed(&install);
 
         // Standing in for the running app
-        let mut app = std::process::Command::new(system("ping.exe"))
+        let mut app = hidden_command("ping.exe")
             .args(["-n", "60", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
@@ -837,7 +848,7 @@ mod tests {
             .open(install.join("assets/old.txt"))
             .unwrap();
 
-        let mut app = std::process::Command::new(system("ping.exe"))
+        let mut app = hidden_command("ping.exe")
             .args(["-n", "60", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
@@ -881,7 +892,7 @@ mod tests {
         let other = Staging::at(&install);
         other.claim().unwrap();
 
-        let mut app = std::process::Command::new(system("ping.exe"))
+        let mut app = hidden_command("ping.exe")
             .args(["-n", "60", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
@@ -905,7 +916,7 @@ mod tests {
     async fn installer_fails_for_a_missing_app() {
         let dir = tempfile::tempdir().unwrap();
         let staging = Staging::at(dir.path());
-        let mut gone = std::process::Command::new(system("whoami.exe"))
+        let mut gone = hidden_command("whoami.exe")
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
