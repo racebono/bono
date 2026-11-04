@@ -973,6 +973,9 @@ fn standing(
         .filter(|class| *class >= 0)
         .map(|class| format!("class {class}"))
         .into();
+    out.car_number = setting(info.car_number)
+        .map(|number| number.to_string())
+        .into();
     out.front_tire_compound_name = compound_name(driver.tire_type_front, driver.tire_subtype_front)
         .map(str::to_owned)
         .into();
@@ -2125,6 +2128,8 @@ mod tests {
         drivers[0].tire_subtype_rear = -1;
         drivers[0].tire_type_rear = R3E_TIRE_TYPE_PRIME;
         drivers[0].drs_state = -1;
+        drivers[0].driver_info.car_number = 44;
+        drivers[1].driver_info.car_number = -1;
         shared.all_drivers_data_1 = drivers;
 
         let update = Converter::default()
@@ -2151,6 +2156,12 @@ mod tests {
             .iter()
             .find(|s| s.vehicle_id.get() == Some(3))
             .unwrap();
+        assert_eq!(theirs.car_number.as_deref(), Some("44"));
+        let me = standings
+            .iter()
+            .find(|s| s.vehicle_id.get() == Some(7))
+            .unwrap();
+        assert_eq!(me.car_number.as_deref(), None);
         assert_eq!(theirs.front_tire_compound_name.as_deref(), Some("soft"));
         assert_eq!(theirs.rear_tire_compound_name.as_deref(), Some("prime"));
         assert_eq!(theirs.drs_active.get(), None);

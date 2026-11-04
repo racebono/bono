@@ -72,6 +72,7 @@
     X(string, vehicle, true)                                                                              \
     X(string, vehicle_class, true)                                                                        \
     X(string, team, true)                                                                                 \
+    X(string, car_number, true) /* text: 007 is not 7 */ \
     X(string, front_tire_compound_name, true) /* the simulator's name, car-specific */ \
     X(string, rear_tire_compound_name, true) \
     X(i64, position, true)                   /* overall, 1-based */                                       \

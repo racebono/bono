@@ -4,7 +4,7 @@
 #![cfg(windows)]
 
 use bono_sim::{
-    recorder::{self, Recorder},
+    recorder::{self, ForecastSource, Recorder},
     sys::{bono_session_info, bono_standing, bono_telemetry},
 };
 use std::{
@@ -12,12 +12,24 @@ use std::{
     os::windows::ffi::OsStringExt,
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
+    sync::Arc,
 };
 
+mod car_numbers;
 mod forecast;
 
+use car_numbers::CarNumbers;
+
 /// What `bono_lmu_recorder*` points to.
-pub struct LmuRecorder(Recorder);
+pub struct LmuRecorder(Recorder, Arc<CarNumbers>);
+
+/// What the recorder's writer thread reads from the web API now and then.
+fn web_api(numbers: Arc<CarNumbers>) -> ForecastSource {
+    Box::new(move |session_time| {
+        numbers.refresh();
+        forecast::fetch(session_time)
+    })
+}
 
 /// # Safety
 /// `dir` must be valid for reads of `len` UTF-16 units.
@@ -25,8 +37,9 @@ pub struct LmuRecorder(Recorder);
 pub unsafe extern "C" fn bono_lmu_open(dir: *const u16, len: usize) -> *mut LmuRecorder {
     let dir = unsafe { path(dir, len) };
     guard(std::ptr::null_mut(), || {
-        match Recorder::new(dir, Some(Box::new(forecast::fetch))) {
-            Ok(recorder) => Box::into_raw(Box::new(LmuRecorder(recorder))),
+        let numbers = Arc::new(CarNumbers::default());
+        match Recorder::new(dir, Some(web_api(numbers.clone()))) {
+            Ok(recorder) => Box::into_raw(Box::new(LmuRecorder(recorder, numbers))),
             Err(_) => std::ptr::null_mut(),
         }
     })
@@ -36,9 +49,9 @@ pub unsafe extern "C" fn bono_lmu_open(dir: *const u16, len: usize) -> *mut LmuR
 /// `recorder` must come from `bono_lmu_open`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bono_lmu_restart(recorder: *mut LmuRecorder) {
-    let recorder = unsafe { &mut (*recorder).0 };
+    let LmuRecorder(recorder, numbers) = unsafe { &mut *recorder };
     guard((), || {
-        let _ = recorder.restart(Some(Box::new(forecast::fetch)));
+        let _ = recorder.restart(Some(web_api(numbers.clone())));
     })
 }
 
@@ -101,7 +114,7 @@ pub unsafe extern "C" fn bono_lmu_push_scoring(
     standings: *mut bono_standing,
     count: usize,
 ) {
-    let recorder = unsafe { &(*recorder).0 };
+    let LmuRecorder(recorder, numbers) = unsafe { &*recorder };
     let session = std::mem::take(unsafe { &mut *session });
     let standings = match count {
         0 => Vec::new(),
@@ -110,7 +123,11 @@ pub unsafe extern "C" fn bono_lmu_push_scoring(
             .map(std::mem::take)
             .collect::<Vec<_>>(),
     };
-    guard((), move || recorder.push_scoring(session, standings))
+    guard((), move || {
+        let mut standings = standings;
+        numbers.fill(&mut standings);
+        recorder.push_scoring(session, standings)
+    })
 }
 
 /// # Safety
