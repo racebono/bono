@@ -29,7 +29,7 @@ use std::{
     mem::MaybeUninit,
     num::{NonZero, NonZeroUsize},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::runtime::Handle;
@@ -57,8 +57,8 @@ const GPU_BACKEND: bool = cfg!(any(
 const RECOMMENDED: &str = "ggml-large-v3-turbo-q5_0.bin";
 
 pub struct Whisper {
-    /// Shared with the workers creating each recording's state; only ever freed on one
-    ctx: Option<MaybeDone<Option<Arc<WhisperContext>>>>,
+    /// Model and reusable session, shared with workers and only freed on one.
+    ctx: Option<MaybeDone<Option<Arc<WhisperModel>>>>,
     /// The model `ctx` is loaded from
     loaded: Option<Arc<Utf8Path>>,
     /// Whether `ctx` was loaded to run on the GPU
@@ -389,28 +389,9 @@ impl Whisper {
             stream.resume()?;
             log::debug!("Started microphone recording");
 
-            // Creating the state allocates whisper's buffers (on the GPU too): a worker does it
-            // while the microphone records, and `finish` waits for it there
-            let (send_session, session) = oneshot::channel();
-            let threads = self.threads;
-            let gpu = GPU_BACKEND && self.loaded_gpu;
-            // Detached: this crate's `spawn_blocking` handle would cancel it once dropped
-            rt.spawn_blocking(move || {
-                let start = Instant::now();
-                let session = ctx.create_state().map(|state| WhisperSession {
-                    state,
-                    threads,
-                    gpu,
-                    multilingual: ctx.is_multilingual(),
-                });
-                log::debug!("Created whisper's state in {:?}", start.elapsed());
-                // Unheard if the recording was dropped meanwhile: it's freed here then
-                let _ = send_session.send(session.map_err(Into::into));
-            });
-
             return Ok::<_, anyhow::Error>(WhisperStream {
                 recv,
-                session: PendingSession(DropInBackground::new(session)),
+                session: PendingSession(DropInBackground::new(ctx)),
                 stream,
             });
         };
@@ -582,13 +563,19 @@ impl Whisper {
         self.loaded_gpu = gpu;
         // The model replaced (or still loading) is freed on a worker
         drop_in_background(self.ctx.take());
+        let threads = self.threads;
         self.ctx = Some(MaybeDone::spawn_blocking(move || {
             let mut params = WhisperContextParameters::default();
             params.use_gpu(gpu);
             match WhisperContext::new_with_params(path.as_os_str(), params) {
                 Ok(ctx) => {
                     log::info!("Loaded {path} for speech to text (GPU: {gpu})");
-                    Some(Arc::new(ctx))
+                    Some(Arc::new(WhisperModel {
+                        ctx,
+                        session: SessionCache::default(),
+                        threads,
+                        gpu: GPU_BACKEND && gpu,
+                    }))
                 }
                 Err(e) => {
                     error(t!("error.stt_model"), e);
@@ -694,16 +681,47 @@ impl<T: Send + 'static> Drop for DropInBackground<T> {
     }
 }
 
-/// The recording's [`WhisperSession`], while a worker creates it. Dropped, the session is freed
-/// on a worker, whether or not it's created yet.
-struct PendingSession(DropInBackground<oneshot::Receiver<anyhow::Result<WhisperSession>>>);
+/// One loaded model generation. Workers serialize access instead of allocating a second state.
+struct WhisperModel {
+    ctx: WhisperContext,
+    session: SessionCache<WhisperSession>,
+    threads: NonZeroUsize,
+    gpu: bool,
+}
 
-impl PendingSession {
-    /// Blocks until the session is created: call it from a worker.
-    fn wait(self) -> anyhow::Result<WhisperSession> {
-        self.0.into_inner().recv()?
+/// Access only on blocking workers: initialization, use and destruction can all be expensive.
+struct SessionCache<T>(Mutex<Option<T>>);
+
+impl<T> Default for SessionCache<T> {
+    fn default() -> Self {
+        Self(Mutex::new(None))
     }
 }
+
+impl<T> SessionCache<T> {
+    fn run<R>(
+        &self,
+        create: impl FnOnce() -> anyhow::Result<T>,
+        use_session: impl FnOnce(&mut T) -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
+        let mut cached = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Whisper session worker panicked"))?;
+        if cached.is_none() {
+            *cached = Some(create()?);
+        }
+        let result = use_session(cached.as_mut().unwrap());
+        // Recovery after a partial library failure isn't guaranteed. Retry with a new state.
+        if result.is_err() {
+            *cached = None;
+        }
+        result
+    }
+}
+
+/// A recording retains its model generation, including when settings change mid-recording.
+struct PendingSession(DropInBackground<Arc<WhisperModel>>);
 
 pub struct WhisperSession {
     state: WhisperState,
@@ -743,8 +761,6 @@ impl PendingSession {
 
         return spawn_blocking(move || {
             let start = Instant::now();
-            let mut session = self.wait()?;
-            let waited = start.elapsed();
             let samples = recv.recv()??;
             log::debug!("Sample count: {}", samples.len());
             if samples.len() < MIN_SAMPLES {
@@ -760,39 +776,53 @@ impl PendingSession {
             if voices.is_empty() {
                 return Ok(Heard::NoVoice(None));
             }
-            // The English-only model only hears English
-            if !session.multilingual && !voices.contains(&arrstr!("en")) {
+            let model = self.0.into_inner();
+            if !model.ctx.is_multilingual() && !voices.contains(&arrstr!("en")) {
                 return Ok(Heard::NoVoice(Some(arrstr!("en"))));
             }
-
-            let mel = Instant::now();
-            session.state.pcm_to_mel(&samples, session.threads.get())?;
-            drop(samples);
-            let detect = Instant::now();
-            let spoken = session.detect_language(&voices, min_confidence)?;
-            let transcribe = Instant::now();
-            // Something said in a language without a voice is still transcribed: if it's no
-            // words after all, it was noise
-            let heard = match spoken {
-                Spoken::Voiced(lang) => match session.speech_to_text(lang)? {
-                    text if text.is_empty() => Heard::Nothing,
-                    text => Heard::Question { text, lang },
+            model.session.run(
+                || {
+                    let start = Instant::now();
+                    let state = model.ctx.create_state()?;
+                    log::debug!("Created whisper's state in {:?}", start.elapsed());
+                    Ok(WhisperSession {
+                        state,
+                        threads: model.threads,
+                        gpu: model.gpu,
+                        multilingual: model.ctx.is_multilingual(),
+                    })
                 },
-                Spoken::Unvoiced(lang) => match session.speech_to_text(lang)? {
-                    text if text.is_empty() => Heard::Nothing,
-                    text => Heard::Unvoiced { text, lang },
+                |session| {
+                    let waited = start.elapsed();
+                    let mel = Instant::now();
+                    session.state.pcm_to_mel(&samples, session.threads.get())?;
+                    let detect = Instant::now();
+                    let spoken = session.detect_language(&voices, min_confidence)?;
+                    let transcribe = Instant::now();
+                    // Something said in a language without a voice is still transcribed: if it's no
+                    // words after all, it was noise
+                    let heard = match spoken {
+                        Spoken::Voiced(lang) => match session.speech_to_text(lang, &samples)? {
+                            text if text.is_empty() => Heard::Nothing,
+                            text => Heard::Question { text, lang },
+                        },
+                        Spoken::Unvoiced(lang) => match session.speech_to_text(lang, &samples)? {
+                            text if text.is_empty() => Heard::Nothing,
+                            text => Heard::Unvoiced { text, lang },
+                        },
+                        Spoken::Unclear => Heard::Nothing,
+                    };
+                    log::debug!(
+                        "Speech to text took {:?}: waited {waited:?} for the state, {:?} for the mel, {:?} \
+                         detecting the language, {:?} transcribing",
+                        start.elapsed(),
+                        detect - mel,
+                        transcribe - detect,
+                        transcribe.elapsed(),
+                    );
+                    return Ok(heard);
                 },
-                Spoken::Unclear => Heard::Nothing,
-            };
-            log::debug!(
-                "Speech to text took {:?}: waited {waited:?} for the state, {:?} for the mel, {:?} \
-                 detecting the language, {:?} transcribing",
-                start.elapsed(),
-                detect - mel,
-                transcribe - detect,
-                transcribe.elapsed(),
-            );
-            return Ok(heard);
+            )
         });
     }
 }
@@ -823,7 +853,7 @@ impl WhisperSession {
     }
 
     /// What was said in `lang`: empty if it's no words.
-    fn speech_to_text(&mut self, lang: ArrayStr<2>) -> anyhow::Result<String> {
+    fn speech_to_text(&mut self, lang: ArrayStr<2>, samples: &[f32]) -> anyhow::Result<String> {
         // Beam search is more accurate, but several times the work: on the CPU, that's seconds
         let mut params = FullParams::new(if self.gpu {
             SamplingStrategy::BeamSearch {
@@ -836,6 +866,8 @@ impl WhisperSession {
 
         params.set_n_threads(c_int::try_from(self.threads.get()).unwrap_or(c_int::MAX));
         params.set_language(Some(&lang));
+        // Recordings are independent even though their buffers are reused.
+        params.set_no_context(true);
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
@@ -844,7 +876,7 @@ impl WhisperSession {
         params.set_suppress_blank(true);
         params.set_suppress_nst(true);
 
-        self.state.full(params, &[])?;
+        self.state.full(params, samples)?;
         let mut text = String::new();
         for segment in self.state.as_iter() {
             // Whisper makes words up for silence and noise ("Thank you.")
@@ -1372,6 +1404,98 @@ mod tests {
         assert_ne!(dropped_on, std::thread::current().id());
     }
 
+    #[test]
+    fn session_cache_reuses_and_retries_after_errors() {
+        let cache = SessionCache::default();
+        let mut created = 0;
+        for expected in 1..=3 {
+            let count = cache
+                .run(
+                    || {
+                        created += 1;
+                        Ok(0)
+                    },
+                    |state| {
+                        *state += 1;
+                        Ok(*state)
+                    },
+                )
+                .unwrap();
+            assert_eq!(count, expected);
+        }
+        assert_eq!(created, 1);
+        let failed: anyhow::Result<()> = cache.run(
+            || panic!("already cached"),
+            |_| anyhow::bail!("processing failed"),
+        );
+        assert!(failed.is_err());
+        assert!(
+            cache
+                .run::<()>(|| anyhow::bail!("creation failed"), |_| panic!("no state"))
+                .is_err()
+        );
+        assert_eq!(cache.run(|| Ok(42), |state| Ok(*state)).unwrap(), 42);
+    }
+
+    #[test]
+    fn concurrent_runs_share_one_session() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = SessionCache::default();
+        let created = AtomicUsize::new(0);
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    cache
+                        .run(
+                            || {
+                                created.fetch_add(1, Ordering::SeqCst);
+                                Ok(0)
+                            },
+                            |state| {
+                                *state += 1;
+                                Ok(())
+                            },
+                        )
+                        .unwrap();
+                });
+            }
+        });
+        assert_eq!(created.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cache
+                .run(|| panic!("already cached"), |state| Ok(*state))
+                .unwrap(),
+            8
+        );
+        let replacement = SessionCache::default();
+        assert_eq!(replacement.run(|| Ok(0), |state| Ok(*state)).unwrap(), 0);
+        assert_eq!(
+            cache
+                .run(|| panic!("old generation retained"), |state| Ok(*state))
+                .unwrap(),
+            8
+        );
+    }
+
+    #[test]
+    fn cached_session_is_retained_until_model_drops_on_worker() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (send, recv) = std::sync::mpsc::channel();
+        let cache = Arc::new(SessionCache::default());
+        cache.run(|| Ok(DropThread(send)), |_| Ok(())).unwrap();
+        // Cancelling a recording releases only its shared handle.
+        drop(DropInBackground::new(cache.clone()));
+        assert!(recv.try_recv().is_err());
+        drop(DropInBackground::new(cache));
+        assert_ne!(
+            recv.recv_timeout(Duration::from_secs(10)).unwrap(),
+            std::thread::current().id()
+        );
+    }
+
     /// Needs `BONO_WHISPER` (a whisper model) and `BONO_VOICE_EN`/`_ES` (Piper voices).
     #[test]
     #[ignore]
@@ -1396,6 +1520,13 @@ mod tests {
             beep_volume: 0.0,
         };
 
+        let mut session = WhisperSession {
+            state: ctx.create_state().unwrap(),
+            threads,
+            gpu: GPU_BACKEND,
+            multilingual: ctx.is_multilingual(),
+        };
+
         for (lang, text) in [
             (
                 arrstr!("es"),
@@ -1414,12 +1545,6 @@ mod tests {
                 .map(|i| speech.samples[(i as f64 * ratio) as usize])
                 .collect::<Vec<_>>();
 
-            let mut session = WhisperSession {
-                state: ctx.create_state().unwrap(),
-                threads,
-                gpu: GPU_BACKEND,
-                multilingual: ctx.is_multilingual(),
-            };
             session.state.pcm_to_mel(&samples, threads.get()).unwrap();
             let (_, probs) = session.state.lang_detect(0, threads.get()).unwrap();
             for code in ["en", "es"] {
@@ -1431,7 +1556,7 @@ mod tests {
             else {
                 panic!("{lang} wasn't detected among the voices");
             };
-            let heard = session.speech_to_text(detected).unwrap();
+            let heard = session.speech_to_text(detected, &samples).unwrap();
             println!("{lang} -> {detected}: {heard}");
             assert_eq!(detected, lang);
         }
