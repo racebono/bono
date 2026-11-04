@@ -132,8 +132,6 @@
     X(boolean, speed_limiter_on)                                                                         \
     X(boolean, headlights)                                                                               \
     X(i64, wipers)                                                                                       \
-    X(i64, front_tire_compound)             /* index of the compound for this car */                     \
-    X(i64, rear_tire_compound)                                                                           \
     X(i64, scheduled_pit_stops)                                                                          \
     X(f64, steering_wheel_range) /* physical; RaceRoom: degrees, full left to full right; LMU: unit and span not documented */ \
     X(f64, engine_max_rpm) /* rev limit, not the best shift point */ \
@@ -218,7 +216,7 @@
     X(f64, tire_optimal_temperature)        /* unit as reported by the simulator */                     \
     X(f64, tire_wear)                       /* fraction worn */                                         \
     X(f64, tire_vertical_deflection)                                                                     \
-    X(i64, tire_compound)                                                                                \
+    X(i64, tire_compound) /* index of the compound for this car */ \
     X(i64, tire_compound_type)                                                                           \
     X(boolean, tire_flat)                                                                                \
     X(boolean, wheel_detached)

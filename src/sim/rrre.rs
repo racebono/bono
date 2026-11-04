@@ -824,8 +824,6 @@ fn player_telemetry(shared: &r3e_shared, out: &mut bono_telemetry) {
         .filter(|lights| *lights >= 0)
         .map(|lights| lights > 0)
         .into();
-    state.front_tire_compound = setting(shared.tire_subtype_front).into();
-    state.rear_tire_compound = setting(shared.tire_subtype_rear).into();
     state.fuel_capacity = non_negative(shared.fuel_capacity).into();
     state.fuel_per_lap = non_negative(shared.fuel_per_lap).into();
     state.virtual_energy_per_lap = fraction(
@@ -864,6 +862,11 @@ fn player_telemetry(shared: &r3e_shared, out: &mut bono_telemetry) {
         wheel.tire_surface_temperature_right = non_negative(temps[2]).into();
         wheel.tire_optimal_temperature = non_negative(tire_temp[i].optimal_temp).into();
         wheel.tire_wear = non_negative(wear[i]).into();
+        wheel.tire_compound = setting(match i {
+            0 | 1 => shared.tire_subtype_front,
+            _ => shared.tire_subtype_rear,
+        })
+        .into();
     }
 }
 
@@ -2165,6 +2168,8 @@ mod tests {
             engaged: 1,
         };
         shared.drs_numActivationsTotal = 8;
+        shared.tire_subtype_front = R3E_TIRE_SUBTYPE_SOFT;
+        shared.tire_subtype_rear = -1;
         shared.prev_lap_valid = 0;
         let mut brakes = shared.brake_temp;
         brakes[1].optimal_temp = 550.0;
@@ -2226,6 +2231,14 @@ mod tests {
         assert_eq!(mine.state.push_to_pass_activations_total.get(), None);
         assert!((mine.state.engine_max_rpm.get().unwrap() - 6000.0).abs() < 1e-3);
         assert_eq!(mine.state.max_gears.get(), Some(6));
+        for (wheel, compound) in [
+            (0, Some(R3E_TIRE_SUBTYPE_SOFT as i64)),
+            (1, Some(R3E_TIRE_SUBTYPE_SOFT as i64)),
+            (2, None),
+            (3, None),
+        ] {
+            assert_eq!(mine.wheels[wheel].tire_compound.get(), compound);
+        }
         assert_eq!(mine.state.previous_lap_invalidated.get(), Some(true));
         // The game doesn't report the range of any control
         assert_eq!(mine.state.traction_control_max.get(), None);

@@ -134,8 +134,6 @@ static void convert(const TelemInfoV01& in, bono_telemetry_s& out) {
     out.speed_limiter_active = in.mSpeedLimiterActive;
     out.state.headlights = in.mHeadlights;
     out.state.wipers = in.mWiperState;
-    out.state.front_tire_compound = in.mFrontTireCompoundIndex;
-    out.state.rear_tire_compound = in.mRearTireCompoundIndex;
     out.state.scheduled_pit_stops = in.mScheduledStops;
 
     out.front_third_spring_deflection = in.mFront3rdDeflection;
