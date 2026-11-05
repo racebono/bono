@@ -625,17 +625,13 @@ impl Conversation {
                 Some(source) => source.lease(invalid_lease.take().as_deref()).await?,
                 None => None,
             };
-            let sent = Instant::now();
+            let mut timing = RequestTiming::new(request_id.as_deref());
             let resp = self
                 .request(bearer.as_deref(), lease.as_deref(), request_id.as_deref())
                 .send()
                 .await;
             if resp.is_err() {
-                log::debug!(
-                    "Request {}: no response in {:?}",
-                    request_id.as_deref().unwrap_or("without an ID"),
-                    sent.elapsed(),
-                );
+                timing.log("no response");
             }
             let resp = match resp {
                 Ok(resp) => resp,
@@ -652,13 +648,11 @@ impl Conversation {
                 Err(e) => return Err(e).context("Claude request failed"),
             };
 
+            timing.response(&resp);
             let status = resp.status();
-            let timing = RequestTiming::new(&resp, sent);
-            if !status.is_success() {
-                timing.log(format_args!("failed with {status}"));
-            }
             // The token expired: a new one, once, for the same request
             if status == StatusCode::UNAUTHORIZED && rejected.is_none() && bearer.is_some() {
+                timing.log(format_args!("failed with {status}"));
                 rejected = bearer;
                 continue;
             }
@@ -710,6 +704,7 @@ impl Conversation {
             };
             let retry_after = resp.headers().get(RETRY_AFTER).and_then(parse_retry_after);
             let error = ApiError::read(resp).await;
+            timing.log(format_args!("failed with {status}"));
 
             // The lease ended, expired, or its week reset: a new one (or none), once, for the
             // same request
@@ -1546,37 +1541,59 @@ fn start_block(sink: &mut TextSink<'_>, block: &serde_json::Value) {
 }
 
 /// How long a request took, and what the server says it spent the time on: logged next to the
-/// request's ID, which finds it on the server's side too.
+/// request's ID, which finds it on the server's side too. Dropped before being logged, the request
+/// was cancelled: the pilot moved on while it was running.
 struct RequestTiming {
     sent: Instant,
-    headers: Duration,
     id: Option<String>,
+    headers: Option<Duration>,
     server: Option<String>,
+    logged: bool,
 }
 
 impl RequestTiming {
-    fn new(resp: &reqwest::Response, sent: Instant) -> Self {
+    /// `id`: the ID it's sent with, if any, until the response says its own.
+    fn new(id: Option<&str>) -> Self {
         Self {
-            sent,
-            headers: sent.elapsed(),
-            id: resp
-                .headers()
-                .get("request-id")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned),
-            server: server_timing(resp.headers()),
+            sent: Instant::now(),
+            id: id.map(str::to_owned),
+            headers: None,
+            server: None,
+            logged: false,
         }
     }
 
+    /// The response's headers arrived.
+    fn response(&mut self, resp: &reqwest::Response) {
+        self.headers = Some(self.sent.elapsed());
+        let id = resp.headers().get("request-id");
+        if let Some(id) = id.and_then(|id| id.to_str().ok()) {
+            self.id = Some(id.to_owned());
+        }
+        self.server = server_timing(resp.headers());
+    }
+
     /// `outcome`: how the request ended.
-    fn log(&self, outcome: impl Display) {
+    fn log(&mut self, outcome: impl Display) {
+        self.logged = true;
         log::debug!(
-            "Request {}: headers in {:?}, done in {:?}, {outcome}; server: {}",
+            "Request {}: {}, done in {:?}, {outcome}; server: {}",
             self.id.as_deref().unwrap_or("without an ID"),
-            self.headers,
+            self.headers.map_or_else(
+                || "no headers".to_owned(),
+                |headers| format!("headers in {headers:?}"),
+            ),
             self.sent.elapsed(),
             self.server.as_deref().unwrap_or("no timing"),
         );
+    }
+}
+
+impl Drop for RequestTiming {
+    fn drop(&mut self) {
+        if !self.logged {
+            self.log("cancelled");
+        }
     }
 }
 

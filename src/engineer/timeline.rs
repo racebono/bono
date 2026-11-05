@@ -38,7 +38,8 @@ impl Timeline {
         let _ = self.first_text.set(Instant::now());
     }
 
-    /// The model finished its turn. Without this mark, it failed or was cut off.
+    /// The model's turn ended without an error, however it stopped (the `Engineer` log line says
+    /// how). Without this mark, the turn failed or the pilot moved on.
     #[inline]
     pub fn answered(&self) {
         let _ = self.answered.set(Instant::now());
