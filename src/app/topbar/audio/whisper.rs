@@ -753,6 +753,7 @@ impl PendingSession {
         mut stream: RecordingStream<Recorder>,
         config: Config,
     ) -> JoinHandle<anyhow::Result<Heard>> {
+        let released = Instant::now();
         // Supersede queued workers even if capture shutdown below fails. Aborting a started
         // blocking task alone cannot stop it from using the session.
         let ticket = self
@@ -834,7 +835,11 @@ impl PendingSession {
                     let heard = match spoken {
                         Spoken::Voiced(lang) => match session.speech_to_text(lang, &samples)? {
                             text if text.is_empty() => Heard::Nothing,
-                            text => Heard::Question { text, lang },
+                            text => Heard::Question {
+                                text,
+                                lang,
+                                released,
+                            },
                         },
                         Spoken::Unvoiced(lang) => match session.speech_to_text(lang, &samples)? {
                             text if text.is_empty() => Heard::Nothing,

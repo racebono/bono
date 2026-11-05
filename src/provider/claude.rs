@@ -20,7 +20,7 @@ use std::{
     fmt::{self, Display, Formatter},
     num::NonZeroU32,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 /// Where the Claude API is, unless `ConversationBuilder::base_url` says otherwise.
@@ -519,6 +519,7 @@ impl Conversation {
             sink.before_tools();
             let tools = &self.tools;
             let result_limit = self.history_limits.map(|limits| limits.max_bytes / 8);
+            let tools_started = Instant::now();
             let mut results = join_all(calls.iter().map(|call| {
                 let name = call.get("name").and_then(serde_json::Value::as_str);
                 let input = call.get("input");
@@ -548,6 +549,11 @@ impl Conversation {
                 }
             }))
             .await;
+            log::debug!(
+                "Ran {} tool calls in {:?}",
+                calls.len(),
+                tools_started.elapsed()
+            );
 
             // Together, too: the request that carries them back must still fit
             let note = self.result_note.clone();
@@ -619,11 +625,15 @@ impl Conversation {
                 Some(source) => source.lease(invalid_lease.take().as_deref()).await?,
                 None => None,
             };
-            let resp = match self
+            let mut timing = RequestTiming::new(request_id.as_deref());
+            let resp = self
                 .request(bearer.as_deref(), lease.as_deref(), request_id.as_deref())
                 .send()
-                .await
-            {
+                .await;
+            if resp.is_err() {
+                timing.log("no response");
+            }
+            let resp = match resp {
                 Ok(resp) => resp,
                 // The request may never have reached the API: worth another try
                 Err(e)
@@ -638,16 +648,23 @@ impl Conversation {
                 Err(e) => return Err(e).context("Claude request failed"),
             };
 
+            timing.response(&resp);
             let status = resp.status();
             // The token expired: a new one, once, for the same request
             if status == StatusCode::UNAUTHORIZED && rejected.is_none() && bearer.is_some() {
+                timing.log(format_args!("failed with {status}"));
                 rejected = bearer;
                 continue;
             }
 
             if status.is_success() {
                 let said = sink.text.len();
-                match read_response(resp, sink).await {
+                let body = read_response(resp, sink).await;
+                match &body {
+                    Ok(body) => timing.log(format_args!("stopped by {:?}", body.stop_reason)),
+                    Err(_) => timing.log("failed midway"),
+                }
+                match body {
                     Ok(body) => return Ok(body),
                     // Failed midway (e.g. overloaded, or the connection dropped): a retry would
                     // say again what's been said, so only before any text
@@ -687,6 +704,7 @@ impl Conversation {
             };
             let retry_after = resp.headers().get(RETRY_AFTER).and_then(parse_retry_after);
             let error = ApiError::read(resp).await;
+            timing.log(format_args!("failed with {status}"));
 
             // The lease ended, expired, or its week reset: a new one (or none), once, for the
             // same request
@@ -1520,6 +1538,73 @@ fn start_block(sink: &mut TextSink<'_>, block: &serde_json::Value) {
     if block["type"] == "fallback" {
         sink.carry_on();
     }
+}
+
+/// How long a request took, and what the server says it spent the time on: logged next to the
+/// request's ID, which finds it on the server's side too. Dropped before being logged, the request
+/// was cancelled: the pilot moved on while it was running.
+struct RequestTiming {
+    sent: Instant,
+    id: Option<String>,
+    headers: Option<Duration>,
+    server: Option<String>,
+    logged: bool,
+}
+
+impl RequestTiming {
+    /// `id`: the ID it's sent with, if any, until the response says its own.
+    fn new(id: Option<&str>) -> Self {
+        Self {
+            sent: Instant::now(),
+            id: id.map(str::to_owned),
+            headers: None,
+            server: None,
+            logged: false,
+        }
+    }
+
+    /// The response's headers arrived.
+    fn response(&mut self, resp: &reqwest::Response) {
+        self.headers = Some(self.sent.elapsed());
+        let id = resp.headers().get("request-id");
+        if let Some(id) = id.and_then(|id| id.to_str().ok()) {
+            self.id = Some(id.to_owned());
+        }
+        self.server = server_timing(resp.headers());
+    }
+
+    /// `outcome`: how the request ended.
+    fn log(&mut self, outcome: impl Display) {
+        self.logged = true;
+        log::debug!(
+            "Request {}: {}, done in {:?}, {outcome}; server: {}",
+            self.id.as_deref().unwrap_or("without an ID"),
+            self.headers.map_or_else(
+                || "no headers".to_owned(),
+                |headers| format!("headers in {headers:?}"),
+            ),
+            self.sent.elapsed(),
+            self.server.as_deref().unwrap_or("no timing"),
+        );
+    }
+}
+
+impl Drop for RequestTiming {
+    fn drop(&mut self) {
+        if !self.logged {
+            self.log("cancelled");
+        }
+    }
+}
+
+/// The server's `Server-Timing`, which it may split over several header fields.
+fn server_timing(headers: &HeaderMap) -> Option<String> {
+    let values = headers
+        .get_all("server-timing")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then(|| values.join(", "))
 }
 
 /// Reads a response, streamed or whole, handing its text to `sink`.
@@ -3175,6 +3260,18 @@ mod tests {
         assert!(conversation.body.messages.is_empty());
         // Not retried
         assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reads_every_server_timing_field() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(server_timing(&headers), None);
+        headers.append("server-timing", HeaderValue::from_static("upstream;dur=1"));
+        headers.append("server-timing", HeaderValue::from_static("cfWorker;dur=2"));
+        assert_eq!(
+            server_timing(&headers).as_deref(),
+            Some("upstream;dur=1, cfWorker;dur=2")
+        );
     }
 
     #[tokio::test]
