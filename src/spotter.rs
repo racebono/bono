@@ -2396,6 +2396,56 @@ mod tests {
         assert_eq!(translate("car left", arrstr!("ca")), "cotxe a l'esquerra");
     }
 
+    #[test]
+    fn says_calls_in_italian() {
+        for (text, expected) in WARM.into_iter().zip([
+            "auto a sinistra",
+            "auto a destra",
+            "tre affiancati",
+            "libero a sinistra",
+            "libero a destra",
+            "tutto libero",
+        ]) {
+            assert_eq!(translate(text, arrstr!("it")), expected);
+        }
+        assert_eq!(translate("red flag", arrstr!("it")), "bandiera rossa");
+        let call = Raised {
+            text: "rain likely in about {} minutes",
+            number: Some(4),
+            urgent: false,
+            session_time: 0.0,
+        };
+        assert_eq!(
+            call.words(arrstr!("it")),
+            "pioggia probabile tra circa 4 minuti"
+        );
+    }
+
+    #[test]
+    fn every_spotter_call_has_italian_words() {
+        let catalog: serde_json::Value =
+            serde_json::from_str(include_str!("../i18n/intl.json")).unwrap();
+        for (key, translations) in catalog.as_object().unwrap() {
+            if key.starts_with("call.") {
+                let italian = translations["it"].as_str().expect(key);
+                let english = translations["en"].as_str().unwrap();
+                assert!(!italian.is_empty(), "{key}");
+                assert_ne!(italian, english, "{key}");
+                assert_eq!(
+                    italian.matches("{}").count(),
+                    english.matches("{}").count(),
+                    "{key}"
+                );
+                // Said through `translate`, by the right key
+                assert_eq!(
+                    translate(english.to_owned().leak(), arrstr!("it")),
+                    italian,
+                    "{key}"
+                );
+            }
+        }
+    }
+
     /// Prints every call the spotter makes over a recording (`EVAL_DB`), e.g. my-engineer's race
     /// fixture, which ends with a lapped car alongside on the right.
     #[test]
