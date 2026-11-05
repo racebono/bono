@@ -20,7 +20,7 @@ use std::{
     fmt::{self, Display, Formatter},
     num::NonZeroU32,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 /// Where the Claude API is, unless `ConversationBuilder::base_url` says otherwise.
@@ -519,6 +519,7 @@ impl Conversation {
             sink.before_tools();
             let tools = &self.tools;
             let result_limit = self.history_limits.map(|limits| limits.max_bytes / 8);
+            let tools_started = Instant::now();
             let mut results = join_all(calls.iter().map(|call| {
                 let name = call.get("name").and_then(serde_json::Value::as_str);
                 let input = call.get("input");
@@ -548,6 +549,11 @@ impl Conversation {
                 }
             }))
             .await;
+            log::debug!(
+                "Ran {} tool calls in {:?}",
+                calls.len(),
+                tools_started.elapsed()
+            );
 
             // Together, too: the request that carries them back must still fit
             let note = self.result_note.clone();
@@ -619,6 +625,7 @@ impl Conversation {
                 Some(source) => source.lease(invalid_lease.take().as_deref()).await?,
                 None => None,
             };
+            let sent = Instant::now();
             let resp = match self
                 .request(bearer.as_deref(), lease.as_deref(), request_id.as_deref())
                 .send()
@@ -647,8 +654,12 @@ impl Conversation {
 
             if status.is_success() {
                 let said = sink.text.len();
+                let timing = RequestTiming::new(&resp, sent);
                 match read_response(resp, sink).await {
-                    Ok(body) => return Ok(body),
+                    Ok(body) => {
+                        timing.log(&body);
+                        return Ok(body);
+                    }
                     // Failed midway (e.g. overloaded, or the connection dropped): a retry would
                     // say again what's been said, so only before any text
                     Err(e)
@@ -1523,6 +1534,43 @@ fn start_block(sink: &mut TextSink<'_>, block: &serde_json::Value) {
 }
 
 /// Reads a response, streamed or whole, handing its text to `sink`.
+/// How long a request took, and what the server says it spent the time on: logged next to the
+/// request's ID, which finds it on the server's side too.
+struct RequestTiming {
+    sent: Instant,
+    headers: Duration,
+    id: Option<String>,
+    server: Option<String>,
+}
+
+impl RequestTiming {
+    fn new(resp: &reqwest::Response, sent: Instant) -> Self {
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        Self {
+            sent,
+            headers: sent.elapsed(),
+            id: header("request-id"),
+            server: header("server-timing"),
+        }
+    }
+
+    fn log(self, body: &ResponseBody) {
+        log::debug!(
+            "Request {}: headers in {:?}, done in {:?}, stopped by {:?}; server: {}",
+            self.id.as_deref().unwrap_or("without an ID"),
+            self.headers,
+            self.sent.elapsed(),
+            body.stop_reason,
+            self.server.as_deref().unwrap_or("no timing"),
+        );
+    }
+}
+
 async fn read_response(
     mut resp: reqwest::Response,
     sink: &mut TextSink<'_>,

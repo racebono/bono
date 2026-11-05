@@ -398,7 +398,14 @@ impl Stream {
             0 => return Step::Waiting,
             len => {
                 let sentence = self.pending.drain(..len).collect::<String>();
-                (voice.speak(&mut self.transmission, &sentence), false)
+                let started = Instant::now();
+                let samples = voice.speak(&mut self.transmission, &sentence);
+                log::debug!(
+                    "Synthesized {} characters in {:?}",
+                    sentence.chars().count(),
+                    started.elapsed()
+                );
+                (samples, false)
             }
         };
 

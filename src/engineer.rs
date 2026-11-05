@@ -25,6 +25,7 @@ use std::{
     task::Poll,
     time::{Duration, Instant},
 };
+use timeline::Timeline;
 use tokio::{
     runtime::Handle,
     sync::{Mutex, mpsc},
@@ -32,6 +33,7 @@ use tokio::{
 use tool::{Engineer as EngineerTool, SCHEMA, SKILL, instructions};
 
 mod routing;
+mod timeline;
 mod tool;
 
 /// One line of the conversation, as the chat shows it.
@@ -44,8 +46,13 @@ pub struct ChatEntry {
 
 /// What the pilot said on the radio, as it was heard.
 pub enum Heard {
-    /// A question, in a language with a voice to answer in
-    Question { text: String, lang: ArrayStr<2> },
+    /// A question, in a language with a voice to answer in. `released`: when the talk button was
+    /// let go.
+    Question {
+        text: String,
+        lang: ArrayStr<2>,
+        released: Instant,
+    },
     /// Something said in a language without a voice
     Unvoiced { text: String, lang: ArrayStr<2> },
     /// Nothing understood: noise, silence, or a language too unclear
@@ -132,6 +139,8 @@ struct Playback {
     done: bool,
     /// Whether SDL played all of it, once it's all on the stream
     drain: Drain,
+    /// The question it answers, if it's an answer
+    timeline: Option<Arc<Timeline>>,
     /// Play the incomplete-answer tone once this speech has drained.
     tone_after_drain: bool,
     sentences: SentenceQueue,
@@ -326,9 +335,13 @@ impl Engineer {
         heard: Heard,
     ) {
         match heard {
-            Heard::Question { text, lang } => {
+            Heard::Question {
+                text,
+                lang,
+                released,
+            } => {
                 self.misheard = 0;
-                self.ask(rt, sim, config, synth, text, Some(lang));
+                self.ask(rt, sim, config, synth, text, Some(lang), Some(released));
             }
             Heard::TooShort => {}
             Heard::Unvoiced { text, lang } => {
@@ -400,6 +413,7 @@ impl Engineer {
             stream: None,
             done: false,
             drain: Drain::new(Instant::now()),
+            timeline: None,
             tone_after_drain: false,
             sentences: SentenceQueue::default(),
         });
@@ -431,7 +445,7 @@ impl Engineer {
             // Nothing to tell languages apart with: the model goes by the question
             None => None,
         };
-        self.ask(rt, sim, config, synth, question, lang);
+        self.ask(rt, sim, config, synth, question, lang, None);
     }
 
     /// The pilot asked something on the radio: it's sent to the model, with the running
@@ -441,6 +455,9 @@ impl Engineer {
     /// `lang`: the language it was asked in, which the model is told to answer in (the voice
     /// speaks the answer in it); `None` if it isn't known, for the model to go by the question,
     /// spoken in the last language the pilot used.
+    ///
+    /// `released`: when the talk button was let go, if it was asked on the radio.
+    #[allow(clippy::too_many_arguments)]
     pub fn ask(
         &mut self,
         rt: &Handle,
@@ -449,6 +466,7 @@ impl Engineer {
         synth: &mut Synthesizer,
         question: String,
         lang: Option<ArrayStr<2>>,
+        released: Option<Instant>,
     ) {
         self.stop();
         let known = lang.is_some();
@@ -507,7 +525,11 @@ impl Engineer {
         let auto_session = *config.get().auto_session();
 
         // What the model writes goes straight to the synthesizer, and to the chat
+        let timeline = Arc::new(Timeline::new(released, Instant::now()));
         let speech = self.speak(rt, config, synth, lang);
+        if let (Some(_), Some(playback)) = (&speech, &mut self.playback) {
+            playback.timeline = Some(timeline.clone());
+        }
         let lang = speech.as_ref().map_or(lang, |(lang, _)| *lang);
         let speech = speech.map(|(_, speech)| speech);
         // Told last, after the question (and its snapshot) and after each tool result: by the
@@ -541,15 +563,18 @@ impl Engineer {
             };
             state.conversation.set_tool_result_note(note);
             let mut on_text = |text: &str| {
+                timeline.first_text();
                 if let Some(speech) = &speech {
                     speech.push(text);
                 }
                 let _ = chat.send(text.to_owned());
             };
-            state
+            let reply = state
                 .conversation
                 .send_streaming(question, &mut on_text)
-                .await
+                .await;
+            timeline.answered();
+            reply
             // The speech's text ends here, with the turn
         });
 
@@ -749,6 +774,7 @@ impl Engineer {
             stream: None,
             done: false,
             drain: Drain::new(Instant::now()),
+            timeline: None,
             tone_after_drain: false,
             sentences: SentenceQueue::default(),
         });
@@ -825,6 +851,9 @@ impl Engineer {
                 return;
             }
             playback.sentences.submitted();
+            if let Some(timeline) = &playback.timeline {
+                timeline.first_audio();
+            }
             if playback.done && playback.sentences.pending().is_none() {
                 if let Some(stream) = &playback.stream
                     && let Err(e) = stream.flush()
@@ -849,6 +878,9 @@ impl Engineer {
         match drained {
             Drained::Playing => {}
             Drained::Done => {
+                if let Some(timeline) = &playback.timeline {
+                    timeline.played();
+                }
                 let tone = playback.tone_after_drain;
                 self.playback = None;
                 if tone {
@@ -1141,6 +1173,7 @@ mod tests {
             stream: Some(stream),
             done: true,
             drain: Drain::new(Instant::now()),
+            timeline: None,
             tone_after_drain: false,
             sentences,
         });
@@ -1197,6 +1230,7 @@ mod tests {
                 stream: None,
                 done: false,
                 drain: Drain::new(Instant::now()),
+                timeline: None,
                 tone_after_drain: false,
                 sentences: SentenceQueue::default(),
             });
@@ -1331,7 +1365,9 @@ mod tests {
             let start = std::time::Instant::now();
             let (running, asked) = (Some(&mut *sim), question.to_owned());
             match lang {
-                Some(lang) => engineer.ask(rt, running, &config, &mut synth, asked, Some(lang)),
+                Some(lang) => {
+                    engineer.ask(rt, running, &config, &mut synth, asked, Some(lang), None)
+                }
                 None => engineer.ask_text(rt, running, &config, &mut synth, asked),
             }
             while engineer.is_thinking() {
