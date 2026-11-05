@@ -406,9 +406,9 @@
         "ca": "{language} (sense veu)"
     },
     "spotter.language_hover": {
-        "en": "The language of its calls: the pilot's is the last one they asked the engineer in. Calls are said in Catalan, Spanish or English; other languages' voices say them in English",
-        "es": "El idioma de sus avisos: el del piloto es el último en el que preguntó al ingeniero. Los avisos se dicen en catalán, español o inglés; con las voces de otros idiomas, se dicen en inglés",
-        "ca": "L'idioma dels seus avisos: el del pilot és l'últim en què va preguntar a l'enginyer. Els avisos es diuen en català, castellà o anglès; amb les veus d'altres idiomes, es diuen en anglès"
+        "en": "The language of its calls: the pilot's is the last one they asked the engineer in. Calls are said in Catalan, Spanish, Italian or English; other languages' voices say them in English",
+        "es": "El idioma de sus avisos: el del piloto es el último en el que preguntó al ingeniero. Los avisos se dicen en catalán, español, italiano o inglés; con las voces de otros idiomas, se dicen en inglés",
+        "ca": "L'idioma dels seus avisos: el del pilot és l'últim en què va preguntar a l'enginyer. Els avisos es diuen en català, castellà, italià o anglès; amb les veus d'altres idiomes, es diuen en anglès"
     },
     "lang.en": {
         "en": "English",
@@ -848,177 +848,212 @@
     "call.car_left": {
         "en": "car left",
         "es": "coche a la izquierda",
-        "ca": "cotxe a l'esquerra"
+        "ca": "cotxe a l'esquerra",
+        "it": "auto a sinistra"
     },
     "call.car_right": {
         "en": "car right",
         "es": "coche a la derecha",
-        "ca": "cotxe a la dreta"
+        "ca": "cotxe a la dreta",
+        "it": "auto a destra"
     },
     "call.three_wide": {
         "en": "three wide",
         "es": "tres en paralelo",
-        "ca": "tres en paral·lel"
+        "ca": "tres en paral·lel",
+        "it": "tre affiancati"
     },
     "call.clear_left": {
         "en": "clear left",
         "es": "libre izquierda",
-        "ca": "lliure esquerra"
+        "ca": "lliure esquerra",
+        "it": "libero a sinistra"
     },
     "call.clear_right": {
         "en": "clear right",
         "es": "libre derecha",
-        "ca": "lliure dreta"
+        "ca": "lliure dreta",
+        "it": "libero a destra"
     },
     "call.clear_all_round": {
         "en": "clear all round",
         "es": "libre",
-        "ca": "lliure"
+        "ca": "lliure",
+        "it": "tutto libero"
     },
     "call.still_there_left": {
         "en": "still there left",
         "es": "sigue a la izquierda",
-        "ca": "segueix a l'esquerra"
+        "ca": "segueix a l'esquerra",
+        "it": "ancora a sinistra"
     },
     "call.still_there_right": {
         "en": "still there right",
         "es": "sigue a la derecha",
-        "ca": "segueix a la dreta"
+        "ca": "segueix a la dreta",
+        "it": "ancora a destra"
     },
     "call.puncture_front_left": {
         "en": "puncture front left",
         "es": "pinchazo delantera izquierda",
-        "ca": "punxada davantera esquerra"
+        "ca": "punxada davantera esquerra",
+        "it": "foratura anteriore sinistra"
     },
     "call.puncture_front_right": {
         "en": "puncture front right",
         "es": "pinchazo delantera derecha",
-        "ca": "punxada davantera dreta"
+        "ca": "punxada davantera dreta",
+        "it": "foratura anteriore destra"
     },
     "call.puncture_rear_left": {
         "en": "puncture rear left",
         "es": "pinchazo trasera izquierda",
-        "ca": "punxada posterior esquerra"
+        "ca": "punxada posterior esquerra",
+        "it": "foratura posteriore sinistra"
     },
     "call.puncture_rear_right": {
         "en": "puncture rear right",
         "es": "pinchazo trasera derecha",
-        "ca": "punxada posterior dreta"
+        "ca": "punxada posterior dreta",
+        "it": "foratura posteriore destra"
     },
     "call.parts_off": {
         "en": "parts off the car",
         "es": "piezas sueltas",
-        "ca": "peces soltes"
+        "ca": "peces soltes",
+        "it": "l'auto sta perdendo pezzi"
     },
     "call.engine_overheating": {
         "en": "engine overheating",
         "es": "motor sobrecalentado",
-        "ca": "motor sobreescalfat"
+        "ca": "motor sobreescalfat",
+        "it": "motore surriscaldato"
     },
     "call.limiter": {
         "en": "limiter, limiter",
         "es": "limitador, limitador",
-        "ca": "limitador, limitador"
+        "ca": "limitador, limitador",
+        "it": "limitatore, limitatore"
     },
     "call.lap_invalidated": {
         "en": "lap invalidated",
         "es": "vuelta invalidada",
-        "ca": "volta invalidada"
+        "ca": "volta invalidada",
+        "it": "giro invalidato"
     },
     "call.car_close_behind": {
         "en": "car close behind",
         "es": "coche pegado detrás",
-        "ca": "cotxe enganxat al darrere"
+        "ca": "cotxe enganxat al darrere",
+        "it": "auto vicina dietro"
     },
     "call.car_within_a_second": {
         "en": "car within a second behind",
         "es": "coche a menos de un segundo detrás",
-        "ca": "cotxe a menys d'un segon al darrere"
+        "ca": "cotxe a menys d'un segon al darrere",
+        "it": "auto a meno di un secondo dietro"
     },
     "call.full_course_yellow": {
         "en": "full course yellow",
         "es": "amarilla en todo el circuito",
-        "ca": "groga a tot el circuit"
+        "ca": "groga a tot el circuit",
+        "it": "bandiera gialla su tutto il circuito"
     },
     "call.green_flag": {
         "en": "green flag, green flag",
         "es": "bandera verde, bandera verde",
-        "ca": "bandera verda, bandera verda"
+        "ca": "bandera verda, bandera verda",
+        "it": "bandiera verde, bandiera verde"
     },
     "call.red_flag": {
         "en": "red flag",
         "es": "bandera roja",
-        "ca": "bandera vermella"
+        "ca": "bandera vermella",
+        "it": "bandiera rossa"
     },
     "call.yellow_flag": {
         "en": "yellow flag on track",
         "es": "bandera amarilla en pista",
-        "ca": "bandera groga a pista"
+        "ca": "bandera groga a pista",
+        "it": "bandiera gialla in pista"
     },
     "call.blue_flag": {
         "en": "blue flag",
         "es": "bandera azul",
-        "ca": "bandera blava"
+        "ca": "bandera blava",
+        "it": "bandiera blu"
     },
     "call.penalty": {
         "en": "penalty",
         "es": "penalización",
-        "ca": "penalització"
+        "ca": "penalització",
+        "it": "penalità"
     },
     "call.rain_starting": {
         "en": "rain starting",
         "es": "empieza a llover",
-        "ca": "comença a ploure"
+        "ca": "comença a ploure",
+        "it": "inizia a piovere"
     },
     "call.rain_heavier": {
         "en": "rain getting heavier",
         "es": "llueve más fuerte",
-        "ca": "plou més fort"
+        "ca": "plou més fort",
+        "it": "la pioggia aumenta"
     },
     "call.rain_easing": {
         "en": "rain easing",
         "es": "la lluvia afloja",
-        "ca": "la pluja minva"
+        "ca": "la pluja minva",
+        "it": "la pioggia diminuisce"
     },
     "call.rain_stopped": {
         "en": "rain stopped",
         "es": "ha dejado de llover",
-        "ca": "ha parat de ploure"
+        "ca": "ha parat de ploure",
+        "it": "ha smesso di piovere"
     },
     "call.track_wet": {
         "en": "track getting wet",
         "es": "la pista se está mojando",
-        "ca": "la pista s'està mullant"
+        "ca": "la pista s'està mullant",
+        "it": "la pista si sta bagnando"
     },
     "call.track_wetter": {
         "en": "track getting wetter",
         "es": "la pista está cada vez más mojada",
-        "ca": "la pista està cada cop més mullada"
+        "ca": "la pista està cada cop més mullada",
+        "it": "la pista è sempre più bagnata"
     },
     "call.track_drying": {
         "en": "track drying",
         "es": "la pista se está secando",
-        "ca": "la pista s'està assecant"
+        "ca": "la pista s'està assecant",
+        "it": "la pista si sta asciugando"
     },
     "call.track_dry": {
         "en": "track dry",
         "es": "pista seca",
-        "ca": "pista seca"
+        "ca": "pista seca",
+        "it": "pista asciutta"
     },
     "call.wet_patch": {
         "en": "wet patch",
         "es": "zona mojada",
-        "ca": "zona mullada"
+        "ca": "zona mullada",
+        "it": "tratto bagnato"
     },
     "call.rain_in_minutes": {
         "en": "rain likely in about {} minutes",
         "es": "probable lluvia en unos {} minutos",
-        "ca": "probable pluja d'aquí a uns {} minuts"
+        "ca": "probable pluja d'aquí a uns {} minuts",
+        "it": "pioggia probabile tra circa {} minuti"
     },
     "call.rain_in_a_minute": {
         "en": "rain likely in about a minute",
         "es": "probable lluvia en un minuto",
-        "ca": "probable pluja d'aquí a un minut"
+        "ca": "probable pluja d'aquí a un minut",
+        "it": "pioggia probabile tra circa un minuto"
     },
     "engineer.no_telemetry": {
         "en": "No telemetry yet, get in the car.",
