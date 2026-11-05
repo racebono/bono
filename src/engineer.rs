@@ -469,6 +469,7 @@ impl Engineer {
         released: Option<Instant>,
     ) {
         self.stop();
+        let timeline = Arc::new(Timeline::new(released, Instant::now()));
         let known = lang.is_some();
         let lang = lang.unwrap_or(self.last_lang);
         self.last_lang = lang;
@@ -485,6 +486,9 @@ impl Engineer {
             let text = t!("engineer.no_telemetry": &lang);
             self.reply(text.into(), Some(t!("engineer.detail_no_telemetry").into()));
             self.say(rt, config, synth, text, lang);
+            if let Some(playback) = &mut self.playback {
+                playback.timeline = Some(timeline);
+            }
             return;
         };
 
@@ -525,7 +529,6 @@ impl Engineer {
         let auto_session = *config.get().auto_session();
 
         // What the model writes goes straight to the synthesizer, and to the chat
-        let timeline = Arc::new(Timeline::new(released, Instant::now()));
         let speech = self.speak(rt, config, synth, lang);
         if let (Some(_), Some(playback)) = (&speech, &mut self.playback) {
             playback.timeline = Some(timeline.clone());
@@ -573,7 +576,9 @@ impl Engineer {
                 .conversation
                 .send_streaming(question, &mut on_text)
                 .await;
-            timeline.answered();
+            if reply.is_ok() {
+                timeline.answered();
+            }
             reply
             // The speech's text ends here, with the turn
         });
@@ -878,7 +883,10 @@ impl Engineer {
         match drained {
             Drained::Playing => {}
             Drained::Done => {
-                if let Some(timeline) = &playback.timeline {
+                // Without a stream, the speech said nothing
+                if playback.stream.is_some()
+                    && let Some(timeline) = &playback.timeline
+                {
                     timeline.played();
                 }
                 let tone = playback.tone_after_drain;
@@ -1167,13 +1175,14 @@ mod tests {
         sentences.consumed(stream.queued_bytes().ok());
         assert_eq!(sentences.pieces.len(), 1);
 
+        let timeline = Arc::new(Timeline::new(None, Instant::now()));
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
         engineer.playback = Some(Playback {
             speech: SpeechOutput::ready(Speech::no_beep(1.0)),
             stream: Some(stream),
             done: true,
             drain: Drain::new(Instant::now()),
-            timeline: None,
+            timeline: Some(timeline.clone()),
             tone_after_drain: false,
             sentences,
         });
@@ -1206,6 +1215,67 @@ mod tests {
         );
         engineer.stop();
         assert!(engineer.playback.is_none());
+        let line = timeline.to_string();
+        assert!(!line.contains("first audio never"), "{line}");
+        assert!(line.ends_with("played never"), "{line}");
+    }
+
+    #[test]
+    #[ignore = "run alone with SDL_AUDIO_DRIVER=dummy"]
+    fn a_drained_answer_is_marked_played() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let sdl = sdl3::init().unwrap();
+        let audio = sdl.audio().unwrap();
+        let spec = Speech::no_beep(1.0).spec();
+        let device = audio.open_playback_device(&spec).unwrap();
+        let stream = device.clone().open_device_stream(Some(&spec)).unwrap();
+
+        let timeline = Arc::new(Timeline::new(None, Instant::now()));
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.playback = Some(Playback {
+            speech: SpeechOutput::ready(Speech::no_beep(1.0)),
+            stream: Some(stream),
+            done: true,
+            drain: Drain::new(Instant::now()),
+            timeline: Some(timeline.clone()),
+            tone_after_drain: false,
+            sentences: SentenceQueue::default(),
+        });
+        engineer.play(&config, Some(&device));
+        assert!(engineer.playback.is_none());
+        let line = timeline.to_string();
+        assert!(!line.ends_with("played never"), "{line}");
+    }
+
+    #[test]
+    fn speech_that_said_nothing_is_not_marked_played() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+
+        let timeline = Arc::new(Timeline::new(None, Instant::now()));
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.playback = Some(Playback {
+            speech: SpeechOutput::ready(Speech::no_beep(1.0)),
+            stream: None,
+            done: true,
+            drain: Drain::new(Instant::now()),
+            timeline: Some(timeline.clone()),
+            tone_after_drain: false,
+            sentences: SentenceQueue::default(),
+        });
+        engineer.play(&config, None);
+        assert!(engineer.playback.is_none());
+        let line = timeline.to_string();
+        assert!(line.ends_with("played never"), "{line}");
     }
 
     #[test]

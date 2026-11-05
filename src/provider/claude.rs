@@ -626,11 +626,18 @@ impl Conversation {
                 None => None,
             };
             let sent = Instant::now();
-            let resp = match self
+            let resp = self
                 .request(bearer.as_deref(), lease.as_deref(), request_id.as_deref())
                 .send()
-                .await
-            {
+                .await;
+            if resp.is_err() {
+                log::debug!(
+                    "Request {}: no response in {:?}",
+                    request_id.as_deref().unwrap_or("without an ID"),
+                    sent.elapsed(),
+                );
+            }
+            let resp = match resp {
                 Ok(resp) => resp,
                 // The request may never have reached the API: worth another try
                 Err(e)
@@ -646,6 +653,10 @@ impl Conversation {
             };
 
             let status = resp.status();
+            let timing = RequestTiming::new(&resp, sent);
+            if !status.is_success() {
+                timing.log(format_args!("failed with {status}"));
+            }
             // The token expired: a new one, once, for the same request
             if status == StatusCode::UNAUTHORIZED && rejected.is_none() && bearer.is_some() {
                 rejected = bearer;
@@ -654,12 +665,13 @@ impl Conversation {
 
             if status.is_success() {
                 let said = sink.text.len();
-                let timing = RequestTiming::new(&resp, sent);
-                match read_response(resp, sink).await {
-                    Ok(body) => {
-                        timing.log(&body);
-                        return Ok(body);
-                    }
+                let body = read_response(resp, sink).await;
+                match &body {
+                    Ok(body) => timing.log(format_args!("stopped by {:?}", body.stop_reason)),
+                    Err(_) => timing.log("failed midway"),
+                }
+                match body {
+                    Ok(body) => return Ok(body),
                     // Failed midway (e.g. overloaded, or the connection dropped): a retry would
                     // say again what's been said, so only before any text
                     Err(e)
@@ -1533,7 +1545,6 @@ fn start_block(sink: &mut TextSink<'_>, block: &serde_json::Value) {
     }
 }
 
-/// Reads a response, streamed or whole, handing its text to `sink`.
 /// How long a request took, and what the server says it spent the time on: logged next to the
 /// request's ID, which finds it on the server's side too.
 struct RequestTiming {
@@ -1545,32 +1556,41 @@ struct RequestTiming {
 
 impl RequestTiming {
     fn new(resp: &reqwest::Response, sent: Instant) -> Self {
-        let header = |name: &str| {
-            resp.headers()
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned)
-        };
         Self {
             sent,
             headers: sent.elapsed(),
-            id: header("request-id"),
-            server: header("server-timing"),
+            id: resp
+                .headers()
+                .get("request-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+            server: server_timing(resp.headers()),
         }
     }
 
-    fn log(self, body: &ResponseBody) {
+    /// `outcome`: how the request ended.
+    fn log(&self, outcome: impl Display) {
         log::debug!(
-            "Request {}: headers in {:?}, done in {:?}, stopped by {:?}; server: {}",
+            "Request {}: headers in {:?}, done in {:?}, {outcome}; server: {}",
             self.id.as_deref().unwrap_or("without an ID"),
             self.headers,
             self.sent.elapsed(),
-            body.stop_reason,
             self.server.as_deref().unwrap_or("no timing"),
         );
     }
 }
 
+/// The server's `Server-Timing`, which it may split over several header fields.
+fn server_timing(headers: &HeaderMap) -> Option<String> {
+    let values = headers
+        .get_all("server-timing")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then(|| values.join(", "))
+}
+
+/// Reads a response, streamed or whole, handing its text to `sink`.
 async fn read_response(
     mut resp: reqwest::Response,
     sink: &mut TextSink<'_>,
@@ -3223,6 +3243,18 @@ mod tests {
         assert!(conversation.body.messages.is_empty());
         // Not retried
         assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reads_every_server_timing_field() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(server_timing(&headers), None);
+        headers.append("server-timing", HeaderValue::from_static("upstream;dur=1"));
+        headers.append("server-timing", HeaderValue::from_static("cfWorker;dur=2"));
+        assert_eq!(
+            server_timing(&headers).as_deref(),
+            Some("upstream;dur=1, cfWorker;dur=2")
+        );
     }
 
     #[tokio::test]

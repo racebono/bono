@@ -38,7 +38,7 @@ impl Timeline {
         let _ = self.first_text.set(Instant::now());
     }
 
-    /// The model finished its turn.
+    /// The model finished its turn. Without this mark, it failed or was cut off.
     #[inline]
     pub fn answered(&self) {
         let _ = self.answered.set(Instant::now());
@@ -52,6 +52,8 @@ impl Timeline {
     }
 
     /// All of the speech was played. Without this mark, the answer was cut off or never spoken.
+    /// Changing the voice ends the speech early the same way it ends normally, so an answer cut
+    /// off by that still gets this mark.
     #[inline]
     pub fn played(&self) {
         let _ = self.played.set(Instant::now());

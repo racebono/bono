@@ -398,14 +398,7 @@ impl Stream {
             0 => return Step::Waiting,
             len => {
                 let sentence = self.pending.drain(..len).collect::<String>();
-                let started = Instant::now();
-                let samples = voice.speak(&mut self.transmission, &sentence);
-                log::debug!(
-                    "Synthesized {} characters in {:?}",
-                    sentence.chars().count(),
-                    started.elapsed()
-                );
-                (samples, false)
+                (voice.speak(&mut self.transmission, &sentence), false)
             }
         };
 
@@ -598,6 +591,7 @@ impl Voice {
         transmission: &mut Transmission,
         text: &str,
     ) -> anyhow::Result<Vec<f32>> {
+        let started = Instant::now();
         let sentences = phonemize(text, &self.espeak_voice)?;
         let silence = (self.sample_rate as f32 * SENTENCE_SILENCE) as usize;
         let mut voice = Vec::<f32>::new();
@@ -624,6 +618,11 @@ impl Voice {
         };
         samples.extend(transmission.radio.voice(&voice));
         clip(&mut samples);
+        log::debug!(
+            "Synthesized {} characters in {:?}",
+            text.chars().count(),
+            started.elapsed()
+        );
         return Ok(samples);
     }
 
