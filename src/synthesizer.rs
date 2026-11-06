@@ -491,7 +491,7 @@ pub struct Voice {
 }
 
 impl Voice {
-    /// Loads the model at `model` and its config at `{model}.json`.
+    /// Loads the model at `model` and its config at `{model}.json`, using at most 8 intra-op threads.
     ///
     /// This blocks while the model is read and compiled.
     pub fn load(model: &Utf8Path, threads: NonZeroUsize) -> anyhow::Result<Self> {
@@ -530,7 +530,7 @@ impl Voice {
 
         let session = (|| {
             Session::builder()?
-                .with_intra_threads(threads.get())?
+                .with_intra_threads(threads.get().min(8))?
                 .commit_from_file(model)
         })()
         .with_context(|| format!("Error loading voice model '{model}'"))?;
