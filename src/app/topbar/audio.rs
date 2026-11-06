@@ -309,6 +309,9 @@ impl AudioTopbar {
             }
             Heard::Nothing => log::info!("Nothing understood on the radio"),
             Heard::NoVoice(_) => log::info!("No voice to answer the radio with"),
+            Heard::UnsupportedLanguage(lang) => {
+                log::info!("The English-only speech model cannot hear {lang}")
+            }
             Heard::TooShort => log::debug!("The talk button was let go too soon"),
             Heard::NotListening(why) => log::info!("Not listening to the radio: {why:?}"),
             Heard::Failed(e) => log::error!("Error hearing the radio: {e:#}"),

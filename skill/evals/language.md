@@ -1,12 +1,12 @@
 # Reply language
 
 Controlled manual/model scenarios, not executed results. They cover answering in the
-pilot's language across tool calls (including Bono Cloud's routed `quick` calls, whose
+selected reply language across tool calls (including Bono Cloud's routed `quick` calls, whose
 telemetry is in English), repeated questions, earlier answers in another language and
 ambiguous short questions.
 
-The app ends each question in a known language with "[Reply in <language>, the pilot's
-language.]", and repeats that note after every tool result. With the ignored harness, set
+The app ends each question with a known reply language with "[Reply in <language>.]",
+and repeats that note after every tool result. With the ignored harness, set
 `EVAL_LANG` (e.g. `it`) so `EVAL_QUESTIONS` are asked as if heard in that language: its
 config has no voices, so typed questions get no note. Questions separated by `|` share one
 conversation. Check the transcript as well as the answers: the note must be the last block
@@ -22,3 +22,9 @@ because only the router makes a call without Claude's thinking.
 
 Grade the content as for the matching English case: the language note must not lengthen
 the answer, or introduce the language or the note itself into it.
+
+Also exercise independent input and output settings in the app: select a Spanish heard
+language and an English spoken language, then ask Spanish questions requiring direct
+answers, early acknowledgements and multiple tool calls. Every spoken part must remain
+English, including after tool results and earlier Spanish conversation. Repeat after
+changing the spoken language between questions; the latest reply note must take priority.

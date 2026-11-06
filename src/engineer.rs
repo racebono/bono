@@ -46,8 +46,8 @@ pub struct ChatEntry {
 
 /// What the pilot said on the radio, as it was heard.
 pub enum Heard {
-    /// A question, in a language with a voice to answer in. `released`: when the talk button was
-    /// let go.
+    /// A question in the pilot's language, answered with the selected or an available voice.
+    /// `released`: when the talk button was let go.
     Question {
         text: String,
         lang: ArrayStr<2>,
@@ -60,6 +60,8 @@ pub enum Heard {
     /// There's no voice to answer with: none at all (`None`), or none for the only language the
     /// speech to text model understands
     NoVoice(Option<ArrayStr<2>>),
+    /// A fixed input language requires a multilingual model, but the loaded one is English-only.
+    UnsupportedLanguage(ArrayStr<2>),
     /// The talk button was let go too soon to have said anything: likely pressed by accident
     TooShort,
     /// The talk button was pressed, but nothing can listen
@@ -274,10 +276,14 @@ impl Engineer {
         self.playback.is_some()
     }
 
-    /// The language the pilot last asked in.
+    /// The configured input language, or the language the pilot last asked in.
     #[inline]
-    pub fn language(&self) -> ArrayStr<2> {
-        self.last_lang
+    pub fn language(&self, config: &Config) -> ArrayStr<2> {
+        config
+            .get()
+            .heard_language()
+            .map(language::voice_code)
+            .unwrap_or(self.last_lang)
     }
 
     /// Pauses the answer being spoken (and holds one about to start) while the spotter speaks;
@@ -394,13 +400,23 @@ impl Engineer {
                 });
                 self.no_beep();
             }
+            Heard::UnsupportedLanguage(lang) => {
+                self.stop();
+                self.notice(t!(
+                    "engineer.stt_unsupported_language",
+                    language = language::ui_name(lang)
+                ));
+                self.no_beep();
+            }
         }
     }
 
-    /// Asks the pilot to say it again, in the language they last asked in (see [`Self::voice`]).
+    /// Asks the pilot to say it again in the selected reply language, or their last language.
     /// Without any voice, the radio's low tone says it can't answer.
     fn say_again(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer) {
-        match self.voice(config, self.last_lang) {
+        let spoken = config.get().engineer_reply_language();
+        let lang = spoken.unwrap_or_else(|| self.language(config));
+        match self.voice(config, lang) {
             Some(lang) => self.say(rt, config, synth, t!("engineer.say_again": &lang), lang),
             None => self.no_beep(),
         }
@@ -437,7 +453,8 @@ impl Engineer {
         synth: &mut Synthesizer,
         question: String,
     ) {
-        let lang = match self.languages.detect(&question) {
+        let heard = *config.get().heard_language();
+        let lang = match heard.or_else(|| self.languages.detect(&question)) {
             Some(lang) => Some(lang),
             // Too short or ambiguous for any language in particular ("Positions."): the one the
             // pilot was speaking
@@ -452,9 +469,9 @@ impl Engineer {
     /// simulator's telemetry, and the answer is spoken as the model writes it. An answer still on its way, or
     /// being spoken, is dropped: the pilot talked over it.
     ///
-    /// `lang`: the language it was asked in, which the model is told to answer in (the voice
-    /// speaks the answer in it); `None` if it isn't known, for the model to go by the question,
-    /// spoken in the last language the pilot used.
+    /// `lang`: the language it was asked in; `None` if it isn't known. Unless a reply language
+    /// is selected, the model is told to answer in this language, or goes by the question if
+    /// unknown, spoken in the last language the pilot used.
     ///
     /// `released`: when the talk button was let go, if it was asked on the radio.
     #[allow(clippy::too_many_arguments)]
@@ -470,9 +487,13 @@ impl Engineer {
     ) {
         self.stop();
         let timeline = Arc::new(Timeline::new(released, Instant::now()));
-        let known = lang.is_some();
+        // Whisper distinguishes Nynorsk (`nn`), but both Norwegian forms use the `no` voice.
+        let lang = lang.map(language::voice_code);
+        let spoken = config.get().engineer_reply_language();
+        let known = lang.is_some() || spoken.is_some();
         let lang = lang.unwrap_or(self.last_lang);
         self.last_lang = lang;
+        let lang = spoken.unwrap_or(lang);
         self.chat.push(ChatEntry {
             speaker: Speaker::Pilot,
             text: question.clone(),
@@ -1088,6 +1109,123 @@ mod tests {
         sys::bono_session_info,
     };
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn selected_reply_language_keeps_the_pilots_language_independent() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let rt = runtime.handle();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // Voice paths only stand in for installed choices; no model or audio device is needed.
+        std::fs::write(
+            &path,
+            r#"{
+            "voices": {"en": "en.onnx", "es": "es.onnx"},
+            "spoken_language": "en",
+            "heard_language": "es"
+        }"#,
+        )
+        .unwrap();
+        let config = runtime.block_on(Config::new(&path)).unwrap();
+        let mut synth = Synthesizer::new(rt, &crate::config::RawConfig::default());
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.ask_text(
+            rt,
+            None,
+            &config,
+            &mut synth,
+            "¿Cuánto combustible me queda?".into(),
+        );
+        assert_eq!(engineer.language(&config), crate::arrstr!("es"));
+        assert_eq!(
+            engineer.chat.last().unwrap().text,
+            t!("engineer.no_telemetry": "en")
+        );
+        assert!(synth.inner.contains_key(&crate::arrstr!("en")));
+        assert!(!synth.inner.contains_key(&crate::arrstr!("es")));
+
+        // The engineer's output preference must not override the spotter's voice selection.
+        assert_eq!(
+            engineer.voice(&config, crate::arrstr!("es")),
+            Some(crate::arrstr!("es"))
+        );
+        engineer.stop();
+    }
+
+    #[test]
+    fn fixed_input_language_applies_to_say_again_before_a_question_succeeds() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let rt = runtime.handle();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+            "voices": {"en": "en.onnx", "es": "es.onnx"},
+            "heard_language": "es"
+        }"#,
+        )
+        .unwrap();
+        let config = runtime.block_on(Config::new(&path)).unwrap();
+        let mut synth = Synthesizer::new(rt, &crate::config::RawConfig::default());
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        assert_eq!(engineer.last_lang, arrstr!("en"));
+        engineer.hear(rt, None, &config, &mut synth, Heard::Nothing);
+        assert_eq!(engineer.language(&config), arrstr!("es"));
+        assert!(synth.inner.contains_key(&arrstr!("es")));
+        assert!(!synth.inner.contains_key(&arrstr!("en")));
+        config.update(|raw| raw.heard_language.set(Some(arrstr!("en"))));
+        assert_eq!(engineer.language(&config), arrstr!("en"));
+        engineer.stop();
+    }
+
+    #[test]
+    fn nynorsk_input_uses_the_norwegian_voice_for_replies_and_the_spotter() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let rt = runtime.handle();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+            "voices": {"en": "en.onnx", "no": "no.onnx"},
+            "heard_language": "nn"
+        }"#,
+        )
+        .unwrap();
+        let config = runtime.block_on(Config::new(&path)).unwrap();
+        let mut synth = Synthesizer::new(rt, &crate::config::RawConfig::default());
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        for radio in [false, true] {
+            let text = "Kor mykje drivstoff har eg att?".to_owned();
+            if radio {
+                engineer.hear(
+                    rt,
+                    None,
+                    &config,
+                    &mut synth,
+                    Heard::Question {
+                        text,
+                        lang: arrstr!("nn"),
+                        released: Instant::now(),
+                    },
+                );
+            } else {
+                engineer.ask_text(rt, None, &config, &mut synth, text);
+            }
+            assert_eq!(engineer.language(&config), arrstr!("no"));
+            assert_eq!(
+                engineer.voice(&config, engineer.language(&config)),
+                Some(arrstr!("no"))
+            );
+            assert!(synth.inner.contains_key(&arrstr!("no")));
+            assert!(!synth.inner.contains_key(&arrstr!("en")));
+        }
+        engineer.stop();
+    }
 
     fn sentences(lengths: &[usize]) -> SentenceQueue {
         let mut queue = SentenceQueue::default();

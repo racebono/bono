@@ -289,6 +289,10 @@ settings! {
         /// Whether the engineer calls corners by their names (Tertre Rouge) rather than their
         /// numbers (turn 5)
         pub corner_names: bool = false,
+        /// The engineer's reply language; the pilot's language when `None`.
+        pub spoken_language: Option<ArrayStr<2>> = None,
+        /// The pilot's input language; automatic when `None` (fixed by a lone voice language).
+        pub heard_language: Option<ArrayStr<2>> = None,
         pub opponent_frequency: NonZeroU32 = NonZeroU32::new(5).unwrap(),
         /// Changed with `set_voice`, which loads the voice too
         voices: BTreeMap<ArrayStr<2>, Utf8PathBuf> = BTreeMap::new(),
@@ -309,6 +313,12 @@ settings! {
 }
 
 impl RawConfig {
+    /// A fixed reply language is usable only while its voice is installed.
+    pub fn engineer_reply_language(&self) -> Option<ArrayStr<2>> {
+        self.spoken_language()
+            .filter(|lang| self.voices().contains_key(lang))
+    }
+
     /// Changes the app's language (e.g. `es`, or `en-US`). Returns whether it did: not for a
     /// locale that isn't valid.
     pub fn set_locale(&mut self, locale: &str) -> bool {
@@ -764,6 +774,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn engineer_languages_are_independent_and_survive_save() {
+        let mut config: RawConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(*config.spoken_language(), None);
+        assert_eq!(*config.heard_language(), None);
+        config.spoken_language.set(Some(arrstr!("en")));
+        config.heard_language.set(Some(arrstr!("es")));
+        config
+            .voices
+            .set(BTreeMap::from([(arrstr!("en"), "en.onnx".into())]));
+        let saved = serde_json::to_string(&config).unwrap();
+        let loaded: RawConfig = serde_json::from_str(&saved).unwrap();
+        assert_eq!(*loaded.spoken_language(), Some(arrstr!("en")));
+        assert_eq!(*loaded.heard_language(), Some(arrstr!("es")));
+        assert_eq!(loaded.engineer_reply_language(), Some(arrstr!("en")));
+
+        // Uninstalling the selected output voice preserves the preference but uses fallback.
+        config.voices.set(BTreeMap::new());
+        assert_eq!(config.engineer_reply_language(), None);
+        assert_eq!(*config.spoken_language(), Some(arrstr!("en")));
+    }
+
+    #[test]
     fn array_strings_accept_json_escapes_and_check_byte_length() {
         for value in ["\\\"", "\n\t", "é"] {
             let original = ArrayStr::<2>::from_str(value).unwrap();
@@ -984,13 +1016,16 @@ mod tests {
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let loaded = std::fs::read(&path).ok().and_then(|b| {
-                serde_json::from_slice::<RawConfig>(&b).ok()
-            });
+            let loaded = std::fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<RawConfig>(&b).ok());
             if loaded.is_some_and(|l| *l.master_volume() == 0.3) {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "latest config never saved");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "latest config never saved"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }

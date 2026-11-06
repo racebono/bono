@@ -74,6 +74,36 @@
         "es": "Ingeniero",
         "ca": "Enginyer"
     },
+    "engineer.spoken_language": {
+        "en": "Spoken language",
+        "es": "Idioma de respuesta",
+        "ca": "Idioma de resposta"
+    },
+    "engineer.heard_language": {
+        "en": "Heard language",
+        "es": "Idioma de entrada",
+        "ca": "Idioma d'entrada"
+    },
+    "engineer.pilots_language": {
+        "en": "Pilot's language",
+        "es": "Idioma del piloto",
+        "ca": "Idioma del pilot"
+    },
+    "engineer.detect_language": {
+        "en": "Automatic",
+        "es": "Automático",
+        "ca": "Automàtic"
+    },
+    "engineer.spoken_language_hover": {
+        "en": "The language the engineer always answers in. Choose a language with an installed voice, or follow the pilot's language. From the next question",
+        "es": "El idioma en el que responde siempre el ingeniero. Elige un idioma con una voz instalada o sigue el idioma del piloto. A partir de la siguiente pregunta",
+        "ca": "L'idioma en què respon sempre l'enginyer. Tria un idioma amb una veu instal·lada o segueix l'idioma del pilot. A partir de la següent pregunta"
+    },
+    "engineer.heard_language_hover": {
+        "en": "The language the pilot speaks. Choosing one skips speech language detection. Automatic also skips detection with only one voice language installed. Languages other than English require a multilingual speech-to-text model",
+        "es": "El idioma que habla el piloto. Elegir uno omite la detección de idioma. Automático también omite la detección si solo hay un idioma de voz instalado. Los idiomas distintos del inglés requieren un modelo de voz a texto multilingüe",
+        "ca": "L'idioma que parla el pilot. Triar-ne un omet la detecció d'idioma. Automàtic també omet la detecció si només hi ha un idioma de veu instal·lat. Els idiomes diferents de l'anglès requereixen un model de veu a text multilingüe"
+    },
     "engineer.corner_names": {
         "en": "Call corners by their names",
         "es": "Llamar a las curvas por su nombre",
@@ -1184,6 +1214,11 @@
         "en": "The speech to text model is still loading: try again in a moment",
         "es": "El modelo de voz a texto todavía se está cargando: inténtalo de nuevo en un momento",
         "ca": "El model de veu a text encara s'està carregant: torna-ho a provar d'aquí a un moment"
+    },
+    "engineer.stt_unsupported_language": {
+        "en": "The selected speech to text model only understands English and cannot hear {language}: pick a multilingual model in Audio › Speech To Text, or choose English in Engineer › Heard language",
+        "es": "El modelo de voz a texto seleccionado solo entiende inglés y no puede escuchar {language}: elige un modelo multilingüe en Audio › Voz a texto, o elige inglés en Ingeniero › Idioma de entrada",
+        "ca": "El model de veu a text seleccionat només entén anglès i no pot escoltar {language}: tria un model multilingüe a Àudio › Veu a text, o tria anglès a Enginyer › Idioma d'entrada"
     },
     "engineer.no_voice_for": {
         "en": "Heard in {language}: \"{text}\". There's no voice to answer in {language}: get one in Audio › Text To Speech",

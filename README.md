@@ -52,6 +52,8 @@ Claude's **Prompt cache lifetime** setting defaults to `1h`; choose `5m` for sho
 
 Speech recognition and synthesis run locally. With a remote language-model endpoint, questions and telemetry returned by the engineer's tools are sent to that endpoint. Initial speech-model downloads require internet access.
 
+In the **Engineer** menu, **Spoken language** fixes the language of replies using an installed voice; **Pilot's language** follows the input as before. **Heard language** independently fixes the pilot's input language, so you can speak one language and receive replies in another. Non-English input requires a multilingual speech-to-text model. With **Automatic** input, speech language detection is skipped when only one voice language is installed; selecting an input language always skips detection. The spotter keeps its own language setting.
+
 ## Troubleshooting
 
 ### Speech recognition is very slow while driving

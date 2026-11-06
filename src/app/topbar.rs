@@ -245,9 +245,13 @@ where
     setting.edit(current, |value| {
         let before = value.clone();
         let menu = ui.menu_button(format!("{label}: {text}"), |ui| {
-            for (option, text) in options {
-                ui.selectable_value(value, option, text);
-            }
+            egui::ScrollArea::vertical()
+                .max_height(400.0)
+                .show(ui, |ui| {
+                    for (option, text) in options {
+                        ui.selectable_value(value, option, text);
+                    }
+                });
         });
         let changed = *value != before;
         let mut button = menu.response;

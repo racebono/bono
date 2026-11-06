@@ -82,12 +82,12 @@ impl LanguageDetector {
     }
 }
 
-/// What the model is told at the end of a question in the language with `code`, and after the
-/// question's tool results: the voice speaks the answer in that language, whatever the
-/// telemetry, the skill's examples or earlier answers are in.
+/// What the model is told at the end of a question and after its tool results: the voice
+/// speaks the answer in the language with `code`, whatever the
+/// pilot, telemetry, the skill's examples or earlier answers are in.
 pub fn reply_note(code: ArrayStr<2>) -> String {
     let language = name(code).unwrap_or_else(|| code.to_string());
-    format!("[Reply in {language}, the pilot's language.]")
+    format!("[Reply in {language}.]")
 }
 
 /// The English name of the language with `code` (as the voices have it), if it's one of those
@@ -126,13 +126,16 @@ pub fn ui_name(code: ArrayStr<2>) -> String {
 
 /// The language's code as the voices have it: whisper's two-letter codes, which make
 /// Norwegian's two written forms one.
+pub fn voice_code(code: ArrayStr<2>) -> ArrayStr<2> {
+    match &*code {
+        "nb" | "nn" => crate::arrstr!("no"),
+        _ => code,
+    }
+}
+
 fn voice_language(language: Language) -> Option<ArrayStr<2>> {
     let code = language.iso_code_639_1().to_string();
-    let code = match code.as_str() {
-        "nb" | "nn" => "no",
-        code => code,
-    };
-    ArrayStr::from_str(code)
+    ArrayStr::from_str(&code).map(voice_code)
 }
 
 #[cfg(test)]
@@ -160,8 +163,14 @@ mod tests {
             detector.update(rt, &voices);
         }
 
-        assert_eq!(detector.detect("How are the tyres looking?"), Some(arrstr!("en")));
-        assert_eq!(detector.detect("¿Cuánto combustible me queda?"), Some(arrstr!("es")));
+        assert_eq!(
+            detector.detect("How are the tyres looking?"),
+            Some(arrstr!("en"))
+        );
+        assert_eq!(
+            detector.detect("¿Cuánto combustible me queda?"),
+            Some(arrstr!("es"))
+        );
         assert_eq!(detector.detect("cuándo paro"), Some(arrstr!("es")));
 
         // Nothing to choose between with a single voice
@@ -172,14 +181,8 @@ mod tests {
 
     #[test]
     fn notes_the_language_to_reply_in() {
-        assert_eq!(
-            reply_note(arrstr!("it")),
-            "[Reply in Italian, the pilot's language.]"
-        );
-        assert_eq!(
-            reply_note(arrstr!("xx")),
-            "[Reply in xx, the pilot's language.]"
-        );
+        assert_eq!(reply_note(arrstr!("it")), "[Reply in Italian.]");
+        assert_eq!(reply_note(arrstr!("xx")), "[Reply in xx.]");
     }
 
     #[test]
