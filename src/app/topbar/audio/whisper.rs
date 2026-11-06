@@ -790,20 +790,33 @@ impl PendingSession {
             if samples.len() < MIN_SAMPLES {
                 return Ok(Heard::TooShort);
             }
-            let (voices, min_confidence) = {
+            let (voices, min_confidence, heard_language, spoken_language) = {
                 let config = config.get();
                 let voices = config.voices().keys().copied().collect::<Vec<_>>();
-                (voices, *config.min_confidence())
+                (
+                    voices,
+                    *config.min_confidence(),
+                    *config.heard_language(),
+                    config.engineer_reply_language(),
+                )
             };
 
-            // Nothing to answer with
-            if voices.is_empty() {
-                return Ok(Heard::NoVoice(None));
-            }
             let model = self.0.into_inner();
-            if !model.ctx.is_multilingual() && !voices.contains(&arrstr!("en")) {
-                return Ok(Heard::NoVoice(Some(arrstr!("en"))));
+            if let Some(problem) = transcription_problem(
+                model.ctx.is_multilingual(),
+                heard_language,
+                spoken_language,
+                &voices,
+            ) {
+                return Ok(problem);
             }
+            // With a fixed reply language, the input needs no voice of its own.
+            let candidates = match spoken_language {
+                Some(_) => (0..=whisper_rs::get_lang_max_id())
+                    .filter_map(|id| whisper_language(id as usize))
+                    .collect::<Vec<_>>(),
+                None => voices.clone(),
+            };
             model.session.run(
                 || {
                     anyhow::ensure!(model.latest.load(Ordering::Relaxed) == ticket, "Superseded recording");
@@ -822,10 +835,13 @@ impl PendingSession {
                         return Ok(Heard::Nothing);
                     }
                     let waited = start.elapsed();
-                    let mel = Instant::now();
-                    session.state.pcm_to_mel(&samples, session.threads.get())?;
                     let detect = Instant::now();
-                    let spoken = session.detect_language(&voices, min_confidence)?;
+                    let spoken = Spoken::resolve(session.multilingual, heard_language, &voices, || {
+                        // Only detection needs this separate pass. Full transcription prepares
+                        // its own mel, so a fixed language goes straight to `speech_to_text`.
+                        session.state.pcm_to_mel(&samples, session.threads.get())?;
+                        session.detect_language(&candidates, min_confidence)
+                    })?;
                     if model.latest.load(Ordering::Relaxed) != ticket {
                         return Ok(Heard::Nothing);
                     }
@@ -848,10 +864,9 @@ impl PendingSession {
                         Spoken::Unclear => Heard::Nothing,
                     };
                     log::debug!(
-                        "Speech to text took {:?}: waited {waited:?} for the state, {:?} for the mel, {:?} \
-                         detecting the language, {:?} transcribing",
+                        "Speech to text took {:?}: waited {waited:?} for the state, {:?} \
+                         resolving the language (including mel preparation for detection), {:?} transcribing",
                         start.elapsed(),
-                        detect - mel,
                         transcribe - detect,
                         transcribe.elapsed(),
                     );
@@ -873,7 +888,6 @@ impl WhisperSession {
             return Ok(Spoken::Voiced(arrstr!("en")));
         }
 
-        // Even with a single voice: whatever was said may be in no language, or another one
         let (_, probs) = self.state.lang_detect(0, self.threads.get())?;
         let mut likeliest = (probs.iter().copied().enumerate())
             .filter_map(|(id, prob)| Some((whisper_language(id)?, prob)))
@@ -901,6 +915,7 @@ impl WhisperSession {
 
         params.set_n_threads(c_int::try_from(self.threads.get()).unwrap_or(c_int::MAX));
         params.set_language(Some(&lang));
+        params.set_detect_language(false);
         // Recordings are independent even though their buffers are reused.
         params.set_no_context(true);
         params.set_print_special(false);
@@ -931,6 +946,27 @@ impl WhisperSession {
 /// pressed by accident.
 const MIN_SAMPLES: usize = 16000 * 3 / 10;
 
+/// Reject incompatible settings before inference or language detection starts.
+fn transcription_problem(
+    multilingual: bool,
+    heard_language: Option<ArrayStr<2>>,
+    spoken_language: Option<ArrayStr<2>>,
+    voices: &[ArrayStr<2>],
+) -> Option<Heard> {
+    if voices.is_empty() {
+        return Some(Heard::NoVoice(None));
+    }
+    if !multilingual {
+        if let Some(lang) = heard_language.filter(|lang| *lang != arrstr!("en")) {
+            return Some(Heard::UnsupportedLanguage(lang));
+        }
+        if spoken_language.is_none() && !voices.contains(&arrstr!("en")) {
+            return Some(Heard::NoVoice(Some(arrstr!("en"))));
+        }
+    }
+    None
+}
+
 /// How sure whisper has to be of a language without a voice to tell the pilot there's none for
 /// it: noise is often a little likelier to be some language or other.
 const UNVOICED_CONFIDENCE: f32 = 0.5;
@@ -946,17 +982,13 @@ const NO_SPEECH: f32 = 0.8;
 /// Whisper's language `id`, as the voices have it.
 fn whisper_language(id: usize) -> Option<ArrayStr<2>> {
     let code = get_lang_str(i32::try_from(id).ok()?)?;
-    ArrayStr::from_str(match code {
-        // Norwegian's voices are for both its written forms
-        "nn" => "no",
-        code => code,
-    })
+    ArrayStr::from_str(code).map(crate::language::voice_code)
 }
 
 /// The language spoken on the radio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Spoken {
-    /// One with a voice
+    /// One with a voice, or a fixed input language that can use a different reply voice
     Voiced(ArrayStr<2>),
     /// One clearly without a voice
     Unvoiced(ArrayStr<2>),
@@ -965,6 +997,27 @@ enum Spoken {
 }
 
 impl Spoken {
+    /// Resolve known languages before doing any detection or preparing audio for it.
+    fn resolve(
+        multilingual: bool,
+        heard_language: Option<ArrayStr<2>>,
+        voices: &[ArrayStr<2>],
+        detect: impl FnOnce() -> anyhow::Result<Self>,
+    ) -> anyhow::Result<Self> {
+        let fixed = if !multilingual {
+            Some(arrstr!("en"))
+        } else {
+            heard_language.or_else(|| match voices {
+                [only] => Some(*only),
+                _ => None,
+            })
+        };
+        match fixed {
+            Some(lang) => Ok(Self::Voiced(lang)),
+            None => detect(),
+        }
+    }
+
     /// The language spoken, from how likely each is (`likeliest`, likeliest first), among
     /// `voices` (the languages with a voice) if it's one of them.
     fn choose(
@@ -1617,6 +1670,68 @@ mod tests {
             println!("{lang} -> {detected}: {heard}");
             assert_eq!(detected, lang);
         }
+    }
+
+    #[test]
+    fn fixed_languages_never_run_detection() {
+        let en = arrstr!("en");
+        let es = arrstr!("es");
+        for (multilingual, heard, voices, expected) in [
+            (true, None, vec![es], es),
+            (true, Some(en), vec![es], en),
+            (true, Some(es), vec![en, es], es),
+            (true, Some(es), vec![en], es),
+            (
+                true,
+                Some(arrstr!("nn")),
+                vec![en, arrstr!("no")],
+                arrstr!("nn"),
+            ),
+            (false, None, vec![en, es], en),
+            (false, Some(en), vec![en, es], en),
+        ] {
+            let spoken = Spoken::resolve(multilingual, heard, &voices, || {
+                panic!("Fixed languages must skip detection, including its mel preparation")
+            })
+            .unwrap();
+            assert_eq!(spoken, Spoken::Voiced(expected));
+        }
+    }
+
+    #[test]
+    fn rejects_incompatible_model_and_voice_settings_before_transcription() {
+        let [en, es] = [arrstr!("en"), arrstr!("es")];
+        assert!(
+            matches!(transcription_problem(false, None, None, &[es]), Some(Heard::NoVoice(Some(lang))) if lang == en)
+        );
+        assert!(
+            matches!(transcription_problem(false, Some(es), Some(en), &[en]), Some(Heard::UnsupportedLanguage(lang)) if lang == es)
+        );
+        assert!(matches!(
+            transcription_problem(true, None, None, &[]),
+            Some(Heard::NoVoice(None))
+        ));
+        assert!(transcription_problem(false, None, Some(es), &[es]).is_none());
+        assert!(transcription_problem(false, Some(en), None, &[en]).is_none());
+        assert!(transcription_problem(true, Some(es), None, &[en]).is_none());
+    }
+
+    #[test]
+    fn automatic_input_with_multiple_voices_runs_detection() {
+        let mut called = false;
+        let spoken = Spoken::resolve(true, None, &[arrstr!("en"), arrstr!("es")], || {
+            called = true;
+            Ok(Spoken::Voiced(arrstr!("es")))
+        })
+        .unwrap();
+        assert!(called);
+        assert_eq!(spoken, Spoken::Voiced(arrstr!("es")));
+        assert!(
+            Spoken::resolve(true, None, &[arrstr!("en"), arrstr!("es")], || {
+                anyhow::bail!("detection failed")
+            })
+            .is_err()
+        );
     }
 
     #[test]

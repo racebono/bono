@@ -286,7 +286,9 @@ impl Spotter {
         settings: &SpotterConfig,
         engineer: &Engineer,
     ) -> ArrayStr<2> {
-        let lang = settings.language().unwrap_or(engineer.language());
+        let lang = settings
+            .language()
+            .unwrap_or_else(|| engineer.language(config));
         engineer.voice(config, lang).unwrap_or(arrstr!("en"))
     }
 
@@ -2394,6 +2396,40 @@ mod tests {
         assert_eq!(call.words(arrstr!("fr")), "rain likely in about 4 minutes");
         assert_eq!(translate("car left", arrstr!("es")), "coche a la izquierda");
         assert_eq!(translate("car left", arrstr!("ca")), "cotxe a l'esquerra");
+    }
+
+    #[tokio::test]
+    async fn fixed_input_language_applies_to_calls_before_any_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+            "voices": {"en": "en.onnx", "es": "es.onnx"},
+            "heard_language": "es", "spoken_language": "en"
+        }"#,
+        )
+        .unwrap();
+        let config = Config::new(&path).await.unwrap();
+        let engineer = Engineer::new(reqwest::Client::new(), None);
+        let spotter = Spotter::new();
+        assert_eq!(
+            spotter.language(&config, &config.get().spotter, &engineer),
+            arrstr!("es")
+        );
+        config.update(|raw| raw.heard_language.set(Some(arrstr!("en"))));
+        assert_eq!(
+            spotter.language(&config, &config.get().spotter, &engineer),
+            arrstr!("en")
+        );
+        config.update(|raw| {
+            raw.heard_language.set(Some(arrstr!("es")));
+            raw.spotter.language.set(Some(arrstr!("en")));
+        });
+        assert_eq!(
+            spotter.language(&config, &config.get().spotter, &engineer),
+            arrstr!("en")
+        );
     }
 
     #[test]
