@@ -1745,9 +1745,7 @@ impl Trace {
         let mut top = 0.0f64;
         for s in &rows {
             let d = s.lap_distance.unwrap_or(0.0).min(length);
-            // The first rows of a lap can still carry the old lap's distance, and a car waiting on
-            // the grid or in its pit box can be just short of the line
-            if d - top > length * derived::IMPOSSIBLE_JUMP {
+            if !derived::believable(top, d, length) {
                 continue;
             }
             // LMU's estimate can step back a little: kept monotonic

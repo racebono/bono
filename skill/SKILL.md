@@ -78,7 +78,8 @@ run, not a race to the flag.
 - `sql`: one read-only `query` (`limit` rows, default 60, maximum 200). Queries stop at ten seconds.
   Long results can be cut, so name the few columns you need rather than `SELECT *`, and make the
   calls you need together. A line starting `-- the current-state tables are incomplete` means they
-  can't be relied on for this answer.
+  can't be relied on for this answer; `-- the lap and corner tables are still reading the session`
+  means figures from them are partial: say so if the answer depends on them.
 
 Prefer the tables below: they're current as of your query and already handle the recording's
 traps. Everything is the current session only. Units are in the names; NULL means not reported,
@@ -145,7 +146,7 @@ Updated as the cars drive, the lap in progress too.
 **`lap_stats`**, one row per car and lap: `vehicle_id`, `lap`, `stint_number`, `first_id`, `last_id`
 (the lap's telemetry rows), `start_s`; `time_s`, `official_time_s`, `sector_1_s`, `sector_2_s`,
 `sector_3_s`, `top_speed_kmh`; `complete`, `invalid`, `pit` (in or out lap; one stop is one more `stint_number`), `refuelled`, `contact`,
-`green` (complete, no pit or refuel: representative for pace and use), `track_limit_steps`;
+`green` (complete and seen whole, no pit or refuel: representative for pace and use), `track_limit_steps`;
 `fuel_start_l`, `fuel_end_l`, `fuel_used_l`, `energy_start_pct`, `energy_end_pct`,
 `energy_used_pct`; `gap_ahead_end_s`, `gap_behind_end_s`.
 
@@ -256,7 +257,8 @@ consumption; don't extrapolate one short saving segment into a finish.
   pace alone.
 - **Energy and stops:** give an action and usable timing, not a menu. Add stop losses from `track` if
   they matter. Keep weather out of an energy-only verdict.
-- **Tyres:** interpret, don't read out; distinguish life remaining from wear used. Why a tyre or brake
+- **Tyres:** interpret, don't read out; distinguish life remaining from wear used. The snapshot has no
+  wear: an overall check needs `wheels_now`, as temperatures alone don't establish condition. Why a tyre or brake
   runs hot: read the trend first (a temperature still climbing isn't settled), then where it builds.
   Brake-led: the brake rises most and the tyre gains under braking in heavy zones. Load-led: gains off
   the brakes in long corners loading that side. Traction-led: a rear gains at full throttle out of slow

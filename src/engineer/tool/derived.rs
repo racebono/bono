@@ -38,6 +38,12 @@ pub(super) const THROTTLE_SEARCH: f64 = 300.0;
 /// A lap distance this far ahead of the car's last one, as a share of the lap, isn't believed:
 /// the first rows of a lap can still carry the old lap's distance
 pub(super) const IMPOSSIBLE_JUMP: f64 = 0.5;
+/// Where a lap's first believable distance can be at most, as a share of the lap: past it, it's the
+/// old lap's, or a car waiting just short of the line
+const FIRST_DISTANCE: f64 = 0.9;
+/// How far from the line a lap's rows must start to have seen all of it, as a share of its rows'
+/// furthest distance
+const SEEN_FROM_THE_START: f64 = 0.05;
 /// A lap with more of it than this unseen, as a share of the lap, isn't relied on
 pub(super) const WIDEST_GAP: f64 = 0.05;
 
@@ -419,6 +425,18 @@ fn authorize(context: AuthContext<'_>) -> Authorization {
     }
 }
 
+/// A number for the model: four significant digits, or to the millisecond for the larger ones (a
+/// session's clock, a distance on a long lap), which those would blur.
+fn real_text(x: f64) -> String {
+    match x.abs() >= 1000.0 && x.is_finite() {
+        true => {
+            let text = format!("{x:.3}");
+            text.trim_end_matches('0').trim_end_matches('.').to_owned()
+        }
+        false => g4(x),
+    }
+}
+
 fn run_query(
     conn: &Connection,
     stream: &Stream,
@@ -428,13 +446,23 @@ fn run_query(
 ) -> anyhow::Result<String> {
     let limit = limit.unwrap_or(60).clamp(1, SQL_MAX_ROWS);
     let mut out = String::new();
+    let latest = scalar::<i64>(conn, "SELECT MAX(id) FROM telemetry", [])
+        .ok()
+        .flatten()
+        .unwrap_or(stream.cursor);
     say!(
         out,
-        "-- player vehicle_id={}, session_first_id={}, latest_telemetry_id={}",
+        "-- player vehicle_id={}, session_first_id={}, latest_telemetry_id={latest}",
         int(stream.player),
         stream.session_start,
-        stream.cursor
     );
+    if stream.behind || stream.failed {
+        say!(
+            out,
+            "-- the lap and corner tables are still reading the session (up to telemetry row {} of {latest}): their figures are partial",
+            stream.cursor
+        );
+    }
     if let Some(note) = note {
         say!(out, "-- the current-state tables are incomplete: {note}");
     }
@@ -468,7 +496,7 @@ fn run_query(
                     Ok(match row.get::<_, Value>(i)? {
                         Value::Null => "NULL".into(),
                         Value::Integer(n) => n.to_string(),
-                        Value::Real(x) => g4(x),
+                        Value::Real(x) => real_text(x),
                         Value::Text(text) => telemetry_text(&text),
                         Value::Blob(blob) => format!("<{} bytes>", blob.len()),
                     })
@@ -640,11 +668,45 @@ fn wear_remaining(laps: &[Lap]) -> bool {
     true
 }
 
+/// The valid green laps, quickest first.
+fn best_laps(laps: &[Lap]) -> Vec<&Lap> {
+    let mut laps = laps
+        .iter()
+        .filter(|lap| lap.green && !lap.invalid && lap.time.is_some())
+        .collect::<Vec<_>>();
+    laps.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(Ordering::Equal));
+    laps
+}
+
 /// The best valid green lap.
 fn best_lap(laps: &[Lap]) -> Option<&Lap> {
-    laps.iter()
-        .filter(|lap| lap.green && !lap.invalid && lap.time.is_some())
-        .min_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(Ordering::Equal))
+    best_laps(laps).first().copied()
+}
+
+/// The quickest of a car's best laps the car was seen all the way round, and its trace.
+fn best_seen_lap<'a>(
+    conn: &Connection,
+    vehicle: i64,
+    laps: &'a [Lap],
+    length: f64,
+) -> rusqlite::Result<Option<(&'a Lap, Trace)>> {
+    for lap in best_laps(laps).into_iter().take(3) {
+        let trace = Trace::read(conn, vehicle, lap, length)?;
+        if trace.ok {
+            return Ok(Some((lap, trace)));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a row's lap distance `d` can follow the furthest one so far on its lap. The first rows of
+/// a lap can still carry the old lap's distance, and a car waiting on the grid or in its pit box can
+/// be just short of the line; a car joining midway really does start far on.
+pub(super) fn believable(top: f64, d: f64, length: f64) -> bool {
+    match top > 0.0 {
+        true => d - top <= length * IMPOSSIBLE_JUMP,
+        false => d <= length * FIRST_DISTANCE,
+    }
 }
 
 /// What temperatures rose by in one corner section, for one wheel.
@@ -676,6 +738,9 @@ struct LapBuild {
     samples: Vec<Sample>,
     /// The furthest believable lap distance so far
     top: f64,
+    /// The nearest and furthest lap distances of its rows
+    nearest: Option<f64>,
+    furthest: Option<f64>,
     /// What's been written of each corner's pass: how many of its marks the car has passed
     marks_passed: Vec<u8>,
     /// The next distance at which something of a pass can be written
@@ -703,6 +768,8 @@ impl LapBuild {
             gap_behind_end: None,
             samples: Vec::new(),
             top: 0.0,
+            nearest: None,
+            furthest: None,
             marks_passed: vec![0; corners],
             next_mark: layout.map_or(f64::INFINITY, |layout| next_mark(layout, 0.0)),
             rises: vec![[Rises::default(); 4]; corners],
@@ -730,9 +797,13 @@ impl LapBuild {
         self.gap_ahead_end = sample.gap_ahead;
         self.gap_behind_end = sample.gap_behind;
         self.samples.push(*sample);
+        if let Some(d) = sample.lap_distance {
+            self.nearest = Some(self.nearest.map_or(d, |nearest| nearest.min(d)));
+            self.furthest = Some(self.furthest.map_or(d, |furthest| furthest.max(d)));
+        }
         if let (Some(d), Some(length)) = (sample.lap_distance, length) {
             let d = d.min(length);
-            if d - self.top <= length * IMPOSSIBLE_JUMP {
+            if believable(self.top, d, length) {
                 self.top = self.top.max(d);
             }
         }
@@ -758,12 +829,17 @@ impl LapBuild {
             }
             Ok(wear)
         };
+        // With laps missing after it, the next lap's start says nothing about this one
+        let next_lap = next.filter(|next| next.lap == self.lap + 1);
         // Consumption: start of this lap to start of the next (falls back to the last row)
-        let fuel_1 = next.map_or(self.fuel_end, |next| next.fuel_start);
-        let energy_1 = next.map_or(self.energy_end, |next| next.energy_start);
+        let (fuel_1, energy_1) = match (next, next_lap) {
+            (None, _) => (self.fuel_end, self.energy_end),
+            (Some(_), Some(next)) => (next.fuel_start, next.energy_start),
+            (Some(_), None) => (None, None),
+        };
         let fuel_used = self.fuel_start.zip(fuel_1).map(|(a, b)| a - b);
         let energy_used = self.energy_start.zip(energy_1).map(|(a, b)| a - b);
-        let time = match (next, self.start) {
+        let time = match (next_lap, self.start) {
             (Some(next), Some(start)) => next
                 .start
                 .filter(|s| *s != 0.0)
@@ -772,6 +848,11 @@ impl LapBuild {
             _ => None,
         };
         let complete = next.is_some();
+        // A car joining midway used a fraction of a lap's fuel
+        let seen_from_the_start = match (self.nearest, self.furthest) {
+            (Some(nearest), Some(furthest)) => nearest <= furthest * SEEN_FROM_THE_START,
+            _ => true,
+        };
         let refuelled =
             fuel_used.is_some_and(|f| f < -0.5) || energy_used.is_some_and(|v| v < -0.01);
         Ok(Lap {
@@ -787,7 +868,7 @@ impl LapBuild {
             refuelled,
             contact: impact.is_some_and(|impact| impact > 0.0) && impact != previous_impact,
             // A pit lap is an in or out lap: the pit lane flag was set at some point during the lap
-            green: complete && !self.pit && !refuelled,
+            green: next_lap.is_some() && seen_from_the_start && !self.pit && !refuelled,
             impact,
             track_limit_steps: state
                 .as_ref()
@@ -1306,13 +1387,13 @@ pub(super) struct Stream {
     layout: Option<Layout>,
     checked_layout: Option<Instant>,
     /// How many laps the player had when the description was last lined up with them
-    calibrated_laps: Option<usize>,
-    /// The player's lap whose braking zones were last looked for (car and lap)
-    zones_from: Option<(i64, i64)>,
+    calibrated_laps: Option<(usize, usize)>,
+    /// How many laps the player had when braking zones were last looked for (car and laps)
+    zones_from: Option<(i64, usize)>,
     standings_cursor: i64,
     standings_t: Option<f64>,
-    /// The standings' laps completed, by car
-    laps_completed: HashMap<i64, i64>,
+    /// The standings' laps completed, by car, and when that last changed
+    laps_completed: HashMap<i64, (i64, f64)>,
     official: HashMap<i64, Vec<Official>>,
 }
 
@@ -1403,16 +1484,24 @@ impl Stream {
 
     /// The row last read must still be the same row, or the file's a new one.
     fn notice_recreated_file(&mut self, conn: &Connection) -> rusqlite::Result<()> {
-        if self.last_row.is_none() {
-            return Ok(());
-        }
-        let r = row(
-            conn,
-            "SELECT session_time, vehicle_id FROM telemetry WHERE id = ?",
-            [self.cursor],
-        )?;
-        let found = r.map(|r| (r.f("session_time"), Some(r.i("vehicle_id").unwrap_or(-1))));
-        if found == self.last_row {
+        let top = |table: &str| {
+            scalar::<i64>(conn, &format!("SELECT MAX(id) FROM {table}"), [])
+                .map(|top| top.unwrap_or(0))
+        };
+        let same = match self.last_row {
+            Some(last_row) => {
+                let r = row(
+                    conn,
+                    "SELECT session_time, vehicle_id FROM telemetry WHERE id = ?",
+                    [self.cursor],
+                )?;
+                r.map(|r| (r.f("session_time"), Some(r.i("vehicle_id").unwrap_or(-1))))
+                    == Some(last_row)
+            }
+            // Nothing read since a rewind: there must still be rows that far on
+            None => top("telemetry")? >= self.cursor,
+        };
+        if same && top("standings")? >= self.standings_cursor {
             return Ok(());
         }
         self.standings_cursor = 0;
@@ -1452,23 +1541,41 @@ impl Stream {
             else {
                 continue;
             };
-            if self
-                .laps_completed
-                .insert(vehicle, laps)
-                .is_none_or(|before| before == laps)
-            {
+            let before = self.laps_completed.get(&vehicle).copied();
+            let new_lap = before.is_some_and(|(before, _)| before != laps);
+            let ended = match new_lap {
+                true => at,
+                false => before.map_or(at, |(_, ended)| ended),
+            };
+            self.laps_completed.insert(vehicle, (laps, ended));
+            // The first we hear of a car says nothing about a lap ending
+            let Some(_) = before else {
                 continue;
-            }
+            };
             let Some(time) = r.f("last_lap_time").filter(|time| *time > 0.0) else {
                 continue;
             };
+            let entries = self.official.entry(vehicle).or_default();
+            // The lap count and its time can come a row apart: the time goes with the count
+            let same_lap = entries.last().is_some_and(|last| last.at == ended);
+            let late = !new_lap
+                && (at - ended) < OFFICIAL_MATCH
+                && entries
+                    .last()
+                    .is_none_or(|last| last.at < ended || last.time != time);
+            if !new_lap && !late {
+                continue;
+            }
             let official = Official {
-                at,
+                at: ended,
                 time,
                 sectors: ["last_sector_1", "last_sector_2", "last_sector_3"]
                     .map(|name| r.f(name).filter(|time| *time > 0.0)),
             };
-            self.official.entry(vehicle).or_default().push(official);
+            if same_lap {
+                entries.pop();
+            }
+            entries.push(official);
             // The telemetry may have seen the lap end first
             conn.prepare_cached(
                 "UPDATE lap_stats SET official_time_s = ?, sector_1_s = ?, sector_2_s = ?, \
@@ -1481,7 +1588,7 @@ impl Stream {
                 official.sectors[1],
                 official.sectors[2],
                 vehicle,
-                at,
+                ended,
                 OFFICIAL_MATCH
             ])?;
         }
@@ -1629,12 +1736,18 @@ impl Stream {
     /// Lines the description up with the laps, once the player has completed another: the layout
     /// moves if that takes more than a car's error in finding its apexes.
     fn calibrate(&mut self, conn: &Connection, shared: &Shared) -> anyhow::Result<()> {
-        let laps = self
+        let player_laps = self
             .player
             .and_then(|player| self.cars.get(&player))
             .map_or(0, |car| car.finished.len());
-        let any_lap = self.cars.values().any(|car| !car.finished.is_empty());
-        if !any_lap || self.calibrated_laps.is_some_and(|before| before >= laps) {
+        let all_laps = self
+            .cars
+            .values()
+            .map(|car| car.finished.len())
+            .sum::<usize>();
+        // Once the player has laps, only theirs count; until then, anyone's might be usable
+        let laps = (player_laps, if player_laps > 0 { 0 } else { all_laps });
+        if all_laps == 0 || self.calibrated_laps.is_some_and(|before| before >= laps) {
             return Ok(());
         }
         self.calibrated_laps = Some(laps);
@@ -1708,17 +1821,13 @@ impl Stream {
         vehicles.extend(quickest);
 
         for vehicle in vehicles {
-            let Some(lap) = self
+            let laps = self
                 .cars
                 .get(&vehicle)
-                .and_then(|car| best_lap(&car.finished))
-            else {
+                .map_or(&[][..], |car| &car.finished[..]);
+            let Some((lap, trace)) = best_seen_lap(conn, vehicle, laps, length)? else {
                 continue;
             };
-            let trace = Trace::read(conn, vehicle, lap, length)?;
-            if !trace.ok {
-                continue;
-            }
             let corners = trace
                 .braking_zones()
                 .into_iter()
@@ -1746,18 +1855,17 @@ impl Stream {
         let Some(vehicle) = self.player else {
             return Ok(());
         };
-        let Some(lap) = self
-            .cars
-            .get(&vehicle)
-            .and_then(|car| best_lap(&car.finished))
-            .cloned()
-        else {
+        let Some(car) = self.cars.get(&vehicle) else {
             return Ok(());
         };
-        if self.zones_from == Some((vehicle, lap.lap)) {
+        let Some(lap) = best_lap(&car.finished) else {
+            return Ok(());
+        };
+        let tried = (vehicle, car.finished.len());
+        if self.zones_from == Some(tried) {
             return Ok(());
         }
-        self.zones_from = Some((vehicle, lap.lap));
+        self.zones_from = Some(tried);
         let session_length = scalar::<f64>(
             conn,
             "SELECT track_length FROM session ORDER BY id DESC LIMIT 1",
@@ -1777,10 +1885,9 @@ impl Stream {
         let Some(length) = length.filter(|length| *length > 0.0) else {
             return Ok(());
         };
-        let trace = Trace::read(conn, vehicle, &lap, length)?;
-        if !trace.ok {
+        let Some((_, trace)) = best_seen_lap(conn, vehicle, &car.finished, length)? else {
             return Ok(());
-        }
+        };
         let turns = trace
             .braking_zones()
             .into_iter()
@@ -1900,9 +2007,12 @@ impl Stream {
     }
 
     fn write_race_state(&self, ctx: &Ctx, sc: &Scoring, now: Option<f64>) -> rusqlite::Result<()> {
-        let Some(s) = &sc.session else {
-            return Ok(());
+        // Without a session row yet, what's known without one is still known
+        let empty = Row {
+            columns: Arc::default(),
+            values: Vec::new(),
         };
+        let s = sc.session.as_ref().unwrap_or(&empty);
         let age = staleness(&ctx.shared.path);
         let (start_t, end_t) = (s.f("pit_window_start_time"), s.f("pit_window_end_time"));
         let opens = start_t
@@ -3091,6 +3201,76 @@ mod tests {
     }
 
     #[test]
+    fn large_numbers_keep_their_precision() {
+        assert_eq!(real_text(3605.2), "3605.2");
+        assert_eq!(real_text(12345.678), "12345.678");
+        assert_eq!(real_text(1000.0), "1000");
+        assert_eq!(real_text(99.8), "99.8");
+        assert_eq!(real_text(-2.5), "-2.5");
+    }
+
+    #[test]
+    fn a_first_distance_is_believed_unless_its_the_old_laps() {
+        assert!(believable(0.0, 10.0, 2000.0));
+        // Joined midway
+        assert!(believable(0.0, 1200.0, 2000.0));
+        // The old lap's, or waiting just short of the line
+        assert!(!believable(0.0, 1990.0, 2000.0));
+        assert!(believable(1200.0, 1300.0, 2000.0));
+        assert!(!believable(100.0, 1200.0, 2000.0));
+    }
+
+    fn build_of(lap: i64, samples: &[Sample], start: f64) -> LapBuild {
+        let mut build = LapBuild::new(&samples[0], lap, None);
+        for sample in samples {
+            build.add(sample, None);
+        }
+        build.start = Some(start);
+        build
+    }
+
+    #[test]
+    fn a_lap_is_only_green_with_all_of_it_and_the_next_one_seen() {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        let whole = partial(2000.0);
+        let lap = |number: i64, next: i64, samples: &[Sample]| {
+            let next = build_of(next, &whole, 100.0);
+            build_of(number, samples, 60.0)
+                .lap(&conn, 1, Some(&next), None, 1)
+                .unwrap()
+        };
+        let clean = lap(1, 2, &whole);
+        assert!(clean.green);
+        assert_eq!(clean.time, Some(40.0));
+        assert_eq!(clean.fuel_used, Some(0.0));
+
+        // Laps missing after it: nothing says how long this one took or what it used
+        let skipped = lap(1, 3, &whole);
+        assert!(skipped.complete && !skipped.green);
+        assert_eq!((skipped.time, skipped.fuel_used), (None, None));
+
+        // Joined midway
+        let joined = whole
+            .iter()
+            .filter(|s| s.lap_distance.unwrap() >= 1200.0)
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(!lap(1, 2, &joined).green);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_query_is_told_when_the_tables_are_behind() {
+        let (_dir, engineer) = race();
+        let out = run(
+            &engineer,
+            serde_json::json!({"command": "sql", "query": "SELECT 1"}),
+        )
+        .await;
+        assert!(!out.contains("still reading"), "{out}");
+    }
+
+    #[test]
     fn a_trace_only_trusts_what_the_car_was_seen_doing() {
         let whole = partial(2000.0);
         // Seen all the way round
@@ -3105,6 +3285,15 @@ mod tests {
         assert!(!trace.ok);
         assert!(trace.seen(0.0, 600.0).is_empty());
         assert_eq!(trace.seen(700.0, 800.0).len(), 21);
+        // Past halfway too: the corners it did get to count
+        let late = whole
+            .iter()
+            .filter(|s| s.lap_distance.unwrap() >= 1200.0)
+            .copied()
+            .collect::<Vec<_>>();
+        let trace = Trace::build(&late, Some(0.0), Some(40.0), 2000.0);
+        assert!(!trace.ok);
+        assert_eq!(trace.seen(1200.0, 1300.0).len(), 21);
         // A gap in the recording
         let gap = whole
             .iter()

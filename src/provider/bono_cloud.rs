@@ -627,6 +627,7 @@ impl Conversation {
             .bearer_source(Arc::new(lease.clone()))
             .lease_source(Arc::new(lease.clone()))
             .server_settings()
+            .request_ids()
             .system(system)
             .tools(tools);
         Ok(Self {
@@ -1268,6 +1269,13 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
+    fn idempotency_key(head: &str) -> &str {
+        head.lines()
+            .find_map(|line| line.strip_prefix("idempotency-key:"))
+            .map(str::trim)
+            .expect("an idempotency key")
+    }
+
     #[tokio::test]
     async fn sends_nothing_for_a_router() {
         let (url, requests) = mock(vec![answer()]).await;
@@ -1275,10 +1283,33 @@ mod tests {
         let mut conversation = conversation(&account, Tools::default());
         conversation.send("Pit?".into()).await.unwrap();
         let requests = requests.lock().unwrap();
-        let (head, body) = &requests[0];
+        let (_, body) = &requests[0];
         assert!(body.get("routing_turn").is_none());
         assert!(body.get("routing_context").is_none());
-        assert!(!head.contains("idempotency-key"));
+    }
+
+    #[tokio::test]
+    async fn every_inference_has_its_own_request_id() {
+        for status in [503, 429] {
+            let (url, requests) = mock_headers(
+                vec![
+                    cloud_error(status, "temporarily_unavailable"),
+                    cloud_error(status, "temporarily_unavailable"),
+                    answer(),
+                ],
+                "x-should-retry: true\r\nretry-after: 0\r\n",
+            )
+            .await;
+            let account = signed_in(url, "access-1");
+            let mut conversation = conversation(&account, Tools::default());
+            assert_eq!(conversation.send("Pit?".into()).await.unwrap().text, "Box.");
+            let requests = requests.lock().unwrap();
+            let keys = requests
+                .iter()
+                .map(|(head, _)| idempotency_key(head))
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(keys.len(), 3);
+        }
     }
 
     #[test]

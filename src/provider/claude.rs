@@ -225,6 +225,8 @@ pub struct Conversation {
     usage: BTreeMap<String, Usage>,
     /// Added after every turn's tool results (see [`Model::set_tool_result_note`])
     result_note: Option<Arc<str>>,
+    /// Requests carry an `Idempotency-Key`, so a retry after a lost connection isn't billed twice
+    request_ids: bool,
 }
 
 /// Tokens billed, by kind, as the API counts them.
@@ -573,6 +575,9 @@ impl Conversation {
         // one was (once per request)
         let mut invalid_lease = None::<String>;
         let mut released = false;
+        // Transport retries keep the identity because the inference may still be running.
+        // Retrying a server error starts a new inference: Cloud retains failed request IDs.
+        let mut request_id = self.request_ids.then(new_request_id);
         loop {
             sink.start_response();
             let bearer = match &self.bearer_source {
@@ -583,9 +588,9 @@ impl Conversation {
                 Some(source) => source.lease(invalid_lease.take().as_deref()).await?,
                 None => None,
             };
-            let mut timing = RequestTiming::new();
+            let mut timing = RequestTiming::new(request_id.as_deref());
             let resp = self
-                .request(bearer.as_deref(), lease.as_deref())
+                .request(bearer.as_deref(), lease.as_deref(), request_id.as_deref())
                 .send()
                 .await;
             if resp.is_err() {
@@ -632,6 +637,9 @@ impl Conversation {
                             && retryable_stream_error(&e) =>
                     {
                         log::warn!("Claude's response failed midway, retrying: {e:#}");
+                        if request_id.is_some() {
+                            request_id = Some(new_request_id());
+                        }
                         tokio::time::sleep(backoff(attempt)).await;
                         attempt += 1;
                         continue;
@@ -679,18 +687,29 @@ impl Conversation {
             }
 
             log::warn!("{error}, retrying");
+            if request_id.is_some() {
+                request_id = Some(new_request_id());
+            }
             tokio::time::sleep(retry_after.unwrap_or_else(|| backoff(attempt))).await;
             attempt += 1;
         }
     }
 
-    fn request(&self, bearer: Option<&str>, lease: Option<&str>) -> RequestBuilder {
-        let request = self
+    fn request(
+        &self,
+        bearer: Option<&str>,
+        lease: Option<&str>,
+        request_id: Option<&str>,
+    ) -> RequestBuilder {
+        let mut request = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
             .headers(self.headers.clone())
             .timeout(self.timeout)
             .json(&self.leased_request(lease));
+        if let Some(request_id) = request_id {
+            request = request.header("idempotency-key", request_id);
+        }
         return match bearer {
             Some(bearer) => request.bearer_auth(bearer),
             None => request,
@@ -970,6 +989,7 @@ pub struct ConversationBuilder {
     history_limits: Option<HistoryLimits>,
     /// The model and its settings are left out of requests, for the server to choose
     server_settings: bool,
+    request_ids: bool,
 }
 
 impl ConversationBuilder {
@@ -994,6 +1014,7 @@ impl ConversationBuilder {
             lease_source: None,
             server_settings: false,
             history_limits: None,
+            request_ids: false,
         }
     }
 
@@ -1057,6 +1078,14 @@ impl ConversationBuilder {
     #[inline]
     pub(super) fn server_settings(&mut self) -> &mut Self {
         self.server_settings = true;
+        self
+    }
+
+    /// Sends each inference with an `Idempotency-Key` (Bono Cloud's), so a retry after a lost
+    /// connection can't be billed as another.
+    #[inline]
+    pub(super) fn request_ids(&mut self) -> &mut Self {
+        self.request_ids = true;
         self
     }
 
@@ -1281,8 +1310,14 @@ impl ConversationBuilder {
             tools: self.tools,
             usage: BTreeMap::new(),
             result_note: None,
+            request_ids: self.request_ids,
         });
     }
+}
+
+/// A new `Idempotency-Key`, for one inference.
+fn new_request_id() -> String {
+    format!("req-{:032x}", rand::random::<u128>())
 }
 
 /// A request as it's sent: the body, with the lease it draws on, if any.
@@ -1462,10 +1497,11 @@ struct RequestTiming {
 }
 
 impl RequestTiming {
-    fn new() -> Self {
+    /// `id`: the ID it's sent with, if any, until the response says its own.
+    fn new(id: Option<&str>) -> Self {
         Self {
             sent: Instant::now(),
-            id: None,
+            id: id.map(str::to_owned),
             headers: None,
             server: None,
             logged: false,
