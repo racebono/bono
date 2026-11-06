@@ -578,7 +578,6 @@ impl Whisper {
                         session: SessionCache::default(),
                         latest: AtomicU64::new(0),
                         threads,
-                        gpu: GPU_BACKEND && gpu,
                     }))
                 }
                 Err(e) => {
@@ -695,7 +694,6 @@ struct WhisperModel {
     session: SessionCache<WhisperSession>,
     latest: AtomicU64,
     threads: NonZeroUsize,
-    gpu: bool,
 }
 
 /// Access only on blocking workers: initialization, use and destruction can all be expensive.
@@ -741,8 +739,6 @@ struct PendingSession(DropInBackground<Arc<WhisperModel>>);
 pub struct WhisperSession {
     state: WhisperState,
     threads: NonZeroUsize,
-    /// Whether the model was loaded to run on the GPU
-    gpu: bool,
     multilingual: bool,
 }
 
@@ -826,7 +822,6 @@ impl PendingSession {
                     Ok(WhisperSession {
                         state,
                         threads: model.threads,
-                        gpu: model.gpu,
                         multilingual: model.ctx.is_multilingual(),
                     })
                 },
@@ -903,15 +898,9 @@ impl WhisperSession {
 
     /// What was said in `lang`: empty if it's no words.
     fn speech_to_text(&mut self, lang: ArrayStr<2>, samples: &[f32]) -> anyhow::Result<String> {
-        // Beam search is more accurate, but several times the work: on the CPU, that's seconds
-        let mut params = FullParams::new(if self.gpu {
-            SamplingStrategy::BeamSearch {
-                beam_size: 5,
-                patience: -1.0,
-            }
-        } else {
-            SamplingStrategy::Greedy { best_of: 1 }
-        });
+        // Use greedy decoding on both CPU and GPU, keeping the default full audio
+        // context and temperature fallback.
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
         params.set_n_threads(c_int::try_from(self.threads.get()).unwrap_or(c_int::MAX));
         params.set_language(Some(&lang));
@@ -1633,7 +1622,6 @@ mod tests {
         let mut session = WhisperSession {
             state: ctx.create_state().unwrap(),
             threads,
-            gpu: GPU_BACKEND,
             multilingual: ctx.is_multilingual(),
         };
 
