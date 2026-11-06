@@ -1679,8 +1679,8 @@ struct Trace {
     pit: Vec<bool>,
     has_pedals: bool,
     ok: bool,
-    /// The lap isn't over: nothing past the last point is known, and nothing goes round the line
-    partial: bool,
+    /// How many points are at the start of the lists before the one added for the lap's end
+    points: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -1708,36 +1708,20 @@ impl Trace {
             ))?
             .query_map(params![vehicle, lap.first_id, lap.last_id], derived::sample)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(Self::build(&samples, lap.start, lap.time, length, false))
+        Ok(Self::build(&samples, lap.start, lap.time, length))
     }
 
-    /// A lap from its rows. `time`: how long it took, if it's over; `partial`: what's there of a
-    /// lap that isn't.
+    /// A lap from its rows. `time`: how long it took, if it's over. Nothing goes round the line: a
+    /// lap is only ever made of its own rows.
     fn build(
         samples: &[derived::Sample],
         start: Option<f64>,
         time: Option<f64>,
         length: f64,
-        partial: bool,
     ) -> Self {
         let rows = samples
             .iter()
             .filter(|s| s.lap_distance.is_some() && s.session_time.is_some())
-            .collect::<Vec<_>>();
-
-        // The first rows of a lap can still carry the old lap's distance, and the last ones the
-        // new lap's
-        let n = rows.len() as f64;
-        let rows = rows
-            .into_iter()
-            .enumerate()
-            .filter(|(i, s)| {
-                let d = s.lap_distance.unwrap_or(0.0);
-                let i = *i as f64;
-                partial
-                    || (!(i < n * 0.1 && d > length * 0.5) && !(i > n * 0.9 && d < length * 0.5))
-            })
-            .map(|(_, s)| s)
             .collect::<Vec<_>>();
 
         let start = start
@@ -1755,13 +1739,15 @@ impl Trace {
             pit: vec![rows.first().is_some_and(|s| s.in_pit)],
             has_pedals: false,
             ok: false,
-            partial,
+            points: 1,
         };
 
         let mut top = 0.0f64;
         for s in &rows {
             let d = s.lap_distance.unwrap_or(0.0).min(length);
-            if partial && d - top > length * derived::IMPOSSIBLE_JUMP {
+            // The first rows of a lap can still carry the old lap's distance, and a car waiting on
+            // the grid or in its pit box can be just short of the line
+            if d - top > length * derived::IMPOSSIBLE_JUMP {
                 continue;
             }
             // LMU's estimate can step back a little: kept monotonic
@@ -1779,17 +1765,31 @@ impl Trace {
             trace.pit.push(s.in_pit);
         }
 
-        if let Some(time) = time
-            && *trace.d.last().unwrap() < length
-        {
-            trace.d.push(length);
-            trace.t.push(start + time);
-            trace.v.push(None);
-            trace.brake.push(None);
-            trace.throttle.push(None);
-            trace.gear.push(None);
-            trace.id.push(*trace.id.last().unwrap());
-            trace.pit.push(*trace.pit.last().unwrap());
+        // Whether the car was seen all the way round, not just that the lap ended
+        trace.points = trace.d.len();
+        let widest = trace
+            .d
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .fold(0.0, f64::max);
+        trace.ok = trace.d.len() > 50
+            && *trace.d.last().unwrap() >= length * 0.98
+            && widest <= length * derived::WIDEST_GAP;
+
+        if let Some(time) = time {
+            // Distances are estimates: the lap ends when it ended, wherever the last one got to
+            if *trace.d.last().unwrap() < length {
+                trace.d.push(length);
+                trace.t.push(start + time);
+                trace.v.push(None);
+                trace.brake.push(None);
+                trace.throttle.push(None);
+                trace.gear.push(None);
+                trace.id.push(*trace.id.last().unwrap());
+                trace.pit.push(*trace.pit.last().unwrap());
+            } else {
+                *trace.t.last_mut().unwrap() = start + time;
+            }
         }
 
         let n = trace.v.len();
@@ -1804,7 +1804,6 @@ impl Trace {
         };
         trace.has_pedals =
             inner.iter().any(Option::is_some) && inner.iter().any(|b| b.unwrap_or(0.0) > 0.0);
-        trace.ok = trace.d.len() > 50 && *trace.d.last().unwrap() >= length * 0.98;
         trace
     }
 
@@ -1824,15 +1823,18 @@ impl Trace {
         self.t[i - 1] + (self.t[i] - self.t[i - 1]) * part
     }
 
-    /// Seconds from distance a to b, going round the line if b < a.
+    /// Seconds from distance a to b.
     fn span(&self, a: f64, b: f64) -> f64 {
-        match b >= a {
-            true => self.time_at(b) - self.time_at(a),
-            false => {
-                (self.time_at(self.length) - self.time_at(a))
-                    + (self.time_at(b) - self.time_at(0.0))
-            }
-        }
+        self.time_at(b) - self.time_at(a)
+    }
+
+    /// The rows the car was actually seen at from distance a to b: their points.
+    fn seen(&self, a: f64, b: f64) -> std::ops::Range<usize> {
+        let points = &self.d[..self.points];
+        // The first point is where the lap starts, not a row
+        let first = points.partition_point(|d| *d < a).max(1);
+        let last = points.partition_point(|d| *d <= b);
+        first..last.max(first)
     }
 
     fn speed_at(&self, x: f64) -> Option<f64> {
@@ -1840,19 +1842,11 @@ impl Trace {
         self.v[i].or(self.v[i.saturating_sub(1)])
     }
 
-    /// Sample indices from distance a to b (wrapping, if the lap is over).
+    /// Sample indices from distance a to b, or from the line if a is past b (a turn that starts
+    /// before the line).
     fn indices(&self, a: f64, b: f64) -> Vec<usize> {
-        match b >= a {
-            true => (self.index(a)..=self.index(b))
-                .filter(|i| *i < self.d.len())
-                .collect(),
-            false if self.partial => self.indices(0.0, b),
-            false => {
-                let mut indices = self.indices(a, self.length);
-                indices.extend(self.indices(0.0, b));
-                indices
-            }
-        }
+        let a = if a > b { 0.0 } else { a };
+        (self.index(a)..=self.index(b)).collect()
     }
 
     fn braking(&self, i: usize, previous: Option<usize>) -> bool {
@@ -1904,19 +1898,15 @@ impl Trace {
     /// Where braking for the corner at `apex` starts: the start of the last continuous braking
     /// run before it.
     fn braking_point(&self, apex: f64) -> Option<f64> {
-        let idx = self.indices((apex - BRAKE_SEARCH).rem_euclid(self.length), apex);
+        let idx = self.indices((apex - BRAKE_SEARCH).max(0.0), apex);
         let mut on = None;
         for (k, &i) in idx.iter().enumerate() {
             let braking = self.braking(i, k.checked_sub(1).map(|k| idx[k]));
             match on {
                 None if braking => on = Some(self.d[i]),
                 // A short lift or dab well before the apex isn't the braking point: keep looking
-                Some(start)
-                    if !braking
-                        && (self.d[i] - start).rem_euclid(self.length) > 0.0
-                        && Some(&i) != idx.last() =>
-                {
-                    if (apex - self.d[i]).rem_euclid(self.length) > 60.0 {
+                Some(start) if !braking && self.d[i] > start && Some(&i) != idx.last() => {
+                    if apex - self.d[i] > 60.0 {
                         on = None;
                     }
                 }
@@ -1937,11 +1927,7 @@ impl Trace {
             .min_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
         let (vmin, at_min) = slowest.map_or((None, None), |(v, d)| (Some(v), Some(d)));
 
-        let search = end + derived::THROTTLE_SEARCH;
-        let search = match self.partial {
-            true => search.min(self.length),
-            false => search.rem_euclid(self.length),
-        };
+        let search = (end + derived::THROTTLE_SEARCH).min(self.length);
         let throttle = at_min.and_then(|at_min| {
             self.indices(at_min, search)
                 .into_iter()
@@ -2432,29 +2418,27 @@ mod tests {
             d,
             has_pedals: true,
             ok: true,
-            partial: false,
+            points: 501,
         }
     }
 
     #[test]
-    fn corner_braking_search_wraps_at_start_finish() {
+    fn braking_is_only_looked_for_on_the_lap_itself() {
         let trace = corner_trace(&[(4600.0, 4700.0), (100.0, 220.0)]);
         assert_eq!(trace.braking_point(250.0), Some(100.0));
-        // A run that releases only after crossing the line must also be discarded.
+        // A run that releases well before the apex must be discarded.
         let trace = corner_trace(&[(4900.0, 5000.0), (0.0, 20.0), (100.0, 220.0)]);
         assert_eq!(trace.braking_point(250.0), Some(100.0));
-        // Preserve actual braking across the line when the release is near the apex.
-        assert_eq!(trace.braking_point(50.0), Some(4900.0));
+        // The end of this lap isn't the approach to its first corner
+        assert_eq!(trace.braking_point(50.0), Some(0.0));
         assert_eq!(corner_trace(&[]).braking_point(250.0), None);
+        // A turn starting before the line has its rows from the line on
+        assert_eq!(trace.indices(4950.0, 20.0), [0, 1, 2]);
     }
 
     #[test]
-    fn a_lap_under_way_only_looks_at_what_it_has() {
-        let mut trace = corner_trace(&[(4900.0, 5000.0), (0.0, 40.0)]);
-        trace.partial = true;
-        // The braking from before the line is on a lap this one hasn't got to
-        assert_eq!(trace.braking_point(50.0), Some(0.0));
-        // Nothing past the last point is guessed at
+    fn nothing_past_the_last_point_is_guessed_at() {
+        let mut trace = corner_trace(&[]);
         trace.d.truncate(11);
         assert_eq!(*trace.d.last().unwrap(), 100.0);
         assert_eq!(trace.time_at(100.0), trace.time_at(500.0));

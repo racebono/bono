@@ -68,14 +68,17 @@ run, not a race to the flag.
 ## The tool
 
 - `quick`: the snapshot again, if time has passed within the turn.
-- `track`: the circuit's description as JSON. Positions are fractions of the lap, already lined up
-  with the laps; multiply by `lap_length_m` for metres. `turn` (`start`, `marker` the apex, `end`,
-  `direction` 0 left 1 right, `scale` 1 hairpin to 6 wide), `straight`, `sector`, `pitentry`,
-  `pitexit`; `time` lists estimated seconds lost per class to a `pit` stop, a `dt` drive-through
-  and a `sng10` stop-and-go.
-- `sql`: one read-only `query` (`limit` rows, default 60, maximum 200; 32 KiB). Queries stop at
-  ten seconds. Name the columns you need rather than `SELECT *`, and make the calls you need
-  together.
+- `track`: the circuit's description as JSON. Positions are fractions of the lap; multiply by
+  `lap_length_m` for metres. They've been lined up with the laps when `calibration` is there; without
+  it they can be off, and `borrowed` means they're another simulator's for the same layout, so say
+  "about". `turn` (`start`, `marker` the apex, `end`, `direction` 0 left 1 right, `scale` 1 hairpin
+  to 6 wide), `straight`, `sector`, `pitentry`, `pitexit`; `time[0]` lists estimated seconds lost by
+  class (`hyper`, `lmp2`, `gte`, `gt3`) to a `pit` stop, a `dt` drive-through and a `sng10`
+  stop-and-go.
+- `sql`: one read-only `query` (`limit` rows, default 60, maximum 200). Queries stop at ten seconds.
+  Long results can be cut, so name the few columns you need rather than `SELECT *`, and make the
+  calls you need together. A line starting `-- the current-state tables are incomplete` means they
+  can't be relied on for this answer.
 
 Prefer the tables below: they're current as of your query and already handle the recording's
 traps. Everything is the current session only. Units are in the names; NULL means not reported,
@@ -96,19 +99,19 @@ which is common for rivals.
 **`cars_now`**, one row per car: `vehicle_id`, `is_player`, `driver`, `team`, `car_number`,
 `vehicle`, `vehicle_class`, `telemetry_id`, `sample_age_s`; `position`, `class_position`,
 `position_estimated`, `qualifying_position`, `place_ahead_vehicle_id`, `place_behind_vehicle_id`;
-`lap`, `laps_completed`, `sector`, `lap_distance_m`, `lap_elapsed_s`, `laps_behind_leader`,
+`lap`, `laps_completed`, `sector` (1 to 3), `lap_distance_m`, `lap_elapsed_s`, `laps_behind_leader`,
 `laps_behind_next`; `gap_place_ahead_s`, `gap_place_behind_s` (standings order, live),
 `gap_car_ahead_s`, `gap_car_behind_s` (nearest on track, any class, live), `time_behind_leader_s`,
 `time_behind_next_s` (as of the car's last scoring row); `ahead_of_player_m`, `right_of_player_m`;
 `last_lap_s`, `best_lap_s`, `last_sector_1_s`, `last_sector_2_s`, `last_sector_3_s`,
-`delta_best_s`, `lap_invalidated`; `speed_kmh`, `gear`, `fuel_l`, `fuel_fraction`,
+`delta_best_s` (positive: slower), `lap_invalidated`; `speed_kmh`, `gear`, `fuel_l`, `fuel_fraction`,
 `energy_left_pct`, `battery_pct`, `front_compound`, `rear_compound`; `water_c`, `oil_c`,
 `engine_overheating`; `tc`, `tc_slip`, `tc_cut`, `abs`, `engine_map`, `front_brake_bias_pct`,
 `brake_migration`, `front_arb`, `rear_arb`, `limiter_on`; `engine_damage`, `transmission_damage`,
 `aero_damage`, `suspension_damage` (0 none to 1 destroyed), `parts_detached`, `dents` (eight
 locations; 0 none, 1 some, 2 more), `last_impact_ago_s`, `last_impact_magnitude`; `in_pit_lane`,
 `in_pits`, `in_garage`, `pit_state`, `pit_stops`, `scheduled_pit_stops`, `pit_services_selected`
-(intent, not work done), `pit_services_active`, `pit_min_duration_left_s`; `flag` (blue: being
+(intent, not work done; `none` when nothing is, NULL when not reported), `pit_services_active`, `pit_min_duration_left_s`; `flag` (blue: being
 lapped), `under_yellow`, `finish_status`, `penalties`, `penalty_type`, `penalty_reason`,
 `track_limit_steps`, `track_limit_points_left`, `incident_points`. A car with no recent telemetry
 has only its standings. Rivals' rows are slightly older than the player's.
@@ -118,7 +121,7 @@ rear left, 3 rear right), `wheel_name`; `life_left_pct`, `stint_wear_pct_per_lap
 `flat`, `detached`; `surface_inner_c`, `surface_middle_c`, `surface_outer_c`, `core_c` (inner
 rubber, a better read of working temperature), `carcass_c`, `optimal_c`, `surface_vs_optimal_c`;
 `pressure_kpa`, `brake_c`, `brake_optimal_c`, `surface_type` (0 dry, 1 wet, 2 grass, 3 dirt, 4
-gravel, 5 kerb, 6 special), `sliding_fraction`.
+gravel, 5 kerb, 6 special; on RaceRoom 0 means paved, wetness unknown), `sliding_fraction`.
 
 **`stint_now`**, one row per car with usable laps. `margin_laps` is the verdict on making the end
 without stopping; `save_pct_needed` is set when short. `vehicle_id`, `stint_number`, `start_lap`,
@@ -141,7 +144,7 @@ Updated as the cars drive, the lap in progress too.
 
 **`lap_stats`**, one row per car and lap: `vehicle_id`, `lap`, `stint_number`, `first_id`, `last_id`
 (the lap's telemetry rows), `start_s`; `time_s`, `official_time_s`, `sector_1_s`, `sector_2_s`,
-`sector_3_s`, `top_speed_kmh`; `complete`, `invalid`, `pit` (in or out lap), `refuelled`, `contact`,
+`sector_3_s`, `top_speed_kmh`; `complete`, `invalid`, `pit` (in or out lap; one stop is one more `stint_number`), `refuelled`, `contact`,
 `green` (complete, no pit or refuel: representative for pace and use), `track_limit_steps`;
 `fuel_start_l`, `fuel_end_l`, `fuel_used_l`, `energy_start_pct`, `energy_end_pct`,
 `energy_used_pct`; `gap_ahead_end_s`, `gap_behind_end_s`.
@@ -159,8 +162,9 @@ across laps and cars, and `total_s` adds up to the lap time. `vehicle_id`, `lap`
 apex: braking and turn-in), `apex_to_end_s`, `straight_s` (the corner's end to the next boundary;
 NULL until the car gets there), `total_s` (likewise); `brake_m_before_apex`, `min_speed_kmh`,
 `min_speed_at_m`, `exit_speed_kmh`, `throttle_on_m_after_apex` (may fill in after the row appears),
-`gear_at_min`; `braking_source`, `sample_count`, `low_precision` (rivals, or too few samples: say
-"about"), `lap_invalid`, `in_pit`, `contact`. Turns come from the track description, or else
+`gear_at_min`; `braking_source`, `sample_count`, `low_precision` (rivals, or too little of it seen:
+say "about"), `lap_invalid`, `in_pit`, `contact`. A pass only uses its own lap's rows, so braking that
+starts before the line isn't seen, and a corner the car wasn't seen in has no row. Turns come from the track description, or else
 (`race_state.corner_source`) from the braking zones of the player's first clean lap; before that
 lap there are none.
 
@@ -175,7 +179,7 @@ Query shapes (`:P` is `race_state.player_vehicle_id`):
 ```sql
 -- where the time went: last complete lap against the best valid green lap, biggest first
 WITH l AS (SELECT lap FROM lap_stats WHERE vehicle_id = :P AND complete = 1 ORDER BY lap DESC LIMIT 1),
-     b AS (SELECT lap FROM lap_stats WHERE vehicle_id = :P AND green = 1 AND invalid = 0 ORDER BY time_s LIMIT 1)
+     b AS (SELECT lap FROM lap_stats WHERE vehicle_id = :P AND green = 1 AND invalid = 0 AND time_s IS NOT NULL ORDER BY time_s LIMIT 1)
 SELECT a.turn_name, a.total_s - r.total_s AS lost, a.entry_s - r.entry_s AS entry,
        a.brake_m_before_apex - r.brake_m_before_apex AS brakes_earlier_m, a.min_speed_kmh - r.min_speed_kmh AS apex_kmh
 FROM corner_passes a JOIN corner_passes r USING (vehicle_id, turn_index)
@@ -184,21 +188,23 @@ ORDER BY lost DESC LIMIT 5;
 -- one corner, this lap against the earlier ones
 SELECT lap, total_s, entry_s, brake_m_before_apex, min_speed_kmh, exit_speed_kmh
 FROM corner_passes WHERE vehicle_id = :P AND turn_name LIKE '%T5%' ORDER BY lap DESC LIMIT 8;
--- a rival's pace against ours
+-- a rival's pace against ours: the same recent laps of both
 SELECT c.driver, s.lap, s.time_s, s.gap_ahead_end_s FROM lap_stats s JOIN cars_now c USING (vehicle_id)
-WHERE s.green = 1 AND c.driver LIKE '%Name%' ORDER BY s.lap DESC LIMIT 5;
--- the moments around an incident on the current lap, sample by sample
-SELECT session_time, lap_distance, speed, throttle, brake, steering, yaw_rate, velocity_lateral FROM telemetry
-WHERE vehicle_id = :P AND id > (SELECT latest_telemetry_id - 3000 FROM race_state)
-  AND session_time > (SELECT session_time_s - 15 FROM race_state) ORDER BY id DESC LIMIT 200;
+WHERE s.green = 1 AND s.invalid = 0 AND (c.is_player = 1 OR c.driver LIKE '%Name%') ORDER BY s.lap DESC LIMIT 10;
+-- the last 20 seconds around an incident, five readings a second (pass `limit`: 200)
+SELECT CAST(session_time * 5 AS INT) / 5.0 AS t, MIN(lap_distance) AS m, AVG(speed) AS speed, AVG(throttle) AS throttle,
+       AVG(brake) AS brake, AVG(steering) AS steering, AVG(yaw_rate) AS yaw, AVG(velocity_lateral) AS slide
+FROM telemetry WHERE vehicle_id = :P AND id > (SELECT MAX(session_first_id - 1, latest_telemetry_id - 20000) FROM race_state)
+  AND session_time > (SELECT session_time_s - 20 FROM race_state) GROUP BY CAST(session_time * 5 AS INT) ORDER BY t;
 ```
 
 ### The recording's own tables
 
 Query these only for what the tables above don't hold: sample-by-sample detail or channels like
 steering and slip. Filter by `id`, the only indexed column: use a `first_id`..`last_id` range or
-`id > latest_telemetry_id - N`, and scope to the vehicle. The session's rows have `id >=
-session_first_id`.
+`id > latest_telemetry_id - N`, and scope to the vehicle. The session's `telemetry` rows have `id >=
+session_first_id`; the other tables number their rows separately (`telemetry_id` in `car_state` and
+`telemetry_wheel` is a `telemetry` id).
 
 - `telemetry`: a row per car per recorded update; the player at every update, rivals every few.
   `id`, `vehicle_id`, `is_player`, `session_time`, `lap`, `lap_start_time`, `lap_distance`,
@@ -223,7 +229,8 @@ Traps: `tire_wear` falls during a stint where it's life left; `tire_optimal_temp
 is Kelvin; `*_left/center/right` are edges seen from behind the car (inside is right on left tyres
 and left on right tyres), and `tire_inner_*` is a layer under the tread, not the inside edge;
 `rear_brake_bias` is the rear's share; `session_time` restarts each session; lap time isn't stored
-in `telemetry`; `lap_invalidated` is the current lap's state; `lap_distance` can jump back a little.
+in `telemetry`; `lap_invalidated` is the current lap's state; `lap_distance` can jump back a little;
+`sector` is zero-based there and in `standings`; `delta_best` positive is slower.
 
 ## Evidence that fits the question
 
