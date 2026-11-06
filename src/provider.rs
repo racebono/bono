@@ -88,15 +88,9 @@ pub trait Model: Send {
         None
     }
 
-    /// What Bono Cloud's router is told about the next questions: the commands it may answer
-    /// them with, from the skill, and the session's state (`None`: Claude answers them all). The
-    /// others don't route.
-    fn set_routing_context(&mut self, _context: Option<Arc<bono_cloud::routing::RoutingContext>>) {}
-
     /// A note added after the tool results of the next questions' turns, e.g. which language to
     /// answer in: it's then the last thing the model reads before answering, after telemetry in
-    /// another language and whoever made the call (Bono Cloud's router makes some). `None`: no
-    /// note. Claude's conversations add it as a text block after the results; the others don't.
+    /// another language. `None`: no note. Claude's conversations add it as a text block after the results; the others don't.
     fn set_tool_result_note(&mut self, _note: Option<Arc<str>>) {}
 }
 

@@ -30,9 +30,8 @@ use tokio::{
     runtime::Handle,
     sync::{Mutex, mpsc},
 };
-use tool::{Engineer as EngineerTool, SCHEMA, SKILL, instructions};
+use tool::{Engineer as EngineerTool, SKILL, instructions};
 
-mod routing;
 mod timeline;
 mod tool;
 
@@ -96,9 +95,6 @@ pub struct Engineer {
     /// Who Bono Cloud is used as
     account: Option<Account>,
     skill: Arc<str>,
-    schema: Arc<str>,
-    /// The skill's documents for Bono Cloud's router
-    routing: Arc<[routing::SkillDocs]>,
     /// Everything said, for the chat
     chat: Vec<ChatEntry>,
     /// The language the pilot last asked in: typed questions whose language is unclear are
@@ -239,13 +235,10 @@ struct SessionState {
 
 impl Engineer {
     pub fn new(client: reqwest::Client, account: Option<Account>) -> Self {
-        let routing = routing::skill_docs(SKILL, &EngineerTool::input_schema()).into();
         Self {
             client,
             account,
-            routing,
             skill: instructions(SKILL.to_owned()).into(),
-            schema: SCHEMA.into(),
             chat: Vec::new(),
             last_lang: arrstr!("en"),
             languages: LanguageDetector::new(),
@@ -545,8 +538,6 @@ impl Engineer {
             return;
         };
         let state = session.state.clone();
-        let cloud = *session.model.provider() == ModelProvider::BonoCloud;
-        let routing = self.routing.clone();
         let auto_session = *config.get().auto_session();
 
         // What the model writes goes straight to the synthesizer, and to the chat
@@ -563,24 +554,7 @@ impl Engineer {
         let task = Task::spawn(async move {
             let mut state = state.lock().await;
             state.follow_game_session(auto_session).await;
-            // Bono Cloud's router picks the first telemetry command, from the skill's documents
-            // and the session's state as they are now: a snapshot would stop it routing. Other
-            // providers get a snapshot with the new question only.
-            let question = match cloud {
-                true => {
-                    let session = match routing::session(&state.pool).await {
-                        Ok(session) => Some(session),
-                        Err(e) => {
-                            log::warn!("Error reading the session for Bono Cloud's router: {e:#}");
-                            None
-                        }
-                    };
-                    let context = routing::context(&routing, session).map(Arc::new);
-                    state.conversation.set_routing_context(context);
-                    question
-                }
-                false => state.tool.question_with_snapshot(question).await,
-            };
+            let question = state.tool.question_with_snapshot(question).await;
             let question = match &note {
                 Some(note) => format!("{question}\n\n{note}"),
                 None => question,
@@ -966,7 +940,7 @@ impl Engineer {
     }
 
     fn start(&self, config: &Config, sim: &'static str, pool: Pool) -> anyhow::Result<Session> {
-        let tool = EngineerTool::new(pool.clone(), self.schema.clone());
+        let tool = EngineerTool::new(pool.clone());
         let mut tools = Tools::default();
         tools.insert(
             EngineerTool::NAME,
@@ -1649,7 +1623,7 @@ mod tests {
             let recorded = Arc::new(std::sync::Mutex::new(Recorded::default()));
             let mut state = SessionState {
                 conversation: Box::new(RecordingModel(recorded.clone())),
-                tool: EngineerTool::new(pool.clone(), "".into()),
+                tool: EngineerTool::new(pool.clone()),
                 pool,
                 sim: "lmu",
                 game_session: None,
