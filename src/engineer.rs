@@ -148,25 +148,61 @@ struct Playback {
     sentences: SentenceQueue,
 }
 
+/// How far behind where it was interrupted an answer resumes, in seconds.
+const RESUME_BEHIND: f32 = 0.4;
+
+/// How much later than that it may resume, in seconds, to start at a zero crossing: starting
+/// halfway through a wave would click.
+const RESUME_SNAP: f32 = 0.005;
+
+/// Where to resume `speech`, a sentence, when it was interrupted at the sample `interrupted`: the
+/// sentence's start if it began less than [`RESUME_BEHIND`] before that. A later start may still
+/// fall in the silence before the sentence's voice, which then replays whole too.
+fn resume_point(speech: &Speech, interrupted: usize) -> usize {
+    let rate = speech.sample_rate as f32;
+    let start = interrupted.saturating_sub((RESUME_BEHIND * rate).round() as usize);
+    if start == 0 {
+        return 0;
+    }
+    let snap = (RESUME_SNAP * rate).ceil() as usize;
+    let crossing = speech.samples[start..]
+        .windows(2)
+        .take(snap)
+        .position(|pair| (pair[0] < 0.0) != (pair[1] < 0.0));
+    return start + crossing.map_or(0, |i| i + 1);
+}
+
 /// Input is always mono f32 at a fixed rate. SDL's queued bytes describe input
 /// consumption, not the physical speaker position (which includes device buffering).
+///
+/// Each piece is a sentence, except the end of the transmission (the roger beep and the squelch
+/// closing).
 #[derive(Default)]
 struct SentenceQueue {
     pieces: VecDeque<Speech>,
     submitted: usize,
+    /// How many samples of the submitted pieces went on the stream
     samples: usize,
+    /// Where the front piece resumes from: its samples before that aren't submitted
+    resume: usize,
 }
 
 impl SentenceQueue {
+    /// How many of the submitted samples were played, given what's `queued` on the stream.
+    fn played(&self, queued: Option<i32>) -> Option<usize> {
+        let queued = queued.and_then(|n| usize::try_from(n).ok())?;
+        Some(
+            self.samples
+                .saturating_sub(queued.div_ceil(size_of::<f32>())),
+        )
+    }
+
     fn consumed(&mut self, queued: Option<i32>) {
-        let Some(queued) = queued.and_then(|n| usize::try_from(n).ok()) else {
+        let Some(mut consumed) = self.played(queued) else {
             return; // Unknown position: replay conservatively from the oldest retained sentence.
         };
-        let mut consumed = self
-            .samples
-            .saturating_sub(queued.div_ceil(size_of::<f32>()));
         while self.submitted > 0 {
-            let len = self.pieces.front().unwrap().samples.len();
+            let len = self.pieces.front().unwrap().samples.len() - self.resume;
             if len > consumed {
                 break;
             }
@@ -174,10 +210,20 @@ impl SentenceQueue {
             self.samples -= len;
             self.submitted -= 1;
             self.pieces.pop_front();
+            self.resume = 0;
         }
     }
 
-    fn rewind(&mut self) {
+    /// The stream is about to be cleared, with `queued` left on it: everything unplayed will be
+    /// submitted again, from where to resume.
+    fn rewind(&mut self, queued: Option<i32>) {
+        self.consumed(queued);
+        self.resume = match (self.played(queued), self.pieces.front()) {
+            // Nothing was played since the last resume: it's still where to resume from
+            (Some(0), _) => self.resume,
+            (Some(played), Some(front)) => resume_point(front, self.resume + played),
+            _ => 0,
+        };
         self.submitted = 0;
         self.samples = 0;
     }
@@ -186,8 +232,16 @@ impl SentenceQueue {
         self.pieces.get(self.submitted)
     }
 
+    /// How many samples of the [pending](Self::pending) piece to skip.
+    fn skip(&self) -> usize {
+        match self.submitted {
+            0 => self.resume,
+            _ => 0,
+        }
+    }
+
     fn submitted(&mut self) {
-        self.samples += self.pending().unwrap().samples.len();
+        self.samples += self.pending().unwrap().samples.len() - self.skip();
         self.submitted += 1;
     }
 }
@@ -199,9 +253,8 @@ impl Playback {
         };
         if held {
             stream.pause()?;
-            self.sentences.consumed(stream.queued_bytes().ok());
+            self.sentences.rewind(stream.queued_bytes().ok());
             stream.clear()?;
-            self.sentences.rewind();
         } else {
             stream.resume()?;
         }
@@ -287,7 +340,8 @@ impl Engineer {
     }
 
     /// Pauses the answer being spoken (and holds one about to start) while the spotter speaks;
-    /// releasing it restarts the first unfinished sentence.
+    /// releasing it resumes `RESUME_BEHIND` before where it stopped, or from the sentence's start
+    /// if that sentence began since then.
     pub fn hold(&mut self, held: bool) {
         if std::mem::replace(&mut self.held, held) == held {
             return;
@@ -859,7 +913,10 @@ impl Engineer {
 
         if let Some(speech) = playback.sentences.pending() {
             let played = match (&playback.stream, speaker) {
-                (Some(stream), _) => stream.put_data_f32(&speech.samples),
+                (Some(stream), _) => {
+                    stream.put_data_f32(&speech.samples[playback.sentences.skip()..])
+                }
+                // Nothing to skip: only a stream's position can be resumed from
                 (None, Some(speaker)) => speech.start(speaker).and_then(|stream| {
                     playback.stream = Some(stream);
                     Ok(())
@@ -1243,9 +1300,9 @@ mod tests {
     fn resumes_first_unfinished_sentence() {
         for (queued, remaining) in [(120, 3), (84, 3), (80, 2), (44, 2), (40, 1), (0, 0)] {
             let mut queue = sentences(&[10, 10, 10]);
-            queue.consumed(Some(queued));
-            queue.rewind();
+            queue.rewind(Some(queued));
             assert_eq!(queue.pieces.len(), remaining, "queued bytes: {queued}");
+            assert_eq!(queue.skip(), 0, "queued bytes: {queued}");
             if remaining > 0 {
                 assert_eq!(queue.pending().unwrap().samples.len(), 10);
                 assert_eq!(queue.pending().unwrap().samples[0], (3 - remaining) as f32);
@@ -1253,18 +1310,108 @@ mod tests {
         }
     }
 
+    /// What's left on the stream, in bytes, once `played` of the `total` samples on it were.
+    fn left(total: usize, played: usize) -> Option<i32> {
+        Some(((total - played) * size_of::<f32>()) as i32)
+    }
+
+    /// [`RESUME_BEHIND`] at the sample rate of [`sentences`].
+    const BEHIND: usize = 8820;
+
+    #[test]
+    fn resumes_behind_where_it_was_interrupted() {
+        let mut queue = sentences(&[22050, 22050]);
+        queue.rewind(left(44100, 11025));
+        assert_eq!(queue.pieces.len(), 2);
+        assert_eq!(queue.submitted, 0);
+        assert_eq!(queue.skip(), 11025 - BEHIND);
+        assert_eq!(queue.pending().unwrap().samples[0], 0.0);
+
+        // Just far enough into the sentence for its start to be out of the window
+        let mut queue = sentences(&[22050]);
+        queue.rewind(left(22050, BEHIND + 1));
+        assert_eq!(queue.skip(), 1);
+    }
+
+    #[test]
+    fn restarts_a_sentence_that_began_in_the_window() {
+        for played in [1, BEHIND - 1, BEHIND] {
+            let mut queue = sentences(&[22050, 22050]);
+            queue.rewind(left(44100, 22050 + played));
+            assert_eq!(queue.pieces.len(), 1, "played: {played}");
+            assert_eq!(queue.skip(), 0, "played: {played}");
+            assert_eq!(queue.pending().unwrap().samples[0], 1.0);
+        }
+    }
+
+    #[test]
+    fn a_resumed_sentence_tracks_its_position() {
+        let mut queue = sentences(&[22050, 22050]);
+        queue.rewind(left(44100, 11025));
+        let resume = 11025 - BEHIND;
+        assert_eq!(queue.skip(), resume);
+
+        // Nothing played since: not further back, whether or not it was resubmitted
+        queue.rewind(Some(0));
+        assert_eq!(queue.skip(), resume);
+        queue.submitted();
+        assert_eq!(queue.samples, 22050 - resume);
+        queue.rewind(left(22050 - resume, 0));
+        assert_eq!(queue.skip(), resume);
+
+        // Measured from where it resumed, not the sentence's start
+        queue.submitted();
+        queue.rewind(left(22050 - resume, 13230));
+        assert_eq!(queue.skip(), resume + 13230 - BEHIND);
+
+        // Played shortly after resuming: back to its start at most
+        let total = 22050 - queue.skip();
+        queue.submitted();
+        queue.rewind(left(total, 1));
+        assert_eq!(queue.skip(), 0);
+        assert_eq!(queue.pieces.len(), 2);
+
+        // The next sentence starts in full once this one is played out
+        let mut queue = sentences(&[22050]);
+        queue.rewind(left(22050, 11025));
+        queue.pieces.push_back(Speech {
+            samples: vec![1.0; 100],
+            sample_rate: 22050,
+        });
+        let total = 22050 - queue.skip();
+        queue.submitted();
+        queue.submitted();
+        queue.consumed(left(total + 100, total));
+        assert_eq!(queue.pieces.len(), 1);
+        assert_eq!(queue.samples, 100);
+        assert_eq!(queue.resume, 0);
+    }
+
+    #[test]
+    fn resumes_at_a_zero_crossing_nearby() {
+        let mut samples = vec![0.5; 22050];
+        samples[BEHIND + 50..].fill(-0.5);
+        let speech = Speech {
+            samples,
+            sample_rate: 22050,
+        };
+        // The crossing is within reach
+        assert_eq!(resume_point(&speech, 2 * BEHIND), BEHIND + 50);
+        // Past it: the next is too far to wait for
+        assert_eq!(resume_point(&speech, 2 * BEHIND + 100), BEHIND + 100);
+        // Before it, and too far
+        assert_eq!(resume_point(&speech, BEHIND + 1), 1);
+    }
+
     #[test]
     fn repeated_interruptions_preserve_unsubmitted_sentences() {
         let mut queue = sentences(&[10, 20, 30]);
-        queue.consumed(Some(160)); // first sentence finished; second half spoken
-        queue.rewind();
+        queue.rewind(Some(160)); // first sentence finished; second half spoken
         queue.submitted(); // only the second sentence has been replayed so far
-        queue.consumed(Some(40));
-        queue.rewind();
+        queue.rewind(Some(40));
         assert_eq!(queue.pending().unwrap().samples, vec![1.0; 20]);
         queue.submitted();
-        queue.consumed(Some(0));
-        queue.rewind();
+        queue.rewind(Some(0));
         assert_eq!(queue.pending().unwrap().samples, vec![2.0; 30]);
     }
 
@@ -1272,10 +1419,19 @@ mod tests {
     fn unknown_positions_retain_audio_and_empty_pieces_do_not_stick() {
         for queued in [None, Some(-1)] {
             let mut queue = sentences(&[10, 20]);
-            queue.consumed(queued);
-            queue.rewind();
+            queue.rewind(queued);
             assert_eq!(queue.pieces.len(), 2);
+            assert_eq!(queue.skip(), 0);
         }
+
+        // An unknown position restarts a sentence that was being resumed
+        let mut queue = sentences(&[22050]);
+        queue.rewind(left(22050, 11025));
+        assert_ne!(queue.skip(), 0);
+        queue.submitted();
+        queue.rewind(None);
+        assert_eq!(queue.skip(), 0);
+
         let mut queue = sentences(&[0, 10, 0]);
         queue.consumed(Some(40));
         assert_eq!(queue.pieces.len(), 2);
@@ -1307,9 +1463,11 @@ mod tests {
             stream.put_data_f32(&speech.samples).unwrap();
         }
         stream.flush().unwrap();
-        // Simulate the first sentence having already drained from the stream.
+        // Simulate the first sentence and half of the second having drained.
         stream.clear().unwrap();
-        stream.put_data_f32(&sentences.pieces[1].samples).unwrap();
+        stream
+            .put_data_f32(&sentences.pieces[1].samples[11025..])
+            .unwrap();
         sentences.consumed(stream.queued_bytes().ok());
         assert_eq!(sentences.pieces.len(), 1);
 
@@ -1329,17 +1487,32 @@ mod tests {
         engineer.play(&config, Some(&device));
         let playback = engineer.playback.as_ref().unwrap();
         assert_eq!(playback.sentences.submitted, 0);
+        let resume = 11025 - BEHIND;
+        assert_eq!(playback.sentences.skip(), resume);
         assert_eq!(playback.stream.as_ref().unwrap().queued_bytes().unwrap(), 0);
 
         engineer.hold(false);
+        // Keep the dummy device paused while submitting, so the exact input byte count is stable.
+        engineer
+            .playback
+            .as_ref()
+            .unwrap()
+            .stream
+            .as_ref()
+            .unwrap()
+            .pause()
+            .unwrap();
         engineer.play(&config, Some(&device));
         let playback = engineer.playback.as_ref().unwrap();
-        playback.stream.as_ref().unwrap().pause().unwrap();
         assert_eq!(playback.sentences.submitted, 1);
-        assert!(playback.stream.as_ref().unwrap().queued_bytes().unwrap() > 0);
+        assert_eq!(
+            playback.stream.as_ref().unwrap().queued_bytes().unwrap() as usize,
+            (22050 - resume) * size_of::<f32>()
+        );
         assert_eq!(playback.sentences.pieces[0].samples[0], 1.0);
         // A second interruption must retain the same unfinished sentence.
         engineer.hold(true);
+        assert_eq!(engineer.playback.as_ref().unwrap().sentences.skip(), resume);
         assert_eq!(
             engineer
                 .playback

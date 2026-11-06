@@ -393,8 +393,8 @@ impl Stream {
             None => 0,
         };
 
-        let (samples, last) = match len {
-            0 if self.ended => (Ok(voice.end(&mut self.transmission)), true),
+        let (pieces, last) = match len {
+            0 if self.ended => (Ok(vec![voice.end(&mut self.transmission)]), true),
             0 => return Step::Waiting,
             len => {
                 let sentence = self.pending.drain(..len).collect::<String>();
@@ -402,22 +402,25 @@ impl Stream {
             }
         };
 
-        let (result, last) = match samples {
-            Ok(samples) if samples.is_empty() => (None, last),
-            Ok(samples) => (
-                Some(Ok(Speech {
-                    samples,
-                    sample_rate: voice.sample_rate(),
-                })),
-                last,
-            ),
-            Err(e) => (Some(Err(e)), true),
+        let pieces = match pieces {
+            Ok(pieces) => pieces,
+            Err(e) => {
+                let _ = self.output.send(Err(e));
+                return Step::Done;
+            }
         };
 
-        if let Some(result) = result
-            && self.output.send(result).is_err()
-        {
-            return Step::Done;
+        for samples in pieces {
+            if samples.is_empty() {
+                continue;
+            }
+            let speech = Speech {
+                samples,
+                sample_rate: voice.sample_rate(),
+            };
+            if self.output.send(Ok(speech)).is_err() {
+                return Step::Done;
+            }
         }
 
         return match last {
@@ -567,7 +570,7 @@ impl Voice {
     /// in clean) and the squelch closes.
     pub fn synthesize(&mut self, text: &str, effects: Effects) -> anyhow::Result<Speech> {
         let mut transmission = self.transmission(effects);
-        let mut samples = self.speak(&mut transmission, text)?;
+        let mut samples = self.speak(&mut transmission, text)?.concat();
         samples.extend(self.end(&mut transmission));
         return Ok(Speech {
             samples,
@@ -584,20 +587,26 @@ impl Voice {
         }
     }
 
-    /// The next of the transmission's sentences, as mono PCM at [`Self::sample_rate`]: the
-    /// first opens the squelch. Nothing if they say nothing.
+    /// The next of the transmission's text, as mono PCM at [`Self::sample_rate`], one piece per
+    /// sentence (the text may hold several): the first opens the squelch. Nothing if they say
+    /// nothing.
     pub fn speak(
         &mut self,
         transmission: &mut Transmission,
         text: &str,
-    ) -> anyhow::Result<Vec<f32>> {
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
         let started = Instant::now();
         let sentences = phonemize(text, &self.espeak_voice)?;
         let silence = (self.sample_rate as f32 * SENTENCE_SILENCE) as usize;
         let mut voice = Vec::<f32>::new();
+        // Where the sentences after the first start, with the silence before them
+        let mut splits = Vec::new();
 
         for phonemes in sentences {
             let ids = self.phoneme_ids(&phonemes);
+            if !voice.is_empty() {
+                splits.push(voice.len());
+            }
             // After the sentence before, even if it was in an earlier piece
             if transmission.open || !voice.is_empty() {
                 voice.resize(voice.len() + silence, 0.0);
@@ -609,13 +618,14 @@ impl Voice {
         }
 
         if voice.is_empty() {
-            return Ok(voice);
+            return Ok(Vec::new());
         }
 
         let mut samples = match std::mem::replace(&mut transmission.open, true) {
             true => Vec::new(),
             false => transmission.radio.open(),
         };
+        let voice_start = samples.len();
         samples.extend(transmission.radio.voice(&voice));
         clip(&mut samples);
         log::debug!(
@@ -623,7 +633,7 @@ impl Voice {
             text.chars().count(),
             started.elapsed()
         );
-        return Ok(samples);
+        return Ok(split_sentences(samples, voice_start, &splits));
     }
 
     /// The end of the transmission: the roger beep and the squelch closing. Nothing if it
@@ -701,6 +711,18 @@ pub struct Transmission {
     effects: Effects,
     /// Something was said
     open: bool,
+}
+
+/// `samples` in a piece per sentence, given where the sentences after the first start (`splits`,
+/// ascending) in the voice that starts at `voice_start`.
+fn split_sentences(mut samples: Vec<f32>, voice_start: usize, splits: &[usize]) -> Vec<Vec<f32>> {
+    let mut pieces = Vec::with_capacity(splits.len() + 1);
+    for split in splits.iter().rev() {
+        pieces.push(samples.split_off(voice_start + split));
+    }
+    pieces.push(samples);
+    pieces.reverse();
+    return pieces;
 }
 
 /// The radio's hiss and the beep can push peaks past full scale.
@@ -950,6 +972,16 @@ mod tests {
         let now = Instant::now();
         assert_eq!(Drain::new(now).check(None, false, now), Drained::Stalled);
         assert_eq!(Drain::new(now).check(None, true, now), Drained::Stalled);
+    }
+
+    #[test]
+    fn splits_a_piece_per_sentence() {
+        let samples = vec![9.0, 9.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0];
+        assert_eq!(
+            split_sentences(samples.clone(), 2, &[2, 5]),
+            [vec![9.0, 9.0, 1.0, 1.0], vec![2.0, 2.0, 2.0], vec![3.0]]
+        );
+        assert_eq!(split_sentences(samples.clone(), 2, &[]), [samples]);
     }
 
     #[test]
