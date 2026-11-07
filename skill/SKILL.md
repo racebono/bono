@@ -164,10 +164,10 @@ apex: braking and turn-in), `apex_to_end_s`, `straight_s` (the corner's end to t
 NULL until the car gets there), `total_s` (likewise); `brake_m_before_apex`, `min_speed_kmh`,
 `min_speed_at_m`, `exit_speed_kmh`, `throttle_on_m_after_apex` (may fill in after the row appears),
 `gear_at_min`; `braking_source`, `sample_count`, `low_precision` (rivals, or too little of it seen:
-say "about"), `lap_invalid`, `in_pit`, `contact`. A pass only uses its own lap's rows, so braking that
+say "about"), `lap_invalid` (the whole lap's invalidity, not proof this corner caused it), `in_pit`, `contact`. Invalidated laps' passes remain available. A pass only uses its own lap's rows, so braking that
 starts before the line isn't seen, and a corner the car wasn't seen in has no row. Turns come from the track description, or else
-(`race_state.corner_source`) from the braking zones of the player's first clean lap; before that
-lap there are none.
+(`race_state.corner_source`) from the braking zones of a representative completed lap, including
+an invalidated one if no usable clean lap is available; before a usable lap there are none.
 
 **`corner_pass_wheels`**, the player's car only, one row per lap, turn and wheel: how much
 temperature rose over that section, by what the car was doing (falls left out, so heat shows where
@@ -175,20 +175,32 @@ it builds). `vehicle_id`, `lap`, `turn_index`, `wheel`; `surface_rise_c`, `surfa
 `surface_rise_off_throttle_c`, `surface_rise_full_throttle_c`, `surface_end_c`; `brake_rise_c`,
 `brake_rise_braking_c`, `brake_rise_off_throttle_c`, `brake_rise_full_throttle_c`, `brake_end_c`.
 
-Query shapes (`:P` is `race_state.player_vehicle_id`):
+Query shapes: replace `:P` with the player's vehicle id and `:OBSERVED_LAP` with the lap being
+discussed; `:FROM_LAP` and `:TO_LAP` bound the requested comparison window (use the session's
+lap range if none was specified). Require the measurements the proposed advice actually uses.
 
 ```sql
--- where the time went: last complete lap against the best valid green lap, biggest first
+-- information: last complete lap against the fastest representative lap, invalidated laps included
 WITH l AS (SELECT lap FROM lap_stats WHERE vehicle_id = :P AND complete = 1 ORDER BY lap DESC LIMIT 1),
-     b AS (SELECT lap FROM lap_stats WHERE vehicle_id = :P AND green = 1 AND invalid = 0 AND time_s IS NOT NULL ORDER BY time_s LIMIT 1)
+     b AS (SELECT lap FROM lap_stats WHERE vehicle_id = :P AND green = 1 AND time_s IS NOT NULL
+           AND lap <> (SELECT lap FROM l) ORDER BY time_s LIMIT 1)
 SELECT a.turn_name, a.total_s - r.total_s AS lost, a.entry_s - r.entry_s AS entry,
-       a.brake_m_before_apex - r.brake_m_before_apex AS brakes_earlier_m, a.min_speed_kmh - r.min_speed_kmh AS apex_kmh
+       a.brake_m_before_apex - r.brake_m_before_apex AS brakes_earlier_m, a.min_speed_kmh - r.min_speed_kmh AS apex_kmh,
+       a.lap_invalid AS observed_lap_invalid, r.lap_invalid AS reference_lap_invalid
 FROM corner_passes a JOIN corner_passes r USING (vehicle_id, turn_index)
 WHERE a.vehicle_id = :P AND a.lap = (SELECT lap FROM l) AND r.lap = (SELECT lap FROM b)
 ORDER BY lost DESC LIMIT 5;
 -- one corner, this lap against the earlier ones
-SELECT lap, total_s, entry_s, brake_m_before_apex, min_speed_kmh, exit_speed_kmh
+SELECT lap, total_s, entry_s, brake_m_before_apex, min_speed_kmh, exit_speed_kmh, lap_invalid
 FROM corner_passes WHERE vehicle_id = :P AND turn_name LIKE '%T5%' ORDER BY lap DESC LIMIT 8;
+-- braking improvement reference: usable clean passes first, invalidated only as fallback
+SELECT lap, turn_name, total_s, brake_m_before_apex, min_speed_kmh, exit_speed_kmh, lap_invalid
+FROM corner_passes WHERE vehicle_id = :P AND turn_name LIKE '%T5%'
+  AND lap BETWEEN :FROM_LAP AND :TO_LAP
+  AND lap <> :OBSERVED_LAP
+  AND in_pit = 0 AND contact = 0 AND low_precision = 0 AND total_s IS NOT NULL
+  AND brake_m_before_apex IS NOT NULL AND min_speed_kmh IS NOT NULL AND exit_speed_kmh IS NOT NULL
+ORDER BY lap_invalid, total_s LIMIT 1;
 -- a rival's pace against ours: the same recent laps of both
 SELECT c.driver, s.lap, s.time_s, s.gap_ahead_end_s FROM lap_stats s JOIN cars_now c USING (vehicle_id)
 WHERE s.green = 1 AND s.invalid = 0 AND (c.is_player = 1 OR c.driver LIKE '%Name%') ORDER BY s.lap DESC LIMIT 10;
@@ -240,6 +252,16 @@ lap's corners or recent telemetry, not the last completed lap; a named older lap
 Compare like with like: the same corner across laps, not a partial lap against a full one. Say "so
 far" for partial findings. Keep complete green laps as the baseline for sustained pace, wear and
 consumption; don't extrapolate one short saving segment into a finish.
+
+Invalidated laps and corner passes are usable evidence for information, explanations and advice:
+do not discard the event the pilot asked about, or filter all corner queries to valid laps.
+Only improvement suggestions need a clean-first reference: look for usable clean passes of the
+same corner in the relevant comparison window. Prefer those even if an invalidated pass was
+faster. If none has the measurements needed, use a usable invalidated pass and briefly tell the
+pilot the suggestion is based on an invalidated lap/pass. Keep the observed pass even if it was
+invalidated. `lap_invalid` doesn't identify a particular corner's violation: don't claim that it
+does, or present a shortcut as a proven improvement. Missing samples, contact and pit driving
+still limit comparability regardless of validity. If no usable evidence exists, say so.
 
 - **Damage check:** report only current damage: affected parts, severity, detached parts, or none
   recorded. Don't mention contact, impact time or magnitude, or another car unless explicitly asked

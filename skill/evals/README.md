@@ -19,6 +19,10 @@ their stated evidence; do not run them against the existing dry database unchang
 `language.md` covers answering in the pilot's language across tool calls, earlier answers in English and ambiguous short questions. Run it
 with `EVAL_LANG`. These are controlled manual/model scenarios, not executed results.
 
+`invalidated-corners.md` covers informational use of invalidated passes, clean-first improvement
+references, explicitly disclosed fallback, and missing or non-comparable evidence. These are
+controlled manual/model scenarios, not executed results.
+
 These cases test the race engineer's answers, not the automatic spotter. Direct side/clear
 calls, immediate alerts and imminent-rain announcements are excluded. Rival pace, longer
 weather outlooks, strategy and driving advice remain in scope.

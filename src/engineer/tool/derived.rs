@@ -699,31 +699,40 @@ fn wear_remaining(laps: &[Lap]) -> bool {
     true
 }
 
-/// The valid green laps, quickest first.
+/// Representative laps for finding and aligning corners: clean first, with invalidated laps
+/// still usable when no clean trace is available. Invalidation doesn't erase the geometry.
 fn best_laps(laps: &[Lap]) -> Vec<&Lap> {
     let mut laps = laps
         .iter()
-        .filter(|lap| lap.green && !lap.invalid && lap.time.is_some())
+        .filter(|lap| lap.green && lap.time.is_some())
         .collect::<Vec<_>>();
-    laps.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(Ordering::Equal));
+    laps.sort_by(|a, b| {
+        a.invalid
+            .cmp(&b.invalid)
+            .then_with(|| a.time.partial_cmp(&b.time).unwrap_or(Ordering::Equal))
+    });
     laps
 }
 
-/// The best valid green lap.
+/// The preferred representative lap, including invalidated evidence if necessary.
 fn best_lap(laps: &[Lap]) -> Option<&Lap> {
     best_laps(laps).first().copied()
 }
 
-/// The quickest of a car's best laps the car was seen all the way round, and its trace.
+/// A trace with usable braking zones, preferring clean laps over invalidated laps.
 fn best_seen_lap<'a>(
     conn: &Connection,
     vehicle: i64,
     laps: &'a [Lap],
     length: f64,
+    allow_invalid: bool,
 ) -> rusqlite::Result<Option<(&'a Lap, Trace)>> {
-    for lap in best_laps(laps).into_iter().take(3) {
+    for lap in best_laps(laps)
+        .into_iter()
+        .filter(|lap| allow_invalid || !lap.invalid)
+    {
         let trace = Trace::read(conn, vehicle, lap, length)?;
-        if trace.ok {
+        if trace.ok && !trace.braking_zones().is_empty() {
             return Ok(Some((lap, trace)));
         }
     }
@@ -1427,6 +1436,8 @@ pub(super) struct Stream {
     calibrated_laps: Option<(usize, usize)>,
     /// How many laps the player had when braking zones were last looked for (car and laps)
     zones_from: Option<(i64, usize)>,
+    /// A fallback layout must be replaced when a usable clean lap becomes available.
+    zones_from_invalid: bool,
     standings_cursor: i64,
     standings_t: Option<f64>,
     /// The standings' laps completed, by car, and when that last changed
@@ -1509,6 +1520,7 @@ impl Stream {
         self.session_start = start;
         self.calibrated_laps = None;
         self.zones_from = None;
+        self.zones_from_invalid = false;
         if self
             .layout
             .as_ref()
@@ -1712,7 +1724,16 @@ impl Stream {
             let Some(mut current) = car.current.take() else {
                 continue;
             };
+            let was_invalid = current.invalid;
             current.add(sample, length);
+            if current.invalid && !was_invalid {
+                // Earlier corners may already be queryable before a later cut invalidates the
+                // lap. Keep their flag current so they cannot look like clean references.
+                conn.prepare_cached(
+                    "UPDATE corner_passes SET lap_invalid = 1 WHERE vehicle_id = ? AND lap = ?",
+                )?
+                .execute(params![sample.vehicle, lap])?;
+            }
             if let (Some(layout), Some(temperatures)) =
                 (writer.layout, temperatures.get(&sample.id))
             {
@@ -1862,7 +1883,9 @@ impl Stream {
                 .cars
                 .get(&vehicle)
                 .map_or(&[][..], |car| &car.finished[..]);
-            let Some((lap, trace)) = best_seen_lap(conn, vehicle, laps, length)? else {
+            // A cut can distort the alignment of a published description. Keep calibration
+            // clean-only; its uncalibrated description still supplies corner observations.
+            let Some((lap, trace)) = best_seen_lap(conn, vehicle, laps, length, false)? else {
                 continue;
             };
             let corners = trace
@@ -1883,10 +1906,14 @@ impl Stream {
         Ok(None)
     }
 
-    /// Without a description, the corners are the braking zones of the player's first clean lap:
-    /// everything's read again with them, earlier laps too.
+    /// Without a description, find corners from a representative player lap (invalidated is
+    /// usable too): everything's read again with them, earlier laps included.
     fn find_braking_zones(&mut self, conn: &Connection) -> anyhow::Result<()> {
-        if self.layout.is_some() {
+        if self
+            .layout
+            .as_ref()
+            .is_some_and(|layout| layout.source != "braking zones" || !self.zones_from_invalid)
+        {
             return Ok(());
         }
         let Some(vehicle) = self.player else {
@@ -1922,9 +1949,14 @@ impl Stream {
         let Some(length) = length.filter(|length| *length > 0.0) else {
             return Ok(());
         };
-        let Some((_, trace)) = best_seen_lap(conn, vehicle, &car.finished, length)? else {
+        let Some((lap, trace)) = best_seen_lap(conn, vehicle, &car.finished, length, true)? else {
             return Ok(());
         };
+        // Keep the fallback stable while replaying it; replace it only with clean evidence.
+        if self.layout.is_some() && lap.invalid {
+            return Ok(());
+        }
+        let invalid = lap.invalid;
         let turns = trace
             .braking_zones()
             .into_iter()
@@ -1942,6 +1974,7 @@ impl Stream {
             return Ok(());
         }
         self.layout = Some(layout(turns, length, "braking zones"));
+        self.zones_from_invalid = invalid;
         self.rewind(conn)?;
         Ok(())
     }
@@ -3171,6 +3204,274 @@ mod tests {
     }
 
     #[test]
+    fn representative_laps_prefer_clean_but_keep_invalidated_fallbacks() {
+        let mut clean = lap_with(false, false, (1.0, 0.9));
+        clean.lap = 1;
+        clean.time = Some(105.0);
+        let mut invalid = clean.clone();
+        invalid.lap = 2;
+        invalid.invalid = true;
+        invalid.time = Some(100.0);
+        let mut pit = clean.clone();
+        pit.lap = 3;
+        pit.green = false;
+        pit.pit = true;
+        pit.time = Some(90.0);
+        let laps = [invalid.clone(), pit, clean];
+        assert_eq!(
+            best_laps(&laps)
+                .iter()
+                .map(|lap| lap.lap)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(best_lap(&[invalid]).unwrap().lap, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reference_trace_uses_invalidated_only_when_no_clean_trace_is_usable() {
+        let (dir, _engineer) = race();
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        let mut invalid = lap_with(false, false, (1.0, 0.9));
+        invalid.lap = 2;
+        invalid.start = Some(0.0);
+        invalid.time = Some(100.0);
+        invalid.first_id = 1;
+        invalid.last_id = 400;
+        invalid.invalid = true;
+        let mut missing = invalid.clone();
+        missing.lap = 1;
+        missing.invalid = false;
+        missing.first_id = 999999;
+        missing.last_id = 999999;
+        let laps = [missing.clone(), invalid.clone()];
+        assert_eq!(
+            best_seen_lap(&conn, 1, &laps, 1000.0, true)
+                .unwrap()
+                .unwrap()
+                .0
+                .lap,
+            2
+        );
+        assert!(
+            best_seen_lap(&conn, 1, &laps, 1000.0, false)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut no_zones = invalid.clone();
+        no_zones.invalid = false;
+        no_zones.lap = 1;
+        no_zones.first_id = 401;
+        no_zones.last_id = 800;
+        no_zones.start = Some(100.0);
+        conn.execute(
+            "UPDATE telemetry SET brake = 0 WHERE vehicle_id = 1 AND lap = 1",
+            [],
+        )
+        .unwrap();
+        let laps = [no_zones, invalid.clone()];
+        assert!(
+            best_seen_lap(&conn, 1, &laps, 1000.0, true)
+                .unwrap()
+                .unwrap()
+                .0
+                .invalid
+        );
+
+        let mut clean = invalid.clone();
+        clean.lap = 4;
+        clean.invalid = false;
+        clean.time = Some(101.0);
+        // Exhaust usable clean candidates before falling back, rather than stopping after
+        // the first few clean laps have missing recordings.
+        let laps = [missing.clone(), missing.clone(), missing, invalid, clean];
+        assert_eq!(
+            best_seen_lap(&conn, 1, &laps, 1000.0, true)
+                .unwrap()
+                .unwrap()
+                .0
+                .lap,
+            4
+        );
+    }
+
+    #[test]
+    fn the_improvement_query_prefers_clean_and_exposes_an_invalidated_fallback() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        conn.execute_batch(
+            "INSERT INTO corner_passes (vehicle_id, lap, turn_index, turn_name, total_s, \
+             lap_invalid, in_pit, contact, low_precision, brake_m_before_apex, min_speed_kmh, exit_speed_kmh) VALUES \
+             (1, 0, 0, 'T5', 9.0, 0, 0, 0, 0, 100, 80, 100), \
+             (1, 1, 0, 'T5', 10.5, 0, 0, 0, 0, 100, 80, 100), \
+             (1, 2, 0, 'T5', 10.0, 1, 0, 0, 0, 100, 80, 100);",
+        )
+        .unwrap();
+        let sql = SKILL
+            .split_once("```sql")
+            .unwrap()
+            .1
+            .split_once("```")
+            .unwrap()
+            .0
+            .split(';')
+            .nth(2)
+            .unwrap()
+            .replace(":P", "1")
+            .replace(":FROM_LAP", "1")
+            .replace(":TO_LAP", "2");
+        let selected = |observed: i64| {
+            let sql = sql.replace(":OBSERVED_LAP", &observed.to_string());
+            conn.query_row(&sql, [], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(6)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(selected(3), (1, 0));
+        conn.execute("UPDATE corner_passes SET total_s = NULL WHERE lap = 1", [])
+            .unwrap();
+        // An older clean pass outside the requested window must not suppress the fallback.
+        assert_eq!(selected(3), (2, 1));
+        conn.execute(
+            "UPDATE corner_passes SET total_s = 10.5, brake_m_before_apex = NULL WHERE lap = 1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(selected(3), (2, 1));
+        conn.execute(
+            "UPDATE corner_passes SET brake_m_before_apex = 100 WHERE lap = 1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(selected(1), (2, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clean_evidence_replaces_an_invalidated_braking_zone_layout_once() {
+        let (dir, original) = race();
+        drop(original);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        conn.execute("UPDATE telemetry SET brake = CASE WHEN lap_distance BETWEEN 100 AND 145 THEN 1 ELSE 0 END WHERE vehicle_id = 1 AND lap = 0", []).unwrap();
+        let mut invalid = lap_with(false, false, (1.0, 0.9));
+        invalid.invalid = true;
+        invalid.first_id = 1;
+        invalid.last_id = 400;
+        invalid.start = Some(0.0);
+        invalid.time = Some(100.0);
+        let car = |laps| Car {
+            finished: laps,
+            ..Car::default()
+        };
+        let mut stream = Stream {
+            player: Some(1),
+            cars: BTreeMap::from([(1, car(vec![invalid.clone()]))]),
+            ..Stream::default()
+        };
+        stream.find_braking_zones(&conn).unwrap();
+        assert!(stream.zones_from_invalid);
+        let fallback = stream.layout.as_ref().unwrap().corners[0].start;
+        // Replaying the same invalid evidence doesn't regenerate/rewind the layout.
+        stream.cars.insert(1, car(vec![invalid.clone()]));
+        stream.find_braking_zones(&conn).unwrap();
+        assert_eq!(stream.cars[&1].finished.len(), 1);
+        let mut clean = invalid.clone();
+        clean.invalid = false;
+        clean.lap = 1;
+        clean.first_id = 401;
+        clean.last_id = 800;
+        clean.start = Some(100.0);
+        stream.cars.insert(1, car(vec![invalid, clean]));
+        stream.find_braking_zones(&conn).unwrap();
+        assert!(!stream.zones_from_invalid);
+        assert!(stream.layout.as_ref().unwrap().corners[0].start > fallback + 100.0);
+        assert!(stream.cars.is_empty());
+        // A clean-sourced layout stays stable after the rebuild.
+        stream.find_braking_zones(&conn).unwrap();
+        assert!(!stream.zones_from_invalid);
+    }
+
+    #[test]
+    fn informational_comparisons_do_not_compare_a_fast_invalid_lap_with_itself() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        conn.execute_batch("INSERT INTO lap_stats (vehicle_id, lap, complete, green, invalid, time_s) VALUES (1, 1, 1, 1, 0, 105), (1, 2, 1, 1, 1, 100);
+            INSERT INTO corner_passes (vehicle_id, lap, turn_index, turn_name, total_s, entry_s, lap_invalid) VALUES (1, 1, 0, 'T1', 10.5, 5.5, 0), (1, 2, 0, 'T1', 10, 5, 1);").unwrap();
+        let sql = SKILL
+            .split_once("```sql")
+            .unwrap()
+            .1
+            .split_once("```")
+            .unwrap()
+            .0
+            .split(';')
+            .next()
+            .unwrap()
+            .replace(":P", "1");
+        let (lost, observed, reference) = conn
+            .query_row(&sql, [], |r| {
+                Ok((
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((lost, observed, reference), (-0.5, 1, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalidated_laps_still_supply_corners_without_a_track_description() {
+        let (dir, original) = race();
+        drop(original);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute("UPDATE telemetry SET lap_invalidated = 1", [])
+            .unwrap();
+        let engineer = reopen(&dir);
+        let passes = query(
+            &engineer,
+            "SELECT lap, lap_invalid FROM corner_passes WHERE vehicle_id = 1 ORDER BY lap",
+        )
+        .await;
+        assert_eq!(passes, [["0", "1"], ["1", "1"], ["2", "1"]]);
+    }
+
+    #[test]
+    fn invalidation_updates_corners_already_written_on_the_current_lap() {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        let mut stream = Stream {
+            player: Some(1),
+            layout: Some(layout(
+                vec![Turn {
+                    label: "T1".into(),
+                    direction: None,
+                    scale: None,
+                    start: 450.0,
+                    apex: 500.0,
+                    end: 550.0,
+                }],
+                2000.0,
+                TRACK_DATA,
+            )),
+            ..Stream::default()
+        };
+        let samples = partial(1900.0);
+        stream.apply_telemetry(&conn, &samples).unwrap();
+        let invalid = || scalar::<i64>(&conn, "SELECT lap_invalid FROM corner_passes", []).unwrap();
+        assert_eq!(invalid(), Some(0));
+        let mut late = *samples.last().unwrap();
+        late.id += 1;
+        late.session_time = late.session_time.map(|t| t + 0.1);
+        late.lap_distance = Some(1905.0);
+        late.invalid = true;
+        stream.apply_telemetry(&conn, &[late]).unwrap();
+        assert_eq!(invalid(), Some(1));
+    }
+
+    #[test]
     fn one_stop_is_one_more_stint() {
         let run = |laps: &[(bool, bool)]| {
             let mut stints = Stints::default();
@@ -3821,9 +4122,13 @@ mod tests {
             .map(str::trim)
             .filter(|query| !query.is_empty())
             .collect::<Vec<_>>();
-        assert_eq!(queries.len(), 4);
+        assert_eq!(queries.len(), 5);
         for sql in queries {
-            let sql = sql.replace(":P", "1");
+            let sql = sql
+                .replace(":P", "1")
+                .replace(":OBSERVED_LAP", "3")
+                .replace(":FROM_LAP", "0")
+                .replace(":TO_LAP", "1000");
             run(
                 &engineer,
                 serde_json::json!({"command": "sql", "query": sql}),
