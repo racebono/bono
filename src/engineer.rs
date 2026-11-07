@@ -30,9 +30,8 @@ use tokio::{
     runtime::Handle,
     sync::{Mutex, mpsc},
 };
-use tool::{Engineer as EngineerTool, SCHEMA, SKILL, instructions};
+use tool::{Engineer as EngineerTool, SKILL, instructions};
 
-mod routing;
 mod timeline;
 mod tool;
 
@@ -96,9 +95,6 @@ pub struct Engineer {
     /// Who Bono Cloud is used as
     account: Option<Account>,
     skill: Arc<str>,
-    schema: Arc<str>,
-    /// The skill's documents for Bono Cloud's router
-    routing: Arc<[routing::SkillDocs]>,
     /// Everything said, for the chat
     chat: Vec<ChatEntry>,
     /// The language the pilot last asked in: typed questions whose language is unclear are
@@ -106,6 +102,9 @@ pub struct Engineer {
     last_lang: ArrayStr<2>,
     /// Which language typed questions are in (the model answers in the pilot's language)
     languages: LanguageDetector,
+    /// The tool for the recording the running simulator has, from the moment it has one: its
+    /// tables are kept up to date in the background, so the first question finds them ready
+    tool: Option<EngineerTool>,
     /// The conversation for the database the tool reads. `None` until the first question, and
     /// again once the simulator stops, letting go of its database
     session: Option<Session>,
@@ -239,16 +238,14 @@ struct SessionState {
 
 impl Engineer {
     pub fn new(client: reqwest::Client, account: Option<Account>) -> Self {
-        let routing = routing::skill_docs(SKILL, &EngineerTool::input_schema()).into();
         Self {
             client,
             account,
-            routing,
             skill: instructions(SKILL.to_owned()).into(),
-            schema: SCHEMA.into(),
             chat: Vec::new(),
             last_lang: arrstr!("en"),
             languages: LanguageDetector::new(),
+            tool: None,
             session: None,
             new_session: false,
             turn: None,
@@ -443,6 +440,60 @@ impl Engineer {
         }
     }
 
+    /// Follows the running simulator's recording, as soon as it has one and however far into a
+    /// session that is. Called every frame: asking the simulator for its recording doesn't block,
+    /// and starting or dropping the tool does its work on other threads.
+    pub fn follow_recording(&mut self, rt: &Handle, sim: Option<&mut Sim>) {
+        let pool = sim.and_then(|sim| sim.database());
+        // Another simulator may still be running, or this recording may disappear and return
+        // at the same path. Release its conversation now rather than at the next question.
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| pool.is_none_or(|pool| session.db != pool.database().path()))
+        {
+            let interrupted = self.turn.is_some();
+            self.stop();
+            self.drop_session(rt);
+            self.notice(t!("engineer.sim_stopped"));
+            if interrupted {
+                self.no_beep();
+            }
+        }
+        match pool {
+            Some(pool) => {
+                self.tool_for(rt, pool);
+            }
+            None => self.drop_tool(rt),
+        }
+    }
+
+    /// The tool for `pool`'s recording, started if it isn't the one being followed.
+    fn tool_for(&mut self, rt: &Handle, pool: &Pool) -> EngineerTool {
+        if let Some(tool) = &self.tool
+            && tool.path() == pool.database().path()
+        {
+            return tool.clone();
+        }
+        self.drop_tool(rt);
+        self.tool.insert(EngineerTool::new(pool.clone())).clone()
+    }
+
+    /// Lets go of the recording. Closing the last of its pool's connections joins their threads:
+    /// not on the UI thread.
+    fn drop_tool(&mut self, rt: &Handle) {
+        if let Some(tool) = self.tool.take() {
+            rt.spawn_blocking(move || drop(tool));
+        }
+    }
+
+    /// A conversation may hold the last pool reference once its recording stops being followed.
+    fn drop_session(&mut self, rt: &Handle) {
+        if let Some(session) = self.session.take() {
+            rt.spawn_blocking(move || drop(session));
+        }
+    }
+
     /// A question typed in the chat, answered like one asked on the radio: spoken in the
     /// question's language, or the last one the pilot used if that's unclear.
     pub fn ask_text(
@@ -530,8 +581,12 @@ impl Engineer {
             || corners_changed
             || self.session.as_ref().is_none_or(|s| s.db != db)
         {
-            match self.start(config, sim, pool) {
-                Ok(session) => self.session = Some(session),
+            let tool = self.tool_for(rt, &pool);
+            match self.start(config, sim, pool, tool) {
+                Ok(session) => {
+                    self.drop_session(rt);
+                    self.session = Some(session);
+                }
                 Err(e) => {
                     self.notice(t!("engineer.error_starting", error = format!("{e:#}")));
                     self.no_beep();
@@ -545,8 +600,6 @@ impl Engineer {
             return;
         };
         let state = session.state.clone();
-        let cloud = *session.model.provider() == ModelProvider::BonoCloud;
-        let routing = self.routing.clone();
         let auto_session = *config.get().auto_session();
 
         // What the model writes goes straight to the synthesizer, and to the chat
@@ -563,24 +616,7 @@ impl Engineer {
         let task = Task::spawn(async move {
             let mut state = state.lock().await;
             state.follow_game_session(auto_session).await;
-            // Bono Cloud's router picks the first telemetry command, from the skill's documents
-            // and the session's state as they are now: a snapshot would stop it routing. Other
-            // providers get a snapshot with the new question only.
-            let question = match cloud {
-                true => {
-                    let session = match routing::session(&state.pool).await {
-                        Ok(session) => Some(session),
-                        Err(e) => {
-                            log::warn!("Error reading the session for Bono Cloud's router: {e:#}");
-                            None
-                        }
-                    };
-                    let context = routing::context(&routing, session).map(Arc::new);
-                    state.conversation.set_routing_context(context);
-                    question
-                }
-                false => state.tool.question_with_snapshot(question).await,
-            };
+            let question = state.tool.question_with_snapshot(question).await;
             let question = match &note {
                 Some(note) => format!("{question}\n\n{note}"),
                 None => question,
@@ -626,7 +662,7 @@ impl Engineer {
         // The game stopped: the conversation lets go of the database, so the plugin can delete it
         if !sim_running && self.session.is_some() {
             let interrupted = self.turn.take().is_some();
-            self.session = None;
+            self.drop_session(rt);
             self.notice(t!("engineer.sim_stopped"));
             if interrupted {
                 self.no_beep();
@@ -645,7 +681,7 @@ impl Engineer {
         if self.session.as_ref().is_some_and(|s| !self.signed_in_as(s)) {
             let interrupted = self.turn.is_some();
             self.stop();
-            self.session = None;
+            self.drop_session(rt);
             self.notice(t!("engineer.signed_out"));
             if interrupted {
                 self.no_beep();
@@ -965,8 +1001,13 @@ impl Engineer {
         });
     }
 
-    fn start(&self, config: &Config, sim: &'static str, pool: Pool) -> anyhow::Result<Session> {
-        let tool = EngineerTool::new(pool.clone(), self.schema.clone());
+    fn start(
+        &self,
+        config: &Config,
+        sim: &'static str,
+        pool: Pool,
+        tool: EngineerTool,
+    ) -> anyhow::Result<Session> {
         let mut tools = Tools::default();
         tools.insert(
             EngineerTool::NAME,
@@ -1018,6 +1059,7 @@ impl Engineer {
 
         self.stop();
         let session = self.session.take();
+        let tool = self.tool.take();
         rt.spawn(async move {
             if let Some(lease) = session.as_ref().and_then(|s| s.lease.as_ref())
                 && tokio::time::timeout(WAIT, lease.end_and_wait())
@@ -1026,7 +1068,9 @@ impl Engineer {
             {
                 log::warn!("Gave up ending the Cloud session lease: it expires on its own");
             }
-            drop(session);
+            // Closing the final pool reference joins SQLite workers, including an interrupted
+            // snapshot's job. Keep this off both the UI and the async executor's workers.
+            let _ = tokio::task::spawn_blocking(move || drop((session, tool))).await;
         })
     }
 }
@@ -1634,6 +1678,115 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn follows_the_recording_before_any_question() {
+        let rt = tokio::runtime::Handle::current();
+        let dir = tempfile::tempdir().unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+        let pool = |name: &str| {
+            Pool::new(
+                Database::read_only(Arc::new(dir.path().join(name))),
+                one,
+                one,
+            )
+        };
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        assert!(engineer.tool.is_none());
+
+        // No simulator yet
+        engineer.follow_recording(&rt, None);
+        assert!(engineer.tool.is_none());
+
+        // Opened mid-session, or the game's just started: followed with no question asked
+        let mut sim = crate::sim::recording(pool("a.db"));
+        engineer.follow_recording(&rt, Some(&mut *sim));
+        let first = engineer.tool.clone().expect("following the recording");
+        assert!(engineer.session.is_none());
+
+        // Frame after frame, and for a conversation, it's the same one: what it's read is kept
+        engineer.follow_recording(&rt, Some(&mut *sim));
+        assert!(engineer.tool.as_ref().unwrap().is_same(&first));
+        let same = pool("a.db");
+        assert!(engineer.tool_for(&rt, &same).is_same(&first));
+
+        // Another recording: another tool
+        let other = engineer.tool_for(&rt, &pool("b.db"));
+        assert!(!other.is_same(&first));
+
+        // The simulator gone: it lets go
+        engineer.follow_recording(&rt, None);
+        assert!(engineer.tool.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_conversation_ends_when_its_recording_is_lost_or_switched() {
+        let rt = tokio::runtime::Handle::current();
+        for switch in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let one = NonZeroUsize::new(1).unwrap();
+            let pool = |name: &str| {
+                Pool::new(
+                    Database::read_only(Arc::new(dir.path().join(name))),
+                    one,
+                    one,
+                )
+            };
+            let original = pool("a.db");
+            let mut sim = crate::sim::recording(original.clone());
+            let mut engineer = Engineer::new(reqwest::Client::new(), None);
+            engineer.follow_recording(&rt, Some(&mut *sim));
+            let first = engineer.tool.clone().unwrap();
+            engineer.session = Some(Session {
+                db: original.database().path().to_owned(),
+                model: ModelConfig::default(),
+                corner_names: false,
+                user: None,
+                lease: None,
+                state: Arc::new(Mutex::new(SessionState {
+                    conversation: Box::new(RecordingModel(Arc::new(std::sync::Mutex::new(
+                        Recorded::default(),
+                    )))),
+                    pool: original,
+                    tool: first.clone(),
+                    sim: "lmu",
+                    game_session: None,
+                })),
+            });
+            engineer.follow_recording(&rt, Some(&mut *sim));
+            assert!(engineer.session.is_some());
+            if switch {
+                let mut other = crate::sim::recording(pool("b.db"));
+                engineer.follow_recording(&rt, Some(&mut *other));
+            } else {
+                engineer.follow_recording(&rt, None);
+                assert!(engineer.tool.is_none());
+            }
+            assert!(engineer.session.is_none());
+            engineer.follow_recording(&rt, Some(&mut *sim));
+            assert!(!engineer.tool.as_ref().unwrap().is_same(&first));
+            engineer.quit(&rt).await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quitting_releases_the_persistent_tool_in_the_shutdown_task() {
+        let rt = tokio::runtime::Handle::current();
+        let dir = tempfile::tempdir().unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+        let pool = Pool::new(
+            Database::read_only(Arc::new(dir.path().join("telemetry.db"))),
+            one,
+            one,
+        );
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        let mut sim = crate::sim::recording(pool);
+        engineer.follow_recording(&rt, Some(&mut *sim));
+        assert!(engineer.tool.is_some());
+        let shutdown = engineer.quit(&rt);
+        assert!(engineer.tool.is_none());
+        shutdown.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn follows_the_game_session() {
         use provider::bono_cloud::SessionType;
 
@@ -1649,7 +1802,7 @@ mod tests {
             let recorded = Arc::new(std::sync::Mutex::new(Recorded::default()));
             let mut state = SessionState {
                 conversation: Box::new(RecordingModel(recorded.clone())),
-                tool: EngineerTool::new(pool.clone(), "".into()),
+                tool: EngineerTool::new(pool.clone()),
                 pool,
                 sim: "lmu",
                 game_session: None,

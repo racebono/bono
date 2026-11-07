@@ -1,6 +1,6 @@
 # Damage-only radio checks
 
-Controlled manual/model scenarios, not executed results. Supply fresh `status` output
+Controlled manual/model scenarios, not executed results. Supply fresh `cars_now` output
 containing both damage and last-impact fields. Run in the pilot's language, including
 Spanish, and repeat after an earlier conversation about contact.
 

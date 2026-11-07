@@ -17,7 +17,7 @@ webbrowser = "1"
 bono-sim = { path = "sim" }
 bono-i18n = { path = "i18n" }
 pin-project = "1.1.13"
-rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "hooks", "limits"] }
 tokio = { version = "^1.54.1", features = [
     "rt-multi-thread",
     "sync",

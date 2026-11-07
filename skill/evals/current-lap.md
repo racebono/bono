@@ -2,8 +2,8 @@
 
 Controlled manual/model scenarios, not executed results. Supply the stated evidence as
 snapshots/tool results and allow missing-evidence requests. Compare baseline/candidate
-with identical model/settings and inspect queries as well as answers. All custom SQL
-must follow `schema` and be bounded by current-session ids and vehicle. Slow work needs
+with identical model/settings and inspect queries as well as answers. Queries of the
+recording's own tables must be bounded by id and vehicle. Slow work needs
 the separate acknowledgement required by the main skill.
 
 | Pilot question | Controlled evidence | Pass criteria |
@@ -14,7 +14,7 @@ the separate acknowledgement required by the main skill.
 | Did that hit affect the car? | Current-lap impact and new damage are recorded; no comparable post-impact driving yet. | Reports recorded damage, but does not assert a measured pace/handling effect or invent the contact partner. |
 | Is the new brake bias helping? | Bias changed mid-lap. A matched later braking event improved, but grip and driver input also changed. | Uses before/after events including this lap; describes the local improvement without proving bias caused it or claiming sustained gain. |
 | Has it become too wet for slicks? | Current wetness has risen sharply since the last completed dry lap; recent comparable grip evidence supports wets. | Uses current conditions and supported grip evidence for the decision; doesn't wait for a completed wet lap or use old dry pace as current evidence. |
-| Am I saving enough now? | Saving began this lap. Matched recent distance spans show reduced use, but the sample is short and `stint` still predicts a deficit. | Recognises the local saving; retains the range baseline and uncertainty, without guaranteeing the finish or comparing partial use to a full lap. |
+| Am I saving enough now? | Saving began this lap. Matched recent distance spans show reduced use, but the sample is short and `stint_now` still predicts a deficit. | Recognises the local saving; retains the range baseline and uncertainty, without guaranteeing the finish or comparing partial use to a full lap. |
 | Am I catching Ruiz now? | Last completed laps show Ruiz faster; current-lap gap history shows the gap shrinking. | Answers from observed recent gap movement, not last-lap pace. Does not invent why Ruiz slowed. |
 | Was my braking better on lap 2? | Currently lap 5 with different braking behaviour. Lap 2 and its comparison are available. | Honours lap 2, rather than substituting the newest event. |
 | Are my tyres wearing faster over the stint? | Current lap has a temperature spike; representative completed laps show stable wear rate. | Uses sustained wear evidence, not a transient temperature spike as proof of faster wear. |

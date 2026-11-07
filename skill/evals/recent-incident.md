@@ -9,9 +9,9 @@ with identical model/settings; inspect tool calls as well as the final answer.
 Pilot: "Why did I lose the car?"
 Evidence: fresh snapshot just after T1 on lap 4. Lap 3 was clean. Recent telemetry on
 lap 4 captures a throttle increase followed by rear wheel slip and rapid rotation;
-the supplied channels support power oversteer. `corners` defaults to lap 3.
-Pass: acknowledges before tool work, reads `schema` before custom SQL, and inspects
-session- and vehicle-scoped recent telemetry including lap 4. Gives the supported cause.
+the supplied channels support power oversteer.
+Pass: acknowledges before tool work, and inspects id- and vehicle-scoped recent telemetry
+including lap 4. Gives the supported cause.
 Fail: diagnoses from lap 3, requires a completed lap, or invents an unrelated cause.
 
 ## Incident across start/finish

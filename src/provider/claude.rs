@@ -1,10 +1,6 @@
 //! Claude, through the Claude API.
 
-use super::{
-    Model, ModelOption, Reply, StopReason, ToolHandler, Tools, Usage,
-    bono_cloud::routing::{self, Phase, RoutingContext, RoutingTurn},
-    text::TextSink,
-};
+use super::{Model, ModelOption, Reply, StopReason, ToolHandler, Tools, Usage, text::TextSink};
 use crate::config::{ClaudeCacheTtl, ClaudeConfig};
 use anyhow::{Context, bail};
 use bono_i18n::t;
@@ -227,19 +223,10 @@ pub struct Conversation {
     tools: Tools,
     /// Every request's tokens, by the model that answered it
     usage: BTreeMap<String, Usage>,
-    /// The driver turn Bono Cloud's router is told about, if it's told
-    routing: Option<Routing>,
     /// Added after every turn's tool results (see [`Model::set_tool_result_note`])
     result_note: Option<Arc<str>>,
-}
-
-/// A driver turn, for Bono Cloud's router (see [`routing`]).
-pub(super) struct Routing {
-    pub id: String,
-    pub context: Arc<RoutingContext>,
-    /// Starts the turn until its first request is sent: every later one carries on (tool
-    /// results, a lost answer, the history trimmed) and never routes it again
-    pub phase: Phase,
+    /// Requests carry an `Idempotency-Key`, so a retry after a lost connection isn't billed twice
+    request_ids: bool,
 }
 
 /// Tokens billed, by kind, as the API counts them.
@@ -356,16 +343,6 @@ impl Conversation {
         let mut builder = ConversationBuilder::from_config(config);
         builder.system(system).tools(tools);
         builder.build(client)
-    }
-
-    /// The driver turn the next message starts, for Bono Cloud's router, or none (it isn't told
-    /// about any).
-    pub(super) fn set_routing(&mut self, turn: Option<(String, Arc<RoutingContext>)>) {
-        self.routing = turn.map(|(id, context)| Routing {
-            id,
-            context,
-            phase: Phase::Start,
-        });
     }
 
     /// Trim only between complete user turns. The system prefix and newest turn survive.
@@ -589,18 +566,6 @@ impl Conversation {
     /// Sends the request and reads the response, streamed (handing its text to `sink` as it
     /// comes) or whole.
     async fn post(&mut self, sink: &mut TextSink<'_>) -> anyhow::Result<ResponseBody> {
-        let result = self.post_once(sink).await;
-        // Whatever happened to it, the turn's been started: the website routes it only once.
-        // Except when it was turned away for its size, before any routing or inference
-        if let Some(routing) = &mut self.routing
-            && !result.as_ref().is_err_and(history_limit_error)
-        {
-            routing.phase = Phase::Continue;
-        }
-        result
-    }
-
-    async fn post_once(&mut self, sink: &mut TextSink<'_>) -> anyhow::Result<ResponseBody> {
         const RETRY_AFTER: HeaderName = HeaderName::from_static("retry-after");
         const SHOULD_RETRY: HeaderName = HeaderName::from_static("x-should-retry");
 
@@ -612,8 +577,8 @@ impl Conversation {
         let mut released = false;
         // Transport retries keep the identity because the inference may still be running.
         // Retrying a server error starts a new inference: Cloud retains failed request IDs.
-        let mut request_id = self.routing.as_ref().map(|_| new_request_id());
-        // Whether the router already said this turn was started (once per request)
+        let mut request_id = self.request_ids.then(new_request_id);
+        // Whether the server already said it has this ID (once per request)
         let mut duplicate = false;
         loop {
             sink.start_response();
@@ -674,10 +639,7 @@ impl Conversation {
                             && retryable_stream_error(&e) =>
                     {
                         log::warn!("Claude's response failed midway, retrying: {e:#}");
-                        // A routed first answer may be what was lost: carried on from the history
-                        // as a new inference, so it's never routed twice nor a tool call invented
-                        if let Some(routing) = &mut self.routing {
-                            routing.phase = Phase::Continue;
+                        if request_id.is_some() {
                             request_id = Some(new_request_id());
                         }
                         tokio::time::sleep(backoff(attempt)).await;
@@ -718,16 +680,15 @@ impl Conversation {
                 return Err(error.into());
             }
 
-            // The router already took this turn (e.g. its answer was lost): Claude carries it on,
-            // with the same turn, never a fresh one
+            // A connection was lost after the server took the request, and it can't replay the
+            // answer: only a new inference gets one, or the pilot's question goes unanswered
             if status == StatusCode::CONFLICT
+                && request_id.is_some()
                 && !duplicate
-                && let Some(routing) = &mut self.routing
-                && routing.phase == Phase::Start
+                && error.code.as_deref() == Some("duplicate_request")
             {
-                log::info!("Bono Cloud already routed this turn, carrying it on: {error}");
+                log::warn!("The answer to a request was lost, asking again: {error}");
                 duplicate = true;
-                routing.phase = Phase::Continue;
                 request_id = Some(new_request_id());
                 continue;
             }
@@ -772,21 +733,14 @@ impl Conversation {
 
     /// The request as it's sent, on `lease` (if any).
     fn leased_request<'a>(&'a self, lease: Option<&'a str>) -> LeasedRequest<'a> {
-        let routing = self.routing.as_ref();
         LeasedRequest {
             body: &self.body,
             session_id: lease,
-            routing_turn: routing.map(|routing| RoutingTurn {
-                version: routing::VERSION,
-                id: &routing.id,
-                phase: routing.phase,
-            }),
-            routing_context: routing.map(|routing| &*routing.context),
         }
     }
 
-    /// The size of the next request, serialized as it's sent: routing fields and all, with room
-    /// for a lease (not known until it's sent).
+    /// The size of the next request, serialized as it's sent, with room for a lease (not known
+    /// until it's sent).
     fn request_size(&self) -> anyhow::Result<usize> {
         /// `,"session_id":"…"`, with room for an id of up to 128 characters
         const LEASE: usize = 160;
@@ -1050,6 +1004,7 @@ pub struct ConversationBuilder {
     history_limits: Option<HistoryLimits>,
     /// The model and its settings are left out of requests, for the server to choose
     server_settings: bool,
+    request_ids: bool,
 }
 
 impl ConversationBuilder {
@@ -1074,6 +1029,7 @@ impl ConversationBuilder {
             lease_source: None,
             server_settings: false,
             history_limits: None,
+            request_ids: false,
         }
     }
 
@@ -1137,6 +1093,14 @@ impl ConversationBuilder {
     #[inline]
     pub(super) fn server_settings(&mut self) -> &mut Self {
         self.server_settings = true;
+        self
+    }
+
+    /// Sends each inference with an `Idempotency-Key` (Bono Cloud's), so a retry after a lost
+    /// connection can't be billed as another.
+    #[inline]
+    pub(super) fn request_ids(&mut self) -> &mut Self {
+        self.request_ids = true;
         self
     }
 
@@ -1360,10 +1324,15 @@ impl ConversationBuilder {
             max_requests: self.max_requests,
             tools: self.tools,
             usage: BTreeMap::new(),
-            routing: None,
             result_note: None,
+            request_ids: self.request_ids,
         });
     }
+}
+
+/// A new `Idempotency-Key`, for one inference.
+fn new_request_id() -> String {
+    format!("req-{:032x}", rand::random::<u128>())
 }
 
 /// A request as it's sent: the body, with the lease it draws on, if any.
@@ -1373,15 +1342,6 @@ struct LeasedRequest<'a> {
     body: &'a RequestBody,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    routing_turn: Option<RoutingTurn<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    routing_context: Option<&'a RoutingContext>,
-}
-
-/// A new `Idempotency-Key`, for one inference.
-fn new_request_id() -> String {
-    format!("req-{:032x}", rand::random::<u128>())
 }
 
 #[derive(Serialize)]
@@ -2451,18 +2411,11 @@ mod tests {
             max_messages: 100,
             target: 0.5,
         });
-        conversation.set_routing(Some((
-            routing::turn_id(),
-            Arc::new(RoutingContext::new(None, Vec::new())),
-        )));
         assert_eq!(
             conversation.send("Gap?".into()).await.unwrap().text,
             "Answer"
         );
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0]["routing_turn"]["phase"], "start");
-        assert_eq!(requests[1]["routing_turn"]["phase"], "start");
+        assert_eq!(requests.lock().unwrap().len(), 2);
     }
 
     #[test]

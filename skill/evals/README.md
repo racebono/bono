@@ -16,9 +16,12 @@ are controlled manual/model scenarios; adding them does not establish a pass.
 choice at a required stop, and reconsidering slicks late in a wet race. These require
 their stated evidence; do not run them against the existing dry database unchanged.
 
-`language.md` covers answering in the pilot's language across tool calls (including Bono
-Cloud's routed ones), earlier answers in English and ambiguous short questions. Run it
+`language.md` covers answering in the pilot's language across tool calls, earlier answers in English and ambiguous short questions. Run it
 with `EVAL_LANG`. These are controlled manual/model scenarios, not executed results.
+
+`invalidated-corners.md` covers informational use of invalidated passes, clean-first improvement
+references, explicitly disclosed fallback, and missing or non-comparable evidence. These are
+controlled manual/model scenarios, not executed results.
 
 These cases test the race engineer's answers, not the automatic spotter. Direct side/clear
 calls, immediate alerts and imminent-rain announcements are excluded. Rival pace, longer
@@ -46,7 +49,7 @@ effort and fixture for baseline and candidate. Record measured times; a transcri
 cannot establish improved latency.
 
 Use the same database, model and effort for the old and new skill, with multiple runs.
-Build both versions: the skill, schema and topic references are all compiled into the tool. Save distinct `EVAL_CONFIG`
+Build both versions: the skill is compiled into the tool. Save distinct `EVAL_CONFIG`
 and `EVAL_RUN` values. The current model comparison uses Haiku 5.5 high and Sonnet 5.5 low.
 
 `scripts/generate_mock_telemetry.py` at the repository root creates controlled race and
