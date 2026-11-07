@@ -102,6 +102,17 @@ impl Engineer {
         }
     }
 
+    /// The recording it reads.
+    pub fn path(&self) -> &Path {
+        &self.inner.shared.path
+    }
+
+    /// Whether it's the same tool, not just one for the same recording.
+    #[cfg(test)]
+    pub fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn description() -> String {
         "Read-only queries over the live telemetry of the simulator the pilot is driving. \
          `command` picks the query: quick (the latest state, as in the question's snapshot), track \

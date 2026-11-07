@@ -258,8 +258,11 @@ pub(super) fn spawn(shared: Arc<Shared>) -> mpsc::Sender<Request> {
 fn thread(shared: &Shared, requests: &mpsc::Receiver<Request>) {
     let mut data = None::<Data>;
     let mut failing = false;
+    // Straight away: the sooner it starts following, the less there is to catch up with
+    let mut started = false;
     loop {
         let wait = match &data {
+            None if !std::mem::replace(&mut started, true) => Duration::ZERO,
             // Reading everything again as fast as it fails helps nobody
             Some(data) if data.stream.failed => RETRY_OPEN,
             Some(data) if data.stream.behind => Duration::ZERO,

@@ -102,6 +102,9 @@ pub struct Engineer {
     last_lang: ArrayStr<2>,
     /// Which language typed questions are in (the model answers in the pilot's language)
     languages: LanguageDetector,
+    /// The tool for the recording the running simulator has, from the moment it has one: its
+    /// tables are kept up to date in the background, so the first question finds them ready
+    tool: Option<EngineerTool>,
     /// The conversation for the database the tool reads. `None` until the first question, and
     /// again once the simulator stops, letting go of its database
     session: Option<Session>,
@@ -242,6 +245,7 @@ impl Engineer {
             chat: Vec::new(),
             last_lang: arrstr!("en"),
             languages: LanguageDetector::new(),
+            tool: None,
             session: None,
             new_session: false,
             turn: None,
@@ -436,6 +440,37 @@ impl Engineer {
         }
     }
 
+    /// Follows the running simulator's recording, as soon as it has one and however far into a
+    /// session that is. Called every frame: asking the simulator for its recording doesn't block,
+    /// and starting or dropping the tool does its work on other threads.
+    pub fn follow_recording(&mut self, rt: &Handle, sim: Option<&mut Sim>) {
+        match sim.and_then(|sim| sim.database()) {
+            Some(pool) => {
+                self.tool_for(rt, pool);
+            }
+            None => self.drop_tool(rt),
+        }
+    }
+
+    /// The tool for `pool`'s recording, started if it isn't the one being followed.
+    fn tool_for(&mut self, rt: &Handle, pool: &Pool) -> EngineerTool {
+        if let Some(tool) = &self.tool
+            && tool.path() == pool.database().path()
+        {
+            return tool.clone();
+        }
+        self.drop_tool(rt);
+        self.tool.insert(EngineerTool::new(pool.clone())).clone()
+    }
+
+    /// Lets go of the recording. Closing the last of its pool's connections joins their threads:
+    /// not on the UI thread.
+    fn drop_tool(&mut self, rt: &Handle) {
+        if let Some(tool) = self.tool.take() {
+            rt.spawn_blocking(move || drop(tool));
+        }
+    }
+
     /// A question typed in the chat, answered like one asked on the radio: spoken in the
     /// question's language, or the last one the pilot used if that's unclear.
     pub fn ask_text(
@@ -523,7 +558,8 @@ impl Engineer {
             || corners_changed
             || self.session.as_ref().is_none_or(|s| s.db != db)
         {
-            match self.start(config, sim, pool) {
+            let tool = self.tool_for(rt, &pool);
+            match self.start(config, sim, pool, tool) {
                 Ok(session) => self.session = Some(session),
                 Err(e) => {
                     self.notice(t!("engineer.error_starting", error = format!("{e:#}")));
@@ -939,8 +975,13 @@ impl Engineer {
         });
     }
 
-    fn start(&self, config: &Config, sim: &'static str, pool: Pool) -> anyhow::Result<Session> {
-        let tool = EngineerTool::new(pool.clone());
+    fn start(
+        &self,
+        config: &Config,
+        sim: &'static str,
+        pool: Pool,
+        tool: EngineerTool,
+    ) -> anyhow::Result<Session> {
         let mut tools = Tools::default();
         tools.insert(
             EngineerTool::NAME,
@@ -1605,6 +1646,46 @@ mod tests {
         fn set_game_session(&mut self, game: &GameSession) {
             self.0.lock().unwrap().games.push(game.clone());
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn follows_the_recording_before_any_question() {
+        let rt = tokio::runtime::Handle::current();
+        let dir = tempfile::tempdir().unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+        let pool = |name: &str| {
+            Pool::new(
+                Database::read_only(Arc::new(dir.path().join(name))),
+                one,
+                one,
+            )
+        };
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        assert!(engineer.tool.is_none());
+
+        // No simulator yet
+        engineer.follow_recording(&rt, None);
+        assert!(engineer.tool.is_none());
+
+        // Opened mid-session, or the game's just started: followed with no question asked
+        let mut sim = crate::sim::recording(pool("a.db"));
+        engineer.follow_recording(&rt, Some(&mut *sim));
+        let first = engineer.tool.clone().expect("following the recording");
+        assert!(engineer.session.is_none());
+
+        // Frame after frame, and for a conversation, it's the same one: what it's read is kept
+        engineer.follow_recording(&rt, Some(&mut *sim));
+        assert!(engineer.tool.as_ref().unwrap().is_same(&first));
+        let same = pool("a.db");
+        assert!(engineer.tool_for(&rt, &same).is_same(&first));
+
+        // Another recording: another tool
+        let other = engineer.tool_for(&rt, &pool("b.db"));
+        assert!(!other.is_same(&first));
+
+        // The simulator gone: it lets go
+        engineer.follow_recording(&rt, None);
+        assert!(engineer.tool.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]

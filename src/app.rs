@@ -331,6 +331,7 @@ impl AppState {
     fn update(&mut self, rt: &Handle, ui: &mut egui::Ui) {
         self.update_simulators();
         self.tracks.update(rt, self.simulators.current_mut());
+        self.engineer.follow_recording(rt, self.simulators.current_mut());
 
         // What the pilot says on the radio goes to the engineer, and its answers come back
         if let Some(heard) = self.gui.topbar.audio.transcription(rt) {
