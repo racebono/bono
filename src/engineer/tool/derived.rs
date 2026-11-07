@@ -382,7 +382,7 @@ impl Data {
         limit: Option<usize>,
     ) -> anyhow::Result<String> {
         let query = query.trim().trim_end_matches(';');
-        let lower = query.to_lowercase();
+        let lower = without_leading_comments(query).to_lowercase();
         if !["select", "with", "pragma"]
             .iter()
             .any(|p| lower.starts_with(p))
@@ -402,6 +402,20 @@ impl Data {
         let result = run_query(conn, &self.stream, query, limit, note.as_deref());
         conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
         result
+    }
+}
+
+/// A query from its first word on.
+fn without_leading_comments(mut query: &str) -> &str {
+    loop {
+        query = query.trim_start();
+        if let Some(rest) = query.strip_prefix("--") {
+            query = rest.split_once('\n').map_or("", |(_, rest)| rest);
+        } else if let Some(rest) = query.strip_prefix("/*") {
+            query = rest.split_once("*/").map_or("", |(_, rest)| rest);
+        } else {
+            return query;
+        }
     }
 }
 
@@ -845,14 +859,18 @@ impl LapBuild {
             _ => None,
         };
         let complete = next.is_some();
-        // A car joining midway used a fraction of a lap's fuel. Only a lap's first distances tell:
-        // near the line, an estimated distance can wrap before the lap number does
+        // A car joining midway used a fraction of a lap's fuel. The lap has to start near the line
+        // and get back round: first rows of the old lap's distance don't count, and near the line
+        // an estimated distance can wrap before the lap number does
         let seen_from_the_start = self.furthest.is_none_or(|furthest| {
-            self.samples
+            let mut rest = self
+                .samples
                 .iter()
                 .filter_map(|sample| sample.lap_distance)
-                .find(|d| *d <= furthest * FIRST_DISTANCE)
-                .is_none_or(|d| d <= furthest * SEEN_FROM_THE_START)
+                .skip_while(|d| *d > furthest * FIRST_DISTANCE);
+            rest.next()
+                .is_some_and(|d| d <= furthest * SEEN_FROM_THE_START)
+                && rest.any(|d| d >= furthest * FIRST_DISTANCE)
         });
         let refuelled =
             fuel_used.is_some_and(|f| f < -0.5) || energy_used.is_some_and(|v| v < -0.01);
@@ -2399,8 +2417,15 @@ fn race_need(
                     .and_then(|r| r.f("lap_start_time"))
                     .filter(|t| t.is_finite())
                 {
-                    let first = start + leader_lap;
-                    t_flag = first + steps_to(first, leader_lap, now + time_left) * leader_lap;
+                    let clock_end = s.f("session_end_time").unwrap_or(now + time_left);
+                    t_flag = match start >= clock_end {
+                        // Started this lap with the clock run out: that was the flag
+                        true => start,
+                        false => {
+                            let first = start + leader_lap;
+                            first + steps_to(first, leader_lap, now + time_left) * leader_lap
+                        }
+                    };
                 }
             }
             _ => {
@@ -2904,6 +2929,53 @@ mod tests {
     }
 
     #[test]
+    fn a_query_can_start_with_comments() {
+        assert_eq!(without_leading_comments("SELECT 1"), "SELECT 1");
+        assert_eq!(
+            without_leading_comments("-- a\n  /* b */\n--c\nWITH x AS (SELECT 1)"),
+            "WITH x AS (SELECT 1)"
+        );
+        assert_eq!(without_leading_comments("-- only"), "");
+    }
+
+    #[test]
+    fn the_flag_having_fallen_leaves_only_the_lap_under_way() {
+        let conn = Connection::open_in_memory().unwrap();
+        let session = row(
+            &conn,
+            "SELECT 1000.0 AS session_end_time, 'race' AS session_type, 1007.0 AS session_time",
+            [],
+        )
+        .unwrap()
+        .unwrap();
+        let leader = row(
+            &conn,
+            "SELECT 2 AS vehicle_id, 1 AS position, 100.0 AS last_lap_time",
+            [],
+        )
+        .unwrap()
+        .unwrap();
+        let me = row(&conn, "SELECT 1 AS vehicle_id, 2 AS position", [])
+            .unwrap()
+            .unwrap();
+        let sc = Scoring {
+            session: Some(session),
+            cars: BTreeMap::from([(1, me.clone()), (2, leader)]),
+            player: Some(me),
+        };
+        let at = |start: f64| {
+            let sql = format!("SELECT {start} AS lap_start_time");
+            BTreeMap::from([(2, row(&conn, &sql, []).unwrap().unwrap())])
+        };
+        // The leader crossed the line at 1005, after the clock ran out at 1000
+        let (need, _) = race_need(&sc, &at(1005.0), 1, Some(1007.0), 0.92, Some(100.0));
+        assert!((need.unwrap() - 0.08).abs() < 1e-9, "{need:?}");
+        // Before the clock's end, that lap's end is the flag: one more for us after this one
+        let (need, _) = race_need(&sc, &at(960.0), 1, Some(1007.0), 0.92, Some(100.0));
+        assert!((need.unwrap() - 1.08).abs() < 1e-9, "{need:?}");
+    }
+
+    #[test]
     fn steps_to_matches_stepping_and_stays_bounded() {
         assert_eq!(steps_to(10.0, 5.0, 3.0), 0.0);
         assert_eq!(steps_to(10.0, 5.0, 10.0), 0.0);
@@ -3256,6 +3328,19 @@ mod tests {
         let skipped = lap(1, 3, &whole);
         assert!(skipped.complete && !skipped.green);
         assert_eq!((skipped.time, skipped.fuel_used), (None, None));
+
+        // Joined in the last stretch of the lap, with or without a distance that wraps early
+        let last = whole
+            .iter()
+            .filter(|s| s.lap_distance.unwrap() >= 1900.0)
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(!lap(1, 2, &last).green);
+        let mut last_wrapped = last.clone();
+        let mut row = *last_wrapped.last().unwrap();
+        row.lap_distance = Some(1.0);
+        last_wrapped.push(row);
+        assert!(!lap(1, 2, &last_wrapped).green);
 
         // Joined midway
         let joined = whole
@@ -3713,14 +3798,7 @@ mod tests {
 
         let (_, block) = SKILL.split_once("```sql").unwrap();
         let (block, _) = block.split_once("```").unwrap();
-        let block = block
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join(
-                "
-",
-            );
+        // As they're written, comments and all
         let queries = block
             .split(';')
             .map(str::trim)
