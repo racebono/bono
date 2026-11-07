@@ -12,7 +12,9 @@
 use super::*;
 use rusqlite::{
     hooks::{AuthAction, AuthContext, Authorization},
+    limits::Limit,
     params_from_iter,
+    types::ValueRef,
 };
 use std::sync::mpsc::{self, RecvTimeoutError};
 
@@ -27,6 +29,8 @@ const CHUNK: i64 = 50_000;
 /// How long a query waits for the tables to catch up with the recording. Past it, it's answered
 /// with what's there and `race_state.derived_catching_up` says so
 const CATCH_UP: Duration = Duration::from_secs(3);
+/// Bound a model query's strings, blobs and rows inside SQLite, before result formatting.
+const SQL_MAX_VALUE_BYTES: i32 = 1024 * 1024;
 /// An official lap time belongs to the lap that ended this close to its scoring row
 const OFFICIAL_MATCH: f64 = 3.0;
 /// The longest race clock taken as one; anything past this is a bad input, not a race.
@@ -402,7 +406,14 @@ impl Data {
 
         let conn = &self.conn;
         conn.authorizer(Some(authorize))?;
-        let result = run_query(conn, &self.stream, query, limit, note.as_deref());
+        let result = (|| {
+            let previous = conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, SQL_MAX_VALUE_BYTES)?;
+            let result = run_query(conn, &self.stream, query, limit, note.as_deref());
+            // The worker's own writes and subsequent queries retain their normal limits,
+            // including when this query fails.
+            conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, previous)?;
+            result
+        })();
         conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
         result
     }
@@ -510,12 +521,15 @@ fn run_query(
         while let Some(row) = rows.next()? {
             let values = (0..columns)
                 .map(|i| {
-                    Ok(match row.get::<_, Value>(i)? {
-                        Value::Null => "NULL".into(),
-                        Value::Integer(n) => n.to_string(),
-                        Value::Real(x) => real_text(x),
-                        Value::Text(text) => telemetry_text(&text),
-                        Value::Blob(blob) => format!("<{} bytes>", blob.len()),
+                    Ok(match row.get_ref(i)? {
+                        ValueRef::Null => "NULL".into(),
+                        ValueRef::Integer(n) => n.to_string(),
+                        ValueRef::Real(x) => real_text(x),
+                        ValueRef::Text(text) => telemetry_text(
+                            std::str::from_utf8(text)
+                                .map_err(|e| rusqlite::Error::Utf8Error(i, e))?,
+                        ),
+                        ValueRef::Blob(blob) => format!("<{} bytes>", blob.len()),
                     })
                 })
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3816,6 +3830,33 @@ mod tests {
             )
             .await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sql_rejects_large_values_and_recovers_after_errors() {
+        let (_dir, engineer) = race();
+        for sql in ["SELECT randomblob(2097152)", "SELECT hex(zeroblob(600000))"] {
+            let error = engineer
+                .run(
+                    serde_json::from_value(serde_json::json!({
+                        "command": "sql", "query": sql
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("too big"), "{sql}: {error:#}");
+        }
+        // Authorizer and limits are restored after failure: current-state writes and
+        // ordinary model queries still work on this same worker connection.
+        assert_eq!(
+            number(&engineer, "SELECT COUNT(*) FROM cars_now").await,
+            2.0
+        );
+        assert_eq!(
+            query(&engineer, "SELECT zeroblob(16)").await,
+            [["<16 bytes>"]]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

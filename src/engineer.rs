@@ -444,7 +444,23 @@ impl Engineer {
     /// session that is. Called every frame: asking the simulator for its recording doesn't block,
     /// and starting or dropping the tool does its work on other threads.
     pub fn follow_recording(&mut self, rt: &Handle, sim: Option<&mut Sim>) {
-        match sim.and_then(|sim| sim.database()) {
+        let pool = sim.and_then(|sim| sim.database());
+        // Another simulator may still be running, or this recording may disappear and return
+        // at the same path. Release its conversation now rather than at the next question.
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| pool.is_none_or(|pool| session.db != pool.database().path()))
+        {
+            let interrupted = self.turn.is_some();
+            self.stop();
+            self.drop_session(rt);
+            self.notice(t!("engineer.sim_stopped"));
+            if interrupted {
+                self.no_beep();
+            }
+        }
+        match pool {
             Some(pool) => {
                 self.tool_for(rt, pool);
             }
@@ -468,6 +484,13 @@ impl Engineer {
     fn drop_tool(&mut self, rt: &Handle) {
         if let Some(tool) = self.tool.take() {
             rt.spawn_blocking(move || drop(tool));
+        }
+    }
+
+    /// A conversation may hold the last pool reference once its recording stops being followed.
+    fn drop_session(&mut self, rt: &Handle) {
+        if let Some(session) = self.session.take() {
+            rt.spawn_blocking(move || drop(session));
         }
     }
 
@@ -560,7 +583,10 @@ impl Engineer {
         {
             let tool = self.tool_for(rt, &pool);
             match self.start(config, sim, pool, tool) {
-                Ok(session) => self.session = Some(session),
+                Ok(session) => {
+                    self.drop_session(rt);
+                    self.session = Some(session);
+                }
                 Err(e) => {
                     self.notice(t!("engineer.error_starting", error = format!("{e:#}")));
                     self.no_beep();
@@ -636,7 +662,7 @@ impl Engineer {
         // The game stopped: the conversation lets go of the database, so the plugin can delete it
         if !sim_running && self.session.is_some() {
             let interrupted = self.turn.take().is_some();
-            self.session = None;
+            self.drop_session(rt);
             self.notice(t!("engineer.sim_stopped"));
             if interrupted {
                 self.no_beep();
@@ -655,7 +681,7 @@ impl Engineer {
         if self.session.as_ref().is_some_and(|s| !self.signed_in_as(s)) {
             let interrupted = self.turn.is_some();
             self.stop();
-            self.session = None;
+            self.drop_session(rt);
             self.notice(t!("engineer.signed_out"));
             if interrupted {
                 self.no_beep();
@@ -1033,6 +1059,7 @@ impl Engineer {
 
         self.stop();
         let session = self.session.take();
+        let tool = self.tool.take();
         rt.spawn(async move {
             if let Some(lease) = session.as_ref().and_then(|s| s.lease.as_ref())
                 && tokio::time::timeout(WAIT, lease.end_and_wait())
@@ -1041,7 +1068,9 @@ impl Engineer {
             {
                 log::warn!("Gave up ending the Cloud session lease: it expires on its own");
             }
-            drop(session);
+            // Closing the final pool reference joins SQLite workers, including an interrupted
+            // snapshot's job. Keep this off both the UI and the async executor's workers.
+            let _ = tokio::task::spawn_blocking(move || drop((session, tool))).await;
         })
     }
 }
@@ -1686,6 +1715,75 @@ mod tests {
         // The simulator gone: it lets go
         engineer.follow_recording(&rt, None);
         assert!(engineer.tool.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_conversation_ends_when_its_recording_is_lost_or_switched() {
+        let rt = tokio::runtime::Handle::current();
+        for switch in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let one = NonZeroUsize::new(1).unwrap();
+            let pool = |name: &str| {
+                Pool::new(
+                    Database::read_only(Arc::new(dir.path().join(name))),
+                    one,
+                    one,
+                )
+            };
+            let original = pool("a.db");
+            let mut sim = crate::sim::recording(original.clone());
+            let mut engineer = Engineer::new(reqwest::Client::new(), None);
+            engineer.follow_recording(&rt, Some(&mut *sim));
+            let first = engineer.tool.clone().unwrap();
+            engineer.session = Some(Session {
+                db: original.database().path().to_owned(),
+                model: ModelConfig::default(),
+                corner_names: false,
+                user: None,
+                lease: None,
+                state: Arc::new(Mutex::new(SessionState {
+                    conversation: Box::new(RecordingModel(Arc::new(std::sync::Mutex::new(
+                        Recorded::default(),
+                    )))),
+                    pool: original,
+                    tool: first.clone(),
+                    sim: "lmu",
+                    game_session: None,
+                })),
+            });
+            engineer.follow_recording(&rt, Some(&mut *sim));
+            assert!(engineer.session.is_some());
+            if switch {
+                let mut other = crate::sim::recording(pool("b.db"));
+                engineer.follow_recording(&rt, Some(&mut *other));
+            } else {
+                engineer.follow_recording(&rt, None);
+                assert!(engineer.tool.is_none());
+            }
+            assert!(engineer.session.is_none());
+            engineer.follow_recording(&rt, Some(&mut *sim));
+            assert!(!engineer.tool.as_ref().unwrap().is_same(&first));
+            engineer.quit(&rt).await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quitting_releases_the_persistent_tool_in_the_shutdown_task() {
+        let rt = tokio::runtime::Handle::current();
+        let dir = tempfile::tempdir().unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+        let pool = Pool::new(
+            Database::read_only(Arc::new(dir.path().join("telemetry.db"))),
+            one,
+            one,
+        );
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        let mut sim = crate::sim::recording(pool);
+        engineer.follow_recording(&rt, Some(&mut *sim));
+        assert!(engineer.tool.is_some());
+        let shutdown = engineer.quit(&rt);
+        assert!(engineer.tool.is_none());
+        shutdown.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
