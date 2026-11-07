@@ -578,6 +578,8 @@ impl Conversation {
         // Transport retries keep the identity because the inference may still be running.
         // Retrying a server error starts a new inference: Cloud retains failed request IDs.
         let mut request_id = self.request_ids.then(new_request_id);
+        // Whether the server already said it has this ID (once per request)
+        let mut duplicate = false;
         loop {
             sink.start_response();
             let bearer = match &self.bearer_source {
@@ -676,6 +678,19 @@ impl Conversation {
                     continue;
                 }
                 return Err(error.into());
+            }
+
+            // A connection was lost after the server took the request, and it can't replay the
+            // answer: only a new inference gets one, or the pilot's question goes unanswered
+            if status == StatusCode::CONFLICT
+                && request_id.is_some()
+                && !duplicate
+                && error.code.as_deref() == Some("duplicate_request")
+            {
+                log::warn!("The answer to a request was lost, asking again: {error}");
+                duplicate = true;
+                request_id = Some(new_request_id());
+                continue;
             }
 
             // A wait that long would hold the pilot's question up: given up on instead

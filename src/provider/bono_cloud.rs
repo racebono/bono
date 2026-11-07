@@ -1289,6 +1289,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_lost_answer_is_asked_for_again_under_a_new_id() {
+        let (url, requests) = mock(vec![cloud_error(409, "duplicate_request"), answer()]).await;
+        let account = signed_in(url, "access-1");
+        let mut first = conversation(&account, Tools::default());
+        assert_eq!(first.send("Pit?".into()).await.unwrap().text, "Box.");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(
+            idempotency_key(&requests[0].0),
+            idempotency_key(&requests[1].0)
+        );
+        assert_eq!(requests[0].1["messages"], requests[1].1["messages"]);
+
+        // Once: a server that keeps saying so isn't asked forever
+        let (url, requests) = mock(vec![
+            cloud_error(409, "duplicate_request"),
+            cloud_error(409, "duplicate_request"),
+        ])
+        .await;
+        let account = signed_in(url, "access-1");
+        let mut conversation = conversation(&account, Tools::default());
+        assert!(conversation.send("Pit?".into()).await.is_err());
+        assert!(requests.lock().unwrap().len() >= 2);
+    }
+
+    #[tokio::test]
     async fn every_inference_has_its_own_request_id() {
         for status in [503, 429] {
             let (url, requests) = mock_headers(

@@ -426,9 +426,9 @@ fn authorize(context: AuthContext<'_>) -> Authorization {
 }
 
 /// A number for the model: four significant digits, or to the millisecond for the larger ones (a
-/// session's clock, a distance on a long lap), which those would blur.
+/// lap time, a session's clock, a distance), which those would blur.
 fn real_text(x: f64) -> String {
-    match x.abs() >= 1000.0 && x.is_finite() {
+    match x.abs() >= 10.0 && x.is_finite() {
         true => {
             let text = format!("{x:.3}");
             text.trim_end_matches('0').trim_end_matches('.').to_owned()
@@ -738,8 +738,7 @@ struct LapBuild {
     samples: Vec<Sample>,
     /// The furthest believable lap distance so far
     top: f64,
-    /// The nearest and furthest lap distances of its rows
-    nearest: Option<f64>,
+    /// The furthest lap distance of its rows
     furthest: Option<f64>,
     /// What's been written of each corner's pass: how many of its marks the car has passed
     marks_passed: Vec<u8>,
@@ -768,7 +767,6 @@ impl LapBuild {
             gap_behind_end: None,
             samples: Vec::new(),
             top: 0.0,
-            nearest: None,
             furthest: None,
             marks_passed: vec![0; corners],
             next_mark: layout.map_or(f64::INFINITY, |layout| next_mark(layout, 0.0)),
@@ -798,7 +796,6 @@ impl LapBuild {
         self.gap_behind_end = sample.gap_behind;
         self.samples.push(*sample);
         if let Some(d) = sample.lap_distance {
-            self.nearest = Some(self.nearest.map_or(d, |nearest| nearest.min(d)));
             self.furthest = Some(self.furthest.map_or(d, |furthest| furthest.max(d)));
         }
         if let (Some(d), Some(length)) = (sample.lap_distance, length) {
@@ -848,11 +845,15 @@ impl LapBuild {
             _ => None,
         };
         let complete = next.is_some();
-        // A car joining midway used a fraction of a lap's fuel
-        let seen_from_the_start = match (self.nearest, self.furthest) {
-            (Some(nearest), Some(furthest)) => nearest <= furthest * SEEN_FROM_THE_START,
-            _ => true,
-        };
+        // A car joining midway used a fraction of a lap's fuel. Only a lap's first distances tell:
+        // near the line, an estimated distance can wrap before the lap number does
+        let seen_from_the_start = self.furthest.is_none_or(|furthest| {
+            self.samples
+                .iter()
+                .filter_map(|sample| sample.lap_distance)
+                .find(|d| *d <= furthest * FIRST_DISTANCE)
+                .is_none_or(|d| d <= furthest * SEEN_FROM_THE_START)
+        });
         let refuelled =
             fuel_used.is_some_and(|f| f < -0.5) || energy_used.is_some_and(|v| v < -0.01);
         Ok(Lap {
@@ -3208,6 +3209,10 @@ mod tests {
         assert_eq!(real_text(12345.678), "12345.678");
         assert_eq!(real_text(1000.0), "1000");
         assert_eq!(real_text(99.8), "99.8");
+        // Lap times keep their milliseconds, whatever the track
+        assert_eq!(real_text(101.234), "101.234");
+        assert_eq!(real_text(95.123), "95.123");
+        assert_eq!(real_text(2.977), "2.977");
         assert_eq!(real_text(-2.5), "-2.5");
     }
 
@@ -3259,6 +3264,16 @@ mod tests {
             .copied()
             .collect::<Vec<_>>();
         assert!(!lap(1, 2, &joined).green);
+        // Nor does a distance wrapping before the lap number make it a whole lap
+        let mut wrapped = joined.clone();
+        let mut row = *wrapped.last().unwrap();
+        row.lap_distance = Some(1.0);
+        wrapped.push(row);
+        assert!(!lap(1, 2, &wrapped).green);
+        // And rows of the old lap's distance don't stop one being one
+        let mut stale = whole.clone();
+        stale[0].lap_distance = Some(1999.0);
+        assert!(lap(1, 2, &stale).green);
     }
 
     #[tokio::test(flavor = "multi_thread")]
