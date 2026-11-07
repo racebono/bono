@@ -3303,9 +3303,10 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO corner_passes (vehicle_id, lap, turn_index, turn_name, total_s, \
              lap_invalid, in_pit, contact, low_precision, brake_m_before_apex, min_speed_kmh, exit_speed_kmh) VALUES \
-             (1, 0, 0, 'T5', 9.0, 0, 0, 0, 0, 100, 80, 100), \
-             (1, 1, 0, 'T5', 10.5, 0, 0, 0, 0, 100, 80, 100), \
-             (1, 2, 0, 'T5', 10.0, 1, 0, 0, 0, 100, 80, 100);",
+             (1, 0, 0, 'T1', 9.0, 0, 0, 0, 0, 100, 80, 100), \
+             (1, 1, 0, 'T1', 10.5, 0, 0, 0, 0, 100, 80, 100), \
+             (1, 2, 0, 'T1', 10.0, 1, 0, 0, 0, 100, 80, 100), \
+             (1, 2, 10, 'T11', 0.5, 0, 0, 0, 0, 100, 80, 100);",
         )
         .unwrap();
         let sql = SKILL
@@ -3319,6 +3320,7 @@ mod tests {
             .nth(2)
             .unwrap()
             .replace(":P", "1")
+            .replace(":TURN_INDEX", "0")
             .replace(":FROM_LAP", "1")
             .replace(":TO_LAP", "2");
         let selected = |observed: i64| {
@@ -3345,6 +3347,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected(1), (2, 1));
+        // The same exact index also works for inferred braking-zone names.
+        conn.execute(
+            "UPDATE corner_passes SET turn_name = 'braking zone 1' WHERE turn_index = 0",
+            [],
+        )
+        .unwrap();
+        assert_eq!(selected(1), (2, 1));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3364,9 +3373,14 @@ mod tests {
             finished: laps,
             ..Car::default()
         };
+        let mut second_invalid = invalid.clone();
+        second_invalid.lap = 1;
+        second_invalid.first_id = 401;
+        second_invalid.last_id = 800;
+        second_invalid.start = Some(100.0);
         let mut stream = Stream {
             player: Some(1),
-            cars: BTreeMap::from([(1, car(vec![invalid.clone()]))]),
+            cars: BTreeMap::from([(1, car(vec![invalid.clone(), second_invalid.clone()]))]),
             ..Stream::default()
         };
         stream.find_braking_zones(&conn).unwrap();
@@ -3378,11 +3392,13 @@ mod tests {
         assert_eq!(stream.cars[&1].finished.len(), 1);
         let mut clean = invalid.clone();
         clean.invalid = false;
-        clean.lap = 1;
-        clean.first_id = 401;
-        clean.last_id = 800;
-        clean.start = Some(100.0);
-        stream.cars.insert(1, car(vec![invalid, clean]));
+        clean.lap = 2;
+        clean.first_id = 801;
+        clean.last_id = 1200;
+        clean.start = Some(200.0);
+        stream
+            .cars
+            .insert(1, car(vec![invalid, second_invalid, clean]));
         stream.find_braking_zones(&conn).unwrap();
         assert!(!stream.zones_from_invalid);
         assert!(stream.layout.as_ref().unwrap().corners[0].start > fallback + 100.0);
@@ -4126,6 +4142,7 @@ mod tests {
         for sql in queries {
             let sql = sql
                 .replace(":P", "1")
+                .replace(":TURN_INDEX", "0")
                 .replace(":OBSERVED_LAP", "3")
                 .replace(":FROM_LAP", "0")
                 .replace(":TO_LAP", "1000");

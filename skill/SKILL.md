@@ -178,6 +178,7 @@ it builds). `vehicle_id`, `lap`, `turn_index`, `wheel`; `surface_rise_c`, `surfa
 Query shapes: replace `:P` with the player's vehicle id and `:OBSERVED_LAP` with the lap being
 discussed; `:FROM_LAP` and `:TO_LAP` bound the requested comparison window (use the session's
 lap range if none was specified). Require the measurements the proposed advice actually uses.
+Resolve `:TURN_INDEX` from the observed corner's row; don't infer it from its name or turn number.
 
 ```sql
 -- information: last complete lap against the fastest representative lap, invalidated laps included
@@ -192,10 +193,10 @@ WHERE a.vehicle_id = :P AND a.lap = (SELECT lap FROM l) AND r.lap = (SELECT lap 
 ORDER BY lost DESC LIMIT 5;
 -- one corner, this lap against the earlier ones
 SELECT lap, total_s, entry_s, brake_m_before_apex, min_speed_kmh, exit_speed_kmh, lap_invalid
-FROM corner_passes WHERE vehicle_id = :P AND turn_name LIKE '%T5%' ORDER BY lap DESC LIMIT 8;
+FROM corner_passes WHERE vehicle_id = :P AND turn_index = :TURN_INDEX ORDER BY lap DESC LIMIT 8;
 -- braking improvement reference: usable clean passes first, invalidated only as fallback
 SELECT lap, turn_name, total_s, brake_m_before_apex, min_speed_kmh, exit_speed_kmh, lap_invalid
-FROM corner_passes WHERE vehicle_id = :P AND turn_name LIKE '%T5%'
+FROM corner_passes WHERE vehicle_id = :P AND turn_index = :TURN_INDEX
   AND lap BETWEEN :FROM_LAP AND :TO_LAP
   AND lap <> :OBSERVED_LAP
   AND in_pit = 0 AND contact = 0 AND low_precision = 0 AND total_s IS NOT NULL
