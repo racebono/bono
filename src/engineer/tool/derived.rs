@@ -1113,10 +1113,11 @@ impl Writer<'_> {
         let sample_count = trace
             .seen(corner.boundary, corner.next_boundary.min(top))
             .len();
+        // Back to the section's start: a car joining midway through it never saw its entry
         let widest = trace.d[from..=to]
             .windows(2)
             .map(|pair| pair[1] - pair[0])
-            .fold(0.0, f64::max);
+            .fold(trace.d[from] - corner.boundary, f64::max);
         let (entered, exited) = (trace.time_at(corner.boundary), trace.time_at(corner.exit));
         let contact = scalar::<i64>(
             self.conn,
@@ -2473,7 +2474,8 @@ fn write_stint(
     let fuel_use = stint.average_use(|lap| lap.fuel_used);
     let energy_use = stint.average_use(|lap| lap.energy_used);
     let (fuel_laps, fuel_out) = range(fuel, fuel_use, lap_now, frac);
-    let (energy_laps, energy_out) = range(energy.filter(|e| *e != 0.0), energy_use, lap_now, frac);
+    // Without any use seen, a level of zero only means the simulator has no such thing
+    let (energy_laps, energy_out) = range(energy, energy_use, lap_now, frac);
     let limit = match (energy_laps, fuel_laps) {
         (Some(energy), Some(fuel)) if energy <= fuel => Some(("energy", energy)),
         (Some(energy), None) => Some(("energy", energy)),
@@ -3361,6 +3363,54 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(rows, [(1, 1)]);
+    }
+
+    #[test]
+    fn joining_midway_through_a_corners_section_is_low_precision_at_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        let layout = layout(
+            vec![Turn {
+                label: "T1".into(),
+                direction: None,
+                scale: None,
+                start: 1400.0,
+                apex: 1500.0,
+                end: 1600.0,
+            }],
+            2000.0,
+            TRACK_DATA,
+        );
+        let official = HashMap::new();
+        let writer = Writer {
+            conn: &conn,
+            layout: Some(&layout),
+            official: &official,
+            player: Some(1),
+        };
+        let joined = partial(1650.0)
+            .into_iter()
+            .filter(|s| s.lap_distance.unwrap() >= 1200.0)
+            .collect::<Vec<_>>();
+        let mut build = LapBuild::new(&joined[0], 0, Some(&layout));
+        for sample in &joined {
+            build.add(sample, Some(2000.0));
+            writer.sample_added(1, &mut build).unwrap();
+        }
+        let low: i64 = conn
+            .query_row("SELECT low_precision FROM corner_passes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(low, 1);
+    }
+
+    #[test]
+    fn range_runs_out_at_zero_only_when_the_use_is_known() {
+        assert_eq!(
+            range(Some(0.0), Some(0.05), Some(3), 0.5),
+            (Some(0.0), Some(3.5))
+        );
+        assert_eq!(range(Some(0.0), None, Some(3), 0.5), (None, None));
     }
 
     #[test]
