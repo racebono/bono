@@ -91,6 +91,7 @@ fern = { version = "0.7.1", features = ["colored", "chrono"] }
 humantime = "2.4.0"
 zip = { version = "9.3.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 semver = "1.0.28"
+sysinfo = "0.40.1"
 
 [target.'cfg(windows)'.dependencies]
 # Steam's per-game "Running" flag, and watching it change
