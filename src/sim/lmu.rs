@@ -6,7 +6,10 @@
 //! the game running, and the plugin replaces it the next time the pilot drives.
 
 use crate::{
-    sim::{PluginStatus, Simulator, SimulatorInfo, SimulatorSettings, probe::Probe},
+    sim::{
+        PluginStatus, Simulator, SimulatorInfo, SimulatorSettings, SteamWatcher, probe::Probe,
+        steam_install_dir, steam_running,
+    },
     sqlite::{Database, pool::Pool},
     steam::{self},
     task::MaybeDone,
@@ -98,9 +101,21 @@ impl LeMansUltimate {
 }
 
 impl SimulatorInfo for LeMansUltimate {
+    type Watcher = SteamWatcher;
+    type Error = std::io::Error;
+
     const NAME: &'static str = "Le Mans Ultimate";
     const TRACK_DATA_ID: &'static str = "lmu";
-    const APP_ID: u32 = STEAM_APP_ID;
+
+    #[inline]
+    fn running() -> Result<(Self::Watcher, tokio::sync::watch::Receiver<bool>), Self::Error> {
+        steam_running(STEAM_APP_ID)
+    }
+
+    #[inline]
+    fn install_dir() -> MaybeDone<Option<PathBuf>> {
+        steam_install_dir::<STEAM_APP_ID>()
+    }
 }
 
 impl Simulator for LeMansUltimate {

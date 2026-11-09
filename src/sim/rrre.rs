@@ -4,8 +4,12 @@
 //! recording is deleted once the game closes.
 
 use crate::{
-    sim::{Simulator, SimulatorInfo, SimulatorSettings, probe::Probe},
+    sim::{
+        Simulator, SimulatorInfo, SimulatorSettings, SteamWatcher, probe::Probe, steam_install_dir,
+        steam_running,
+    },
     sqlite::{Database, pool::Pool},
+    task::MaybeDone,
 };
 use bono_sim::{
     recorder::{DATABASE, Recorder, SETTINGS, try_remove_database},
@@ -134,9 +138,21 @@ async fn write_settings(
 }
 
 impl SimulatorInfo for RaceRoom {
+    type Watcher = SteamWatcher;
+    type Error = std::io::Error;
+
     const NAME: &'static str = "RaceRoom";
     const TRACK_DATA_ID: &'static str = "rrre";
-    const APP_ID: u32 = STEAM_APP_ID;
+
+    #[inline]
+    fn running() -> Result<(Self::Watcher, tokio::sync::watch::Receiver<bool>), Self::Error> {
+        steam_running(STEAM_APP_ID)
+    }
+
+    #[inline]
+    fn install_dir() -> MaybeDone<Option<PathBuf>> {
+        steam_install_dir::<STEAM_APP_ID>()
+    }
 }
 
 impl Simulator for RaceRoom {

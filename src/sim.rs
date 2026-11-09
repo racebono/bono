@@ -7,7 +7,8 @@ use crate::{
 use futures::future::select_all;
 use serde::{Deserialize, Serialize};
 use std::{
-    fmt,
+    any::Any,
+    fmt::{self, Display},
     num::NonZeroU32,
     ops::{Deref, DerefMut},
     path::PathBuf,
@@ -16,6 +17,8 @@ use std::{
 };
 use tokio::sync::{Mutex, watch};
 
+#[cfg(windows)]
+mod iracing;
 #[cfg(windows)]
 mod lmu;
 #[cfg(any(windows, test))]
@@ -27,16 +30,17 @@ pub struct Sim<T: ?Sized = dyn Simulator> {
     name: &'static str,
     /// e.g. `lmu`
     id: &'static str,
-    app_id: u32,
+    install_dir_fn: fn() -> MaybeDone<Option<PathBuf>>,
+    retry_fn: fn() -> Option<(Box<dyn Any + Send>, watch::Receiver<bool>)>,
     /// Whether Steam reports the game running
     running: watch::Receiver<bool>,
     /// Shared with the task that keeps the session's track description up to date
     track_data: Arc<Mutex<TrackData>>,
     /// Kept for its thread. Without Steam's key for the game (it's not installed), a sender kept
     /// so `running` stays false instead of closing
-    _watcher: Result<AppWatcher, watch::Sender<bool>>,
+    _watcher: Result<Box<dyn Any + Send>, watch::Sender<bool>>,
     /// Following the game again, started in the background by `ActiveSimulator::changed`
-    retrying: Option<tokio::task::JoinHandle<Option<AppWatcher>>>,
+    retrying: Option<tokio::task::JoinHandle<Option<(Box<dyn Any + Send>, watch::Receiver<bool>)>>>,
     simulator: T,
 }
 
@@ -45,11 +49,8 @@ impl<T> Sim<T> {
     where
         T: SimulatorInfo,
     {
-        let (watcher, running) = match AppWatcher::new(T::APP_ID) {
-            Ok(watcher) => {
-                let running = watcher.subscribe();
-                (Ok(watcher), running)
-            }
+        let (watcher, running) = match <T as SimulatorInfo>::running() {
+            Ok((watcher, running)) => (Ok(Box::new(watcher) as Box<dyn Any + Send>), running),
             Err(e) => {
                 log::debug!("Not following {} starting and stopping: {e}", T::NAME);
                 let (send, running) = watch::channel(false);
@@ -60,7 +61,14 @@ impl<T> Sim<T> {
         Self {
             name: T::NAME,
             id: T::TRACK_DATA_ID,
-            app_id: T::APP_ID,
+            install_dir_fn: <T as SimulatorInfo>::install_dir,
+            retry_fn: || match <T as SimulatorInfo>::running() {
+                Ok((watcher, recv)) => Some((Box::new(watcher) as Box<dyn Any + Send>, recv)),
+                Err(e) => {
+                    log::debug!("Not following {} starting and stopping: {e}", T::NAME);
+                    None
+                }
+            },
             running,
             track_data: Arc::new(Mutex::new(TrackData::new(T::TRACK_DATA_ID))),
             _watcher: watcher,
@@ -87,9 +95,9 @@ where
 
     /// Looks for the folder Steam installed the game in, if it's installed, in the background:
     /// it looks through Steam's libraries.
+    #[inline]
     pub fn install_dir(&self) -> MaybeDone<Option<PathBuf>> {
-        let app_id = self.app_id;
-        MaybeDone::spawn_blocking(move || steam::app_install_dir(app_id))
+        (self.install_dir_fn)()
     }
 
     /// Whether Steam reports the game running now.
@@ -150,9 +158,28 @@ where
 }
 
 pub trait SimulatorInfo: Simulator {
+    type Error: Display;
+    type Watcher: Send + 'static;
+
     const NAME: &'static str;
     const TRACK_DATA_ID: &'static str;
-    const APP_ID: u32;
+
+    fn running() -> Result<(Self::Watcher, watch::Receiver<bool>), Self::Error>;
+    fn install_dir() -> MaybeDone<Option<PathBuf>>;
+}
+
+type SteamWatcher = AppWatcher;
+
+#[inline]
+fn steam_running(app_id: u32) -> std::io::Result<(SteamWatcher, watch::Receiver<bool>)> {
+    let watcher = AppWatcher::new(app_id)?;
+    let recv = watcher.subscribe();
+    Ok((watcher, recv))
+}
+
+#[inline]
+fn steam_install_dir<const APP_ID: u32>() -> MaybeDone<Option<PathBuf>> {
+    MaybeDone::spawn_blocking(move || steam::app_install_dir(APP_ID))
 }
 
 pub trait Simulator: Send {
@@ -298,7 +325,7 @@ impl ActiveSimulator {
                 self.last_watch_retry = Instant::now();
             }
             for sim in &mut self.simulators {
-                poll_retry(sim, due);
+                poll_retry(sim, due, sim.retry_fn);
             }
             let next = self.pick();
             if next != self.current {
@@ -352,7 +379,11 @@ impl ActiveSimulator {
 
 /// Takes a finished background retry of following the game, and starts one if `due` and needed.
 /// Never waits for one.
-fn poll_retry(sim: &mut Sim<dyn Simulator>, due: bool) {
+fn poll_retry(
+    sim: &mut Sim,
+    due: bool,
+    retry_fn: fn() -> Option<(Box<dyn Any + Send>, watch::Receiver<bool>)>,
+) {
     if sim.retrying.as_ref().is_some_and(|task| task.is_finished())
         && let Some(task) = sim.retrying.take()
     {
@@ -360,33 +391,27 @@ fn poll_retry(sim: &mut Sim<dyn Simulator>, due: bool) {
         let next = futures::FutureExt::now_or_never(tokio::task::coop::unconstrained(task))
             .and_then(Result::ok)
             .flatten();
+
         // A closed watcher being replaced already ended its thread, so dropping it doesn't wait
-        retry_watcher(&mut sim._watcher, &mut sim.running, || {
-            let watcher = next?;
-            let running = watcher.subscribe();
-            Some((watcher, running))
-        });
+        retry_watcher(&mut sim._watcher, &mut sim.running, next);
     }
 
     if due
         && sim.retrying.is_none()
         && (sim._watcher.is_err() || sim.running.has_changed().is_err())
     {
-        let app_id = sim.app_id;
-        sim.retrying = Some(tokio::task::spawn_blocking(move || {
-            AppWatcher::new(app_id).ok()
-        }));
+        sim.retrying = Some(tokio::task::spawn_blocking(retry_fn));
     }
 }
 
 /// Keeps the fallback channel until Steam can be followed, then takes its current state too.
-fn retry_watcher<W>(
-    watcher: &mut Result<W, watch::Sender<bool>>,
+fn retry_watcher(
+    watcher: &mut Result<Box<dyn Any + Send>, watch::Sender<bool>>,
     running: &mut watch::Receiver<bool>,
-    create: impl FnOnce() -> Option<(W, watch::Receiver<bool>)>,
+    create: Option<(Box<dyn Any + Send>, watch::Receiver<bool>)>,
 ) {
     if (watcher.is_err() || running.has_changed().is_err())
-        && let Some((next, receiver)) = create()
+        && let Some((next, receiver)) = create
     {
         *running = receiver;
         *watcher = Ok(next);
@@ -427,7 +452,14 @@ pub(crate) fn recording(pool: Pool) -> Box<Sim> {
     Box::new(Sim {
         name: "Test",
         id: "test",
-        app_id: 0,
+        install_dir_fn: steam_install_dir::<0>,
+        retry_fn: || match steam_running(0) {
+            Ok((watcher, recv)) => Some((Box::new(watcher) as Box<dyn Any + Send>, recv)),
+            Err(e) => {
+                log::debug!("{e}");
+                None
+            }
+        },
         running,
         track_data: Arc::new(Mutex::new(TrackData::new("test".into()))),
         _watcher: Err(send),
@@ -445,16 +477,16 @@ mod tests {
     #[test]
     fn retries_missing_watcher_and_adopts_its_running_state() {
         let (send, mut running) = watch::channel(false);
-        let mut watcher: Result<(), _> = Err(send);
-        retry_watcher(&mut watcher, &mut running, || None);
+        let mut watcher: Result<_, _> = Err(send);
+        retry_watcher(&mut watcher, &mut running, None);
         assert!(watcher.is_err());
         assert!(!*running.borrow());
 
         let (send, receiver) = watch::channel(true);
-        retry_watcher(&mut watcher, &mut running, || Some(((), receiver)));
+        retry_watcher(&mut watcher, &mut running, Some((Box::new(()), receiver)));
         assert!(watcher.is_ok());
         assert!(*running.borrow());
-        retry_watcher(&mut watcher, &mut running, || panic!("already watching"));
+        retry_watcher(&mut watcher, &mut running, panic!("already watching"));
         send.send(false).unwrap();
         assert!(!*running.borrow());
     }
@@ -463,9 +495,9 @@ mod tests {
     fn reconnects_a_closed_watcher() {
         let (send, mut running) = watch::channel(true);
         drop(send);
-        let mut watcher = Ok(());
+        let mut watcher = Ok(Box::new(()) as Box<dyn Any + Send>);
         let (_send, receiver) = watch::channel(false);
-        retry_watcher(&mut watcher, &mut running, || Some(((), receiver)));
+        retry_watcher(&mut watcher, &mut running, Some((Box::new(()), receiver)));
         assert!(!*running.borrow());
         assert!(running.has_changed().is_ok());
     }
@@ -486,7 +518,14 @@ mod tests {
         let sim = Box::new(Sim {
             name,
             id: name,
-            app_id: 0,
+            install_dir_fn: steam_install_dir::<0>,
+            retry_fn: || match steam_running(0) {
+                Ok((watcher, recv)) => Some((Box::new(watcher) as Box<dyn Any + Send>, recv)),
+                Err(e) => {
+                    log::debug!("{e}");
+                    None
+                }
+            },
             running,
             track_data: Arc::new(Mutex::new(TrackData::new(name.into()))),
             // Not the test's sender, so the test can close the channel
