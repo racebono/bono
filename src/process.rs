@@ -94,18 +94,20 @@ fn look(watched: Vec<Watched>, stop: mpsc::Receiver<Infallible>) {
     }
     .without_tasks();
 
+    // Kept between looks: a new one would make sysinfo look at every process again as if it had
+    // just started, every look. It documents that every refresh reads each process's name again,
+    // and `executable` checks a process named like the game is really it
+    let mut system = match System::new() {
+        Ok(system) => system,
+        Err(e) => {
+            log::warn!(
+                "Can't look at the processes running, so only Steam's games are found: {e:?}"
+            );
+            return;
+        }
+    };
+
     loop {
-        // A new list every look: sysinfo doesn't document what it keeps of a process whose id
-        // the OS gave to another since, so every name and path here is from this look
-        let mut system = match System::new() {
-            Ok(system) => system,
-            Err(e) => {
-                log::warn!(
-                    "Can't look at the processes running, so only Steam's games are found: {e:?}"
-                );
-                return;
-            }
-        };
         system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
 
         for program in &watched {
@@ -121,7 +123,6 @@ fn look(watched: Vec<Watched>, stop: mpsc::Receiver<Infallible>) {
                 .send
                 .send_if_modified(|current| current.update(found));
         }
-        drop(system);
 
         match stop.recv_timeout(LOOK_EVERY) {
             Ok(x) => match x {},
