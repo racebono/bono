@@ -204,6 +204,10 @@ static void convert(const TelemInfoV01& in, bono_telemetry_s& out) {
 }
 
 namespace {
+    // The timing sectors of every LMU track.
+    constexpr int LMU_SECTORS = 3;
+    static_assert(LMU_SECTORS <= BONO_MAX_SECTORS);
+
     // LMU fills fixed-size char arrays; empty ones become NULL.
     template<std::size_t N>
     std::optional<std::string> text(const char (&chars)[N]) {
@@ -320,9 +324,9 @@ namespace {
             default:
                 break;
         }
-        out.local_yellow_1 = in.mSectorFlag[0] != 0;
-        out.local_yellow_2 = in.mSectorFlag[1] != 0;
-        out.local_yellow_3 = in.mSectorFlag[2] != 0;
+        // LMU's API has room for three sectors only (mSectorFlag[3], mSector 0 to 2): every track has three.
+        out.sector_count = LMU_SECTORS;
+        for (int i = 0; i < LMU_SECTORS; ++i) out.sectors[i].local_yellow = in.mSectorFlag[i] != 0;
         out.start_light = in.mStartLight;
         out.red_lights = in.mNumRedLights;
         out.in_realtime = in.mInRealtime;
@@ -391,16 +395,19 @@ namespace {
         }
         out.lap_start_time = in.mLapStartET;
         out.last_lap_time = time_or_null(in.mLastLapTime);
-        out.last_sector_1 = time_or_null(in.mLastSector1);
-        out.last_sector_2 = difference(in.mLastSector2, in.mLastSector1);
-        out.last_sector_3 = difference(in.mLastLapTime, in.mLastSector2);
         out.best_lap_time = time_or_null(in.mBestLapTime);
-        out.best_lap_sector_1 = time_or_null(in.mBestLapSector1);
-        out.best_lap_sector_2 = difference(in.mBestLapSector2, in.mBestLapSector1);
-        out.best_sector_1 = time_or_null(in.mBestSector1);
-        out.best_sectors_1_and_2 = time_or_null(in.mBestSector2);
-        out.current_sector_1 = time_or_null(in.mCurSector1);
-        out.current_sector_2 = difference(in.mCurSector2, in.mCurSector1);
+        // The best lap's sector 2 is cumulative like the others, though the SDK doesn't say so.
+        bono_standing_sector_s* sectors = out.sectors;
+        sectors[0].last_lap = time_or_null(in.mLastSector1);
+        sectors[1].last_lap = difference(in.mLastSector2, in.mLastSector1);
+        sectors[2].last_lap = difference(in.mLastLapTime, in.mLastSector2);
+        sectors[0].best_lap = time_or_null(in.mBestLapSector1);
+        sectors[1].best_lap = difference(in.mBestLapSector2, in.mBestLapSector1);
+        sectors[2].best_lap = difference(in.mBestLapTime, in.mBestLapSector2);
+        // mBestSector2 is the best of sectors 1 and 2 together, which says nothing of either alone.
+        sectors[0].best = time_or_null(in.mBestSector1);
+        sectors[0].current_lap = time_or_null(in.mCurSector1);
+        sectors[1].current_lap = difference(in.mCurSector2, in.mCurSector1);
         out.laps_behind_leader = in.mLapsBehindLeader;
         out.laps_behind_next = in.mLapsBehindNext;
         out.pit_stops = in.mNumPitstops;

@@ -158,7 +158,13 @@ impl ParseCallbacks for PrivateFields {
 }
 
 /// Structs with no strings, which can be `Copy` (`bono_opt_string` owns its string).
-const COPY_STRUCTS: &[&str] = &["bono_wheel_telemetry", "bono_car_state", "bono_telemetry"];
+const COPY_STRUCTS: &[&str] = &[
+    "bono_wheel_telemetry",
+    "bono_car_state",
+    "bono_telemetry",
+    "bono_session_sector",
+    "bono_standing_sector",
+];
 
 /// bindgen can't see the traits of the hand-written `bono_opt_*` types (they're
 /// blocklisted), so it derives nothing for the structs containing them: add the derives back.

@@ -791,20 +791,20 @@ fn frame(conn: &Connection, player: &Car, frequency: u32) -> rusqlite::Result<Ve
 fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scoring>> {
     let session = conn
         .prepare_cached(
-            "SELECT full_course_yellow, phase, local_yellow_1, local_yellow_2, local_yellow_3, \
+            "SELECT full_course_yellow, phase, \
+             EXISTS (SELECT 1 FROM session_sector WHERE session_id = session.id AND local_yellow), \
              rain, track_wetness_average, session_type, session_end_time \
              FROM session WHERE ?1 IS NULL OR session_time <= ?1 ORDER BY id DESC LIMIT 1",
         )?
         .query_row([upto], |row| {
-            let yellow = |i| row.get::<_, Option<bool>>(i).map(|y| y.unwrap_or(false));
             Ok(Scoring {
                 full_course_yellow: row.get(0)?,
                 phase: row.get(1)?,
-                yellow: yellow(2)? || yellow(3)? || yellow(4)?,
-                rain: row.get(5)?,
-                wetness: row.get(6)?,
-                session_type: row.get(7)?,
-                session_end_time: row.get(8)?,
+                yellow: row.get(2)?,
+                rain: row.get(3)?,
+                wetness: row.get(4)?,
+                session_type: row.get(5)?,
+                session_end_time: row.get(6)?,
                 ..Scoring::default()
             })
         })
@@ -2141,9 +2141,10 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE session (id INTEGER PRIMARY KEY, session_time REAL,
-             full_course_yellow TEXT, phase TEXT, local_yellow_1 INTEGER,
-             local_yellow_2 INTEGER, local_yellow_3 INTEGER, rain REAL,
+             full_course_yellow TEXT, phase TEXT, sector_count INTEGER, rain REAL,
              track_wetness_average REAL, session_type TEXT, session_end_time REAL);
+             CREATE TABLE session_sector (session_id INTEGER, sector INTEGER,
+             local_yellow INTEGER);
              CREATE TABLE standings (id INTEGER PRIMARY KEY, is_player INTEGER,
              session_time REAL, flag TEXT, penalties INTEGER);
              INSERT INTO session (session_time) VALUES (0);
@@ -2171,9 +2172,17 @@ mod tests {
         // The recorder clears the tables for a new session.
         conn.execute_batch("DELETE FROM standings; DELETE FROM session; INSERT INTO session (session_time) VALUES (0);")
             .unwrap();
-        let scoring = scoring(&conn, None).unwrap().unwrap();
-        assert_eq!(scoring.flag, None);
-        assert_eq!(scoring.penalties, None);
+        let latest = scoring(&conn, None).unwrap().unwrap();
+        assert_eq!(latest.flag, None);
+        assert_eq!(latest.penalties, None);
+        assert!(!latest.yellow);
+        // A local yellow in any of the session's sectors
+        conn.execute_batch(
+            "INSERT INTO session_sector SELECT MAX(id), 0, 0 FROM session;
+             INSERT INTO session_sector SELECT MAX(id), 4, 1 FROM session;",
+        )
+        .unwrap();
+        assert!(scoring(&conn, None).unwrap().unwrap().yellow);
     }
 
     #[test]

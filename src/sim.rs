@@ -291,6 +291,12 @@ pub trait Simulator: Send {
     fn install_plugin(&mut self) -> MaybeDone<anyhow::Result<()>> {
         MaybeDone::Done(Err(anyhow::anyhow!("This game has no plugin")))
     }
+
+    /// Whether the game runs an outdated plugin (see `PluginStatus::outdated`), so its sessions
+    /// aren't followed: `database` has none until the plugin is updated.
+    fn plugin_outdated(&self) -> bool {
+        false
+    }
 }
 
 /// What a game's plugin looks like on this computer.
@@ -312,6 +318,21 @@ impl PluginStatus {
     /// The version of the copy that comes with the app, if it's there and says it.
     pub fn bundled_version(&self) -> Option<&Version> {
         self.bundled.as_ref()?.as_ref()
+    }
+
+    /// Whether the installed copy is older than the one that comes with the app, another build of
+    /// its version, or too old to say its version: what it records may not be what the app reads.
+    /// Without the app's copy, or its version, there's nothing to tell it by, and a copy with the
+    /// same contents is the app's, whatever its version reads as.
+    pub fn outdated(&self) -> bool {
+        if self.same_as_bundled == Some(true) {
+            return false;
+        }
+        match (&self.installed, self.bundled_version()) {
+            (Some(Some(installed)), Some(latest)) => latest.replaces(installed),
+            (Some(None), Some(_)) => true,
+            _ => false,
+        }
     }
 
     /// Whether the installed copy says it's the same version as the one that comes with the app,
@@ -890,5 +911,39 @@ mod tests {
         // Another version is expected to be other code
         assert!(!status(version(0), version(1), Some(false)).unexpected_code());
         assert!(!status(None, version(0), None).unexpected_code());
+    }
+
+    #[test]
+    fn only_plugins_the_apps_copy_replaces_are_outdated() {
+        let version = |patch| {
+            Some(Some(Version {
+                major: 0,
+                minor: 1,
+                patch,
+                build: None,
+            }))
+        };
+        let status = |installed, bundled| PluginStatus {
+            installed,
+            enabled: true,
+            bundled,
+            same_as_bundled: None,
+        };
+
+        assert!(status(version(0), version(1)).outdated());
+        assert!(!status(version(1), version(1)).outdated());
+        assert!(!status(version(2), version(1)).outdated());
+        // Too old to say its version
+        assert!(status(Some(None), version(1)).outdated());
+        // The app's own copy, whatever its version reads as
+        let same = PluginStatus {
+            same_as_bundled: Some(true),
+            ..status(Some(None), version(1))
+        };
+        assert!(!same.outdated());
+        // Nothing to tell it by
+        assert!(!status(version(0), None).outdated());
+        assert!(!status(version(0), Some(None)).outdated());
+        assert!(!status(None, version(1)).outdated());
     }
 }

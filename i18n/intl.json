@@ -180,6 +180,16 @@
         "es": "Ningún simulador en marcha",
         "ca": "Cap simulador en marxa"
     },
+    "topbar.plugin_outdated": {
+        "en": "Plugin outdated",
+        "es": "Plugin desactualizado",
+        "ca": "Plugin desactualitzat"
+    },
+    "topbar.plugin_outdated_hover": {
+        "en": "Sessions can't start with this version of the plugin: close the game and update it from Simulators",
+        "es": "Las sesiones no pueden empezar con esta versión del plugin: cierra el juego y actualízalo desde Simuladores",
+        "ca": "Les sessions no poden començar amb aquesta versió del plugin: tanca el joc i actualitza'l des de Simuladors"
+    },
     "simulators": {
         "en": "Simulators",
         "es": "Simuladores",
@@ -234,6 +244,11 @@
         "en": "Plugin installed (unknown version)",
         "es": "Plugin instalado (versión desconocida)",
         "ca": "Plugin instal·lat (versió desconeguda)"
+    },
+    "plugin.outdated_blocks": {
+        "en": "Its sessions can't start until it's updated",
+        "es": "Sus sesiones no pueden empezar hasta que se actualice",
+        "ca": "Les seves sessions no poden començar fins que s'actualitzi"
     },
     "plugin.unexpected_code": {
         "en": "The installed plugin isn't the one that comes with bono",
@@ -1094,6 +1109,16 @@
         "en": "Say again?",
         "es": "¿Puedes repetir?",
         "ca": "Pots repetir?"
+    },
+    "engineer.plugin_outdated": {
+        "en": "The game's plugin is out of date. Close the game and update it from Simulators.",
+        "es": "El plugin del juego está desactualizado. Cierra el juego y actualízalo desde Simuladores.",
+        "ca": "El plugin del joc està desactualitzat. Tanca el joc i actualitza'l des de Simuladors."
+    },
+    "engineer.detail_plugin_outdated": {
+        "en": "plugin outdated",
+        "es": "plugin desactualizado",
+        "ca": "plugin desactualitzat"
     },
     "engineer.detail_no_telemetry": {
         "en": "no telemetry",

@@ -72,7 +72,10 @@ run, not a race to the flag.
   `lap_length_m` for metres. They've been lined up with the laps when `calibration` is there; without
   it they can be off, and `borrowed` means they're another simulator's for the same layout, so say
   "about". `turn` (`start`, `marker` the apex, `end`, `direction` 0 left 1 right, `scale` 1 hairpin
-  to 6 wide), `straight`, `sector`, `pitentry`, `pitexit`; `time[0]` lists estimated seconds lost by
+  to 6 wide), `straight`, `sector` (each `marker` is where that sector ends; `sector_source`
+  `timing` means they're the simulator's own timing lines, seen on the pilot's laps, `track data`
+  the description's, and `none` that there are none matching the simulator's sectors), `pitentry`,
+  `pitexit`; `time[0]` lists estimated seconds lost by
   class (`hyper`, `lmp2`, `gte`, `gt3`) to a `pit` stop, a `dt` drive-through and a `sng10`
   stop-and-go.
 - `sql`: one read-only `query` (`limit` rows, default 60, maximum 200). Queries stop at ten seconds.
@@ -91,7 +94,8 @@ which is common for rivals.
 `max_laps`, `session_time_s`, `time_left_s`, `leader_laps_completed`, `player_vehicle_id`,
 `session_first_id`, `latest_telemetry_id`, `data_age_s`, `is_stale`, `corner_source`,
 `derived_catching_up` (the tables are still reading the session: say so if it matters),
-`full_course_yellow`, `local_yellow`, `start_light`, `air_c`, `track_c`, `rain_pct`,
+`full_course_yellow`, `local_yellow`, `sector_count` (the simulator's timing sectors; NULL when
+not reported), `start_light`, `air_c`, `track_c`, `rain_pct`,
 `wetness_avg_pct`, `wetness_min_pct`, `wetness_max_pct` (racing line), `grip_level`,
 `cloudiness_pct`, `wind_speed_kmh`, `pit_window_status`, `pit_window_start_lap`,
 `pit_window_end_lap`, `pit_window_opens_in_s`, `pit_window_closes_in_s`, `pit_speed_limit_kmh`,
@@ -100,11 +104,11 @@ which is common for rivals.
 **`cars_now`**, one row per car: `vehicle_id`, `is_player`, `driver`, `team`, `car_number`,
 `vehicle`, `vehicle_class`, `telemetry_id`, `sample_age_s`; `position`, `class_position`,
 `position_estimated`, `qualifying_position`, `place_ahead_vehicle_id`, `place_behind_vehicle_id`;
-`lap`, `laps_completed`, `sector` (1 to 3), `lap_distance_m`, `lap_elapsed_s`, `laps_behind_leader`,
+`lap`, `laps_completed`, `sector` (from 1 to `race_state.sector_count`), `lap_distance_m`, `lap_elapsed_s`, `laps_behind_leader`,
 `laps_behind_next`; `gap_place_ahead_s`, `gap_place_behind_s` (standings order, live),
 `gap_car_ahead_s`, `gap_car_behind_s` (nearest on track, any class, live), `time_behind_leader_s`,
 `time_behind_next_s` (as of the car's last scoring row); `ahead_of_player_m`, `right_of_player_m`;
-`last_lap_s`, `best_lap_s`, `last_sector_1_s`, `last_sector_2_s`, `last_sector_3_s`,
+`last_lap_s`, `best_lap_s` (sector times in `sectors_now`),
 `delta_best_s` (positive: slower), `lap_invalidated`; `speed_kmh`, `gear`, `fuel_l`, `fuel_fraction`,
 `energy_left_pct`, `battery_pct`, `front_compound`, `rear_compound`; `water_c`, `oil_c`,
 `engine_overheating`; `tc`, `tc_slip`, `tc_cut`, `abs`, `engine_map`, `front_brake_bias_pct`,
@@ -123,6 +127,11 @@ rear left, 3 rear right), `wheel_name`; `life_left_pct`, `stint_wear_pct_per_lap
 rubber, a better read of working temperature), `carcass_c`, `optimal_c`, `surface_vs_optimal_c`;
 `pressure_kpa`, `brake_c`, `brake_optimal_c`, `surface_type` (0 dry, 1 wet, 2 grass, 3 dirt, 4
 gravel, 5 kerb, 6 special; on RaceRoom 0 means paved, wetness unknown), `sliding_fraction`.
+
+**`sectors_now`**, one row per car and timing sector, as the simulator last scored it: `vehicle_id`,
+`sector` (from 1), `last_lap_s` (on the last lap), `best_lap_s` (on the best lap), `best_s` (the
+best of any lap), `current_lap_s` (on this lap, once the car is past it). Each is the sector on its
+own; tracks have as many sectors as `race_state.sector_count`.
 
 **`stint_now`**, one row per car with usable laps. `margin_laps` is the verdict on making the end
 without stopping; `save_pct_needed` is set when short. `vehicle_id`, `stint_number`, `start_lap`,
@@ -144,8 +153,7 @@ compare it with `laps_left`. Average use over `baseline_laps` green laps, not th
 Updated as the cars drive, the lap in progress too.
 
 **`lap_stats`**, one row per car and lap: `vehicle_id`, `lap`, `stint_number`, `first_id`, `last_id`
-(the lap's telemetry rows), `start_s`; `time_s`, `official_time_s`, `sector_1_s`, `sector_2_s`,
-`sector_3_s`, `top_speed_kmh`; `complete`, `invalid`, `pit` (in or out lap; one stop is one more `stint_number`), `refuelled`, `contact`,
+(the lap's telemetry rows), `start_s`; `time_s`, `official_time_s`, `top_speed_kmh`; `complete`, `invalid`, `pit` (in or out lap; one stop is one more `stint_number`), `refuelled`, `contact`,
 `green` (complete and seen whole, no pit or refuel: representative for pace and use), `track_limit_steps`;
 `fuel_start_l`, `fuel_end_l`, `fuel_used_l`, `energy_start_pct`, `energy_end_pct`,
 `energy_used_pct`; `gap_ahead_end_s`, `gap_behind_end_s`.
@@ -154,6 +162,10 @@ Updated as the cars drive, the lap in progress too.
 progress: `vehicle_id`, `lap`, `wheel`, `wheel_name`; `life_start_pct`, `life_end_pct`;
 `surface_avg_c`, `surface_peak_c`, `inner_avg_c`, `middle_avg_c`, `outer_avg_c`, `optimal_c`;
 `pressure_avg_kpa`, `brake_avg_c`, `brake_peak_c`.
+
+**`lap_sector_stats`**, one row per car, complete lap and timing sector with an official time:
+`vehicle_id`, `lap`, `sector` (from 1), `time_s` (that sector alone). Join on `vehicle_id` and `lap`
+with `lap_stats`.
 
 **`corner_passes`**, one row per car, lap and turn, written as soon as the car leaves the corner, so
 this lap's completed corners are there. Every lap is split at the same places, so passes compare
@@ -237,7 +249,11 @@ session_first_id`; the other tables number their rows separately (`telemetry_id`
 - `car_state`: settings, pit stops, track-limit steps, damage, impacts, written only when one
   changes; a car's value at row X is its latest row with `telemetry_id <= X` (indexed on
   `(vehicle_id, telemetry_id)`). A setting change is a new row: use it for when a setting changed.
-- `session`, `standings`, `forecast`: scoring rows, written on change. Prefer the tables above.
+- `session`, `standings`, `forecast`: scoring rows, written on change, with `session_sector` and
+  `standing_sector`: a row per timing sector of a `session` or `standings` row (`session_id` or
+  `standing_id`, `sector` from 0; `session_sector`'s yellows are in the simulator's own order, which
+  may not be the cars' sector numbering, so don't match them to a car's `sector`). Prefer the tables
+  above.
 
 Traps: `tire_wear` falls during a stint where it's life left; `tire_optimal_temperature` above 200
 is Kelvin; `*_left/center/right` are edges seen from behind the car (inside is right on left tyres

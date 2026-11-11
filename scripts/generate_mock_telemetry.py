@@ -11,6 +11,7 @@ import sqlite3
 
 ROOT = Path(__file__).resolve().parents[1]
 LENGTH = 5000.0
+SECTORS = 3
 APEXES = [600.0, 1500.0, 2500.0, 3400.0, 4400.0]
 NAMES = ['Prima', 'Curva del Lago', 'Esse', 'Bosco', 'Ultima']
 
@@ -29,7 +30,7 @@ def columns():
                 line = next(lines)
                 body += '\n' + line
             result[match[1]] = re.findall(r'X\((f64|i64|boolean|string),\s*(\w+)(?:,\s*\w+)?\)', body)
-    assert len(result) == 6, result.keys()
+    assert len(result) == 8, result.keys()
     return result
 
 
@@ -41,18 +42,28 @@ def generate(output):
         raise FileExistsError(path)
     conn = sqlite3.connect(path)
     mapping = {'telemetry': 'TELEMETRY', 'telemetry_wheel': 'WHEEL_TELEMETRY',
-               'car_state': 'CAR_STATE', 'session': 'SESSION', 'standings': 'STANDING', 'forecast': 'FORECAST'}
+               'car_state': 'CAR_STATE', 'session': 'SESSION', 'session_sector': 'SESSION_SECTOR',
+               'standings': 'STANDING', 'standing_sector': 'STANDING_SECTOR', 'forecast': 'FORECAST'}
+    # The tables with a row per part of another's row: its key, and the part's
+    children = {'telemetry_wheel': ('telemetry_id', 'telemetry', 'wheel'),
+                'session_sector': ('session_id', 'session', 'sector'),
+                'standing_sector': ('standing_id', 'standings', 'sector')}
     schema = columns()
     types = {'f64': 'REAL', 'i64': 'INTEGER', 'boolean': 'INTEGER', 'string': 'TEXT'}
     fields = {}
     for table, macro in mapping.items():
-        leading = 'telemetry_id INTEGER NOT NULL REFERENCES telemetry(id), wheel INTEGER NOT NULL' if table == 'telemetry_wheel' else 'id INTEGER PRIMARY KEY'
+        leading, ending = 'id INTEGER PRIMARY KEY', ''
+        if table in children:
+            key, parent, part = children[table]
+            leading = f'{key} INTEGER NOT NULL REFERENCES {parent}(id), {part} INTEGER NOT NULL'
+            ending = f', PRIMARY KEY({key},{part})'
         if table == 'car_state':
             leading += ', telemetry_id INTEGER NOT NULL REFERENCES telemetry(id), vehicle_id INTEGER, session_time REAL'
         definitions = ', '.join(name + ' ' + types[ty] for ty, name in schema[macro])
-        ending = ', PRIMARY KEY(telemetry_id,wheel)' if table == 'telemetry_wheel' else ''
         conn.execute(f'CREATE TABLE {table} ({leading}, {definitions}{ending})')
         fields[table] = {name for _, name in schema[macro]} | {'id', 'telemetry_id', 'wheel'}
+        if table in children:
+            fields[table] |= {children[table][0], children[table][2]}
         if table == 'car_state':
             fields[table] |= {'vehicle_id', 'session_time'}
     conn.execute('CREATE INDEX car_state_by_vehicle ON car_state(vehicle_id,telemetry_id)')
@@ -64,11 +75,14 @@ def generate(output):
 
     traces = []
     lap_durations = {}
+    sector_durations = {}
     for vehicle in [1, 2, 3, 4]:
         t = 0.0
         durations = []
+        sectors = []
         for lap in range(11):
             start = t
+            sectors.append([0.0] * SECTORS)
             for distance in range(0, int(LENGTH), 10):
                 # Last complete lap brakes 35 m early for T2; lap 7 loses exit speed at T3.
                 early = vehicle == 1 and lap in (8, 9) and 1300 <= distance < 1500
@@ -87,15 +101,17 @@ def generate(output):
                 if vehicle == 3:
                     speed *= 0.99
                 traces.append(dict(vehicle_id=vehicle, is_player=int(vehicle == 1), session_time=t,
-                    lap=lap, lap_start_time=start, lap_distance=float(distance), sector=min(2, distance // 1667),
+                    lap=lap, lap_start_time=start, lap_distance=float(distance), sector=min(SECTORS - 1, int(distance * SECTORS // LENGTH)),
                     speed=speed, heading=0.0, position_x=0.0, position_y=0.0, position_z=-float(distance),
                     brake=float(braking), throttle=0.0 if braking else 1.0, steering=0.1 if speed < 60 else 0.0,
                     fuel=90 - (lap + distance / LENGTH) * 3.0,
                     virtual_energy=0.84 - (lap + distance / LENGTH) * 0.04,
                     in_pit_lane=0, lap_invalidated=0, engine_overheating=0, gear=4, engine_rpm=6500.0))
+                sectors[-1][traces[-1]['sector']] += 10 / speed
                 t += 10 / speed
             durations.append(t - start)
         lap_durations[vehicle] = durations
+        sector_durations[vehicle] = sectors
     # Ten completed laps, then ten seconds of the next one; one shared latest frame.
     now = sum(lap_durations[1][:10]) + 10.0
     traces = [row for row in traces if row['session_time'] < now]
@@ -126,21 +142,32 @@ def generate(output):
                 virtual_energy_per_lap=0.04, fuel_per_lap=3.0, fuel_capacity=90.0,
                 speed_limiter_on=0))
     for t in [0.0, now]:
-        insert('session', dict(session_time=t, time_remaining=now+900-t, track='Synthetic Lago Ring',
+        session_id = insert('session', dict(session_time=t, time_remaining=now+900-t, track='Synthetic Lago Ring',
             track_length=LENGTH, session_type='race', phase='green', session_end_time=now+900,
             vehicle_count=4, ambient_temperature=21.0, track_temperature=30.0,
             rain=0.0, track_wetness_min=0.0, track_wetness_max=0.0, track_wetness_average=0.0,
-            track_limits_steps_per_penalty=4, track_limits_steps_per_point=1))
+            track_limits_steps_per_penalty=4, track_limits_steps_per_point=1, sector_count=SECTORS))
+        for sector in range(SECTORS):
+            insert('session_sector', dict(session_id=session_id, sector=sector, local_yellow=0))
         for vehicle, driver, position in [(1, 'Ana Lopes', 2), (2, 'Lena Fischer', 1), (3, 'Sofia Ruiz', 3), (4, 'Tom Hughes', 4)]:
             laps = (9 if vehicle == 4 else 10) if t else 0
-            duration = lap_durations[vehicle][9] if t else None
-            insert('standings', dict(session_time=t, vehicle_id=vehicle, is_player=int(vehicle == 1),
+            # Of the laps it has completed, as are the sectors below
+            done = lap_durations[vehicle][:laps]
+            duration = done[-1] if done else None
+            standing_id = insert('standings', dict(session_time=t, vehicle_id=vehicle, is_player=int(vehicle == 1),
                 driver=driver, vehicle='Mock Hypercar' if vehicle != 4 else 'Mock GT3',
                 vehicle_class='Hypercar' if vehicle != 4 else 'GT3', position=position, laps_completed=laps,
                 lap_start_time=now-10 if t else 0.0, lap_distance=800.0,
-                last_lap_time=duration, best_lap_time=min(lap_durations[vehicle][:10]) if t else None,
+                last_lap_time=duration, best_lap_time=min(done) if done else None,
                 laps_behind_leader=1 if vehicle == 4 else 0, pit_stops=0, penalties=0,
                 in_pits=0, flag='blue' if vehicle == 4 else 'green', finish_status='none'))
+            # As the recorder writes them: a row per sector, NULL until there's a time
+            best = done.index(min(done)) if done else None
+            for sector in range(SECTORS):
+                insert('standing_sector', dict(standing_id=standing_id, sector=sector,
+                    last_lap=sector_durations[vehicle][laps - 1][sector] if done else None,
+                    best_lap=sector_durations[vehicle][best][sector] if done else None,
+                    best=min(s[sector] for s in sector_durations[vehicle][:laps]) if done else None))
     for session_type, chances in [('race', [0.0, 0.01, 0.03, 0.25, 0.70]), ('practice', [0.0, 0.01, 0.01, 0.02, 0.03])]:
         for fraction, chance in zip([0, .25, .5, .75, 1], chances):
             insert('forecast', dict(session_time=now, session_type=session_type, session_fraction=fraction,

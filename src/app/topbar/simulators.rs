@@ -52,12 +52,8 @@ impl Found {
         };
         !plugin.enabled
             || plugin.unexpected_code()
-            || match (&plugin.installed, plugin.bundled_version()) {
-                (None, _) => true,
-                (Some(Some(installed)), Some(latest)) => latest.replaces(installed),
-                (Some(None), Some(_)) => true,
-                (Some(_), None) => false,
-            }
+            || plugin.installed.is_none()
+            || plugin.outdated()
     }
 }
 
@@ -246,6 +242,9 @@ fn plugin_status(ui: &mut egui::Ui, plugin: &PluginStatus) {
         },
     }
 
+    if plugin.outdated() {
+        ui.colored_label(warn, t!("plugin.outdated_blocks"));
+    }
     if plugin.unexpected_code() {
         ui.colored_label(warn, t!("plugin.unexpected_code"))
             .on_hover_text(t!("plugin.unexpected_code_hover"));

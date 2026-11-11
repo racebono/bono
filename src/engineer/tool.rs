@@ -658,6 +658,8 @@ fn wheels_at(conn: &Connection, telemetry_id: i64) -> rusqlite::Result<BTreeMap<
 /// fuel_fraction) are snapshots from that moment: use telemetry for anything live.
 struct Scoring {
     session: Option<Row>,
+    /// The session row's sectors under a local yellow, zero-based, in the simulator's order
+    yellow_sectors: Vec<i64>,
     cars: BTreeMap<i64, Row>,
     player: Option<Row>,
 }
@@ -680,6 +682,18 @@ impl Scoring {
     fn new(ctx: &Ctx) -> anyhow::Result<Self> {
         let conn = ctx.conn;
         let session = row(conn, "SELECT * FROM session ORDER BY id DESC LIMIT 1", [])?;
+        let yellow_sectors = match session.as_ref().and_then(|s| s.i("id")) {
+            Some(id) => rows(
+                conn,
+                "SELECT sector FROM session_sector WHERE session_id = ? AND local_yellow \
+                 ORDER BY sector",
+                [id],
+            )?
+            .iter()
+            .filter_map(|r| r.i("sector"))
+            .collect(),
+            None => Vec::new(),
+        };
         let expected = session
             .as_ref()
             .and_then(|s| s.i("vehicle_count"))
@@ -726,8 +740,20 @@ impl Scoring {
             .cloned();
         Ok(Self {
             session,
+            yellow_sectors,
             cars,
             player,
+        })
+    }
+
+    /// The sectors under a local yellow, as "1,3" (numbered from 1 in the simulator's order), if any.
+    fn yellow_sectors(&self) -> Option<String> {
+        (!self.yellow_sectors.is_empty()).then(|| {
+            self.yellow_sectors
+                .iter()
+                .map(|sector| (sector + 1).to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         })
     }
 
@@ -811,15 +837,8 @@ impl Scoring {
         if let Some(fcy) = s.text("full_course_yellow").filter(|f| *f != "none") {
             parts.push(format!("FULL COURSE YELLOW ({fcy})"));
         }
-        let yellows = (1..=3)
-            .filter(|i| s.b(&format!("local_yellow_{i}")))
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>();
-        if !yellows.is_empty() {
-            parts.push(format!(
-                "local yellow flag in sector index {}",
-                yellows.join(",")
-            ));
+        if let Some(yellows) = self.yellow_sectors() {
+            parts.push(format!("local yellow flag in sector index {yellows}"));
         }
         if let Some(track) = s.text("track") {
             parts.push(format!("track={}", telemetry_text(track)));
@@ -1184,14 +1203,9 @@ fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
             }
             _ => {}
         }
-        let yellows = (1..=3)
-            .filter(|i| s.b(&format!("local_yellow_{i}")))
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>();
-        if !yellows.is_empty() {
+        if let Some(yellows) = sc.yellow_sectors() {
             info.push(format!(
-                "local yellow somewhere on track (sector index {} as the sim reports it)",
-                yellows.join(",")
+                "local yellow somewhere on track (sector index {yellows} as the sim reports it)"
             ));
         }
     }
@@ -2604,11 +2618,19 @@ mod tests {
                 s.last_lap_time = last.into();
                 s.best_lap_time = last.into();
                 s.lap_distance = Some(0.0).into();
+                // Sectors of 30 s, 35 s and the rest
+                if let Some(last) = last {
+                    for (sector, time) in s.sectors.iter_mut().zip([30.0, 35.0, last - 65.0]) {
+                        sector.last_lap = Some(time).into();
+                        sector.best_lap = Some(time).into();
+                    }
+                }
                 s
             };
         let session = |t: f64| {
             let mut s = bono_session_info::default();
             s.session_time = Some(t).into();
+            s.sector_count = Some(3).into();
             s.track = Some("Test Ring".to_owned()).into();
             s.track_length = Some(1000.0).into();
             s.session_type = Some("race".to_owned()).into();
@@ -2640,7 +2662,13 @@ mod tests {
                 telemetry.lap = Some(lap).into();
                 telemetry.lap_start_time = Some(lap as f64 * lap_time).into();
                 telemetry.lap_distance = Some(distance).into();
-                telemetry.sector = Some(0).into();
+                // The timing lines at 300 m and 650 m
+                let sector = match distance {
+                    d if d < 300.0 => 0,
+                    d if d < 650.0 => 1,
+                    _ => 2,
+                };
+                telemetry.sector = Some(sector).into();
                 telemetry.speed = Some(10.0).into();
                 telemetry.heading = Some(0.0).into();
                 // Forward is -z, right is -x
