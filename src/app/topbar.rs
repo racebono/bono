@@ -180,6 +180,10 @@ impl Topbar {
                     ui.label(
                         simulator.map_or(t!("topbar.no_simulator"), |simulator| simulator.name()),
                     );
+                    if simulator.is_some_and(|simulator| simulator.plugin_outdated()) {
+                        ui.colored_label(ui.visuals().warn_fg_color, t!("topbar.plugin_outdated"))
+                            .on_hover_text(t!("topbar.plugin_outdated_hover"));
+                    }
                 });
             });
         });

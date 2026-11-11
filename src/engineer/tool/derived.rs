@@ -5,8 +5,8 @@
 //! They live in an in-memory database with the recording attached read-only under it, on one
 //! connection owned by a background thread, so the app's UI never waits for any of this and the
 //! model's query can join both. The thread follows the recording's new rows: `lap_stats`,
-//! `lap_wheel_stats`, `corner_passes` and `corner_pass_wheels` are updated as they arrive, a corner
-//! pass as soon as the car leaves the corner. The `*_now` tables are only worth anything when
+//! `lap_wheel_stats`, `lap_sector_stats`, `corner_passes` and `corner_pass_wheels` are updated as
+//! they arrive, a corner pass as soon as the car leaves the corner. The `*_now` tables are only worth anything when
 //! they're read, so they're written just before each query.
 
 use super::*;
@@ -55,8 +55,7 @@ const TABLES: &str = "
 CREATE TABLE lap_stats (
     vehicle_id INTEGER NOT NULL, lap INTEGER NOT NULL, stint_number INTEGER,
     first_id INTEGER, last_id INTEGER, start_s REAL,
-    time_s REAL, official_time_s REAL, sector_1_s REAL, sector_2_s REAL, sector_3_s REAL,
-    top_speed_kmh REAL,
+    time_s REAL, official_time_s REAL, top_speed_kmh REAL,
     complete INTEGER, invalid INTEGER, pit INTEGER, refuelled INTEGER, contact INTEGER,
     green INTEGER, track_limit_steps INTEGER,
     fuel_start_l REAL, fuel_end_l REAL, fuel_used_l REAL,
@@ -70,6 +69,10 @@ CREATE TABLE lap_wheel_stats (
     surface_avg_c REAL, surface_peak_c REAL, inner_avg_c REAL, middle_avg_c REAL, outer_avg_c REAL,
     optimal_c REAL, pressure_avg_kpa REAL, brake_avg_c REAL, brake_peak_c REAL,
     PRIMARY KEY (vehicle_id, lap, wheel)
+) WITHOUT ROWID;
+CREATE TABLE lap_sector_stats (
+    vehicle_id INTEGER NOT NULL, lap INTEGER NOT NULL, sector INTEGER NOT NULL, time_s REAL,
+    PRIMARY KEY (vehicle_id, lap, sector)
 ) WITHOUT ROWID;
 CREATE TABLE corner_passes (
     vehicle_id INTEGER NOT NULL, lap INTEGER NOT NULL, turn_index INTEGER NOT NULL,
@@ -97,7 +100,7 @@ CREATE TABLE race_state (
     max_laps INTEGER, session_time_s REAL, time_left_s REAL, leader_laps_completed INTEGER,
     player_vehicle_id INTEGER, session_first_id INTEGER, latest_telemetry_id INTEGER,
     data_age_s REAL, is_stale INTEGER, corner_source TEXT, derived_catching_up INTEGER,
-    full_course_yellow TEXT, local_yellow INTEGER, start_light INTEGER,
+    full_course_yellow TEXT, local_yellow INTEGER, sector_count INTEGER, start_light INTEGER,
     air_c REAL, track_c REAL, rain_pct REAL,
     wetness_avg_pct REAL, wetness_min_pct REAL, wetness_max_pct REAL, grip_level INTEGER,
     cloudiness_pct REAL, wind_speed_kmh REAL,
@@ -116,8 +119,7 @@ CREATE TABLE cars_now (
     gap_place_ahead_s REAL, gap_place_behind_s REAL, gap_car_ahead_s REAL, gap_car_behind_s REAL,
     time_behind_leader_s REAL, time_behind_next_s REAL,
     ahead_of_player_m REAL, right_of_player_m REAL,
-    last_lap_s REAL, best_lap_s REAL, last_sector_1_s REAL, last_sector_2_s REAL,
-    last_sector_3_s REAL, delta_best_s REAL, lap_invalidated INTEGER,
+    last_lap_s REAL, best_lap_s REAL, delta_best_s REAL, lap_invalidated INTEGER,
     speed_kmh REAL, gear INTEGER, fuel_l REAL, fuel_fraction REAL, energy_left_pct REAL,
     battery_pct REAL, front_compound TEXT, rear_compound TEXT,
     water_c REAL, oil_c REAL, engine_overheating INTEGER,
@@ -142,6 +144,11 @@ CREATE TABLE wheels_now (
     sliding_fraction REAL,
     PRIMARY KEY (vehicle_id, wheel)
 ) WITHOUT ROWID;
+CREATE TABLE sectors_now (
+    vehicle_id INTEGER NOT NULL, sector INTEGER NOT NULL,
+    last_lap_s REAL, best_lap_s REAL, best_s REAL, current_lap_s REAL,
+    PRIMARY KEY (vehicle_id, sector)
+) WITHOUT ROWID;
 CREATE TABLE stint_now (
     vehicle_id INTEGER PRIMARY KEY, stint_number INTEGER, start_lap INTEGER, laps_complete INTEGER,
     lap_fraction REAL, baseline_laps INTEGER, avg_lap_s REAL, pace_trend_s_per_lap REAL,
@@ -159,16 +166,18 @@ CREATE TABLE forecast_now (
 );
 ";
 
-const STREAM_TABLES: [&str; 4] = [
+const STREAM_TABLES: [&str; 5] = [
     "lap_stats",
     "lap_wheel_stats",
+    "lap_sector_stats",
     "corner_passes",
     "corner_pass_wheels",
 ];
-const NOW_TABLES: [&str; 5] = [
+const NOW_TABLES: [&str; 6] = [
     "race_state",
     "cars_now",
     "wheels_now",
+    "sectors_now",
     "stint_now",
     "forecast_now",
 ];
@@ -983,11 +992,39 @@ impl Car {
 }
 
 /// An official lap time, from the standings.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Official {
     at: f64,
     time: f64,
-    sectors: [Option<f64>; 3],
+    /// Each sector's time from the line on, as many as the session has
+    sectors: Vec<Option<f64>>,
+}
+
+/// Replaces a lap's sector times with the official ones known.
+fn write_lap_sectors(
+    conn: &Connection,
+    vehicle: i64,
+    lap: i64,
+    sectors: &[Option<f64>],
+) -> rusqlite::Result<()> {
+    conn.prepare_cached("DELETE FROM lap_sector_stats WHERE vehicle_id = ? AND lap = ?")?
+        .execute(params![vehicle, lap])?;
+    for (sector, time) in sectors.iter().enumerate() {
+        if time.is_none() {
+            continue;
+        }
+        insert(
+            conn,
+            "lap_sector_stats",
+            vec![
+                ("vehicle_id", Value::Integer(vehicle)),
+                ("lap", Value::Integer(lap)),
+                ("sector", Value::Integer(sector as i64 + 1)),
+                ("time_s", real(*time)),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// A turn's place on the lap, and the section of the lap it's measured over: every lap is split
@@ -1338,9 +1375,6 @@ impl Writer<'_> {
                 ("start_s", real(lap.start)),
                 ("time_s", real(lap.time)),
                 ("official_time_s", real(official.map(|o| o.time))),
-                ("sector_1_s", real(official.and_then(|o| o.sectors[0]))),
-                ("sector_2_s", real(official.and_then(|o| o.sectors[1]))),
-                ("sector_3_s", real(official.and_then(|o| o.sectors[2]))),
                 ("top_speed_kmh", real(km_h(lap.top_speed))),
                 ("complete", flag(lap.complete)),
                 ("invalid", flag(lap.invalid)),
@@ -1366,6 +1400,8 @@ impl Writer<'_> {
                 ("gap_behind_end_s", real(lap.gap_behind_end)),
             ],
         )?;
+        let sectors = official.map_or(&[][..], |o| &o.sectors[..]);
+        write_lap_sectors(self.conn, vehicle, lap.lap, sectors)?;
 
         if !heat {
             return Ok(());
@@ -1563,15 +1599,14 @@ impl Stream {
 
     /// Reads the standings' new rows for official lap times. Whether there are more to read.
     fn read_standings(&mut self, conn: &Connection) -> rusqlite::Result<bool> {
-        let rows = rows(
+        let standings = rows(
             conn,
-            "SELECT id, vehicle_id, session_time, laps_completed, last_lap_time, last_sector_1, \
-                    last_sector_2, last_sector_3 \
+            "SELECT id, vehicle_id, session_time, laps_completed, last_lap_time \
              FROM standings WHERE id > ? ORDER BY id LIMIT ?",
             params![self.standings_cursor, CHUNK],
         )?;
-        let behind = rows.len() as i64 == CHUNK;
-        for r in rows {
+        let behind = standings.len() as i64 == CHUNK;
+        for r in standings {
             self.standings_cursor = r.i("id").unwrap_or(self.standings_cursor);
             let t = r.f("session_time");
             // The clock going back: another session's
@@ -1615,31 +1650,45 @@ impl Stream {
             if !new_lap && !late {
                 continue;
             }
+            let mut sectors = Vec::new();
+            for s in rows(
+                conn,
+                "SELECT sector, last_lap FROM standing_sector WHERE standing_id = ? \
+                 ORDER BY sector",
+                [self.standings_cursor],
+            )? {
+                let Some(sector) = s.i("sector").and_then(|s| usize::try_from(s).ok()) else {
+                    continue;
+                };
+                if sectors.len() <= sector {
+                    sectors.resize(sector + 1, None);
+                }
+                sectors[sector] = s.f("last_lap").filter(|time| *time > 0.0);
+            }
             let official = Official {
                 at: ended,
                 time,
-                sectors: ["last_sector_1", "last_sector_2", "last_sector_3"]
-                    .map(|name| r.f(name).filter(|time| *time > 0.0)),
+                sectors,
             };
             if same_lap {
                 entries.pop();
             }
-            entries.push(official);
             // The telemetry may have seen the lap end first
             conn.prepare_cached(
-                "UPDATE lap_stats SET official_time_s = ?, sector_1_s = ?, sector_2_s = ?, \
-                 sector_3_s = ? WHERE vehicle_id = ? AND complete = 1 \
+                "UPDATE lap_stats SET official_time_s = ? WHERE vehicle_id = ? AND complete = 1 \
                  AND ABS(start_s + time_s - ?) < ?",
             )?
-            .execute(params![
-                time,
-                official.sectors[0],
-                official.sectors[1],
-                official.sectors[2],
-                vehicle,
-                ended,
-                OFFICIAL_MATCH
-            ])?;
+            .execute(params![time, vehicle, ended, OFFICIAL_MATCH])?;
+            let laps = rows(
+                conn,
+                "SELECT lap FROM lap_stats WHERE vehicle_id = ? AND complete = 1 \
+                 AND ABS(start_s + time_s - ?) < ?",
+                params![vehicle, ended, OFFICIAL_MATCH],
+            )?;
+            for lap in laps.iter().filter_map(|r| r.i("lap")) {
+                write_lap_sectors(conn, vehicle, lap, &official.sectors)?;
+            }
+            entries.push(official);
         }
         Ok(behind)
     }
@@ -2054,6 +2103,7 @@ impl Stream {
             None => Vec::new(),
         };
         self.write_car(ctx, sc, vehicle, telemetry.as_ref(), now, order)?;
+        write_sectors(ctx, sc, vehicle)?;
         let Some(telemetry) = &telemetry else {
             return Ok(());
         };
@@ -2118,10 +2168,8 @@ impl Stream {
                 ),
                 ("derived_catching_up", flag(self.behind || self.failed)),
                 ("full_course_yellow", copy(s, "full_course_yellow")),
-                (
-                    "local_yellow",
-                    flag((1..=3).any(|i| s.b(&format!("local_yellow_{i}")))),
-                ),
+                ("local_yellow", flag(!sc.yellow_sectors.is_empty())),
+                ("sector_count", copy(s, "sector_count")),
                 ("start_light", copy(s, "start_light")),
                 ("air_c", copy(s, "ambient_temperature")),
                 ("track_c", copy(s, "track_temperature")),
@@ -2245,9 +2293,6 @@ impl Stream {
                 ("right_of_player_m", real(relative.map(|(_, right)| right))),
                 ("last_lap_s", copy(st, "last_lap_time")),
                 ("best_lap_s", copy(st, "best_lap_time")),
-                ("last_sector_1_s", copy(st, "last_sector_1")),
-                ("last_sector_2_s", copy(st, "last_sector_2")),
-                ("last_sector_3_s", copy(st, "last_sector_3")),
                 ("delta_best_s", copy(t, "delta_best")),
                 ("lap_invalidated", copy(t, "lap_invalidated")),
                 ("speed_kmh", real(km_h(t.f("speed")))),
@@ -2617,6 +2662,36 @@ fn write_stint(
     )
 }
 
+/// The car's sector times as of its newest standing.
+fn write_sectors(ctx: &Ctx, sc: &Scoring, vehicle: i64) -> rusqlite::Result<()> {
+    let Some(id) = sc.cars.get(&vehicle).and_then(|st| st.i("id")) else {
+        return Ok(());
+    };
+    for s in rows(
+        ctx.conn,
+        "SELECT * FROM standing_sector WHERE standing_id = ? ORDER BY sector",
+        [id],
+    )? {
+        let Some(sector) = s.i("sector") else {
+            continue;
+        };
+        let time = |name| real(s.f(name).filter(|time| *time > 0.0));
+        insert(
+            ctx.conn,
+            "sectors_now",
+            vec![
+                ("vehicle_id", Value::Integer(vehicle)),
+                ("sector", Value::Integer(sector + 1)),
+                ("last_lap_s", time("last_lap")),
+                ("best_lap_s", time("best_lap")),
+                ("best_s", time("best")),
+                ("current_lap_s", time("current_lap")),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn write_wheels(
     ctx: &Ctx,
     vehicle: i64,
@@ -2947,8 +3022,97 @@ fn track_json(conn: &Connection, shared: &Shared) -> anyhow::Result<String> {
     if let Some(length) = length {
         track["lap_length_m"] = length.into();
     }
+    // The simulator's own timing lines are already where its laps are: after the shift
+    let count = session
+        .as_ref()
+        .and_then(|s| s.i("sector_count"))
+        .filter(|n| *n > 0);
+    let timing = match (count, length) {
+        (Some(count), Some(length)) => timing_sector_ends(conn, count, length)?,
+        _ => None,
+    };
+    let described = track.get("sector").and_then(Json::as_array).map(Vec::len);
+    let source = match (timing, count) {
+        (Some(ends), _) => {
+            track["sector"] = ends
+                .iter()
+                .enumerate()
+                .map(|(i, end)| serde_json::json!({"name": (i + 1).to_string(), "marker": end}))
+                .collect();
+            "timing"
+        }
+        // Another simulator's, or another split of the lap: not the sectors the times are for
+        (None, Some(count)) if described.is_some_and(|n| n as i64 != count) => {
+            if let Some(object) = track.as_object_mut() {
+                object.remove("sector");
+            }
+            "none"
+        }
+        _ if described.is_some() => "track data",
+        _ => "none",
+    };
+    track["sector_source"] = source.into();
     track["attribution"] = TRACK_SOURCE.into();
     Ok(serde_json::to_string(&track)?)
+}
+
+/// The most recent player rows looked through for where the timing sectors change.
+const TIMING_ROWS: i64 = 200_000;
+
+/// Where each of the simulator's `count` timing sectors ends, as fractions of the lap: where the
+/// player's recent laps went from one sector to the next (the median of them), the last at the
+/// line. `None` until every one of those lines has been crossed this session.
+fn timing_sector_ends(
+    conn: &Connection,
+    count: i64,
+    length: f64,
+) -> rusqlite::Result<Option<Vec<f64>>> {
+    let Ok(count) = usize::try_from(count) else {
+        return Ok(None);
+    };
+    let top = scalar::<i64>(conn, "SELECT MAX(id) FROM telemetry", [])?.unwrap_or(0);
+    // A crossing is a row in the next sector after one in the sector before; the clock going back
+    // is another session, whose crossings say nothing of this one's track
+    let marks = rows(
+        conn,
+        "SELECT id, sector, lap_distance, session_time < before_t - 1.0 AS restart FROM (
+             SELECT id, sector, lap_distance, in_pit_lane, session_time,
+                    LAG(sector) OVER w AS before, LAG(session_time) OVER w AS before_t
+             FROM telemetry WHERE is_player = 1 AND id > ? WINDOW w AS (ORDER BY id)
+         )
+         WHERE (sector = before + 1 AND NOT coalesce(in_pit_lane, 0))
+            OR session_time < before_t - 1.0
+         ORDER BY id",
+        [top - TIMING_ROWS],
+    )?;
+    let mut crossings = vec![Vec::new(); count.saturating_sub(1)];
+    for mark in marks {
+        if mark.b("restart") {
+            crossings.iter_mut().for_each(Vec::clear);
+            continue;
+        }
+        let (Some(sector), Some(distance)) = (mark.i("sector"), mark.f("lap_distance")) else {
+            continue;
+        };
+        // Into sector k (zero-based) is where sector k - 1 ends
+        if let Some(ends) = usize::try_from(sector - 1)
+            .ok()
+            .and_then(|i| crossings.get_mut(i))
+            && (0.0..=length).contains(&distance)
+        {
+            ends.push(distance);
+        }
+    }
+    let mut ends = Vec::with_capacity(count);
+    for mut seen in crossings {
+        if seen.is_empty() {
+            return Ok(None);
+        }
+        seen.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        ends.push(seen[seen.len() / 2] / length);
+    }
+    ends.push(1.0);
+    Ok(Some(ends))
 }
 
 #[cfg(test)]
@@ -3010,6 +3174,7 @@ mod tests {
             .unwrap();
         let sc = Scoring {
             session: Some(session),
+            yellow_sectors: Vec::new(),
             cars: BTreeMap::from([(1, me.clone()), (2, leader)]),
             player: Some(me),
         };
@@ -4257,6 +4422,108 @@ mod tests {
             number(&engineer, "SELECT COUNT(*) FROM lap_stats").await,
             1.0
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sectors_are_as_many_as_the_simulator_times() {
+        let (dir, engineer) = race();
+        assert_eq!(
+            number(&engineer, "SELECT sector_count FROM race_state").await,
+            3.0
+        );
+        // Each complete lap's official sectors, which add up to its official time
+        assert_eq!(
+            number(
+                &engineer,
+                "SELECT COUNT(*) FROM lap_sector_stats WHERE vehicle_id = 2"
+            )
+            .await,
+            9.0
+        );
+        let lap = "SELECT SUM(s.time_s) - l.official_time_s FROM lap_sector_stats s \
+                   JOIN lap_stats l USING (vehicle_id, lap) WHERE vehicle_id = 2 AND lap = 1";
+        assert!(number(&engineer, lap).await.abs() < 1e-9);
+        assert_eq!(
+            number(
+                &engineer,
+                "SELECT time_s FROM lap_sector_stats WHERE vehicle_id = 2 AND lap = 1 AND sector = 2"
+            )
+            .await,
+            35.0
+        );
+        // The newest standing's, one row a sector
+        assert_eq!(
+            number(
+                &engineer,
+                "SELECT COUNT(*) FROM sectors_now WHERE vehicle_id = 1"
+            )
+            .await,
+            3.0
+        );
+        let last = number(
+            &engineer,
+            "SELECT last_lap_s FROM sectors_now WHERE vehicle_id = 2 AND sector = 3",
+        )
+        .await;
+        assert!((last - 34.8).abs() < 1e-9, "{last}");
+
+        // A local yellow in the second sector
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute(
+            "UPDATE session_sector SET local_yellow = 1 \
+             WHERE session_id = (SELECT MAX(id) FROM session) AND sector = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(
+            number(&engineer, "SELECT local_yellow FROM race_state").await,
+            1.0
+        );
+        let quick = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(
+            quick.contains("sector index 2 as the sim reports it"),
+            "{quick}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tracks_sectors_are_the_simulators() {
+        let (dir, engineer) = race();
+        // Another split of the lap than the simulator's
+        std::fs::write(
+            dir.path().join(crate::track::TRACK_FILE),
+            serde_json::json!({
+                "name": "Test Ring",
+                "length": 1000.0,
+                "source_track": "Test Ring",
+                "sector": [
+                    {"name": "1", "marker": 0.2}, {"name": "2", "marker": 0.5},
+                    {"name": "3", "marker": 0.8}, {"name": "4", "marker": 1.0},
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let track = run(&engineer, serde_json::json!({"command": "track"})).await;
+        let track: Json = serde_json::from_str(&track).unwrap();
+        assert_eq!(track["sector_source"], "timing", "{track}");
+        let ends = track["sector"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["marker"].as_f64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ends, [0.3, 0.65, 1.0]);
+
+        // Without the lines crossed, the description's four can't stand for the three
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute("UPDATE telemetry SET sector = 0", []).unwrap();
+        drop(conn);
+        let track = run(&engineer, serde_json::json!({"command": "track"})).await;
+        let track: Json = serde_json::from_str(&track).unwrap();
+        assert_eq!(track["sector_source"], "none", "{track}");
+        assert!(track.get("sector").is_none(), "{track}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

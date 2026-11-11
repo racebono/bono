@@ -1,10 +1,11 @@
 //! The database the simulator plugins record into, with one table per struct in `include/bono`
-//! and a column per field: `telemetry`, `telemetry_wheel`, `car_state`, `session`, `standings` and
-//! `forecast`. The columns come from the headers' column lists (see `build.rs`).
+//! and a column per field: `telemetry`, `telemetry_wheel`, `car_state`, `session`,
+//! `session_sector`, `standings`, `standing_sector` and `forecast`. The columns come from the
+//! headers' column lists (see `build.rs`).
 
 use crate::sys::{
-    bono_car_state, bono_forecast_point, bono_session_info, bono_standing, bono_telemetry,
-    bono_wheel_telemetry,
+    bono_car_state, bono_forecast_point, bono_session_info, bono_session_sector, bono_standing,
+    bono_standing_sector, bono_telemetry, bono_wheel_telemetry,
 };
 use rusqlite::{Connection, PrepFlags, Statement};
 use std::collections::HashMap;
@@ -66,6 +67,8 @@ macro_rules! columns {
 sim_forecast_columns!(columns!(bono_forecast_point));
 sim_session_columns!(columns!(bono_session_info));
 sim_standing_columns!(columns!(bono_standing));
+sim_session_sector_columns!(columns!(bono_session_sector));
+sim_standing_sector_columns!(columns!(bono_standing_sector));
 sim_telemetry_columns!(columns!(bono_telemetry));
 sim_car_state_columns!(columns!(bono_car_state));
 sim_wheel_telemetry_columns!(columns!(bono_wheel_telemetry));
@@ -87,14 +90,25 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS car_state_by_vehicle ON car_state (vehicle_id, telemetry_id);
 
+        -- sector: zero-based, as in telemetry; a row per sector of the session's sector_count
         CREATE TABLE IF NOT EXISTS session (id INTEGER PRIMARY KEY{session});
+        CREATE TABLE IF NOT EXISTS session_sector (
+            session_id INTEGER NOT NULL REFERENCES session(id), sector INTEGER NOT NULL{session_sector},
+            PRIMARY KEY (session_id, sector)
+        ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS standings (id INTEGER PRIMARY KEY{standing});
+        CREATE TABLE IF NOT EXISTS standing_sector (
+            standing_id INTEGER NOT NULL REFERENCES standings(id), sector INTEGER NOT NULL{standing_sector},
+            PRIMARY KEY (standing_id, sector)
+        ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS forecast (id INTEGER PRIMARY KEY, generation INTEGER{forecast});",
         telemetry = bono_telemetry::DEFINITIONS,
         wheel = bono_wheel_telemetry::DEFINITIONS,
         state = bono_car_state::DEFINITIONS,
         session = bono_session_info::DEFINITIONS,
+        session_sector = bono_session_sector::DEFINITIONS,
         standing = bono_standing::DEFINITIONS,
+        standing_sector = bono_standing_sector::DEFINITIONS,
         forecast = bono_forecast_point::DEFINITIONS,
     ))?;
     Ok(())
@@ -127,7 +141,7 @@ pub fn recreate_tables(conn: &Connection) -> rusqlite::Result<()> {
 /// Deletes every row of every table.
 pub fn clear_tables(conn: &Connection) -> rusqlite::Result<()> {
     // Newest first: the tables referencing `telemetry` (`telemetry_wheel`, `car_state`) are made
-    // after it, so they're emptied before it. Foreign keys are on (rusqlite's bundled SQLite), and
+    // after it, and each `*_sector` table after the one it belongs to, so they're emptied first. Foreign keys are on (rusqlite's bundled SQLite), and
     // each `telemetry` row deleted while `car_state` still has rows is looked up in it, which has
     // no index by `telemetry_id`: a whole scan per row, minutes for a weekend
     let tables = conn
@@ -241,17 +255,63 @@ impl<'conn> TelemetryWriter<'conn> {
 
 /// Writes scoring only when it changes: see scoring.h.
 pub struct ScoringWriter<'conn> {
+    conn: &'conn Connection,
     insert_session: Statement<'conn>,
+    insert_session_sector: Statement<'conn>,
     insert_standing: Statement<'conn>,
+    insert_standing_sector: Statement<'conn>,
     last_session: Option<bono_session_info>,
     last_standings: HashMap<i64, bono_standing>,
+}
+
+/// How many of a session's sectors are written: its `sector_count`, as far as there's room.
+fn sector_count(session: &bono_session_info) -> usize {
+    let count = session.sector_count.get().unwrap_or(0).max(0);
+    usize::try_from(count).map_or(session.sectors.len(), |count| {
+        count.min(session.sectors.len())
+    })
+}
+
+/// Whether any of the first `count` sectors differs.
+fn sectors_changed<T: Columns>(sectors: &[T], other: &[T], count: usize) -> bool {
+    sectors[..count]
+        .iter()
+        .zip(&other[..count])
+        .any(|(sector, other)| sector.changed(other))
+}
+
+/// Writes the first `count` sectors, as rows of the row `parent`.
+fn write_sectors<T: Columns>(
+    insert: &mut Statement<'_>,
+    parent: i64,
+    sectors: &[T],
+    count: usize,
+) -> rusqlite::Result<()> {
+    for (sector, s) in sectors[..count].iter().enumerate() {
+        insert.raw_bind_parameter(1, parent)?;
+        insert.raw_bind_parameter(2, sector as i64)?;
+        s.bind(insert, 3)?;
+        insert.raw_execute()?;
+    }
+    Ok(())
 }
 
 impl<'conn> ScoringWriter<'conn> {
     pub fn new(conn: &'conn Connection) -> rusqlite::Result<Self> {
         Ok(Self {
+            conn,
             insert_session: prepare_insert::<bono_session_info>(conn, "session", &[])?,
+            insert_session_sector: prepare_insert::<bono_session_sector>(
+                conn,
+                "session_sector",
+                &["session_id", "sector"],
+            )?,
             insert_standing: prepare_insert::<bono_standing>(conn, "standings", &[])?,
+            insert_standing_sector: prepare_insert::<bono_standing_sector>(
+                conn,
+                "standing_sector",
+                &["standing_id", "sector"],
+            )?,
             last_session: None,
             last_standings: HashMap::new(),
         })
@@ -267,28 +327,35 @@ impl<'conn> ScoringWriter<'conn> {
         session: bono_session_info,
         standings: Vec<bono_standing>,
     ) -> rusqlite::Result<()> {
-        if self
-            .last_session
-            .as_ref()
-            .is_none_or(|last| session.changed(last))
-        {
+        // `sector_count` is compared, so a row it changes on is written whatever its sectors say
+        let count = sector_count(&session);
+        if self.last_session.as_ref().is_none_or(|last| {
+            session.changed(last) || sectors_changed(&session.sectors, &last.sectors, count)
+        }) {
             session.bind(&mut self.insert_session, 1)?;
             self.insert_session.raw_execute()?;
+            let id = self.conn.last_insert_rowid();
+            write_sectors(&mut self.insert_session_sector, id, &session.sectors, count)?;
             self.last_session = Some(session);
         }
 
         for standing in standings {
             let key = standing.vehicle_id.get().unwrap_or(-1);
-            if self
-                .last_standings
-                .get(&key)
-                .is_some_and(|last| !standing.changed(last))
-            {
+            if self.last_standings.get(&key).is_some_and(|last| {
+                !standing.changed(last) && !sectors_changed(&standing.sectors, &last.sectors, count)
+            }) {
                 continue;
             }
 
             standing.bind(&mut self.insert_standing, 1)?;
             self.insert_standing.raw_execute()?;
+            let id = self.conn.last_insert_rowid();
+            write_sectors(
+                &mut self.insert_standing_sector,
+                id,
+                &standing.sectors,
+                count,
+            )?;
             self.last_standings.insert(key, standing);
         }
 
@@ -378,6 +445,73 @@ mod tests {
             "SELECT (SELECT COUNT(*) FROM standings), penalty_drive_through_active, penalty_stop_and_go_seconds, pit_service_refuel_selected, pit_service_refuel_active, pit_service_front_tires_active, simulator_metadata FROM standings ORDER BY id DESC LIMIT 1", [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).unwrap();
         assert_eq!(result, (2, false, 15.0, true, true, None, None));
+    }
+
+    #[test]
+    fn writes_as_many_sectors_as_the_session_has() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let mut writer = ScoringWriter::new(&conn).unwrap();
+        let count = |table: &str| {
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+
+        // More than there's room for: the count is kept, and the sectors there's room for
+        let mut session = bono_session_info::default();
+        session.sector_count = Some(20).into();
+        session.sectors[15].local_yellow = Some(true).into();
+        let mut car = bono_standing::default();
+        car.vehicle_id = Some(1).into();
+        car.sectors[0].last_lap = Some(30.0).into();
+        writer.write(session.clone(), vec![car.clone()]).unwrap();
+        assert_eq!(count("session_sector"), 16);
+        assert_eq!(count("standing_sector"), 16);
+        let yellow: i64 = conn
+            .query_row(
+                "SELECT sector FROM session_sector WHERE local_yellow",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(yellow, 15);
+
+        // Nothing changed: nothing written
+        writer.write(session.clone(), vec![car.clone()]).unwrap();
+        assert_eq!((count("session"), count("standings")), (1, 1));
+
+        // A sector's time alone is a change
+        car.sectors[1].last_lap = Some(35.0).into();
+        writer.write(session.clone(), vec![car.clone()]).unwrap();
+        assert_eq!((count("session"), count("standings")), (1, 2));
+        let (last, standing): (f64, i64) = conn
+            .query_row(
+                "SELECT last_lap, standing_id FROM standing_sector WHERE sector = 1 \
+                 ORDER BY standing_id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((last, standing), (35.0, 2));
+
+        // Fewer sectors: only theirs are written, and only theirs compared
+        session.sector_count = Some(2).into();
+        session.sectors[15].local_yellow = Some(false).into();
+        writer.write(session.clone(), vec![car.clone()]).unwrap();
+        assert_eq!(count("session"), 2);
+        assert_eq!(count("session_sector"), 18);
+        car.sectors[5].last_lap = Some(40.0).into();
+        writer.write(session.clone(), vec![car.clone()]).unwrap();
+        assert_eq!(count("standings"), 2);
+
+        // A session without a count has none
+        session.sector_count = None.into();
+        writer.write(session, vec![car]).unwrap();
+        assert_eq!(count("session"), 3);
+        assert_eq!(count("session_sector"), 18);
+        assert_eq!(count("standing_sector"), 32);
     }
 
     #[test]

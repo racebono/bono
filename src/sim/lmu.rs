@@ -12,6 +12,7 @@ use crate::{
     task::MaybeDone,
 };
 use bono_sim::recorder::{DATABASE, SETTINGS, try_remove_database};
+use futures::FutureExt;
 use serde_json::{Map, Value};
 use std::{
     num::NonZeroUsize,
@@ -19,7 +20,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::{
+    sync::mpsc,
+    task::{JoinHandle, coop::unconstrained},
+};
 
 mod plugin;
 
@@ -48,6 +52,10 @@ pub struct LeMansUltimate {
     /// in order (two "clear" requests at once would otherwise both read the same count). Started
     /// with the first change
     settings: Option<mpsc::UnboundedSender<SettingsChange>>,
+    /// Looking at the plugin the game runs, once a run
+    plugin_check: Option<JoinHandle<PluginStatus>>,
+    /// Whether the plugin the game runs is outdated, once looked at this run
+    plugin_outdated: Option<bool>,
 }
 
 /// A change to settings.json in a folder, and what it's for (for the log, if it fails).
@@ -62,7 +70,46 @@ impl LeMansUltimate {
             live: None,
             ready: Probe::new(LOOK_EVERY),
             settings: None,
+            plugin_check: None,
+            plugin_outdated: None,
         }
+    }
+
+    /// Whether the plugin the game runs is known to be up to date, looking at it in the background
+    /// if it hasn't been yet this run. The game loads the plugin as it starts, and the plugin can't
+    /// be replaced while the game runs, so one look a run tells.
+    fn plugin_current(&mut self) -> bool {
+        if self.plugin_outdated.is_none() {
+            match &self.plugin_check {
+                Some(check) if check.is_finished() => {
+                    let check = self.plugin_check.take();
+                    // Finished, so this doesn't wait
+                    match check.and_then(|check| unconstrained(check).now_or_never()) {
+                        Some(Ok(status)) => {
+                            let outdated = status.outdated();
+                            if outdated {
+                                log::warn!(
+                                    "The Le Mans Ultimate plugin is outdated: its sessions aren't \
+                                     followed until it's updated"
+                                );
+                            }
+                            self.plugin_outdated = Some(outdated);
+                        }
+                        // Not knowing isn't knowing it's outdated
+                        Some(Err(e)) => {
+                            log::error!("Error looking at the Le Mans Ultimate plugin: {e}");
+                            self.plugin_outdated = Some(false);
+                        }
+                        None => {}
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    self.plugin_check = Some(tokio::spawn(plugin_status()));
+                }
+            }
+        }
+        self.plugin_outdated == Some(false)
     }
 
     /// Changes settings.json in the background, keeping what else is in it (the plugin acts on any
@@ -107,11 +154,20 @@ impl Simulator for LeMansUltimate {
     /// The database the plugin is writing right now, or `None` when the game isn't installed, isn't
     /// running, or hasn't written one yet (the pilot hasn't loaded a session).
     fn database(&mut self, running: bool) -> Option<&Pool> {
-        // Looked up in the background: finding the game searches Steam's libraries
+        // Looked up in the background: finding the game searches Steam's libraries. With an
+        // outdated plugin, or before it's known not to be, there's no session to follow
         let path = if running {
-            self.ready.get(database_path).cloned().flatten()
+            let current = self.plugin_current();
+            self.ready
+                .get(database_path)
+                .cloned()
+                .flatten()
+                .filter(|_| current)
         } else {
             self.ready.reset();
+            // The next run may load another plugin: detached, its answer is dropped
+            self.plugin_check = None;
+            self.plugin_outdated = None;
             None
         };
 
@@ -165,14 +221,7 @@ impl Simulator for LeMansUltimate {
     }
 
     fn plugin(&mut self) -> Option<MaybeDone<PluginStatus>> {
-        Some(MaybeDone::spawn(async {
-            // Finding the game searches Steam's libraries
-            let install_dir = tokio::task::spawn_blocking(install_dir)
-                .await
-                .ok()
-                .flatten();
-            plugin::status(install_dir).await
-        }))
+        Some(MaybeDone::spawn(plugin_status()))
     }
 
     fn install_plugin(&mut self) -> MaybeDone<anyhow::Result<()>> {
@@ -197,6 +246,10 @@ impl Simulator for LeMansUltimate {
             }
             result
         })
+    }
+
+    fn plugin_outdated(&self) -> bool {
+        self.plugin_outdated == Some(true)
     }
 }
 
@@ -233,6 +286,16 @@ async fn remove_when_closed(dir: PathBuf, pool: Pool) {
             Err(_) => {}
         }
     }
+}
+
+/// The plugin in the game's folder, and the one that comes with the app.
+async fn plugin_status() -> PluginStatus {
+    // Finding the game searches Steam's libraries
+    let install_dir = tokio::task::spawn_blocking(install_dir)
+        .await
+        .ok()
+        .flatten();
+    plugin::status(install_dir).await
 }
 
 /// The game's folder, if it's installed.
@@ -274,4 +337,30 @@ async fn write_replacing(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let temp = PathBuf::from(temp);
     tokio::fs::write(&temp, contents).await?;
     tokio::fs::rename(&temp, path).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_outdated_plugin_has_no_session_to_follow() {
+        let mut lmu = LeMansUltimate::new();
+        lmu.plugin_outdated = Some(true);
+        assert!(lmu.database(true).is_none());
+        assert!(lmu.plugin_outdated());
+
+        // The next run may load another plugin: it's looked at again
+        assert!(lmu.database(false).is_none());
+        assert!(!lmu.plugin_outdated());
+        assert!(lmu.plugin_outdated.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_session_is_followed_before_the_plugin_is_looked_at() {
+        let mut lmu = LeMansUltimate::new();
+        assert!(lmu.database(true).is_none());
+        assert!(lmu.plugin_check.is_some());
+        assert!(!lmu.plugin_outdated());
+    }
 }

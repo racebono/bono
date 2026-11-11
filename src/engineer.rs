@@ -605,12 +605,22 @@ impl Engineer {
             detail: None,
         });
 
+        let outdated = sim.as_deref().is_some_and(|sim| sim.plugin_outdated());
         let database = sim.and_then(|sim| Some((sim.id(), sim.database()?.clone())));
         let Some((sim, pool)) = database else {
             // Said in the pilot's language, when there's a voice for it
             let lang = self.voice(config, lang).unwrap_or(lang);
-            let text = t!("engineer.no_telemetry": &lang);
-            self.reply(text.into(), Some(t!("engineer.detail_no_telemetry").into()));
+            let (text, detail) = match outdated {
+                true => (
+                    t!("engineer.plugin_outdated": &lang),
+                    t!("engineer.detail_plugin_outdated"),
+                ),
+                false => (
+                    t!("engineer.no_telemetry": &lang),
+                    t!("engineer.detail_no_telemetry"),
+                ),
+            };
+            self.reply(text.into(), Some(detail.into()));
             self.say(rt, config, synth, text, lang);
             if let Some(playback) = &mut self.playback {
                 playback.timeline = Some(timeline);
