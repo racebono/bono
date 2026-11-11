@@ -33,8 +33,11 @@ pub struct SimulatorsTopbar {
 /// What the disk says about a simulator: slow enough not to look every frame.
 #[derive(Default)]
 struct Found {
+    /// Whether the simulator looks for the game's folder: those that don't can't tell whether it's
+    /// installed
+    locates: bool,
     install_dir: Option<PathBuf>,
-    /// Looking through Steam's libraries for `install_dir`
+    /// Looking for `install_dir` (e.g. in Steam's libraries)
     dir_lookup: Option<MaybeDone<Option<PathBuf>>>,
     plugin: Option<PluginStatus>,
     lookup: Option<MaybeDone<PluginStatus>>,
@@ -61,7 +64,8 @@ impl SimulatorsTopbar {
         self.found.iter().any(Found::needs_setup)
     }
 
-    /// Whether any of the games is installed, as last looked up.
+    /// Whether any of the games is installed, as last looked up. Games whose simulators don't look
+    /// for their folder don't count.
     pub fn any_installed(&self) -> bool {
         self.found.iter().any(|found| found.install_dir.is_some())
     }
@@ -84,7 +88,8 @@ impl SimulatorsTopbar {
                 .resize_with(simulators.simulators().count(), Found::default);
             for (sim, found) in simulators.simulators().zip(&mut self.found) {
                 if found.dir_lookup.is_none() {
-                    found.dir_lookup = Some(sim.install_dir());
+                    found.dir_lookup = sim.install_dir();
+                    found.locates = found.dir_lookup.is_some();
                 }
                 if found.lookup.is_none() {
                     found.lookup = sim.plugin();
@@ -133,6 +138,8 @@ impl SimulatorsTopbar {
                     _ if running => {
                         ui.colored_label(ui.visuals().selection.bg_fill, t!("simulators.running"));
                     }
+                    // Whether it's installed isn't known: only whether it runs
+                    None if !found.locates => {}
                     Some(dir) => {
                         ui.label(t!("simulators.installed")).on_hover_text(t!(
                             "simulators.install_dir_hover",

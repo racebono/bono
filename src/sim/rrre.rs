@@ -1,10 +1,10 @@
-//! RaceRoom Racing Experience, through Steam. It has no plugins: it publishes its state in a
-//! shared memory block (`$R3E`, see `r3e.h`), which a thread of ours reads while the game runs and
-//! records like LMU's plugin does (`bono_sim::recorder`), into a folder of the app's own. The
-//! recording is deleted once the game closes.
+//! RaceRoom Racing Experience, installed by Steam. It has no plugins: it publishes
+//! its state in a shared memory block (`$R3E`, see `r3e.h`), which a thread of ours reads while the
+//! game runs and records like LMU's plugin does (`bono_sim::recorder`), into a folder of the app's
+//! own. The recording is deleted once the game closes.
 
 use crate::{
-    sim::{Simulator, SimulatorInfo, SimulatorSettings, probe::Probe},
+    sim::{Simulator, SimulatorInfo, SimulatorSettings, probe::Probe, steam_install_dir},
     sqlite::{Database, pool::Pool},
 };
 use bono_sim::{
@@ -140,7 +140,12 @@ async fn write_settings(
 impl SimulatorInfo for RaceRoom {
     const NAME: &'static str = "RaceRoom";
     const TRACK_DATA_ID: &'static str = "rrre";
-    const APP_ID: u32 = STEAM_APP_ID;
+    const APP_ID: Option<u32> = Some(STEAM_APP_ID);
+    /// 64-bit (`Game\x64`, or `Game\x64dxvk` with DXVK) and 32-bit (`Game`)
+    const EXECUTABLES: &'static [&'static str] = &["RRRE64.exe", "RRRE.exe"];
+    /// Not needed to record it (its shared memory is), but tells the pilot it's installed. Always
+    /// installed through Steam, even when started outside it
+    const INSTALL_DIR: Option<fn() -> Option<PathBuf>> = Some(steam_install_dir::<Self>);
 }
 
 impl Simulator for RaceRoom {

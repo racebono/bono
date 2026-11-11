@@ -8,8 +8,10 @@ Built in Rust with SDL3 and egui, Bono uses local Whisper speech recognition and
 
 Both current simulator integrations run on Windows:
 
-- **Le Mans Ultimate:** a plugin records telemetry, scoring, and weather data. Bono detects Steam installations and can install, update, and enable its plugin from the setup guide or Simulators menu. Close the game before installing or updating it.
+- **Le Mans Ultimate:** a plugin records telemetry, scoring, and weather data. Bono can install, update, and enable its plugin from the setup guide or Simulators menu. Close the game before installing or updating it.
 - **RaceRoom Racing Experience:** Bono reads the game's shared memory directly; no Bono plugin is required.
+
+Bono locates Le Mans Ultimate and RaceRoom in Steam's libraries; both games are assumed to be installed through Steam. It follows Steam's running flags and also checks running processes once a second (`Le Mans Ultimate.exe`; `RRRE64.exe` or `RRRE.exe`), so games launched outside Steam are detected too. On Windows, a fresh process-name snapshot every 30 polls catches games hidden by cached names after process-ID reuse, even while another game runs. Recording settings are passed to a game again each time it starts running.
 
 The application contains Linux and macOS build paths, but its current simulator adapters are Windows-only.
 

@@ -1496,9 +1496,9 @@
         "ca": "Bono segueix la cursa des del joc. Alguns jocs necessiten un plugin per fer-ho: instal·la'l aquí, amb el joc tancat."
     },
     "onboarding.no_simulator": {
-        "en": "None of these games is installed. You can still continue: the Simulators menu shows them once one is.",
-        "es": "Ninguno de estos juegos está instalado. Puedes continuar igualmente: el menú Simuladores los muestra en cuanto haya uno.",
-        "ca": "Cap d'aquests jocs no està instal·lat. Pots continuar igualment: el menú Simuladors els mostra quan n'hi hagi un."
+        "en": "None of these games was found in Steam's libraries. You can still continue and check the Simulators menu after installing one through Steam.",
+        "es": "No se ha encontrado ninguno de estos juegos en las bibliotecas de Steam. Puedes continuar y consultar el menú Simuladores después de instalar uno con Steam.",
+        "ca": "No s'ha trobat cap d'aquests jocs a les biblioteques de Steam. Pots continuar i consultar el menú Simuladors després d'instal·lar-ne un amb Steam."
     },
     "error.download": {
         "en": "Error downloading",

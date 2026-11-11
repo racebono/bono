@@ -63,6 +63,8 @@ futures = { version = "0.3.34", default-features = false, features = [
     "async-await",
 ] }
 steamlocate = "2.1.1"
+# Which games are running, including games started outside Steam
+sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
 # Which language a typed question is in. Each language's model is built into the binary (a few
 # MB each), so only common ones are by default: `all-languages` adds the rest that have voices
 lingua = { version = "1.8.0", default-features = false, features = [
@@ -101,6 +103,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]

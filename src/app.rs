@@ -72,7 +72,7 @@ impl App {
         let joysticks = Joysticks::new(&joystick);
         let event = sdl.event()?;
         let fonts = load_fonts()?;
-        // Initial Steam registry discovery and watcher creation can wait on the OS too.
+        // Initial Steam registry discovery and starting the watcher threads can wait on the OS too.
         let simulators = rt.spawn_blocking(ActiveSimulator::default);
 
         // Everything waited on happens before the window exists: SDL's init callback must return
@@ -383,16 +383,18 @@ impl AppState {
     }
 
     /// Passes the recording settings on to every simulator when they change (and at startup), and
-    /// follows which simulator is running.
+    /// to a simulator again when it starts running, and follows which simulator is running.
     fn update_simulators(&mut self) {
         let opponent_frequency = *self.config.get().opponent_frequency();
-        if self.applied_opponent_frequency != Some(opponent_frequency) {
-            let settings = SimulatorSettings { opponent_frequency };
-            for simulator in self.simulators.simulators() {
+        let settings = SimulatorSettings { opponent_frequency };
+        let changed = self.applied_opponent_frequency != Some(opponent_frequency);
+        for simulator in self.simulators.simulators() {
+            // Reapply on process starts too: Steam's running flag can lag behind a restart.
+            if simulator.started() || changed {
                 simulator.apply(&settings);
             }
-            self.applied_opponent_frequency = Some(opponent_frequency);
         }
+        self.applied_opponent_frequency = Some(opponent_frequency);
 
         // Only looks: a change waiting is taken, otherwise it's looked for again next frame
         if let Some(current) = self.simulators.changed().now_or_never() {
