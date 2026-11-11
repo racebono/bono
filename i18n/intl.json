@@ -206,9 +206,9 @@
         "ca": "Instal·lat a {path}"
     },
     "simulators.not_installed_hover": {
-        "en": "Steam doesn't have it installed in any of its libraries",
-        "es": "Steam no lo tiene instalado en ninguna de sus bibliotecas",
-        "ca": "Steam no el té instal·lat a cap de les seves biblioteques"
+        "en": "Steam doesn't have it installed in any of its libraries. Installed some other way? Start the game once and Bono finds it",
+        "es": "Steam no lo tiene instalado en ninguna de sus bibliotecas. ¿Lo instalaste de otra forma? Inicia el juego una vez y Bono lo encontrará",
+        "ca": "Steam no el té instal·lat a cap de les seves biblioteques. L'has instal·lat d'una altra manera? Inicia el joc un cop i Bono el trobarà"
     },
     "plugin.not_installed": {
         "en": "Plugin not installed: nothing is recorded",
@@ -1471,9 +1471,9 @@
         "ca": "Bono segueix la cursa des del joc. Alguns jocs necessiten un plugin per fer-ho: instal·la'l aquí, amb el joc tancat."
     },
     "onboarding.no_simulator": {
-        "en": "None of these games is installed. You can still continue: the Simulators menu shows them once one is.",
-        "es": "Ninguno de estos juegos está instalado. Puedes continuar igualmente: el menú Simuladores los muestra en cuanto haya uno.",
-        "ca": "Cap d'aquests jocs no està instal·lat. Pots continuar igualment: el menú Simuladors els mostra quan n'hi hagi un."
+        "en": "None of these games is installed through Steam. If you installed one some other way, start it once and Bono finds it. You can still continue: the Simulators menu shows them once one is found.",
+        "es": "Ninguno de estos juegos está instalado con Steam. Si instalaste alguno de otra forma, inícialo una vez y Bono lo encontrará. Puedes continuar igualmente: el menú Simuladores los muestra en cuanto encuentre uno.",
+        "ca": "Cap d'aquests jocs no està instal·lat amb Steam. Si n'has instal·lat algun d'una altra manera, inicia'l un cop i Bono el trobarà. Pots continuar igualment: el menú Simuladors els mostra quan en trobi un."
     },
     "error.download": {
         "en": "Error downloading",

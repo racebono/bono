@@ -1,7 +1,7 @@
-//! RaceRoom Racing Experience, through Steam. It has no plugins: it publishes its state in a
-//! shared memory block (`$R3E`, see `r3e.h`), which a thread of ours reads while the game runs and
-//! records like LMU's plugin does (`bono_sim::recorder`), into a folder of the app's own. The
-//! recording is deleted once the game closes.
+//! RaceRoom Racing Experience, installed by Steam or any other way. It has no plugins: it publishes
+//! its state in a shared memory block (`$R3E`, see `r3e.h`), which a thread of ours reads while the
+//! game runs and records like LMU's plugin does (`bono_sim::recorder`), into a folder of the app's
+//! own. The recording is deleted once the game closes.
 
 use crate::{
     sim::{Simulator, SimulatorInfo, SimulatorSettings, probe::Probe},
@@ -137,6 +137,20 @@ impl SimulatorInfo for RaceRoom {
     const NAME: &'static str = "RaceRoom";
     const TRACK_DATA_ID: &'static str = "rrre";
     const APP_ID: u32 = STEAM_APP_ID;
+    /// 64-bit (`Game\x64`, or `Game\x64dxvk` with DXVK) and 32-bit (`Game`)
+    const EXECUTABLES: &'static [&'static str] = &["RRRE64.exe", "RRRE.exe"];
+
+    /// The executables are under the `Game` folder at the top of the game's.
+    fn install_dir_of(exe: &Path) -> Option<PathBuf> {
+        exe.ancestors()
+            .find(|dir| {
+                dir.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("Game"))
+            })?
+            .parent()
+            .map(Path::to_owned)
+    }
 }
 
 impl Simulator for RaceRoom {
@@ -1361,6 +1375,26 @@ mod sys {
 mod tests {
     use super::*;
     use std::num::NonZeroU32;
+
+    #[test]
+    fn install_dir_is_above_the_game_folder() {
+        let root = Path::new(r"E:\Games\RaceRoom Racing Experience");
+        for exe in [
+            r"Game\RRRE.exe",
+            r"Game\x64\RRRE64.exe",
+            r"game\x64dxvk\RRRE64.exe",
+        ] {
+            assert_eq!(
+                RaceRoom::install_dir_of(&root.join(exe)).as_deref(),
+                Some(root),
+                "{exe}"
+            );
+        }
+        assert_eq!(
+            RaceRoom::install_dir_of(Path::new(r"E:\Other\RRRE64.exe")),
+            None
+        );
+    }
 
     async fn wait_for_reader(sim: &mut RaceRoom) {
         tokio::time::timeout(Duration::from_secs(5), async {

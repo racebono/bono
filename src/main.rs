@@ -39,6 +39,7 @@ mod provider;
 mod sim;
 mod spotter;
 mod sqlite;
+mod process;
 mod steam;
 mod synthesizer;
 mod task;

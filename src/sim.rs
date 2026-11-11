@@ -1,4 +1,5 @@
 use crate::{
+    process::{ProcessWatcher, Program, Programs},
     sqlite::pool::Pool,
     steam::{self, AppWatcher},
     task::MaybeDone,
@@ -8,9 +9,11 @@ use futures::future::select_all;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
+    future::Future,
     num::NonZeroU32,
     ops::{Deref, DerefMut},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -27,9 +30,13 @@ pub struct Sim<T: ?Sized = dyn Simulator> {
     name: &'static str,
     /// e.g. `lmu`
     id: &'static str,
-    app_id: u32,
+    /// Where the game is, shared with the simulator's background tasks
+    game: Game,
     /// Whether Steam reports the game running
     running: watch::Receiver<bool>,
+    /// Whether one of the game's processes is running, however it was installed. Closed if the
+    /// processes can't be looked at
+    process: watch::Receiver<Program>,
     /// Shared with the task that keeps the session's track description up to date
     track_data: Arc<Mutex<TrackData>>,
     /// Kept for its thread. Without Steam's key for the game (it's not installed), a sender kept
@@ -41,7 +48,8 @@ pub struct Sim<T: ?Sized = dyn Simulator> {
 }
 
 impl<T> Sim<T> {
-    pub fn new(simulator: T) -> Self
+    /// `game` is the one the simulator was made with.
+    pub fn new(simulator: T, game: Game) -> Self
     where
         T: SimulatorInfo,
     {
@@ -60,7 +68,8 @@ impl<T> Sim<T> {
         Self {
             name: T::NAME,
             id: T::TRACK_DATA_ID,
-            app_id: T::APP_ID,
+            process: game.0.process.clone(),
+            game,
             running,
             track_data: Arc::new(Mutex::new(TrackData::new(T::TRACK_DATA_ID))),
             _watcher: watcher,
@@ -85,17 +94,40 @@ where
         self.id
     }
 
-    /// Looks for the folder Steam installed the game in, if it's installed, in the background:
-    /// it looks through Steam's libraries.
+    /// Looks for the game's folder, if it's installed, in the background (see
+    /// `Game::install_dir`).
     pub fn install_dir(&self) -> MaybeDone<Option<PathBuf>> {
-        let app_id = self.app_id;
-        MaybeDone::spawn_blocking(move || steam::app_install_dir(app_id))
+        let game = self.game.clone();
+        MaybeDone::spawn_blocking(move || game.install_dir())
     }
 
-    /// Whether Steam reports the game running now.
+    /// Whether the game is running now: Steam reports it, or one of its processes is running.
     #[inline]
     pub fn is_running(&self) -> bool {
-        *self.running.borrow()
+        *self.running.borrow() || self.process.borrow().running
+    }
+
+    /// Waits for Steam or the processes to report the game starting or stopping. Closed channels
+    /// aren't waited on: `None` if both are.
+    fn wait_for_change(&mut self) -> Option<Pin<Box<dyn Future<Output = ()> + '_>>> {
+        let steam = self.running.has_changed().is_ok();
+        let process = self.process.has_changed().is_ok();
+        let (running, processes) = (&mut self.running, &mut self.process);
+        Some(match (steam, process) {
+            (true, true) => Box::pin(async move {
+                tokio::select! {
+                    _ = running.changed() => {},
+                    _ = processes.changed() => {},
+                }
+            }),
+            (true, false) => Box::pin(async move {
+                let _ = running.changed().await;
+            }),
+            (false, true) => Box::pin(async move {
+                let _ = processes.changed().await;
+            }),
+            (false, false) => return None,
+        })
     }
 
     /// The simulator's track descriptions.
@@ -152,7 +184,63 @@ where
 pub trait SimulatorInfo: Simulator {
     const NAME: &'static str;
     const TRACK_DATA_ID: &'static str;
+    /// Steam's id for the game
     const APP_ID: u32;
+    /// The game's executables, by file name (compared ignoring ASCII case): any of them running is
+    /// the game running, however it was installed
+    const EXECUTABLES: &'static [&'static str];
+
+    /// The game's folder, given the path of one of its `EXECUTABLES`.
+    fn install_dir_of(exe: &Path) -> Option<PathBuf>;
+}
+
+/// Where a game is installed and whether it's running, as Steam and the processes running tell:
+/// Steam only knows the games it installed, and only while they're started through it. Cheap to
+/// clone, for the simulator's background tasks.
+#[derive(Clone)]
+pub struct Game(Arc<GameInner>);
+
+struct GameInner {
+    app_id: u32,
+    process: watch::Receiver<Program>,
+    install_dir_of: fn(&Path) -> Option<PathBuf>,
+}
+
+impl Game {
+    /// `process` follows `T::EXECUTABLES` (see `Programs::watch`).
+    pub fn new<T: SimulatorInfo>(process: watch::Receiver<Program>) -> Self {
+        Self(Arc::new(GameInner {
+            app_id: T::APP_ID,
+            process,
+            install_dir_of: T::install_dir_of,
+        }))
+    }
+
+    /// Whether one of the game's processes is running, or Steam reports it running. Reads Steam's
+    /// registry key: brief, but not for every frame (`Sim::is_running` is).
+    pub fn is_running(&self) -> bool {
+        self.0.process.borrow().running || steam::is_app_running(self.0.app_id)
+    }
+
+    /// The game's folder, if it's installed: the one it was last seen running from (since the app
+    /// started), otherwise the one Steam installed it in. Blocks: it may look through Steam's
+    /// libraries.
+    pub fn install_dir(&self) -> Option<PathBuf> {
+        // Cloned, so the channel isn't held while looking at the disk
+        let exe = self.0.process.borrow().exe.clone();
+        exe.and_then(|exe| (self.0.install_dir_of)(&exe))
+            .filter(|dir| dir.is_dir())
+            .or_else(|| steam::app_install_dir(self.0.app_id).filter(|dir| dir.is_dir()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fake() -> Self {
+        Self(Arc::new(GameInner {
+            app_id: 0,
+            process: watch::channel(Program::default()).1,
+            install_dir_of: |_| None,
+        }))
+    }
 }
 
 pub trait Simulator: Send {
@@ -251,21 +339,25 @@ pub struct ActiveSimulator {
     simulators: Vec<Box<Sim<dyn Simulator>>>,
     current: Option<usize>,
     last_watch_retry: Instant,
+    /// Following the simulators' processes, for their `process` channels
+    processes: Option<ProcessWatcher>,
 }
 
 impl ActiveSimulator {
     /// Joins watchers and closes idle database connections away from SDL's event thread.
     pub fn shutdown(&mut self) -> tokio::task::JoinHandle<()> {
         let simulators = std::mem::take(&mut self.simulators);
+        let processes = self.processes.take();
         self.current = None;
-        tokio::task::spawn_blocking(move || drop(simulators))
+        tokio::task::spawn_blocking(move || drop((simulators, processes)))
     }
 
-    fn new(simulators: Vec<Box<Sim<dyn Simulator>>>) -> Self {
+    fn new(simulators: Vec<Box<Sim<dyn Simulator>>>, processes: Option<ProcessWatcher>) -> Self {
         let mut this = Self {
             simulators,
             current: None,
             last_watch_retry: Instant::now(),
+            processes,
         };
         this.current = this.pick();
         this
@@ -312,12 +404,11 @@ impl ActiveSimulator {
                 wait = wait.min(Duration::from_millis(100));
             }
 
-            // Closed channels aren't waited on: the next retry reconnects them.
+            // Closed channels aren't waited on: the next retry reconnects Steam's.
             let waits = self
                 .simulators
                 .iter_mut()
-                .filter(|sim| sim.running.has_changed().is_ok())
-                .map(|sim| Box::pin(sim.running.changed()))
+                .filter_map(|sim| sim.wait_for_change())
                 .collect::<Vec<_>>();
 
             let retry = tokio::time::sleep(wait);
@@ -338,11 +429,7 @@ impl ActiveSimulator {
 
     /// The current simulator while it runs, otherwise the first one running.
     fn pick(&self) -> Option<usize> {
-        let is_running = |i: usize| {
-            self.simulators
-                .get(i)
-                .is_some_and(|sim| *sim.running.borrow())
-        };
+        let is_running = |i: usize| self.simulators.get(i).is_some_and(|sim| sim.is_running());
 
         self.current
             .filter(|&current| is_running(current))
@@ -372,7 +459,7 @@ fn poll_retry(sim: &mut Sim<dyn Simulator>, due: bool) {
         && sim.retrying.is_none()
         && (sim._watcher.is_err() || sim.running.has_changed().is_err())
     {
-        let app_id = sim.app_id;
+        let app_id = sim.game.0.app_id;
         sim.retrying = Some(tokio::task::spawn_blocking(move || {
             AppWatcher::new(app_id).ok()
         }));
@@ -394,20 +481,39 @@ fn retry_watcher<W>(
 }
 
 impl Default for ActiveSimulator {
+    /// Blocks: opens Steam's registry keys and starts threads.
     fn default() -> Self {
-        Self::new(simulators())
+        let mut programs = Programs::default();
+        let simulators = simulators(&mut programs);
+        let processes = programs.spawn().unwrap_or_else(|e| {
+            // The `process` channels close with `programs`: only Steam's games are found
+            log::warn!("Can't follow the simulators' processes: {e}");
+            None
+        });
+        Self::new(simulators, processes)
     }
 }
 
-fn simulators() -> Vec<Box<Sim<dyn Simulator>>> {
-    return [
-        #[cfg(windows)]
-        (Box::new(Sim::new(lmu::LeMansUltimate::new())) as Box<Sim<dyn Simulator>>),
-        #[cfg(windows)]
-        (Box::new(Sim::new(rrre::RaceRoom::new())) as Box<Sim<dyn Simulator>>),
-    ]
-    .into_iter()
-    .collect::<Vec<_>>();
+#[cfg_attr(not(windows), allow(unused_variables, unused_mut))]
+fn simulators(programs: &mut Programs) -> Vec<Box<Sim<dyn Simulator>>> {
+    let mut simulators = Vec::new();
+    #[cfg(windows)]
+    {
+        add(&mut simulators, programs, lmu::LeMansUltimate::new);
+        add(&mut simulators, programs, |_| rrre::RaceRoom::new());
+    }
+    simulators
+}
+
+/// Adds the simulator `make` makes with its game, whose processes `programs` follows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn add<T: SimulatorInfo + 'static>(
+    simulators: &mut Vec<Box<Sim<dyn Simulator>>>,
+    programs: &mut Programs,
+    make: impl FnOnce(Game) -> T,
+) {
+    let game = Game::new::<T>(programs.watch(T::EXECUTABLES));
+    simulators.push(Box::new(Sim::new(make(game.clone()), game)));
 }
 
 /// A running simulator whose recording is `pool`'s database, for tests.
@@ -427,8 +533,9 @@ pub(crate) fn recording(pool: Pool) -> Box<Sim> {
     Box::new(Sim {
         name: "Test",
         id: "test",
-        app_id: 0,
+        game: Game::fake(),
         running,
+        process: watch::channel(Program::default()).1,
         track_data: Arc::new(Mutex::new(TrackData::new("test".into()))),
         _watcher: Err(send),
         retrying: None,
@@ -486,8 +593,9 @@ mod tests {
         let sim = Box::new(Sim {
             name,
             id: name,
-            app_id: 0,
+            game: Game::fake(),
             running,
+            process: watch::channel(Program::default()).1,
             track_data: Arc::new(Mutex::new(TrackData::new(name.into()))),
             // Not the test's sender, so the test can close the channel
             _watcher: Err(watch::channel(false).0),
@@ -516,7 +624,7 @@ mod tests {
     async fn keeps_the_current_simulator_while_it_runs() {
         let (a, a_running) = fake("a", false);
         let (b, b_running) = fake("b", true);
-        let mut active = ActiveSimulator::new(vec![a, b]);
+        let mut active = ActiveSimulator::new(vec![a, b], None);
         assert_eq!(active.current_mut().map(|sim| sim.name()), Some("b"));
 
         // Another starting doesn't take over
@@ -541,7 +649,7 @@ mod tests {
     async fn ignores_simulators_that_cant_be_followed() {
         let (a, a_running) = fake("a", false);
         let (b, b_running) = fake("b", false);
-        let mut active = ActiveSimulator::new(vec![a, b]);
+        let mut active = ActiveSimulator::new(vec![a, b], None);
         drop(a_running);
         no_change(&mut active).await;
 
@@ -553,8 +661,89 @@ mod tests {
     async fn waits_when_all_watcher_channels_are_closed() {
         let (sim, running) = fake("a", false);
         drop(running);
-        let mut active = ActiveSimulator::new(vec![sim]);
+        let mut active = ActiveSimulator::new(vec![sim], None);
         no_change(&mut active).await;
+    }
+
+    #[tokio::test]
+    async fn follows_a_game_running_without_steam() {
+        let (mut sim, _steam) = fake("a", false);
+        let (process, receiver) = watch::channel(Program::default());
+        sim.process = receiver;
+        let mut active = ActiveSimulator::new(vec![sim], None);
+        assert!(active.current().is_none());
+
+        process.send_modify(|program| program.running = true);
+        assert_eq!(next(&mut active).await, Some("a"));
+        assert!(active.current().is_some_and(|sim| sim.is_running()));
+
+        process.send_modify(|program| program.running = false);
+        assert_eq!(next(&mut active).await, None);
+    }
+
+    #[tokio::test]
+    async fn either_steam_or_the_process_keeps_a_game_running() {
+        let (mut sim, steam) = fake("a", true);
+        let (process, receiver) = watch::channel(Program {
+            running: true,
+            exe: None,
+        });
+        sim.process = receiver;
+        let mut active = ActiveSimulator::new(vec![sim], None);
+
+        // Steam lags behind the process exiting
+        process.send_modify(|program| program.running = false);
+        no_change(&mut active).await;
+        steam.send(false).unwrap();
+        assert_eq!(next(&mut active).await, None);
+
+        // The process closing its channel leaves Steam's to follow
+        drop(process);
+        steam.send(true).unwrap();
+        assert_eq!(next(&mut active).await, Some("a"));
+    }
+
+    struct Named;
+
+    impl Simulator for Named {
+        fn database(&mut self, _: bool) -> Option<&Pool> {
+            None
+        }
+        fn apply(&mut self, _: &SimulatorSettings) {}
+        fn clear(&mut self) {}
+    }
+
+    impl SimulatorInfo for Named {
+        const NAME: &'static str = "Named";
+        const TRACK_DATA_ID: &'static str = "named";
+        const APP_ID: u32 = 0;
+        const EXECUTABLES: &'static [&'static str] = &["Named.exe"];
+
+        fn install_dir_of(exe: &Path) -> Option<PathBuf> {
+            exe.parent()?.parent().map(Path::to_owned)
+        }
+    }
+
+    #[test]
+    fn install_dir_is_where_the_game_last_ran_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("bin").join("Named.exe");
+        let (process, receiver) = watch::channel(Program::default());
+        let game = Game::new::<Named>(receiver);
+
+        process.send_replace(Program {
+            running: true,
+            exe: Some(exe.clone()),
+        });
+        assert_eq!(game.install_dir().as_deref(), Some(dir.path()));
+        assert!(game.is_running());
+
+        // Remembered once it stops
+        process.send_replace(Program {
+            running: false,
+            exe: Some(exe),
+        });
+        assert_eq!(game.install_dir().as_deref(), Some(dir.path()));
     }
 
     #[test]

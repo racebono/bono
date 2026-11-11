@@ -1,14 +1,13 @@
-//! Le Mans Ultimate, through Steam. Its plugin (`lmu/`) writes `UserData\bono\telemetry.db`
-//! in the game's folder while the game runs, a weekend at a time, and deletes it when the game
-//! closes. It can't while this app still has it open (Windows doesn't delete open files), and the app
-//! only lets go once Steam reports the game closed, which is after: so the app deletes it then. A
-//! file left behind anyway (a crash, or another program had it open) only counts while Steam reports
-//! the game running, and the plugin replaces it the next time the pilot drives.
+//! Le Mans Ultimate, installed by Steam or any other way. Its plugin (`lmu/`) writes
+//! `UserData\bono\telemetry.db` in the game's folder while the game runs, a weekend at a time, and
+//! deletes it when the game closes. It can't while this app still has it open (Windows doesn't
+//! delete open files), and the app only lets go once it sees the game closed, which is after: so the
+//! app deletes it then. A file left behind anyway (a crash, or another program had it open) only
+//! counts while the game runs, and the plugin replaces it the next time the pilot drives.
 
 use crate::{
-    sim::{PluginStatus, Simulator, SimulatorInfo, SimulatorSettings, probe::Probe},
+    sim::{Game, PluginStatus, Simulator, SimulatorInfo, SimulatorSettings, probe::Probe},
     sqlite::{Database, pool::Pool},
-    steam::{self},
     task::MaybeDone,
 };
 use bono_sim::recorder::{DATABASE, SETTINGS, try_remove_database};
@@ -34,11 +33,13 @@ const MAX_OPEN: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 /// finish (an answer being written, say) before giving up on deleting it.
 const REMOVE_FOR: Duration = Duration::from_secs(60);
 const REMOVE_EVERY: Duration = Duration::from_secs(1);
-/// While the game runs, how often Steam's libraries and the plugin's folder are looked at again for
-/// the database.
+/// While the game runs, how often the game's folder (which may mean Steam's libraries) and the
+/// plugin's are looked at again for the database.
 const LOOK_EVERY: Duration = Duration::from_secs(1);
 
 pub struct LeMansUltimate {
+    /// Where the game is, and whether it's running
+    game: Game,
     /// The database the plugin is writing right now, read-only
     live: Option<Pool>,
     /// Where the plugin's database is, if it's there, as last looked up in the background while
@@ -57,8 +58,9 @@ struct SettingsChange {
 }
 
 impl LeMansUltimate {
-    pub fn new() -> Self {
+    pub fn new(game: Game) -> Self {
         Self {
+            game,
             live: None,
             ready: Probe::new(LOOK_EVERY),
             settings: None,
@@ -74,11 +76,13 @@ impl LeMansUltimate {
     ) {
         let settings = self.settings.get_or_insert_with(|| {
             let (send, mut recv) = mpsc::unbounded_channel::<SettingsChange>();
+            let game = self.game.clone();
             tokio::spawn(async move {
                 while let Some(SettingsChange { change, purpose }) = recv.recv().await {
-                    // Discovery reads Steam's library files, so it belongs on a worker too.
-                    let folder = tokio::task::spawn_blocking(|| {
-                        Some(install_dir()?.join("UserData").join(FOLDER))
+                    // Discovery may read Steam's library files, so it belongs on a worker too.
+                    let game = game.clone();
+                    let folder = tokio::task::spawn_blocking(move || {
+                        Some(game.install_dir()?.join("UserData").join(FOLDER))
                     })
                     .await;
                     let Ok(Some(folder)) = folder else { continue };
@@ -101,15 +105,25 @@ impl SimulatorInfo for LeMansUltimate {
     const NAME: &'static str = "Le Mans Ultimate";
     const TRACK_DATA_ID: &'static str = "lmu";
     const APP_ID: u32 = STEAM_APP_ID;
+    const EXECUTABLES: &'static [&'static str] = &["Le Mans Ultimate.exe"];
+
+    /// The executable is at the top of the game's folder.
+    fn install_dir_of(exe: &Path) -> Option<PathBuf> {
+        exe.parent().map(Path::to_owned)
+    }
 }
 
 impl Simulator for LeMansUltimate {
     /// The database the plugin is writing right now, or `None` when the game isn't installed, isn't
     /// running, or hasn't written one yet (the pilot hasn't loaded a session).
     fn database(&mut self, running: bool) -> Option<&Pool> {
-        // Looked up in the background: finding the game searches Steam's libraries
+        // Looked up in the background: finding the game may search Steam's libraries
         let path = if running {
-            self.ready.get(database_path).cloned().flatten()
+            let game = self.game.clone();
+            self.ready
+                .get(move || database_path(&game))
+                .cloned()
+                .flatten()
         } else {
             self.ready.reset();
             None
@@ -120,7 +134,7 @@ impl Simulator for LeMansUltimate {
             // they were open goes
             if let Some(pool) = self.live.take() {
                 if !running && let Some(dir) = pool.database().path().parent() {
-                    tokio::spawn(remove_when_closed(dir.to_owned(), pool));
+                    tokio::spawn(remove_when_closed(dir.to_owned(), pool, self.game.clone()));
                 } else {
                     // The database can disappear while the game still runs. Closing the last
                     // pool reference joins its SQLite workers, so this branch needs a worker too.
@@ -165,9 +179,10 @@ impl Simulator for LeMansUltimate {
     }
 
     fn plugin(&mut self) -> Option<MaybeDone<PluginStatus>> {
-        Some(MaybeDone::spawn(async {
-            // Finding the game searches Steam's libraries
-            let install_dir = tokio::task::spawn_blocking(install_dir)
+        let game = self.game.clone();
+        Some(MaybeDone::spawn(async move {
+            // Finding the game may search Steam's libraries
+            let install_dir = tokio::task::spawn_blocking(move || game.install_dir())
                 .await
                 .ok()
                 .flatten();
@@ -176,12 +191,17 @@ impl Simulator for LeMansUltimate {
     }
 
     fn install_plugin(&mut self) -> MaybeDone<anyhow::Result<()>> {
-        MaybeDone::spawn(async {
+        let game = self.game.clone();
+        MaybeDone::spawn(async move {
             let result = async {
-                if steam::is_app_running(STEAM_APP_ID) {
+                // Both read the registry, and finding the game may search Steam's libraries
+                let (running, install_dir) =
+                    tokio::task::spawn_blocking(move || (game.is_running(), game.install_dir()))
+                        .await?;
+                if running {
                     anyhow::bail!("Le Mans Ultimate is running: close it first");
                 }
-                let Some(install_dir) = install_dir() else {
+                let Some(install_dir) = install_dir else {
                     anyhow::bail!("Le Mans Ultimate isn't installed");
                 };
                 plugin::install(&install_dir).await?;
@@ -203,14 +223,14 @@ impl Simulator for LeMansUltimate {
 /// Deletes the database in `dir` once nothing has it open: the pool's connections close as the ones
 /// in use are returned (the engineer's last answer, say). Stops if the game starts again, since its
 /// plugin replaces the file itself.
-async fn remove_when_closed(dir: PathBuf, pool: Pool) {
+async fn remove_when_closed(dir: PathBuf, pool: Pool, game: Game) {
     drop(pool);
 
     let mut waited = Duration::ZERO;
     loop {
         tokio::time::sleep(REMOVE_EVERY).await;
         waited += REMOVE_EVERY;
-        if steam::is_app_running(STEAM_APP_ID) {
+        if game.is_running() {
             return;
         }
 
@@ -235,15 +255,16 @@ async fn remove_when_closed(dir: PathBuf, pool: Pool) {
     }
 }
 
-/// The game's folder, if it's installed.
-fn install_dir() -> Option<PathBuf> {
-    steam::app_install_dir(STEAM_APP_ID).filter(|dir| dir.is_dir())
-}
-
-/// The plugin's database, if the game is installed and the file is there. Blocks: searches
+/// The plugin's database, if the game is installed and the file is there. Blocks: may search
 /// Steam's libraries.
-fn database_path() -> Option<PathBuf> {
-    Some(install_dir()?.join("UserData").join(FOLDER).join(DATABASE)).filter(|path| path.is_file())
+fn database_path(game: &Game) -> Option<PathBuf> {
+    Some(
+        game.install_dir()?
+            .join("UserData")
+            .join(FOLDER)
+            .join(DATABASE),
+    )
+    .filter(|path| path.is_file())
 }
 
 /// Changes settings.json in `folder`, keeping what else is in it.

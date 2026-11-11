@@ -72,7 +72,7 @@ impl App {
         let joysticks = Joysticks::new(&joystick);
         let event = sdl.event()?;
         let fonts = load_fonts()?;
-        // Initial Steam registry discovery and watcher creation can wait on the OS too.
+        // Initial Steam registry discovery and starting the watcher threads can wait on the OS too.
         let simulators = rt.spawn_blocking(ActiveSimulator::default);
 
         // Everything waited on happens before the window exists: SDL's init callback must return
