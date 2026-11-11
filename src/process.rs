@@ -83,10 +83,14 @@ pub struct ProcessWatcher {
     _stop: mpsc::Sender<Infallible>,
 }
 
+/// While none of the programs runs, how many looks before the processes are listed afresh (see
+/// `look`).
+const LIST_AFRESH_EVERY: u32 = 30;
+
 /// Until `stop` disconnects, or the processes can't be listed. Dropping the senders then closes the
 /// receivers.
 fn look(watched: Vec<Watched>, stop: mpsc::Receiver<Infallible>) {
-    // On Windows the path is read in `executable`, only for the processes named like a program
+    // On Windows the path is read by `Executables`, only for the processes named like a program
     let refresh = if cfg!(windows) {
         ProcessRefreshKind::nothing()
     } else {
@@ -94,9 +98,8 @@ fn look(watched: Vec<Watched>, stop: mpsc::Receiver<Infallible>) {
     }
     .without_tasks();
 
-    // Kept between looks: a new one would make sysinfo look at every process again as if it had
-    // just started, every look. It documents that every refresh reads each process's name again,
-    // and `executable` checks a process named like the game is really it
+    // Kept between looks: a new one would make sysinfo open every process again, the game
+    // included, every look. `Executables` checks that a process named like a program really is it
     let mut system = match System::new() {
         Ok(system) => system,
         Err(e) => {
@@ -106,10 +109,13 @@ fn look(watched: Vec<Watched>, stop: mpsc::Receiver<Infallible>) {
             return;
         }
     };
+    let mut executables = Executables::default();
+    let mut idle_looks = 0;
 
     loop {
         system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
 
+        let mut any_running = false;
         for program in &watched {
             let found = find(
                 system
@@ -117,11 +123,25 @@ fn look(watched: Vec<Watched>, stop: mpsc::Receiver<Infallible>) {
                     .values()
                     .map(|process| (process.pid(), process.exe(), process.name())),
                 program.names,
-                executable,
+                |pid, exe| executables.get(pid, exe),
             );
+            any_running |= found.is_some();
             program
                 .send
                 .send_if_modified(|current| current.update(found));
+        }
+        executables.forget_others();
+
+        // On Windows sysinfo reads a process's name when it first lists its id, not on every
+        // refresh, so a game given the id of a process that just exited could hide behind that
+        // one's name. A new list now and then finds it, only while no program runs, so a game
+        // running isn't opened again
+        idle_looks = if any_running { 0 } else { idle_looks + 1 };
+        if idle_looks >= LIST_AFRESH_EVERY {
+            idle_looks = 0;
+            if let Ok(fresh) = System::new() {
+                system = fresh;
+            }
         }
 
         match stop.recv_timeout(LOOK_EVERY) {
@@ -157,18 +177,76 @@ fn find<'a>(
         .map(|(_, exe)| exe)
 }
 
-/// The path of process `pid`'s executable, if it's still running and Windows tells it. Windows
-/// lists a process that exited for as long as another program holds a handle to it, and sysinfo
-/// doesn't document telling them apart, so this asks Windows itself.
+/// Tells the executable of processes named like a program, given their id and the path sysinfo
+/// has.
+///
+/// On Windows it asks Windows itself: Windows lists a process that exited for as long as another
+/// program holds a handle to it, and sysinfo doesn't document telling them apart. Each process is
+/// opened once, and its handle kept while it runs (which also keeps Windows from giving its id to
+/// another), so a game isn't opened again every look.
+#[derive(Default)]
+struct Executables {
+    /// The live processes asked about, and their executable
+    #[cfg(windows)]
+    opened: std::collections::HashMap<Pid, (std::os::windows::io::OwnedHandle, PathBuf)>,
+    /// The ids asked about since the last `forget_others`
+    #[cfg(windows)]
+    asked: std::collections::HashSet<Pid>,
+}
+
+impl Executables {
+    /// The path of process `pid`'s executable, if it's still running and Windows tells it.
+    #[cfg(windows)]
+    fn get(&mut self, pid: Pid, _: Option<&Path>) -> Option<PathBuf> {
+        self.asked.insert(pid);
+        if let Some((handle, path)) = self.opened.get(&pid) {
+            if win32::is_alive(handle) {
+                return Some(path.clone());
+            }
+            // Held, it'd keep Windows listing the process
+            self.opened.remove(&pid);
+            return None;
+        }
+
+        // Not kept if it fails, so it's tried again next look
+        let handle = win32::open(pid)?;
+        if !win32::is_alive(&handle) {
+            return None;
+        }
+        let path = win32::image(&handle)?;
+        self.opened.insert(pid, (handle, path.clone()));
+        Some(path)
+    }
+
+    /// The path sysinfo read, if it's there.
+    #[cfg(not(windows))]
+    fn get(&mut self, _: Pid, exe: Option<&Path>) -> Option<PathBuf> {
+        exe.filter(|exe| !exe.as_os_str().is_empty())
+            .map(Path::to_owned)
+    }
+
+    /// Lets go of the processes not asked about since the last call: they're gone, or aren't
+    /// named like a program any more.
+    fn forget_others(&mut self) {
+        #[cfg(windows)]
+        {
+            let asked = std::mem::take(&mut self.asked);
+            self.opened.retain(|pid, _| asked.contains(pid));
+        }
+    }
+}
+
 #[cfg(windows)]
-fn executable(pid: Pid, _: Option<&Path>) -> Option<PathBuf> {
+mod win32 {
     use std::{
         ffi::OsString,
         os::windows::{
             ffi::OsStringExt,
             io::{AsRawHandle, FromRawHandle, OwnedHandle},
         },
+        path::PathBuf,
     };
+    use sysinfo::Pid;
     use windows_sys::Win32::{
         Foundation::WAIT_TIMEOUT,
         System::Threading::{
@@ -177,48 +255,44 @@ fn executable(pid: Pid, _: Option<&Path>) -> Option<PathBuf> {
         },
     };
 
-    // The least access there is, which Windows grants for most processes, even elevated ones
-    let handle = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-            0,
-            pid.as_u32(),
-        )
-    };
-    if handle.is_null() {
-        return None;
-    }
-    // Closed when dropped
-    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-
-    // A process is signaled once it has exited
-    if unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } != WAIT_TIMEOUT {
-        return None;
+    /// Opens the process with the least access there is, which Windows grants for most processes,
+    /// even elevated ones.
+    pub fn open(pid: Pid) -> Option<OwnedHandle> {
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid.as_u32(),
+            )
+        };
+        // Closed when dropped
+        (!handle.is_null()).then(|| unsafe { OwnedHandle::from_raw_handle(handle) })
     }
 
-    // Windows' longest path, so no path is cut short
-    let mut path = vec![0u16; 32 * 1024];
-    let mut len = path.len() as u32;
-    let read = unsafe {
-        QueryFullProcessImageNameW(
-            handle.as_raw_handle(),
-            PROCESS_NAME_WIN32,
-            path.as_mut_ptr(),
-            &mut len,
-        )
-    };
-    if read == 0 {
-        return None;
+    /// Whether it hasn't exited: a process is signaled once it has.
+    pub fn is_alive(process: &OwnedHandle) -> bool {
+        unsafe { WaitForSingleObject(process.as_raw_handle(), 0) == WAIT_TIMEOUT }
     }
-    path.truncate(len as usize);
-    Some(OsString::from_wide(&path).into())
-}
 
-/// The path sysinfo read, if it's there.
-#[cfg(not(windows))]
-fn executable(_: Pid, exe: Option<&Path>) -> Option<PathBuf> {
-    exe.filter(|exe| !exe.as_os_str().is_empty())
-        .map(Path::to_owned)
+    /// The full path of its executable.
+    pub fn image(process: &OwnedHandle) -> Option<PathBuf> {
+        // Windows' longest path, so no path is cut short
+        let mut path = vec![0u16; 32 * 1024];
+        let mut len = path.len() as u32;
+        let read = unsafe {
+            QueryFullProcessImageNameW(
+                process.as_raw_handle(),
+                PROCESS_NAME_WIN32,
+                path.as_mut_ptr(),
+                &mut len,
+            )
+        };
+        if read == 0 {
+            return None;
+        }
+        path.truncate(len as usize);
+        Some(OsString::from_wide(&path).into())
+    }
 }
 
 #[cfg(test)]
@@ -317,6 +391,24 @@ mod tests {
                 exe: Some(exe),
             }
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn keeps_the_live_processes_it_opened_while_asked_about() {
+        let pid = Pid::from_u32(std::process::id());
+        let exe = std::env::current_exe().unwrap();
+        let mut executables = Executables::default();
+
+        let path = executables.get(pid, None).unwrap();
+        assert_eq!(path.file_name(), exe.file_name());
+        // Asked again, it answers from the handle it kept
+        assert_eq!(executables.get(pid, None), Some(path));
+        executables.forget_others();
+        assert!(executables.opened.contains_key(&pid));
+        // Not asked about since
+        executables.forget_others();
+        assert!(executables.opened.is_empty());
     }
 
     #[test]
