@@ -134,7 +134,10 @@ impl Simulator for LeMansUltimate {
             // they were open goes
             if let Some(pool) = self.live.take() {
                 if !running && let Some(dir) = pool.database().path().parent() {
-                    tokio::spawn(remove_when_closed(dir.to_owned(), pool, self.game.clone()));
+                    let game = self.game.clone();
+                    tokio::spawn(remove_when_closed(dir.to_owned(), pool, move || {
+                        game.is_running()
+                    }));
                 } else {
                     // The database can disappear while the game still runs. Closing the last
                     // pool reference joins its SQLite workers, so this branch needs a worker too.
@@ -149,9 +152,16 @@ impl Simulator for LeMansUltimate {
             .as_ref()
             .is_some_and(|pool| pool.database().path() != &path)
         {
-            // Closing joins the connections' threads: not on the UI thread
+            // The path is in the game's folder, so another copy runs now (Steam's flag can keep the
+            // game running through the switch): the one that closed has its recording removed like
+            // when the game closes. A copy still running from there would keep the file open, and
+            // SQLite doesn't let others delete the files it opens
             if let Some(pool) = self.live.take() {
-                tokio::task::spawn_blocking(move || drop(pool));
+                match pool.database().path().parent().map(Path::to_owned) {
+                    Some(dir) => drop(tokio::spawn(remove_when_closed(dir, pool, || false))),
+                    // Closing joins the connections' threads: not on the UI thread
+                    None => drop(tokio::task::spawn_blocking(move || drop(pool))),
+                }
             }
         }
         Some(self.live.get_or_insert_with(|| {
@@ -221,16 +231,16 @@ impl Simulator for LeMansUltimate {
 }
 
 /// Deletes the database in `dir` once nothing has it open: the pool's connections close as the ones
-/// in use are returned (the engineer's last answer, say). Stops if the game starts again, since its
-/// plugin replaces the file itself.
-async fn remove_when_closed(dir: PathBuf, pool: Pool, game: Game) {
+/// in use are returned (the engineer's last answer, say). Stops once `in_use` (e.g. the game started
+/// again, since its plugin replaces the file itself).
+async fn remove_when_closed(dir: PathBuf, pool: Pool, in_use: impl Fn() -> bool) {
     drop(pool);
 
     let mut waited = Duration::ZERO;
     loop {
         tokio::time::sleep(REMOVE_EVERY).await;
         waited += REMOVE_EVERY;
-        if game.is_running() {
+        if in_use() {
             return;
         }
 
