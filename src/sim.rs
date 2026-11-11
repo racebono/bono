@@ -44,6 +44,8 @@ pub struct Sim<T: ?Sized = dyn Simulator> {
     _watcher: Result<AppWatcher, watch::Sender<bool>>,
     /// Following the game again, started in the background by `ActiveSimulator::changed`
     retrying: Option<tokio::task::JoinHandle<Option<AppWatcher>>>,
+    /// Whether it was running at the last `started`
+    was_running: bool,
     simulator: T,
 }
 
@@ -74,6 +76,7 @@ impl<T> Sim<T> {
             track_data: Arc::new(Mutex::new(TrackData::new(T::TRACK_DATA_ID))),
             _watcher: watcher,
             retrying: None,
+            was_running: false,
             simulator,
         }
     }
@@ -105,6 +108,13 @@ where
     #[inline]
     pub fn is_running(&self) -> bool {
         *self.running.borrow() || process_running(&self.process)
+    }
+
+    /// Whether the game started running since the last call (or since it was made, on the first),
+    /// whether or not it's the current simulator. Only reads channels, so it's cheap every frame.
+    pub fn started(&mut self) -> bool {
+        let running = self.is_running();
+        !std::mem::replace(&mut self.was_running, running) && running
     }
 
     /// Waits for Steam or the processes to report the game starting or stopping. Closed channels
@@ -555,6 +565,7 @@ pub(crate) fn recording(pool: Pool) -> Box<Sim> {
         track_data: Arc::new(Mutex::new(TrackData::new("test".into()))),
         _watcher: Err(send),
         retrying: None,
+        was_running: false,
         simulator: Recording(pool),
     })
 }
@@ -616,6 +627,7 @@ mod tests {
             // Not the test's sender, so the test can close the channel
             _watcher: Err(watch::channel(false).0),
             retrying: None,
+            was_running: false,
             simulator: Fake,
         });
         (sim, send)
@@ -679,6 +691,19 @@ mod tests {
         drop(running);
         let mut active = ActiveSimulator::new(vec![sim], None);
         no_change(&mut active).await;
+    }
+
+    #[test]
+    fn reports_each_start_once() {
+        let (mut sim, steam) = fake("a", false);
+        assert!(!sim.started());
+        steam.send(true).unwrap();
+        assert!(sim.started());
+        assert!(!sim.started());
+        steam.send(false).unwrap();
+        assert!(!sim.started());
+        steam.send(true).unwrap();
+        assert!(sim.started());
     }
 
     #[tokio::test]

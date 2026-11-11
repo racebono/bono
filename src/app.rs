@@ -387,22 +387,20 @@ impl AppState {
     fn update_simulators(&mut self) {
         let opponent_frequency = *self.config.get().opponent_frequency();
         let settings = SimulatorSettings { opponent_frequency };
-        if self.applied_opponent_frequency != Some(opponent_frequency) {
-            for simulator in self.simulators.simulators() {
+        let changed = self.applied_opponent_frequency != Some(opponent_frequency);
+        for simulator in self.simulators.simulators() {
+            // A game Steam doesn't know about is only found once it runs, so the earlier settings
+            // may never have reached its folder
+            if simulator.started() || changed {
                 simulator.apply(&settings);
             }
-            self.applied_opponent_frequency = Some(opponent_frequency);
         }
+        self.applied_opponent_frequency = Some(opponent_frequency);
 
         // Only looks: a change waiting is taken, otherwise it's looked for again next frame
         if let Some(current) = self.simulators.changed().now_or_never() {
             match current {
-                Some(simulator) => {
-                    log::info!("{} is running", simulator.name());
-                    // A game Steam doesn't know about is only found once it runs, so the earlier
-                    // settings may never have reached its folder
-                    simulator.apply(&settings);
-                }
+                Some(simulator) => log::info!("{} is running", simulator.name()),
                 None => log::info!("No simulator is running"),
             }
 
