@@ -151,16 +151,17 @@ def generate(output):
             insert('session_sector', dict(session_id=session_id, sector=sector, local_yellow=0))
         for vehicle, driver, position in [(1, 'Ana Lopes', 2), (2, 'Lena Fischer', 1), (3, 'Sofia Ruiz', 3), (4, 'Tom Hughes', 4)]:
             laps = (9 if vehicle == 4 else 10) if t else 0
-            duration = lap_durations[vehicle][9] if t else None
+            # Of the laps it has completed, as are the sectors below
+            done = lap_durations[vehicle][:laps]
+            duration = done[-1] if done else None
             standing_id = insert('standings', dict(session_time=t, vehicle_id=vehicle, is_player=int(vehicle == 1),
                 driver=driver, vehicle='Mock Hypercar' if vehicle != 4 else 'Mock GT3',
                 vehicle_class='Hypercar' if vehicle != 4 else 'GT3', position=position, laps_completed=laps,
                 lap_start_time=now-10 if t else 0.0, lap_distance=800.0,
-                last_lap_time=duration, best_lap_time=min(lap_durations[vehicle][:10]) if t else None,
+                last_lap_time=duration, best_lap_time=min(done) if done else None,
                 laps_behind_leader=1 if vehicle == 4 else 0, pit_stops=0, penalties=0,
                 in_pits=0, flag='blue' if vehicle == 4 else 'green', finish_status='none'))
             # As the recorder writes them: a row per sector, NULL until there's a time
-            done = lap_durations[vehicle][:laps]
             best = done.index(min(done)) if done else None
             for sector in range(SECTORS):
                 insert('standing_sector', dict(standing_id=standing_id, sector=sector,

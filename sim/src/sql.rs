@@ -91,7 +91,8 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS car_state_by_vehicle ON car_state (vehicle_id, telemetry_id);
 
         -- sector: zero-based, a row per sector of the session's sector_count; standing_sector's
-        -- are telemetry's, session_sector's in the order the simulator reports them
+        -- are telemetry's, session_sector's in the order the simulator reports them, which may
+        -- not be telemetry's: the two aren't to be joined on it
         CREATE TABLE IF NOT EXISTS session (id INTEGER PRIMARY KEY{session});
         CREATE TABLE IF NOT EXISTS session_sector (
             session_id INTEGER NOT NULL REFERENCES session(id), sector INTEGER NOT NULL{session_sector},
@@ -331,10 +332,14 @@ impl<'conn> ScoringWriter<'conn> {
         // `sector_count` is compared, so a row it changes on is written whatever its sectors say,
         // and so is every standing: the last ones have the old count's sectors
         let count = sector_count(&session);
-        let recounted = self
+        if self
             .last_session
             .as_ref()
-            .is_some_and(|last| sector_count(last) != count);
+            .is_some_and(|last| sector_count(last) != count)
+        {
+            // Cars that aren't in this update too, once they're back
+            self.last_standings.clear();
+        }
         if self.last_session.as_ref().is_none_or(|last| {
             session.changed(last) || sectors_changed(&session.sectors, &last.sectors, count)
         }) {
@@ -347,12 +352,9 @@ impl<'conn> ScoringWriter<'conn> {
 
         for standing in standings {
             let key = standing.vehicle_id.get().unwrap_or(-1);
-            if !recounted
-                && self.last_standings.get(&key).is_some_and(|last| {
-                    !standing.changed(last)
-                        && !sectors_changed(&standing.sectors, &last.sectors, count)
-                })
-            {
+            if self.last_standings.get(&key).is_some_and(|last| {
+                !standing.changed(last) && !sectors_changed(&standing.sectors, &last.sectors, count)
+            }) {
                 continue;
             }
 

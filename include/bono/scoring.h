@@ -146,7 +146,7 @@
 
 // One timing sector of the session, in the `session_sector` table.
 #define SIM_SESSION_SECTOR_COLUMNS(X)                                                                     \
-    X(boolean, local_yellow, true)           /* sectors in the order the simulator reports them */
+    X(boolean, local_yellow, true)           /* sectors in the order the simulator reports them, which may not be telemetry's */
 
 // One car's time in one timing sector, in the `standing_sector` table. Each is the sector on its own,
 // never cumulative from the line.

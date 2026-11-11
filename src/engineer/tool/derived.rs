@@ -3073,8 +3073,9 @@ fn track_json(conn: &Connection, shared: &Shared, stream: &mut Stream) -> anyhow
     Ok(serde_json::to_string(&track)?)
 }
 
-/// The most recent telemetry rows (every car's) looked through for where the timing sectors change.
-const TIMING_ROWS: i64 = 200_000;
+/// The most recent player rows looked through for where the timing sectors change: minutes of
+/// driving, whatever the grid.
+const TIMING_ROWS: i64 = 60_000;
 
 /// Where each of the simulator's `count` timing sectors ends, as fractions of the lap: where the
 /// player's recent laps (since the row `from`, the session's first) went from one sector to the
@@ -3089,22 +3090,26 @@ fn timing_sector_ends(
     let Ok(count) = usize::try_from(count) else {
         return Ok(None);
     };
-    let top = scalar::<i64>(conn, "SELECT MAX(id) FROM telemetry", [])?.unwrap_or(0);
-    // A crossing is a row in the next sector after one in the sector before, both out of the pit
-    // lane; the clock going back is another session, whose crossings say nothing of this one's
+    // A crossing is a row in the next sector after one of the same car in the sector before, both
+    // out of the pit lane; the clock going back is another session, whose crossings say nothing of
+    // this one's
     let marks = rows(
         conn,
         "SELECT id, sector, lap_distance, session_time < before_t - 1.0 AS restart FROM (
              SELECT id, sector, lap_distance, in_pit_lane, session_time,
                     LAG(sector) OVER w AS before, LAG(session_time) OVER w AS before_t,
                     LAG(in_pit_lane) OVER w AS before_pit
-             FROM telemetry WHERE is_player = 1 AND id >= ? WINDOW w AS (ORDER BY id)
+             FROM (
+                 SELECT id, vehicle_id, sector, lap_distance, in_pit_lane, session_time
+                 FROM telemetry WHERE is_player = 1 AND id >= ? ORDER BY id DESC LIMIT ?
+             )
+             WINDOW w AS (PARTITION BY vehicle_id ORDER BY id)
          )
          WHERE (sector = before + 1 AND NOT coalesce(in_pit_lane, 0)
                 AND NOT coalesce(before_pit, 0))
             OR session_time < before_t - 1.0
          ORDER BY id",
-        [from.max(top - TIMING_ROWS + 1)],
+        params![from, TIMING_ROWS],
     )?;
     let mut crossings = vec![Vec::new(); count.saturating_sub(1)];
     for mark in marks {
