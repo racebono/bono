@@ -406,9 +406,9 @@ mod tests {
     #[test]
     fn finds_programs_by_their_executables_name_ignoring_case() {
         let paths = [
-            (1, r"C:\Other\other.exe"),
-            (2, r"D:\Games\Game\GAME64.EXE"),
-            (3, r"D:\Game\Game.exe"),
+            (1, r"C:/Other/other.exe"),
+            (2, r"D:/Games/Game/GAME64.EXE"),
+            (3, r"D:/Game/Game.exe"),
         ];
         assert_eq!(
             find([process(1, None, "other.exe")], NAMES, live(&paths)),
@@ -416,16 +416,16 @@ mod tests {
         );
         assert_eq!(
             find([process(2, None, "GAME64.EXE")], NAMES, live(&paths)),
-            Some(PathBuf::from(r"D:\Games\Game\GAME64.EXE"))
+            Some(PathBuf::from(r"D:/Games/Game/GAME64.EXE"))
         );
         // Named otherwise, but sysinfo has its path
         assert_eq!(
             find(
-                [process(3, Some(r"D:\Game\Game.exe"), "renamed")],
+                [process(3, Some(r"D:/Game/Game.exe"), "renamed")],
                 NAMES,
                 live(&paths)
             ),
-            Some(PathBuf::from(r"D:\Game\Game.exe"))
+            Some(PathBuf::from(r"D:/Game/Game.exe"))
         );
     }
 
@@ -438,7 +438,7 @@ mod tests {
             find(
                 [process(2, None, "Game.exe")],
                 NAMES,
-                live(&[(2, r"C:\Other\other.exe")])
+                live(&[(2, r"C:/Other/other.exe")])
             ),
             None
         );
@@ -453,14 +453,14 @@ mod tests {
                 process(1, None, "Game.exe"),
             ],
             NAMES,
-            live(&[(9, r"D:\B\Game.exe"), (5, r"D:\A\Game64.exe")]),
+            live(&[(9, r"D:/B/Game.exe"), (5, r"D:/A/Game64.exe")]),
         );
-        assert_eq!(found, Some(PathBuf::from(r"D:\A\Game64.exe")));
+        assert_eq!(found, Some(PathBuf::from(r"D:/A/Game64.exe")));
     }
 
     #[test]
     fn remembers_the_last_executable_once_stopped() {
-        let exe = PathBuf::from(r"D:\Game\Game.exe");
+        let exe = PathBuf::from(r"D:/Game/Game.exe");
         let mut program = Program::default();
         assert!(!program.update(None));
         assert!(program.update(Some(exe.clone())));
@@ -588,7 +588,7 @@ mod tests {
         let mut executables = Executables::default();
         executables
             .opened
-            .insert(pid, (handle, PathBuf::from(r"C:\Game.exe")));
+            .insert(pid, (handle, PathBuf::from(r"C:/Game.exe")));
         let (send, recv) = watch::channel(Program {
             running: true,
             exe: None,
