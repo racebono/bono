@@ -6,10 +6,8 @@ use std::{
     convert::Infallible,
     ffi::OsStr,
     io,
-    panic::resume_unwind,
     path::{Path, PathBuf},
     sync::mpsc::{self, RecvTimeoutError},
-    thread::JoinHandle,
     time::Duration,
 };
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -70,36 +68,20 @@ impl Programs {
         }
 
         let (stop, stopped) = mpsc::channel();
-        let thread = std::thread::Builder::new()
+        // Detached: it holds nothing that needs finishing, so dropping the watcher never waits
+        std::thread::Builder::new()
             .name("process watcher".into())
             .spawn(move || look(self.watched, stopped))?;
 
-        Ok(Some(ProcessWatcher {
-            stop: Some(stop),
-            thread: Some(thread),
-        }))
+        Ok(Some(ProcessWatcher { _stop: stop }))
     }
 }
 
-/// Following the programs, until dropped. Dropping it waits for the thread, which can be in the
-/// middle of a look (a few milliseconds): not on the UI thread.
+/// Following the programs, until dropped. Dropping it doesn't wait: the thread stops at the end of
+/// the look it's in, if any (a few milliseconds), then the receivers close.
 pub struct ProcessWatcher {
-    stop: Option<mpsc::Sender<Infallible>>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl Drop for ProcessWatcher {
-    fn drop(&mut self) {
-        // Disconnecting wakes the thread from its wait
-        drop(self.stop.take());
-        tokio::task::block_in_place(|| {
-            if let Some(thread) = self.thread.take() {
-                if let Err(payload) = thread.join() {
-                    resume_unwind(payload);
-                }
-            }
-        });
-    }
+    /// Disconnecting it wakes the thread from its wait, to stop
+    _stop: mpsc::Sender<Infallible>,
 }
 
 /// Until `stop` disconnects. Dropping the senders then closes the receivers.
@@ -268,11 +250,14 @@ mod tests {
                 .await
                 .expect("never saw this process running")
                 .unwrap();
+
+            // Dropping doesn't wait for the thread, which closes the receiver once it stops
+            drop(watcher);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while running.changed().await.is_ok() {}
+            })
+            .await
+            .expect("the receiver never closed");
         });
-        drop(watcher);
-        assert!(
-            running.has_changed().is_err(),
-            "the receiver closes with the watcher"
-        );
     }
 }

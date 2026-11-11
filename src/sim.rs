@@ -104,7 +104,7 @@ where
     /// Whether the game is running now: Steam reports it, or one of its processes is running.
     #[inline]
     pub fn is_running(&self) -> bool {
-        *self.running.borrow() || self.process.borrow().running
+        *self.running.borrow() || process_running(&self.process)
     }
 
     /// Waits for Steam or the processes to report the game starting or stopping. Closed channels
@@ -194,6 +194,12 @@ pub trait SimulatorInfo: Simulator {
     fn install_dir_of(exe: &Path) -> Option<PathBuf>;
 }
 
+/// Whether the process watcher reports the program running. Not once its channel closed: the last
+/// value it sent would stay forever.
+fn process_running(process: &watch::Receiver<Program>) -> bool {
+    process.has_changed().is_ok() && process.borrow().running
+}
+
 /// Where a game is installed and whether it's running, as Steam and the processes running tell:
 /// Steam only knows the games it installed, and only while they're started through it. Cheap to
 /// clone, for the simulator's background tasks.
@@ -219,18 +225,28 @@ impl Game {
     /// Whether one of the game's processes is running, or Steam reports it running. Reads Steam's
     /// registry key: brief, but not for every frame (`Sim::is_running` is).
     pub fn is_running(&self) -> bool {
-        self.0.process.borrow().running || steam::is_app_running(self.0.app_id)
+        process_running(&self.0.process) || steam::is_app_running(self.0.app_id)
     }
 
     /// The game's folder, if it's installed: the one it was last seen running from (since the app
-    /// started), otherwise the one Steam installed it in. Blocks: it may look through Steam's
-    /// libraries.
+    /// started), otherwise the one Steam installed it in. While Steam reports it running before its
+    /// process is seen, Steam's comes first: the copy last seen may be another one. Blocks: it reads
+    /// Steam's registry key and may look through its libraries.
     pub fn install_dir(&self) -> Option<PathBuf> {
         // Cloned, so the channel isn't held while looking at the disk
         let exe = self.0.process.borrow().exe.clone();
-        exe.and_then(|exe| (self.0.install_dir_of)(&exe))
-            .filter(|dir| dir.is_dir())
-            .or_else(|| steam::app_install_dir(self.0.app_id).filter(|dir| dir.is_dir()))
+        let seen = || {
+            exe.as_deref()
+                .and_then(self.0.install_dir_of)
+                .filter(|dir| dir.is_dir())
+        };
+        let steam = || steam::app_install_dir(self.0.app_id).filter(|dir| dir.is_dir());
+
+        if !process_running(&self.0.process) && steam::is_app_running(self.0.app_id) {
+            steam().or_else(seen)
+        } else {
+            seen().or_else(steam)
+        }
     }
 
     #[cfg(test)]
@@ -678,6 +694,12 @@ mod tests {
         assert!(active.current().is_some_and(|sim| sim.is_running()));
 
         process.send_modify(|program| program.running = false);
+        assert_eq!(next(&mut active).await, None);
+
+        // The watcher stopping while the game runs doesn't leave it running forever
+        process.send_modify(|program| program.running = true);
+        assert_eq!(next(&mut active).await, Some("a"));
+        drop(process);
         assert_eq!(next(&mut active).await, None);
     }
 

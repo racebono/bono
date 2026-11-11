@@ -383,11 +383,11 @@ impl AppState {
     }
 
     /// Passes the recording settings on to every simulator when they change (and at startup), and
-    /// follows which simulator is running.
+    /// to a simulator again when it starts running, and follows which simulator is running.
     fn update_simulators(&mut self) {
         let opponent_frequency = *self.config.get().opponent_frequency();
+        let settings = SimulatorSettings { opponent_frequency };
         if self.applied_opponent_frequency != Some(opponent_frequency) {
-            let settings = SimulatorSettings { opponent_frequency };
             for simulator in self.simulators.simulators() {
                 simulator.apply(&settings);
             }
@@ -397,7 +397,12 @@ impl AppState {
         // Only looks: a change waiting is taken, otherwise it's looked for again next frame
         if let Some(current) = self.simulators.changed().now_or_never() {
             match current {
-                Some(simulator) => log::info!("{} is running", simulator.name()),
+                Some(simulator) => {
+                    log::info!("{} is running", simulator.name());
+                    // A game Steam doesn't know about is only found once it runs, so the earlier
+                    // settings may never have reached its folder
+                    simulator.apply(&settings);
+                }
                 None => log::info!("No simulator is running"),
             }
 
