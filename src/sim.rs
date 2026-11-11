@@ -44,8 +44,8 @@ pub struct Sim<T: ?Sized = dyn Simulator> {
     _watcher: Result<AppWatcher, watch::Sender<bool>>,
     /// Following the game again, started in the background by `ActiveSimulator::changed`
     retrying: Option<tokio::task::JoinHandle<Option<AppWatcher>>>,
-    /// Whether it was running at the last `started`
-    was_running: bool,
+    /// Whether it was running, and whether its process was, at the last `started`
+    was_running: (bool, bool),
     simulator: T,
 }
 
@@ -76,7 +76,7 @@ impl<T> Sim<T> {
             track_data: Arc::new(Mutex::new(TrackData::new(T::TRACK_DATA_ID))),
             _watcher: watcher,
             retrying: None,
-            was_running: false,
+            was_running: (false, false),
             simulator,
         }
     }
@@ -111,10 +111,13 @@ where
     }
 
     /// Whether the game started running since the last call (or since it was made, on the first),
-    /// whether or not it's the current simulator. Only reads channels, so it's cheap every frame.
+    /// whether or not it's the current simulator. Its process being seen counts as a start too,
+    /// though Steam may already report it running: Steam's flag can lag behind one copy closing
+    /// as another starts. Only reads channels, so it's cheap every frame.
     pub fn started(&mut self) -> bool {
-        let running = self.is_running();
-        !std::mem::replace(&mut self.was_running, running) && running
+        let now = (self.is_running(), process_running(&self.process));
+        let (was_running, was_process) = std::mem::replace(&mut self.was_running, now);
+        (now.0 && !was_running) || (now.1 && !was_process)
     }
 
     /// Waits for Steam or the processes to report the game starting or stopping. Closed channels
@@ -565,7 +568,7 @@ pub(crate) fn recording(pool: Pool) -> Box<Sim> {
         track_data: Arc::new(Mutex::new(TrackData::new("test".into()))),
         _watcher: Err(send),
         retrying: None,
-        was_running: false,
+        was_running: (false, false),
         simulator: Recording(pool),
     })
 }
@@ -627,7 +630,7 @@ mod tests {
             // Not the test's sender, so the test can close the channel
             _watcher: Err(watch::channel(false).0),
             retrying: None,
-            was_running: false,
+            was_running: (false, false),
             simulator: Fake,
         });
         (sim, send)
@@ -704,6 +707,14 @@ mod tests {
         assert!(!sim.started());
         steam.send(true).unwrap();
         assert!(sim.started());
+
+        // Another copy starting while Steam still reports the first one running
+        let (process, receiver) = watch::channel(Program::default());
+        sim.process = receiver;
+        assert!(!sim.started());
+        process.send_modify(|program| program.running = true);
+        assert!(sim.started());
+        assert!(!sim.started());
     }
 
     #[tokio::test]
