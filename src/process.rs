@@ -10,10 +10,10 @@ use std::{
     sync::mpsc::{self, RecvTimeoutError},
     time::Duration,
 };
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::sync::watch;
 
-/// How often the processes are looked at. Each look is a few milliseconds of the thread's time.
+/// How often the processes are looked at. Each look is several milliseconds of the thread's time.
 const LOOK_EVERY: Duration = Duration::from_secs(1);
 
 /// What's known about a program from the processes running.
@@ -21,19 +21,18 @@ const LOOK_EVERY: Duration = Duration::from_secs(1);
 pub struct Program {
     /// Whether one of its processes is running now
     pub running: bool,
-    /// The executable it last ran from, kept once it stops: `None` until it's seen running with a
-    /// path the OS lets us read
+    /// The executable it runs from, kept once it stops: `None` until it's seen running
     pub exe: Option<PathBuf>,
 }
 
 impl Program {
-    /// Takes in a look at the processes: `found` is whether one is running, and its executable if
-    /// known. Returns whether anything changed.
-    fn update(&mut self, found: Option<Option<PathBuf>>) -> bool {
+    /// Takes in a look at the processes: `found` is the executable of the one running, if any.
+    /// Returns whether anything changed.
+    fn update(&mut self, found: Option<PathBuf>) -> bool {
         let before = (self.running, self.exe.clone());
         self.running = found.is_some();
-        if let Some(Some(exe)) = found {
-            self.exe = Some(exe);
+        if found.is_some() {
+            self.exe = found;
         }
         before != (self.running, self.exe.clone())
     }
@@ -84,26 +83,31 @@ pub struct ProcessWatcher {
     _stop: mpsc::Sender<Infallible>,
 }
 
-/// Until `stop` disconnects. Dropping the senders then closes the receivers.
+/// Until `stop` disconnects, or the processes can't be listed. Dropping the senders then closes the
+/// receivers.
 fn look(watched: Vec<Watched>, stop: mpsc::Receiver<Infallible>) {
-    let mut system = match System::new() {
-        Ok(system) => system,
-        Err(e) => {
-            log::warn!(
-                "Can't look at the processes running, so only Steam's games are found: {e:?}"
-            );
-            return;
-        }
-    };
-
-    // Always read again: a process id the OS reused for another program mustn't keep the old one's
-    // path
-    let refresh = ProcessRefreshKind::nothing()
-        .with_exe(UpdateKind::Always)
-        .without_tasks();
+    // On Windows the path is read in `executable`, only for the processes named like a program
+    let refresh = if cfg!(windows) {
+        ProcessRefreshKind::nothing()
+    } else {
+        ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::Always)
+    }
+    .without_tasks();
 
     loop {
+        // A new list every look: sysinfo doesn't document what it keeps of a process whose id
+        // the OS gave to another since, so every name and path here is from this look
+        let mut system = match System::new() {
+            Ok(system) => system,
+            Err(e) => {
+                log::warn!(
+                    "Can't look at the processes running, so only Steam's games are found: {e:?}"
+                );
+                return;
+            }
+        };
         system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
+
         for program in &watched {
             let found = find(
                 system
@@ -111,11 +115,13 @@ fn look(watched: Vec<Watched>, stop: mpsc::Receiver<Infallible>) {
                     .values()
                     .map(|process| (process.pid(), process.exe(), process.name())),
                 program.names,
+                executable,
             );
             program
                 .send
                 .send_if_modified(|current| current.update(found));
         }
+        drop(system);
 
         match stop.recv_timeout(LOOK_EVERY) {
             Ok(x) => match x {},
@@ -125,14 +131,15 @@ fn look(watched: Vec<Watched>, stop: mpsc::Receiver<Infallible>) {
     }
 }
 
-/// Whether one of `processes` (id, executable, name) is the program named any of `names`, and its
-/// executable if known. The executable's file name is what's compared, as sysinfo recommends; its
-/// process name only when the OS doesn't tell the path. Of several, the one with the lowest id that
-/// has a path, so the answer doesn't flip between them.
+/// The executable of the one of `processes` (id, executable, name) that's the program named any of
+/// `names`, if one is. A process named like it is only taken if `executable` (given its id and the
+/// path sysinfo has) tells the path of a live process, and the path's file name is one of `names`.
+/// Of several, the one with the lowest id, so the answer doesn't flip between them.
 fn find<'a>(
     processes: impl IntoIterator<Item = (Pid, Option<&'a Path>, &'a OsStr)>,
     names: &[&str],
-) -> Option<Option<PathBuf>> {
+    mut executable: impl FnMut(Pid, Option<&Path>) -> Option<PathBuf>,
+) -> Option<PathBuf> {
     let is_named = |name: Option<&OsStr>| {
         name.and_then(OsStr::to_str)
             .is_some_and(|name| names.iter().any(|n| n.eq_ignore_ascii_case(name)))
@@ -140,17 +147,77 @@ fn find<'a>(
 
     processes
         .into_iter()
-        .filter_map(|(pid, exe, name)| {
-            // An empty path is no path
-            let exe = exe.filter(|exe| !exe.as_os_str().is_empty());
-            let matches = match exe {
-                Some(exe) => is_named(exe.file_name()),
-                None => is_named(Some(name)),
-            };
-            matches.then_some((exe.is_none(), pid, exe))
+        .filter(|&(_, exe, name)| is_named(Some(name)) || is_named(exe.and_then(Path::file_name)))
+        .filter_map(|(pid, exe, _)| {
+            let exe = executable(pid, exe)?;
+            is_named(exe.file_name()).then_some((pid, exe))
         })
-        .min_by_key(|&(no_exe, pid, _)| (no_exe, pid))
-        .map(|(_, _, exe)| exe.map(Path::to_owned))
+        .min_by_key(|&(pid, _)| pid)
+        .map(|(_, exe)| exe)
+}
+
+/// The path of process `pid`'s executable, if it's still running and Windows tells it. Windows
+/// lists a process that exited for as long as another program holds a handle to it, and sysinfo
+/// doesn't document telling them apart, so this asks Windows itself.
+#[cfg(windows)]
+fn executable(pid: Pid, _: Option<&Path>) -> Option<PathBuf> {
+    use std::{
+        ffi::OsString,
+        os::windows::{
+            ffi::OsStringExt,
+            io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        },
+    };
+    use windows_sys::Win32::{
+        Foundation::WAIT_TIMEOUT,
+        System::Threading::{
+            OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, WaitForSingleObject,
+        },
+    };
+
+    // The least access there is, which Windows grants for most processes, even elevated ones
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid.as_u32(),
+        )
+    };
+    if handle.is_null() {
+        return None;
+    }
+    // Closed when dropped
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+
+    // A process is signaled once it has exited
+    if unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } != WAIT_TIMEOUT {
+        return None;
+    }
+
+    // Windows' longest path, so no path is cut short
+    let mut path = vec![0u16; 32 * 1024];
+    let mut len = path.len() as u32;
+    let read = unsafe {
+        QueryFullProcessImageNameW(
+            handle.as_raw_handle(),
+            PROCESS_NAME_WIN32,
+            path.as_mut_ptr(),
+            &mut len,
+        )
+    };
+    if read == 0 {
+        return None;
+    }
+    path.truncate(len as usize);
+    Some(OsString::from_wide(&path).into())
+}
+
+/// The path sysinfo read, if it's there.
+#[cfg(not(windows))]
+fn executable(_: Pid, exe: Option<&Path>) -> Option<PathBuf> {
+    exe.filter(|exe| !exe.as_os_str().is_empty())
+        .map(Path::to_owned)
 }
 
 #[cfg(test)]
@@ -167,67 +234,86 @@ mod tests {
         (Pid::from(pid), exe.map(Path::new), OsStr::new(name))
     }
 
+    /// What `executable` would say for each process: its own path, or `None` if it exited.
+    fn live<'a>(
+        paths: &'a [(usize, &'a str)],
+    ) -> impl FnMut(Pid, Option<&Path>) -> Option<PathBuf> {
+        move |pid, _| {
+            paths
+                .iter()
+                .find(|&&(id, _)| Pid::from(id) == pid)
+                .map(|&(_, path)| PathBuf::from(path))
+        }
+    }
+
     #[test]
     fn finds_programs_by_their_executables_name_ignoring_case() {
+        let paths = [
+            (1, r"C:\Other\other.exe"),
+            (2, r"D:\Games\Game\GAME64.EXE"),
+            (3, r"D:\Game\Game.exe"),
+        ];
         assert_eq!(
-            find(
-                [process(1, Some(r"C:\Other\other.exe"), "other.exe")],
-                NAMES
-            ),
+            find([process(1, None, "other.exe")], NAMES, live(&paths)),
             None
         );
         assert_eq!(
+            find([process(2, None, "GAME64.EXE")], NAMES, live(&paths)),
+            Some(PathBuf::from(r"D:\Games\Game\GAME64.EXE"))
+        );
+        // Named otherwise, but sysinfo has its path
+        assert_eq!(
             find(
-                [process(2, Some(r"D:\Games\Game\GAME64.EXE"), "GAME64.EXE")],
-                NAMES
+                [process(3, Some(r"D:\Game\Game.exe"), "renamed")],
+                NAMES,
+                live(&paths)
             ),
-            Some(Some(PathBuf::from(r"D:\Games\Game\GAME64.EXE")))
-        );
-        // The executable's name decides, whatever the process says it's called
-        assert_eq!(
-            find([process(3, Some(r"C:\Other\other.exe"), "Game.exe")], NAMES),
-            None
-        );
-        assert_eq!(
-            find([process(4, Some(r"D:\Game\Game.exe"), "renamed")], NAMES),
-            Some(Some(PathBuf::from(r"D:\Game\Game.exe")))
+            Some(PathBuf::from(r"D:\Game\Game.exe"))
         );
     }
 
     #[test]
-    fn falls_back_to_the_process_name_without_a_path() {
-        assert_eq!(find([process(1, None, "game.exe")], NAMES), Some(None));
-        assert_eq!(find([process(1, Some(""), "game.exe")], NAMES), Some(None));
-        assert_eq!(find([process(1, None, "other.exe")], NAMES), None);
+    fn only_takes_live_processes_whose_path_is_the_program() {
+        // Exited, or not one Windows tells about
+        assert_eq!(find([process(1, None, "Game.exe")], NAMES, live(&[])), None);
+        // Named like it, but another program
+        assert_eq!(
+            find(
+                [process(2, None, "Game.exe")],
+                NAMES,
+                live(&[(2, r"C:\Other\other.exe")])
+            ),
+            None
+        );
     }
 
     #[test]
-    fn prefers_a_process_with_a_path_then_the_lowest_id() {
+    fn prefers_the_lowest_id() {
         let found = find(
             [
+                process(9, None, "Game.exe"),
+                process(5, None, "Game64.exe"),
                 process(1, None, "Game.exe"),
-                process(9, Some(r"D:\B\Game.exe"), "Game.exe"),
-                process(5, Some(r"D:\A\Game64.exe"), "Game64.exe"),
             ],
             NAMES,
+            live(&[(9, r"D:\B\Game.exe"), (5, r"D:\A\Game64.exe")]),
         );
-        assert_eq!(found, Some(Some(PathBuf::from(r"D:\A\Game64.exe"))));
+        assert_eq!(found, Some(PathBuf::from(r"D:\A\Game64.exe")));
     }
 
     #[test]
     fn remembers_the_last_executable_once_stopped() {
+        let exe = PathBuf::from(r"D:\Game\Game.exe");
         let mut program = Program::default();
         assert!(!program.update(None));
-        assert!(program.update(Some(Some(PathBuf::from(r"D:\Game\Game.exe")))));
-        assert!(!program.update(Some(Some(PathBuf::from(r"D:\Game\Game.exe")))));
-        // Running without a readable path keeps the one seen before
-        assert!(!program.update(Some(None)));
+        assert!(program.update(Some(exe.clone())));
+        assert!(!program.update(Some(exe.clone())));
         assert!(program.update(None));
         assert_eq!(
             program,
             Program {
                 running: false,
-                exe: Some(PathBuf::from(r"D:\Game\Game.exe")),
+                exe: Some(exe),
             }
         );
     }
@@ -250,6 +336,10 @@ mod tests {
                 .await
                 .expect("never saw this process running")
                 .unwrap();
+            assert_eq!(
+                running.borrow().exe.as_deref().and_then(Path::file_name),
+                exe.file_name()
+            );
 
             // Dropping doesn't wait for the thread, which closes the receiver once it stops
             drop(watcher);
