@@ -6,7 +6,10 @@
 //! counts while the game runs, and the plugin replaces it the next time the pilot drives.
 
 use crate::{
-    sim::{Game, PluginStatus, Simulator, SimulatorInfo, SimulatorSettings, probe::Probe},
+    sim::{
+        Game, PluginStatus, Simulator, SimulatorInfo, SimulatorSettings, probe::Probe,
+        steam_install_dir,
+    },
     sqlite::{Database, pool::Pool},
     task::MaybeDone,
 };
@@ -104,8 +107,10 @@ impl LeMansUltimate {
 impl SimulatorInfo for LeMansUltimate {
     const NAME: &'static str = "Le Mans Ultimate";
     const TRACK_DATA_ID: &'static str = "lmu";
-    const APP_ID: u32 = STEAM_APP_ID;
+    const APP_ID: Option<u32> = Some(STEAM_APP_ID);
     const EXECUTABLES: &'static [&'static str] = &["Le Mans Ultimate.exe"];
+    /// Always installed through Steam, even when started outside it
+    const INSTALL_DIR: Option<fn() -> Option<PathBuf>> = Some(steam_install_dir::<Self>);
 }
 
 impl Simulator for LeMansUltimate {

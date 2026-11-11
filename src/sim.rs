@@ -32,15 +32,15 @@ pub struct Sim<T: ?Sized = dyn Simulator> {
     id: &'static str,
     /// Where the game is, shared with the simulator's background tasks
     game: Game,
-    /// Whether Steam reports the game running
+    /// Whether Steam reports the game running (never, for games Steam doesn't distribute)
     running: watch::Receiver<bool>,
     /// Whether one of the game's processes is running, even outside Steam. Closed if the
     /// processes can't be looked at
     process: watch::Receiver<Program>,
     /// Shared with the task that keeps the session's track description up to date
     track_data: Arc<Mutex<TrackData>>,
-    /// Kept for its thread. Without Steam's key for the game (it's not installed), a sender kept
-    /// so `running` stays false instead of closing
+    /// Kept for its thread. Without Steam's key for the game (it's not installed, or Steam doesn't
+    /// distribute it), a sender kept so `running` stays false instead of closing
     _watcher: Result<AppWatcher, watch::Sender<bool>>,
     /// Following the game again, started in the background by `ActiveSimulator::changed`
     retrying: Option<tokio::task::JoinHandle<Option<AppWatcher>>>,
@@ -55,13 +55,18 @@ impl<T> Sim<T> {
     where
         T: SimulatorInfo,
     {
-        let (watcher, running) = match AppWatcher::new(T::APP_ID) {
-            Ok(watcher) => {
+        let (watcher, running) = match T::APP_ID.map(AppWatcher::new) {
+            Some(Ok(watcher)) => {
                 let running = watcher.subscribe();
                 (Ok(watcher), running)
             }
-            Err(e) => {
-                log::debug!("Not following {} starting and stopping: {e}", T::NAME);
+            not_followed => {
+                if let Some(Err(e)) = not_followed {
+                    log::debug!(
+                        "Not following {} starting and stopping in Steam: {e}",
+                        T::NAME
+                    );
+                }
                 let (send, running) = watch::channel(false);
                 (Err(send), running)
             }
@@ -98,10 +103,12 @@ where
     }
 
     /// Looks for the game's folder, if it's installed, in the background (see
-    /// `Game::install_dir`).
-    pub fn install_dir(&self) -> MaybeDone<Option<PathBuf>> {
+    /// `Game::install_dir`). `None` for simulators that don't look for it
+    /// (`SimulatorInfo::INSTALL_DIR`).
+    pub fn install_dir(&self) -> Option<MaybeDone<Option<PathBuf>>> {
+        self.game.0.install_dir?;
         let game = self.game.clone();
-        MaybeDone::spawn_blocking(move || game.install_dir())
+        Some(MaybeDone::spawn_blocking(move || game.install_dir()))
     }
 
     /// Whether the game is running now: Steam reports it, or one of its processes is running.
@@ -197,11 +204,22 @@ where
 pub trait SimulatorInfo: Simulator {
     const NAME: &'static str;
     const TRACK_DATA_ID: &'static str;
-    /// Steam's id for the game
-    const APP_ID: u32;
+    /// Steam's id for the game, for games Steam distributes: Steam reporting it running counts too
+    const APP_ID: Option<u32>;
     /// The game's executables, by file name (compared ignoring ASCII case): any of them running is
     /// the game running, even when started outside Steam
     const EXECUTABLES: &'static [&'static str];
+    /// Finds the game's folder, for simulators that need it (to install a plugin, or read what the
+    /// game writes there) or that tell whether the game is installed: `None` for the others, which
+    /// only follow it running. e.g. `steam_install_dir`. Blocks: it may look at the disk
+    const INSTALL_DIR: Option<fn() -> Option<PathBuf>>;
+}
+
+/// The folder Steam installed `T` in, if it did, for `SimulatorInfo::INSTALL_DIR`. Blocks: it looks
+/// through Steam's libraries.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn steam_install_dir<T: SimulatorInfo + ?Sized>() -> Option<PathBuf> {
+    steam::app_install_dir(T::APP_ID?).filter(|dir| dir.is_dir())
 }
 
 /// Whether the process watcher reports the program running. Not once its channel closed: the last
@@ -210,14 +228,15 @@ fn process_running(process: &watch::Receiver<Program>) -> bool {
     process.has_changed().is_ok() && process.borrow().running
 }
 
-/// Steam's installation folder and the running state from Steam or process detection.
-/// Cheap to clone, for the simulator's background tasks.
+/// Where a game is installed, and whether it's running as Steam (for games it distributes) and the
+/// running processes tell. Cheap to clone, for the simulator's background tasks.
 #[derive(Clone)]
 pub struct Game(Arc<GameInner>);
 
 struct GameInner {
-    app_id: u32,
+    app_id: Option<u32>,
     process: watch::Receiver<Program>,
+    install_dir: Option<fn() -> Option<PathBuf>>,
 }
 
 impl Game {
@@ -226,26 +245,30 @@ impl Game {
         Self(Arc::new(GameInner {
             app_id: T::APP_ID,
             process,
+            install_dir: T::INSTALL_DIR,
         }))
     }
 
     /// Whether one of the game's processes is running, or Steam reports it running. Reads Steam's
-    /// registry key: brief, but not for every frame (`Sim::is_running` is).
+    /// registry key, for games Steam distributes: brief, but not for every frame
+    /// (`Sim::is_running` is).
     pub fn is_running(&self) -> bool {
-        process_running(&self.0.process) || steam::is_app_running(self.0.app_id)
+        process_running(&self.0.process) || self.0.app_id.is_some_and(steam::is_app_running)
     }
 
-    /// The game's Steam installation folder. LMU and RaceRoom are always installed through
-    /// Steam, even when launched outside it. Blocks: it may look through Steam's libraries.
+    /// The game's folder, if it's installed, as its simulator finds it
+    /// (`SimulatorInfo::INSTALL_DIR`): `None` for simulators that don't look for it. Blocks: it may
+    /// look through Steam's libraries.
     pub fn install_dir(&self) -> Option<PathBuf> {
-        steam::app_install_dir(self.0.app_id).filter(|dir| dir.is_dir())
+        (self.0.install_dir?)()
     }
 
     #[cfg(test)]
     pub(crate) fn fake() -> Self {
         Self(Arc::new(GameInner {
-            app_id: 0,
+            app_id: None,
             process: watch::channel(Program::default()).1,
+            install_dir: None,
         }))
     }
 }
@@ -462,11 +485,12 @@ fn poll_retry(sim: &mut Sim<dyn Simulator>, due: bool) {
         });
     }
 
+    // Only games Steam distributes are followed through it
     if due
         && sim.retrying.is_none()
         && (sim._watcher.is_err() || sim.running.has_changed().is_err())
+        && let Some(app_id) = sim.game.0.app_id
     {
-        let app_id = sim.game.0.app_id;
         sim.retrying = Some(tokio::task::spawn_blocking(move || {
             AppWatcher::new(app_id).ok()
         }));
@@ -749,28 +773,78 @@ mod tests {
         fn clear(&mut self) {}
     }
 
+    /// A game Steam doesn't distribute, whose folder isn't looked for.
     impl SimulatorInfo for Named {
         const NAME: &'static str = "Named";
         const TRACK_DATA_ID: &'static str = "named";
-        const APP_ID: u32 = 0;
+        const APP_ID: Option<u32> = None;
         const EXECUTABLES: &'static [&'static str] = &["Named.exe"];
+        const INSTALL_DIR: Option<fn() -> Option<PathBuf>> = None;
     }
 
     #[test]
-    fn process_path_does_not_supply_an_installation_folder() {
-        let dir = tempfile::tempdir().unwrap();
+    fn follows_a_game_steam_doesnt_distribute_by_its_process() {
         let (process, receiver) = watch::channel(Program::default());
         let game = Game::new::<Named>(receiver);
-        let installed = game.install_dir();
-        // Even an existing folder reported by a live process must not override Steam.
+        // Steam isn't asked (outside Windows it would say running)
+        assert!(!game.is_running());
+        assert_eq!(game.install_dir(), None);
+
+        let mut sim: Box<Sim> = Box::new(Sim::new(Named, game.clone()));
+        assert!(sim.install_dir().is_none());
+        assert!(!sim.is_running());
+        poll_retry(&mut sim, true);
+        assert!(sim.retrying.is_none(), "followed through Steam");
+
         process.send_replace(Program {
             running: true,
-            exe: Some(dir.path().join("Named.exe")),
+            exe: Some(PathBuf::from("Named.exe")),
         });
-        assert_eq!(game.install_dir(), installed);
         assert!(game.is_running());
-        process.send_modify(|program| program.running = false);
-        assert_eq!(game.install_dir(), installed);
+        assert!(sim.is_running());
+        assert!(sim.started());
+        // Where it runs from isn't taken for its folder
+        assert_eq!(game.install_dir(), None);
+    }
+
+    struct Located;
+
+    impl Simulator for Located {
+        fn database(&mut self, _: bool) -> Option<&Pool> {
+            None
+        }
+        fn apply(&mut self, _: &SimulatorSettings) {}
+        fn clear(&mut self) {}
+    }
+
+    fn located_dir() -> Option<PathBuf> {
+        Some(PathBuf::from("installed"))
+    }
+
+    /// A game found its own way.
+    impl SimulatorInfo for Located {
+        const NAME: &'static str = "Located";
+        const TRACK_DATA_ID: &'static str = "located";
+        const APP_ID: Option<u32> = None;
+        const EXECUTABLES: &'static [&'static str] = &["Located.exe"];
+        const INSTALL_DIR: Option<fn() -> Option<PathBuf>> = Some(located_dir);
+    }
+
+    #[tokio::test]
+    async fn install_dir_is_where_the_simulator_finds_it() {
+        let (process, receiver) = watch::channel(Program::default());
+        let game = Game::new::<Located>(receiver);
+        assert_eq!(game.install_dir(), located_dir());
+
+        // Even a live process elsewhere doesn't change it
+        process.send_replace(Program {
+            running: true,
+            exe: Some(PathBuf::from("elsewhere").join("Located.exe")),
+        });
+        assert_eq!(game.install_dir(), located_dir());
+
+        // Looked for in the background
+        assert!(Sim::new(Located, game).install_dir().is_some());
     }
 
     #[test]
