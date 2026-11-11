@@ -3,8 +3,10 @@
 //! running every second and reports each program starting and stopping.
 
 use std::{
+    convert::Infallible,
     ffi::OsStr,
     io,
+    panic::resume_unwind,
     path::{Path, PathBuf},
     sync::mpsc::{self, RecvTimeoutError},
     thread::JoinHandle,
@@ -66,10 +68,12 @@ impl Programs {
         if self.watched.is_empty() {
             return Ok(None);
         }
+
         let (stop, stopped) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("process watcher".into())
             .spawn(move || look(self.watched, stopped))?;
+
         Ok(Some(ProcessWatcher {
             stop: Some(stop),
             thread: Some(thread),
@@ -80,7 +84,7 @@ impl Programs {
 /// Following the programs, until dropped. Dropping it waits for the thread, which can be in the
 /// middle of a look (a few milliseconds): not on the UI thread.
 pub struct ProcessWatcher {
-    stop: Option<mpsc::Sender<()>>,
+    stop: Option<mpsc::Sender<Infallible>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -88,14 +92,18 @@ impl Drop for ProcessWatcher {
     fn drop(&mut self) {
         // Disconnecting wakes the thread from its wait
         drop(self.stop.take());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        tokio::task::block_in_place(|| {
+            if let Some(thread) = self.thread.take() {
+                if let Err(payload) = thread.join() {
+                    resume_unwind(payload);
+                }
+            }
+        });
     }
 }
 
 /// Until `stop` disconnects. Dropping the senders then closes the receivers.
-fn look(watched: Vec<Watched>, stop: mpsc::Receiver<()>) {
+fn look(watched: Vec<Watched>, stop: mpsc::Receiver<Infallible>) {
     let mut system = match System::new() {
         Ok(system) => system,
         Err(e) => {
@@ -105,6 +113,7 @@ fn look(watched: Vec<Watched>, stop: mpsc::Receiver<()>) {
             return;
         }
     };
+
     // Always read again: a process id the OS reused for another program mustn't keep the old one's
     // path
     let refresh = ProcessRefreshKind::nothing()
@@ -127,8 +136,9 @@ fn look(watched: Vec<Watched>, stop: mpsc::Receiver<()>) {
         }
 
         match stop.recv_timeout(LOOK_EVERY) {
+            Ok(x) => match x {},
             Err(RecvTimeoutError::Timeout) => {}
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Disconnected) => return,
         }
     }
 }
