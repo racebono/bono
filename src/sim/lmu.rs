@@ -89,9 +89,15 @@ impl LeMansUltimate {
                 let check = self.plugin_check.take();
                 // Finished, so this doesn't wait
                 match check.and_then(|check| unconstrained(check).now_or_never()) {
-                    // The game, or its plugin, not found while the game runs: the lookup failed,
-                    // which says nothing new about the plugin it loaded
-                    Some(Ok(status)) if status.installed.is_none() => {
+                    // The game's plugin not found while the game runs, the app's copy's version not
+                    // read, or the plugin's no longer read once it was: the lookup failed, which says
+                    // nothing new about the plugin loaded
+                    Some(Ok(status))
+                        if status.installed.is_none()
+                            || status.bundled_version().is_none()
+                            || (self.plugin_outdated.is_some()
+                                && matches!(status.installed, Some(None))) =>
+                    {
                         self.plugin_outdated.get_or_insert(false);
                     }
                     Some(Ok(status)) => {
@@ -368,6 +374,57 @@ mod tests {
         assert!(lmu.database(false).is_none());
         assert!(!lmu.plugin_outdated());
         assert!(lmu.plugin_outdated.is_none());
+    }
+
+    /// The verdict after a look at the plugin that found `status`.
+    async fn looked_at(lmu: &mut LeMansUltimate, status: PluginStatus) -> bool {
+        let check = tokio::spawn(async move { status });
+        while !check.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        lmu.plugin_check = Some(check);
+        lmu.plugin_looked = Some(Instant::now());
+        lmu.plugin_current()
+    }
+
+    #[tokio::test]
+    async fn a_failed_look_says_nothing_new_about_the_plugin() {
+        let version = |patch| {
+            Some(Some(crate::sim::Version {
+                major: 0,
+                minor: 2,
+                patch,
+                build: None,
+            }))
+        };
+        let status = |installed, bundled| PluginStatus {
+            installed,
+            enabled: true,
+            bundled,
+            same_as_bundled: None,
+        };
+
+        let mut lmu = LeMansUltimate::new();
+        assert!(!looked_at(&mut lmu, status(version(0), version(1))).await);
+        assert!(lmu.plugin_outdated());
+        // The plugin not found, the app's copy's version not read, the plugin's no longer read
+        for failed in [
+            status(None, version(1)),
+            status(version(0), None),
+            status(version(0), Some(None)),
+            status(Some(None), version(1)),
+        ] {
+            assert!(!looked_at(&mut lmu, failed).await);
+            assert!(lmu.plugin_outdated());
+        }
+        // A look that tells
+        assert!(looked_at(&mut lmu, status(version(1), version(1))).await);
+        assert!(!lmu.plugin_outdated());
+
+        // Without a version on the first look, the plugin's too old to say it
+        let mut lmu = LeMansUltimate::new();
+        assert!(!looked_at(&mut lmu, status(Some(None), version(1))).await);
+        assert!(lmu.plugin_outdated());
     }
 
     #[tokio::test]
