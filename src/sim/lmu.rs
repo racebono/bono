@@ -18,7 +18,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     sync::mpsc,
@@ -41,6 +41,9 @@ const REMOVE_EVERY: Duration = Duration::from_secs(1);
 /// While the game runs, how often Steam's libraries and the plugin's folder are looked at again for
 /// the database.
 const LOOK_EVERY: Duration = Duration::from_secs(1);
+/// While the game runs, how often the plugin is looked at again: once a run would do, as the game
+/// keeps the one it loaded, but the app may not see the game stop between two runs.
+const PLUGIN_LOOK_EVERY: Duration = Duration::from_secs(30);
 
 pub struct LeMansUltimate {
     /// The database the plugin is writing right now, read-only
@@ -52,8 +55,10 @@ pub struct LeMansUltimate {
     /// in order (two "clear" requests at once would otherwise both read the same count). Started
     /// with the first change
     settings: Option<mpsc::UnboundedSender<SettingsChange>>,
-    /// Looking at the plugin the game runs, once a run
+    /// Looking at the plugin the game runs
     plugin_check: Option<JoinHandle<PluginStatus>>,
+    /// When the plugin was last looked at this run
+    plugin_looked: Option<Instant>,
     /// Whether the plugin the game runs is outdated, once looked at this run
     plugin_outdated: Option<bool>,
 }
@@ -71,43 +76,46 @@ impl LeMansUltimate {
             ready: Probe::new(LOOK_EVERY),
             settings: None,
             plugin_check: None,
+            plugin_looked: None,
             plugin_outdated: None,
         }
     }
 
-    /// Whether the plugin the game runs is known to be up to date, looking at it in the background
-    /// if it hasn't been yet this run. The game loads the plugin as it starts, and the plugin can't
-    /// be replaced while the game runs, so one look a run tells.
+    /// Whether the plugin the game runs is known to be up to date, as last looked at in the
+    /// background (every `PLUGIN_LOOK_EVERY`, keeping the last answer meanwhile).
     fn plugin_current(&mut self) -> bool {
-        if self.plugin_outdated.is_none() {
-            match &self.plugin_check {
-                Some(check) if check.is_finished() => {
-                    let check = self.plugin_check.take();
-                    // Finished, so this doesn't wait
-                    match check.and_then(|check| unconstrained(check).now_or_never()) {
-                        Some(Ok(status)) => {
-                            let outdated = status.outdated();
-                            if outdated {
-                                log::warn!(
-                                    "The Le Mans Ultimate plugin is outdated: its sessions aren't \
-                                     followed until it's updated"
-                                );
-                            }
-                            self.plugin_outdated = Some(outdated);
+        match &self.plugin_check {
+            Some(check) if check.is_finished() => {
+                let check = self.plugin_check.take();
+                // Finished, so this doesn't wait
+                match check.and_then(|check| unconstrained(check).now_or_never()) {
+                    Some(Ok(status)) => {
+                        let outdated = status.outdated();
+                        if outdated && self.plugin_outdated != Some(true) {
+                            log::warn!(
+                                "The Le Mans Ultimate plugin is outdated: its sessions aren't \
+                                 followed until it's updated"
+                            );
                         }
-                        // Not knowing isn't knowing it's outdated
-                        Some(Err(e)) => {
-                            log::error!("Error looking at the Le Mans Ultimate plugin: {e}");
-                            self.plugin_outdated = Some(false);
-                        }
-                        None => {}
+                        self.plugin_outdated = Some(outdated);
                     }
-                }
-                Some(_) => {}
-                None => {
-                    self.plugin_check = Some(tokio::spawn(plugin_status()));
+                    // Not knowing isn't knowing it's outdated: the last answer stands, if any
+                    Some(Err(e)) => {
+                        log::error!("Error looking at the Le Mans Ultimate plugin: {e}");
+                        self.plugin_outdated.get_or_insert(false);
+                    }
+                    None => {}
                 }
             }
+            Some(_) => {}
+            None if self
+                .plugin_looked
+                .is_none_or(|at| at.elapsed() >= PLUGIN_LOOK_EVERY) =>
+            {
+                self.plugin_looked = Some(Instant::now());
+                self.plugin_check = Some(tokio::spawn(plugin_status()));
+            }
+            None => {}
         }
         self.plugin_outdated == Some(false)
     }
@@ -167,6 +175,7 @@ impl Simulator for LeMansUltimate {
             self.ready.reset();
             // The next run may load another plugin: detached, its answer is dropped
             self.plugin_check = None;
+            self.plugin_looked = None;
             self.plugin_outdated = None;
             None
         };

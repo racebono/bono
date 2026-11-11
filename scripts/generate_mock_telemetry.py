@@ -159,14 +159,14 @@ def generate(output):
                 last_lap_time=duration, best_lap_time=min(lap_durations[vehicle][:10]) if t else None,
                 laps_behind_leader=1 if vehicle == 4 else 0, pit_stops=0, penalties=0,
                 in_pits=0, flag='blue' if vehicle == 4 else 'green', finish_status='none'))
-            if t:
-                done = lap_durations[vehicle][:laps]
-                best = done.index(min(done))
-                for sector in range(SECTORS):
-                    insert('standing_sector', dict(standing_id=standing_id, sector=sector,
-                        last_lap=sector_durations[vehicle][laps - 1][sector],
-                        best_lap=sector_durations[vehicle][best][sector],
-                        best=min(s[sector] for s in sector_durations[vehicle][:laps])))
+            # As the recorder writes them: a row per sector, NULL until there's a time
+            done = lap_durations[vehicle][:laps]
+            best = done.index(min(done)) if done else None
+            for sector in range(SECTORS):
+                insert('standing_sector', dict(standing_id=standing_id, sector=sector,
+                    last_lap=sector_durations[vehicle][laps - 1][sector] if done else None,
+                    best_lap=sector_durations[vehicle][best][sector] if done else None,
+                    best=min(s[sector] for s in sector_durations[vehicle][:laps]) if done else None))
     for session_type, chances in [('race', [0.0, 0.01, 0.03, 0.25, 0.70]), ('practice', [0.0, 0.01, 0.01, 0.02, 0.03])]:
         for fraction, chance in zip([0, .25, .5, .75, 1], chances):
             insert('forecast', dict(session_time=now, session_type=session_type, session_fraction=fraction,

@@ -1067,7 +1067,10 @@ fn standing(
     for (i, sector) in out.sectors.iter_mut().take(SECTORS).enumerate() {
         sector.last_lap = split(previous, i).into();
         sector.best_lap = split(best, i).into();
-        sector.current_lap = split(current, i).into();
+        // Past the last sector, the lap is over: it's no longer the one in progress
+        if i < SECTORS - 1 {
+            sector.current_lap = split(current, i).into();
+        }
     }
 
     out.time_behind_next = seconds(driver.time_delta_front).into();

@@ -313,7 +313,7 @@ fn thread(shared: &Shared, requests: &mpsc::Receiver<Request>) {
             Some(request) => {
                 let result = match request.job {
                     Job::Sql { query, limit } => data.sql(shared, &query, limit),
-                    Job::Track => track_json(&data.conn, shared),
+                    Job::Track => track_json(&data.conn, shared, &mut data.stream),
                     #[cfg(test)]
                     Job::Sync => data.sync(shared).map(|()| String::new()),
                 };
@@ -1479,6 +1479,9 @@ pub(super) struct Stream {
     /// The standings' laps completed, by car, and when that last changed
     laps_completed: HashMap<i64, (i64, f64)>,
     official: HashMap<i64, Vec<Official>>,
+    /// The simulator's timing sectors' ends as last seen whole, and the session start, track and
+    /// sector count they're for: a window of the laps can miss lines the session has crossed
+    timing: Option<((i64, String, i64), Vec<f64>)>,
 }
 
 impl Stream {
@@ -2994,7 +2997,7 @@ pub(super) fn track_turns(track: &Json, length: f64) -> Vec<Turn> {
 }
 
 /// `track`: the description as it's published, its positions lined up with the laps.
-fn track_json(conn: &Connection, shared: &Shared) -> anyhow::Result<String> {
+fn track_json(conn: &Connection, shared: &Shared, stream: &mut Stream) -> anyhow::Result<String> {
     let session = row(conn, "SELECT * FROM session ORDER BY id DESC LIMIT 1", [])?;
     let name = session.as_ref().and_then(|s| s.text("track"));
     let session_length = session.as_ref().and_then(|s| s.f("track_length"));
@@ -3028,7 +3031,21 @@ fn track_json(conn: &Connection, shared: &Shared) -> anyhow::Result<String> {
         .and_then(|s| s.i("sector_count"))
         .filter(|n| *n > 0);
     let timing = match (count, length) {
-        (Some(count), Some(length)) => timing_sector_ends(conn, count, length)?,
+        (Some(count), Some(length)) => {
+            let from = stream.session_start;
+            let key = (from, name.unwrap_or_default().to_owned(), count);
+            match timing_sector_ends(conn, count, length, from)? {
+                Some(ends) => {
+                    stream.timing = Some((key, ends.clone()));
+                    Some(ends)
+                }
+                None => stream
+                    .timing
+                    .as_ref()
+                    .filter(|(seen, _)| *seen == key)
+                    .map(|(_, ends)| ends.clone()),
+            }
+        }
         _ => None,
     };
     let described = track.get("sector").and_then(Json::as_array).map(Vec::len);
@@ -3056,34 +3073,38 @@ fn track_json(conn: &Connection, shared: &Shared) -> anyhow::Result<String> {
     Ok(serde_json::to_string(&track)?)
 }
 
-/// The most recent player rows looked through for where the timing sectors change.
+/// The most recent telemetry rows (every car's) looked through for where the timing sectors change.
 const TIMING_ROWS: i64 = 200_000;
 
 /// Where each of the simulator's `count` timing sectors ends, as fractions of the lap: where the
-/// player's recent laps went from one sector to the next (the median of them), the last at the
-/// line. `None` until every one of those lines has been crossed this session.
+/// player's recent laps (since the row `from`, the session's first) went from one sector to the
+/// next (the median of them), the last at the line. `None` until every one of those lines has been
+/// crossed, or if they don't come one after another round the lap.
 fn timing_sector_ends(
     conn: &Connection,
     count: i64,
     length: f64,
+    from: i64,
 ) -> rusqlite::Result<Option<Vec<f64>>> {
     let Ok(count) = usize::try_from(count) else {
         return Ok(None);
     };
     let top = scalar::<i64>(conn, "SELECT MAX(id) FROM telemetry", [])?.unwrap_or(0);
-    // A crossing is a row in the next sector after one in the sector before; the clock going back
-    // is another session, whose crossings say nothing of this one's track
+    // A crossing is a row in the next sector after one in the sector before, both out of the pit
+    // lane; the clock going back is another session, whose crossings say nothing of this one's
     let marks = rows(
         conn,
         "SELECT id, sector, lap_distance, session_time < before_t - 1.0 AS restart FROM (
              SELECT id, sector, lap_distance, in_pit_lane, session_time,
-                    LAG(sector) OVER w AS before, LAG(session_time) OVER w AS before_t
-             FROM telemetry WHERE is_player = 1 AND id > ? WINDOW w AS (ORDER BY id)
+                    LAG(sector) OVER w AS before, LAG(session_time) OVER w AS before_t,
+                    LAG(in_pit_lane) OVER w AS before_pit
+             FROM telemetry WHERE is_player = 1 AND id >= ? WINDOW w AS (ORDER BY id)
          )
-         WHERE (sector = before + 1 AND NOT coalesce(in_pit_lane, 0))
+         WHERE (sector = before + 1 AND NOT coalesce(in_pit_lane, 0)
+                AND NOT coalesce(before_pit, 0))
             OR session_time < before_t - 1.0
          ORDER BY id",
-        [top - TIMING_ROWS],
+        [from.max(top - TIMING_ROWS + 1)],
     )?;
     let mut crossings = vec![Vec::new(); count.saturating_sub(1)];
     for mark in marks {
@@ -3112,7 +3133,10 @@ fn timing_sector_ends(
         ends.push(seen[seen.len() / 2] / length);
     }
     ends.push(1.0);
-    Ok(Some(ends))
+    // Stray crossings (a rewind, say) can outnumber the real ones over a lap or two
+    let in_order = ends.first().is_some_and(|first| *first > 0.0)
+        && ends.windows(2).all(|pair| pair[0] < pair[1]);
+    Ok(in_order.then_some(ends))
 }
 
 #[cfg(test)]
@@ -4505,6 +4529,8 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+        // The session's start known, as it is once the tables have read the recording
+        engineer.sync().await.unwrap();
         let track = run(&engineer, serde_json::json!({"command": "track"})).await;
         let track: Json = serde_json::from_str(&track).unwrap();
         assert_eq!(track["sector_source"], "timing", "{track}");
@@ -4516,10 +4542,18 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ends, [0.3, 0.65, 1.0]);
 
-        // Without the lines crossed, the description's four can't stand for the three
+        // Lines out of the window, or never crossed: what was seen of them this session stands
         let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
         conn.execute("UPDATE telemetry SET sector = 0", []).unwrap();
         drop(conn);
+        let track = run(&engineer, serde_json::json!({"command": "track"})).await;
+        let track: Json = serde_json::from_str(&track).unwrap();
+        assert_eq!(track["sector_source"], "timing", "{track}");
+
+        // Without the lines ever seen, the description's four can't stand for the three
+        drop(engineer);
+        let engineer = reopen(&dir);
+        engineer.sync().await.unwrap();
         let track = run(&engineer, serde_json::json!({"command": "track"})).await;
         let track: Json = serde_json::from_str(&track).unwrap();
         assert_eq!(track["sector_source"], "none", "{track}");

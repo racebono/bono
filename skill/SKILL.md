@@ -251,7 +251,8 @@ session_first_id`; the other tables number their rows separately (`telemetry_id`
   `(vehicle_id, telemetry_id)`). A setting change is a new row: use it for when a setting changed.
 - `session`, `standings`, `forecast`: scoring rows, written on change, with `session_sector` and
   `standing_sector`: a row per timing sector of a `session` or `standings` row (`session_id` or
-  `standing_id`, `sector` from 0). Prefer the tables above.
+  `standing_id`, `sector` from 0; `session_sector`'s yellows are in the simulator's own order). Prefer
+  the tables above.
 
 Traps: `tire_wear` falls during a stint where it's life left; `tire_optimal_temperature` above 200
 is Kelvin; `*_left/center/right` are edges seen from behind the car (inside is right on left tyres

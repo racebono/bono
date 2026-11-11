@@ -90,7 +90,8 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS car_state_by_vehicle ON car_state (vehicle_id, telemetry_id);
 
-        -- sector: zero-based, as in telemetry; a row per sector of the session's sector_count
+        -- sector: zero-based, a row per sector of the session's sector_count; standing_sector's
+        -- are telemetry's, session_sector's in the order the simulator reports them
         CREATE TABLE IF NOT EXISTS session (id INTEGER PRIMARY KEY{session});
         CREATE TABLE IF NOT EXISTS session_sector (
             session_id INTEGER NOT NULL REFERENCES session(id), sector INTEGER NOT NULL{session_sector},
@@ -327,8 +328,13 @@ impl<'conn> ScoringWriter<'conn> {
         session: bono_session_info,
         standings: Vec<bono_standing>,
     ) -> rusqlite::Result<()> {
-        // `sector_count` is compared, so a row it changes on is written whatever its sectors say
+        // `sector_count` is compared, so a row it changes on is written whatever its sectors say,
+        // and so is every standing: the last ones have the old count's sectors
         let count = sector_count(&session);
+        let recounted = self
+            .last_session
+            .as_ref()
+            .is_some_and(|last| sector_count(last) != count);
         if self.last_session.as_ref().is_none_or(|last| {
             session.changed(last) || sectors_changed(&session.sectors, &last.sectors, count)
         }) {
@@ -341,9 +347,12 @@ impl<'conn> ScoringWriter<'conn> {
 
         for standing in standings {
             let key = standing.vehicle_id.get().unwrap_or(-1);
-            if self.last_standings.get(&key).is_some_and(|last| {
-                !standing.changed(last) && !sectors_changed(&standing.sectors, &last.sectors, count)
-            }) {
+            if !recounted
+                && self.last_standings.get(&key).is_some_and(|last| {
+                    !standing.changed(last)
+                        && !sectors_changed(&standing.sectors, &last.sectors, count)
+                })
+            {
                 continue;
             }
 
@@ -502,16 +511,19 @@ mod tests {
         writer.write(session.clone(), vec![car.clone()]).unwrap();
         assert_eq!(count("session"), 2);
         assert_eq!(count("session_sector"), 18);
+        // The new count's sectors for every car, changed or not
+        assert_eq!(count("standings"), 3);
+        assert_eq!(count("standing_sector"), 34);
         car.sectors[5].last_lap = Some(40.0).into();
         writer.write(session.clone(), vec![car.clone()]).unwrap();
-        assert_eq!(count("standings"), 2);
+        assert_eq!(count("standings"), 3);
 
         // A session without a count has none
         session.sector_count = None.into();
         writer.write(session, vec![car]).unwrap();
         assert_eq!(count("session"), 3);
         assert_eq!(count("session_sector"), 18);
-        assert_eq!(count("standing_sector"), 32);
+        assert_eq!((count("standings"), count("standing_sector")), (4, 34));
     }
 
     #[test]
