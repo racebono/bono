@@ -135,7 +135,8 @@ fn look(watched: Vec<Watched>, stop: mpsc::Receiver<Infallible>) {
         // On Windows sysinfo reads a process's name when it first lists its id, not on every
         // refresh, so a game given the id of a process that just exited could hide behind that
         // one's name. A new list now and then finds it, only while no program runs, so a game
-        // running isn't opened again
+        // running isn't opened again (a second game hidden so while another runs is only found
+        // once that one closes: two simulators at once isn't worth reopening the running one)
         idle_looks = if any_running { 0 } else { idle_looks + 1 };
         if idle_looks >= LIST_AFRESH_EVERY {
             idle_looks = 0;
