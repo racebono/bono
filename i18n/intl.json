@@ -206,9 +206,9 @@
         "ca": "Instal·lat a {path}"
     },
     "simulators.not_installed_hover": {
-        "en": "Steam doesn't have it installed in any of its libraries. Installed some other way? Start the game and Bono finds it until Bono closes",
-        "es": "Steam no lo tiene instalado en ninguna de sus bibliotecas. ¿Lo instalaste de otra forma? Inicia el juego y Bono lo encontrará hasta que cierres Bono",
-        "ca": "Steam no el té instal·lat a cap de les seves biblioteques. L'has instal·lat d'una altra manera? Inicia el joc i Bono el trobarà fins que tanquis Bono"
+        "en": "Steam doesn't have it installed in any of its libraries",
+        "es": "Steam no lo tiene instalado en ninguna de sus bibliotecas",
+        "ca": "Steam no el té instal·lat a cap de les seves biblioteques"
     },
     "plugin.not_installed": {
         "en": "Plugin not installed: nothing is recorded",
@@ -1471,9 +1471,9 @@
         "ca": "Bono segueix la cursa des del joc. Alguns jocs necessiten un plugin per fer-ho: instal·la'l aquí, amb el joc tancat."
     },
     "onboarding.no_simulator": {
-        "en": "None of these games is installed through Steam. If you installed one some other way, start it and Bono finds it until Bono closes. You can still continue: the Simulators menu shows them once one is found.",
-        "es": "Ninguno de estos juegos está instalado con Steam. Si instalaste alguno de otra forma, inícialo y Bono lo encontrará hasta que cierres Bono. Puedes continuar igualmente: el menú Simuladores los muestra en cuanto encuentre uno.",
-        "ca": "Cap d'aquests jocs no està instal·lat amb Steam. Si n'has instal·lat algun d'una altra manera, inicia'l i Bono el trobarà fins que tanquis Bono. Pots continuar igualment: el menú Simuladors els mostra quan en trobi un."
+        "en": "None of these games was found in Steam's libraries. You can still continue and check the Simulators menu after installing one through Steam.",
+        "es": "No se ha encontrado ninguno de estos juegos en las bibliotecas de Steam. Puedes continuar y consultar el menú Simuladores después de instalar uno con Steam.",
+        "ca": "No s'ha trobat cap d'aquests jocs a les biblioteques de Steam. Pots continuar i consultar el menú Simuladors després d'instal·lar-ne un amb Steam."
     },
     "error.download": {
         "en": "Error downloading",

@@ -12,12 +12,9 @@ use std::{
     future::Future,
     num::NonZeroU32,
     ops::{Deref, DerefMut},
-    path::{Path, PathBuf},
+    path::PathBuf,
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, watch};
@@ -37,7 +34,7 @@ pub struct Sim<T: ?Sized = dyn Simulator> {
     game: Game,
     /// Whether Steam reports the game running
     running: watch::Receiver<bool>,
-    /// Whether one of the game's processes is running, however it was installed. Closed if the
+    /// Whether one of the game's processes is running, even outside Steam. Closed if the
     /// processes can't be looked at
     process: watch::Receiver<Program>,
     /// Shared with the task that keeps the session's track description up to date
@@ -47,9 +44,8 @@ pub struct Sim<T: ?Sized = dyn Simulator> {
     _watcher: Result<AppWatcher, watch::Sender<bool>>,
     /// Following the game again, started in the background by `ActiveSimulator::changed`
     retrying: Option<tokio::task::JoinHandle<Option<AppWatcher>>>,
-    /// Whether it was running, whether Steam reported it, and whether its process was, at the last
-    /// `started`
-    was_running: (bool, bool, bool),
+    /// Whether the game and its process were running at the last `started`
+    was_running: (bool, bool),
     simulator: T,
 }
 
@@ -80,7 +76,7 @@ impl<T> Sim<T> {
             track_data: Arc::new(Mutex::new(TrackData::new(T::TRACK_DATA_ID))),
             _watcher: watcher,
             retrying: None,
-            was_running: (false, false, false),
+            was_running: (false, false),
             simulator,
         }
     }
@@ -114,26 +110,13 @@ where
         *self.running.borrow() || process_running(&self.process)
     }
 
-    /// Whether the game started running since the last call (or since it was made, on the first),
-    /// whether or not it's the current simulator. Its process being seen counts as a start too,
-    /// though Steam may already report it running: Steam's flag can lag behind one copy closing
-    /// as another starts. Only reads channels, so it's cheap every frame.
-    ///
-    /// Also tells `Game::install_dir` which of them reported the game last, so it's called every
-    /// frame (by `update_simulators`).
+    /// Whether the game started running since the last call. A newly seen process also counts
+    /// while Steam still reports it running, so settings reach a game restarted under a lagging
+    /// Steam flag. Only reads channels, so it's cheap every frame.
     pub fn started(&mut self) -> bool {
-        let steam = *self.running.borrow();
         let process = process_running(&self.process);
-        let now = (steam || process, steam, process);
-        let (was_running, was_steam, was_process) = std::mem::replace(&mut self.was_running, now);
-
-        // In this order: a process seen in the same frame tells the copy for sure
-        if steam && !was_steam {
-            self.game.0.steam_first.store(true, Ordering::Relaxed);
-        }
-        if process && !was_process {
-            self.game.0.steam_first.store(false, Ordering::Relaxed);
-        }
+        let now = (*self.running.borrow() || process, process);
+        let (was_running, was_process) = std::mem::replace(&mut self.was_running, now);
         (now.0 && !was_running) || (process && !was_process)
     }
 
@@ -217,11 +200,8 @@ pub trait SimulatorInfo: Simulator {
     /// Steam's id for the game
     const APP_ID: u32;
     /// The game's executables, by file name (compared ignoring ASCII case): any of them running is
-    /// the game running, however it was installed
+    /// the game running, even when started outside Steam
     const EXECUTABLES: &'static [&'static str];
-
-    /// The game's folder, given the path of one of its `EXECUTABLES`.
-    fn install_dir_of(exe: &Path) -> Option<PathBuf>;
 }
 
 /// Whether the process watcher reports the program running. Not once its channel closed: the last
@@ -230,19 +210,14 @@ fn process_running(process: &watch::Receiver<Program>) -> bool {
     process.has_changed().is_ok() && process.borrow().running
 }
 
-/// Where a game is installed and whether it's running, as Steam and the processes running tell:
-/// Steam only knows the games it installed, and only while they're started through it. Cheap to
-/// clone, for the simulator's background tasks.
+/// Steam's installation folder and the running state from Steam or process detection.
+/// Cheap to clone, for the simulator's background tasks.
 #[derive(Clone)]
 pub struct Game(Arc<GameInner>);
 
 struct GameInner {
     app_id: u32,
     process: watch::Receiver<Program>,
-    install_dir_of: fn(&Path) -> Option<PathBuf>,
-    /// Whether Steam reported the game starting since one of its processes was last seen starting
-    /// (`Sim::started` keeps it): its copy may not be the one last seen then
-    steam_first: AtomicBool,
 }
 
 impl Game {
@@ -251,8 +226,6 @@ impl Game {
         Self(Arc::new(GameInner {
             app_id: T::APP_ID,
             process,
-            install_dir_of: T::install_dir_of,
-            steam_first: AtomicBool::new(false),
         }))
     }
 
@@ -262,26 +235,10 @@ impl Game {
         process_running(&self.0.process) || steam::is_app_running(self.0.app_id)
     }
 
-    /// The game's folder, if it's installed: the one it was last seen running from (since the app
-    /// started), otherwise the one Steam installed it in. Steam's comes first if Steam reported the
-    /// game starting since its process was last seen starting: the copy last seen may be another
-    /// one. Steam's flag outlasting a process doesn't count, so the folder of a copy that just closed
-    /// stays, for its recording to be removed. Blocks: it may look through Steam's libraries.
+    /// The game's Steam installation folder. LMU and RaceRoom are always installed through
+    /// Steam, even when launched outside it. Blocks: it may look through Steam's libraries.
     pub fn install_dir(&self) -> Option<PathBuf> {
-        // Cloned, so the channel isn't held while looking at the disk
-        let exe = self.0.process.borrow().exe.clone();
-        let seen = || {
-            exe.as_deref()
-                .and_then(self.0.install_dir_of)
-                .filter(|dir| dir.is_dir())
-        };
-        let steam = || steam::app_install_dir(self.0.app_id).filter(|dir| dir.is_dir());
-
-        if self.0.steam_first.load(Ordering::Relaxed) {
-            steam().or_else(seen)
-        } else {
-            seen().or_else(steam)
-        }
+        steam::app_install_dir(self.0.app_id).filter(|dir| dir.is_dir())
     }
 
     #[cfg(test)]
@@ -289,8 +246,6 @@ impl Game {
         Self(Arc::new(GameInner {
             app_id: 0,
             process: watch::channel(Program::default()).1,
-            install_dir_of: |_| None,
-            steam_first: AtomicBool::new(false),
         }))
     }
 }
@@ -591,7 +546,7 @@ pub(crate) fn recording(pool: Pool) -> Box<Sim> {
         track_data: Arc::new(Mutex::new(TrackData::new("test".into()))),
         _watcher: Err(send),
         retrying: None,
-        was_running: (false, false, false),
+        was_running: (false, false),
         simulator: Recording(pool),
     })
 }
@@ -653,7 +608,7 @@ mod tests {
             // Not the test's sender, so the test can close the channel
             _watcher: Err(watch::channel(false).0),
             retrying: None,
-            was_running: (false, false, false),
+            was_running: (false, false),
             simulator: Fake,
         });
         (sim, send)
@@ -731,44 +686,13 @@ mod tests {
         steam.send(true).unwrap();
         assert!(sim.started());
 
-        // Another copy starting while Steam still reports the first one running
+        // The process starting while Steam still reports the game running
         let (process, receiver) = watch::channel(Program::default());
         sim.process = receiver;
         assert!(!sim.started());
         process.send_modify(|program| program.running = true);
         assert!(sim.started());
         assert!(!sim.started());
-    }
-
-    #[test]
-    fn install_dir_follows_whichever_reported_the_game_last() {
-        let (mut sim, steam) = fake("a", false);
-        let (process, receiver) = watch::channel(Program::default());
-        sim.process = receiver;
-        let steam_first = |sim: &Sim| sim.game.0.steam_first.load(Ordering::Relaxed);
-        sim.started();
-        assert!(!steam_first(&sim));
-
-        // Steam starting a copy: it may not be the one last seen
-        steam.send(true).unwrap();
-        sim.started();
-        assert!(steam_first(&sim));
-        process.send_modify(|program| program.running = true);
-        sim.started();
-        assert!(!steam_first(&sim));
-
-        // Steam's flag outlasting the process keeps the copy seen
-        process.send_modify(|program| program.running = false);
-        sim.started();
-        assert!(!steam_first(&sim));
-
-        // Both in the same frame: the process tells the copy
-        steam.send(false).unwrap();
-        sim.started();
-        steam.send(true).unwrap();
-        process.send_modify(|program| program.running = true);
-        sim.started();
-        assert!(!steam_first(&sim));
     }
 
     #[tokio::test]
@@ -830,32 +754,23 @@ mod tests {
         const TRACK_DATA_ID: &'static str = "named";
         const APP_ID: u32 = 0;
         const EXECUTABLES: &'static [&'static str] = &["Named.exe"];
-
-        fn install_dir_of(exe: &Path) -> Option<PathBuf> {
-            exe.parent()?.parent().map(Path::to_owned)
-        }
     }
 
     #[test]
-    fn install_dir_is_where_the_game_last_ran_from() {
+    fn process_path_does_not_supply_an_installation_folder() {
         let dir = tempfile::tempdir().unwrap();
-        let exe = dir.path().join("bin").join("Named.exe");
         let (process, receiver) = watch::channel(Program::default());
         let game = Game::new::<Named>(receiver);
-
+        let installed = game.install_dir();
+        // Even an existing folder reported by a live process must not override Steam.
         process.send_replace(Program {
             running: true,
-            exe: Some(exe.clone()),
+            exe: Some(dir.path().join("Named.exe")),
         });
-        assert_eq!(game.install_dir().as_deref(), Some(dir.path()));
+        assert_eq!(game.install_dir(), installed);
         assert!(game.is_running());
-
-        // Remembered once it stops
-        process.send_replace(Program {
-            running: false,
-            exe: Some(exe),
-        });
-        assert_eq!(game.install_dir().as_deref(), Some(dir.path()));
+        process.send_modify(|program| program.running = false);
+        assert_eq!(game.install_dir(), installed);
     }
 
     #[test]

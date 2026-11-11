@@ -1,4 +1,4 @@
-//! Le Mans Ultimate, installed by Steam or any other way. Its plugin (`lmu/`) writes
+//! Le Mans Ultimate, installed by Steam. Its plugin (`lmu/`) writes
 //! `UserData\bono\telemetry.db` in the game's folder while the game runs, a weekend at a time, and
 //! deletes it when the game closes. It can't while this app still has it open (Windows doesn't
 //! delete open files), and the app only lets go once it sees the game closed, which is after: so the
@@ -106,11 +106,6 @@ impl SimulatorInfo for LeMansUltimate {
     const TRACK_DATA_ID: &'static str = "lmu";
     const APP_ID: u32 = STEAM_APP_ID;
     const EXECUTABLES: &'static [&'static str] = &["Le Mans Ultimate.exe"];
-
-    /// The executable is at the top of the game's folder.
-    fn install_dir_of(exe: &Path) -> Option<PathBuf> {
-        exe.parent().map(Path::to_owned)
-    }
 }
 
 impl Simulator for LeMansUltimate {
@@ -152,16 +147,10 @@ impl Simulator for LeMansUltimate {
             .as_ref()
             .is_some_and(|pool| pool.database().path() != &path)
         {
-            // The path is in the game's folder, so another copy runs now (Steam's flag can keep the
-            // game running through the switch): the one that closed has its recording removed like
-            // when the game closes. A copy still running from there would keep the file open, and
-            // SQLite doesn't let others delete the files it opens
+            // Steam's installation folder changed. Closing joins the connections' threads;
+            // release them off the UI thread without deleting a possibly active recording.
             if let Some(pool) = self.live.take() {
-                match pool.database().path().parent().map(Path::to_owned) {
-                    Some(dir) => drop(tokio::spawn(remove_when_closed(dir, pool, || false))),
-                    // Closing joins the connections' threads: not on the UI thread
-                    None => drop(tokio::task::spawn_blocking(move || drop(pool))),
-                }
+                tokio::task::spawn_blocking(move || drop(pool));
             }
         }
         Some(self.live.get_or_insert_with(|| {

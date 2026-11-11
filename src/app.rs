@@ -389,8 +389,7 @@ impl AppState {
         let settings = SimulatorSettings { opponent_frequency };
         let changed = self.applied_opponent_frequency != Some(opponent_frequency);
         for simulator in self.simulators.simulators() {
-            // A game Steam doesn't know about is only found once it runs, so the earlier settings
-            // may never have reached its folder
+            // Reapply on process starts too: Steam's running flag can lag behind a restart.
             if simulator.started() || changed {
                 simulator.apply(&settings);
             }

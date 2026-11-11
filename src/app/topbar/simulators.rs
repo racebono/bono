@@ -34,7 +34,7 @@ pub struct SimulatorsTopbar {
 #[derive(Default)]
 struct Found {
     install_dir: Option<PathBuf>,
-    /// Looking for `install_dir`, where the game last ran from or in Steam's libraries
+    /// Looking for `install_dir` in Steam's libraries
     dir_lookup: Option<MaybeDone<Option<PathBuf>>>,
     plugin: Option<PluginStatus>,
     lookup: Option<MaybeDone<PluginStatus>>,

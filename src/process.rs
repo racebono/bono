@@ -1,10 +1,10 @@
-//! Which programs are running, by their executable's file name, for games Steam doesn't know
-//! about (installed some other way, or started outside Steam). A thread looks at the processes
-//! running every second and reports each program starting and stopping.
+//! Which programs are running, by their executable's file name, even when started outside Steam.
+//! A thread looks at the processes running every second and reports each program starting and
+//! stopping.
 
 use std::{
     convert::Infallible,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     io,
     path::{Path, PathBuf},
     sync::mpsc::{self, RecvTimeoutError},
@@ -83,9 +83,9 @@ pub struct ProcessWatcher {
     _stop: mpsc::Sender<Infallible>,
 }
 
-/// While none of the programs runs, how many looks before the processes are listed afresh (see
-/// `look`).
-const LIST_AFRESH_EVERY: u32 = 30;
+/// How many looks between fresh Windows process-name snapshots.
+#[cfg(windows)]
+const SNAPSHOT_EVERY: u32 = 30;
 
 /// Until `stop` disconnects, or the processes can't be listed. Dropping the senders then closes the
 /// receivers.
@@ -110,40 +110,39 @@ fn look(watched: Vec<Watched>, stop: mpsc::Receiver<Infallible>) {
         }
     };
     let mut executables = Executables::default();
-    let mut idle_looks = 0;
+    #[cfg(windows)]
+    let mut until_snapshot: u32 = 0;
 
     loop {
         system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
 
-        let mut any_running = false;
-        for program in &watched {
-            let found = find(
-                system
-                    .processes()
-                    .values()
-                    .map(|process| (process.pid(), process.exe(), process.name())),
-                program.names,
-                |pid, exe| executables.get(pid, exe),
-            );
-            any_running |= found.is_some();
-            program
-                .send
-                .send_if_modified(|current| current.update(found));
-        }
-        executables.forget_others();
-
-        // On Windows sysinfo reads a process's name when it first lists its id, not on every
-        // refresh, so a game given the id of a process that just exited could hide behind that
-        // one's name. A new list now and then finds it, only while no program runs, so a game
-        // running isn't opened again (a second game hidden so while another runs is only found
-        // once that one closes: two simulators at once isn't worth reopening the running one)
-        idle_looks = if any_running { 0 } else { idle_looks + 1 };
-        if idle_looks >= LIST_AFRESH_EVERY {
-            idle_looks = 0;
-            if let Ok(fresh) = System::new() {
-                system = fresh;
-            }
-        }
+        // sysinfo's cached names can hide a game after PID reuse. A snapshot supplies fresh
+        // candidate names without us opening every process again, including the running game.
+        #[cfg(windows)]
+        let snapshot = {
+            let snapshot = if until_snapshot == 0 {
+                until_snapshot = SNAPSHOT_EVERY;
+                win32::snapshot().unwrap_or_else(|e| {
+                    log::debug!("Can't refresh process names: {e}");
+                    Vec::new()
+                })
+            } else {
+                Vec::new()
+            };
+            until_snapshot -= 1;
+            snapshot
+        };
+        #[cfg(not(windows))]
+        let snapshot = Vec::new();
+        observe(
+            &watched,
+            system
+                .processes()
+                .values()
+                .map(|process| (process.pid(), process.exe(), process.name())),
+            &mut executables,
+            &snapshot,
+        );
 
         match stop.recv_timeout(LOOK_EVERY) {
             Ok(x) => match x {},
@@ -151,6 +150,36 @@ fn look(watched: Vec<Watched>, stop: mpsc::Receiver<Infallible>) {
             Err(RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+/// Includes retained candidates every look, so a game found only by a snapshot stays visible
+/// between snapshots and when taking one fails. Every source is still validated by `get`.
+fn observe<'a>(
+    watched: &[Watched],
+    processes: impl Iterator<Item = (Pid, Option<&'a Path>, &'a OsStr)>,
+    executables: &mut Executables,
+    snapshot: &[(Pid, OsString)],
+) {
+    let retained = executables.candidates();
+    let mut candidates = Vec::new();
+    for (pid, path) in &retained {
+        candidates.push((*pid, Some(path.as_path()), path.as_os_str()));
+    }
+    for (pid, name) in snapshot {
+        candidates.push((*pid, None, name.as_os_str()));
+    }
+    for (pid, exe, name) in processes {
+        candidates.push((pid, exe, name));
+    }
+    for program in watched {
+        let found = find(candidates.iter().copied(), program.names, |pid, exe| {
+            executables.get(pid, exe)
+        });
+        program
+            .send
+            .send_if_modified(|current| current.update(found));
+    }
+    executables.forget_others();
 }
 
 /// The executable of the one of `processes` (id, executable, name) that's the program named any of
@@ -196,6 +225,18 @@ struct Executables {
 }
 
 impl Executables {
+    /// Paths from retained handles, used as candidates even if sysinfo has an old name.
+    fn candidates(&self) -> Vec<(Pid, PathBuf)> {
+        #[cfg(windows)]
+        return self
+            .opened
+            .iter()
+            .map(|(&pid, (_, path))| (pid, path.clone()))
+            .collect();
+        #[cfg(not(windows))]
+        Vec::new()
+    }
+
     /// The path of process `pid`'s executable, if it's still running and Windows tells it.
     #[cfg(windows)]
     fn get(&mut self, pid: Pid, _: Option<&Path>) -> Option<PathBuf> {
@@ -249,12 +290,52 @@ mod win32 {
     };
     use sysinfo::Pid;
     use windows_sys::Win32::{
-        Foundation::WAIT_TIMEOUT,
-        System::Threading::{
-            OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-            PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, WaitForSingleObject,
+        Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE, WAIT_TIMEOUT},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+                TH32CS_SNAPPROCESS,
+            },
+            Threading::{
+                OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+                PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, WaitForSingleObject,
+            },
         },
     };
+
+    /// Current process IDs and executable names. The handle owns only the snapshot; full paths
+    /// and liveness are checked separately using retained process handles.
+    pub fn snapshot() -> std::io::Result<Vec<(Pid, OsString)>> {
+        let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..unsafe { std::mem::zeroed() }
+        };
+        let mut entries = Vec::new();
+        let mut next = unsafe { Process32FirstW(handle.as_raw_handle(), &mut entry) };
+        while next != 0 {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            entries.push((
+                Pid::from_u32(entry.th32ProcessID),
+                OsString::from_wide(&entry.szExeFile[..len]),
+            ));
+            next = unsafe { Process32NextW(handle.as_raw_handle(), &mut entry) };
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+            Ok(entries)
+        } else {
+            Err(error)
+        }
+    }
 
     /// Opens the process with the least access there is, which Windows grants for most processes,
     /// even elevated ones.
@@ -410,6 +491,116 @@ mod tests {
         // Not asked about since
         executables.forget_others();
         assert!(executables.opened.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn snapshots_find_a_second_game_and_keep_it_visible_between_snapshots() {
+        let pid = Pid::from_u32(std::process::id());
+        let exe = std::env::current_exe().unwrap();
+        let name: &'static str = exe.file_name().unwrap().to_str().unwrap().to_owned().leak();
+        let names: &'static [&'static str] = Box::leak(Box::new([name]));
+        let (send, recv) = watch::channel(Program::default());
+        let child = waiting_process();
+        let child_pid = Pid::from_u32(child.0.id());
+        let (first, first_recv) = watch::channel(Program::default());
+        let watched = [
+            Watched {
+                names: &["cmd.exe"],
+                send: first,
+            },
+            Watched { names, send },
+        ];
+        let mut executables = Executables::default();
+        let stale = [
+            (child_pid, None, OsStr::new("cmd.exe")),
+            (pid, None, OsStr::new("old-process-name.exe")),
+        ];
+        observe(&watched, stale.iter().copied(), &mut executables, &[]);
+        assert!(first_recv.borrow().running);
+        assert!(!recv.borrow().running);
+        // A snapshot discovers it despite a stale sysinfo name while another program runs.
+        observe(
+            &watched,
+            stale.iter().copied(),
+            &mut executables,
+            &[(pid, OsString::from(name))],
+        );
+        assert!(recv.borrow().running);
+        for _ in 0..SNAPSHOT_EVERY + 1 {
+            // An absent or failed snapshot contributes no entries. Retained handles still do.
+            observe(&watched, stale.iter().copied(), &mut executables, &[]);
+            assert!(first_recv.borrow().running);
+            assert!(recv.borrow().running);
+            assert!(executables.opened.contains_key(&pid));
+        }
+        assert_eq!(recv.borrow().exe.as_deref(), Some(exe.as_path()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn snapshot_contains_this_process_with_its_current_name() {
+        let pid = Pid::from_u32(std::process::id());
+        let exe = std::env::current_exe().unwrap();
+        let entries = win32::snapshot().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|(id, name)| *id == pid && Some(name.as_os_str()) == exe.file_name())
+        );
+    }
+
+    #[cfg(windows)]
+    struct WaitingProcess(std::process::Child);
+
+    #[cfg(windows)]
+    impl Drop for WaitingProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(windows)]
+    fn waiting_process() -> WaitingProcess {
+        use std::os::windows::process::CommandExt;
+        // Stay alive waiting for input, without a console window; the guard always reaps it.
+        WaitingProcess(
+            std::process::Command::new("cmd.exe")
+                .args(["/D", "/C", "set /p wait="])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_exited_process_is_not_reported_as_running() {
+        let mut child = waiting_process();
+        let pid = Pid::from_u32(child.0.id());
+        let handle = win32::open(pid).unwrap();
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let mut executables = Executables::default();
+        executables
+            .opened
+            .insert(pid, (handle, PathBuf::from(r"C:\Game.exe")));
+        let (send, recv) = watch::channel(Program {
+            running: true,
+            exe: None,
+        });
+        observe(
+            &[Watched { names: NAMES, send }],
+            std::iter::empty(),
+            &mut executables,
+            &[],
+        );
+        assert!(!recv.borrow().running);
+        assert!(!executables.opened.contains_key(&pid));
     }
 
     #[test]
