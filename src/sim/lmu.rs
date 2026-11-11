@@ -61,6 +61,8 @@ pub struct LeMansUltimate {
     plugin_looked: Option<Instant>,
     /// Whether the plugin the game runs is outdated, once looked at this run
     plugin_outdated: Option<bool>,
+    /// Whether the plugin's version has been read this run
+    plugin_version_read: bool,
 }
 
 /// A change to settings.json in a folder, and what it's for (for the log, if it fails).
@@ -78,6 +80,7 @@ impl LeMansUltimate {
             plugin_check: None,
             plugin_looked: None,
             plugin_outdated: None,
+            plugin_version_read: false,
         }
     }
 
@@ -95,12 +98,13 @@ impl LeMansUltimate {
                     Some(Ok(status))
                         if status.installed.is_none()
                             || status.bundled_version().is_none()
-                            || (self.plugin_outdated.is_some()
+                            || (self.plugin_version_read
                                 && matches!(status.installed, Some(None))) =>
                     {
                         self.plugin_outdated.get_or_insert(false);
                     }
                     Some(Ok(status)) => {
+                        self.plugin_version_read |= matches!(status.installed, Some(Some(_)));
                         let outdated = status.outdated();
                         if outdated && self.plugin_outdated != Some(true) {
                             log::warn!(
@@ -188,6 +192,7 @@ impl Simulator for LeMansUltimate {
             self.plugin_check = None;
             self.plugin_looked = None;
             self.plugin_outdated = None;
+            self.plugin_version_read = false;
             None
         };
 
@@ -423,6 +428,12 @@ mod tests {
 
         // Without a version on the first look, the plugin's too old to say it
         let mut lmu = LeMansUltimate::new();
+        assert!(!looked_at(&mut lmu, status(Some(None), version(1))).await);
+        assert!(lmu.plugin_outdated());
+
+        // Likewise after a first look that didn't find it
+        let mut lmu = LeMansUltimate::new();
+        assert!(looked_at(&mut lmu, status(None, version(1))).await);
         assert!(!looked_at(&mut lmu, status(Some(None), version(1))).await);
         assert!(lmu.plugin_outdated());
     }
