@@ -89,6 +89,11 @@ impl LeMansUltimate {
                 let check = self.plugin_check.take();
                 // Finished, so this doesn't wait
                 match check.and_then(|check| unconstrained(check).now_or_never()) {
+                    // The game, or its plugin, not found while the game runs: the lookup failed,
+                    // which says nothing new about the plugin it loaded
+                    Some(Ok(status)) if status.installed.is_none() => {
+                        self.plugin_outdated.get_or_insert(false);
+                    }
                     Some(Ok(status)) => {
                         let outdated = status.outdated();
                         if outdated && self.plugin_outdated != Some(true) {

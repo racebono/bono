@@ -605,8 +605,12 @@ impl Engineer {
             detail: None,
         });
 
+        let mut sim = sim;
+        let database = sim
+            .as_deref_mut()
+            .and_then(|sim| Some((sim.id(), sim.database()?.clone())));
+        // After `database`, which takes in the latest look at the plugin
         let outdated = sim.as_deref().is_some_and(|sim| sim.plugin_outdated());
-        let database = sim.and_then(|sim| Some((sim.id(), sim.database()?.clone())));
         let Some((sim, pool)) = database else {
             // Said in the pilot's language, when there's a voice for it
             let lang = self.voice(config, lang).unwrap_or(lang);

@@ -3034,16 +3034,16 @@ fn track_json(conn: &Connection, shared: &Shared, stream: &mut Stream) -> anyhow
         (Some(count), Some(length)) => {
             let from = stream.session_start;
             let key = (from, name.unwrap_or_default().to_owned(), count);
-            match timing_sector_ends(conn, count, length, from)? {
-                Some(ends) => {
-                    stream.timing = Some((key, ends.clone()));
-                    Some(ends)
+            // The lines don't move during a session: once seen whole, they're not looked for again
+            match &stream.timing {
+                Some((seen, ends)) if *seen == key => Some(ends.clone()),
+                _ => {
+                    let ends = timing_sector_ends(conn, count, length, from)?;
+                    if let Some(ends) = &ends {
+                        stream.timing = Some((key, ends.clone()));
+                    }
+                    ends
                 }
-                None => stream
-                    .timing
-                    .as_ref()
-                    .filter(|(seen, _)| *seen == key)
-                    .map(|(_, ends)| ends.clone()),
             }
         }
         _ => None,
@@ -3080,14 +3080,15 @@ const TIMING_ROWS: i64 = 60_000;
 /// Where each of the simulator's `count` timing sectors ends, as fractions of the lap: where the
 /// player's recent laps (since the row `from`, the session's first) went from one sector to the
 /// next (the median of them), the last at the line. `None` until every one of those lines has been
-/// crossed, or if they don't come one after another round the lap.
+/// crossed, or if they don't come one after another round the lap; and with a single sector, which
+/// has no line to see.
 fn timing_sector_ends(
     conn: &Connection,
     count: i64,
     length: f64,
     from: i64,
 ) -> rusqlite::Result<Option<Vec<f64>>> {
-    let Ok(count) = usize::try_from(count) else {
+    let Some(count) = usize::try_from(count).ok().filter(|count| *count > 1) else {
         return Ok(None);
     };
     // A crossing is a row in the next sector after one of the same car in the sector before, both
