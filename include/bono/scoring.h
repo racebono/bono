@@ -30,9 +30,7 @@
     X(i64, vehicle_count, true)                                                                           \
     X(i64, max_vehicles, true)                                                                            \
     X(string, full_course_yellow, true)      /* none, pending, pits_closed, pit_lead_lap, pits_open, last_lap, resume, race_halt */ \
-    X(boolean, local_yellow_1, true)         /* per track sector, in the order the simulator reports */   \
-    X(boolean, local_yellow_2, true)                                                                      \
-    X(boolean, local_yellow_3, true)                                                                      \
+    X(i64, sector_count, true)               /* timing sectors of the track; `sectors` holds the first BONO_MAX_SECTORS */ \
     X(i64, start_light, true)                                                                             \
     X(i64, red_lights, true)                                                                              \
     X(boolean, in_realtime, true)            /* the player is driving rather than in menus */             \
@@ -85,16 +83,7 @@
     X(string, finish_status, true)           /* none, finished, dnf, dnq, dns, disqualified */            \
     X(f64, lap_start_time, true)             /* session time the current lap started */                  \
     X(f64, last_lap_time, true)                                                                           \
-    X(f64, last_sector_1, true)              /* sector times of the last lap */                           \
-    X(f64, last_sector_2, true)                                                                           \
-    X(f64, last_sector_3, true)                                                                           \
     X(f64, best_lap_time, true)                                                                           \
-    X(f64, best_lap_sector_1, true)          /* sector 1 of the best lap */                               \
-    X(f64, best_lap_sector_2, true) /* sector 2 alone of the best lap; LMU's source is cumulative, though its SDK doesn't say so */ \
-    X(f64, best_sector_1, true)              /* best sector 1 of any lap */                               \
-    X(f64, best_sectors_1_and_2, true)       /* best combined sectors 1 and 2 of any lap */               \
-    X(f64, current_sector_1, true)           /* sector times of the lap in progress */                    \
-    X(f64, current_sector_2, true)                                                                        \
     X(i64, laps_behind_leader, true)                                                                      \
     X(i64, laps_behind_next, true)                                                                        \
     X(i64, pit_stops, true)                                                                               \
@@ -154,18 +143,50 @@
     X(f64, fuel_fraction, false)             /* fuel or battery left, 0-1 */                              \
     X(f64, lateral_position, false)          /* meters from the approximate track center line */          \
     X(f64, track_edge, false)                /* meters from the center line to the edge on the car's side */
+
+// One timing sector of the session, in the `session_sector` table.
+#define SIM_SESSION_SECTOR_COLUMNS(X)                                                                     \
+    X(boolean, local_yellow, true)           /* sectors in the order the simulator reports them, which may not be telemetry's */
+
+// One car's time in one timing sector, in the `standing_sector` table. Each is the sector on its own,
+// never cumulative from the line.
+#define SIM_STANDING_SECTOR_COLUMNS(X)                                                                    \
+    X(f64, last_lap, true)                   /* on the last lap */                                        \
+    X(f64, best_lap, true)                   /* on the best lap */                                        \
+    X(f64, best, true)                       /* the best of any lap */                                    \
+    X(f64, current_lap, true)                /* on the lap in progress, once the car is past the sector */
 // clang-format on
 
+// The most timing sectors kept. A track with more keeps its true count in `sector_count`, and its
+// first BONO_MAX_SECTORS sectors.
+#define BONO_MAX_SECTORS 16
+
 #define SIM_DECLARE_SCORING_FIELD(type, name, compared)                          bono_opt_##type##_s name;
+
+typedef struct bono_session_sector {
+  SIM_SESSION_SECTOR_COLUMNS(SIM_DECLARE_SCORING_FIELD)
+} bono_session_sector_s;
+
+typedef struct bono_standing_sector {
+  SIM_STANDING_SECTOR_COLUMNS(SIM_DECLARE_SCORING_FIELD)
+} bono_standing_sector_s;
 
 // The state of the session, in the `session` table.
 typedef struct bono_session_info {
   SIM_SESSION_COLUMNS(SIM_DECLARE_SCORING_FIELD)
+
+  // In the order the simulator reports them; the first `sector_count` (at most BONO_MAX_SECTORS)
+  // are written, to `session_sector`.
+  bono_session_sector_s sectors[BONO_MAX_SECTORS];
 } bono_session_info_s;
 
 // The standing of one car, in the `standings` table.
 typedef struct bono_standing {
   SIM_STANDING_COLUMNS(SIM_DECLARE_SCORING_FIELD)
+
+  // Sector by sector from the line; as many as the session's `sector_count` are written, to
+  // `standing_sector`.
+  bono_standing_sector_s sectors[BONO_MAX_SECTORS];
 } bono_standing_s;
 
 #undef SIM_DECLARE_SCORING_FIELD

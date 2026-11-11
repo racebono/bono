@@ -27,6 +27,10 @@ use tokio::sync::mpsc;
 
 const STEAM_APP_ID: u32 = 211500;
 
+/// The timing sectors of every track: the game's data has room for no more (`sector_yellow`,
+/// the sector times, `track_sector` 1 to 3).
+const SECTORS: usize = 3;
+
 const MAX_IDLE: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 const MAX_OPEN: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
@@ -938,10 +942,11 @@ fn scoring(
     }
 
     let flags = shared.flags;
-    let sector_yellow = flags.sector_yellow;
-    session.local_yellow_1 = flag(sector_yellow[0]).into();
-    session.local_yellow_2 = flag(sector_yellow[1]).into();
-    session.local_yellow_3 = flag(sector_yellow[2]).into();
+    let sector_yellow: [_; SECTORS] = flags.sector_yellow;
+    session.sector_count = Some(SECTORS as i64).into();
+    for (sector, yellow) in session.sectors.iter_mut().zip(sector_yellow) {
+        sector.local_yellow = flag(yellow).into();
+    }
 
     session.pit_window_status = match shared.pit_window_status {
         R3E_PIT_WINDOW_DISABLED => Some("disabled"),
@@ -1051,21 +1056,22 @@ fn standing(
         driver.sector_time_best_self,
         driver.sector_time_current_self,
     );
-    let split = |times: [f32; 3], i: usize| match i {
+    let split = |times: [f32; SECTORS], i: usize| match i {
         0 => seconds(times[0]),
         _ => seconds(times[i])
             .zip(seconds(times[i - 1]))
             .map(|(to, from)| to - from),
     };
-    out.last_lap_time = seconds(previous[2]).into();
-    out.last_sector_1 = split(previous, 0).into();
-    out.last_sector_2 = split(previous, 1).into();
-    out.last_sector_3 = split(previous, 2).into();
-    out.best_lap_time = seconds(best[2]).into();
-    out.best_lap_sector_1 = split(best, 0).into();
-    out.best_lap_sector_2 = split(best, 1).into();
-    out.current_sector_1 = split(current, 0).into();
-    out.current_sector_2 = split(current, 1).into();
+    out.last_lap_time = seconds(previous[SECTORS - 1]).into();
+    out.best_lap_time = seconds(best[SECTORS - 1]).into();
+    for (i, sector) in out.sectors.iter_mut().take(SECTORS).enumerate() {
+        sector.last_lap = split(previous, i).into();
+        sector.best_lap = split(best, i).into();
+        // Past the last sector, the lap is over: it's no longer the one in progress
+        if i < SECTORS - 1 {
+            sector.current_lap = split(current, i).into();
+        }
+    }
 
     out.time_behind_next = seconds(driver.time_delta_front).into();
     out.pit_stops = setting(driver.num_pitstops).into();
@@ -1327,7 +1333,9 @@ fn fraction(part: f32, whole: f32) -> Option<f64> {
 
 /// The game's sectors are 1 to 3; the recording's from 0.
 fn sector(value: i32) -> Option<i64> {
-    (1..=3).contains(&value).then_some(value as i64 - 1)
+    (1..=SECTORS as i32)
+        .contains(&value)
+        .then_some(value as i64 - 1)
 }
 
 /// The surface under a tire, as LMU's plugin numbers them.
@@ -1833,8 +1841,10 @@ mod tests {
         assert_eq!(session.phase.as_deref(), Some("green"));
         assert_eq!(session.time_remaining.get(), Some(3100.0));
         assert_eq!(session.session_end_time.get(), Some(3600.0));
-        assert_eq!(session.local_yellow_2.get(), Some(true));
-        assert_eq!(session.local_yellow_1.get(), Some(false));
+        assert_eq!(session.sector_count.get(), Some(3));
+        assert_eq!(session.sectors[1].local_yellow.get(), Some(true));
+        assert_eq!(session.sectors[0].local_yellow.get(), Some(false));
+        assert_eq!(session.sectors[3].local_yellow.get(), None);
 
         let me = standings
             .iter()
@@ -1849,12 +1859,13 @@ mod tests {
         assert_eq!(me.lap_start_time.get(), Some(460.0));
         // The game's sectors add up: these don't
         assert_eq!(me.last_lap_time.get(), Some(100.0));
-        assert_eq!(me.last_sector_1.get(), Some(30.0));
-        assert_eq!(me.last_sector_2.get(), Some(35.0));
-        assert_eq!(me.last_sector_3.get(), Some(35.0));
+        let last = me.sectors.map(|s| s.last_lap.get());
+        assert_eq!(last[..4], [Some(30.0), Some(35.0), Some(35.0), None]);
         assert_eq!(me.best_lap_time.get(), Some(98.5));
-        assert_eq!(me.current_sector_1.get(), Some(31.0));
-        assert_eq!(me.current_sector_2.get(), None);
+        let best_lap = me.sectors.map(|s| s.best_lap.get());
+        assert_eq!(best_lap[..3], [Some(29.0), Some(35.0), Some(34.5)]);
+        let current = me.sectors.map(|s| s.current_lap.get());
+        assert_eq!(current[..3], [Some(31.0), None, None]);
         assert_eq!(me.penalties.get(), Some(1));
         let other = standings
             .iter()
@@ -2302,7 +2313,7 @@ mod tests {
         assert_eq!(theirs.rear_tire_compound_name.as_deref(), Some("prime"));
         assert_eq!(theirs.drs_active.get(), None);
         // Sector 2 alone, not cumulative
-        assert_eq!(theirs.best_lap_sector_2.get(), Some(35.0));
+        assert_eq!(theirs.sectors[1].best_lap.get(), Some(35.0));
 
         // Not the player's car: the range isn't documented for it
         shared.control_type = R3E_CONTROL_AI;
