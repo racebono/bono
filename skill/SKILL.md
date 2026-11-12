@@ -268,7 +268,8 @@ session_first_id`; the other tables number their rows separately (`telemetry_id`
   `throttle`, `brake`, `clutch` (0 to 1), `steering` (-1 left to 1 right), `throttle_filtered`,
   `brake_filtered`, `gear`, `engine_rpm`, `fuel`, `virtual_energy`, `battery_charge`,
   `traction_control_active`, `abs_active`, `front_ride_height`, `rear_ride_height`, `drag`,
-  `gap_to_car_ahead/behind`, `gap_to_place_ahead/behind`.
+  `gap_to_car_ahead/behind`, `gap_to_place_ahead/behind`, `cars_left/right` (the player's row:
+  cars alongside as the simulator reports them, 0 to 2; NULL on simulators that don't).
 - `telemetry_wheel`: four rows per `telemetry` row (`telemetry_id`, `wheel`): `suspension_deflection`,
   `ride_height`, `camber`, `toe` (rad), `brake_temperature`, `brake_pressure`, `rotation_speed`,
   `lateral_force`, `longitudinal_force`, `tire_load`, `sliding_fraction`, `surface_type`,

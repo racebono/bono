@@ -78,6 +78,8 @@ impl Raised {
         match self.text {
             "car left" | "still there left" | "clear left" => 1,
             "car right" | "still there right" | "clear right" => 2,
+            "three wide left" => 1,
+            "three wide right" => 2,
             "three wide" | "clear all round" => 3,
             _ => 0,
         }
@@ -105,10 +107,9 @@ enum WarningCategory {
 impl Raised {
     fn warning_category(&self) -> WarningCategory {
         match self.text {
-            "car left" | "car right" | "three wide" | "clear left" | "clear right"
-            | "clear all round" | "still there left" | "still there right" => {
-                WarningCategory::Traffic
-            }
+            "car left" | "car right" | "three wide" | "three wide left" | "three wide right"
+            | "clear left" | "clear right" | "clear all round" | "still there left"
+            | "still there right" => WarningCategory::Traffic,
             "limiter, limiter" => WarningCategory::Limiter,
             "full course yellow" | "green flag, green flag" | "red flag" => WarningCategory::Flag,
             text => WarningCategory::Other(text),
@@ -616,6 +617,10 @@ struct Player {
     /// Unknown isn't off: some simulators only report the limiter while the pilot drives
     limiter: Option<bool>,
     parts_detached: bool,
+    /// Cars alongside (left, right) as the simulator itself reports them, for simulators that
+    /// don't give the other cars' positions. `None` when it doesn't: they're worked out from the
+    /// positions instead.
+    alongside: Option<[u8; 2]>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -699,6 +704,7 @@ fn player(conn: &Connection, car: Car) -> rusqlite::Result<Player> {
     let (limiter, parts_detached) = state.unwrap_or_default();
 
     Ok(Player {
+        alongside: alongside(conn, car.id)?,
         car,
         lap_invalidated,
         engine_overheating,
@@ -706,6 +712,29 @@ fn player(conn: &Connection, car: Car) -> rusqlite::Result<Player> {
         limiter,
         parts_detached: parts_detached.unwrap_or(false),
     })
+}
+
+/// The cars alongside the simulator reports at the player's row, when it reports them (both
+/// sides). Recordings made before the columns existed don't have them.
+fn alongside(conn: &Connection, telemetry_id: i64) -> rusqlite::Result<Option<[u8; 2]>> {
+    let columns = conn
+        .prepare_cached(
+            "SELECT count(*) FROM pragma_table_info('telemetry') \
+             WHERE name IN ('cars_left', 'cars_right')",
+        )?
+        .query_row([], |row| row.get::<_, i64>(0))?;
+    if columns != 2 {
+        return Ok(None);
+    }
+    let (left, right) = conn
+        .prepare_cached("SELECT cars_left, cars_right FROM telemetry WHERE id = ?1")?
+        .query_row([telemetry_id], |row| {
+            Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?;
+    let count = |cars: i64| u8::try_from(cars.clamp(0, 2)).unwrap_or(0);
+    Ok(left
+        .zip(right)
+        .map(|(left, right)| [count(left), count(right)]))
 }
 
 /// The player's tyres at their row.
@@ -934,11 +963,116 @@ impl Side {
     }
 }
 
-struct Logic {
+/// What's beside the player, however it's known: worked out from the cars' positions
+/// ([`Geometry`]) or reported by the simulator ([`Player::alongside`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Proximity {
+    /// Can't tell (no positions, or the simulator isn't reporting): never a reason to say clear
+    Unavailable,
+    /// Cars alongside on each side, at most two
+    Known { left: u8, right: u8 },
+}
+
+/// Works out the cars beside the player from everyone's positions, following each car: it counts
+/// once it's been there `debounce`, and stops counting past the (wider) exit distances.
+#[derive(Debug, Default)]
+struct Geometry {
     /// Cars beside the player, not yet for long enough: vehicle -> (side, since)
     pending: HashMap<i64, (Side, f64)>,
     /// Cars beside the player: vehicle -> side
     overlap: HashMap<i64, Side>,
+}
+
+impl Geometry {
+    fn reset(&mut self) {
+        self.pending.clear();
+        self.overlap.clear();
+    }
+
+    /// Positions can't tell two cars side by side on one side from two in line there, so a side
+    /// counts one car at most.
+    fn update(
+        &mut self,
+        config: &SpotterConfig,
+        player: &Car,
+        others: &[Car],
+        t: f64,
+    ) -> Proximity {
+        if player.x.is_none() || player.z.is_none() || player.heading.is_none() {
+            self.reset();
+            return Proximity::Unavailable;
+        }
+        self.track(config, player, others, t);
+        let mut sides = [0; 2];
+        for side in self.overlap.values() {
+            sides[side.index()] = 1;
+        }
+        Proximity::Known {
+            left: sides[Side::Left.index()],
+            right: sides[Side::Right.index()],
+        }
+    }
+
+    fn track(&mut self, config: &SpotterConfig, player: &Car, others: &[Car], t: f64) {
+        self.pending
+            .retain(|vehicle, _| others.iter().any(|other| other.vehicle == *vehicle));
+        let mut seen = Vec::new();
+        for other in others {
+            if other.x.is_none() || other.z.is_none() || other.in_pit_lane {
+                continue;
+            }
+            if (other.y.unwrap_or(0.0) - player.y.unwrap_or(0.0)).abs()
+                > *config.max_height_difference()
+            {
+                continue;
+            }
+            let Some((along, across)) = relative(player, other) else {
+                continue;
+            };
+            let side = if across > 0.0 {
+                Side::Right
+            } else {
+                Side::Left
+            };
+            let (along, across) = (along.abs(), across.abs());
+
+            if let Some(overlap) = self.overlap.get(&other.vehicle) {
+                if along <= *config.exit_along()
+                    && (*config.min_across()..=*config.exit_across()).contains(&across)
+                    && side == *overlap
+                {
+                    seen.push(other.vehicle);
+                }
+                continue;
+            }
+
+            if along <= *config.enter_along()
+                && (*config.min_across()..=*config.enter_across()).contains(&across)
+            {
+                match self.pending.get(&other.vehicle) {
+                    Some(&(pending, since)) if pending == side => {
+                        if t - since >= *config.debounce() {
+                            self.overlap.insert(other.vehicle, side);
+                            self.pending.remove(&other.vehicle);
+                            seen.push(other.vehicle);
+                        }
+                    }
+                    _ => {
+                        self.pending.insert(other.vehicle, (side, t));
+                    }
+                }
+            } else {
+                self.pending.remove(&other.vehicle);
+            }
+        }
+        self.overlap.retain(|vehicle, _| seen.contains(vehicle));
+    }
+}
+
+struct Logic {
+    geometry: Geometry,
+    /// Cars alongside on each side as last called (0 while it can't be told)
+    alongside: [u8; 2],
     /// Since when each side has been taken, and when "still there" was last said for it
     side_since: [Option<f64>; 2],
     last_still: [Option<f64>; 2],
@@ -961,8 +1095,8 @@ struct Logic {
 impl Default for Logic {
     fn default() -> Self {
         Self {
-            pending: HashMap::new(),
-            overlap: HashMap::new(),
+            geometry: Geometry::default(),
+            alongside: [0; 2],
             side_since: [None; 2],
             last_still: [None; 2],
             prev: None,
@@ -1030,16 +1164,20 @@ impl Logic {
             *self = Logic::default();
         }
 
-        let stopped = p.speed.unwrap_or(0.0) < *config.min_speed()
-            || p.in_pit_lane
-            || p.x.is_none()
-            || p.z.is_none()
-            || p.heading.is_none();
+        let stopped = p.speed.unwrap_or(0.0) < *config.min_speed() || p.in_pit_lane;
         // On the formation lap cars weave and run side by side on purpose
         let formation_lap = scoring.is_some_and(|s| s.phase.as_deref() == Some("formation_lap"));
-        let quiet = stopped || formation_lap;
 
-        self.traffic(config, p, others, t, quiet, &mut calls);
+        let proximity = if stopped || formation_lap {
+            self.geometry.reset();
+            Proximity::Unavailable
+        } else if let Some([left, right]) = player.alongside {
+            self.geometry.reset();
+            Proximity::Known { left, right }
+        } else {
+            self.geometry.update(config, p, others, t)
+        };
+        self.traffic(config, proximity, t, &mut calls);
         if let Some(prev) = self.prev.take() {
             let race = scoring.is_some_and(|s| s.session_type.as_deref() == Some("race"));
             self.alerts(
@@ -1062,23 +1200,15 @@ impl Logic {
         calls.calls
     }
 
-    /// Cars alongside: who came, who went, and who's still there.
-    fn traffic(
-        &mut self,
-        config: &SpotterConfig,
-        p: &Car,
-        others: &[Car],
-        t: f64,
-        quiet: bool,
-        calls: &mut Calls,
-    ) {
-        let before = self.sides();
-        if quiet {
-            self.reset_traffic();
-        } else {
-            self.track(config, p, others, t);
-        }
-        let after = self.sides();
+    /// Cars alongside: who came, who went, and who's still there. While it can't be told the
+    /// sides empty silently, and calls start again from what's next seen.
+    fn traffic(&mut self, config: &SpotterConfig, proximity: Proximity, t: f64, calls: &mut Calls) {
+        let before = self.alongside;
+        let (after, known) = match proximity {
+            Proximity::Unavailable => ([0; 2], false),
+            Proximity::Known { left, right } => ([left.min(2), right.min(2)], true),
+        };
+        self.alongside = after;
 
         let became = Side::BOTH
             .into_iter()
@@ -1088,33 +1218,76 @@ impl Logic {
             .into_iter()
             .filter(|s| before[s.index()] > 0 && after[s.index()] == 0)
             .collect::<Vec<_>>();
+        // Three wide: a car each side, or two on one side
+        let three_wide = |sides: [u8; 2]| sides[0] + sides[1] >= 2;
+        // Two on one side is said the same but is only about that side, so a clear of the
+        // other doesn't leave a car there in the queue
+        let three_wide_call = |sides: [u8; 2]| match sides {
+            [0, _] => "three wide right",
+            [_, 0] => "three wide left",
+            _ => "three wide",
+        };
 
+        let mut clears = Vec::new();
+        for &side in &cleared {
+            let held = self.side_since[side.index()].map_or(0.0, |since| t - since);
+            self.side_since[side.index()] = None;
+            self.last_still[side.index()] = None;
+            if held >= *config.min_hold_for_clear() && known {
+                clears.push(side);
+            }
+        }
         for side in &became {
             self.side_since[side.index()] = Some(t);
             self.last_still[side.index()] = Some(t);
         }
-        if let Some(first) = became.first() {
-            match (after[0] > 0 && after[1] > 0, first) {
-                (true, _) => calls.raise("three wide", true),
-                (false, Side::Left) => calls.raise("car left", true),
-                (false, Side::Right) => calls.raise("car right", true),
+        let side_call = |side: Side| match side {
+            Side::Left => "car left",
+            Side::Right => "car right",
+        };
+        // What's alongside was said this update
+        let mut stated = true;
+        if let Some(&first) = became.first() {
+            calls.raise(
+                if three_wide(after) {
+                    three_wide_call(after)
+                } else {
+                    side_call(first)
+                },
+                true,
+            );
+        } else if three_wide(after) && !three_wide(before) {
+            // A second car joined one already alongside on the same side
+            calls.raise(three_wide_call(after), true);
+        } else if three_wide(before) && !three_wide(after) && clears.is_empty() {
+            // One of two went (from one side, or too soon to call clear): the other's still there
+            if let Some(side) = Side::BOTH.into_iter().find(|s| after[s.index()] > 0) {
+                calls.raise(side_call(side), true);
             }
+        } else {
+            stated = false;
         }
 
-        let mut clears = Vec::new();
-        for side in cleared {
-            let held = self.side_since[side.index()].map_or(0.0, |since| t - since);
-            self.side_since[side.index()] = None;
-            self.last_still[side.index()] = None;
-            if held >= *config.min_hold_for_clear() && !quiet {
-                clears.push(side);
-            }
-        }
         match clears.as_slice() {
-            [_, _] => calls.raise("clear all round", true),
+            // Both went: one that went too soon to call clear is clear all the same, and a
+            // one-sided clear would leave a queued three wide to it
+            [_, ..] if cleared.len() == 2 => calls.raise("clear all round", true),
             [Side::Left] => calls.raise("clear left", true),
             [Side::Right] => calls.raise("clear right", true),
             _ => {}
+        }
+        // A car each side became two on one: still three wide
+        if became.is_empty() && !cleared.is_empty() && three_wide(after) {
+            calls.raise(three_wide_call(after), true);
+            stated = true;
+        }
+        // A reminder due now would replace what was just said in the queue: it waits
+        if stated {
+            for side in Side::BOTH {
+                if after[side.index()] > 0 {
+                    self.last_still[side.index()] = Some(t);
+                }
+            }
         }
 
         for side in Side::BOTH {
@@ -1132,63 +1305,6 @@ impl Logic {
                 );
             }
         }
-    }
-
-    /// Follows the cars beside the player: they count once they've been there `debounce`, and
-    /// stop counting past the (wider) exit distances.
-    fn track(&mut self, config: &SpotterConfig, player: &Car, others: &[Car], t: f64) {
-        self.pending
-            .retain(|vehicle, _| others.iter().any(|other| other.vehicle == *vehicle));
-        let mut seen = Vec::new();
-        for other in others {
-            if other.x.is_none() || other.z.is_none() || other.in_pit_lane {
-                continue;
-            }
-            if (other.y.unwrap_or(0.0) - player.y.unwrap_or(0.0)).abs()
-                > *config.max_height_difference()
-            {
-                continue;
-            }
-            let Some((along, across)) = relative(player, other) else {
-                continue;
-            };
-            let side = if across > 0.0 {
-                Side::Right
-            } else {
-                Side::Left
-            };
-            let (along, across) = (along.abs(), across.abs());
-
-            if let Some(overlap) = self.overlap.get(&other.vehicle) {
-                if along <= *config.exit_along()
-                    && (*config.min_across()..=*config.exit_across()).contains(&across)
-                    && side == *overlap
-                {
-                    seen.push(other.vehicle);
-                }
-                continue;
-            }
-
-            if along <= *config.enter_along()
-                && (*config.min_across()..=*config.enter_across()).contains(&across)
-            {
-                match self.pending.get(&other.vehicle) {
-                    Some(&(pending, since)) if pending == side => {
-                        if t - since >= *config.debounce() {
-                            self.overlap.insert(other.vehicle, side);
-                            self.pending.remove(&other.vehicle);
-                            seen.push(other.vehicle);
-                        }
-                    }
-                    _ => {
-                        self.pending.insert(other.vehicle, (side, t));
-                    }
-                }
-            } else {
-                self.pending.remove(&other.vehicle);
-            }
-        }
-        self.overlap.retain(|vehicle, _| seen.contains(vehicle));
     }
 
     /// Rising edges of the player's own alerts.
@@ -1403,22 +1519,6 @@ impl Logic {
             return;
         }
     }
-
-    fn reset_traffic(&mut self) {
-        self.pending.clear();
-        self.overlap.clear();
-        self.side_since = [None; 2];
-        self.last_still = [None; 2];
-    }
-
-    /// How many cars are beside the player on each side.
-    fn sides(&self) -> [usize; 2] {
-        let mut count = [0; 2];
-        for side in self.overlap.values() {
-            count[side.index()] += 1;
-        }
-        count
-    }
 }
 
 const PUNCTURES: [&str; 4] = [
@@ -1436,7 +1536,7 @@ pub fn translate(text: &'static str, lang: ArrayStr<2>) -> &'static str {
     match text {
         "car left" => t!("call.car_left": lang),
         "car right" => t!("call.car_right": lang),
-        "three wide" => t!("call.three_wide": lang),
+        "three wide" | "three wide left" | "three wide right" => t!("call.three_wide": lang),
         "clear left" => t!("call.clear_left": lang),
         "clear right" => t!("call.clear_right": lang),
         "clear all round" => t!("call.clear_all_round": lang),
@@ -1828,6 +1928,32 @@ mod tests {
     }
 
     #[test]
+    fn clearing_two_on_one_side_leaves_no_car_on_the_other() {
+        for (three_wide, clear) in [
+            ("three wide right", "clear right"),
+            ("three wide left", "clear left"),
+        ] {
+            let mut queue = VecDeque::new();
+            for text in [three_wide, clear] {
+                Spotter::enqueue(
+                    &mut queue,
+                    Raised {
+                        text,
+                        number: None,
+                        urgent: true,
+                        session_time: 1.0,
+                    },
+                    Instant::now(),
+                );
+            }
+            assert_eq!(
+                queue.iter().map(|(call, _)| call.text).collect::<Vec<_>>(),
+                [clear],
+            );
+        }
+    }
+
+    #[test]
     fn single_side_clear_preserves_remaining_synthesizing_traffic() {
         for completed in [false, true] {
             for (clear, remaining) in [("clear left", "car right"), ("clear right", "car left")] {
@@ -1960,13 +2086,19 @@ mod tests {
         let mut logic = Logic::default();
         let config = SpotterConfig::default();
         let others = [other(2, 1.0, 3.0)];
-        logic.track(&config, &player(0.0).car, &others, 0.0);
-        logic.track(&config, &player(0.1).car, &[], 0.1);
-        assert!(logic.pending.is_empty());
-        logic.track(&config, &player(1.0).car, &others, 1.0);
-        assert!(logic.overlap.is_empty());
-        logic.track(&config, &player(1.2).car, &others, 1.2);
-        assert!(logic.overlap.get(&2) == Some(&Side::Right));
+        logic
+            .geometry
+            .track(&config, &player(0.0).car, &others, 0.0);
+        logic.geometry.track(&config, &player(0.1).car, &[], 0.1);
+        assert!(logic.geometry.pending.is_empty());
+        logic
+            .geometry
+            .track(&config, &player(1.0).car, &others, 1.0);
+        assert!(logic.geometry.overlap.is_empty());
+        logic
+            .geometry
+            .track(&config, &player(1.2).car, &others, 1.2);
+        assert!(logic.geometry.overlap.get(&2) == Some(&Side::Right));
     }
 
     #[test]
@@ -2094,6 +2226,192 @@ mod tests {
             );
             assert!(calls.is_empty());
         }
+    }
+
+    /// Runs the logic at 30 Hz from `from` to `to` with the simulator reporting the cars
+    /// `alongside` and nobody's position, returning the calls.
+    fn run_reported(
+        logic: &mut Logic,
+        from: f64,
+        to: f64,
+        alongside: Option<[u8; 2]>,
+    ) -> Vec<&'static str> {
+        let config = SpotterConfig::default();
+        let mut calls = Vec::new();
+        let mut t = from;
+        while t < to {
+            let mut p = player(t);
+            (p.car.x, p.car.z, p.car.heading) = (None, None, None);
+            p.alongside = alongside;
+            calls.extend(texts(logic.update(
+                &config,
+                &p,
+                &[],
+                &Wheels::default(),
+                None,
+            )));
+            t += 1.0 / 30.0;
+        }
+        calls
+    }
+
+    #[test]
+    fn calls_reported_cars_alongside_without_waiting() {
+        let mut logic = Logic::default();
+        assert_eq!(
+            run_reported(&mut logic, 0.0, 1.0 / 60.0, Some([0, 1])),
+            ["car right"]
+        );
+        assert!(run_reported(&mut logic, 1.0 / 60.0, 1.0, Some([0, 1])).is_empty());
+        assert_eq!(
+            run_reported(&mut logic, 1.0, 1.5, Some([0, 0])),
+            ["clear right"]
+        );
+    }
+
+    #[test]
+    fn calls_three_wide_with_two_reported_on_one_side() {
+        let mut logic = Logic::default();
+        assert_eq!(
+            run_reported(&mut logic, 0.0, 1.0, Some([1, 0])),
+            ["car left"]
+        );
+        assert_eq!(
+            run_reported(&mut logic, 1.0, 2.0, Some([2, 0])),
+            ["three wide left"]
+        );
+        // One of the two went: the other's still there
+        assert_eq!(
+            run_reported(&mut logic, 2.0, 3.0, Some([1, 0])),
+            ["car left"]
+        );
+        assert_eq!(
+            run_reported(&mut logic, 3.0, 4.0, Some([2, 0])),
+            ["three wide left"]
+        );
+        assert_eq!(
+            run_reported(&mut logic, 4.0, 4.5, Some([0, 0])),
+            ["clear left"]
+        );
+    }
+
+    #[test]
+    fn calls_three_wide_with_a_car_reported_each_side() {
+        let mut logic = Logic::default();
+        assert_eq!(
+            run_reported(&mut logic, 0.0, 1.0, Some([1, 0])),
+            ["car left"]
+        );
+        assert_eq!(
+            run_reported(&mut logic, 1.0, 2.0, Some([1, 1])),
+            ["three wide"]
+        );
+        assert_eq!(
+            run_reported(&mut logic, 2.0, 3.0, Some([0, 1])),
+            ["clear left"]
+        );
+        assert_eq!(
+            run_reported(&mut logic, 3.0, 3.5, Some([0, 0])),
+            ["clear right"]
+        );
+    }
+
+    #[test]
+    fn a_car_each_side_becoming_two_on_one_is_still_three_wide() {
+        let mut logic = Logic::default();
+        run_reported(&mut logic, 0.0, 1.0, Some([1, 1]));
+        assert_eq!(
+            run_reported(&mut logic, 1.0, 2.0, Some([0, 2])),
+            ["clear left", "three wide right"]
+        );
+
+        // Even when the side went too soon to call clear
+        let mut logic = Logic::default();
+        run_reported(&mut logic, 0.0, 0.5, Some([1, 0]));
+        run_reported(&mut logic, 0.5, 0.6, Some([1, 1]));
+        assert_eq!(
+            run_reported(&mut logic, 0.6, 0.8, Some([2, 0])),
+            ["three wide left"]
+        );
+
+        // Back to one car too soon to call clear: that car is said again
+        let mut logic = Logic::default();
+        run_reported(&mut logic, 0.0, 0.1, Some([1, 0]));
+        run_reported(&mut logic, 0.1, 0.3, Some([1, 1]));
+        assert_eq!(
+            run_reported(&mut logic, 0.3, 0.5, Some([1, 0])),
+            ["car left"]
+        );
+
+        // Both go, one too soon to call clear: both are clear all the same
+        let mut logic = Logic::default();
+        run_reported(&mut logic, 0.0, 1.0, Some([1, 0]));
+        run_reported(&mut logic, 1.0, 1.1, Some([1, 1]));
+        assert_eq!(
+            run_reported(&mut logic, 1.1, 1.5, Some([0, 0])),
+            ["clear all round"]
+        );
+
+        // Both at once from one car: three wide is said once
+        let mut logic = Logic::default();
+        run_reported(&mut logic, 0.0, 1.0, Some([1, 0]));
+        assert_eq!(
+            run_reported(&mut logic, 1.0, 2.0, Some([0, 2])),
+            ["three wide right", "clear left"]
+        );
+    }
+
+    #[test]
+    fn three_wide_is_not_replaced_by_a_reminder_due_at_once() {
+        let mut logic = Logic::default();
+        let from_start = run_reported(&mut logic, 0.0, 6.0 - 1.0 / 60.0, Some([1, 0]));
+        assert_eq!(from_start, ["car left"]);
+        // The reminder for the left falls due as a second car joins it
+        assert_eq!(
+            run_reported(&mut logic, 6.0, 6.5, Some([2, 0])),
+            ["three wide left"]
+        );
+    }
+
+    #[test]
+    fn unknown_alongside_is_never_clear() {
+        let mut logic = Logic::default();
+        assert_eq!(
+            run_reported(&mut logic, 0.0, 1.0, Some([1, 0])),
+            ["car left"]
+        );
+        // The simulator stops reporting: nothing said, and no reminders
+        assert!(run_reported(&mut logic, 1.0, 8.0, None).is_empty());
+        // Reporting again: called afresh, and a clear side is no news
+        assert_eq!(
+            run_reported(&mut logic, 8.0, 9.0, Some([1, 0])),
+            ["car left"]
+        );
+        assert!(run_reported(&mut logic, 9.0, 9.5, None).is_empty());
+        assert!(run_reported(&mut logic, 9.5, 10.0, Some([0, 0])).is_empty());
+    }
+
+    #[test]
+    fn reads_reported_cars_alongside_when_recorded() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A recording from before the columns existed
+        conn.execute_batch(
+            "CREATE TABLE telemetry (id INTEGER PRIMARY KEY, vehicle_id INTEGER);
+             INSERT INTO telemetry VALUES (1, 1);",
+        )
+        .unwrap();
+        assert_eq!(alongside(&conn, 1).unwrap(), None);
+
+        conn.execute_batch(
+            "ALTER TABLE telemetry ADD COLUMN cars_left INTEGER;
+             ALTER TABLE telemetry ADD COLUMN cars_right INTEGER;
+             INSERT INTO telemetry VALUES (2, 1, 2, 0), (3, 1, 1, NULL), (4, 1, 5, -1);",
+        )
+        .unwrap();
+        assert_eq!(alongside(&conn, 1).unwrap(), None);
+        assert_eq!(alongside(&conn, 2).unwrap(), Some([2, 0]));
+        assert_eq!(alongside(&conn, 3).unwrap(), None);
+        assert_eq!(alongside(&conn, 4).unwrap(), Some([2, 0]));
     }
 
     #[test]
