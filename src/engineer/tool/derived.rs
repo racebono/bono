@@ -1137,18 +1137,23 @@ impl Drivers {
             run.first = t;
             run.standing_id = None;
         }
-        let staying = runs.iter().map(|run| run.driver).collect::<BTreeSet<_>>();
+        // When each driver staying was first seen in the new car
+        let mut staying = HashMap::new();
+        for run in runs.iter() {
+            let first = staying.entry(run.driver).or_insert(run.first);
+            *first = run.first.min(*first);
+        }
         let known = &mut self.known;
         self.ids.retain(|(car, _), id| {
             let driver = &mut known[(*id - 1) as usize];
-            match (*car == vehicle, staying.contains(id)) {
+            match (*car == vehicle, staying.get(id)) {
                 (false, _) => true,
-                (true, true) => {
-                    driver.first_seen = driver.first_seen.max(t);
+                (true, Some(first)) => {
+                    driver.first_seen = *first;
                     true
                 }
                 // Named again, they're someone new
-                (true, false) => {
+                (true, None) => {
                     driver.gone = true;
                     false
                 }
@@ -1220,15 +1225,16 @@ impl StintStart {
 /// What a stint was on course for when last worked out while current, and which stint that was:
 /// its number can change, when another is found to have begun before it.
 struct Saved {
-    driver: Option<i64>,
     start: StintStart,
     columns: Columns,
 }
 
 impl Saved {
-    /// Whether it was worked out for this stint, whatever its number is now.
+    /// Whether it was worked out for this stint, whatever its number is now: when it began says
+    /// which it is, though who drove it may only be known later.
     fn is(&self, stint: &Segment) -> bool {
-        self.driver == stint.driver && self.start == stint.start
+        let (a, b) = (&self.start, &stint.start);
+        (a.lap, a.from, a.to) == (b.lap, b.from, b.to)
     }
 }
 
@@ -2048,7 +2054,8 @@ impl Stream {
         };
         self.behind |= standings_behind || telemetry_behind;
         if let Err(e) = tx.commit() {
-            self.forget_stints();
+            // What was applied of those rows is gone: read them again
+            self.rewind(conn)?;
             return Err(e.into());
         }
 
@@ -2657,7 +2664,6 @@ impl Stream {
                     let saved = self.projections.entry(vehicle).or_default();
                     saved.retain(|saved| !saved.is(stint));
                     saved.push(Saved {
-                        driver: stint.driver,
                         start: stint.start.clone(),
                         columns,
                     });
