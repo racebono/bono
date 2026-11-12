@@ -144,7 +144,8 @@ no rows, and `stints.driver_id` is NULL.
 between its in and out laps; leaving the garage isn't one), and so does someone else taking over;
 swapping drivers during a stop starts just the one. The current one is `cars_now.current_stint_id`;
 the driver is its `driver_id` in `drivers_now`, and a driver back in the car has a new stint under
-the same `driver_id`. `stint_id`, `vehicle_id`, `stint_number`, `driver_id`; `start_reason`
+the same `driver_id`. Ids can change as more is known: join on them within a query, not from an
+earlier answer. `stint_id`, `vehicle_id`, `stint_number`, `driver_id`; `start_reason`
 (`first seen`, `pit stop`, `driver change`, `pit stop and driver change`), `start_from_s`,
 `start_to_s` (when it began as observed: a handover is somewhere between the last standings row
 naming the driver before and the first naming the next), `start_standing_id` (that first row);
@@ -155,7 +156,7 @@ green laps; `any driver`, whoever drove the car before: say the pace or use is p
 else's), `avg_lap_s`,
 `pace_trend_s_per_lap`, `fuel_per_lap_l`, `energy_per_lap_pct`. What it's on course for, as of
 `calculated_at_s` (compare it with `race_state.session_time_s`: for a stint that's over, it's the
-last time it was worked out while current, history and not a forecast; NULL if never): `lap_fraction`; `fuel_l`, `fuel_laps_left`, `fuel_runs_out_lap`,
+last time a query worked it out while current, history and not a forecast; NULL if never): `lap_fraction`; `fuel_l`, `fuel_laps_left`, `fuel_runs_out_lap`,
 `tank_capacity_l`; `energy_left_pct`, `energy_laps_left`, `energy_runs_out_lap`;
 `game_fuel_per_lap_l`, `game_energy_per_lap_pct`; `limited_by` (fuel or energy), `laps_left`,
 `last_full_lap`, `laps_needed` (from the session, including the lap you finish after the flag),

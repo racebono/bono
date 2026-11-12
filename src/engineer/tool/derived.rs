@@ -2033,9 +2033,7 @@ impl Stream {
                 // Stints worked out with rows put right that are now gone: they're all put right
                 // again next time
                 drop(tx);
-                for car in self.cars.values_mut() {
-                    car.stints.clear();
-                }
+                self.forget_stints();
                 return Err(e.into());
             }
         };
@@ -2049,13 +2047,24 @@ impl Stream {
             }
         };
         self.behind |= standings_behind || telemetry_behind;
-        tx.commit()?;
+        if let Err(e) = tx.commit() {
+            self.forget_stints();
+            return Err(e.into());
+        }
 
         if !self.behind {
             self.calibrate(conn, shared)?;
         }
         self.find_braking_zones(conn)?;
         Ok(())
+    }
+
+    /// The rows' stints may not be what the cars' say, the writes having been undone: they're all
+    /// put right next time.
+    fn forget_stints(&mut self) {
+        for car in self.cars.values_mut() {
+            car.stints.clear();
+        }
     }
 
     fn rewind_memory(&mut self) {
@@ -2082,6 +2091,8 @@ impl Stream {
     fn start_session(&mut self, conn: &Connection, start: i64) -> rusqlite::Result<()> {
         self.session_start = start;
         self.stint_ids = StintIds::default();
+        // Another car taking a slot was on the old session's clock
+        self.drivers.replaced.clear();
         self.projections.clear();
         self.calibrated_laps = None;
         self.zones_from = None;
@@ -2631,7 +2642,10 @@ impl Stream {
         if let Err(e) = self.write_drivers(conn) {
             problems.push(format!("drivers_now: {e}"));
         }
-        tx.commit()?;
+        if let Err(e) = tx.commit() {
+            self.forget_stints();
+            return Err(e.into());
+        }
         // Only what's worked out from all of it is kept: a car still being read could be in a stint
         // it's long finished
         if !self.behind && !self.failed {
