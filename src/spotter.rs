@@ -1228,6 +1228,15 @@ impl Logic {
             _ => "three wide",
         };
 
+        let mut clears = Vec::new();
+        for &side in &cleared {
+            let held = self.side_since[side.index()].map_or(0.0, |since| t - since);
+            self.side_since[side.index()] = None;
+            self.last_still[side.index()] = None;
+            if held >= *config.min_hold_for_clear() && known {
+                clears.push(side);
+            }
+        }
         for side in &became {
             self.side_since[side.index()] = Some(t);
             self.last_still[side.index()] = Some(t);
@@ -1250,8 +1259,8 @@ impl Logic {
         } else if three_wide(after) && !three_wide(before) {
             // A second car joined one already alongside on the same side
             calls.raise(three_wide_call(after), true);
-        } else if three_wide(before) && !three_wide(after) && cleared.is_empty() {
-            // One of two cars on the same side went: the other's still there
+        } else if three_wide(before) && !three_wide(after) && clears.is_empty() {
+            // One of two went (from one side, or too soon to call clear): the other's still there
             if let Some(side) = Side::BOTH.into_iter().find(|s| after[s.index()] > 0) {
                 calls.raise(side_call(side), true);
             }
@@ -1259,15 +1268,6 @@ impl Logic {
             stated = false;
         }
 
-        let mut clears = Vec::new();
-        for &side in &cleared {
-            let held = self.side_since[side.index()].map_or(0.0, |since| t - since);
-            self.side_since[side.index()] = None;
-            self.last_still[side.index()] = None;
-            if held >= *config.min_hold_for_clear() && known {
-                clears.push(side);
-            }
-        }
         match clears.as_slice() {
             [_, _] => calls.raise("clear all round", true),
             [Side::Left] => calls.raise("clear left", true),
@@ -2330,6 +2330,15 @@ mod tests {
         assert_eq!(
             run_reported(&mut logic, 0.6, 0.8, Some([2, 0])),
             ["three wide left"]
+        );
+
+        // Back to one car too soon to call clear: that car is said again
+        let mut logic = Logic::default();
+        run_reported(&mut logic, 0.0, 0.1, Some([1, 0]));
+        run_reported(&mut logic, 0.1, 0.3, Some([1, 1]));
+        assert_eq!(
+            run_reported(&mut logic, 0.3, 0.5, Some([1, 0])),
+            ["car left"]
         );
 
         // Both at once from one car: three wide is said once
