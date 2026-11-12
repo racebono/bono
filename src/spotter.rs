@@ -6,7 +6,8 @@
 //! soon as the game stops, so the plugin can delete the file), and turns what changed into calls.
 //! They're said in the engineer's voice: urgent ones (traffic, the pit limiter, full course
 //! yellows, red flags) cut in over the engineer, which carries on afterwards; the rest wait for it
-//! to finish.
+//! to finish. A call a newer one makes out of date (a car called on a side that's just cleared) is
+//! dropped before it's said, or cut off while it is, and the newer call is said in its place.
 
 use crate::{
     arrstr,
@@ -95,12 +96,15 @@ impl Raised {
     }
 }
 
-/// Urgent state updates supersede only warnings about the same thing.
+/// What a call is about. A newer call about the same thing makes an older one out of date; calls
+/// about anything else are left alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WarningCategory {
     Traffic,
     Limiter,
     Flag,
+    GapBehind,
+    /// One-off news (a puncture, a penalty, the weather changing): never out of date by another
     Other(&'static str),
 }
 
@@ -112,18 +116,26 @@ impl Raised {
             | "still there right" => WarningCategory::Traffic,
             "limiter, limiter" => WarningCategory::Limiter,
             "full course yellow" | "green flag, green flag" | "red flag" => WarningCategory::Flag,
+            "car close behind" | "car within a second behind" => WarningCategory::GapBehind,
             text => WarningCategory::Other(text),
         }
     }
 
-    /// Preserve the occupied side when a clear replaces a pending three-wide call.
+    /// What's still true of a pending call this replaces: the side still taken when a clear
+    /// replaces three wide, and the side still clear when a car comes back to the other after
+    /// clear all round.
     fn remaining_traffic(&self, older: &Raised) -> Option<Raised> {
-        if !self.supersedes(older) || older.text != "three wide" {
+        if !self.supersedes(older) {
             return None;
         }
-        let text = match self.text {
-            "clear left" => "car right",
-            "clear right" => "car left",
+        let text = match (older.text, self.text) {
+            ("three wide", "clear left") => "car right",
+            ("three wide", "clear right") => "car left",
+            ("clear all round", _) => match self.traffic_sides() {
+                1 => "clear right",
+                2 => "clear left",
+                _ => return None,
+            },
             _ => return None,
         };
         Some(Raised {
@@ -132,18 +144,36 @@ impl Raised {
         })
     }
 
-    /// A traffic update replaces only the sides it describes; other urgent updates
-    /// replace the older state in their category.
+    /// A traffic update replaces only the sides it describes; other updates replace the older
+    /// state in their category, as urgent as they are. Nothing but a red flag replaces a red
+    /// flag: the session's stopped until it restarts, which isn't called.
     fn supersedes(&self, older: &Raised) -> bool {
-        if !self.urgent || !older.urgent {
+        if self.urgent != older.urgent {
             return false;
         }
         match (self.warning_category(), older.warning_category()) {
             (WarningCategory::Traffic, WarningCategory::Traffic) => {
                 self.traffic_sides() & older.traffic_sides() != 0
             }
+            (WarningCategory::Flag, WarningCategory::Flag) => {
+                older.text != "red flag" || self.text == "red flag"
+            }
+            (WarningCategory::Other(_), _) | (_, WarningCategory::Other(_)) => false,
             (new, old) => new == old,
         }
+    }
+
+    /// The same words as `other` (three wide is said the same whichever side has two cars).
+    fn says_the_same_as(&self, other: &Raised) -> bool {
+        let en = arrstr!("en");
+        self.words(en) == other.words(en)
+    }
+
+    /// Cuts `playing` off while it's being said: it's out of date, and this says something else
+    /// (the same words again would only restart it). Only urgent calls cut in; the rest take
+    /// their turn.
+    fn interrupts(&self, playing: &Raised) -> bool {
+        self.urgent && self.supersedes(playing) && !self.says_the_same_as(playing)
     }
 }
 
@@ -185,8 +215,12 @@ enum Saying {
         call: Raised,
         at: Instant,
     },
-    /// Dropping the stream stops it
-    Playing(AudioStreamOwner, Drain),
+    Playing {
+        /// Dropping it stops the call, mid-word if need be
+        stream: AudioStreamOwner,
+        drain: Drain,
+        call: Raised,
+    },
 }
 
 impl Spotter {
@@ -246,9 +280,7 @@ impl Spotter {
                 .as_ref()
                 .and_then(|running| running.calls.try_recv().ok())
             {
-                let at = Instant::now();
-                self.discard_stale_synthesis(at, Some(&call));
-                Self::enqueue(&mut self.queue, call, at);
+                self.hear(call, Instant::now());
             }
             self.warm(rt, config, synth, lang);
         }
@@ -259,7 +291,7 @@ impl Spotter {
     /// The speaker `which` is gone (unplugged): the call on it is dropped, so the spotter says the
     /// next ones and the engineer is let go.
     pub fn speaker_removed(&mut self, which: u32) {
-        if let Some(Saying::Playing(stream, _)) = &self.saying
+        if let Some(Saying::Playing { stream, .. }) = &self.saying
             && plays_on(stream, which)
         {
             log::warn!("The speaker was removed while the spotter was speaking");
@@ -267,16 +299,56 @@ impl Spotter {
         }
     }
 
-    fn enqueue(queue: &mut VecDeque<(Raised, Instant)>, call: Raised, at: Instant) {
+    /// A new call: whatever it makes out of date goes before it's said (or, when it's being said,
+    /// is cut off), and it waits its turn. Replacing the call being said, it takes that call's
+    /// turn: next, after what that call still had to say.
+    fn hear(&mut self, call: Raised, at: Instant) {
+        // The words being said already say it: they're now about the newer state
+        if let Some(Saying::Playing { call: playing, .. }) = &mut self.saying
+            && call.supersedes(playing)
+            && call.says_the_same_as(playing)
+        {
+            Self::retire(&mut self.queue, &call);
+            *playing = call;
+            return;
+        }
+        let place = self.drop_outdated(at, Some(&call));
+        let queued = Self::enqueue(&mut self.queue, call, at);
+        if let Some(place) = place.filter(|place| *place < queued)
+            && let Some(call) = self.queue.remove(queued)
+        {
+            self.queue.insert(place, call);
+        }
+    }
+
+    /// Queues `call`, in the turn of the first call it replaces (after what that call still had
+    /// to say), or else at the back. Where it went.
+    fn enqueue(queue: &mut VecDeque<(Raised, Instant)>, call: Raised, at: Instant) -> usize {
+        let place = Self::retire(queue, &call).unwrap_or(queue.len());
+        queue.insert(place, (call, at));
+        place
+    }
+
+    /// Drops the queued calls `call` makes out of date, keeping what's still true of them. Where
+    /// the first of them was, for `call` to take its turn.
+    fn retire(queue: &mut VecDeque<(Raised, Instant)>, call: &Raised) -> Option<usize> {
+        let mut place = None;
+        let mut kept = 0;
         queue.retain_mut(|(queued, _)| {
-            if let Some(remaining) = call.remaining_traffic(queued) {
+            let keep = if let Some(remaining) = call.remaining_traffic(queued) {
                 *queued = remaining;
+                place.get_or_insert(kept + 1);
                 true
+            } else if call.supersedes(queued) {
+                place.get_or_insert(kept);
+                false
             } else {
-                !call.supersedes(queued)
-            }
+                true
+            };
+            kept += usize::from(keep);
+            keep
         });
-        queue.push_back((call, at));
+        place
     }
 
     /// The calls' language: the configured one, or the pilot's; the engineer's fallback without
@@ -350,18 +422,38 @@ impl Spotter {
             });
     }
 
-    /// Drop the receiver promptly, so an obsolete call no longer holds the engineer.
-    fn discard_stale_synthesis(&mut self, now: Instant, newer: Option<&Raised>) {
-        if let Some(Saying::Synthesizing { call, at, .. }) = &self.saying {
-            let superseded = newer.is_some_and(|newer| newer.supersedes(call));
-            if !call.valid_at(*at, now) || superseded {
-                if call.valid_at(*at, now)
-                    && let Some(remaining) = newer.and_then(|newer| newer.remaining_traffic(call))
-                {
-                    self.queue.push_front((remaining, *at));
+    /// Drops the call being said once it's out of date (expired before it was heard, or replaced by
+    /// `newer`), so it no longer holds the engineer and the newer call is said straight away.
+    /// Replaced by `newer`, where in the queue `newer` goes to take its turn.
+    fn drop_outdated(&mut self, now: Instant, newer: Option<&Raised>) -> Option<usize> {
+        match &self.saying {
+            Some(Saying::Synthesizing { call, at, .. }) => {
+                let valid = call.valid_at(*at, now);
+                let superseded = newer.is_some_and(|newer| newer.supersedes(call));
+                if !valid || superseded {
+                    let mut place = None;
+                    if valid && let Some(newer) = newer {
+                        place = Some(0);
+                        if let Some(remaining) = newer.remaining_traffic(call) {
+                            self.queue.push_front((remaining, *at));
+                            place = Some(1);
+                        }
+                    }
+                    self.saying = None;
+                    return place;
                 }
-                self.saying = None;
+                None
             }
+            // Started, so not restated: the pilot heard (part of) it, and the newer call is what
+            // matters now
+            Some(Saying::Playing { call, .. })
+                if newer.is_some_and(|newer| newer.interrupts(call)) =>
+            {
+                log::debug!("Cutting off the spotter's \"{}\": out of date", call.text);
+                self.saying = None;
+                Some(0)
+            }
+            _ => None,
         }
     }
 
@@ -374,7 +466,7 @@ impl Spotter {
         engineer: &mut Engineer,
         lang: ArrayStr<2>,
     ) {
-        self.discard_stale_synthesis(Instant::now(), None);
+        self.drop_outdated(Instant::now(), None);
 
         // The call being said
         match &mut self.saying {
@@ -382,7 +474,9 @@ impl Spotter {
                 Ok(Ok(speech)) => {
                     let speech = Arc::new(speech);
                     self.cache.insert(key.clone(), speech.clone());
-                    self.saying = self.play(config, speaker, &speech);
+                    if let Some(Saying::Synthesizing { call, .. }) = self.saying.take() {
+                        self.saying = self.play(config, speaker, &speech, call);
+                    }
                 }
                 Ok(Err(e)) => {
                     log::warn!("Error synthesizing a spotter call: {e:#}");
@@ -392,7 +486,7 @@ impl Spotter {
                 Err(oneshot::error::TryRecvError::Empty) => {}
             },
             // A speaker that stops taking audio doesn't keep the spotter (and the engineer) waiting
-            Some(Saying::Playing(stream, drain)) => {
+            Some(Saying::Playing { stream, drain, .. }) => {
                 match drain.check(stream.queued_bytes().ok(), false, Instant::now()) {
                     Drained::Playing => {}
                     Drained::Done => self.saying = None,
@@ -420,7 +514,7 @@ impl Spotter {
                 let words = call.words(lang);
                 let key = Self::key(config, lang, words.clone());
                 self.saying = match self.cache.get(&key).cloned() {
-                    Some(speech) => self.play(config, speaker, &speech),
+                    Some(speech) => self.play(config, speaker, &speech, call),
                     None => {
                         let recv = synth.synthesize(rt, lang, words, Self::effects(config));
                         Some(Saying::Synthesizing {
@@ -443,6 +537,7 @@ impl Spotter {
         config: &Config,
         speaker: Option<&AudioDevice>,
         speech: &Speech,
+        call: Raised,
     ) -> Option<Saying> {
         let speaker = speaker?;
         let gain = {
@@ -454,7 +549,11 @@ impl Spotter {
             sample_rate: speech.sample_rate,
         };
         match speech.play(speaker) {
-            Ok(stream) => Some(Saying::Playing(stream, Drain::new(Instant::now()))),
+            Ok(stream) => Some(Saying::Playing {
+                stream,
+                drain: Drain::new(Instant::now()),
+                call,
+            }),
             Err(e) => {
                 log::warn!("Error playing a spotter call: {e}");
                 None
@@ -1378,6 +1477,8 @@ impl Logic {
             calls.raise("full course yellow", true);
         } else if caution(&last.full_course_yellow)
             && now.full_course_yellow.as_deref() == Some("none")
+            // The caution ending as the session's stopped isn't a restart: it's still red
+            && now.phase.as_deref() != Some("stopped")
         {
             calls.raise("green flag, green flag", true);
         }
@@ -1739,11 +1840,25 @@ mod tests {
             ("green flag, green flag", true),
             ("red flag", true),
         ]);
+        // Each replacement takes the turn of the call it replaces
         assert_eq!(
             queue.iter().map(|(call, _)| call.text).collect::<Vec<_>>(),
-            ["blue flag", "limiter, limiter", "clear right", "red flag"]
+            ["blue flag", "clear right", "red flag", "limiter, limiter"]
         );
         assert_eq!(queue.iter().position(|(call, _)| call.urgent), Some(1));
+    }
+
+    #[test]
+    fn only_a_red_flag_replaces_a_red_flag() {
+        for newer in ["full course yellow", "green flag, green flag"] {
+            let queue = queued(&[("red flag", true), (newer, true)]);
+            assert_eq!(
+                queue.iter().map(|(call, _)| call.text).collect::<Vec<_>>(),
+                ["red flag", newer]
+            );
+        }
+        let queue = queued(&[("red flag", true), ("red flag", true)]);
+        assert_eq!(queue.len(), 1);
     }
 
     #[test]
@@ -1765,7 +1880,7 @@ mod tests {
                 .iter()
                 .map(|(call, at)| (call.text, *at))
                 .collect::<Vec<_>>(),
-            [("limiter, limiter", old), ("still there left", new)]
+            [("still there left", new), ("limiter, limiter", old)]
         );
     }
 
@@ -1806,7 +1921,7 @@ mod tests {
             number: None,
             session_time: 1.0,
         };
-        spotter.discard_stale_synthesis(at, Some(&newer));
+        spotter.drop_outdated(at, Some(&newer));
         Spotter::enqueue(&mut spotter.queue, newer, at);
         assert!(spotter.saying.is_none());
         assert!(send.is_closed());
@@ -1842,7 +1957,7 @@ mod tests {
         let at = Instant::now();
         for (urgent, lifetime) in [(true, URGENT_FOR), (false, OTHER_FOR)] {
             let (mut spotter, send) = pending_call("car right", urgent, at);
-            spotter.discard_stale_synthesis(at + lifetime - Duration::from_nanos(1), None);
+            spotter.drop_outdated(at + lifetime - Duration::from_nanos(1), None);
             assert!(spotter.saying.is_some());
             // Completion at the deadline must not reach playback, even if already received.
             assert!(
@@ -1852,7 +1967,7 @@ mod tests {
                 }))
                 .is_ok()
             );
-            spotter.discard_stale_synthesis(at + lifetime, None);
+            spotter.drop_outdated(at + lifetime, None);
             assert!(spotter.saying.is_none());
         }
     }
@@ -1861,7 +1976,7 @@ mod tests {
     fn expired_pending_synthesis_releases_the_call_without_waiting_for_completion() {
         let at = Instant::now();
         let (mut spotter, send) = pending_call("car right", true, at);
-        spotter.discard_stale_synthesis(at + URGENT_FOR, None);
+        spotter.drop_outdated(at + URGENT_FOR, None);
         assert!(spotter.saying.is_none());
         assert!(send.is_closed());
     }
@@ -1892,7 +2007,7 @@ mod tests {
                     number: None,
                     session_time: 1.0,
                 };
-                spotter.discard_stale_synthesis(at, Some(&newer));
+                spotter.drop_outdated(at, Some(&newer));
                 assert!(spotter.saying.is_none(), "{old} superseded by {new}");
             }
         }
@@ -1974,7 +2089,7 @@ mod tests {
                     urgent: true,
                     session_time: 1.0,
                 };
-                spotter.discard_stale_synthesis(at, Some(&newer));
+                spotter.drop_outdated(at, Some(&newer));
                 Spotter::enqueue(&mut spotter.queue, newer, at);
                 assert!(spotter.saying.is_none());
                 assert_eq!(
@@ -2000,9 +2115,260 @@ mod tests {
                 number: None,
                 session_time: 1.0,
             };
-            spotter.discard_stale_synthesis(at, Some(&newer));
+            spotter.drop_outdated(at, Some(&newer));
             assert!(spotter.saying.is_some(), "unrelated {new}");
         }
+    }
+
+    fn call(text: &'static str, urgent: bool) -> Raised {
+        Raised {
+            text,
+            urgent,
+            number: None,
+            session_time: 1.0,
+        }
+    }
+
+    #[test]
+    fn a_change_of_the_same_state_cuts_off_the_call_being_said() {
+        for (playing, newer) in [
+            ("car right", "clear right"),
+            ("car left", "clear left"),
+            ("car left", "clear all round"),
+            ("still there right", "clear right"),
+            ("three wide", "clear left"),
+            ("three wide", "car right"),
+            ("three wide right", "clear right"),
+            ("car right", "three wide"),
+            ("clear right", "car right"),
+            ("full course yellow", "green flag, green flag"),
+            ("green flag, green flag", "red flag"),
+        ] {
+            assert!(
+                call(newer, true).interrupts(&call(playing, true)),
+                "{newer} over {playing}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_news_waits_for_the_call_being_said() {
+        for (playing, newer) in [
+            // Another side, or something else altogether
+            ("car right", "clear left"),
+            ("car left", "car right"),
+            ("three wide left", "clear right"),
+            ("car right", "limiter, limiter"),
+            ("limiter, limiter", "full course yellow"),
+            ("full course yellow", "car left"),
+            // Saying it again would only restart it
+            ("car right", "car right"),
+            ("limiter, limiter", "limiter, limiter"),
+            ("three wide left", "three wide"),
+            ("three wide", "three wide right"),
+        ] {
+            assert!(
+                !call(newer, true).interrupts(&call(playing, true)),
+                "{newer} over {playing}"
+            );
+        }
+        // Calls that aren't urgent take their turn
+        assert!(!call("car close behind", false).interrupts(&call("car right", true)));
+        assert!(
+            !call("car close behind", false).interrupts(&call("car within a second behind", false))
+        );
+        assert!(!call("rain stopped", false).interrupts(&call("rain starting", false)));
+    }
+
+    fn texts_of(queue: &VecDeque<(Raised, Instant)>) -> Vec<&'static str> {
+        queue.iter().map(|(call, _)| call.text).collect()
+    }
+
+    #[test]
+    fn a_replacement_takes_the_turn_of_the_call_it_replaces() {
+        let at = Instant::now();
+        for (pending, newer, expected) in [
+            (
+                "car right",
+                "clear right",
+                &["clear right", "limiter, limiter"][..],
+            ),
+            (
+                "three wide",
+                "clear left",
+                &["car right", "clear left", "limiter, limiter"][..],
+            ),
+            (
+                "clear all round",
+                "car right",
+                &["clear left", "car right", "limiter, limiter"][..],
+            ),
+        ] {
+            let (mut spotter, _send) = pending_call(pending, true, at);
+            spotter.hear(call("limiter, limiter", true), at);
+            spotter.hear(call(newer, true), at);
+            assert!(spotter.saying.is_none());
+            assert_eq!(texts_of(&spotter.queue), expected, "{newer} over {pending}");
+        }
+        // A second replacement before the first is said keeps the turn
+        let (mut spotter, _send) = pending_call("green flag, green flag", true, at);
+        for newer in ["limiter, limiter", "full course yellow", "red flag"] {
+            spotter.hear(call(newer, true), at);
+        }
+        assert_eq!(texts_of(&spotter.queue), ["red flag", "limiter, limiter"]);
+        // Unrelated news still waits its turn
+        let (mut spotter, _send) = pending_call("car right", true, at);
+        spotter.hear(call("limiter, limiter", true), at);
+        spotter.hear(call("red flag", true), at);
+        assert!(spotter.saying.is_some());
+        assert_eq!(texts_of(&spotter.queue), ["limiter, limiter", "red flag"]);
+    }
+
+    #[test]
+    fn a_car_back_on_one_side_keeps_the_other_side_clear() {
+        for (newer, remaining) in [
+            ("car right", "clear left"),
+            ("three wide right", "clear left"),
+            ("car left", "clear right"),
+            ("three wide left", "clear right"),
+        ] {
+            let queue = queued(&[("clear all round", true), (newer, true)]);
+            assert_eq!(
+                queue.iter().map(|(call, _)| call.text).collect::<Vec<_>>(),
+                [remaining, newer],
+            );
+        }
+        let queue = queued(&[("clear all round", true), ("three wide", true)]);
+        assert_eq!(
+            queue.iter().map(|(call, _)| call.text).collect::<Vec<_>>(),
+            ["three wide"],
+        );
+    }
+
+    #[test]
+    fn a_newer_gap_behind_replaces_the_queued_one() {
+        let queue = queued(&[
+            ("car within a second behind", false),
+            ("penalty", false),
+            ("car close behind", false),
+            ("penalty", false),
+        ]);
+        assert_eq!(
+            queue.iter().map(|(call, _)| call.text).collect::<Vec<_>>(),
+            ["car close behind", "penalty", "penalty"]
+        );
+    }
+
+    #[test]
+    fn a_newer_gap_behind_replaces_the_one_being_synthesized() {
+        let at = Instant::now();
+        let (mut spotter, send) = pending_call("car within a second behind", false, at);
+        spotter.hear(call("car close behind", false), at);
+        assert!(spotter.saying.is_none());
+        assert!(send.is_closed());
+        assert_eq!(
+            spotter
+                .queue
+                .iter()
+                .map(|(call, _)| call.text)
+                .collect::<Vec<_>>(),
+            ["car close behind"]
+        );
+    }
+
+    #[test]
+    #[ignore = "run alone with SDL_AUDIO_DRIVER=dummy"]
+    fn a_clear_cuts_off_the_car_call_being_said_and_is_said_instead() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let mut synth = Synthesizer::new(runtime.handle(), &config.get());
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        let sdl = sdl3::init().unwrap();
+        let audio = sdl.audio().unwrap();
+        let lang = arrstr!("en");
+        // Long enough to still be playing when the clear comes
+        let speech = || Speech {
+            samples: vec![0.0; 24000 * 5],
+            sample_rate: 24000,
+        };
+        let device = audio.open_playback_device(&speech().spec()).unwrap();
+
+        let mut spotter = Spotter::new();
+        spotter.cache.insert(
+            Spotter::key(&config, lang, call("clear right", true).words(lang)),
+            Arc::new(speech()),
+        );
+        spotter.saying = spotter.play(&config, Some(&device), &speech(), call("car right", true));
+        let playing = |spotter: &Spotter| match &spotter.saying {
+            Some(Saying::Playing { call, .. }) => Some(call.text),
+            _ => None,
+        };
+        assert_eq!(playing(&spotter), Some("car right"));
+
+        // News about something else waits for it
+        spotter.hear(call("limiter, limiter", true), Instant::now());
+        assert_eq!(playing(&spotter), Some("car right"));
+
+        // The clear takes its turn, ahead of what was waiting
+        spotter.hear(call("clear right", true), Instant::now());
+        assert_eq!(playing(&spotter), None);
+        assert_eq!(
+            texts_of(&spotter.queue),
+            ["clear right", "limiter, limiter"]
+        );
+        spotter.say(
+            runtime.handle(),
+            &config,
+            &mut synth,
+            Some(&device),
+            &mut engineer,
+            lang,
+        );
+        assert_eq!(playing(&spotter), Some("clear right"));
+        assert_eq!(texts_of(&spotter.queue), ["limiter, limiter"]);
+    }
+
+    #[test]
+    #[ignore = "run alone with SDL_AUDIO_DRIVER=dummy"]
+    fn the_same_words_carry_on_about_the_newer_state() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let sdl = sdl3::init().unwrap();
+        let audio = sdl.audio().unwrap();
+        let speech = Speech {
+            samples: vec![0.0; 24000 * 5],
+            sample_rate: 24000,
+        };
+        let device = audio.open_playback_device(&speech.spec()).unwrap();
+        let mut spotter = Spotter::new();
+        spotter.saying = spotter.play(
+            &config,
+            Some(&device),
+            &speech,
+            call("three wide left", true),
+        );
+        let playing = |spotter: &Spotter| match &spotter.saying {
+            Some(Saying::Playing { call, .. }) => Some(call.text),
+            _ => None,
+        };
+
+        // Two cars on the left become one each side: still three wide, said once
+        spotter.hear(call("three wide", true), Instant::now());
+        assert_eq!(playing(&spotter), Some("three wide"));
+        assert!(spotter.queue.is_empty());
+
+        // So the right clearing cuts it off
+        spotter.hear(call("clear right", true), Instant::now());
+        assert_eq!(playing(&spotter), None);
+        assert_eq!(texts_of(&spotter.queue), ["clear right"]);
     }
 
     /// The player at `t`, heading along -z (heading 0) at 50 m/s.
@@ -2452,6 +2818,16 @@ mod tests {
         );
         scoring.phase = Some("stopped".into());
         assert_eq!(step(0.5, &scoring), [("red flag", true)]);
+
+        // A caution ending once the session's stopped is no green flag
+        scoring.phase = Some("green".into());
+        assert!(step(0.6, &scoring).is_empty());
+        scoring.full_course_yellow = Some("pending".into());
+        assert_eq!(step(0.7, &scoring), [("full course yellow", true)]);
+        scoring.phase = Some("stopped".into());
+        assert_eq!(step(0.8, &scoring), [("red flag", true)]);
+        scoring.full_course_yellow = Some("none".into());
+        assert!(step(0.9, &scoring).is_empty());
     }
 
     #[test]
