@@ -45,6 +45,8 @@
     X(f64, position_z)                                                                                   \
     X(f64, heading) /* radians the car body points: 0 along world -z, + turning right; see the schema guide for opponents */ \
     X(f64, course) /* radians of the direction of travel, same convention; NULL below 1 m/s */ \
+    X(i64, cars_left) /* player: cars alongside on the left as the simulator reports them, 0-2; NULL when it doesn't (the spotter works it out from positions) */ \
+    X(i64, cars_right) /* the same on the right; set both or neither */ \
     X(f64, pitch)                                                                                        \
     X(f64, roll)                                                                                         \
     X(f64, speed)                                                                                        \
