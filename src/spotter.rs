@@ -1260,7 +1260,7 @@ impl Logic {
         }
 
         let mut clears = Vec::new();
-        for side in cleared {
+        for &side in &cleared {
             let held = self.side_since[side.index()].map_or(0.0, |since| t - since);
             self.side_since[side.index()] = None;
             self.last_still[side.index()] = None;
@@ -1275,7 +1275,7 @@ impl Logic {
             _ => {}
         }
         // A car each side became two on one: still three wide
-        if became.is_empty() && !clears.is_empty() && three_wide(after) {
+        if became.is_empty() && !cleared.is_empty() && three_wide(after) {
             calls.raise(three_wide_call(after), true);
             stated = true;
         }
@@ -2321,6 +2321,15 @@ mod tests {
         assert_eq!(
             run_reported(&mut logic, 1.0, 2.0, Some([0, 2])),
             ["clear left", "three wide right"]
+        );
+
+        // Even when the side went too soon to call clear
+        let mut logic = Logic::default();
+        run_reported(&mut logic, 0.0, 0.5, Some([1, 0]));
+        run_reported(&mut logic, 0.5, 0.6, Some([1, 1]));
+        assert_eq!(
+            run_reported(&mut logic, 0.6, 0.8, Some([2, 0])),
+            ["three wide left"]
         );
 
         // Both at once from one car: three wide is said once
