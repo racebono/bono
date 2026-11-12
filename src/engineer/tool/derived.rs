@@ -2306,7 +2306,6 @@ impl Stream {
             player,
             drivers,
             stint_ids,
-            projections,
             ..
         } = self;
         let writer = Writer {
@@ -2339,7 +2338,6 @@ impl Stream {
                     )?;
                 }
                 *car = Car::default();
-                projections.remove(&sample.vehicle);
                 // Nor are its drivers
                 if let Some(t) = sample.session_time {
                     drivers.replaced(sample.vehicle, t);
