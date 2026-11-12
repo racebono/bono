@@ -137,7 +137,8 @@ own; tracks have as many sectors as `race_state.sector_count`.
 **`drivers_now`**, one row per driver the standings have named this session: `driver_id`,
 `vehicle_id`, `name`, `first_seen_s`, `last_seen_s` (the first and last standings rows naming them:
 sightings, not exact times). The simulator gives names, not ids or a roster: a name in a car is one
-driver, and a co-driver who hasn't driven yet isn't here.
+driver, and a co-driver who hasn't driven yet isn't here. Without names from the simulator there are
+no rows, and `stints.driver_id` is NULL.
 
 **`stints`**, one row per stint of every car, past and current. A stop starts one (at the line
 between its in and out laps; leaving the garage isn't one), and so does someone else taking over;
@@ -147,13 +148,14 @@ the same `driver_id`. `stint_id`, `vehicle_id`, `stint_number`, `driver_id`; `st
 (`first seen`, `pit stop`, `driver change`, `pit stop and driver change`), `start_from_s`,
 `start_to_s` (when it began as observed: a handover is somewhere between the last standings row
 naming the driver before and the first naming the next), `start_standing_id` (that first row);
-`start_lap`, `end_lap`, `laps_complete` (its laps wholly in it); `baseline_laps`,
+`start_lap`, `end_lap`, `laps_complete` (its laps wholly in it: after a stop, from the out lap, or
+from the lap after it when the drivers swapped during it); `baseline_laps`,
 `baseline_source` (`this stint`; `this driver`, their earlier stints too, when it has too few
 green laps; `any driver`, whoever drove the car before: say the pace or use is partly someone
 else's), `avg_lap_s`,
 `pace_trend_s_per_lap`, `fuel_per_lap_l`, `energy_per_lap_pct`. What it's on course for, as of
-`calculated_at_s` (for a stint that's over, the last time it was worked out while current: history,
-not a forecast; NULL if never): `lap_fraction`; `fuel_l`, `fuel_laps_left`, `fuel_runs_out_lap`,
+`calculated_at_s` (compare it with `race_state.session_time_s`: for a stint that's over, it's the
+last time it was worked out while current, history and not a forecast; NULL if never): `lap_fraction`; `fuel_l`, `fuel_laps_left`, `fuel_runs_out_lap`,
 `tank_capacity_l`; `energy_left_pct`, `energy_laps_left`, `energy_runs_out_lap`;
 `game_fuel_per_lap_l`, `game_energy_per_lap_pct`; `limited_by` (fuel or energy), `laps_left`,
 `last_full_lap`, `laps_needed` (from the session, including the lap you finish after the flag),

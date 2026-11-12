@@ -17,6 +17,7 @@ use rusqlite::{
     types::ValueRef,
 };
 use std::{
+    borrow::Cow,
     collections::BTreeSet,
     sync::mpsc::{self, RecvTimeoutError},
 };
@@ -1113,12 +1114,21 @@ impl Drivers {
         }
     }
 
+    /// Another car took the slot after the last one was last seen at `t`: the spells begun by
+    /// then were the last one's.
+    fn forget_until(&mut self, vehicle: i64, t: f64) {
+        if let Some(runs) = self.runs.get_mut(&vehicle) {
+            runs.retain(|run| run.first > t);
+        }
+    }
+
     fn runs(&self, vehicle: i64) -> &[Run] {
         self.runs.get(&vehicle).map_or(&[], Vec::as_slice)
     }
 }
 
-/// A car's stint keeps its id however often its stints are worked out again.
+/// A stint's id goes with its car and number: the same as long as no stint is found to have begun
+/// before it.
 #[derive(Default)]
 struct StintIds(HashMap<(i64, i64), i64>);
 
@@ -1173,6 +1183,24 @@ impl StintStart {
     }
 }
 
+/// What a stint was on course for when last worked out while current, and which stint that was:
+/// the same number can become another stint, when one is found to have begun before it.
+struct Saved {
+    driver: Option<i64>,
+    start: StintStart,
+    columns: Columns,
+}
+
+/// What a refresh of the tables works out once for all of them.
+#[derive(Default)]
+struct Fresh {
+    stints: CarStints,
+    /// Each car's laps, as read for it
+    laps: HashMap<i64, Vec<Lap>>,
+    /// What each car's current stint is on course for
+    projections: HashMap<i64, Columns>,
+}
+
 /// One of a car's stints.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Segment {
@@ -1191,6 +1219,13 @@ pub(super) enum Place {
     Across,
     /// There's no telling: when it was driven isn't known
     Unknown,
+}
+
+/// Where each of the laps belongs.
+fn places(laps: &[Lap], stints: &[Segment]) -> Vec<Place> {
+    laps.iter()
+        .map(|lap| place(stints, lap.lap, lap.start, lap.end))
+        .collect()
 }
 
 pub(super) fn place(stints: &[Segment], lap: i64, from: Option<f64>, to: Option<f64>) -> Place {
@@ -1369,14 +1404,13 @@ fn resegment(
     if stints == car.stints {
         return Ok(());
     }
-    car.stints = stints;
     for span in &spans {
-        let [id, across] = stint_columns(&car.stints, span.lap, span.start, span.end);
+        let [id, across] = stint_columns(&stints, span.lap, span.start, span.end);
         conn.prepare_cached(
             "UPDATE lap_stats SET stint_id = ?, stint_boundary = ? WHERE vehicle_id = ? AND lap = ?",
         )?
         .execute(params![id, across, vehicle, span.lap])?;
-        if let Place::Stint(_) = place(&car.stints, span.lap, span.start, span.end) {
+        if let Place::Stint(_) = place(&stints, span.lap, span.start, span.end) {
             conn.prepare_cached(
                 "UPDATE corner_passes SET stint_id = ?, stint_boundary = ? \
                  WHERE vehicle_id = ? AND lap = ?",
@@ -1392,7 +1426,7 @@ fn resegment(
             params![vehicle, span.lap],
         )? {
             let (from, to) = pass_span(r.f("entered_at_s"), r.f("exited_at_s"), r.f("total_s"));
-            let [id, across] = stint_columns(&car.stints, span.lap, from, to);
+            let [id, across] = stint_columns(&stints, span.lap, from, to);
             conn.prepare_cached(
                 "UPDATE corner_passes SET stint_id = ?, stint_boundary = ? \
                  WHERE vehicle_id = ? AND lap = ? AND turn_index = ?",
@@ -1400,6 +1434,8 @@ fn resegment(
             .execute(params![id, across, vehicle, span.lap, r.i("turn_index")])?;
         }
     }
+    // Only once its rows are right: a failure leaves them to be put right next time
+    car.stints = stints;
     Ok(())
 }
 
@@ -1912,7 +1948,7 @@ pub(super) struct Stream {
     stint_ids: StintIds,
     /// What each stint (by car and number) was on course for when last worked out, kept once it's
     /// over
-    projections: HashMap<(i64, i64), Columns>,
+    projections: HashMap<(i64, i64), Saved>,
     /// The simulator's timing sectors' ends as last seen whole, and the session start, track and
     /// sector count they're for: a window of the laps can miss lines the session has crossed
     timing: Option<((i64, String, i64), Vec<f64>)>,
@@ -1948,7 +1984,18 @@ impl Stream {
             .query_map(params![self.cursor, CHUNK], sample)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let tx = conn.unchecked_transaction()?;
-        let standings_behind = self.read_standings(conn)?;
+        let standings_behind = match self.read_standings(conn) {
+            Ok(behind) => behind,
+            Err(e) => {
+                // Stints worked out with rows put right that are now gone: they're all put right
+                // again next time
+                drop(tx);
+                for car in self.cars.values_mut() {
+                    car.stints.clear();
+                }
+                return Err(e.into());
+            }
+        };
         let telemetry_behind = match self.apply_telemetry(conn, &samples) {
             Ok(behind) => behind,
             Err(e) => {
@@ -2220,6 +2267,11 @@ impl Stream {
                     continue;
                 }
                 // Another car in the slot: nothing of the last one's is this one's
+                let left = [&car.current, &car.waiting]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|build| build.samples.last()?.session_time)
+                    .reduce(f64::max);
                 for table in STREAM_TABLES {
                     conn.execute(
                         &format!("DELETE FROM {table} WHERE vehicle_id = ?"),
@@ -2228,6 +2280,10 @@ impl Stream {
                 }
                 *car = Car::default();
                 projections.retain(|(vehicle, _), _| *vehicle != sample.vehicle);
+                // Nor are its drivers
+                if let Some(left) = left {
+                    drivers.forget_until(sample.vehicle, left);
+                }
             }
             if car
                 .current
@@ -2525,32 +2581,39 @@ impl Stream {
             conn.execute(&format!("DELETE FROM {table}"), [])?;
         }
         let mut problems = Vec::new();
-        let stints = match self.stints(conn) {
-            Ok(stints) => stints,
-            Err(e) => {
-                problems.push(format!("stints: {e}"));
-                CarStints::new()
-            }
+        let mut fresh = Fresh {
+            stints: self.stints(conn, &mut problems),
+            ..Fresh::default()
         };
-        let mut projections = Vec::new();
-        if let Err(e) = self.write_now(conn, shared, &stints, &mut projections, &mut problems) {
+        if let Err(e) = self.write_now(conn, shared, &mut fresh, &mut problems) {
             problems.push(format!("{e:#}"));
         }
-        self.projections.extend(projections);
         // Without a player's car too: they're the recording's
-        if let Err(e) = self.write_stints(conn, &stints) {
-            problems.push(format!("stints: {e}"));
-        }
+        self.write_stints(conn, &fresh, &mut problems);
         if let Err(e) = self.write_drivers(conn) {
             problems.push(format!("drivers_now: {e}"));
         }
         tx.commit()?;
+        // Only what's worked out from all of it is kept: a car still being read could be in a stint
+        // it's long finished
+        if !self.behind && !self.failed {
+            for (vehicle, columns) in fresh.projections {
+                if let Some(stint) = fresh.stints.get(&vehicle).and_then(|stints| stints.last()) {
+                    let saved = Saved {
+                        driver: stint.driver,
+                        start: stint.start.clone(),
+                        columns,
+                    };
+                    self.projections.insert((vehicle, stint.number), saved);
+                }
+            }
+        }
         Ok((!problems.is_empty()).then(|| problems.join("; ")))
     }
 
     /// Every car's stints as they stand, its rows put right if they've changed: a lap's gone on,
     /// and a stop with it. A car with no laps has them from its drivers alone.
-    fn stints(&mut self, conn: &Connection) -> rusqlite::Result<CarStints> {
+    fn stints(&mut self, conn: &Connection, problems: &mut Vec<String>) -> CarStints {
         let Self {
             cars,
             drivers,
@@ -2559,7 +2622,9 @@ impl Stream {
         } = self;
         let mut stints = CarStints::new();
         for (vehicle, car) in cars.iter_mut() {
-            resegment(conn, *vehicle, car, drivers.runs(*vehicle), stint_ids)?;
+            if let Err(e) = resegment(conn, *vehicle, car, drivers.runs(*vehicle), stint_ids) {
+                problems.push(format!("car {vehicle}'s stints: {e}"));
+            }
             stints.insert(*vehicle, car.stints.clone());
         }
         for (vehicle, runs) in &drivers.runs {
@@ -2567,7 +2632,7 @@ impl Stream {
                 .entry(*vehicle)
                 .or_insert_with(|| numbered(*vehicle, segment(&[], runs), stint_ids));
         }
-        Ok(stints)
+        stints
     }
 
     fn write_drivers(&self, conn: &Connection) -> rusqlite::Result<()> {
@@ -2588,29 +2653,47 @@ impl Stream {
     }
 
     /// Every stint so far: what it's done, and what it was on course for when last worked out.
-    fn write_stints(&self, conn: &Connection, stints: &CarStints) -> rusqlite::Result<()> {
-        for (vehicle, car_stints) in stints {
-            let laps = match self.cars.get(vehicle) {
-                Some(car) => car.laps(conn, *vehicle)?,
-                None => Vec::new(),
+    fn write_stints(&self, conn: &Connection, fresh: &Fresh, problems: &mut Vec<String>) {
+        for (vehicle, stints) in &fresh.stints {
+            let laps = match (fresh.laps.get(vehicle), self.cars.get(vehicle)) {
+                (Some(laps), _) => Cow::Borrowed(laps.as_slice()),
+                (None, Some(car)) => match car.laps(conn, *vehicle) {
+                    Ok(laps) => Cow::Owned(laps),
+                    Err(e) => {
+                        problems.push(format!("car {vehicle}'s stints: {e}"));
+                        continue;
+                    }
+                },
+                (None, None) => Cow::Owned(Vec::new()),
             };
-            for (i, segment) in car_stints.iter().enumerate() {
-                let mut columns = stint_row(*vehicle, segment, &Stint::new(&laps, car_stints, i));
-                if let Some(projection) = self.projections.get(&(*vehicle, segment.number)) {
+            let places = places(&laps, stints);
+            for (i, segment) in stints.iter().enumerate() {
+                let stint = Stint::new(&laps, &places, stints, i);
+                let mut columns = stint_row(*vehicle, segment, &stint);
+                let fresh = fresh
+                    .projections
+                    .get(vehicle)
+                    .filter(|_| i + 1 == stints.len());
+                let saved = self
+                    .projections
+                    .get(&(*vehicle, segment.number))
+                    .filter(|saved| saved.driver == segment.driver && saved.start == segment.start)
+                    .map(|saved| &saved.columns);
+                if let Some(projection) = fresh.or(saved) {
                     columns.extend(projection.iter().cloned());
                 }
-                insert(conn, "stints", columns)?;
+                if let Err(e) = insert(conn, "stints", columns) {
+                    problems.push(format!("car {vehicle}'s stints: {e}"));
+                }
             }
         }
-        Ok(())
     }
 
     fn write_now(
         &self,
         conn: &Connection,
         shared: &Shared,
-        stints: &CarStints,
-        projections: &mut Vec<((i64, i64), Columns)>,
+        fresh: &mut Fresh,
         problems: &mut Vec<String>,
     ) -> anyhow::Result<()> {
         let ctx = Ctx::new(conn, shared)?;
@@ -2630,19 +2713,29 @@ impl Stream {
 
         for vehicle in vehicles {
             let order = (ids.as_slice(), &place, exact);
-            let car_stints = stints.get(&vehicle).map_or(&[][..], Vec::as_slice);
-            if let Err(e) = self.write_car_now(
-                &ctx,
-                sc,
-                &frame,
-                vehicle,
-                now,
-                order,
-                car_stints,
-                projections,
-            ) {
-                problems.push(format!("car {vehicle}: {e}"));
+            let laps = match self.cars.get(&vehicle) {
+                Some(car) => match car.laps(conn, vehicle) {
+                    Ok(laps) => laps,
+                    Err(e) => {
+                        problems.push(format!("car {vehicle}: {e}"));
+                        continue;
+                    }
+                },
+                None => Vec::new(),
+            };
+            let stints = fresh.stints.get(&vehicle).map_or(&[][..], Vec::as_slice);
+            let projection =
+                match self.write_car_now(&ctx, sc, &frame, vehicle, now, order, stints, &laps) {
+                    Ok(projection) => projection,
+                    Err(e) => {
+                        problems.push(format!("car {vehicle}: {e}"));
+                        None
+                    }
+                };
+            if let Some(projection) = projection {
+                fresh.projections.insert(vehicle, projection);
             }
+            fresh.laps.insert(vehicle, laps);
         }
         if let Err(e) = write_forecast(conn, sc, now) {
             problems.push(format!("forecast_now: {e}"));
@@ -2660,8 +2753,8 @@ impl Stream {
         now: Option<f64>,
         order: (&[i64], &HashMap<i64, usize>, bool),
         stints: &[Segment],
-        projections: &mut Vec<((i64, i64), Columns)>,
-    ) -> rusqlite::Result<()> {
+        laps: &[Lap],
+    ) -> rusqlite::Result<Option<Columns>> {
         let conn = ctx.conn;
         // The player's own row is the newest, with its car_state values
         let telemetry = match vehicle == ctx.vehicle {
@@ -2670,10 +2763,6 @@ impl Stream {
                 .get(&vehicle)
                 .map(|r| with_state(conn, r))
                 .transpose()?,
-        };
-        let laps = match self.cars.get(&vehicle) {
-            Some(car) => car.laps(conn, vehicle)?,
-            None => Vec::new(),
         };
         let current = stints.last();
         self.write_car(
@@ -2687,19 +2776,15 @@ impl Stream {
         )?;
         write_sectors(ctx, sc, vehicle)?;
         let Some(telemetry) = &telemetry else {
-            return Ok(());
+            return Ok(None);
         };
-        let stint = current.map(|_| Stint::new(&laps, stints, stints.len() - 1));
+        let places = places(laps, stints);
+        let stint = current.map(|_| Stint::new(laps, &places, stints, stints.len() - 1));
         let frac = lap_fraction(stint.as_ref().and_then(|stint| stint.avg_time), telemetry);
-        write_wheels(ctx, vehicle, telemetry, &laps, frac)?;
-        if let (Some(current), Some(stint)) = (current, &stint)
-            && !laps.is_empty()
-        {
-            projections.push((
-                (vehicle, current.number),
-                projection(sc, frame, vehicle, telemetry, stint, frac, now),
-            ));
-        }
+        write_wheels(ctx, vehicle, telemetry, laps, frac)?;
+        let projection = stint
+            .filter(|_| !laps.is_empty())
+            .map(|stint| projection(sc, frame, vehicle, telemetry, &stint, frac, now));
 
         // How the lap in progress stands
         if let Some(car) = self.cars.get(&vehicle) {
@@ -2713,7 +2798,7 @@ impl Stream {
                 writer.write_lap(vehicle, car, lap, vehicle == ctx.vehicle)?;
             }
         }
-        Ok(())
+        Ok(projection)
     }
 
     fn write_race_state(&self, ctx: &Ctx, sc: &Scoring, now: Option<f64>) -> rusqlite::Result<()> {
@@ -3002,11 +3087,13 @@ struct Stint<'a> {
 impl<'a> Stint<'a> {
     /// Stint `index` of `stints`. With too few green laps of its own, it borrows its driver's from
     /// before, or else anyone's in the car before it; a lap across a change of stint is no one's.
-    fn new(laps: &'a [Lap], stints: &[Segment], index: usize) -> Self {
+    /// `places`: where each lap belongs.
+    fn new(laps: &'a [Lap], places: &[Place], stints: &[Segment], index: usize) -> Self {
         let placed = laps
             .iter()
-            .filter_map(|lap| match place(stints, lap.lap, lap.start, lap.end) {
-                Place::Stint(i) if i <= index => Some((lap, i)),
+            .zip(places)
+            .filter_map(|(lap, place)| match place {
+                Place::Stint(i) if *i <= index => Some((lap, *i)),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -4434,6 +4521,32 @@ mod tests {
     }
 
     #[test]
+    fn another_car_in_the_slot_leaves_its_drivers_behind() {
+        let mut drivers = Drivers::default();
+        for t in [0.0, 450.0, 900.0] {
+            drivers.seen(2, "Ana Lopes", t, t as i64);
+        }
+        // The last car's last seen at 900 s, and the new one's driver named before its telemetry
+        // shows up
+        drivers.seen(2, "Bea Costa", 905.0, 905);
+        drivers.forget_until(2, 900.0);
+        drivers.seen(2, "Bea Costa", 950.0, 950);
+        let runs = drivers.runs(2).to_vec();
+        assert_eq!(
+            runs,
+            [Run {
+                driver: 2,
+                first: 905.0,
+                last: 950.0,
+                standing_id: 905
+            }]
+        );
+        let stints = stints_of(&[], &runs);
+        assert_eq!(stints.len(), 1);
+        assert_eq!(stints[0].driver, Some(2));
+    }
+
+    #[test]
     fn a_short_stint_borrows_its_drivers_laps_first() {
         let (no, pit) = ((false, false), (true, false));
         let flags = [no, no, no, pit, pit, no, pit, pit, no];
@@ -4457,17 +4570,17 @@ mod tests {
         let stints = stints_of(&spans, &runs);
         assert_eq!(stints.len(), 3);
         // One green lap of their own, none from before: anyone's
-        let second = Stint::new(&laps, &stints, 1);
+        let second = Stint::new(&laps, &places(&laps, &stints), &stints, 1);
         assert_eq!(second.baseline_source, Some("any driver"));
         // One green lap of their own, and this driver's from before
-        let third = Stint::new(&laps, &stints, 2);
+        let third = Stint::new(&laps, &places(&laps, &stints), &stints, 2);
         assert_eq!(third.baseline_source, Some("this driver"));
         let used = third.baseline.iter().map(|lap| lap.lap).collect::<Vec<_>>();
         assert_eq!(used, [0, 1, 2, 8]);
         assert_eq!(third.own.iter().map(|lap| lap.lap).collect::<Vec<_>>(), [8]);
         // Enough of its own
         assert_eq!(
-            Stint::new(&laps, &stints, 0).baseline_source,
+            Stint::new(&laps, &places(&laps, &stints), &stints, 0).baseline_source,
             Some("this stint")
         );
     }
