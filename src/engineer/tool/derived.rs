@@ -16,7 +16,10 @@ use rusqlite::{
     params_from_iter,
     types::ValueRef,
 };
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::{
+    collections::BTreeSet,
+    sync::mpsc::{self, RecvTimeoutError},
+};
 
 /// How often the thread looks for new rows
 const TICK: Duration = Duration::from_millis(100);
@@ -53,7 +56,7 @@ pub(super) const WIDEST_GAP: f64 = 0.05;
 
 const TABLES: &str = "
 CREATE TABLE lap_stats (
-    vehicle_id INTEGER NOT NULL, lap INTEGER NOT NULL, stint_number INTEGER,
+    vehicle_id INTEGER NOT NULL, lap INTEGER NOT NULL, stint_id INTEGER, stint_boundary INTEGER,
     first_id INTEGER, last_id INTEGER, start_s REAL,
     time_s REAL, official_time_s REAL, top_speed_kmh REAL,
     complete INTEGER, invalid INTEGER, pit INTEGER, refuelled INTEGER, contact INTEGER,
@@ -76,7 +79,7 @@ CREATE TABLE lap_sector_stats (
 ) WITHOUT ROWID;
 CREATE TABLE corner_passes (
     vehicle_id INTEGER NOT NULL, lap INTEGER NOT NULL, turn_index INTEGER NOT NULL,
-    turn_name TEXT, direction TEXT, scale INTEGER,
+    stint_id INTEGER, stint_boundary INTEGER, turn_name TEXT, direction TEXT, scale INTEGER,
     first_id INTEGER, last_id INTEGER, entered_at_s REAL, exited_at_s REAL,
     boundary_m REAL, start_m REAL, apex_m REAL, end_m REAL, next_boundary_m REAL,
     entry_s REAL, apex_to_end_s REAL, straight_s REAL, total_s REAL,
@@ -110,7 +113,8 @@ CREATE TABLE race_state (
     max_incident_points REAL
 );
 CREATE TABLE cars_now (
-    vehicle_id INTEGER PRIMARY KEY, is_player INTEGER, driver TEXT, team TEXT, car_number TEXT,
+    vehicle_id INTEGER PRIMARY KEY, is_player INTEGER, current_stint_id INTEGER, team TEXT,
+    car_number TEXT,
     vehicle TEXT, vehicle_class TEXT, telemetry_id INTEGER, sample_age_s REAL,
     position INTEGER, class_position INTEGER, position_estimated INTEGER,
     qualifying_position INTEGER, place_ahead_vehicle_id INTEGER, place_behind_vehicle_id INTEGER,
@@ -149,12 +153,18 @@ CREATE TABLE sectors_now (
     last_lap_s REAL, best_lap_s REAL, best_s REAL, current_lap_s REAL,
     PRIMARY KEY (vehicle_id, sector)
 ) WITHOUT ROWID;
-CREATE TABLE stint_now (
-    vehicle_id INTEGER PRIMARY KEY, stint_number INTEGER, start_lap INTEGER, laps_complete INTEGER,
-    lap_fraction REAL, baseline_laps INTEGER, avg_lap_s REAL, pace_trend_s_per_lap REAL,
-    fuel_l REAL, fuel_per_lap_l REAL, fuel_laps_left REAL, fuel_runs_out_lap REAL,
-    tank_capacity_l REAL,
-    energy_left_pct REAL, energy_per_lap_pct REAL, energy_laps_left REAL, energy_runs_out_lap REAL,
+CREATE TABLE drivers_now (
+    driver_id INTEGER PRIMARY KEY, vehicle_id INTEGER, name TEXT,
+    first_seen_s REAL, last_seen_s REAL
+);
+CREATE TABLE stints (
+    stint_id INTEGER PRIMARY KEY, vehicle_id INTEGER NOT NULL, stint_number INTEGER NOT NULL,
+    driver_id INTEGER, start_reason TEXT, start_from_s REAL, start_to_s REAL,
+    start_standing_id INTEGER, start_lap INTEGER, end_lap INTEGER, laps_complete INTEGER,
+    baseline_laps INTEGER, baseline_source TEXT, avg_lap_s REAL, pace_trend_s_per_lap REAL,
+    fuel_per_lap_l REAL, energy_per_lap_pct REAL, calculated_at_s REAL, lap_fraction REAL,
+    fuel_l REAL, fuel_laps_left REAL, fuel_runs_out_lap REAL, tank_capacity_l REAL,
+    energy_left_pct REAL, energy_laps_left REAL, energy_runs_out_lap REAL,
     game_fuel_per_lap_l REAL, game_energy_per_lap_pct REAL,
     limited_by TEXT, laps_left REAL, last_full_lap INTEGER, laps_needed REAL,
     laps_needed_source TEXT, margin_laps REAL, save_pct_needed REAL
@@ -173,16 +183,19 @@ const STREAM_TABLES: [&str; 5] = [
     "corner_passes",
     "corner_pass_wheels",
 ];
-const NOW_TABLES: [&str; 6] = [
+const NOW_TABLES: [&str; 7] = [
     "race_state",
     "cars_now",
+    "drivers_now",
+    "stints",
     "wheels_now",
     "sectors_now",
-    "stint_now",
     "forecast_now",
 ];
 
 type Columns = Vec<(&'static str, Value)>;
+/// Every car's stints, by car
+type CarStints = BTreeMap<i64, Vec<Segment>>;
 
 fn real(v: Option<f64>) -> Value {
     v.filter(|v| v.is_finite()).map_or(Value::Null, Value::Real)
@@ -630,10 +643,11 @@ pub(super) fn sample(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sample> {
 #[derive(Clone)]
 pub(super) struct Lap {
     pub lap: i64,
-    pub stint_number: i64,
     pub first_id: i64,
     pub last_id: i64,
     pub start: Option<f64>,
+    /// The next lap's start once it's known, or else the session time of its last row
+    pub end: Option<f64>,
     pub time: Option<f64>,
     pub complete: bool,
     pub invalid: bool,
@@ -660,33 +674,14 @@ impl Lap {
     fn has_wear(wear: &[Option<f64>; 4]) -> bool {
         wear.iter().any(Option::is_some)
     }
-}
 
-/// Counts a car's stints: one stop is one more, though the in lap and the out lap both show the pit
-/// lane when it crosses the line. Leaving the garage isn't a stop.
-#[derive(Clone, Copy)]
-struct Stints {
-    number: i64,
-    stopped: bool,
-}
-
-impl Default for Stints {
-    fn default() -> Self {
-        Self {
-            number: 1,
-            stopped: true,
+    fn span(&self) -> LapSpan {
+        LapSpan {
+            lap: self.lap,
+            start: self.start,
+            end: self.end,
+            stopped: self.pit || self.refuelled,
         }
-    }
-}
-
-impl Stints {
-    /// `lap` is over.
-    fn advance(&mut self, lap: &Lap) {
-        let stopped = lap.pit || lap.refuelled;
-        if stopped && !self.stopped {
-            self.number += 1;
-        }
-        self.stopped = stopped;
     }
 }
 
@@ -855,6 +850,49 @@ impl LapBuild {
         }
     }
 
+    /// How long it took, when it ended and what it used, `next` being the lap after it (if it's
+    /// finished): consumption runs from the start of this lap to the start of the next (or else to
+    /// its last row).
+    fn timing(&self, next: Option<&LapBuild>) -> Timing {
+        // With laps missing after it, the next lap's start says nothing about this one
+        let next_lap = next.filter(|next| next.lap == self.lap + 1);
+        let (fuel_1, energy_1) = match (next, next_lap) {
+            (None, _) => (self.fuel_end, self.energy_end),
+            (Some(_), Some(next)) => (next.fuel_start, next.energy_start),
+            (Some(_), None) => (None, None),
+        };
+        let fuel_used = self.fuel_start.zip(fuel_1).map(|(a, b)| a - b);
+        let energy_used = self.energy_start.zip(energy_1).map(|(a, b)| a - b);
+        let next_start = next_lap.and_then(|next| next.start).filter(|s| *s != 0.0);
+        let time = next_start
+            .zip(self.start)
+            .map(|(next, start)| next - start)
+            .filter(|time| *time > 0.0);
+        let end = match time {
+            Some(_) => next_start,
+            None => self.samples.last().and_then(|sample| sample.session_time),
+        };
+        Timing {
+            next_lap: next_lap.is_some(),
+            time,
+            end,
+            fuel_used,
+            energy_used,
+            refuelled: fuel_used.is_some_and(|f| f < -0.5)
+                || energy_used.is_some_and(|v| v < -0.01),
+        }
+    }
+
+    fn span(&self, next: Option<&LapBuild>) -> LapSpan {
+        let timing = self.timing(next);
+        LapSpan {
+            lap: self.lap,
+            start: self.start,
+            end: timing.end,
+            stopped: self.pit || timing.refuelled,
+        }
+    }
+
     /// The lap as it stands, `next` being the lap after it (if it's finished).
     fn lap(
         &self,
@@ -862,7 +900,6 @@ impl LapBuild {
         vehicle: i64,
         next: Option<&LapBuild>,
         previous_impact: Option<f64>,
-        stint_number: i64,
     ) -> rusqlite::Result<Lap> {
         let state = car_state(conn, vehicle, self.last_id)?;
         let impact = state.as_ref().and_then(|state| state.f("last_impact_time"));
@@ -875,24 +912,14 @@ impl LapBuild {
             }
             Ok(wear)
         };
-        // With laps missing after it, the next lap's start says nothing about this one
-        let next_lap = next.filter(|next| next.lap == self.lap + 1);
-        // Consumption: start of this lap to start of the next (falls back to the last row)
-        let (fuel_1, energy_1) = match (next, next_lap) {
-            (None, _) => (self.fuel_end, self.energy_end),
-            (Some(_), Some(next)) => (next.fuel_start, next.energy_start),
-            (Some(_), None) => (None, None),
-        };
-        let fuel_used = self.fuel_start.zip(fuel_1).map(|(a, b)| a - b);
-        let energy_used = self.energy_start.zip(energy_1).map(|(a, b)| a - b);
-        let time = match (next_lap, self.start) {
-            (Some(next), Some(start)) => next
-                .start
-                .filter(|s| *s != 0.0)
-                .map(|next| next - start)
-                .filter(|time| *time > 0.0),
-            _ => None,
-        };
+        let Timing {
+            next_lap,
+            time,
+            end,
+            fuel_used,
+            energy_used,
+            refuelled,
+        } = self.timing(next);
         let complete = next.is_some();
         // A car joining midway used a fraction of a lap's fuel. The lap has to start near the line
         // and get back round: first rows of the old lap's distance don't count, and near the line
@@ -907,14 +934,12 @@ impl LapBuild {
                 .is_some_and(|d| d <= furthest * SEEN_FROM_THE_START)
                 && rest.any(|d| d >= furthest * FIRST_DISTANCE)
         });
-        let refuelled =
-            fuel_used.is_some_and(|f| f < -0.5) || energy_used.is_some_and(|v| v < -0.01);
         Ok(Lap {
             lap: self.lap,
-            stint_number,
             first_id: self.first_id,
             last_id: self.last_id,
             start: self.start,
+            end,
             time,
             complete,
             invalid: self.invalid,
@@ -922,7 +947,7 @@ impl LapBuild {
             refuelled,
             contact: impact.is_some_and(|impact| impact > 0.0) && impact != previous_impact,
             // A pit lap is an in or out lap: the pit lane flag was set at some point during the lap
-            green: next_lap.is_some() && seen_from_the_start && !self.pit && !refuelled,
+            green: next_lap && seen_from_the_start && !self.pit && !refuelled,
             impact,
             track_limit_steps: state
                 .as_ref()
@@ -954,7 +979,8 @@ struct Car {
     last_impact: Option<f64>,
     /// Wear has been seen to count up, and the life already written was put right
     wear_counts_up: bool,
-    stints: Stints,
+    /// Its stints as its rows were last written with
+    stints: Vec<Segment>,
 }
 
 impl Car {
@@ -962,19 +988,29 @@ impl Car {
     fn laps(&self, conn: &Connection, vehicle: i64) -> rusqlite::Result<Vec<Lap>> {
         let mut laps = self.finished.clone();
         let mut impact = self.last_impact;
-        let mut stints = self.stints;
         if let Some(waiting) = &self.waiting {
-            let lap = waiting.lap(conn, vehicle, self.current.as_ref(), impact, stints.number)?;
+            let lap = waiting.lap(conn, vehicle, self.current.as_ref(), impact)?;
             if lap.impact.is_some_and(|i| i != 0.0) {
                 impact = lap.impact;
             }
-            stints.advance(&lap);
             laps.push(lap);
         }
         if let Some(current) = &self.current {
-            laps.push(current.lap(conn, vehicle, None, impact, stints.number)?);
+            laps.push(current.lap(conn, vehicle, None, impact)?);
         }
         Ok(laps)
+    }
+
+    /// When every lap so far was driven, and which were stops: all its stints need.
+    fn spans(&self) -> Vec<LapSpan> {
+        let mut spans = self.finished.iter().map(Lap::span).collect::<Vec<_>>();
+        if let Some(waiting) = &self.waiting {
+            spans.push(waiting.span(self.current.as_ref()));
+        }
+        if let Some(current) = &self.current {
+            spans.push(current.span(None));
+        }
+        spans
     }
 
     /// A row of an earlier lap than the one under way that's only a late one of a lap just ended,
@@ -989,6 +1025,382 @@ impl Car {
                 .last()
                 .is_some_and(|finished| finished.lap == lap && same(finished.start))
     }
+}
+
+// --------------------------------------------------------------------------- drivers and stints
+
+/// When a lap was driven, and whether it was a stop: all a car's stints need of it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct LapSpan {
+    pub lap: i64,
+    pub start: Option<f64>,
+    pub end: Option<f64>,
+    /// In the pit lane at some point, or refuelled
+    pub stopped: bool,
+}
+
+/// What a lap took and used, as `LapBuild::timing` works it out.
+struct Timing {
+    /// The lap after it is the next one, not one further on
+    next_lap: bool,
+    time: Option<f64>,
+    end: Option<f64>,
+    fuel_used: Option<f64>,
+    energy_used: Option<f64>,
+    refuelled: bool,
+}
+
+/// Someone the standings named as a car's driver.
+struct Driver {
+    vehicle: i64,
+    name: String,
+    first_seen: f64,
+    last_seen: f64,
+}
+
+/// A spell of one driver in a car, from the first standings row naming them to the last.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Run {
+    pub driver: i64,
+    pub first: f64,
+    pub last: f64,
+    /// The standings row first naming them
+    pub standing_id: i64,
+}
+
+/// The session's drivers. A name is all the simulator gives, so a driver is a name in a car: the
+/// same name in another car is someone else.
+#[derive(Default)]
+struct Drivers {
+    ids: HashMap<(i64, String), i64>,
+    /// By id, from 1
+    known: Vec<Driver>,
+    /// By car, who drove it in turn
+    runs: HashMap<i64, Vec<Run>>,
+}
+
+impl Drivers {
+    /// The standings name `name` the car's driver at `t`. Whether that starts a spell.
+    fn seen(&mut self, vehicle: i64, name: &str, t: f64, standing_id: i64) -> bool {
+        let next = self.known.len() as i64 + 1;
+        let id = *self.ids.entry((vehicle, name.to_owned())).or_insert(next);
+        if id == next {
+            self.known.push(Driver {
+                vehicle,
+                name: name.to_owned(),
+                first_seen: t,
+                last_seen: t,
+            });
+        }
+        let driver = &mut self.known[(id - 1) as usize];
+        driver.first_seen = driver.first_seen.min(t);
+        driver.last_seen = driver.last_seen.max(t);
+        let runs = self.runs.entry(vehicle).or_default();
+        match runs.last_mut() {
+            Some(run) if run.driver == id => {
+                run.last = run.last.max(t);
+                false
+            }
+            _ => {
+                runs.push(Run {
+                    driver: id,
+                    first: t,
+                    last: t,
+                    standing_id,
+                });
+                true
+            }
+        }
+    }
+
+    fn runs(&self, vehicle: i64) -> &[Run] {
+        self.runs.get(&vehicle).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// A car's stint keeps its id however often its stints are worked out again.
+#[derive(Default)]
+struct StintIds(HashMap<(i64, i64), i64>);
+
+impl StintIds {
+    fn get(&mut self, vehicle: i64, number: i64) -> i64 {
+        let next = self.0.len() as i64 + 1;
+        *self.0.entry((vehicle, number)).or_insert(next)
+    }
+}
+
+/// How a stint began.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct StintStart {
+    pub reason: &'static str,
+    /// A stop's out lap: laps before it are the stint before's
+    pub lap: Option<i64>,
+    /// When it began, as observed: at the line between a stop's in and out laps, or between the
+    /// last sighting of the driver before and the first of the next (the standings don't say just
+    /// when they swapped)
+    pub from: Option<f64>,
+    pub to: Option<f64>,
+    /// Someone else took over: which side of it a lap is on goes by when it was driven
+    pub by_time: bool,
+    /// The standings row first naming the new driver
+    pub standing_id: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Side {
+    Before,
+    After,
+    Across,
+    Unknown,
+}
+
+impl StintStart {
+    /// Where a stretch of lap `lap`, driven from `from` to `to`, is from this start.
+    fn side(&self, lap: i64, from: Option<f64>, to: Option<f64>) -> Side {
+        if self.by_time {
+            return match (self.from, self.to, from, to) {
+                (Some(start), _, _, Some(to)) if to <= start => Side::Before,
+                (_, Some(end), Some(from), _) if from >= end => Side::After,
+                (Some(_), Some(_), Some(_), Some(_)) => Side::Across,
+                _ => Side::Unknown,
+            };
+        }
+        match self.lap {
+            Some(first) if lap < first => Side::Before,
+            Some(_) => Side::After,
+            None => Side::Unknown,
+        }
+    }
+}
+
+/// One of a car's stints.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Segment {
+    pub id: i64,
+    pub number: i64,
+    pub driver: Option<i64>,
+    pub start: StintStart,
+}
+
+/// Where a lap, or a stretch of one, belongs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Place {
+    /// Wholly in this stint, by index
+    Stint(usize),
+    /// Across the start of one
+    Across,
+    /// There's no telling: when it was driven isn't known
+    Unknown,
+}
+
+pub(super) fn place(stints: &[Segment], lap: i64, from: Option<f64>, to: Option<f64>) -> Place {
+    if stints.is_empty() {
+        return Place::Unknown;
+    }
+    let (mut index, mut unknown) = (0, false);
+    for (i, stint) in stints.iter().enumerate().skip(1) {
+        match stint.start.side(lap, from, to) {
+            Side::After => index = i,
+            Side::Before => {}
+            Side::Across => return Place::Across,
+            Side::Unknown => unknown = true,
+        }
+    }
+    match unknown {
+        true => Place::Unknown,
+        false => Place::Stint(index),
+    }
+}
+
+/// `stint_id` and `stint_boundary`: NULL and 1 across the start of a stint, NULL and 0 when there's
+/// no telling.
+fn stint_columns(stints: &[Segment], lap: i64, from: Option<f64>, to: Option<f64>) -> [Value; 2] {
+    match place(stints, lap, from, to) {
+        Place::Stint(i) => [Value::Integer(stints[i].id), flag(false)],
+        Place::Across => [Value::Null, flag(true)],
+        Place::Unknown => [Value::Null, flag(false)],
+    }
+}
+
+/// When a corner pass was driven: from the start of its section to the end, or to the corner's
+/// exit until the car gets there.
+fn pass_span(
+    entered: Option<f64>,
+    exited: Option<f64>,
+    total: Option<f64>,
+) -> (Option<f64>, Option<f64>) {
+    (entered, entered.zip(total).map(|(e, t)| e + t).or(exited))
+}
+
+/// A car's stints, with who drove each, from its laps and the drivers the standings named. A stop
+/// starts one at the line between its in and out laps (leaving the garage isn't one), and so does
+/// someone else taking over: during a stop, that's the same new stint.
+pub(super) fn segment(spans: &[LapSpan], runs: &[Run]) -> Vec<(Option<i64>, StintStart)> {
+    struct Stop {
+        start: StintStart,
+        /// From the start of its in lap to the end of its last lap in the pits
+        window: Option<(f64, f64)>,
+        driver: Option<i64>,
+    }
+    if spans.is_empty() && runs.is_empty() {
+        return Vec::new();
+    }
+    let mut stops = Vec::new();
+    // Leaving the garage isn't a stop
+    let mut stopped = true;
+    for (i, span) in spans.iter().enumerate() {
+        // Both the in lap and the out lap show the pit lane when it crosses the line
+        if span.stopped
+            && !stopped
+            && let Some(next) = spans.get(i + 1)
+        {
+            let at = next.start.or(span.end);
+            let last = spans[i..]
+                .iter()
+                .take_while(|span| span.stopped)
+                .last()
+                .unwrap_or(span);
+            stops.push(Stop {
+                start: StintStart {
+                    reason: "pit stop",
+                    lap: Some(next.lap),
+                    from: at,
+                    to: at,
+                    by_time: false,
+                    standing_id: None,
+                },
+                window: span.start.or(span.end).zip(last.end),
+                driver: None,
+            });
+        }
+        stopped = span.stopped;
+    }
+
+    let mut starts = Vec::new();
+    for pair in runs.windows(2) {
+        let (before, after) = (pair[0], pair[1]);
+        let (from, to) = (before.last, after.first);
+        let stop = stops.iter_mut().find(|stop| {
+            stop.window
+                .is_some_and(|(start, end)| from <= end && to >= start)
+        });
+        match stop {
+            Some(stop) => {
+                let start = &mut stop.start;
+                start.reason = "pit stop and driver change";
+                start.from = Some(start.from.map_or(from, |f| f.min(from)));
+                start.to = Some(start.to.map_or(to, |t| t.max(to)));
+                start.by_time = true;
+                start.standing_id = Some(after.standing_id);
+                stop.driver = Some(after.driver);
+            }
+            None => starts.push((
+                Some(after.driver),
+                StintStart {
+                    reason: "driver change",
+                    lap: None,
+                    from: Some(from),
+                    to: Some(to),
+                    by_time: true,
+                    standing_id: Some(after.standing_id),
+                },
+            )),
+        }
+    }
+    starts.extend(stops.into_iter().map(|stop| (stop.driver, stop.start)));
+    starts.sort_by(|(_, a), (_, b)| {
+        let at = |start: &StintStart| start.from.unwrap_or(f64::INFINITY);
+        at(a).total_cmp(&at(b))
+    });
+
+    let first_lap = spans.first().and_then(|span| span.start.or(span.end));
+    let first_seen = runs.first().map(|run| run.first);
+    let from = match (first_lap, first_seen) {
+        (Some(lap), Some(seen)) => Some(lap.min(seen)),
+        (lap, seen) => lap.or(seen),
+    };
+    let mut driver = runs.first().map(|run| run.driver);
+    let mut stints = vec![(
+        driver,
+        StintStart {
+            reason: "first seen",
+            lap: spans.first().map(|span| span.lap),
+            from,
+            to: from,
+            by_time: false,
+            standing_id: runs.first().map(|run| run.standing_id),
+        },
+    )];
+    for (new_driver, start) in starts {
+        driver = new_driver.or(driver);
+        stints.push((driver, start));
+    }
+    stints
+}
+
+fn numbered(
+    vehicle: i64,
+    stints: Vec<(Option<i64>, StintStart)>,
+    ids: &mut StintIds,
+) -> Vec<Segment> {
+    stints
+        .into_iter()
+        .zip(1..)
+        .map(|((driver, start), number)| Segment {
+            id: ids.get(vehicle, number),
+            number,
+            driver,
+            start,
+        })
+        .collect()
+}
+
+/// Works out the car's stints again, and if they've changed, which of them its laps and corner
+/// passes are in.
+fn resegment(
+    conn: &Connection,
+    vehicle: i64,
+    car: &mut Car,
+    runs: &[Run],
+    ids: &mut StintIds,
+) -> rusqlite::Result<()> {
+    let spans = car.spans();
+    let stints = numbered(vehicle, segment(&spans, runs), ids);
+    if stints == car.stints {
+        return Ok(());
+    }
+    car.stints = stints;
+    for span in &spans {
+        let [id, across] = stint_columns(&car.stints, span.lap, span.start, span.end);
+        conn.prepare_cached(
+            "UPDATE lap_stats SET stint_id = ?, stint_boundary = ? WHERE vehicle_id = ? AND lap = ?",
+        )?
+        .execute(params![id, across, vehicle, span.lap])?;
+        if let Place::Stint(_) = place(&car.stints, span.lap, span.start, span.end) {
+            conn.prepare_cached(
+                "UPDATE corner_passes SET stint_id = ?, stint_boundary = ? \
+                 WHERE vehicle_id = ? AND lap = ?",
+            )?
+            .execute(params![id, across, vehicle, span.lap])?;
+            continue;
+        }
+        // Each pass by when it was driven
+        for r in rows(
+            conn,
+            "SELECT turn_index, entered_at_s, exited_at_s, total_s FROM corner_passes \
+             WHERE vehicle_id = ? AND lap = ?",
+            params![vehicle, span.lap],
+        )? {
+            let (from, to) = pass_span(r.f("entered_at_s"), r.f("exited_at_s"), r.f("total_s"));
+            let [id, across] = stint_columns(&car.stints, span.lap, from, to);
+            conn.prepare_cached(
+                "UPDATE corner_passes SET stint_id = ?, stint_boundary = ? \
+                 WHERE vehicle_id = ? AND lap = ? AND turn_index = ?",
+            )?
+            .execute(params![id, across, vehicle, span.lap, r.i("turn_index")])?;
+        }
+    }
+    Ok(())
 }
 
 /// An official lap time, from the standings.
@@ -1129,7 +1541,12 @@ struct Writer<'a> {
 }
 
 impl Writer<'_> {
-    fn sample_added(&self, vehicle: i64, build: &mut LapBuild) -> rusqlite::Result<()> {
+    fn sample_added(
+        &self,
+        vehicle: i64,
+        build: &mut LapBuild,
+        stints: &[Segment],
+    ) -> rusqlite::Result<()> {
         let Some(layout) = self.layout else {
             return Ok(());
         };
@@ -1137,12 +1554,13 @@ impl Writer<'_> {
             return Ok(());
         }
         let trace = Trace::build(&build.samples, build.start, None, layout.length);
-        self.write_passes(vehicle, build, layout, &trace, true, false)?;
+        self.write_passes(vehicle, build, layout, &trace, true, false, stints)?;
         build.next_mark = next_mark(layout, build.top);
         Ok(())
     }
 
     /// Writes the passes `trace` adds something to.
+    #[allow(clippy::too_many_arguments)]
     fn write_passes(
         &self,
         vehicle: i64,
@@ -1151,6 +1569,7 @@ impl Writer<'_> {
         trace: &Trace,
         reliable: bool,
         all: bool,
+        stints: &[Segment],
     ) -> rusqlite::Result<()> {
         let top = trace.d.last().copied().unwrap_or(0.0);
         for (k, corner) in layout.corners.iter().enumerate() {
@@ -1162,11 +1581,12 @@ impl Writer<'_> {
                 continue;
             }
             build.marks_passed[k] = passed;
-            self.write_pass(vehicle, build, layout, k, trace, reliable)?;
+            self.write_pass(vehicle, build, layout, k, trace, reliable, stints)?;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_pass(
         &self,
         vehicle: i64,
@@ -1175,6 +1595,7 @@ impl Writer<'_> {
         k: usize,
         trace: &Trace,
         reliable: bool,
+        stints: &[Segment],
     ) -> rusqlite::Result<()> {
         let corner = &layout.corners[k];
         let top = trace.d.last().copied().unwrap_or(0.0);
@@ -1214,6 +1635,9 @@ impl Writer<'_> {
             ],
         )?;
         let is_player = self.player == Some(vehicle);
+        let total = straight.map(|s| entry + apex_to_end + s);
+        let (driven_from, driven_to) = pass_span(Some(entered), Some(exited), total);
+        let [stint_id, boundary] = stint_columns(stints, build.lap, driven_from, driven_to);
         insert(
             self.conn,
             "corner_passes",
@@ -1221,6 +1645,8 @@ impl Writer<'_> {
                 ("vehicle_id", Value::Integer(vehicle)),
                 ("lap", Value::Integer(build.lap)),
                 ("turn_index", Value::Integer(k as i64)),
+                ("stint_id", stint_id),
+                ("stint_boundary", boundary),
                 ("turn_name", Value::Text(corner.name.clone())),
                 ("direction", text_or_null(corner.direction)),
                 ("scale", integer(corner.scale)),
@@ -1236,7 +1662,7 @@ impl Writer<'_> {
                 ("entry_s", real(Some(entry))),
                 ("apex_to_end_s", real(Some(apex_to_end))),
                 ("straight_s", real(straight)),
-                ("total_s", real(straight.map(|s| entry + apex_to_end + s))),
+                ("total_s", real(total)),
                 (
                     "brake_m_before_apex",
                     real(metrics.brake.map(|b| corner.apex - b)),
@@ -1316,17 +1742,10 @@ impl Writer<'_> {
         mut build: LapBuild,
         next: &LapBuild,
     ) -> rusqlite::Result<()> {
-        let lap = build.lap(
-            self.conn,
-            vehicle,
-            Some(next),
-            car.last_impact,
-            car.stints.number,
-        )?;
+        let lap = build.lap(self.conn, vehicle, Some(next), car.last_impact)?;
         if lap.impact.is_some_and(|impact| impact != 0.0) {
             car.last_impact = lap.impact;
         }
-        car.stints.advance(&lap);
         // Only finished laps settle what the wear means
         car.finished.push(lap.clone());
         if !car.wear_counts_up && !wear_remaining(&car.finished) {
@@ -1343,7 +1762,15 @@ impl Writer<'_> {
             let trace = Trace::build(&build.samples, build.start, lap.time, layout.length);
             // Not always a lap to rely on (the car joined midway, say): what it did get to
             let reliable = trace.ok;
-            self.write_passes(vehicle, &mut build, layout, &trace, reliable, true)?;
+            self.write_passes(
+                vehicle,
+                &mut build,
+                layout,
+                &trace,
+                reliable,
+                true,
+                &car.stints,
+            )?;
         }
         Ok(())
     }
@@ -1363,13 +1790,15 @@ impl Writer<'_> {
                         .unwrap_or(Ordering::Equal)
                 })
         });
+        let [stint_id, boundary] = stint_columns(&car.stints, lap.lap, lap.start, lap.end);
         insert(
             self.conn,
             "lap_stats",
             vec![
                 ("vehicle_id", Value::Integer(vehicle)),
                 ("lap", Value::Integer(lap.lap)),
-                ("stint_number", Value::Integer(lap.stint_number)),
+                ("stint_id", stint_id),
+                ("stint_boundary", boundary),
                 ("first_id", Value::Integer(lap.first_id)),
                 ("last_id", Value::Integer(lap.last_id)),
                 ("start_s", real(lap.start)),
@@ -1479,6 +1908,11 @@ pub(super) struct Stream {
     /// The standings' laps completed, by car, and when that last changed
     laps_completed: HashMap<i64, (i64, f64)>,
     official: HashMap<i64, Vec<Official>>,
+    drivers: Drivers,
+    stint_ids: StintIds,
+    /// What each stint (by car and number) was on course for when last worked out, kept once it's
+    /// over
+    projections: HashMap<(i64, i64), Columns>,
     /// The simulator's timing sectors' ends as last seen whole, and the session start, track and
     /// sector count they're for: a window of the laps can miss lines the session has crossed
     timing: Option<((i64, String, i64), Vec<f64>)>,
@@ -1557,6 +1991,8 @@ impl Stream {
 
     fn start_session(&mut self, conn: &Connection, start: i64) -> rusqlite::Result<()> {
         self.session_start = start;
+        self.stint_ids = StintIds::default();
+        self.projections.clear();
         self.calibrated_laps = None;
         self.zones_from = None;
         self.zones_from_invalid = false;
@@ -1596,19 +2032,24 @@ impl Stream {
         self.standings_t = None;
         self.laps_completed.clear();
         self.official.clear();
+        self.drivers = Drivers::default();
         let start = session_start(conn)?;
         self.start_session(conn, start)
     }
 
-    /// Reads the standings' new rows for official lap times. Whether there are more to read.
+    /// Reads the standings' new rows for official lap times and who's driving. Whether there are
+    /// more to read.
     fn read_standings(&mut self, conn: &Connection) -> rusqlite::Result<bool> {
         let standings = rows(
             conn,
-            "SELECT id, vehicle_id, session_time, laps_completed, last_lap_time \
+            "SELECT id, vehicle_id, session_time, laps_completed, last_lap_time, driver \
              FROM standings WHERE id > ? ORDER BY id LIMIT ?",
             params![self.standings_cursor, CHUNK],
         )?;
         let behind = standings.len() as i64 == CHUNK;
+        // The cars someone else has taken over, or all of them
+        let mut taken_over = BTreeSet::new();
+        let mut everyone = false;
         for r in standings {
             self.standings_cursor = r.i("id").unwrap_or(self.standings_cursor);
             let t = r.f("session_time");
@@ -1618,9 +2059,19 @@ impl Stream {
             {
                 self.laps_completed.clear();
                 self.official.clear();
+                self.drivers = Drivers::default();
+                everyone = true;
             }
             if t.is_some() {
                 self.standings_t = t;
+            }
+            if let (Some(vehicle), Some(name), Some(t)) = (
+                r.i("vehicle_id"),
+                r.text("driver").filter(|name| !name.is_empty()),
+                t,
+            ) && self.drivers.seen(vehicle, name, t, self.standings_cursor)
+            {
+                taken_over.insert(vehicle);
             }
 
             let (Some(vehicle), Some(laps), Some(at)) =
@@ -1693,6 +2144,18 @@ impl Stream {
             }
             entries.push(official);
         }
+        let Self {
+            cars,
+            drivers,
+            stint_ids,
+            ..
+        } = self;
+        for (vehicle, car) in cars
+            .iter_mut()
+            .filter(|(vehicle, _)| everyone || taken_over.contains(*vehicle))
+        {
+            resegment(conn, *vehicle, car, drivers.runs(*vehicle), stint_ids)?;
+        }
         Ok(behind)
     }
 
@@ -1729,6 +2192,9 @@ impl Stream {
             layout,
             official,
             player,
+            drivers,
+            stint_ids,
+            projections,
             ..
         } = self;
         let writer = Writer {
@@ -1743,6 +2209,8 @@ impl Stream {
                 continue;
             };
             let car = cars.entry(sample.vehicle).or_default();
+            // A lap's started or ended: its stints may have too
+            let mut laps_changed = false;
             if car
                 .current
                 .as_ref()
@@ -1759,6 +2227,7 @@ impl Stream {
                     )?;
                 }
                 *car = Car::default();
+                projections.retain(|(vehicle, _), _| *vehicle != sample.vehicle);
             }
             if car
                 .current
@@ -1772,6 +2241,7 @@ impl Stream {
                 }
                 car.waiting = current;
                 car.current = Some(LapBuild::new(sample, lap, writer.layout));
+                laps_changed = true;
             }
             let Some(mut current) = car.current.take() else {
                 continue;
@@ -1798,12 +2268,24 @@ impl Stream {
                     .start
                     .is_some_and(|start| !waiting.start.is_some_and(|before| before >= start));
                 match started {
-                    true => writer.finish(sample.vehicle, car, waiting, &current)?,
+                    true => {
+                        writer.finish(sample.vehicle, car, waiting, &current)?;
+                        laps_changed = true;
+                    }
                     false => car.waiting = Some(waiting),
                 }
             }
-            writer.sample_added(sample.vehicle, &mut current)?;
+            writer.sample_added(sample.vehicle, &mut current, &car.stints)?;
             car.current = Some(current);
+            if laps_changed {
+                resegment(
+                    conn,
+                    sample.vehicle,
+                    car,
+                    drivers.runs(sample.vehicle),
+                    stint_ids,
+                )?;
+            }
         }
 
         self.cursor = last_id;
@@ -2034,7 +2516,7 @@ impl Stream {
     /// Writes the tables of how things are now, and says what it couldn't: one car's trouble isn't
     /// the others', and a query is better off told than given an empty field.
     pub fn refresh_now(
-        &self,
+        &mut self,
         conn: &Connection,
         shared: &Shared,
     ) -> anyhow::Result<Option<String>> {
@@ -2043,17 +2525,92 @@ impl Stream {
             conn.execute(&format!("DELETE FROM {table}"), [])?;
         }
         let mut problems = Vec::new();
-        if let Err(e) = self.write_now(conn, shared, &mut problems) {
+        let stints = match self.stints(conn) {
+            Ok(stints) => stints,
+            Err(e) => {
+                problems.push(format!("stints: {e}"));
+                CarStints::new()
+            }
+        };
+        let mut projections = Vec::new();
+        if let Err(e) = self.write_now(conn, shared, &stints, &mut projections, &mut problems) {
             problems.push(format!("{e:#}"));
+        }
+        self.projections.extend(projections);
+        // Without a player's car too: they're the recording's
+        if let Err(e) = self.write_stints(conn, &stints) {
+            problems.push(format!("stints: {e}"));
+        }
+        if let Err(e) = self.write_drivers(conn) {
+            problems.push(format!("drivers_now: {e}"));
         }
         tx.commit()?;
         Ok((!problems.is_empty()).then(|| problems.join("; ")))
+    }
+
+    /// Every car's stints as they stand, its rows put right if they've changed: a lap's gone on,
+    /// and a stop with it. A car with no laps has them from its drivers alone.
+    fn stints(&mut self, conn: &Connection) -> rusqlite::Result<CarStints> {
+        let Self {
+            cars,
+            drivers,
+            stint_ids,
+            ..
+        } = self;
+        let mut stints = CarStints::new();
+        for (vehicle, car) in cars.iter_mut() {
+            resegment(conn, *vehicle, car, drivers.runs(*vehicle), stint_ids)?;
+            stints.insert(*vehicle, car.stints.clone());
+        }
+        for (vehicle, runs) in &drivers.runs {
+            stints
+                .entry(*vehicle)
+                .or_insert_with(|| numbered(*vehicle, segment(&[], runs), stint_ids));
+        }
+        Ok(stints)
+    }
+
+    fn write_drivers(&self, conn: &Connection) -> rusqlite::Result<()> {
+        for (id, driver) in (1..).zip(&self.drivers.known) {
+            insert(
+                conn,
+                "drivers_now",
+                vec![
+                    ("driver_id", Value::Integer(id)),
+                    ("vehicle_id", Value::Integer(driver.vehicle)),
+                    ("name", Value::Text(driver.name.clone())),
+                    ("first_seen_s", real(Some(driver.first_seen))),
+                    ("last_seen_s", real(Some(driver.last_seen))),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Every stint so far: what it's done, and what it was on course for when last worked out.
+    fn write_stints(&self, conn: &Connection, stints: &CarStints) -> rusqlite::Result<()> {
+        for (vehicle, car_stints) in stints {
+            let laps = match self.cars.get(vehicle) {
+                Some(car) => car.laps(conn, *vehicle)?,
+                None => Vec::new(),
+            };
+            for (i, segment) in car_stints.iter().enumerate() {
+                let mut columns = stint_row(*vehicle, segment, &Stint::new(&laps, car_stints, i));
+                if let Some(projection) = self.projections.get(&(*vehicle, segment.number)) {
+                    columns.extend(projection.iter().cloned());
+                }
+                insert(conn, "stints", columns)?;
+            }
+        }
+        Ok(())
     }
 
     fn write_now(
         &self,
         conn: &Connection,
         shared: &Shared,
+        stints: &CarStints,
+        projections: &mut Vec<((i64, i64), Columns)>,
         problems: &mut Vec<String>,
     ) -> anyhow::Result<()> {
         let ctx = Ctx::new(conn, shared)?;
@@ -2073,7 +2630,17 @@ impl Stream {
 
         for vehicle in vehicles {
             let order = (ids.as_slice(), &place, exact);
-            if let Err(e) = self.write_car_now(&ctx, sc, &frame, vehicle, now, order) {
+            let car_stints = stints.get(&vehicle).map_or(&[][..], Vec::as_slice);
+            if let Err(e) = self.write_car_now(
+                &ctx,
+                sc,
+                &frame,
+                vehicle,
+                now,
+                order,
+                car_stints,
+                projections,
+            ) {
                 problems.push(format!("car {vehicle}: {e}"));
             }
         }
@@ -2083,6 +2650,7 @@ impl Stream {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_car_now(
         &self,
         ctx: &Ctx,
@@ -2091,6 +2659,8 @@ impl Stream {
         vehicle: i64,
         now: Option<f64>,
         order: (&[i64], &HashMap<i64, usize>, bool),
+        stints: &[Segment],
+        projections: &mut Vec<((i64, i64), Columns)>,
     ) -> rusqlite::Result<()> {
         let conn = ctx.conn;
         // The player's own row is the newest, with its car_state values
@@ -2105,14 +2675,31 @@ impl Stream {
             Some(car) => car.laps(conn, vehicle)?,
             None => Vec::new(),
         };
-        self.write_car(ctx, sc, vehicle, telemetry.as_ref(), now, order)?;
+        let current = stints.last();
+        self.write_car(
+            ctx,
+            sc,
+            vehicle,
+            telemetry.as_ref(),
+            now,
+            order,
+            current.map(|stint| stint.id),
+        )?;
         write_sectors(ctx, sc, vehicle)?;
         let Some(telemetry) = &telemetry else {
             return Ok(());
         };
-        let stint = Stint::new(&laps, telemetry);
-        write_wheels(ctx, vehicle, telemetry, &laps, &stint)?;
-        write_stint(conn, sc, frame, vehicle, telemetry, &stint, now)?;
+        let stint = current.map(|_| Stint::new(&laps, stints, stints.len() - 1));
+        let frac = lap_fraction(stint.as_ref().and_then(|stint| stint.avg_time), telemetry);
+        write_wheels(ctx, vehicle, telemetry, &laps, frac)?;
+        if let (Some(current), Some(stint)) = (current, &stint)
+            && !laps.is_empty()
+        {
+            projections.push((
+                (vehicle, current.number),
+                projection(sc, frame, vehicle, telemetry, stint, frac, now),
+            ));
+        }
 
         // How the lap in progress stands
         if let Some(car) = self.cars.get(&vehicle) {
@@ -2205,6 +2792,7 @@ impl Stream {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_car(
         &self,
         ctx: &Ctx,
@@ -2213,6 +2801,7 @@ impl Stream {
         telemetry: Option<&Row>,
         now: Option<f64>,
         (ids, place, exact): (&[i64], &HashMap<i64, usize>, bool),
+        current_stint: Option<i64>,
     ) -> rusqlite::Result<()> {
         let empty = Row {
             columns: Arc::default(),
@@ -2248,7 +2837,7 @@ impl Stream {
             vec![
                 ("vehicle_id", Value::Integer(vehicle)),
                 ("is_player", flag(vehicle == ctx.vehicle)),
-                ("driver", copy(st, "driver")),
+                ("current_stint_id", integer(current_stint)),
                 ("team", copy(st, "team")),
                 ("car_number", copy(st, "car_number")),
                 ("vehicle", copy(st, "vehicle")),
@@ -2400,50 +2989,68 @@ fn pit_services(st: &Row) -> (Option<String>, Option<String>) {
     (list("selected"), list("active"))
 }
 
-/// The current stint's numbers.
+/// One stint's laps, and the green ones its averages come from.
 struct Stint<'a> {
-    laps: &'a [Lap],
-    start: usize,
+    /// The laps wholly in it
+    own: Vec<&'a Lap>,
     baseline: Vec<&'a Lap>,
+    /// Whose laps the baseline is
+    baseline_source: Option<&'static str>,
     avg_time: Option<f64>,
-    frac: f64,
 }
 
 impl<'a> Stint<'a> {
-    fn new(laps: &'a [Lap], telemetry: &Row) -> Self {
-        // The laps after the last refuel or pit
-        let start = laps
+    /// Stint `index` of `stints`. With too few green laps of its own, it borrows its driver's from
+    /// before, or else anyone's in the car before it; a lap across a change of stint is no one's.
+    fn new(laps: &'a [Lap], stints: &[Segment], index: usize) -> Self {
+        let placed = laps
             .iter()
-            .rposition(|lap| lap.refuelled || lap.pit)
-            .map_or(0, |i| i + 1);
-        let last_green = |laps: &'a [Lap]| -> Vec<&'a Lap> {
-            let green = laps.iter().filter(|lap| lap.green).collect::<Vec<_>>();
+            .filter_map(|lap| match place(stints, lap.lap, lap.start, lap.end) {
+                Place::Stint(i) if i <= index => Some((lap, i)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let driver = stints[index].driver;
+        let same_driver = |i: usize| driver.is_some() && stints[i].driver == driver;
+        let last_green = |of: &dyn Fn(usize) -> bool| {
+            let green = placed
+                .iter()
+                .copied()
+                .filter(|(lap, i)| lap.green && of(*i))
+                .collect::<Vec<_>>();
             green[green.len().saturating_sub(5)..].to_vec()
         };
-        let mut baseline = last_green(&laps[start..]);
-        if baseline.len() < 2 {
-            // Not enough in this stint: borrow from the previous one
-            baseline = last_green(laps);
+        let mut baseline = last_green(&|i| i == index);
+        if baseline.len() < 2 && driver.is_some() {
+            baseline = last_green(&same_driver);
         }
+        if baseline.len() < 2 {
+            baseline = last_green(&|_| true);
+        }
+        let baseline_source = (!baseline.is_empty()).then(|| {
+            if baseline.iter().all(|(_, i)| *i == index) {
+                "this stint"
+            } else if baseline.iter().all(|(_, i)| same_driver(*i)) {
+                "this driver"
+            } else {
+                "any driver"
+            }
+        });
+        let baseline = baseline.into_iter().map(|(lap, _)| lap).collect::<Vec<_>>();
         let times = baseline
             .iter()
             .filter_map(|lap| lap.time)
             .collect::<Vec<_>>();
         let avg_time = (!times.is_empty()).then(|| times.iter().sum::<f64>() / times.len() as f64);
-        let elapsed = telemetry
-            .f("session_time")
-            .zip(telemetry.f("lap_start_time"))
-            .map(|(t, s)| t - s);
-        let frac = match (avg_time, elapsed) {
-            (Some(avg), Some(elapsed)) if avg != 0.0 => (elapsed / avg).clamp(0.0, 0.99),
-            _ => 0.0,
-        };
         Self {
-            laps,
-            start,
+            own: placed
+                .iter()
+                .filter(|(_, i)| *i == index)
+                .map(|(lap, _)| *lap)
+                .collect(),
             baseline,
+            baseline_source,
             avg_time,
-            frac,
         }
     }
 
@@ -2455,6 +3062,18 @@ impl<'a> Stint<'a> {
             .filter(|v| *v > 0.0)
             .collect::<Vec<_>>();
         (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+    }
+}
+
+/// How far into its lap the car is, by its stint's average lap.
+fn lap_fraction(avg_time: Option<f64>, telemetry: &Row) -> f64 {
+    let elapsed = telemetry
+        .f("session_time")
+        .zip(telemetry.f("lap_start_time"))
+        .map(|(t, s)| t - s);
+    match (avg_time, elapsed) {
+        (Some(avg), Some(elapsed)) if avg != 0.0 => (elapsed / avg).clamp(0.0, 0.99),
+        _ => 0.0,
     }
 }
 
@@ -2568,20 +3187,8 @@ fn range(
     }
 }
 
-fn write_stint(
-    conn: &Connection,
-    sc: &Scoring,
-    frame: &BTreeMap<i64, Row>,
-    vehicle: i64,
-    p: &Row,
-    stint: &Stint,
-    now: Option<f64>,
-) -> rusqlite::Result<()> {
-    let (laps, frac) = (&stint.laps[stint.start..], stint.frac);
-    if stint.laps.is_empty() {
-        return Ok(());
-    }
-    let lap_now = p.i("lap");
+/// What a stint is and has done, from its laps.
+fn stint_row(vehicle: i64, segment: &Segment, stint: &Stint) -> Columns {
     let times = stint
         .baseline
         .iter()
@@ -2593,6 +3200,53 @@ fn write_stint(
         }
         _ => None,
     };
+    let energy_is_fraction = stint
+        .baseline
+        .iter()
+        .any(|lap| lap.energy_start.is_some_and(|energy| energy <= 1.0));
+    let energy_use = stint.average_use(|lap| lap.energy_used);
+    let start = &segment.start;
+    vec![
+        ("stint_id", Value::Integer(segment.id)),
+        ("vehicle_id", Value::Integer(vehicle)),
+        ("stint_number", Value::Integer(segment.number)),
+        ("driver_id", integer(segment.driver)),
+        ("start_reason", Value::Text(start.reason.into())),
+        ("start_from_s", real(start.from)),
+        ("start_to_s", real(start.to)),
+        ("start_standing_id", integer(start.standing_id)),
+        ("start_lap", integer(stint.own.first().map(|lap| lap.lap))),
+        ("end_lap", integer(stint.own.last().map(|lap| lap.lap))),
+        (
+            "laps_complete",
+            Value::Integer(stint.own.iter().filter(|lap| lap.complete).count() as i64),
+        ),
+        ("baseline_laps", Value::Integer(stint.baseline.len() as i64)),
+        ("baseline_source", text_or_null(stint.baseline_source)),
+        ("avg_lap_s", real(stint.avg_time)),
+        ("pace_trend_s_per_lap", real(trend)),
+        (
+            "fuel_per_lap_l",
+            real(stint.average_use(|lap| lap.fuel_used)),
+        ),
+        (
+            "energy_per_lap_pct",
+            real(energy_use.filter(|_| energy_is_fraction).map(|e| e * 100.0)),
+        ),
+    ]
+}
+
+/// What the car's current stint is on course for, as of `now`: kept with the stint once it's over.
+fn projection(
+    sc: &Scoring,
+    frame: &BTreeMap<i64, Row>,
+    vehicle: i64,
+    p: &Row,
+    stint: &Stint,
+    frac: f64,
+    now: Option<f64>,
+) -> Columns {
+    let lap_now = p.i("lap");
     let fuel = p.f("fuel");
     let energy = p.f("virtual_energy");
     let fuel_use = stint.average_use(|lap| lap.fuel_used);
@@ -2612,57 +3266,37 @@ fn write_stint(
         .zip(need)
         .filter(|(margin, _)| *margin < 0.0)
         .map(|(margin, need)| -margin / need.max(0.1) * 100.0);
-    let energy_is_fraction = energy.is_some_and(|energy| energy <= 1.0);
-    insert(
-        conn,
-        "stint_now",
-        vec![
-            ("vehicle_id", Value::Integer(vehicle)),
-            (
-                "stint_number",
-                integer(stint.laps.last().map(|lap| lap.stint_number)),
-            ),
-            ("start_lap", integer(laps.first().map(|lap| lap.lap))),
-            (
-                "laps_complete",
-                Value::Integer(laps.iter().filter(|lap| lap.complete).count() as i64),
-            ),
-            ("lap_fraction", real(Some(frac))),
-            ("baseline_laps", Value::Integer(stint.baseline.len() as i64)),
-            ("avg_lap_s", real(stint.avg_time)),
-            ("pace_trend_s_per_lap", real(trend)),
-            ("fuel_l", real(fuel)),
-            ("fuel_per_lap_l", real(fuel_use)),
-            ("fuel_laps_left", real(fuel_laps)),
-            ("fuel_runs_out_lap", real(fuel_out)),
-            ("tank_capacity_l", copy(p, "fuel_capacity")),
-            ("energy_left_pct", real(energy_percent(energy))),
-            (
-                "energy_per_lap_pct",
-                real(energy_use.filter(|_| energy_is_fraction).map(|e| e * 100.0)),
-            ),
-            ("energy_laps_left", real(energy_laps)),
-            ("energy_runs_out_lap", real(energy_out)),
-            ("game_fuel_per_lap_l", copy(p, "fuel_per_lap")),
-            (
-                "game_energy_per_lap_pct",
-                real(percent(p.f("virtual_energy_per_lap"))),
-            ),
-            ("limited_by", text_or_null(limit.map(|(which, _)| which))),
-            ("laps_left", real(limit.map(|(_, left)| left))),
-            (
-                "last_full_lap",
-                // Lap N spans [N, N + 1), so reaching N completes lap N - 1.
-                integer(limit.map(|(_, left)| {
+    vec![
+        ("calculated_at_s", real(now)),
+        ("lap_fraction", real(Some(frac))),
+        ("fuel_l", real(fuel)),
+        ("fuel_laps_left", real(fuel_laps)),
+        ("fuel_runs_out_lap", real(fuel_out)),
+        ("tank_capacity_l", copy(p, "fuel_capacity")),
+        ("energy_left_pct", real(energy_percent(energy))),
+        ("energy_laps_left", real(energy_laps)),
+        ("energy_runs_out_lap", real(energy_out)),
+        ("game_fuel_per_lap_l", copy(p, "fuel_per_lap")),
+        (
+            "game_energy_per_lap_pct",
+            real(percent(p.f("virtual_energy_per_lap"))),
+        ),
+        ("limited_by", text_or_null(limit.map(|(which, _)| which))),
+        ("laps_left", real(limit.map(|(_, left)| left))),
+        (
+            "last_full_lap",
+            // Lap N spans [N, N + 1), so reaching N completes lap N - 1.
+            integer(
+                limit.map(|(_, left)| {
                     (lap_now.unwrap_or(0) as f64 + frac + left).floor() as i64 - 1
-                })),
+                }),
             ),
-            ("laps_needed", real(need)),
-            ("laps_needed_source", Value::Text(source)),
-            ("margin_laps", real(margin)),
-            ("save_pct_needed", real(save)),
-        ],
-    )
+        ),
+        ("laps_needed", real(need)),
+        ("laps_needed_source", Value::Text(source)),
+        ("margin_laps", real(margin)),
+        ("save_pct_needed", real(save)),
+    ]
 }
 
 /// The car's sector times as of its newest standing.
@@ -2700,18 +3334,23 @@ fn write_wheels(
     vehicle: i64,
     telemetry: &Row,
     laps: &[Lap],
-    stint: &Stint,
+    frac: f64,
 ) -> rusqlite::Result<()> {
     let Some(id) = telemetry.i("id") else {
         return Ok(());
     };
     let remaining = wear_remaining(laps);
-    let stint_laps = &laps[stint.start..];
+    // The tyres' laps: since the last refuel or pit
+    let start = laps
+        .iter()
+        .rposition(|lap| lap.refuelled || lap.pit)
+        .map_or(0, |i| i + 1);
+    let stint_laps = &laps[start..];
     let done = stint_laps
         .iter()
         .filter(|lap| lap.complete && Lap::has_wear(&lap.wear_end))
         .count();
-    let n = done as f64 + stint.frac;
+    let n = done as f64 + frac;
     for (wheel, r) in wheels_at(ctx.conn, id)? {
         let Some(name) = WHEELS.get(wheel) else {
             continue;
@@ -3287,16 +3926,18 @@ mod tests {
         let (_dir, engineer) = race();
         let rows = query(
             &engineer,
-            "SELECT lap, time_s, complete, green, stint_number FROM lap_stats WHERE vehicle_id = 1 ORDER BY lap",
+            "SELECT lap, time_s, complete, green, \
+             (SELECT stint_number FROM stints t WHERE t.stint_id = l.stint_id), stint_boundary \
+             FROM lap_stats l WHERE vehicle_id = 1 ORDER BY lap",
         )
         .await;
         assert_eq!(
             rows,
             [
-                ["0", "100", "1", "1", "1"],
-                ["1", "100", "1", "1", "1"],
-                ["2", "100", "1", "1", "1"],
-                ["3", "NULL", "0", "0", "1"],
+                ["0", "100", "1", "1", "1", "0"],
+                ["1", "100", "1", "1", "1", "0"],
+                ["2", "100", "1", "1", "1", "0"],
+                ["3", "NULL", "0", "0", "1", "0"],
             ]
         );
         assert_eq!(
@@ -3371,10 +4012,10 @@ mod tests {
     fn lap_with(pit: bool, refuelled: bool, wear: (f64, f64)) -> Lap {
         Lap {
             lap: 0,
-            stint_number: 1,
             first_id: 0,
             last_id: 0,
             start: None,
+            end: None,
             time: None,
             complete: true,
             invalid: false,
@@ -3682,17 +4323,49 @@ mod tests {
         assert_eq!(invalid(), Some(1));
     }
 
+    /// Laps of 100 s from lap 0, each `(pit, refuelled)`.
+    fn spans_of(laps: &[(bool, bool)]) -> Vec<LapSpan> {
+        laps.iter()
+            .zip(0..)
+            .map(|((pit, refuelled), lap)| LapSpan {
+                lap,
+                start: Some(lap as f64 * 100.0),
+                end: Some(lap as f64 * 100.0 + 100.0),
+                stopped: *pit || *refuelled,
+            })
+            .collect()
+    }
+
+    fn spell(driver: i64, first: f64, last: f64) -> Run {
+        Run {
+            driver,
+            first,
+            last,
+            standing_id: (first * 10.0) as i64,
+        }
+    }
+
+    fn stints_of(spans: &[LapSpan], runs: &[Run]) -> Vec<Segment> {
+        numbered(1, segment(spans, runs), &mut StintIds::default())
+    }
+
+    /// Each lap's stint number, 0 across the start of one.
+    fn numbers(stints: &[Segment], spans: &[LapSpan]) -> Vec<i64> {
+        spans
+            .iter()
+            .map(|span| match place(stints, span.lap, span.start, span.end) {
+                Place::Stint(i) => stints[i].number,
+                Place::Across => 0,
+                Place::Unknown => -1,
+            })
+            .collect()
+    }
+
     #[test]
     fn one_stop_is_one_more_stint() {
         let run = |laps: &[(bool, bool)]| {
-            let mut stints = Stints::default();
-            laps.iter()
-                .map(|(pit, refuelled)| {
-                    let number = stints.number;
-                    stints.advance(&lap_with(*pit, *refuelled, (1.0, 1.0)));
-                    number
-                })
-                .collect::<Vec<_>>()
+            let spans = spans_of(laps);
+            numbers(&stints_of(&spans, &[]), &spans)
         };
         let (no, pit, refuel) = ((false, false), (true, false), (false, true));
         // The in lap and the out lap both show the pit lane
@@ -3702,6 +4375,247 @@ mod tests {
         // Leaving the garage isn't a stop
         assert_eq!(run(&[pit, no, no]), [1, 1, 1]);
         assert_eq!(run(&[no, refuel, no]), [1, 1, 2]);
+        // The in lap still under way: no stop yet
+        assert_eq!(run(&[no, pit]), [1, 1]);
+    }
+
+    #[test]
+    fn a_driver_change_in_a_stop_is_the_stops_stint() {
+        let (no, pit) = ((false, false), (true, false));
+        let spans = spans_of(&[no, no, pit, pit, no]);
+        // Last seen at the line, the next driver ten seconds into the out lap
+        let stints = stints_of(&spans, &[spell(1, 0.0, 300.0), spell(2, 310.0, 450.0)]);
+        assert_eq!(stints.len(), 2);
+        assert_eq!(stints[1].start.reason, "pit stop and driver change");
+        assert_eq!(stints[1].start.lap, Some(3));
+        assert_eq!(
+            (stints[1].start.from, stints[1].start.to),
+            (Some(300.0), Some(310.0))
+        );
+        assert_eq!(stints[1].start.standing_id, Some(3100));
+        assert_eq!((stints[0].driver, stints[1].driver), (Some(1), Some(2)));
+        // The out lap had both of them: it's no one stint's
+        assert_eq!(numbers(&stints, &spans), [1, 1, 1, 0, 2]);
+        // So are its corners up to the handover, but not those after it
+        assert_eq!(place(&stints, 3, Some(300.0), Some(305.0)), Place::Across);
+        assert_eq!(place(&stints, 3, Some(320.0), Some(330.0)), Place::Stint(1));
+        assert_eq!(place(&stints, 2, Some(250.0), Some(260.0)), Place::Stint(0));
+        // When it was driven isn't known
+        assert_eq!(place(&stints, 4, None, None), Place::Unknown);
+    }
+
+    #[test]
+    fn a_returning_driver_starts_a_new_stint_as_themselves() {
+        let (no, pit) = ((false, false), (true, false));
+        let spans = spans_of(&[no, pit, pit, no, pit, pit, no]);
+        // Each last seen at the line, the next driver a little into the out lap
+        let runs = [
+            spell(1, 0.0, 200.0),
+            spell(2, 205.0, 500.0),
+            spell(1, 505.0, 690.0),
+        ];
+        let stints = stints_of(&spans, &runs);
+        let drivers = stints.iter().map(|stint| stint.driver).collect::<Vec<_>>();
+        assert_eq!(drivers, [Some(1), Some(2), Some(1)]);
+        assert_eq!(numbers(&stints, &spans), [1, 1, 0, 2, 2, 0, 3]);
+    }
+
+    #[test]
+    fn a_driver_change_away_from_a_stop_is_a_stint_of_its_own() {
+        let no = (false, false);
+        let spans = spans_of(&[no, no, no]);
+        let stints = stints_of(&spans, &[spell(1, 0.0, 150.0), spell(2, 160.0, 290.0)]);
+        assert_eq!(stints[1].start.reason, "driver change");
+        assert_eq!(numbers(&stints, &spans), [1, 0, 2]);
+        // Its drivers alone, for a car without laps
+        let stints = stints_of(&[], &[spell(1, 0.0, 150.0), spell(2, 160.0, 290.0)]);
+        assert_eq!(stints.len(), 2);
+        assert_eq!(stints[1].driver, Some(2));
+    }
+
+    #[test]
+    fn a_short_stint_borrows_its_drivers_laps_first() {
+        let (no, pit) = ((false, false), (true, false));
+        let flags = [no, no, no, pit, pit, no, pit, pit, no];
+        let spans = spans_of(&flags);
+        let laps = flags
+            .iter()
+            .zip(&spans)
+            .map(|((pit, refuelled), span)| Lap {
+                lap: span.lap,
+                start: span.start,
+                end: span.end,
+                time: Some(100.0 + span.lap as f64),
+                ..lap_with(*pit, *refuelled, (1.0, 1.0))
+            })
+            .collect::<Vec<_>>();
+        let runs = [
+            spell(1, 0.0, 395.0),
+            spell(2, 405.0, 695.0),
+            spell(1, 705.0, 890.0),
+        ];
+        let stints = stints_of(&spans, &runs);
+        assert_eq!(stints.len(), 3);
+        // One green lap of their own, none from before: anyone's
+        let second = Stint::new(&laps, &stints, 1);
+        assert_eq!(second.baseline_source, Some("any driver"));
+        // One green lap of their own, and this driver's from before
+        let third = Stint::new(&laps, &stints, 2);
+        assert_eq!(third.baseline_source, Some("this driver"));
+        let used = third.baseline.iter().map(|lap| lap.lap).collect::<Vec<_>>();
+        assert_eq!(used, [0, 1, 2, 8]);
+        assert_eq!(third.own.iter().map(|lap| lap.lap).collect::<Vec<_>>(), [8]);
+        // Enough of its own
+        assert_eq!(
+            Stint::new(&laps, &stints, 0).baseline_source,
+            Some("this stint")
+        );
+    }
+
+    /// Five laps of a 1000 m track at 10 m/s, a stop between laps 2 and 3, and one driver handing
+    /// over to another during it, as the standings saw it.
+    fn relay(standings_first: bool) -> (Connection, Stream) {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        let mut stream = Stream {
+            player: Some(1),
+            layout: Some(layout(
+                vec![Turn {
+                    label: "T1".into(),
+                    direction: None,
+                    scale: None,
+                    start: 450.0,
+                    apex: 500.0,
+                    end: 550.0,
+                }],
+                1000.0,
+                TRACK_DATA,
+            )),
+            ..Stream::default()
+        };
+        let samples = (0..=460)
+            .map(|i| {
+                let t = i as f64;
+                let lap = i / 100;
+                let d = t * 10.0 - lap as f64 * 1000.0;
+                Sample {
+                    id: i + 1,
+                    vehicle: 1,
+                    is_player: true,
+                    session_time: Some(t),
+                    lap: Some(lap),
+                    lap_start: Some(lap as f64 * 100.0),
+                    lap_distance: Some(d),
+                    in_pit: (lap == 2 && d >= 900.0) || (lap == 3 && d < 100.0),
+                    invalid: false,
+                    speed: Some(10.0),
+                    brake: Some(f64::from((400.0..450.0).contains(&d))),
+                    throttle: Some(f64::from(!(400.0..500.0).contains(&d))),
+                    gear: Some(3),
+                    fuel: Some(50.0 - t * 0.02),
+                    energy: None,
+                    gap_ahead: None,
+                    gap_behind: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let standings = |conn: &Connection| {
+            for (t, driver) in [
+                (0.0, "Ana Lopes"),
+                (100.0, "Ana Lopes"),
+                (200.0, "Ana Lopes"),
+                (300.0, "Ana Lopes"),
+                (310.0, "Bea Costa"),
+                (400.0, "Bea Costa"),
+            ] {
+                conn.execute(
+                    "INSERT INTO standings (session_time, vehicle_id, is_player, driver) \
+                     VALUES (?, 1, 1, ?)",
+                    params![t, driver],
+                )
+                .unwrap();
+            }
+        };
+        if standings_first {
+            standings(&conn);
+            stream.read_standings(&conn).unwrap();
+            stream.apply_telemetry(&conn, &samples).unwrap();
+        } else {
+            stream.apply_telemetry(&conn, &samples).unwrap();
+            standings(&conn);
+            stream.read_standings(&conn).unwrap();
+        }
+        (conn, stream)
+    }
+
+    #[test]
+    fn a_handover_in_the_pits_splits_laps_and_corners_by_stint() {
+        for standings_first in [true, false] {
+            let (conn, stream) = relay(standings_first);
+            let car = &stream.cars[&1];
+            let reasons = car
+                .stints
+                .iter()
+                .map(|stint| (stint.start.reason, stint.driver))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                reasons,
+                [
+                    ("first seen", Some(1)),
+                    ("pit stop and driver change", Some(2))
+                ]
+            );
+            let names = stream
+                .drivers
+                .known
+                .iter()
+                .map(|driver| driver.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["Ana Lopes", "Bea Costa"]);
+            let (first, second) = (car.stints[0].id, car.stints[1].id);
+            let laps = rows(
+                &conn,
+                "SELECT lap, stint_id, stint_boundary FROM lap_stats ORDER BY lap",
+                [],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| (r.i("lap"), r.i("stint_id"), r.i("stint_boundary")))
+            .collect::<Vec<_>>();
+            assert_eq!(
+                laps,
+                [
+                    (Some(0), Some(first), Some(0)),
+                    (Some(1), Some(first), Some(0)),
+                    (Some(2), Some(first), Some(0)),
+                    // The out lap: one driver, then the other
+                    (Some(3), None, Some(1)),
+                ],
+                "standings first: {standings_first}"
+            );
+            let passes = rows(
+                &conn,
+                "SELECT lap, stint_id, stint_boundary FROM corner_passes ORDER BY lap",
+                [],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| (r.i("lap"), r.i("stint_id"), r.i("stint_boundary")))
+            .collect::<Vec<_>>();
+            assert_eq!(
+                passes,
+                [
+                    (Some(0), Some(first), Some(0)),
+                    (Some(1), Some(first), Some(0)),
+                    (Some(2), Some(first), Some(0)),
+                    // Its section starts at the line, before the handover
+                    (Some(3), None, Some(1)),
+                    (Some(4), Some(second), Some(0)),
+                ],
+                "standings first: {standings_first}"
+            );
+        }
     }
 
     #[test]
@@ -3845,7 +4759,7 @@ mod tests {
         let lap = |number: i64, next: i64, samples: &[Sample]| {
             let next = build_of(next, &whole, 100.0);
             build_of(number, samples, 60.0)
-                .lap(&conn, 1, Some(&next), None, 1)
+                .lap(&conn, 1, Some(&next), None)
                 .unwrap()
         };
         let clean = lap(1, 2, &whole);
@@ -4025,7 +4939,7 @@ mod tests {
         let mut build = LapBuild::new(&joined[0], 0, Some(&layout));
         for sample in &joined {
             build.add(sample, Some(2000.0));
-            writer.sample_added(1, &mut build).unwrap();
+            writer.sample_added(1, &mut build, &[]).unwrap();
         }
         let low: i64 = conn
             .query_row("SELECT low_precision FROM corner_passes", [], |r| r.get(0))
@@ -4134,7 +5048,7 @@ mod tests {
         };
         for sample in samples {
             build.add(&sample, Some(2000.0));
-            writer.sample_added(1, &mut build).unwrap();
+            writer.sample_added(1, &mut build, &[]).unwrap();
             let d = sample.lap_distance.unwrap();
             let row = pass(&conn, "entry_s");
             // The boundary with the next turn is at 1000 m, and the throttle's search ends 300 m
@@ -4229,8 +5143,9 @@ mod tests {
 
         let cars = query(
             &engineer,
-            "SELECT vehicle_id, is_player, driver, position, ROUND(ahead_of_player_m), ROUND(right_of_player_m), place_behind_vehicle_id \
-             FROM cars_now ORDER BY vehicle_id",
+            "SELECT c.vehicle_id, is_player, d.name, position, ROUND(ahead_of_player_m), ROUND(right_of_player_m), place_behind_vehicle_id \
+             FROM cars_now c JOIN stints s ON s.stint_id = c.current_stint_id JOIN drivers_now d USING (driver_id) \
+             ORDER BY c.vehicle_id",
         )
         .await;
         assert_eq!(cars[0][..4], ["1", "1", "\"Ana Lopes\"", "1"]);
@@ -4251,24 +5166,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn stint_now_gives_the_verdict() {
+    async fn the_current_stint_gives_the_verdict() {
         let (_dir, engineer) = race();
         let rows = query(
             &engineer,
             "SELECT limited_by, ROUND(laps_left, 1), ROUND(laps_needed), last_full_lap, margin_laps < 0, \
-             save_pct_needed > 0, ROUND(avg_lap_s) FROM stint_now WHERE vehicle_id = 1",
+             save_pct_needed > 0, ROUND(avg_lap_s), baseline_source, start_reason, start_lap, \
+             calculated_at_s = (SELECT session_time_s FROM race_state) \
+             FROM stints s JOIN cars_now c ON s.stint_id = c.current_stint_id WHERE c.vehicle_id = 1",
         )
         .await;
         // 1.0 - t * 0.0005 energy over 100 s laps: 0.05 a lap, at 0.845 left after 310 s
         // 60 - t * 0.02 fuel: 2 L a lap, 53.8 L left
         assert_eq!(
             rows,
-            [["\"energy\"", "16.9", "15", "18", "0", "NULL", "100"]],
+            [[
+                "\"energy\"",
+                "16.9",
+                "15",
+                "18",
+                "0",
+                "NULL",
+                "100",
+                "\"this stint\"",
+                "\"first seen\"",
+                "0",
+                "1"
+            ]],
             "{rows:?}"
         );
         // A rival's too, from what the recording has of it
+        assert_eq!(number(&engineer, "SELECT COUNT(*) FROM stints").await, 2.0);
         assert_eq!(
-            number(&engineer, "SELECT COUNT(*) FROM stint_now").await,
+            number(&engineer, "SELECT COUNT(*) FROM drivers_now").await,
             2.0
         );
     }
@@ -4310,7 +5240,7 @@ mod tests {
             2.0
         );
         let table_info = query(&engineer, "PRAGMA table_info(lap_stats)").await;
-        assert!(table_info.iter().any(|row| row[1] == "\"stint_number\""));
+        assert!(table_info.iter().any(|row| row[1] == "\"stint_id\""));
     }
 
     #[tokio::test(flavor = "multi_thread")]

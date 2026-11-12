@@ -101,8 +101,9 @@ not reported), `start_light`, `air_c`, `track_c`, `rain_pct`,
 `pit_window_end_lap`, `pit_window_opens_in_s`, `pit_window_closes_in_s`, `pit_speed_limit_kmh`,
 `track_limit_steps_per_penalty`, `track_limit_steps_per_point`, `max_incident_points`.
 
-**`cars_now`**, one row per car: `vehicle_id`, `is_player`, `driver`, `team`, `car_number`,
-`vehicle`, `vehicle_class`, `telemetry_id`, `sample_age_s`; `position`, `class_position`,
+**`cars_now`**, one row per car: `vehicle_id`, `is_player`, `current_stint_id` (its stint now, in
+`stints`, whose `driver_id` is who's driving), `team`, `car_number`, `vehicle`, `vehicle_class`,
+`telemetry_id`, `sample_age_s`; `position`, `class_position`,
 `position_estimated`, `qualifying_position`, `place_ahead_vehicle_id`, `place_behind_vehicle_id`;
 `lap`, `laps_completed`, `sector` (from 1 to `race_state.sector_count`), `lap_distance_m`, `lap_elapsed_s`, `laps_behind_leader`,
 `laps_behind_next`; `gap_place_ahead_s`, `gap_place_behind_s` (standings order, live),
@@ -133,15 +134,33 @@ gravel, 5 kerb, 6 special; on RaceRoom 0 means paved, wetness unknown), `sliding
 best of any lap), `current_lap_s` (on this lap, once the car is past it). Each is the sector on its
 own; tracks have as many sectors as `race_state.sector_count`.
 
-**`stint_now`**, one row per car with usable laps. `margin_laps` is the verdict on making the end
-without stopping; `save_pct_needed` is set when short. `vehicle_id`, `stint_number`, `start_lap`,
-`laps_complete`, `lap_fraction`; `baseline_laps`, `avg_lap_s`, `pace_trend_s_per_lap`; `fuel_l`,
-`fuel_per_lap_l`, `fuel_laps_left`, `fuel_runs_out_lap`, `tank_capacity_l`; `energy_left_pct`,
-`energy_per_lap_pct`, `energy_laps_left`, `energy_runs_out_lap`; `game_fuel_per_lap_l`,
-`game_energy_per_lap_pct`; `limited_by` (fuel or energy), `laps_left`, `last_full_lap`,
-`laps_needed` (from the session, including the lap you finish after the flag),
-`laps_needed_source`, `margin_laps`, `save_pct_needed`. If the pilot gives another race length,
-compare it with `laps_left`. Average use over `baseline_laps` green laps, not this lap.
+**`drivers_now`**, one row per driver the standings have named this session: `driver_id`,
+`vehicle_id`, `name`, `first_seen_s`, `last_seen_s` (the first and last standings rows naming them:
+sightings, not exact times). The simulator gives names, not ids or a roster: a name in a car is one
+driver, and a co-driver who hasn't driven yet isn't here.
+
+**`stints`**, one row per stint of every car, past and current. A stop starts one (at the line
+between its in and out laps; leaving the garage isn't one), and so does someone else taking over;
+swapping drivers during a stop starts just the one. The current one is `cars_now.current_stint_id`;
+the driver is its `driver_id` in `drivers_now`, and a driver back in the car has a new stint under
+the same `driver_id`. `stint_id`, `vehicle_id`, `stint_number`, `driver_id`; `start_reason`
+(`first seen`, `pit stop`, `driver change`, `pit stop and driver change`), `start_from_s`,
+`start_to_s` (when it began as observed: a handover is somewhere between the last standings row
+naming the driver before and the first naming the next), `start_standing_id` (that first row);
+`start_lap`, `end_lap`, `laps_complete` (its laps wholly in it); `baseline_laps`,
+`baseline_source` (`this stint`; `this driver`, their earlier stints too, when it has too few
+green laps; `any driver`, whoever drove the car before: say the pace or use is partly someone
+else's), `avg_lap_s`,
+`pace_trend_s_per_lap`, `fuel_per_lap_l`, `energy_per_lap_pct`. What it's on course for, as of
+`calculated_at_s` (for a stint that's over, the last time it was worked out while current: history,
+not a forecast; NULL if never): `lap_fraction`; `fuel_l`, `fuel_laps_left`, `fuel_runs_out_lap`,
+`tank_capacity_l`; `energy_left_pct`, `energy_laps_left`, `energy_runs_out_lap`;
+`game_fuel_per_lap_l`, `game_energy_per_lap_pct`; `limited_by` (fuel or energy), `laps_left`,
+`last_full_lap`, `laps_needed` (from the session, including the lap you finish after the flag),
+`laps_needed_source`, `margin_laps`, `save_pct_needed`. The current stint's `margin_laps` is the
+verdict on making the end without stopping; `save_pct_needed` is set when short. If the pilot gives
+another race length, compare it with `laps_left`. Average use over `baseline_laps` green laps, not
+this lap.
 
 **`forecast_now`**, one row per forecast point: `session_type`, `is_current_session`,
 `session_fraction`, `minutes_from_now` (negative: passed; NULL for a session still to come),
@@ -152,8 +171,10 @@ compare it with `laps_left`. Average use over `baseline_laps` green laps, not th
 
 Updated as the cars drive, the lap in progress too.
 
-**`lap_stats`**, one row per car and lap: `vehicle_id`, `lap`, `stint_number`, `first_id`, `last_id`
-(the lap's telemetry rows), `start_s`; `time_s`, `official_time_s`, `top_speed_kmh`; `complete`, `invalid`, `pit` (in or out lap; one stop is one more `stint_number`), `refuelled`, `contact`,
+**`lap_stats`**, one row per car and lap: `vehicle_id`, `lap`, `stint_id` (in `stints`, for who drove
+it), `stint_boundary` (1: the lap is across the start of a stint, such as an out lap the drivers
+swapped during, and `stint_id` is NULL; a NULL `stint_id` with 0 means there's no telling), `first_id`, `last_id`
+(the lap's telemetry rows), `start_s`; `time_s`, `official_time_s`, `top_speed_kmh`; `complete`, `invalid`, `pit` (in or out lap; one stop is one more stint), `refuelled`, `contact`,
 `green` (complete and seen whole, no pit or refuel: representative for pace and use), `track_limit_steps`;
 `fuel_start_l`, `fuel_end_l`, `fuel_used_l`, `energy_start_pct`, `energy_end_pct`,
 `energy_used_pct`; `gap_ahead_end_s`, `gap_behind_end_s`.
@@ -170,7 +191,8 @@ with `lap_stats`.
 **`corner_passes`**, one row per car, lap and turn, written as soon as the car leaves the corner, so
 this lap's completed corners are there. Every lap is split at the same places, so passes compare
 across laps and cars, and `total_s` adds up to the lap time. `vehicle_id`, `lap`, `turn_index`,
-`turn_name`, `direction`, `scale`; `first_id`, `last_id` (its telemetry rows), `entered_at_s`,
+`stint_id`, `stint_boundary` (as in `lap_stats`, by when the pass was driven), `turn_name`,
+`direction`, `scale`; `first_id`, `last_id` (its telemetry rows), `entered_at_s`,
 `exited_at_s`; `boundary_m`, `start_m`, `apex_m`, `end_m`, `next_boundary_m`; `entry_s` (boundary to
 apex: braking and turn-in), `apex_to_end_s`, `straight_s` (the corner's end to the next boundary;
 NULL until the car gets there), `total_s` (likewise); `brake_m_before_apex`, `min_speed_kmh`,
@@ -214,9 +236,12 @@ FROM corner_passes WHERE vehicle_id = :P AND turn_index = :TURN_INDEX
   AND in_pit = 0 AND contact = 0 AND low_precision = 0 AND total_s IS NOT NULL
   AND brake_m_before_apex IS NOT NULL AND min_speed_kmh IS NOT NULL AND exit_speed_kmh IS NOT NULL
 ORDER BY lap_invalid, total_s LIMIT 1;
--- a rival's pace against ours: the same recent laps of both
-SELECT c.driver, s.lap, s.time_s, s.gap_ahead_end_s FROM lap_stats s JOIN cars_now c USING (vehicle_id)
-WHERE s.green = 1 AND s.invalid = 0 AND (c.is_player = 1 OR c.driver LIKE '%Name%') ORDER BY s.lap DESC LIMIT 10;
+-- a rival's pace against ours: the same recent laps of both, and who drove each
+SELECT d.name, s.vehicle_id, s.lap, s.time_s, s.gap_ahead_end_s FROM lap_stats s JOIN cars_now c USING (vehicle_id)
+LEFT JOIN stints t USING (stint_id) LEFT JOIN drivers_now d ON d.driver_id = t.driver_id
+WHERE s.green = 1 AND s.invalid = 0
+  AND (c.is_player = 1 OR s.vehicle_id IN (SELECT vehicle_id FROM drivers_now WHERE name LIKE '%Name%'))
+ORDER BY s.lap DESC LIMIT 10;
 -- the last 20 seconds around an incident, five readings a second (pass `limit`: 200)
 SELECT CAST(session_time * 5 AS INT) / 5.0 AS t, MIN(lap_distance) AS m, AVG(speed) AS speed, AVG(throttle) AS throttle,
        AVG(brake) AS brake, AVG(steering) AS steering, AVG(yaw_rate) AS yaw, AVG(velocity_lateral) AS slide
