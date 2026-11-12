@@ -1057,6 +1057,8 @@ struct Driver {
     name: String,
     first_seen: f64,
     last_seen: f64,
+    /// Another car took the slot: they were in the one that left
+    gone: bool,
 }
 
 /// A spell of one driver in a car, from the first standings row naming them to the last.
@@ -1065,8 +1067,8 @@ pub(super) struct Run {
     pub driver: i64,
     pub first: f64,
     pub last: f64,
-    /// The standings row first naming them
-    pub standing_id: i64,
+    /// The standings row first naming them, if it's known which
+    pub standing_id: Option<i64>,
 }
 
 /// The session's drivers. A name is all the simulator gives, so a driver is a name in a car: the
@@ -1078,11 +1080,20 @@ struct Drivers {
     known: Vec<Driver>,
     /// By car, who drove it in turn
     runs: HashMap<i64, Vec<Run>>,
+    /// By car, when another car took the slot: standings from before then are the last one's
+    replaced: HashMap<i64, f64>,
 }
 
 impl Drivers {
     /// The standings name `name` the car's driver at `t`. Whether that starts a spell.
     fn seen(&mut self, vehicle: i64, name: &str, t: f64, standing_id: i64) -> bool {
+        if self
+            .replaced
+            .get(&vehicle)
+            .is_some_and(|replaced| t < *replaced)
+        {
+            return false;
+        }
         let next = self.known.len() as i64 + 1;
         let id = *self.ids.entry((vehicle, name.to_owned())).or_insert(next);
         if id == next {
@@ -1091,6 +1102,7 @@ impl Drivers {
                 name: name.to_owned(),
                 first_seen: t,
                 last_seen: t,
+                gone: false,
             });
         }
         let driver = &mut self.known[(id - 1) as usize];
@@ -1107,19 +1119,41 @@ impl Drivers {
                     driver: id,
                     first: t,
                     last: t,
-                    standing_id,
+                    standing_id: Some(standing_id),
                 });
                 true
             }
         }
     }
 
-    /// Another car took the slot after the last one was last seen at `t`: the spells begun by
-    /// then were the last one's.
-    fn forget_until(&mut self, vehicle: i64, t: f64) {
-        if let Some(runs) = self.runs.get_mut(&vehicle) {
-            runs.retain(|run| run.first > t);
+    /// Another car took the slot at `t`: what the standings said before then was the last one's,
+    /// read or still to be read. A spell going on past it (the same name in the new car) is the
+    /// new one's from then on.
+    fn replaced(&mut self, vehicle: i64, t: f64) {
+        self.replaced.insert(vehicle, t);
+        let runs = self.runs.entry(vehicle).or_default();
+        runs.retain(|run| run.last >= t);
+        for run in runs.iter_mut().filter(|run| run.first < t) {
+            run.first = t;
+            run.standing_id = None;
         }
+        let staying = runs.iter().map(|run| run.driver).collect::<BTreeSet<_>>();
+        let known = &mut self.known;
+        self.ids.retain(|(car, _), id| {
+            let driver = &mut known[(*id - 1) as usize];
+            match (*car == vehicle, staying.contains(id)) {
+                (false, _) => true,
+                (true, true) => {
+                    driver.first_seen = driver.first_seen.max(t);
+                    true
+                }
+                // Named again, they're someone new
+                (true, false) => {
+                    driver.gone = true;
+                    false
+                }
+            }
+        });
     }
 
     fn runs(&self, vehicle: i64) -> &[Run] {
@@ -1184,11 +1218,18 @@ impl StintStart {
 }
 
 /// What a stint was on course for when last worked out while current, and which stint that was:
-/// the same number can become another stint, when one is found to have begun before it.
+/// its number can change, when another is found to have begun before it.
 struct Saved {
     driver: Option<i64>,
     start: StintStart,
     columns: Columns,
+}
+
+impl Saved {
+    /// Whether it was worked out for this stint, whatever its number is now.
+    fn is(&self, stint: &Segment) -> bool {
+        self.driver == stint.driver && self.start == stint.start
+    }
 }
 
 /// What a refresh of the tables works out once for all of them.
@@ -1197,8 +1238,9 @@ struct Fresh {
     stints: CarStints,
     /// Each car's laps, as read for it
     laps: HashMap<i64, Vec<Lap>>,
-    /// What each car's current stint is on course for
-    projections: HashMap<i64, Columns>,
+    /// What each car's current stint is on course for, and whether that's worth keeping once it's
+    /// over: not from the pits, where it's being refuelled
+    projections: HashMap<i64, (Columns, bool)>,
 }
 
 /// One of a car's stints.
@@ -1326,7 +1368,7 @@ pub(super) fn segment(spans: &[LapSpan], runs: &[Run]) -> Vec<(Option<i64>, Stin
                 start.from = Some(start.from.map_or(from, |f| f.min(from)));
                 start.to = Some(start.to.map_or(to, |t| t.max(to)));
                 start.by_time = true;
-                start.standing_id = Some(after.standing_id);
+                start.standing_id = after.standing_id;
                 stop.driver = Some(after.driver);
             }
             None => starts.push((
@@ -1337,7 +1379,7 @@ pub(super) fn segment(spans: &[LapSpan], runs: &[Run]) -> Vec<(Option<i64>, Stin
                     from: Some(from),
                     to: Some(to),
                     by_time: true,
-                    standing_id: Some(after.standing_id),
+                    standing_id: after.standing_id,
                 },
             )),
         }
@@ -1363,7 +1405,7 @@ pub(super) fn segment(spans: &[LapSpan], runs: &[Run]) -> Vec<(Option<i64>, Stin
             from,
             to: from,
             by_time: false,
-            standing_id: runs.first().map(|run| run.standing_id),
+            standing_id: runs.first().and_then(|run| run.standing_id),
         },
     )];
     for (new_driver, start) in starts {
@@ -1404,6 +1446,8 @@ fn resegment(
     if stints == car.stints {
         return Ok(());
     }
+    // Until its rows are all right: a failure leaves every one to be put right next time
+    car.stints.clear();
     for span in &spans {
         let [id, across] = stint_columns(&stints, span.lap, span.start, span.end);
         conn.prepare_cached(
@@ -1946,9 +1990,8 @@ pub(super) struct Stream {
     official: HashMap<i64, Vec<Official>>,
     drivers: Drivers,
     stint_ids: StintIds,
-    /// What each stint (by car and number) was on course for when last worked out, kept once it's
-    /// over
-    projections: HashMap<(i64, i64), Saved>,
+    /// What each car's stints were on course for when last worked out, kept once they're over
+    projections: HashMap<i64, Vec<Saved>>,
     /// The simulator's timing sectors' ends as last seen whole, and the session start, track and
     /// sector count they're for: a window of the laps can miss lines the session has crossed
     timing: Option<((i64, String, i64), Vec<f64>)>,
@@ -2267,11 +2310,6 @@ impl Stream {
                     continue;
                 }
                 // Another car in the slot: nothing of the last one's is this one's
-                let left = [&car.current, &car.waiting]
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|build| build.samples.last()?.session_time)
-                    .reduce(f64::max);
                 for table in STREAM_TABLES {
                     conn.execute(
                         &format!("DELETE FROM {table} WHERE vehicle_id = ?"),
@@ -2279,10 +2317,10 @@ impl Stream {
                     )?;
                 }
                 *car = Car::default();
-                projections.retain(|(vehicle, _), _| *vehicle != sample.vehicle);
+                projections.remove(&sample.vehicle);
                 // Nor are its drivers
-                if let Some(left) = left {
-                    drivers.forget_until(sample.vehicle, left);
+                if let Some(t) = sample.session_time {
+                    drivers.replaced(sample.vehicle, t);
                 }
             }
             if car
@@ -2597,14 +2635,18 @@ impl Stream {
         // Only what's worked out from all of it is kept: a car still being read could be in a stint
         // it's long finished
         if !self.behind && !self.failed {
-            for (vehicle, columns) in fresh.projections {
+            for (vehicle, (columns, keep)) in fresh.projections {
+                if !keep {
+                    continue;
+                }
                 if let Some(stint) = fresh.stints.get(&vehicle).and_then(|stints| stints.last()) {
-                    let saved = Saved {
+                    let saved = self.projections.entry(vehicle).or_default();
+                    saved.retain(|saved| !saved.is(stint));
+                    saved.push(Saved {
                         driver: stint.driver,
                         start: stint.start.clone(),
                         columns,
-                    };
-                    self.projections.insert((vehicle, stint.number), saved);
+                    });
                 }
             }
         }
@@ -2637,6 +2679,9 @@ impl Stream {
 
     fn write_drivers(&self, conn: &Connection) -> rusqlite::Result<()> {
         for (id, driver) in (1..).zip(&self.drivers.known) {
+            if driver.gone {
+                continue;
+            }
             insert(
                 conn,
                 "drivers_now",
@@ -2673,11 +2718,12 @@ impl Stream {
                 let fresh = fresh
                     .projections
                     .get(vehicle)
-                    .filter(|_| i + 1 == stints.len());
+                    .filter(|_| i + 1 == stints.len())
+                    .map(|(columns, _)| columns);
                 let saved = self
                     .projections
-                    .get(&(*vehicle, segment.number))
-                    .filter(|saved| saved.driver == segment.driver && saved.start == segment.start)
+                    .get(vehicle)
+                    .and_then(|saved| saved.iter().find(|saved| saved.is(segment)))
                     .map(|saved| &saved.columns);
                 if let Some(projection) = fresh.or(saved) {
                     columns.extend(projection.iter().cloned());
@@ -2754,7 +2800,7 @@ impl Stream {
         order: (&[i64], &HashMap<i64, usize>, bool),
         stints: &[Segment],
         laps: &[Lap],
-    ) -> rusqlite::Result<Option<Columns>> {
+    ) -> rusqlite::Result<Option<(Columns, bool)>> {
         let conn = ctx.conn;
         // The player's own row is the newest, with its car_state values
         let telemetry = match vehicle == ctx.vehicle {
@@ -2782,9 +2828,12 @@ impl Stream {
         let stint = current.map(|_| Stint::new(laps, &places, stints, stints.len() - 1));
         let frac = lap_fraction(stint.as_ref().and_then(|stint| stint.avg_time), telemetry);
         write_wheels(ctx, vehicle, telemetry, laps, frac)?;
-        let projection = stint
-            .filter(|_| !laps.is_empty())
-            .map(|stint| projection(sc, frame, vehicle, telemetry, &stint, frac, now));
+        let in_the_pits =
+            telemetry.b("in_pit_lane") || laps.last().is_some_and(|lap| lap.pit || lap.refuelled);
+        let projection = stint.filter(|_| !laps.is_empty()).map(|stint| {
+            let columns = projection(sc, frame, vehicle, telemetry, &stint, frac, now);
+            (columns, !in_the_pits)
+        });
 
         // How the lap in progress stands
         if let Some(car) = self.cars.get(&vehicle) {
@@ -4428,7 +4477,7 @@ mod tests {
             driver,
             first,
             last,
-            standing_id: (first * 10.0) as i64,
+            standing_id: Some((first * 10.0) as i64),
         }
     }
 
@@ -4523,27 +4572,49 @@ mod tests {
     #[test]
     fn another_car_in_the_slot_leaves_its_drivers_behind() {
         let mut drivers = Drivers::default();
-        for t in [0.0, 450.0, 900.0] {
+        // The last car's driver, still named a little after its last telemetry
+        for t in [0.0, 450.0, 900.0, 900.2] {
             drivers.seen(2, "Ana Lopes", t, t as i64);
         }
-        // The last car's last seen at 900 s, and the new one's driver named before its telemetry
-        // shows up
+        // The new car's telemetry shows up at 910 s, its driver named a little before
         drivers.seen(2, "Bea Costa", 905.0, 905);
-        drivers.forget_until(2, 900.0);
         drivers.seen(2, "Bea Costa", 950.0, 950);
+        drivers.replaced(2, 910.0);
+        // The last car's standings read late
+        assert!(!drivers.seen(2, "Ana Lopes", 900.5, 901));
         let runs = drivers.runs(2).to_vec();
         assert_eq!(
             runs,
             [Run {
                 driver: 2,
-                first: 905.0,
+                first: 910.0,
                 last: 950.0,
-                standing_id: 905
+                standing_id: None
             }]
         );
         let stints = stints_of(&[], &runs);
         assert_eq!(stints.len(), 1);
         assert_eq!(stints[0].driver, Some(2));
+        // The same name in the new car, named before its telemetry shows up
+        drivers.seen(3, "Ana Lopes", 0.0, 1);
+        drivers.seen(3, "Ana Lopes", 950.0, 950);
+        drivers.replaced(3, 910.0);
+        let runs = drivers.runs(3);
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].first, runs[0].last), (910.0, 950.0));
+        // The last car's driver is gone, and someone new if the name's seen again
+        let gone = |drivers: &Drivers, name: &str| {
+            drivers
+                .known
+                .iter()
+                .filter(|driver| driver.vehicle == 2 && driver.name == name)
+                .map(|driver| driver.gone)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(gone(&drivers, "Ana Lopes"), [true]);
+        assert_eq!(gone(&drivers, "Bea Costa"), [false]);
+        drivers.seen(2, "Ana Lopes", 990.0, 990);
+        assert_eq!(gone(&drivers, "Ana Lopes"), [true, false]);
     }
 
     #[test]
