@@ -1269,7 +1269,9 @@ impl Logic {
         }
 
         match clears.as_slice() {
-            [_, _] => calls.raise("clear all round", true),
+            // Both went: one that went too soon to call clear is clear all the same, and a
+            // one-sided clear would leave a queued three wide to it
+            [_, ..] if cleared.len() == 2 => calls.raise("clear all round", true),
             [Side::Left] => calls.raise("clear left", true),
             [Side::Right] => calls.raise("clear right", true),
             _ => {}
@@ -2339,6 +2341,15 @@ mod tests {
         assert_eq!(
             run_reported(&mut logic, 0.3, 0.5, Some([1, 0])),
             ["car left"]
+        );
+
+        // Both go, one too soon to call clear: both are clear all the same
+        let mut logic = Logic::default();
+        run_reported(&mut logic, 0.0, 1.0, Some([1, 0]));
+        run_reported(&mut logic, 1.0, 1.1, Some([1, 1]));
+        assert_eq!(
+            run_reported(&mut logic, 1.1, 1.5, Some([0, 0])),
+            ["clear all round"]
         );
 
         // Both at once from one car: three wide is said once
