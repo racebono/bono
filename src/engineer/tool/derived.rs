@@ -2102,8 +2102,6 @@ impl Stream {
     fn start_session(&mut self, conn: &Connection, start: i64) -> rusqlite::Result<()> {
         self.session_start = start;
         self.stint_ids = StintIds::default();
-        // Another car taking a slot was on the old session's clock
-        self.drivers.replaced.clear();
         self.projections.clear();
         self.calibrated_laps = None;
         self.zones_from = None;
@@ -2176,6 +2174,18 @@ impl Stream {
             }
             if t.is_some() {
                 self.standings_t = t;
+            }
+            // Fewer laps than the car had: another car in the slot. Found here, the standings'
+            // drivers and its cut-off are always in the same session
+            if let (Some(vehicle), Some(laps), Some(t)) =
+                (r.i("vehicle_id"), r.i("laps_completed"), t)
+                && self
+                    .laps_completed
+                    .get(&vehicle)
+                    .is_some_and(|(before, _)| laps < *before)
+            {
+                self.drivers.replaced(vehicle, t);
+                taken_over.insert(vehicle);
             }
             if let (Some(vehicle), Some(name), Some(t)) = (
                 r.i("vehicle_id"),
@@ -2337,11 +2347,9 @@ impl Stream {
                         [sample.vehicle],
                     )?;
                 }
+                // Its drivers the standings leave behind themselves: the telemetry can be in
+                // another session than they are
                 *car = Car::default();
-                // Nor are its drivers
-                if let Some(t) = sample.session_time {
-                    drivers.replaced(sample.vehicle, t);
-                }
             }
             if car
                 .current
@@ -4637,6 +4645,46 @@ mod tests {
         assert_eq!(gone(&drivers, "Bea Costa"), [false]);
         drivers.seen(2, "Ana Lopes", 990.0, 990);
         assert_eq!(gone(&drivers, "Ana Lopes"), [true, false]);
+    }
+
+    #[test]
+    fn the_standings_say_when_another_car_takes_the_slot() {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        let mut stream = Stream::default();
+        // The telemetry already in the next session: it has no say in who drove the slot
+        stream.start_session(&conn, 1).unwrap();
+        for (t, driver, laps) in [
+            (1000.0, "Old Session", 10),
+            // The next session
+            (50.0, "Ana Lopes", 2),
+            (100.0, "Ana Lopes", 3),
+            // Another car takes the slot
+            (150.0, "Bea Costa", 0),
+            (200.0, "Bea Costa", 1),
+        ] {
+            conn.execute(
+                "INSERT INTO standings (session_time, vehicle_id, driver, laps_completed) \
+                 VALUES (?, 2, ?, ?)",
+                params![t, driver, laps],
+            )
+            .unwrap();
+        }
+        stream.read_standings(&conn).unwrap();
+        let runs = stream.drivers.runs(2).to_vec();
+        assert_eq!(runs.len(), 1);
+        let bea = &stream.drivers.known[(runs[0].driver - 1) as usize];
+        assert_eq!(bea.name, "Bea Costa");
+        assert_eq!((runs[0].first, runs[0].last), (150.0, 200.0));
+        let listed = stream
+            .drivers
+            .known
+            .iter()
+            .filter(|driver| !driver.gone)
+            .map(|driver| driver.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(listed, ["Bea Costa"]);
     }
 
     #[test]
