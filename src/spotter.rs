@@ -78,6 +78,8 @@ impl Raised {
         match self.text {
             "car left" | "still there left" | "clear left" => 1,
             "car right" | "still there right" | "clear right" => 2,
+            "three wide left" => 1,
+            "three wide right" => 2,
             "three wide" | "clear all round" => 3,
             _ => 0,
         }
@@ -105,10 +107,9 @@ enum WarningCategory {
 impl Raised {
     fn warning_category(&self) -> WarningCategory {
         match self.text {
-            "car left" | "car right" | "three wide" | "clear left" | "clear right"
-            | "clear all round" | "still there left" | "still there right" => {
-                WarningCategory::Traffic
-            }
+            "car left" | "car right" | "three wide" | "three wide left" | "three wide right"
+            | "clear left" | "clear right" | "clear all round" | "still there left"
+            | "still there right" => WarningCategory::Traffic,
             "limiter, limiter" => WarningCategory::Limiter,
             "full course yellow" | "green flag, green flag" | "red flag" => WarningCategory::Flag,
             text => WarningCategory::Other(text),
@@ -1219,6 +1220,13 @@ impl Logic {
             .collect::<Vec<_>>();
         // Three wide: a car each side, or two on one side
         let three_wide = |sides: [u8; 2]| sides[0] + sides[1] >= 2;
+        // Two on one side is said the same but is only about that side, so a clear of the
+        // other doesn't leave a car there in the queue
+        let three_wide_call = |sides: [u8; 2]| match sides {
+            [0, _] => "three wide right",
+            [_, 0] => "three wide left",
+            _ => "three wide",
+        };
 
         for side in &became {
             self.side_since[side.index()] = Some(t);
@@ -1228,10 +1236,12 @@ impl Logic {
             Side::Left => "car left",
             Side::Right => "car right",
         };
+        // What's alongside was said this update
+        let mut stated = true;
         if let Some(&first) = became.first() {
             calls.raise(
                 if three_wide(after) {
-                    "three wide"
+                    three_wide_call(after)
                 } else {
                     side_call(first)
                 },
@@ -1239,12 +1249,14 @@ impl Logic {
             );
         } else if three_wide(after) && !three_wide(before) {
             // A second car joined one already alongside on the same side
-            calls.raise("three wide", true);
+            calls.raise(three_wide_call(after), true);
         } else if three_wide(before) && !three_wide(after) && cleared.is_empty() {
             // One of two cars on the same side went: the other's still there
             if let Some(side) = Side::BOTH.into_iter().find(|s| after[s.index()] > 0) {
                 calls.raise(side_call(side), true);
             }
+        } else {
+            stated = false;
         }
 
         let mut clears = Vec::new();
@@ -1261,6 +1273,19 @@ impl Logic {
             [Side::Left] => calls.raise("clear left", true),
             [Side::Right] => calls.raise("clear right", true),
             _ => {}
+        }
+        // A car each side became two on one: still three wide
+        if became.is_empty() && !clears.is_empty() && three_wide(after) {
+            calls.raise(three_wide_call(after), true);
+            stated = true;
+        }
+        // A reminder due now would replace what was just said in the queue: it waits
+        if stated {
+            for side in Side::BOTH {
+                if after[side.index()] > 0 {
+                    self.last_still[side.index()] = Some(t);
+                }
+            }
         }
 
         for side in Side::BOTH {
@@ -1509,7 +1534,7 @@ pub fn translate(text: &'static str, lang: ArrayStr<2>) -> &'static str {
     match text {
         "car left" => t!("call.car_left": lang),
         "car right" => t!("call.car_right": lang),
-        "three wide" => t!("call.three_wide": lang),
+        "three wide" | "three wide left" | "three wide right" => t!("call.three_wide": lang),
         "clear left" => t!("call.clear_left": lang),
         "clear right" => t!("call.clear_right": lang),
         "clear all round" => t!("call.clear_all_round": lang),
@@ -1901,6 +1926,32 @@ mod tests {
     }
 
     #[test]
+    fn clearing_two_on_one_side_leaves_no_car_on_the_other() {
+        for (three_wide, clear) in [
+            ("three wide right", "clear right"),
+            ("three wide left", "clear left"),
+        ] {
+            let mut queue = VecDeque::new();
+            for text in [three_wide, clear] {
+                Spotter::enqueue(
+                    &mut queue,
+                    Raised {
+                        text,
+                        number: None,
+                        urgent: true,
+                        session_time: 1.0,
+                    },
+                    Instant::now(),
+                );
+            }
+            assert_eq!(
+                queue.iter().map(|(call, _)| call.text).collect::<Vec<_>>(),
+                [clear],
+            );
+        }
+    }
+
+    #[test]
     fn single_side_clear_preserves_remaining_synthesizing_traffic() {
         for completed in [false, true] {
             for (clear, remaining) in [("clear left", "car right"), ("clear right", "car left")] {
@@ -2225,7 +2276,7 @@ mod tests {
         );
         assert_eq!(
             run_reported(&mut logic, 1.0, 2.0, Some([2, 0])),
-            ["three wide"]
+            ["three wide left"]
         );
         // One of the two went: the other's still there
         assert_eq!(
@@ -2234,7 +2285,7 @@ mod tests {
         );
         assert_eq!(
             run_reported(&mut logic, 3.0, 4.0, Some([2, 0])),
-            ["three wide"]
+            ["three wide left"]
         );
         assert_eq!(
             run_reported(&mut logic, 4.0, 4.5, Some([0, 0])),
@@ -2260,6 +2311,36 @@ mod tests {
         assert_eq!(
             run_reported(&mut logic, 3.0, 3.5, Some([0, 0])),
             ["clear right"]
+        );
+    }
+
+    #[test]
+    fn a_car_each_side_becoming_two_on_one_is_still_three_wide() {
+        let mut logic = Logic::default();
+        run_reported(&mut logic, 0.0, 1.0, Some([1, 1]));
+        assert_eq!(
+            run_reported(&mut logic, 1.0, 2.0, Some([0, 2])),
+            ["clear left", "three wide right"]
+        );
+
+        // Both at once from one car: three wide is said once
+        let mut logic = Logic::default();
+        run_reported(&mut logic, 0.0, 1.0, Some([1, 0]));
+        assert_eq!(
+            run_reported(&mut logic, 1.0, 2.0, Some([0, 2])),
+            ["three wide right", "clear left"]
+        );
+    }
+
+    #[test]
+    fn three_wide_is_not_replaced_by_a_reminder_due_at_once() {
+        let mut logic = Logic::default();
+        let from_start = run_reported(&mut logic, 0.0, 6.0 - 1.0 / 60.0, Some([1, 0]));
+        assert_eq!(from_start, ["car left"]);
+        // The reminder for the left falls due as a second car joins it
+        assert_eq!(
+            run_reported(&mut logic, 6.0, 6.5, Some([2, 0])),
+            ["three wide left"]
         );
     }
 
