@@ -4653,7 +4653,7 @@ mod tests {
         bono_sim::sql::create_tables(&conn).unwrap();
         conn.execute_batch(TABLES).unwrap();
         let mut stream = Stream::default();
-        // The telemetry already in the next session: it has no say in who drove the slot
+        // Whichever session the telemetry has got to, the standings alone say who drove the slot
         stream.start_session(&conn, 1).unwrap();
         for (t, driver, laps) in [
             (1000.0, "Old Session", 10),
