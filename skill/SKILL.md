@@ -152,8 +152,8 @@ naming the driver before and the first naming the next), `start_standing_id` (th
 `start_lap`, `end_lap`, `laps_complete` (its laps wholly in it: after a stop, from the out lap, or
 from the lap after it when the drivers swapped during it); `baseline_laps`,
 `baseline_source` (`this stint`; `this driver`, their earlier stints too, when it has too few
-green laps; `any driver`, whoever drove the car before: say the pace or use is partly someone
-else's), `avg_lap_s`,
+green laps; `any driver`, whoever drove the car before: with a `driver_id`, say the pace or use
+is partly someone else's), `avg_lap_s`,
 `pace_trend_s_per_lap`, `fuel_per_lap_l`, `energy_per_lap_pct`. What it's on course for, as of
 `calculated_at_s` (compare it with `race_state.session_time_s`: for a stint that's over, it's the
 last time a query worked it out while current, history and not a forecast; NULL if never): `lap_fraction`; `fuel_l`, `fuel_laps_left`, `fuel_runs_out_lap`,

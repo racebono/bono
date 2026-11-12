@@ -2033,13 +2033,17 @@ impl Stream {
             .query_map(params![self.cursor, CHUNK], sample)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let tx = conn.unchecked_transaction()?;
+        let standings_from = self.standings_cursor;
         let standings_behind = match self.read_standings(conn) {
             Ok(behind) => behind,
             Err(e) => {
-                // Stints worked out with rows put right that are now gone: they're all put right
-                // again next time
                 drop(tx);
-                self.forget_stints();
+                match self.standings_cursor == standings_from {
+                    // Nothing read, but stints worked out with rows put right that are now gone
+                    true => self.forget_stints(),
+                    // Official times put on laps written for good are gone too: write them again
+                    false => self.rewind(conn)?,
+                }
                 return Err(e.into());
             }
         };
