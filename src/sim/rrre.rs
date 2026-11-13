@@ -9,6 +9,7 @@ use crate::{
 };
 use bono_sim::{
     recorder::{DATABASE, Recorder, SETTINGS, try_remove_database},
+    sql::EpochReason,
     sys::{bono_session_info, bono_standing, bono_telemetry},
 };
 use serde_json::{Map, Value};
@@ -410,6 +411,8 @@ fn record(recorder: &Recorder, update: Update) {
     // Another event (track, layout): what was recorded is about something else
     if update.new_event {
         recorder.clear();
+    } else if let Some(reason) = update.new_epoch {
+        recorder.begin_epoch(reason);
     }
     // Scoring first: it says which car is the player's, which the telemetry needs
     if let Some((session, standings)) = update.scoring {
@@ -491,6 +494,10 @@ struct Update {
     scoring: Option<(bono_session_info, Vec<bono_standing>)>,
     /// The track or layout changed since the last update
     new_event: bool,
+    /// The timeline broke since the last update, within the same event: another session, the
+    /// clock going back (a restart), or a replay that didn't end where the live session left off.
+    /// Not set with `new_event`, which starts afresh anyway
+    new_epoch: Option<EpochReason>,
 }
 
 /// Turns reads of the game into the recorder's updates (LMU's units and conventions).
@@ -509,6 +516,12 @@ struct Converter {
     session: Option<(i32, i32)>,
     /// The car the player's data is about, and where it last pointed, kept while it can't be told
     player_heading: Option<(i32, f64)>,
+    /// The car the local player drives in this session: the one the game's data is about while
+    /// the player controls it. Kept while the camera is on another car (spectating, or while
+    /// something else controls it), so watching a car never makes it the player's
+    owner: Option<i32>,
+    /// A replay played since the last update
+    replayed: bool,
 }
 
 /// A car's current lap, held steady across the reads. The game's lap count and lap timer don't
@@ -593,30 +606,62 @@ impl Converter {
     fn convert(&mut self, shared: &r3e_shared, now: Instant) -> Option<Update> {
         let player = shared.player;
         let time = player.game_simulation_time;
+        // A replay isn't recorded: its laps and incidents aren't the live session's
+        if shared.game_in_replay == 1 {
+            self.replayed = true;
+            return None;
+        }
         let in_session = shared.game_in_menus != 1
             && shared.session_type != R3E_SESSION_UNAVAILABLE
             && shared.layout_length > 0.0;
-        if !in_session || self.last_time == Some(time) {
+        // The same physics frame, unless it's another session's (whose boundary goes now)
+        let event = (shared.track_id, shared.layout_id, shared.event_index);
+        let session = (shared.session_type, shared.session_iteration);
+        if !in_session
+            || (self.last_time == Some(time)
+                && self.event == Some(event)
+                && self.session == Some(session))
+        {
             return None;
         }
         let dt = self
             .last_time
             .map(|last| time - last)
             .filter(|dt| *dt > 0.0);
+        // As the recorder tells it (see `bono_sim::recorder`): less than a second back is the same
+        // timeline
+        let went_back = self.last_time.is_some_and(|last| time < last - 1.0);
         self.last_time = Some(time);
 
-        let event = (shared.track_id, shared.layout_id, shared.event_index);
         let new_event = self.event.is_some_and(|last| last != event);
         self.event = Some(event);
-        // Another session, or its clock went back (a restart): its laps start over
-        let session = (shared.session_type, shared.session_iteration);
-        if new_event || self.session != Some(session) || dt.is_none() {
+        // Another session, or its clock went back (a restart): its laps start over. Back in the
+        // same session with its clock moving on (from menus, a pause or a replay), it carries on
+        let replayed = std::mem::take(&mut self.replayed);
+        let new_epoch = match self.session {
+            _ if new_event => None,
+            Some(last) if last != session => Some(EpochReason::Session),
+            Some(_) if went_back && replayed => Some(EpochReason::Replay),
+            Some(_) if went_back => Some(EpochReason::ClockRollback),
+            _ => None,
+        };
+        if new_event || new_epoch.is_some() || dt.is_none() {
             self.laps.clear();
             // Cars are moved between sessions: that's not how they're heading
             self.cars.clear();
             self.player_heading = None;
         }
+        if new_event || new_epoch.is_some() {
+            // Slots are handed out again: whoever drives one now isn't known yet
+            self.owner = None;
+            // The new epoch's scoring comes first, saying whose car is whose
+            self.last_scoring = None;
+        }
         self.session = Some(session);
+        // Only while the player is in control is the game's data about the player's own car
+        if shared.control_type == R3E_CONTROL_PLAYER {
+            self.owner = Some(shared.vehicle_info.slot_id);
+        }
 
         let count = (shared.num_cars.max(0) as usize).min(R3E_NUM_DRIVERS_MAX as usize);
         let drivers = shared.all_drivers_data_1;
@@ -693,7 +738,7 @@ impl Converter {
             Some(last) if now.duration_since(last) < SCORING_EVERY => None,
             _ => {
                 self.last_scoring = Some(now);
-                let (session, mut standings) = scoring(shared, drivers, time);
+                let (session, mut standings) = scoring(shared, drivers, time, self.owner);
                 // The lap starts the telemetry has, held steady across the line
                 for standing in &mut standings {
                     let slot = standing.vehicle_id.get().map(|slot| slot as i32);
@@ -708,6 +753,7 @@ impl Converter {
             telemetry,
             scoring,
             new_event,
+            new_epoch,
         })
     }
 }
@@ -880,11 +926,13 @@ fn player_telemetry(shared: &r3e_shared, out: &mut bono_telemetry) {
     }
 }
 
-/// The session, and every car's standing.
+/// The session, and every car's standing. `owner` is the local player's car, if known (see
+/// `Converter::owner`).
 fn scoring(
     shared: &r3e_shared,
     drivers: &[r3e_driver_data],
     time: f64,
+    owner: Option<i32>,
 ) -> (bono_session_info, Vec<bono_standing>) {
     let mut session = bono_session_info::default();
     session.session_time = Some(time).into();
@@ -982,16 +1030,15 @@ fn scoring(
         }
     }
 
-    let player_slot = shared.vehicle_info.slot_id;
+    // The game's own data is about the car it shows, which is the player's only while they drive
+    let viewed = shared.vehicle_info.slot_id;
     let standings = drivers
         .iter()
         .map(|driver| {
-            standing(
-                shared,
-                driver,
-                time,
-                driver.driver_info.slot_id == player_slot,
-            )
+            let slot = driver.driver_info.slot_id;
+            let mut standing = standing(shared, driver, time, slot == viewed);
+            standing.is_player = Some(owner == Some(slot)).into();
+            standing
         })
         .collect();
     (session, standings)
@@ -1003,6 +1050,8 @@ fn scoring_time(time: f64) -> f64 {
     (time * 1000.0).round() / 1000.0
 }
 
+/// One car's standing. `is_player` is whether it's the car the game's data is about (see
+/// `scoring`, which works out whose car it is).
 fn standing(
     shared: &r3e_shared,
     driver: &r3e_driver_data,
@@ -1772,7 +1821,7 @@ mod tests {
             assert_eq!(out.pit_service_front_tires_selected.get(), None);
             assert_eq!(out.pit_service_penalty_active.get(), None);
             writer
-                .write(bono_session_info::default(), vec![out])
+                .write(1, bono_session_info::default(), vec![out])
                 .unwrap();
         }
         shared.pit_state = 3;
@@ -1790,12 +1839,13 @@ mod tests {
         assert_eq!(out.pit_service_front_tires_active.get(), Some(true));
         assert_eq!(out.pit_service_rear_tires_active.get(), Some(false));
         writer
-            .write(bono_session_info::default(), vec![out])
+            .write(1, bono_session_info::default(), vec![out])
             .unwrap();
         // Menu-only change, then progress-only change, both persist with count still one.
         shared.pit_menu_state[4] = 0;
         writer
             .write(
+                1,
                 bono_session_info::default(),
                 vec![standing(&shared, &driver, 507.0, true)],
             )
@@ -1803,6 +1853,7 @@ mod tests {
         shared.pit_elapsed_time = 4.0;
         writer
             .write(
+                1,
                 bono_session_info::default(),
                 vec![standing(&shared, &driver, 508.0, true)],
             )
@@ -1810,6 +1861,7 @@ mod tests {
         shared.pit_action = 0;
         writer
             .write(
+                1,
                 bono_session_info::default(),
                 vec![standing(&shared, &driver, 509.0, true)],
             )
@@ -1990,12 +2042,17 @@ mod tests {
             for driver in &mut drivers[..2] {
                 driver.lap_time_current_self = (time - 460.0) as f32;
             }
-            let (session, standings) = scoring(&shared, &drivers[..2], time);
+            let (session, standings) = scoring(
+                &shared,
+                &drivers[..2],
+                time,
+                Some(shared.vehicle_info.slot_id),
+            );
             assert_eq!(session.session_end_time.get(), Some(3600.0));
             assert_eq!(session.pit_window_start_time.get(), Some(600.0));
             assert_eq!(session.pit_window_end_time.get(), Some(1200.0));
             assert_eq!(standings[0].lap_start_time.get(), Some(460.0));
-            writer.write(session, standings).unwrap();
+            writer.write(1, session, standings).unwrap();
         }
         let count = |table: &str| {
             conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -2014,12 +2071,17 @@ mod tests {
         drivers[0].completed_laps += 1;
         drivers[0].lap_time_current_self = 0.2;
         drivers[1].lap_time_current_self = 100.0;
-        let (session, standings) = scoring(&shared, &drivers[..2], 560.0);
+        let (session, standings) = scoring(
+            &shared,
+            &drivers[..2],
+            560.0,
+            Some(shared.vehicle_info.slot_id),
+        );
         assert_eq!(session.session_end_time.get(), Some(3660.0));
         assert_eq!(session.pit_window_start_time.get(), Some(720.0));
         assert_eq!(session.pit_window_end_time.get(), Some(1320.0));
         assert_eq!(standings[0].lap_start_time.get(), Some(559.8));
-        writer.write(session, standings).unwrap();
+        writer.write(1, session, standings).unwrap();
         assert_eq!(count("session"), 2);
         assert_eq!(count("standings"), 3);
     }
@@ -2402,5 +2464,125 @@ mod tests {
                 .convert(&menus, start + Duration::from_secs(2))
                 .is_none()
         );
+    }
+
+    /// The car each standing says is the player's.
+    fn owner(update: &Update) -> Option<i64> {
+        let (_, standings) = update.scoring.as_ref().expect("scoring");
+        standings
+            .iter()
+            .find(|s| s.is_player.get() == Some(true))
+            .and_then(|s| s.vehicle_id.get())
+    }
+
+    #[test]
+    fn starts_an_epoch_where_the_timeline_breaks() {
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        let first = converter.convert(&shared(500.0, 0.0), start).unwrap();
+        assert_eq!(first.new_epoch, None);
+
+        // Back from the menus, same session, clock moving on: it carries on
+        let mut menus = shared(510.0, 0.0);
+        menus.game_in_menus = 1;
+        assert!(converter.convert(&menus, start).is_none());
+        let update = converter
+            .convert(&shared(520.0, 0.0), start + Duration::from_millis(20))
+            .unwrap();
+        assert_eq!(update.new_epoch, None);
+        assert!(update.scoring.is_none());
+
+        // Less than a second back is the same timeline
+        let update = converter
+            .convert(&shared(519.5, 0.0), start + Duration::from_millis(30))
+            .unwrap();
+        assert_eq!(update.new_epoch, None);
+
+        // A restart: the clock goes back, and the new epoch scores straight away
+        let update = converter
+            .convert(&shared(1.0, 0.0), start + Duration::from_millis(40))
+            .unwrap();
+        assert_eq!(update.new_epoch, Some(EpochReason::ClockRollback));
+        assert!(update.scoring.is_some());
+
+        // Another session of the same event, its clock later than the last one's
+        let mut qualifying = shared(2000.0, 0.0);
+        qualifying.session_type = R3E_SESSION_QUALIFY;
+        let update = converter
+            .convert(&qualifying, start + Duration::from_millis(60))
+            .unwrap();
+        assert_eq!(update.new_epoch, Some(EpochReason::Session));
+        assert!(!update.new_event);
+
+        // Another session on the very same clock (no physics frame since) still starts one
+        let mut race = shared(2000.0, 0.0);
+        race.session_type = R3E_SESSION_RACE;
+        let update = converter
+            .convert(&race, start + Duration::from_millis(70))
+            .unwrap();
+        assert_eq!(update.new_epoch, Some(EpochReason::Session));
+
+        // Another event clears instead
+        let mut other = shared(2001.0, 0.0);
+        other.session_type = R3E_SESSION_QUALIFY;
+        other.track_id = 9;
+        let update = converter
+            .convert(&other, start + Duration::from_millis(80))
+            .unwrap();
+        assert!(update.new_event);
+        assert_eq!(update.new_epoch, None);
+    }
+
+    #[test]
+    fn a_replay_is_skipped_and_resumes_only_where_it_left_off() {
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        converter.convert(&shared(500.0, 0.0), start).unwrap();
+
+        let mut replay = shared(100.0, 0.0);
+        replay.game_in_replay = 1;
+        assert!(converter.convert(&replay, start).is_none());
+        // Live again, later on the clock: the same epoch
+        let update = converter
+            .convert(&shared(501.0, 0.0), start + Duration::from_millis(20))
+            .unwrap();
+        assert_eq!(update.new_epoch, None);
+
+        // A replay, then live with the clock earlier than before it
+        assert!(converter.convert(&replay, start).is_none());
+        let update = converter
+            .convert(&shared(300.0, 0.0), start + Duration::from_millis(40))
+            .unwrap();
+        assert_eq!(update.new_epoch, Some(EpochReason::Replay));
+    }
+
+    #[test]
+    fn watching_another_car_never_makes_it_the_players() {
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        // Driving car 7
+        let update = converter.convert(&shared(500.0, 0.0), start).unwrap();
+        assert_eq!(owner(&update), Some(7));
+
+        // The camera on car 3, which the AI drives: car 7 is still the player's, and car 3's
+        // data is car 3's, not the player's
+        let mut watching = shared(501.0, 0.0);
+        watching.vehicle_info.slot_id = 3;
+        watching.control_type = R3E_CONTROL_AI;
+        let update = converter
+            .convert(&watching, start + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(owner(&update), Some(7));
+
+        // Spectating from the start of a session: nobody's car is the player's
+        let mut spectating = shared(10.0, 0.0);
+        spectating.session_type = R3E_SESSION_QUALIFY;
+        spectating.vehicle_info.slot_id = 3;
+        spectating.control_type = R3E_CONTROL_REMOTE;
+        let update = converter
+            .convert(&spectating, start + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(update.new_epoch, Some(EpochReason::Session));
+        assert_eq!(owner(&update), None);
     }
 }

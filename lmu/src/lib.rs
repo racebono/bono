@@ -5,6 +5,7 @@
 
 use bono_sim::{
     recorder::{self, ForecastSource, Recorder},
+    sql::EpochReason,
     sys::{bono_session_info, bono_standing, bono_telemetry},
 };
 use std::{
@@ -155,6 +156,18 @@ pub unsafe extern "C" fn bono_lmu_clear(recorder: *const LmuRecorder) {
         numbers.clear();
         track_limits.clear();
         recorder.clear()
+    })
+}
+
+/// # Safety
+/// `recorder` must come from `bono_lmu_open`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bono_lmu_begin_session(recorder: *const LmuRecorder) {
+    let LmuRecorder(recorder, _, track_limits) = unsafe { &*recorder };
+    guard((), || {
+        // The session's rule, its scoring says again: until then, points are unknown
+        track_limits.clear();
+        recorder.begin_epoch(EpochReason::Session)
     })
 }
 

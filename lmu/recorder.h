@@ -38,6 +38,9 @@ void bono_lmu_push_scoring(bono_lmu_recorder* recorder, bono_session_info_s* ses
                                bono_standing_s* standings, size_t count);
 // Deletes everything recorded so far, e.g. when a session ends, and forgets what's kept to fill those in.
 void bono_lmu_clear(bono_lmu_recorder* recorder);
+// A session started: what's recorded from now on is a new epoch of the recording, which readers keep apart
+// from the earlier sessions'.
+void bono_lmu_begin_session(bono_lmu_recorder* recorder);
 // Whether recording stopped on an error: nothing more is recorded until it is restarted.
 bool bono_lmu_failed(bono_lmu_recorder* recorder);
 

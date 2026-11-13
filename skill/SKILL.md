@@ -258,7 +258,10 @@ Query these only for what the tables above don't hold: sample-by-sample detail o
 steering and slip. Filter by `id`, the only indexed column: use a `first_id`..`last_id` range or
 `id > latest_telemetry_id - N`, and scope to the vehicle. The session's `telemetry` rows have `id >=
 session_first_id`; the other tables number their rows separately (`telemetry_id` in `car_state` and
-`telemetry_wheel` is a `telemetry` id).
+`telemetry_wheel` is a `telemetry` id). The comment above each SQL result gives the session's first
+`standings` and `session` ids too (`standings_first_id`, `session_row_first_id`): stay at or after
+them. The recording can hold earlier sessions (each row's `epoch` says which), and a `vehicle_id` or
+`is_player` from one of them says nothing about this session's cars.
 
 - `telemetry`: a row per car per recorded update; the player at every update, rivals every few.
   `id`, `vehicle_id`, `is_player`, `session_time`, `lap`, `lap_start_time`, `lap_distance`,
