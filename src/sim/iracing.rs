@@ -493,6 +493,7 @@ mod tests {
     #[test]
     #[ignore = "needs iRacing's saved telemetry (.ibt files) in BONO_IRACING_TELEMETRY"]
     fn sector_times_add_up_to_the_games_lap_times() {
+        let mut compared = 0;
         for path in saved_files() {
             let dir = tempfile::tempdir().unwrap();
             record_file(&path, dir.path());
@@ -515,6 +516,7 @@ mod tests {
             for (lap, official, sum, missing) in rows {
                 println!("{}: lap {lap} {official} vs {sum:?}", path.display());
                 if let (Some(sum), 0, 2..) = (sum, missing, lap) {
+                    compared += 1;
                     assert!(
                         (sum - official).abs() < 0.1,
                         "{}: lap {lap}: {sum} vs {official}",
@@ -523,6 +525,7 @@ mod tests {
                 }
             }
         }
+        assert!(compared > 0, "no saved lap had every sector timed");
     }
 
     /// Pearson's correlation of the pairs.
@@ -548,7 +551,7 @@ mod tests {
     fn axis_conventions_hold_on_saved_laps() {
         use std::f64::consts::PI;
         let wrap = |a: f64| (a + PI).rem_euclid(2.0 * PI) - PI;
-        let (mut checked, mut calmed, mut climbed, mut winded) = (0, 0, 0, 0);
+        let (mut checked, mut calmed, mut climbed, mut winded, mut turned) = (0, 0, 0, 0, 0);
         for path in saved_files() {
             let ibt = Ibt::open(&path).unwrap();
             let n = ibt.records();
@@ -777,6 +780,7 @@ mod tests {
                     .map(|((a, _), (b, _))| (*a, *b))
                     .collect();
                 if correlation(&alike) < 0.9 {
+                    turned += 1;
                     assert!(
                         correlation(&tail) > correlation(&other),
                         "{name}: WindDir doesn't turn clockwise"
@@ -788,6 +792,7 @@ mod tests {
         assert!(calmed > 0, "no saved laps calm enough to check gravity");
         assert!(climbed > 0, "no saved laps climb enough to check pitch");
         assert!(winded > 0, "no saved laps windy enough to check the wind");
+        assert!(turned > 0, "no saved laps tell which way WindDir turns");
     }
 
     #[test]
