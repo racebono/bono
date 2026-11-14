@@ -260,6 +260,12 @@ impl Recorder {
         self.shared.wake.notify_one();
     }
 
+    /// How many scoring updates wait to be written. Past `MAX_QUEUED_SCORING`, new ones are
+    /// dropped: something replaying a game faster than it runs can wait for room.
+    pub fn queued_scoring(&self) -> usize {
+        lock(&self.shared.queue).scoring.len()
+    }
+
     /// Deletes everything recorded so far (on the writer thread, soon after), e.g. when a session
     /// ends. What's known about the cars goes too: until the next scoring update, the new
     /// session's cars aren't taken for the old one's (the player's id, where each car was).

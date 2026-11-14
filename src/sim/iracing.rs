@@ -367,6 +367,10 @@ mod tests {
             let frame = ibt.frame(i);
             let now = start + Duration::from_secs_f64(i as f64 / 60.0);
             if let Some(update) = converter.convert(&frame, &info, now) {
+                // Faster than the game: the writer's queue would fill, and drop scoring updates
+                while update.scoring.is_some() && recorder.queued_scoring() >= 50 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 record(&recorder, update);
                 recorded += 1;
             }
@@ -667,7 +671,12 @@ mod tests {
             if high - low >= 5.0 {
                 climbed += 1;
                 let climb = |i: usize| (at(i + 3, "Alt") - at(i - 3, "Alt")) / (6.0 * dt);
-                let pitch = pairs(&|i| (at(i, "Pitch"), climb(i) / at(i, "Speed")));
+                // Without braking or accelerating hard: the nose dives and squats more than slopes
+                let pitch: Vec<_> = samples
+                    .iter()
+                    .filter(|&&i| rate(i, "Speed").abs() < 1.0)
+                    .map(|&i| (at(i, "Pitch"), climb(i) / at(i, "Speed")))
+                    .collect();
                 assert!(correlation(&pitch) < 0.0, "{name}: Pitch isn't + nose down");
                 // Nose up, gravity pulls back on the car: the accelerometer reads it forward
                 let gravity = pairs(&|i| (at(i, "Pitch"), at(i, "LongAccel") - rate(i, "Speed")));
@@ -706,33 +715,47 @@ mod tests {
                 })
                 .collect();
             // Within each gear and speed, the faster against the more tailwind: both less what's
-            // usual there, so what's left is the wind, where it varies (other straights, headings)
-            let tailwind = |i: usize| {
-                let from = at(i, "WindDir") - at(i, "YawNorth");
-                -at(i, "WindVel") * from.cos()
+            // usual there, so what's left is the wind, where it varies (other straights, headings).
+            // As the wind blows from WindDir clockwise from north, or else counter-clockwise
+            let residuals = |clockwise: f64| {
+                let tailwind = |i: usize| {
+                    let from = clockwise * at(i, "WindDir") - at(i, "YawNorth");
+                    -at(i, "WindVel") * from.cos()
+                };
+                let mut usual = std::collections::HashMap::<_, (f64, f64, usize)>::new();
+                for (key, gain, i) in &gains {
+                    let entry = usual.entry(*key).or_default();
+                    *entry = (entry.0 + gain, entry.1 + tailwind(*i), entry.2 + 1);
+                }
+                gains
+                    .iter()
+                    .filter(|(key, _, _)| usual[key].2 >= 20)
+                    .map(|(key, gain, i)| {
+                        let (gains, tails, count) = usual[key];
+                        let count = count as f64;
+                        (tailwind(*i) - tails / count, gain - gains / count)
+                    })
+                    .collect::<Vec<_>>()
             };
-            let mut usual = std::collections::HashMap::<_, (f64, f64, usize)>::new();
-            for (key, gain, i) in &gains {
-                let entry = usual.entry(*key).or_default();
-                *entry = (entry.0 + gain, entry.1 + tailwind(*i), entry.2 + 1);
-            }
-            let tail = gains
-                .iter()
-                .filter(|(key, _, _)| usual[key].2 >= 20)
-                .map(|(key, gain, i)| {
-                    let (gains, tails, count) = usual[key];
-                    let count = count as f64;
-                    (tailwind(*i) - tails / count, gain - gains / count)
-                })
-                .collect::<Vec<_>>();
-            let spread =
-                (tail.iter().map(|(t, _)| t * t).sum::<f64>() / tail.len().max(1) as f64).sqrt();
-            if wind >= 3.0 && tail.len() >= 2000 && spread >= 0.5 {
+            let rms = |values: &mut dyn Iterator<Item = f64>| {
+                let (sum, count) = values.fold((0.0, 0usize), |(s, n), v| (s + v * v, n + 1));
+                (sum / count.max(1) as f64).sqrt()
+            };
+            let (tail, other) = (residuals(1.0), residuals(-1.0));
+            if wind >= 3.0 && tail.len() >= 2000 && rms(&mut tail.iter().map(|(t, _)| *t)) >= 0.5 {
                 winded += 1;
                 assert!(
                     correlation(&tail) > 0.0,
                     "{name}: WindDir isn't where the wind blows from"
                 );
+                // Wind from the north or south reads the same either way round
+                let apart = rms(&mut tail.iter().zip(&other).map(|((a, _), (b, _))| a - b));
+                if apart >= 0.5 {
+                    assert!(
+                        correlation(&tail) > correlation(&other),
+                        "{name}: WindDir doesn't turn clockwise"
+                    );
+                }
             }
         }
         assert!(checked > 0, "no saved laps long enough to check");
