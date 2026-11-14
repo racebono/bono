@@ -983,7 +983,12 @@ fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scor
     if let Some((flag, penalties, under_yellow)) = standing {
         scoring.flag = flag;
         scoring.penalties = penalties;
-        if !sector_yellows {
+        // Not under a full course caution, which is called on its own
+        let caution = scoring
+            .full_course_yellow
+            .as_deref()
+            .is_some_and(|fcy| fcy != "none");
+        if !sector_yellows && !caution {
             scoring.yellow = under_yellow.unwrap_or(false);
         }
     }

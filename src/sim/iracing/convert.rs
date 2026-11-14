@@ -1401,9 +1401,15 @@ mod tests {
         assert_eq!(track.lap_start, Some(10.5));
         update(&mut track, 11.0, Some(0.02), 2, &SECTORS);
         assert!((track.lap_start.unwrap() - 10.75).abs() < 1e-9);
-        // Later crossings without a count aren't this lap's
-        update(&mut track, 40.0, Some(0.02), 2, &SECTORS);
+        // A later crossing without a count isn't this lap's
+        let (mut time, mut pct) = (11.0, 0.02);
+        while pct < 1.0 {
+            time += 0.5;
+            pct += 0.04;
+            update(&mut track, time, Some(pct % 1.0), 2, &SECTORS);
+        }
         assert!((track.lap_start.unwrap() - 10.75).abs() < 1e-9);
+        assert!(track.line.is_some());
 
         // Counted past the line, its crossing not seen: the count's the lap it's on
         let mut track = CarTrack::default();

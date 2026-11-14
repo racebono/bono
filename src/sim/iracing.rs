@@ -142,7 +142,15 @@ impl Source for Game {
         // What the header says is where it can't be: nothing's read until it says otherwise
         let fits =
             |range: Option<std::ops::Range<usize>>| range.is_some_and(|r| r.end <= memory.len);
-        if !(fits(header.var_headers()) && fits(header.session_info())) {
+        // The latest update, once there's one, with a length that fits too
+        let update_range = header.latest().map(|(_, offset)| {
+            let end = header.buf_len().and_then(|len| offset.checked_add(len));
+            end.map(|end| offset..end)
+        });
+        if !(fits(header.var_headers())
+            && fits(header.session_info())
+            && update_range.is_none_or(fits))
+        {
             if !self.warned_range {
                 log::warn!(
                     "iRacing's shared memory header points past the memory: not recording it"
