@@ -247,20 +247,26 @@ fn espeak_data_dir() -> Option<PathBuf> {
     return exe_dir.ancestors().take(2).find_map(newest_built_data);
 }
 
-/// The most recently built `espeak-rs-sys-*/out/share` under `{dir}/build`.
+/// The most recently built espeak-rs-sys `out/share` under `{dir}/build`: in
+/// `espeak-rs-sys-{hash}/out`, or `espeak-rs-sys/{hash}/out` where Cargo nests build outputs by
+/// package.
 fn newest_built_data(dir: &Path) -> Option<PathBuf> {
     let mut newest = None::<(SystemTime, PathBuf)>;
 
+    let mut builds = Vec::new();
     for entry in std::fs::read_dir(dir.join("build")).ok()?.flatten() {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("espeak-rs-sys-")
-        {
-            continue;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "espeak-rs-sys" {
+            let nested = std::fs::read_dir(entry.path()).into_iter().flatten();
+            builds.extend(nested.flatten().map(|build| build.path()));
+        } else if name.starts_with("espeak-rs-sys-") {
+            builds.push(entry.path());
         }
+    }
 
-        let share = entry.path().join("out").join("share");
+    for build in builds {
+        let share = build.join("out").join("share");
         let Ok(modified) = share
             .join("espeak-ng-data")
             .join("phondata")
@@ -296,5 +302,20 @@ mod tests {
 
         assert!(phonemize("  ", "en-us").unwrap().is_empty());
         assert!(phonemize("Hello.", "not-a-voice").is_err());
+    }
+
+    #[test]
+    fn finds_built_data_in_either_build_layout() {
+        for build in ["espeak-rs-sys-0123abcd", "espeak-rs-sys/0123abcd"] {
+            let dir = tempfile::tempdir().unwrap();
+            let share = dir.path().join("build").join(build).join("out").join("share");
+            std::fs::create_dir_all(share.join("espeak-ng-data")).unwrap();
+            std::fs::write(share.join("espeak-ng-data").join("phondata"), "").unwrap();
+            // Another package's output, and a build without the data
+            std::fs::create_dir_all(dir.path().join("build/espeak-rs-sys-ffff/out")).unwrap();
+            std::fs::create_dir_all(dir.path().join("build/other-sys/0123abcd/out/share")).unwrap();
+
+            assert_eq!(newest_built_data(dir.path()), Some(share), "{build}");
+        }
     }
 }
