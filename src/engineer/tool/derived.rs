@@ -265,9 +265,72 @@ pub(super) enum Job {
     Sync,
 }
 
-pub(super) struct Request {
-    pub job: Job,
-    pub reply: tokio::sync::oneshot::Sender<anyhow::Result<String>>,
+pub(super) enum Request {
+    /// A query for the model, answered as text
+    Job {
+        job: Job,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<String>>,
+    },
+    /// What requests for later watch: see [`Reading`]
+    Watch {
+        conditions: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Reading>>,
+    },
+}
+
+impl Request {
+    fn fail(self, e: anyhow::Error) {
+        match self {
+            Request::Job { reply, .. } => drop(reply.send(Err(e))),
+            Request::Watch { reply, .. } => drop(reply.send(Err(e))),
+        }
+    }
+}
+
+/// The longest one watched condition may run: past it, it's stopped and counts as an error. With
+/// [`MAX_WATCHED`], it bounds how long a reading can hold this thread up, and the model's
+/// queries with it.
+const WATCH_TIME: Duration = Duration::from_millis(100);
+/// The longest LIKE or GLOB pattern a watched condition can use, in bytes
+const WATCH_PATTERN_BYTES: i32 = 100;
+/// The largest value (or row) a watched condition can make or read, in bytes
+const WATCH_VALUE_BYTES: i32 = 16 * 1024;
+/// The most conditions one reading evaluates
+pub const MAX_WATCHED: usize = 4;
+
+/// The session, its clock and the player's laps as the current-state tables say now, and what
+/// each watched condition says of it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Reading {
+    /// Which session it is: its first telemetry row, and its track, type and number. Requests
+    /// for later belong to one.
+    pub session: Option<(i64, String)>,
+    pub session_time: Option<f64>,
+    /// The lap the player's on, and how many they've completed
+    pub lap: Option<i64>,
+    pub laps_completed: Option<i64>,
+    /// The newest telemetry row: a condition's reading only counts again once there are new rows
+    pub latest_telemetry_id: Option<i64>,
+    /// The recording's gone quiet (the game's paused, or stopped), or the derived tables are still
+    /// reading it: nothing should be decided on it
+    pub stale: bool,
+    /// The derived tables are still reading the recording (or a session they haven't started):
+    /// the session, clock and laps are from earlier than now
+    pub catching_up: bool,
+    /// Some of the current-state tables couldn't be written (a car's rows missing, say): what a
+    /// condition finds may be for want of them
+    pub incomplete: bool,
+    /// For each condition asked about, in order: what it says (`None`: it can't tell), or why it
+    /// couldn't be run
+    pub conditions: Vec<Result<Option<Verdict>, String>>,
+}
+
+/// What a watched condition said.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Verdict {
+    pub met: bool,
+    /// Its second column, if it has one: what was seen, for the model to say
+    pub detail: Option<String>,
 }
 
 /// Starts the thread, which ends once the sender returned is dropped.
@@ -312,9 +375,8 @@ fn thread(shared: &Shared, requests: &mpsc::Receiver<Request>) {
                 Err(e) => {
                     log::debug!("The engineer can't open the recording yet: {e}");
                     if let Some(request) = request {
-                        let _ = request.reply.send(
-                            Err(anyhow::Error::new(e)).context("the recording can't be opened"),
-                        );
+                        request
+                            .fail(anyhow::Error::new(e).context("the recording can't be opened"));
                     }
                     continue;
                 }
@@ -324,14 +386,17 @@ fn thread(shared: &Shared, requests: &mpsc::Receiver<Request>) {
             continue;
         };
         match request {
-            Some(request) => {
-                let result = match request.job {
+            Some(Request::Job { job, reply }) => {
+                let result = match job {
                     Job::Sql { query, limit } => data.sql(shared, &query, limit),
                     Job::Track => track_json(&data.conn, shared, &mut data.stream),
                     #[cfg(test)]
                     Job::Sync => data.sync(shared).map(|()| String::new()),
                 };
-                let _ = request.reply.send(result);
+                let _ = reply.send(result);
+            }
+            Some(Request::Watch { conditions, reply }) => {
+                let _ = reply.send(data.watch(shared, &conditions));
             }
             None => match data.stream.tick(&data.conn, shared) {
                 Ok(()) => failing = false,
@@ -427,19 +492,190 @@ impl Data {
             Err(e) => Some(format!("{e:#}")),
         };
 
-        let conn = &self.conn;
-        conn.authorizer(Some(authorize))?;
-        let result = (|| {
-            let previous = conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, SQL_MAX_VALUE_BYTES)?;
-            let result = run_query(conn, &self.stream, query, limit, note.as_deref());
-            // The worker's own writes and subsequent queries retain their normal limits,
-            // including when this query fails.
-            conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, previous)?;
-            result
-        })();
-        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
-        result
+        let stream = &self.stream;
+        restricted(&self.conn, |conn| {
+            run_query(conn, stream, query, limit, note.as_deref())
+        })
     }
+
+    /// The current-state tables written once, and read for requests for later: the session, its
+    /// clock and the player's laps, and each of `conditions` (at most [`MAX_WATCHED`], each
+    /// stopped after [`WATCH_TIME`]). Reads the recording's new rows once, without waiting for the
+    /// tables to catch up: that's said with [`Reading::stale`] instead, so a reading holds the
+    /// thread up as little as possible.
+    fn watch(&mut self, shared: &Shared, conditions: &[String]) -> anyhow::Result<Reading> {
+        if conditions.len() > MAX_WATCHED {
+            bail!("at most {MAX_WATCHED} conditions are watched at once");
+        }
+        // The session it's in is the stream's: a session started since its last tick, or a stream
+        // that's never read anything, would be taken for the one before
+        if let Err(e) = self.stream.tick(&self.conn, shared) {
+            log::debug!("The engineer's tables didn't update: {e:#}");
+        }
+        let note = self.stream.refresh_now(&self.conn, shared)?;
+        if let Some(note) = &note {
+            log::debug!("Requests for later read incomplete tables: {note}");
+        }
+        let incomplete = note.is_some();
+        let state = row(
+            &self.conn,
+            "SELECT r.session_first_id AS session_first_id, r.track AS track, \
+             r.session_type AS session_type, r.session_number AS session_number, \
+             r.session_time_s AS session_time_s, r.latest_telemetry_id AS latest_telemetry_id, \
+             r.is_stale AS is_stale, c.lap AS lap, c.laps_completed AS laps_completed \
+             FROM race_state r LEFT JOIN cars_now c ON c.vehicle_id = r.player_vehicle_id",
+            [],
+        )?;
+        // The player's clock gone back since the stream's last row is a session it hasn't started
+        // yet, as it tells them apart (see `apply_telemetry`)
+        let restarted = match (
+            state.as_ref().and_then(|s| s.f("session_time_s")),
+            self.stream.player_t,
+        ) {
+            (Some(t), Some(before)) => t < before - 1.0,
+            _ => false,
+        };
+        let catching_up = self.stream.behind || self.stream.failed || restarted;
+        let Some(state) = state else {
+            // No player's car yet: nothing to go by
+            return Ok(Reading {
+                stale: true,
+                catching_up,
+                conditions: conditions.iter().map(|_| Ok(None)).collect(),
+                ..Reading::default()
+            });
+        };
+        let session = state.i("session_first_id").map(|first| {
+            let key = format!(
+                "{}|{}|{}",
+                state.text("track").unwrap_or_default(),
+                state.text("session_type").unwrap_or_default(),
+                state.i("session_number").unwrap_or_default()
+            );
+            (first, key)
+        });
+        let conditions = conditions
+            .iter()
+            .map(|sql| restricted(&self.conn, |conn| condition(conn, sql)))
+            .map(|verdict| verdict.map_err(|e| format!("{e:#}")))
+            .collect();
+        Ok(Reading {
+            session,
+            session_time: state.f("session_time_s"),
+            lap: state.i("lap"),
+            laps_completed: state.i("laps_completed"),
+            latest_telemetry_id: state.i("latest_telemetry_id"),
+            stale: catching_up || state.b("is_stale"),
+            catching_up,
+            incomplete,
+            conditions,
+        })
+    }
+}
+
+/// Runs `f` with the model's restrictions on the connection: reading only (see [`authorize`]),
+/// and no value larger than [`SQL_MAX_VALUE_BYTES`]. The worker's own writes and the queries after
+/// get their normal limits back, whether `f` fails or not.
+fn restricted<T>(
+    conn: &Connection,
+    f: impl FnOnce(&Connection) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    conn.authorizer(Some(authorize))?;
+    let result = (|| {
+        let previous = conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, SQL_MAX_VALUE_BYTES)?;
+        let result = f(conn);
+        conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, previous)?;
+        result
+    })();
+    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+    result
+}
+
+/// What a watched condition says now: its first row's first column, 1 or 0, and `None` when it's
+/// NULL or there are no rows. Missing data is never taken to mean it holds, nor is anything else
+/// (a fuel figure written by mistake).
+fn condition(conn: &Connection, sql: &str) -> anyhow::Result<Option<Verdict>> {
+    let sql = sql.trim().trim_end_matches(';');
+    let lower = without_leading_comments(sql).to_lowercase();
+    if !["select", "with"].iter().any(|p| lower.starts_with(p)) {
+        bail!("a condition is one SELECT or WITH query");
+    }
+    // A function's work (a LIKE's grows with its pattern's length times its text's) is all one
+    // step of the query, which the deadline can't stop: short patterns and short values keep each
+    // step short. A condition only reads figures. Run within `restricted`, whose authorizer it
+    // narrows and puts back.
+    let patterns = conn.set_limit(Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH, WATCH_PATTERN_BYTES)?;
+    let values = conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, WATCH_VALUE_BYTES)?;
+    conn.authorizer(Some(authorize_condition))?;
+    let result = verdict(conn, sql);
+    conn.authorizer(Some(authorize))?;
+    conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, values)?;
+    conn.set_limit(Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH, patterns)?;
+    result
+}
+
+fn verdict(conn: &Connection, sql: &str) -> anyhow::Result<Option<Verdict>> {
+    // From before it's prepared: working out a query can take long too
+    let deadline = Instant::now() + WATCH_TIME;
+    conn.progress_handler(100, Some(move || Instant::now() > deadline))?;
+    let result = (|| -> rusqlite::Result<Option<Option<Verdict>>> {
+        let mut stmt = conn.prepare(sql)?;
+        if !stmt.readonly() {
+            return Ok(None);
+        }
+        let columns = stmt.column_count();
+        let mut rows = stmt.query([])?;
+        let Some(row) = rows.next()? else {
+            return Ok(Some(None));
+        };
+        let met = match row.get_ref(0)? {
+            ValueRef::Null => return Ok(Some(None)),
+            ValueRef::Integer(n @ (0 | 1)) => n == 1,
+            ValueRef::Real(x) if x == 0.0 || x == 1.0 => x == 1.0,
+            value => {
+                return Err(rusqlite::Error::InvalidColumnType(
+                    0,
+                    "the first column must be 1, 0 or NULL".into(),
+                    value.data_type(),
+                ));
+            }
+        };
+        let detail = match columns > 1 {
+            true => match row.get_ref(1)? {
+                ValueRef::Null => None,
+                value => Some(value_text(value, 1)?),
+            },
+            false => None,
+        };
+        Ok(Some(Some(Verdict { met, detail })))
+    })();
+    conn.progress_handler(0, None::<fn() -> bool>)?;
+    match result {
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::OperationInterrupted =>
+        {
+            bail!(
+                "the condition took longer than {} ms and was stopped: it must be a quick read of the current-state tables",
+                WATCH_TIME.as_millis()
+            )
+        }
+        Ok(None) => bail!("only queries that read are allowed"),
+        Ok(Some(verdict)) => Ok(verdict),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// A value of the column `i` as the model is shown it.
+fn value_text(value: ValueRef<'_>, i: usize) -> rusqlite::Result<String> {
+    Ok(match value {
+        ValueRef::Null => "NULL".into(),
+        ValueRef::Integer(n) => n.to_string(),
+        ValueRef::Real(x) => real_text(x),
+        ValueRef::Text(text) => {
+            telemetry_text(std::str::from_utf8(text).map_err(|e| rusqlite::Error::Utf8Error(i, e))?)
+        }
+        ValueRef::Blob(blob) => format!("<{} bytes>", blob.len()),
+    })
 }
 
 /// A query from its first word on.
@@ -474,6 +710,50 @@ fn authorize(context: AuthContext<'_>) -> Authorization {
         }
         _ => Authorization::Deny,
     }
+}
+
+/// The recording's own tables, as the recorder makes them.
+const RECORDING_TABLES: [&str; 8] = [
+    "telemetry",
+    "telemetry_wheel",
+    "car_state",
+    "session",
+    "session_sector",
+    "standings",
+    "standing_sector",
+    "forecast",
+];
+
+/// [`authorize`], for a watched condition: of the derived tables only (the recording's can keep
+/// it waiting on the recorder, which no deadline stops), and without `printf` (or `format`), whose
+/// width or precision can have it work and allocate far beyond the value limit before that's
+/// checked.
+fn authorize_condition(context: AuthContext<'_>) -> Authorization {
+    // A table read for no column (`COUNT(*)`, of a table or a CTE) comes without its database:
+    // by its name, then. Pragmas (their functions too) can read the recording's schema, and
+    // `dbstat`, read as `main`'s, any schema's pages.
+    let recording = match context.action {
+        AuthAction::Read { table_name, .. } if table_name.eq_ignore_ascii_case("dbstat") => true,
+        AuthAction::Read { table_name, .. } => match context.database_name {
+            Some(database) => database != "main",
+            None => RECORDING_TABLES
+                .iter()
+                .any(|table| table.eq_ignore_ascii_case(table_name)),
+        },
+        AuthAction::Pragma { .. } => true,
+        _ => false,
+    };
+    if recording {
+        return Authorization::Deny;
+    }
+    if let AuthAction::Function { function_name } = context.action
+        && ["printf", "format"]
+            .iter()
+            .any(|f| function_name.eq_ignore_ascii_case(f))
+    {
+        return Authorization::Deny;
+    }
+    authorize(context)
 }
 
 /// A number for the model: four significant digits, or to the millisecond for the larger ones (a
@@ -543,18 +823,7 @@ fn run_query(
         let mut n = 0;
         while let Some(row) = rows.next()? {
             let values = (0..columns)
-                .map(|i| {
-                    Ok(match row.get_ref(i)? {
-                        ValueRef::Null => "NULL".into(),
-                        ValueRef::Integer(n) => n.to_string(),
-                        ValueRef::Real(x) => real_text(x),
-                        ValueRef::Text(text) => telemetry_text(
-                            std::str::from_utf8(text)
-                                .map_err(|e| rusqlite::Error::Utf8Error(i, e))?,
-                        ),
-                        ValueRef::Blob(blob) => format!("<{} bytes>", blob.len()),
-                    })
-                })
+                .map(|i| value_text(row.get_ref(i)?, i))
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let line = values.join(" | ");
             // Leave space for the truncation notice, and never split a UTF-8 string.
@@ -5455,6 +5724,151 @@ mod tests {
             number(&engineer, "SELECT COUNT(*) FROM drivers_now").await,
             2.0
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_watch_reads_the_session_and_bounded_read_only_conditions() {
+        let (_dir, engineer) = race();
+        engineer.sync().await.unwrap();
+        let watcher = engineer.watcher();
+        let reading = watcher
+            .watch(vec![
+                "SELECT COUNT(*) = 2, COUNT(*) FROM cars_now".into(),
+                "-- a comment first\nSELECT 0".into(),
+                "SELECT NULL".into(),
+                "SELECT 1 FROM cars_now WHERE 0".into(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(reading.session, Some((1, "Test Ring|race|0".into())));
+        assert_eq!(reading.session_time, Some(310.0));
+        assert!(reading.lap.is_some() && reading.laps_completed.is_some());
+        assert!(reading.latest_telemetry_id.is_some());
+        assert!(!reading.stale);
+        assert_eq!(
+            reading.conditions,
+            [
+                Ok(Some(Verdict {
+                    met: true,
+                    detail: Some("2".into())
+                })),
+                Ok(Some(Verdict {
+                    met: false,
+                    detail: None
+                })),
+                // Not knowing is never taken for an answer
+                Ok(None),
+                Ok(None),
+            ]
+        );
+
+        let reading = watcher
+            .watch(vec![
+                "SELECT nope FROM cars_now".into(),
+                "DELETE FROM lap_stats".into(),
+                "SELECT 'yes'".into(),
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) \
+                 SELECT MAX(x) > 0 FROM c"
+                    .into(),
+            ])
+            .await
+            .unwrap();
+        let errors = reading
+            .conditions
+            .iter()
+            .map(|c| c.clone().unwrap_err())
+            .collect::<Vec<_>>();
+        assert!(errors[0].contains("no such column"), "{errors:?}");
+        assert!(errors[1].contains("SELECT or WITH"), "{errors:?}");
+        assert!(errors[2].contains("1, 0 or NULL"), "{errors:?}");
+        assert!(errors[3].contains("took longer"), "{errors:?}");
+
+        // A figure isn't an answer, and patterns stay short enough for the deadline to hold
+        let long = format!("SELECT 'a' LIKE '{}'", "%".repeat(200));
+        let reading = watcher
+            .watch(vec![
+                "SELECT 42".into(),
+                long,
+                "SELECT 1.0".into(),
+                "SELECT length(zeroblob(20000)) > 0".into(),
+            ])
+            .await
+            .unwrap();
+        let [figure, pattern, real, big] = &reading.conditions[..] else {
+            panic!("{:?}", reading.conditions);
+        };
+        assert!(figure.as_ref().unwrap_err().contains("1, 0 or NULL"));
+        assert!(
+            pattern
+                .as_ref()
+                .unwrap_err()
+                .contains("pattern too complex")
+        );
+        assert!(big.as_ref().unwrap_err().contains("too big"), "{big:?}");
+        // Nor can it format text, whose work isn't bounded by the value limit
+        let reading = watcher
+            .watch(vec!["SELECT printf('%.2f', 1.0) IS NOT NULL".into()])
+            .await
+            .unwrap();
+        let error = reading.conditions[0].as_ref().unwrap_err();
+        assert!(error.contains("not authorized"), "{error}");
+        // Nor read the recording's own tables
+        let reading = watcher
+            .watch(vec![
+                "SELECT COUNT(*) > 0 FROM telemetry".into(),
+                "SELECT MAX(id) > 0 FROM recording.telemetry".into(),
+                "SELECT COUNT(*) > 0 FROM cars_now".into(),
+                "WITH hot AS MATERIALIZED (SELECT vehicle_id FROM cars_now)                  SELECT COUNT(*) > 0 FROM hot"
+                    .into(),
+            ])
+            .await
+            .unwrap();
+        for condition in &reading.conditions[..2] {
+            let error = condition.as_ref().unwrap_err();
+            assert!(
+                error.contains("not authorized") || error.contains("prohibited"),
+                "{error}"
+            );
+        }
+        assert!(
+            reading.conditions[2..].iter().all(Result::is_ok),
+            "{:?}",
+            reading.conditions
+        );
+        let reading = watcher
+            .watch(vec![
+                "SELECT 0, name FROM pragma_table_info('telemetry', 'recording')".into(),
+                "SELECT 0, SUM(ncell) FROM dbstat WHERE schema = 'recording'".into(),
+            ])
+            .await
+            .unwrap();
+        for condition in &reading.conditions {
+            assert!(
+                condition
+                    .as_ref()
+                    .is_err_and(|e| e.contains("not authorized") || e.contains("prohibited")),
+                "{condition:?}"
+            );
+        }
+        assert_eq!(
+            real,
+            &Ok(Some(Verdict {
+                met: true,
+                detail: None
+            }))
+        );
+
+        let too_many = vec!["SELECT 1".to_owned(); MAX_WATCHED + 1];
+        assert!(watcher.watch(too_many).await.is_err());
+        // The thread's own writes, and the model's queries, carry on as before
+        assert_eq!(
+            number(&engineer, "SELECT COUNT(*) FROM cars_now").await,
+            2.0
+        );
+        let long = format!("SELECT 'a' LIKE '{}'", "%".repeat(200));
+        assert_eq!(number(&engineer, &long).await, 1.0);
+        let big = "SELECT length(printf('%.*c', 20000, 'a'))";
+        assert_eq!(number(&engineer, big).await, 20000.0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1260,6 +1260,66 @@
         "es": "El ingeniero no tiene voz para responder: descarga una en Audio › Texto a voz",
         "ca": "L'enginyer no té veu per respondre: descarrega'n una a Àudio › Text a veu"
     },
+    "engineer.schedule_registered": {
+        "en": "Scheduled #{id}: {summary}",
+        "es": "Programado #{id}: {summary}",
+        "ca": "Programat #{id}: {summary}"
+    },
+    "engineer.schedule_cancelled": {
+        "en": "Cancelled #{id}: {summary}",
+        "es": "Cancelado #{id}: {summary}",
+        "ca": "Cancel·lat #{id}: {summary}"
+    },
+    "engineer.schedule_dropped": {
+        "en": "Not scheduled #{id}, the answer didn't finish: {summary}",
+        "es": "No se ha programado #{id}, la respuesta no ha terminado: {summary}",
+        "ca": "No s'ha programat #{id}, la resposta no ha acabat: {summary}"
+    },
+    "engineer.schedule_not_cancelled": {
+        "en": "Not cancelled #{id}, the answer didn't finish: {summary}",
+        "es": "No se ha cancelado #{id}, la respuesta no ha terminado: {summary}",
+        "ca": "No s'ha cancel·lat #{id}, la resposta no ha acabat: {summary}"
+    },
+    "engineer.schedule_due": {
+        "en": "Due now #{id}: {summary}",
+        "es": "Toca ahora #{id}: {summary}",
+        "ca": "Toca ara #{id}: {summary}"
+    },
+    "engineer.schedule_session_ended": {
+        "en": "Request #{id} expired, a new session started: {summary}",
+        "es": "La petición #{id} ha caducado, ha empezado otra sesión: {summary}",
+        "ca": "La petició #{id} ha caducat, ha començat una altra sessió: {summary}"
+    },
+    "engineer.schedule_recording_ended": {
+        "en": "Request #{id} expired, the game's telemetry stopped: {summary}",
+        "es": "La petición #{id} ha caducado, la telemetría del juego se ha detenido: {summary}",
+        "ca": "La petició #{id} ha caducat, la telemetria del joc s'ha aturat: {summary}"
+    },
+    "engineer.schedule_watch_failed": {
+        "en": "Stopped watching #{id}, its check keeps failing ({error}): {summary}",
+        "es": "Se ha dejado de vigilar #{id}, su comprobación sigue fallando ({error}): {summary}",
+        "ca": "S'ha deixat de vigilar #{id}, la seva comprovació continua fallant ({error}): {summary}"
+    },
+    "engineer.schedule_overdue": {
+        "en": "Request #{id} dropped, the radio wasn't free in time: {summary}",
+        "es": "Petición #{id} descartada, la radio no ha quedado libre a tiempo: {summary}",
+        "ca": "Petició #{id} descartada, la ràdio no ha quedat lliure a temps: {summary}"
+    },
+    "engineer.schedule_undelivered": {
+        "en": "Couldn't deliver #{id}: {summary}",
+        "es": "No se ha podido dar #{id}: {summary}",
+        "ca": "No s'ha pogut donar #{id}: {summary}"
+    },
+    "engineer.detail_scheduled": {
+        "en": "requested earlier, #{id}",
+        "es": "pedido antes, #{id}",
+        "ca": "demanat abans, #{id}"
+    },
+    "engineer.detail_text_only": {
+        "en": "text only",
+        "es": "solo texto",
+        "ca": "només text"
+    },
     "provider.claude_unreachable": {
         "en": "Couldn't reach the Claude API",
         "es": "No se pudo conectar con la API de Claude",

@@ -17,6 +17,7 @@ use crate::{
     task::Task,
 };
 use bono_i18n::t;
+use schedule::{Deliver, Delivery, Ended, Event as ScheduleEvent, ScheduleTool, Scheduler};
 use sdl3::audio::{AudioDevice, AudioStreamOwner};
 use std::{
     collections::VecDeque,
@@ -32,6 +33,7 @@ use tokio::{
 };
 use tool::{Engineer as EngineerTool, SKILL, instructions};
 
+mod schedule;
 mod timeline;
 mod tool;
 
@@ -118,6 +120,15 @@ pub struct Engineer {
     held: bool,
     /// Times in a row nothing was understood on the radio
     misheard: u32,
+    /// The requests for later of the recording followed, kept with its tool rather than the
+    /// conversation, which can start over without them
+    schedule: Option<Scheduler>,
+    /// How many turns of the conversation were started: each one's number
+    turns: u64,
+    /// The request for later being delivered
+    delivering: Option<Delivering>,
+    /// The request for later whose delivery played out, or was written for want of a voice
+    delivered: Option<schedule::Id>,
 }
 
 /// A question being answered.
@@ -129,6 +140,28 @@ struct Turn {
     text: mpsc::UnboundedReceiver<String>,
     /// The chat entry it's written into, once it says something
     entry: Option<usize>,
+    /// Its number: what it registers or cancels of the requests for later counts once it's answered
+    token: u64,
+    /// The request for later it answers, when it isn't the pilot's question
+    delivery: Option<schedule::Id>,
+    /// Whether it's spoken: without any voice, it's only written
+    voiced: bool,
+}
+
+/// A request for later being delivered.
+struct Delivering {
+    id: schedule::Id,
+    /// The answer written for it once its turn's ended, and when: said again if it's cut off
+    /// soon after
+    said: Option<(String, Instant)>,
+}
+
+/// Why a turn of the conversation wasn't started.
+enum NotStarted {
+    /// There's no telemetry to answer from. `outdated`: the game's plugin is out of date
+    NoTelemetry { outdated: bool },
+    /// The conversation couldn't be started: the pilot's been told
+    Failed,
 }
 
 /// Speech played as it's synthesized.
@@ -145,6 +178,8 @@ struct Playback {
     /// Play the incomplete-answer tone once this speech has drained.
     tone_after_drain: bool,
     sentences: SentenceQueue,
+    /// The request for later it delivers, done once it's played to the end
+    delivery: Option<schedule::Id>,
 }
 
 /// How far behind where it was interrupted an answer resumes, in seconds.
@@ -305,6 +340,10 @@ impl Engineer {
             playback: None,
             held: false,
             misheard: 0,
+            schedule: None,
+            turns: 0,
+            delivering: None,
+            delivered: None,
         }
     }
 
@@ -348,7 +387,7 @@ impl Engineer {
             let result = playback.set_held(held);
             if let Err(e) = result {
                 log::warn!("Error holding the answer for the spotter: {e}");
-                self.playback = None;
+                self.speech_failed();
             }
         }
     }
@@ -364,7 +403,7 @@ impl Engineer {
             .and_then(|playback| playback.stream.as_ref())
             .is_some_and(|stream| plays_on(stream, which));
         if on_it {
-            self.playback = None;
+            self.speech_failed();
         }
         if on_it || picked {
             self.notice(t!("engineer.speaker_removed"));
@@ -483,6 +522,7 @@ impl Engineer {
             timeline: None,
             tone_after_drain: false,
             sentences: SentenceQueue::default(),
+            delivery: None,
         });
     }
 
@@ -530,12 +570,23 @@ impl Engineer {
             return tool.clone();
         }
         self.drop_tool(rt);
-        self.tool.insert(EngineerTool::new(pool.clone())).clone()
+        let tool = EngineerTool::new(pool.clone());
+        self.schedule = Some(Scheduler::new(tool.watcher()));
+        self.tool.insert(tool).clone()
     }
 
-    /// Lets go of the recording. Closing the last of its pool's connections joins their threads:
-    /// not on the UI thread.
+    /// Lets go of the recording, and of its requests for later. Closing the last of its pool's
+    /// connections joins their threads: not on the UI thread. The requests hold none.
     fn drop_tool(&mut self, rt: &Handle) {
+        // One delivered already isn't one that ends with it
+        self.finish_delivery();
+        if let Some(scheduler) = self.schedule.take() {
+            let events = scheduler.schedule().clear(Ended::Recording);
+            self.schedule_notices(events);
+            if let Some(id) = self.delivering.as_ref().map(|d| d.id) {
+                self.abandon_delivery(id);
+            }
+        }
         if let Some(tool) = self.tool.take() {
             rt.spawn_blocking(move || drop(tool));
         }
@@ -605,13 +656,18 @@ impl Engineer {
             detail: None,
         });
 
-        let mut sim = sim;
-        let database = sim
-            .as_deref_mut()
-            .and_then(|sim| Some((sim.id(), sim.database()?.clone())));
-        // After `database`, which takes in the latest look at the plugin
-        let outdated = sim.as_deref().is_some_and(|sim| sim.plugin_outdated());
-        let Some((sim, pool)) = database else {
+        let started = self.converse(
+            rt,
+            sim,
+            config,
+            synth,
+            question,
+            lang,
+            known,
+            timeline.clone(),
+            None,
+        );
+        if let Err(NotStarted::NoTelemetry { outdated }) = started {
             // Said in the pilot's language, when there's a voice for it
             let lang = self.voice(config, lang).unwrap_or(lang);
             let (text, detail) = match outdated {
@@ -629,7 +685,34 @@ impl Engineer {
             if let Some(playback) = &mut self.playback {
                 playback.timeline = Some(timeline);
             }
-            return;
+        }
+    }
+
+    /// Starts a turn of the conversation with `prompt`, answered in `lang` (told to the model if
+    /// `known`) and spoken as the model writes it. `delivery`: the request for later it answers,
+    /// rather than a question of the pilot's. A conversation is started first if there's none
+    /// for the running simulator's recording, or its settings changed.
+    #[allow(clippy::too_many_arguments)]
+    fn converse(
+        &mut self,
+        rt: &Handle,
+        sim: Option<&mut Sim>,
+        config: &Config,
+        synth: &mut Synthesizer,
+        prompt: String,
+        lang: ArrayStr<2>,
+        known: bool,
+        timeline: Arc<Timeline>,
+        delivery: Option<schedule::Id>,
+    ) -> Result<(), NotStarted> {
+        let mut sim = sim;
+        let database = sim
+            .as_deref_mut()
+            .and_then(|sim| Some((sim.id(), sim.database()?.clone())));
+        // After `database`, which takes in the latest look at the plugin
+        let outdated = sim.as_deref().is_some_and(|sim| sim.plugin_outdated());
+        let Some((sim, pool)) = database else {
+            return Err(NotStarted::NoTelemetry { outdated });
         };
 
         let db = pool.database().path().to_owned();
@@ -650,6 +733,10 @@ impl Engineer {
             || self.session.as_ref().is_none_or(|s| s.db != db)
         {
             let tool = self.tool_for(rt, &pool);
+            // A new recording ends the request for later this was to deliver (`drop_tool`)
+            if delivery.is_some() && self.delivering.as_ref().map(|d| d.id) != delivery {
+                return Err(NotStarted::Failed);
+            }
             match self.start(config, sim, pool, tool) {
                 Ok(session) => {
                     self.drop_session(rt);
@@ -658,14 +745,14 @@ impl Engineer {
                 Err(e) => {
                     self.notice(t!("engineer.error_starting", error = format!("{e:#}")));
                     self.no_beep();
-                    return;
+                    return Err(NotStarted::Failed);
                 }
             }
             self.new_session = false;
         }
 
         let Some(session) = &self.session else {
-            return;
+            return Err(NotStarted::Failed);
         };
         let state = session.state.clone();
         let auto_session = *config.get().auto_session();
@@ -674,8 +761,16 @@ impl Engineer {
         let speech = self.speak(rt, config, synth, lang);
         if let (Some(_), Some(playback)) = (&speech, &mut self.playback) {
             playback.timeline = Some(timeline.clone());
+            playback.delivery = delivery;
         }
+        let voiced = speech.is_some();
         let lang = speech.as_ref().map_or(lang, |(lang, _)| *lang);
+        self.turns += 1;
+        let token = self.turns;
+        // A reminder it registers is said in the language it answers in
+        if let Some(scheduler) = &self.schedule {
+            scheduler.schedule().begin_turn(token, lang);
+        }
         let speech = speech.map(|(_, speech)| speech);
         // Told last, after the question (and its snapshot) and after each tool result: by the
         // answer, the skill, the telemetry and often earlier answers are all in English
@@ -684,7 +779,7 @@ impl Engineer {
         let task = Task::spawn(async move {
             let mut state = state.lock().await;
             state.follow_game_session(auto_session).await;
-            let question = state.tool.question_with_snapshot(question).await;
+            let question = state.tool.question_with_snapshot(prompt).await;
             let question = match &note {
                 Some(note) => format!("{question}\n\n{note}"),
                 None => question,
@@ -713,7 +808,11 @@ impl Engineer {
             lang,
             text,
             entry: None,
+            token,
+            delivery,
+            voiced,
         });
+        Ok(())
     }
 
     /// Called every frame: answers come in, are synthesized and played. `sim_running`: whether a
@@ -729,7 +828,11 @@ impl Engineer {
         self.languages.update(rt, config.get().voices());
         // The game stopped: the conversation lets go of the database, so the plugin can delete it
         if !sim_running && self.session.is_some() {
-            let interrupted = self.turn.take().is_some();
+            let turn = self.turn.take();
+            let interrupted = turn.is_some();
+            if let Some(turn) = turn {
+                self.end_turn(turn.token, false);
+            }
             self.drop_session(rt);
             self.notice(t!("engineer.sim_stopped"));
             if interrupted {
@@ -782,6 +885,7 @@ impl Engineer {
                             self.chat[entry].detail = Some(t!("engineer.detail_cut_off").into());
                         }
                         self.notice(t!("engineer.error_asking", error = format!("{e:#}")));
+                        self.end_turn(turn.token, false);
                         self.no_beep();
                     }
                 }
@@ -818,7 +922,39 @@ impl Engineer {
             output = usage.output_tokens
         );
 
+        // An answer the pilot heard in full: what the turn did of the requests for later counts,
+        // having been confirmed to them
+        let answered = matches!(reply.stop, StopReason::EndTurn | StopReason::StopSequence)
+            && !reply.text.trim().is_empty();
         let text = match reply.stop {
+            // Nothing to say for a request for later: it's tried again, and the pilot's told if
+            // it never is
+            StopReason::Refusal if turn.delivery.is_some() => {
+                detail = format!("{detail} | {}", t!("engineer.detail_declined"));
+                self.playback = None;
+                reply.text
+            }
+            // Half an answer to a request for later isn't one: it's tried again
+            StopReason::MaxTokens | StopReason::ContextWindowExceeded
+                if turn.delivery.is_some() =>
+            {
+                let why = match reply.stop {
+                    StopReason::ContextWindowExceeded => {
+                        self.new_session = true;
+                        t!("engineer.detail_full")
+                    }
+                    _ => t!("engineer.detail_cut_off"),
+                };
+                detail = format!("{detail} | {why}");
+                self.playback = None;
+                reply.text
+            }
+            StopReason::EndTurn | StopReason::StopSequence
+                if turn.delivery.is_some() && reply.text.trim().is_empty() =>
+            {
+                self.playback = None;
+                reply.text
+            }
             // The exchange was forgotten, and whatever was said with it: the pilot can ask again
             StopReason::Refusal => {
                 detail = format!("{detail} | {}", t!("engineer.detail_declined"));
@@ -849,6 +985,31 @@ impl Engineer {
             }
         };
 
+        if let Some(id) = turn.delivery {
+            let written = answered && !text.trim().is_empty();
+            detail = format!("{detail} | {}", t!("engineer.detail_scheduled", id = id));
+            if let Some(delivering) = self.delivering.as_mut().filter(|d| d.id == id)
+                && written
+            {
+                delivering.said = Some((text.clone(), Instant::now()));
+            }
+            // Without a voice, the chat's how it's delivered
+            if written && !turn.voiced {
+                detail = format!("{detail} | {}", t!("engineer.detail_text_only"));
+                self.delivered = Some(id);
+            }
+            // Nor is it said with no speaker to say it on: the chat has it whole now
+            if written
+                && turn.voiced
+                && !self
+                    .playback
+                    .as_ref()
+                    .is_some_and(|p| p.delivery == Some(id))
+            {
+                self.delivered = Some(id);
+            }
+        }
+
         match turn.entry {
             Some(entry) => {
                 self.chat[entry].text = text;
@@ -857,6 +1018,8 @@ impl Engineer {
             None if !text.trim().is_empty() => self.reply(text, Some(detail)),
             None => {}
         }
+        // After the answer, which confirms them
+        self.end_turn(turn.token, answered);
     }
 
     /// Speaks `text` in `lang` (see [`Self::voice`]): nothing without any voice.
@@ -907,6 +1070,7 @@ impl Engineer {
             timeline: None,
             tone_after_drain: false,
             sentences: SentenceQueue::default(),
+            delivery: None,
         });
         Some((lang, input))
     }
@@ -932,7 +1096,7 @@ impl Engineer {
                 Poll::Pending => None,
                 Poll::Ready(Some(Ok(speech))) => Some(speech),
                 Poll::Ready(Some(Err(e))) => {
-                    self.playback = None;
+                    self.speech_failed();
                     self.notice(t!("engineer.error_synthesizing", error = format!("{e:#}")));
                     self.no_beep();
                     return;
@@ -972,14 +1136,14 @@ impl Engineer {
                     Ok(())
                 }),
                 (None, None) => {
-                    self.playback = None;
+                    self.speech_failed();
                     self.notice(t!("engineer.no_speaker"));
                     return;
                 }
             };
 
             if let Err(e) = played {
-                self.playback = None;
+                self.speech_failed();
                 self.notice(t!("engineer.error_playing", error = e));
                 return;
             }
@@ -1017,6 +1181,14 @@ impl Engineer {
                 {
                     timeline.played();
                 }
+                // Said whole, unless its answer's still being written: then it's done once that
+                // ends written (see `answer`)
+                // (or, with no audio made of it, written whole in the chat)
+                if let Some(id) = playback.delivery
+                    && !self.turn.as_ref().is_some_and(|t| t.delivery == Some(id))
+                {
+                    self.delivered = Some(id);
+                }
                 let tone = playback.tone_after_drain;
                 self.playback = None;
                 if tone {
@@ -1024,9 +1196,20 @@ impl Engineer {
                 }
             }
             Drained::Stalled => {
-                self.playback = None;
+                self.speech_failed();
                 self.notice(t!("engineer.speaker_stalled"));
             }
+        }
+    }
+
+    /// The speech couldn't be said (no speaker, or it failed): it's dropped. A request for later
+    /// it was delivering is in the chat, as it would be without a voice: a reminder now, and an
+    /// answer once it's written whole (see `answer`).
+    fn speech_failed(&mut self) {
+        if let Some(id) = self.playback.take().and_then(|p| p.delivery)
+            && !self.turn.as_ref().is_some_and(|t| t.delivery == Some(id))
+        {
+            self.delivered = Some(id);
         }
     }
 
@@ -1050,6 +1233,7 @@ impl Engineer {
                 self.chat[entry].detail = Some(t!("engineer.detail_cut_off").into());
             }
             self.notice(t!("engineer.cancelled"));
+            self.end_turn(turn.token, false);
         }
         self.playback = None;
     }
@@ -1072,6 +1256,222 @@ impl Engineer {
         });
     }
 
+    /// Called every frame, after [`Self::update`]: requests for later are watched (the telemetry's
+    /// read on another thread; this only looks whether it has been), and the one due longest is
+    /// delivered once the radio's free: the pilot isn't talking or being transcribed
+    /// (`radio_busy`), no answer is on its way or being spoken, and the spotter isn't speaking.
+    pub fn follow_schedule(
+        &mut self,
+        rt: &Handle,
+        sim: Option<&mut Sim>,
+        config: &Config,
+        synth: &mut Synthesizer,
+        radio_busy: bool,
+    ) {
+        // One delivered already isn't one a reading can end
+        self.finish_delivery();
+        let Some(scheduler) = &mut self.schedule else {
+            return;
+        };
+        let events = scheduler.update(rt);
+        // The one being delivered ended with its session: its answer isn't for this one
+        let ended = self.delivering.as_ref().map(|d| d.id).filter(|delivering| {
+            (events.iter())
+                .any(|e| matches!(e, ScheduleEvent::Ended { id, .. } if id == delivering))
+        });
+        self.schedule_notices(events);
+        if let Some(id) = ended {
+            self.abandon_delivery(id);
+        }
+        if radio_busy
+            || self.held
+            || self.turn.is_some()
+            || self.playback.is_some()
+            || self.delivering.is_some()
+        {
+            return;
+        }
+        let delivery = (self.schedule.as_ref())
+            .and_then(|scheduler| scheduler.schedule().next_due(Instant::now()));
+        if let Some(delivery) = delivery {
+            self.deliver(rt, sim, config, synth, delivery);
+        }
+    }
+
+    /// Delivers a request for later that's due: a reminder (or an answer cut off a moment ago) is
+    /// said as it is, and an assessment is asked of the model and its answer said. Done once it's
+    /// played to the end, or written in the chat without a voice to say it with: see
+    /// [`Self::finish_delivery`].
+    fn deliver(
+        &mut self,
+        rt: &Handle,
+        sim: Option<&mut Sim>,
+        config: &Config,
+        synth: &mut Synthesizer,
+        delivery: Delivery,
+    ) {
+        let Delivery {
+            id,
+            summary,
+            lang,
+            what,
+        } = delivery;
+        self.notice(t!("engineer.schedule_due", id = id, summary = summary));
+        self.delivering = Some(Delivering { id, said: None });
+        match what {
+            Deliver::Say(text) => {
+                let detail = t!("engineer.detail_scheduled", id = id);
+                match self.voice(config, lang) {
+                    Some(voice) => {
+                        self.reply(text.clone(), Some(detail));
+                        self.say(rt, config, synth, &text, voice);
+                        if let Some(playback) = &mut self.playback {
+                            playback.delivery = Some(id);
+                        }
+                    }
+                    None => {
+                        let text_only = t!("engineer.detail_text_only");
+                        self.reply(text, Some(format!("{detail} | {text_only}")));
+                        self.delivered = Some(id);
+                    }
+                }
+            }
+            Deliver::Ask(prompt) => {
+                let timeline = Arc::new(Timeline::new(None, Instant::now()));
+                // Not started: nothing's delivering it, so it's tried again later
+                let _ = self.converse(
+                    rt,
+                    sim,
+                    config,
+                    synth,
+                    prompt,
+                    lang,
+                    true,
+                    timeline,
+                    Some(id),
+                );
+            }
+        }
+    }
+
+    /// Stops delivering the request for later `id`, which is gone: its answer on its way, or being
+    /// said, goes with it.
+    fn abandon_delivery(&mut self, id: schedule::Id) {
+        if self.turn.as_ref().is_some_and(|t| t.delivery == Some(id))
+            && let Some(turn) = self.turn.take()
+        {
+            if let Some(entry) = turn.entry {
+                self.chat[entry].detail = Some(t!("engineer.detail_cut_off").into());
+            }
+            self.end_turn(turn.token, false);
+        }
+        if self
+            .playback
+            .as_ref()
+            .is_some_and(|p| p.delivery == Some(id))
+        {
+            self.playback = None;
+        }
+        self.delivering = None;
+        self.delivered = None;
+    }
+
+    /// Once nothing's delivering the request for later being delivered any more, it's done if it
+    /// was played to the end (or written, without a voice), and otherwise tried again later: it
+    /// was cut off (the pilot talked over it), or failed.
+    fn finish_delivery(&mut self) {
+        let Some(id) = self.delivering.as_ref().map(|d| d.id) else {
+            self.delivered = None;
+            return;
+        };
+        if self.turn.as_ref().is_some_and(|t| t.delivery == Some(id))
+            || self
+                .playback
+                .as_ref()
+                .is_some_and(|p| p.delivery == Some(id))
+        {
+            return;
+        }
+        let Some(delivering) = self.delivering.take() else {
+            return;
+        };
+        let delivered = self.delivered.take() == Some(id);
+        let Some(scheduler) = &self.schedule else {
+            return;
+        };
+        let schedule = scheduler.schedule();
+        let event = match delivered {
+            true => {
+                schedule.delivered(id);
+                None
+            }
+            false => schedule.interrupted(id, delivering.said, Instant::now()),
+        };
+        self.schedule_notices(event.into_iter().collect());
+    }
+
+    /// The turn `token` ended: what it registered or cancelled of the requests for later counts
+    /// if it was `answered`, and the pilot's told.
+    fn end_turn(&mut self, token: u64, answered: bool) {
+        if let Some(scheduler) = &self.schedule {
+            let events = scheduler.schedule().end_turn(token, answered);
+            self.schedule_notices(events);
+        }
+    }
+
+    /// Tells the pilot what came of requests for later.
+    fn schedule_notices(&mut self, events: Vec<ScheduleEvent>) {
+        for event in events {
+            let text = match event {
+                ScheduleEvent::Registered { id, summary } => {
+                    t!("engineer.schedule_registered", id = id, summary = summary)
+                }
+                ScheduleEvent::Cancelled { id, summary } => {
+                    t!("engineer.schedule_cancelled", id = id, summary = summary)
+                }
+                ScheduleEvent::Dropped { id, summary } => {
+                    t!("engineer.schedule_dropped", id = id, summary = summary)
+                }
+                ScheduleEvent::NotCancelled { id, summary } => {
+                    t!(
+                        "engineer.schedule_not_cancelled",
+                        id = id,
+                        summary = summary
+                    )
+                }
+                ScheduleEvent::Ended { id, summary, why } => match why {
+                    Ended::Session => {
+                        t!(
+                            "engineer.schedule_session_ended",
+                            id = id,
+                            summary = summary
+                        )
+                    }
+                    Ended::Recording => {
+                        t!(
+                            "engineer.schedule_recording_ended",
+                            id = id,
+                            summary = summary
+                        )
+                    }
+                },
+                ScheduleEvent::WatchFailed { id, summary, error } => t!(
+                    "engineer.schedule_watch_failed",
+                    id = id,
+                    summary = summary,
+                    error = error
+                ),
+                ScheduleEvent::Overdue { id, summary } => {
+                    t!("engineer.schedule_overdue", id = id, summary = summary)
+                }
+                ScheduleEvent::Undelivered { id, summary } => {
+                    t!("engineer.schedule_undelivered", id = id, summary = summary)
+                }
+            };
+            self.notice(text);
+        }
+    }
+
     fn start(
         &self,
         config: &Config,
@@ -1088,6 +1488,14 @@ impl Engineer {
         );
         let model = config.get().model.clone();
         let corner_names = *config.get().corner_names();
+        if let Some(scheduler) = &self.schedule {
+            tools.insert(
+                ScheduleTool::NAME,
+                Some(ScheduleTool::description()),
+                ScheduleTool::input_schema(),
+                scheduler.tool(),
+            );
+        }
         // Taken before the conversation: if the account signs out meanwhile, it ends next frame
         let user = match model.provider() {
             ModelProvider::BonoCloud => match self.account.as_ref().map(Account::status) {
@@ -1131,6 +1539,8 @@ impl Engineer {
         self.stop();
         let session = self.session.take();
         let tool = self.tool.take();
+        // Not restored: they belong to this run of the game
+        self.schedule = None;
         rt.spawn(async move {
             if let Some(lease) = session.as_ref().and_then(|s| s.lease.as_ref())
                 && tokio::time::timeout(WAIT, lease.end_and_wait())
@@ -1539,6 +1949,7 @@ mod tests {
             timeline: Some(timeline.clone()),
             tone_after_drain: false,
             sentences,
+            delivery: None,
         });
         engineer.hold(true);
         engineer.hold(true);
@@ -1614,6 +2025,7 @@ mod tests {
             timeline: Some(timeline.clone()),
             tone_after_drain: false,
             sentences: SentenceQueue::default(),
+            delivery: None,
         });
         engineer.play(&config, Some(&device));
         assert!(engineer.playback.is_none());
@@ -1640,6 +2052,7 @@ mod tests {
             timeline: Some(timeline.clone()),
             tone_after_drain: false,
             sentences: SentenceQueue::default(),
+            delivery: None,
         });
         engineer.play(&config, None);
         assert!(engineer.playback.is_none());
@@ -1672,6 +2085,7 @@ mod tests {
                 timeline: None,
                 tone_after_drain: false,
                 sentences: SentenceQueue::default(),
+                delivery: None,
             });
             let (_, text) = mpsc::unbounded_channel();
             engineer.answer(
@@ -1689,6 +2103,9 @@ mod tests {
                     lang: arrstr!("en"),
                     text,
                     entry: None,
+                    token: 0,
+                    delivery: None,
+                    voiced: true,
                 },
             );
             let playback = engineer.playback.as_mut().unwrap();
@@ -1740,6 +2157,9 @@ mod tests {
                 lang: arrstr!("en"),
                 text: receiver,
                 entry: None,
+                token: 0,
+                delivery: None,
+                voiced: true,
             };
             engineer.answer(
                 rt,
@@ -1952,6 +2372,105 @@ mod tests {
             assert!(!engineer.tool.as_ref().unwrap().is_same(&first));
             engineer.quit(&rt).await.unwrap();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requests_for_later_wait_for_the_radio_and_end_with_the_recording() {
+        let rt = tokio::runtime::Handle::current();
+        let dir = tempfile::tempdir().unwrap();
+        // No voices: what's due is written in the chat
+        let config = Config::new(dir.path().join("config.json")).await.unwrap();
+        let mut synth = Synthesizer::new(&rt, &config.get());
+        let one = NonZeroUsize::new(1).unwrap();
+        let pool = Pool::new(
+            Database::read_only(Arc::new(dir.path().join("telemetry.db"))),
+            one,
+            one,
+        );
+        let mut sim = crate::sim::recording(pool);
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.follow_recording(&rt, Some(&mut *sim));
+        let schedule = engineer.schedule.as_ref().unwrap().schedule().clone();
+        let summary = |id| format!("summary {id}");
+
+        // Not while the pilot's talking
+        let first = schedule.due_reminder("Reminder: change the engine map.");
+        engineer.follow_schedule(&rt, None, &config, &mut synth, true);
+        assert!(engineer.chat.is_empty());
+        engineer.follow_schedule(&rt, None, &config, &mut synth, false);
+        let said = engineer.chat.last().unwrap();
+        assert_eq!(said.speaker, Speaker::Engineer);
+        assert_eq!(said.text, "Reminder: change the engine map.");
+        let detail = said.detail.as_deref().unwrap();
+        assert!(detail.contains(t!("engineer.detail_text_only")), "{detail}");
+        assert_eq!(
+            engineer.chat[engineer.chat.len() - 2].text,
+            t!(
+                "engineer.schedule_due",
+                id = first,
+                summary = summary(first)
+            )
+        );
+        engineer.follow_schedule(&rt, None, &config, &mut synth, false);
+        assert_eq!(schedule.len(), 0);
+
+        // An answer for one, cut off by the pilot's question: kept, and tried again in a while
+        let cut = schedule.due_reminder("Reminder: fuel map two.");
+        let delivery = schedule.next_due(Instant::now()).unwrap();
+        assert_eq!(delivery.id, cut);
+        engineer.delivering = Some(Delivering {
+            id: cut,
+            said: None,
+        });
+        let (_, text) = mpsc::unbounded_channel();
+        engineer.turn = Some(Turn {
+            task: Task::spawn(std::future::pending()),
+            lang: arrstr!("en"),
+            text,
+            entry: None,
+            token: 9,
+            delivery: Some(cut),
+            voiced: false,
+        });
+        // Nothing else is delivered meanwhile
+        let brake = schedule.due_reminder("Reminder: brake bias.");
+        engineer.follow_schedule(&rt, None, &config, &mut synth, false);
+        assert!(engineer.delivering.is_some());
+        engineer.stop();
+        let before = engineer.chat.len();
+        engineer.follow_schedule(&rt, None, &config, &mut synth, false);
+        assert_eq!(schedule.len(), 2);
+        // The other one's due: it goes first
+        assert_eq!(engineer.delivering.as_ref().map(|d| d.id), Some(brake));
+        assert_eq!(engineer.chat.len(), before + 2);
+        engineer.follow_schedule(&rt, None, &config, &mut synth, false);
+        assert_eq!(schedule.len(), 1);
+
+        // The recording gone, they go with it, and the pilot's told of each
+        let last = schedule.due_reminder("Reminder: pit next lap.");
+        engineer.follow_recording(&rt, None);
+        assert!(engineer.schedule.is_none());
+        assert_eq!(schedule.len(), 0);
+        let told = engineer.chat[engineer.chat.len() - 2..]
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            told,
+            [
+                t!(
+                    "engineer.schedule_recording_ended",
+                    id = cut,
+                    summary = summary(cut)
+                ),
+                t!(
+                    "engineer.schedule_recording_ended",
+                    id = last,
+                    summary = summary(last)
+                ),
+            ]
+        );
+        engineer.quit(&rt).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

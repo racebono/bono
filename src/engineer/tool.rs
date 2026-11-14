@@ -195,18 +195,52 @@ impl Engineer {
         let (reply, answer) = tokio::sync::oneshot::channel();
         self.inner
             .data
-            .send(derived::Request { job, reply })
+            .send(derived::Request::Job { job, reply })
             .ok()
             .context("the engineer's data thread stopped")?;
         answer.await.context("the engineer's data thread stopped")?
     }
 
+    /// What reads the telemetry for requests for later. It holds no connection of its own, so
+    /// it's dropped anywhere, unlike the tool.
+    pub fn watcher(&self) -> Watcher {
+        Watcher {
+            data: self.inner.data.clone(),
+        }
+    }
+
     /// Waits for the derived tables to catch up with the recording.
     #[cfg(test)]
-    async fn sync(&self) -> anyhow::Result<()> {
+    pub(in crate::engineer) async fn sync(&self) -> anyhow::Result<()> {
         self.ask(derived::Job::Sync).await.map(|_| ())
     }
 }
+
+/// Reads the session's clock, the player's laps and watched conditions on the thread keeping the
+/// derived tables (see [`Reading`]). Cheap to clone.
+#[derive(Clone)]
+pub struct Watcher {
+    data: mpsc::Sender<derived::Request>,
+}
+
+impl Watcher {
+    /// A reading now, with what each of `conditions` (at most [`MAX_WATCHED`]) says.
+    pub fn watch(
+        &self,
+        conditions: Vec<String>,
+    ) -> impl Future<Output = anyhow::Result<Reading>> + Send + 'static {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let sent = self
+            .data
+            .send(derived::Request::Watch { conditions, reply });
+        async move {
+            sent.ok().context("the engineer's data thread stopped")?;
+            answer.await.context("the engineer's data thread stopped")?
+        }
+    }
+}
+
+pub use derived::{MAX_WATCHED, Reading, Verdict};
 
 impl ToolHandler for Engineer {
     type Input = EngineerInput;
@@ -2316,7 +2350,7 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::sqlite::Database;
     use bono_sim::{
@@ -2600,7 +2634,7 @@ mod tests {
 
     /// A recorded race: the player (vehicle 1, "Ana Lopes") and Fischer (vehicle 2) right behind
     /// on the right, over three laps of a 1000 m track, Fischer a little quicker.
-    pub(super) fn race() -> (tempfile::TempDir, Engineer) {
+    pub(in crate::engineer) fn race() -> (tempfile::TempDir, Engineer) {
         let dir = tempfile::tempdir().unwrap();
         // Every opponent update recorded, so they're in the player's latest frame
         std::fs::write(
@@ -2914,6 +2948,13 @@ mod tests {
         ] {
             assert!(skill.contains(&format!("`{table}`")), "{table}");
         }
+        // And every tool the conversation has
+        for tool in [
+            Engineer::NAME,
+            crate::engineer::schedule::ScheduleTool::NAME,
+        ] {
+            assert!(skill.contains(&format!("`{tool}` tool")), "{tool}");
+        }
     }
 
     /// The slowest points of a lap in LMU (from its own telemetry recordings), against a
@@ -3034,10 +3075,49 @@ mod tests {
 mod evals {
     use super::*;
     use crate::{
+        engineer::schedule::{ScheduleInput, ScheduleTool, Scheduler},
         provider::{Model, claude::ConversationBuilder},
         sqlite::Database,
     };
     use std::{num::NonZeroUsize, sync::Mutex as StdMutex, time::Instant};
+
+    /// The `schedule` tool, recording every call and what it answered.
+    #[derive(Clone)]
+    struct RecordingSchedule {
+        tool: ScheduleTool,
+        calls: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl ToolHandler for RecordingSchedule {
+        type Input = serde_json::Value;
+
+        fn handle(
+            &self,
+            input: serde_json::Value,
+        ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
+            let tool = self.tool.clone();
+            let calls = self.calls.clone();
+            async move {
+                let result = match ScheduleInput::deserialize(&input) {
+                    Ok(parsed) => tool.handle(parsed).await,
+                    Err(e) => Err(e.into()),
+                };
+                let answer = match &result {
+                    Ok(text) => text.clone(),
+                    Err(e) => format!("ERROR: {e:#}"),
+                };
+                calls.lock().unwrap().push(format!(
+                    "### Schedule call: `{input}`
+
+```
+{answer}
+```
+"
+                ));
+                result
+            }
+        }
+    }
 
     /// The tool, recording every call and what it answered.
     #[derive(Clone)]
@@ -3207,6 +3287,9 @@ mod evals {
                     let calls = Arc::new(StdMutex::new(Vec::new()));
                     let events = Arc::new(StdMutex::new(Vec::new()));
                     let start = Instant::now();
+                    // As the app offers it: what's registered is listed in the transcript
+                    let scheduler = Scheduler::new(tool.watcher());
+                    scheduler.schedule().begin_turn(1, crate::arrstr!("en"));
                     let mut builder = ConversationBuilder::new();
                     builder.model(model).effort(effort).system(system).tool(
                         Engineer::NAME,
@@ -3217,6 +3300,15 @@ mod evals {
                             calls: calls.clone(),
                             events: events.clone(),
                             start,
+                        },
+                    );
+                    builder.tool(
+                        ScheduleTool::NAME,
+                        Some(ScheduleTool::description()),
+                        ScheduleTool::input_schema(),
+                        RecordingSchedule {
+                            tool: scheduler.tool(),
+                            calls: calls.clone(),
                         },
                     );
                     let mut conversation = builder.build(reqwest::Client::new()).unwrap();

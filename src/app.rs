@@ -351,6 +351,15 @@ impl AppState {
             &mut self.synth,
             self.gui.topbar.audio.speaker.get(),
         );
+        // Requests for later wait while the pilot's talking or being heard
+        let radio_busy = self.gui.topbar.audio.recording() || self.gui.topbar.audio.transcribing();
+        self.engineer.follow_schedule(
+            rt,
+            self.simulators.current_mut(),
+            &self.config,
+            &mut self.synth,
+            radio_busy,
+        );
         self.spotter.update(
             rt,
             self.simulators.current_mut(),
