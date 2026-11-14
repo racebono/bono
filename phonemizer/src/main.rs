@@ -235,7 +235,9 @@ fn init_espeak() -> anyhow::Result<()> {
 /// The directory *containing* `espeak-ng-data`, which is what espeak-ng expects.
 ///
 /// Distributions ship it next to the executable. During development it's only in
-/// espeak-rs-sys's build output, next to the executable (or its parent for test binaries).
+/// espeak-rs-sys's build output, under the profile directory: the executable's directory, or for
+/// test binaries its parent (`deps/`) or fourth ancestor (`build/{package}/{hash}/out/`, where
+/// Cargo nests build outputs by package).
 fn espeak_data_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent()?;
@@ -244,7 +246,7 @@ fn espeak_data_dir() -> Option<PathBuf> {
         return Some(exe_dir.to_path_buf());
     }
 
-    return exe_dir.ancestors().take(2).find_map(newest_built_data);
+    return exe_dir.ancestors().take(5).find_map(newest_built_data);
 }
 
 /// The most recently built espeak-rs-sys `out/share` under `{dir}/build`: in
