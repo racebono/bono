@@ -98,6 +98,8 @@ const SPEED_WINDOW: f64 = 0.25;
 /// How close (s) a lap timed here must be to the game's best lap to be taken for it: the line
 /// crossing is worked out between updates, from the lap distance, which the game's timing isn't.
 const BEST_LAP_MATCH: f64 = 0.1;
+/// The steps (m/s) the wind is recorded in.
+const WIND_STEP: f64 = 0.5;
 /// Slower than this (m/s), which way a car moves is noise.
 const MIN_DIRECTION_SPEED: f64 = 1.0;
 /// Slower than this (m/s), a car in its pit box has stopped there.
@@ -130,6 +132,8 @@ pub struct Converter {
     cars: HashMap<i64, CarTrack>,
     /// When the session's clock runs out, as last recorded
     session_end: Option<f64>,
+    /// The wind as last recorded (see `steady_wind`)
+    wind: Option<(f64, f64)>,
 }
 
 /// One car in one update, as read and as worked out.
@@ -185,6 +189,7 @@ impl Converter {
         if new_event || self.session != Some(session) || dt.is_none() {
             self.cars.clear();
             self.session_end = None;
+            self.wind = None;
         }
         self.session = Some(session);
 
@@ -222,6 +227,11 @@ impl Converter {
                     &info.sectors,
                 );
                 let lap_offset = track.lap_offset();
+                // Push to pass shows the car has it: a car without it reads 0 and off
+                track.push_to_pass_seen |= car.bool("CarIdxP2P_Status", "P2P_Status") == Some(true)
+                    || car
+                        .i32("CarIdxP2P_Count", "P2P_Count")
+                        .is_some_and(|count| count > 0);
                 Car {
                     idx,
                     driver,
@@ -284,13 +294,13 @@ impl Converter {
                 .filter(|rpm| *rpm >= 0.0)
                 .into();
             out.state.incident_points = car.driver.team_incidents.map(|n| n as f64).into();
-            // Push to pass, on cars that have it: whether it's on, and in races what's left (its
-            // count is the uses outside races, "or remaining in Race")
+            // Push to pass: whether it's on, and in races what's left (its count is the uses
+            // outside races, "or remaining in Race"), once the car's shown it has it
             let per_car = PerCar::new(frame, car.idx, player);
             out.state.push_to_pass_engaged = per_car.bool("CarIdxP2P_Status", "P2P_Status").into();
             out.state.push_to_pass_activations_left = per_car
                 .i32("CarIdxP2P_Count", "P2P_Count")
-                .filter(|count| race && *count >= 0)
+                .filter(|count| race && *count >= 0 && track.push_to_pass_seen)
                 .map(i64::from)
                 .into();
             if Some(car.idx) == player {
@@ -307,6 +317,7 @@ impl Converter {
                     .f64("SessionTimeRemain")
                     .filter(|t| *t >= 0.0 && *t < UNLIMITED_TIME);
                 self.session_end = session_end(self.session_end, time, remaining);
+                self.wind = steady_wind(self.wind, wind(frame));
                 Some(self.scoring(frame, info, &cars, player, race, time, &places))
             }
         };
@@ -377,9 +388,8 @@ impl Converter {
         let skies = frame.i32("Skies").filter(|s| (0..=3).contains(s));
         s.cloud_coverage = skies.map(i64::from).into();
         s.cloudiness = skies.map(|s| f64::from(s) / 3.0).into();
-        let (wind_x, wind_z) = wind(frame);
-        s.wind_x = wind_x.into();
-        s.wind_z = wind_z.into();
+        s.wind_x = self.wind.map(|(x, _)| x).into();
+        s.wind_z = self.wind.map(|(_, z)| z).into();
         s.ambient_temperature = frame.f64("AirTemp").map(round_tenth).into();
         s.track_temperature = frame
             .f64("TrackTempCrew")
@@ -853,22 +863,26 @@ fn average(values: &[Option<f64>]) -> Option<f64> {
 
 /// Which way the air moves, in m/s, in the world the player's heading points in (`heading` 0 is
 /// north, along world -z, and turning right is towards -x): x west, z south. From where the wind
-/// blows from (`WindDir`, see the module's doc), at its speed (`WindVel`). Rounded to half a
-/// metre a second: the weather's gusts would write a session row with every update.
-fn wind(frame: &Frame<'_>) -> (Option<f64>, Option<f64>) {
-    let Some((speed, from)) = frame
+/// blows from (`WindDir`, see the module's doc), at its speed (`WindVel`).
+fn wind(frame: &Frame<'_>) -> Option<(f64, f64)> {
+    let (speed, from) = frame
         .f64("WindVel")
         .zip(frame.f64("WindDir"))
-        .filter(|(speed, _)| *speed >= 0.0)
-    else {
-        return (None, None);
-    };
-    let half = |v: f64| (v * 2.0).round() / 2.0 + 0.0;
+        .filter(|(speed, _)| *speed >= 0.0)?;
     // Towards the bearing opposite: east -sin, north -cos; x is west and z south
-    (
-        Some(half(speed * from.sin())),
-        Some(half(speed * from.cos())),
-    )
+    Some((speed * from.sin(), speed * from.cos()))
+}
+
+/// The wind as recorded: in half metres a second, and only moved off what it was once it's a
+/// whole step away from it. The weather's gusts, and a wind on the edge between two steps, would
+/// otherwise write a session row with every update.
+fn steady_wind(last: Option<(f64, f64)>, now: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    let (x, z) = now?;
+    let half = |v: f64| (v * 2.0).round() / 2.0 + 0.0;
+    match last {
+        Some((lx, lz)) if (x - lx).abs() < WIND_STEP && (z - lz).abs() < WIND_STEP => last,
+        _ => Some((half(x), half(z))),
+    }
 }
 
 /// The session's phase. A red flag stops it whatever its state.
@@ -1076,6 +1090,8 @@ struct CarTrack {
     visit: Option<(bool, bool)>,
     pit_stops: i64,
     pit_state: Option<&'static str>,
+    /// Whether the car was seen to have push to pass (on, or some count) this session
+    push_to_pass_seen: bool,
 }
 
 impl CarTrack {
@@ -1705,8 +1721,8 @@ mod tests {
         assert_eq!(track.lap_start, None);
     }
 
-    /// Push to pass on and, in races, how much is left, from the player's own variables where
-    /// there are no arrays.
+    /// Push to pass on and, in races, how much is left: from each car's arrays (the player's own
+    /// variables where there are none), once the car's shown it has it.
     #[test]
     fn push_to_pass_left_only_in_races() {
         use super::super::sdk::{Value, Vars};
@@ -1714,7 +1730,7 @@ mod tests {
         let info = |kind: &'static str| SessionInfo {
             track_length: Some(1000.0),
             player: Some(0),
-            drivers: HashMap::from([(0, Driver::default())]),
+            drivers: HashMap::from([(0, Driver::default()), (1, Driver::default())]),
             sessions: vec![Session {
                 num: 0,
                 kind: Some(kind),
@@ -1723,23 +1739,64 @@ mod tests {
             }],
             ..Default::default()
         };
+        let left = |update: &Update, car: i64| {
+            let row = update
+                .telemetry
+                .iter()
+                .find(|t| t.vehicle_id.get() == Some(car))
+                .unwrap();
+            (
+                row.state.push_to_pass_engaged.get(),
+                row.state.push_to_pass_activations_left.get(),
+            )
+        };
+
+        // The player's own variables, without arrays
         let (vars, data) = Vars::of(&[
             ("SessionTime", Value::Double(10.0)),
             ("SessionNum", Value::Int(0)),
             ("PlayerCarIdx", Value::Int(0)),
             ("LapDistPct", Value::Double(0.5)),
-            ("P2P_Status", Value::Bool(true)),
+            ("P2P_Status", Value::Bool(false)),
             ("P2P_Count", Value::Int(5)),
         ]);
         let frame = Frame::new(&vars, &data);
-        for (kind, left) in [("race", Some(5)), ("practice", None)] {
+        for (kind, expected) in [("race", Some(5)), ("practice", None)] {
             let update = Converter::default()
                 .convert(&frame, &info(kind), Instant::now())
                 .unwrap();
-            let state = update.telemetry[0].state;
-            assert_eq!(state.push_to_pass_engaged.get(), Some(true), "{kind}");
-            assert_eq!(state.push_to_pass_activations_left.get(), left, "{kind}");
+            assert_eq!(left(&update, 0), (Some(false), expected), "{kind}");
         }
+
+        // Every car's from the arrays: the second car on with 3 left; the first shows nothing (no
+        // push to pass, or none yet): off, and nothing left said
+        let (vars, data) = Vars::of(&[
+            ("SessionTime", Value::Double(10.0)),
+            ("SessionNum", Value::Int(0)),
+            ("PlayerCarIdx", Value::Int(0)),
+            ("CarIdxLapDistPct", Value::Doubles(vec![0.5, 0.6])),
+            ("CarIdxP2P_Status", Value::Bools(vec![false, true])),
+            ("CarIdxP2P_Count", Value::Ints(vec![0, 3])),
+        ]);
+        let mut converter = Converter::default();
+        let update = converter
+            .convert(&Frame::new(&vars, &data), &info("race"), Instant::now())
+            .unwrap();
+        assert_eq!(left(&update, 0), (Some(false), None));
+        assert_eq!(left(&update, 1), (Some(true), Some(3)));
+        // Shown once, its count's what's left from then on, used up too
+        let (vars, data) = Vars::of(&[
+            ("SessionTime", Value::Double(10.1)),
+            ("SessionNum", Value::Int(0)),
+            ("PlayerCarIdx", Value::Int(0)),
+            ("CarIdxLapDistPct", Value::Doubles(vec![0.5, 0.601])),
+            ("CarIdxP2P_Status", Value::Bools(vec![false, false])),
+            ("CarIdxP2P_Count", Value::Ints(vec![0, 0])),
+        ]);
+        let update = converter
+            .convert(&Frame::new(&vars, &data), &info("race"), Instant::now())
+            .unwrap();
+        assert_eq!(left(&update, 1), (Some(false), Some(0)));
     }
 
     /// The player's axes and rotations, from iRacing's directions (see the module's doc) to the
@@ -1807,15 +1864,27 @@ mod tests {
         let wind = |speed: f64, from: f64| {
             let (vars, data) =
                 super::super::sdk::Vars::doubles(&[("WindVel", speed), ("WindDir", from)]);
-            wind(&Frame::new(&vars, &data))
+            steady_wind(None, wind(&Frame::new(&vars, &data)))
         };
         // From the north: the air moves south, +z
-        assert_eq!(wind(8.0, 0.0), (Some(0.0), Some(8.0)));
+        assert_eq!(wind(8.0, 0.0), Some((0.0, 8.0)));
         // From the east: west, +x
-        assert_eq!(wind(8.0, PI / 2.0), (Some(8.0), Some(0.0)));
+        assert_eq!(wind(8.0, PI / 2.0), Some((8.0, 0.0)));
         // From the south-west: north-east, -x and -z
-        assert_eq!(wind(4.0, 1.25 * PI), (Some(-3.0), Some(-3.0)));
-        assert_eq!(wind(-1.0, 0.0), (None, None));
+        assert_eq!(wind(4.0, 1.25 * PI), Some((-3.0, -3.0)));
+        // Nothing west or east is no wind either way (not -0)
+        let (x, _) = wind(8.0, -0.01).unwrap();
+        assert!(x == 0.0 && x.is_sign_positive());
+        assert_eq!(wind(-1.0, 0.0), None);
+
+        // On the edge between two steps, it stays on one; a step away, it moves
+        let mut last = steady_wind(None, Some((0.0, 8.249)));
+        assert_eq!(last, Some((0.0, 8.0)));
+        for z in [8.251, 8.249, 8.3, 8.45] {
+            last = steady_wind(last, Some((0.0, z)));
+            assert_eq!(last, Some((0.0, 8.0)), "{z}");
+        }
+        assert_eq!(steady_wind(last, Some((0.0, 8.6))), Some((0.0, 8.5)));
     }
 
     #[test]

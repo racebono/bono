@@ -196,13 +196,16 @@ struct Var {
     count: usize,
 }
 
-/// A value of a test's update (see `Vars::of`).
+/// A value of a test's update (see `Vars::of`): one, or an array of them.
 #[cfg(test)]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Value {
     Double(f64),
     Int(i32),
     Bool(bool),
+    Doubles(Vec<f64>),
+    Ints(Vec<i32>),
+    Bools(Vec<bool>),
 }
 
 /// The variables an update has, by name.
@@ -228,17 +231,32 @@ impl Vars {
         let mut vars = HashMap::new();
         let mut data = Vec::new();
         for (name, value) in values {
-            let (kind, bytes) = match value {
-                Value::Double(v) => (Kind::Double, v.to_le_bytes().to_vec()),
-                Value::Int(v) => (Kind::Int, v.to_le_bytes().to_vec()),
-                Value::Bool(v) => (Kind::Bool, vec![u8::from(*v)]),
+            let (kind, count, bytes): (_, _, Vec<u8>) = match value {
+                Value::Double(v) => (Kind::Double, 1, v.to_le_bytes().to_vec()),
+                Value::Int(v) => (Kind::Int, 1, v.to_le_bytes().to_vec()),
+                Value::Bool(v) => (Kind::Bool, 1, vec![u8::from(*v)]),
+                Value::Doubles(v) => (
+                    Kind::Double,
+                    v.len(),
+                    v.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                ),
+                Value::Ints(v) => (
+                    Kind::Int,
+                    v.len(),
+                    v.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                ),
+                Value::Bools(v) => (
+                    Kind::Bool,
+                    v.len(),
+                    v.iter().map(|v| u8::from(*v)).collect(),
+                ),
             };
             vars.insert(
                 (*name).to_owned(),
                 Var {
                     kind,
                     offset: data.len(),
-                    count: 1,
+                    count,
                 },
             );
             data.extend_from_slice(&bytes);

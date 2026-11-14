@@ -155,8 +155,8 @@
     X(f64, incident_points) /* points against the limit, can be fractional. RaceRoom: its incident points. LMU: track-limit points, as it has no collision penalties. iRacing: the team's incident count (the player's car: else the driver's) */ \
     X(boolean, push_to_pass_equipped) \
     X(boolean, push_to_pass_charged) /* NULL on cars without a charge cycle; false while charging */ \
-    X(boolean, push_to_pass_engaged) \
-    X(i64, push_to_pass_activations_left) /* NULL when unlimited or unknown. iRacing: races only; 0 also on cars without it */ \
+    X(boolean, push_to_pass_engaged) /* iRacing: every car */ \
+    X(i64, push_to_pass_activations_left) /* NULL when unlimited or unknown. iRacing: every car, in races, once it's shown it has push to pass */ \
     X(i64, push_to_pass_activations_total) \
     /* Fuel */                                                                                           \
     X(f64, fuel_capacity)                   /* liters */                                                 \

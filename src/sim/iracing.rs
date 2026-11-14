@@ -680,52 +680,59 @@ mod tests {
                     (at(i, "VelocityZ"), climb(i) - nose)
                 });
                 assert!(correlation(&vertical) > 0.0, "{name}: VelocityZ isn't + up");
-
-                // The wind, by what it does flat out on the straights: a tailwind is less drag
-                let wind =
-                    samples.iter().map(|&i| at(i, "WindVel")).sum::<f64>() / samples.len() as f64;
-                let gear = |i: usize| ibt.frame(i).i32("Gear");
-                let flat_out = |i: usize| {
-                    [i - 6, i, i + 6].iter().all(|&j| {
-                        at(j, "ThrottleRaw") >= 0.99
-                            && at(j, "BrakeRaw") <= 0.01
-                            && gear(j).is_some()
-                            && gear(j) == gear(i)
-                    }) && at(i, "LatAccel").abs() < 2.0
-                        && at(i, "Speed") > 20.0
-                };
-                // How much faster than the car usually goes at that gear and speed, uphill or not
-                let gains: Vec<_> = samples
-                    .iter()
-                    .filter(|&&i| flat_out(i))
-                    .map(|&i| {
-                        let v = at(i, "Speed");
-                        let gain = (at(i + 6, "Speed") - at(i - 6, "Speed")) / (12.0 * dt)
-                            + 9.81 * (at(i + 6, "Alt") - at(i - 6, "Alt")) / (12.0 * dt) / v;
-                        ((gear(i), v.round() as i64), gain, i)
-                    })
-                    .collect();
-                let mut usual = std::collections::HashMap::<_, (f64, usize)>::new();
-                for (key, gain, _) in &gains {
-                    let entry = usual.entry(*key).or_default();
-                    *entry = (entry.0 + gain, entry.1 + 1);
-                }
-                let tail = gains
-                    .iter()
-                    .filter(|(key, _, _)| usual[key].1 >= 20)
-                    .map(|(key, gain, i)| {
-                        let (sum, count) = usual[key];
-                        let from = at(*i, "WindDir") - at(*i, "YawNorth");
-                        (-at(*i, "WindVel") * from.cos(), gain - sum / count as f64)
-                    })
-                    .collect::<Vec<_>>();
-                if wind >= 3.0 && tail.len() >= 2000 {
-                    winded += 1;
-                    assert!(
-                        correlation(&tail) > 0.0,
-                        "{name}: WindDir isn't where the wind blows from"
-                    );
-                }
+            }
+            // The wind, by what it does flat out on the straights: a tailwind is less drag
+            let wind =
+                samples.iter().map(|&i| at(i, "WindVel")).sum::<f64>() / samples.len() as f64;
+            let gear = |i: usize| ibt.frame(i).i32("Gear");
+            let flat_out = |i: usize| {
+                [i - 6, i, i + 6].iter().all(|&j| {
+                    at(j, "ThrottleRaw") >= 0.99
+                        && at(j, "BrakeRaw") <= 0.01
+                        && gear(j).is_some()
+                        && gear(j) == gear(i)
+                }) && at(i, "LatAccel").abs() < 2.0
+                    && at(i, "Speed") > 20.0
+            };
+            // How much faster than the car usually goes at that gear and speed, uphill or not
+            let gains: Vec<_> = samples
+                .iter()
+                .filter(|&&i| flat_out(i))
+                .map(|&i| {
+                    let v = at(i, "Speed");
+                    let gain = (at(i + 6, "Speed") - at(i - 6, "Speed")) / (12.0 * dt)
+                        + 9.81 * (at(i + 6, "Alt") - at(i - 6, "Alt")) / (12.0 * dt) / v;
+                    ((gear(i), v.round() as i64), gain, i)
+                })
+                .collect();
+            // Within each gear and speed, the faster against the more tailwind: both less what's
+            // usual there, so what's left is the wind, where it varies (other straights, headings)
+            let tailwind = |i: usize| {
+                let from = at(i, "WindDir") - at(i, "YawNorth");
+                -at(i, "WindVel") * from.cos()
+            };
+            let mut usual = std::collections::HashMap::<_, (f64, f64, usize)>::new();
+            for (key, gain, i) in &gains {
+                let entry = usual.entry(*key).or_default();
+                *entry = (entry.0 + gain, entry.1 + tailwind(*i), entry.2 + 1);
+            }
+            let tail = gains
+                .iter()
+                .filter(|(key, _, _)| usual[key].2 >= 20)
+                .map(|(key, gain, i)| {
+                    let (gains, tails, count) = usual[key];
+                    let count = count as f64;
+                    (tailwind(*i) - tails / count, gain - gains / count)
+                })
+                .collect::<Vec<_>>();
+            let spread =
+                (tail.iter().map(|(t, _)| t * t).sum::<f64>() / tail.len().max(1) as f64).sqrt();
+            if wind >= 3.0 && tail.len() >= 2000 && spread >= 0.5 {
+                winded += 1;
+                assert!(
+                    correlation(&tail) > 0.0,
+                    "{name}: WindDir isn't where the wind blows from"
+                );
             }
         }
         assert!(checked > 0, "no saved laps long enough to check");
