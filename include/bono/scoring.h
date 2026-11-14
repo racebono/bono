@@ -43,7 +43,7 @@
     X(i64, cloud_coverage, true)             /* as reported by the simulator */                           \
     X(f64, ambient_temperature, true)                                                                     \
     X(f64, track_temperature, true)                                                                       \
-    X(f64, wind_x, true)                     /* m/s, world coordinates */                                 \
+    X(f64, wind_x, true)                     /* m/s, world coordinates; iRacing: x west, z south, as its heading's 0 is north */ \
     X(f64, wind_y, true)                                                                                  \
     X(f64, wind_z, true)                                                                                  \
     X(f64, wind_max_speed, true)             /* m/s, the weather system's maximum (ground) wind speed */  \

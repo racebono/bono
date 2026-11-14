@@ -29,6 +29,10 @@
 //!   against gravity's pull on `LongAccel`.
 //! - `Roll` isn't recorded: the laps don't say which way it points (it mixes how the car leans
 //!   with the track's camber, and the two anchors disagree between tracks).
+//! - `WindDir` is the compass bearing the wind blows from, clockwise from north (as weather
+//!   reports give it): flat out on the straights, a car gains with the tailwind that reading gives,
+//!   and loses with the headwind. The laps tell it apart from blowing towards it, or turning the
+//!   other way round, by less than they do the car's axes, but every lap with enough wind agrees.
 //!
 //! `sim::iracing::tests::axis_conventions_hold_on_saved_laps` checks these against saved laps.
 
@@ -364,6 +368,9 @@ impl Converter {
         let skies = frame.i32("Skies").filter(|s| (0..=3).contains(s));
         s.cloud_coverage = skies.map(i64::from).into();
         s.cloudiness = skies.map(|s| f64::from(s) / 3.0).into();
+        let (wind_x, wind_z) = wind(frame);
+        s.wind_x = wind_x.into();
+        s.wind_z = wind_z.into();
         s.ambient_temperature = frame.f64("AirTemp").map(round_tenth).into();
         s.track_temperature = frame
             .f64("TrackTempCrew")
@@ -834,6 +841,26 @@ fn player_telemetry(frame: &Frame<'_>, info: &SessionInfo, out: &mut bono_teleme
 fn average(values: &[Option<f64>]) -> Option<f64> {
     let sum = values.iter().copied().sum::<Option<f64>>()?;
     Some(sum / values.len() as f64)
+}
+
+/// Which way the air moves, in m/s, in the world the player's heading points in (`heading` 0 is
+/// north, along world -z, and turning right is towards -x): x west, z south. From where the wind
+/// blows from (`WindDir`, see the module's doc), at its speed (`WindVel`). Rounded to half a
+/// metre a second: the weather's gusts would write a session row with every update.
+fn wind(frame: &Frame<'_>) -> (Option<f64>, Option<f64>) {
+    let Some((speed, from)) = frame
+        .f64("WindVel")
+        .zip(frame.f64("WindDir"))
+        .filter(|(speed, _)| *speed >= 0.0)
+    else {
+        return (None, None);
+    };
+    let half = |v: f64| (v * 2.0).round() / 2.0 + 0.0;
+    // Towards the bearing opposite: east -sin, north -cos; x is west and z south
+    (
+        Some(half(speed * from.sin())),
+        Some(half(speed * from.cos())),
+    )
 }
 
 /// The session's phase. A red flag stops it whatever its state.
@@ -1668,6 +1695,82 @@ mod tests {
         update(&mut track, 2.0, Some(0.45), 0, &SECTORS);
         assert_eq!(track.sector_start, None);
         assert_eq!(track.lap_start, None);
+    }
+
+    /// The player's axes and rotations, from iRacing's directions (see the module's doc) to the
+    /// recording's.
+    #[test]
+    fn turns_the_players_axes_round() {
+        use std::f64::consts::PI;
+        let player = |values: &[(&str, f64)]| {
+            let (vars, data) = super::super::sdk::Vars::doubles(values);
+            let mut out = bono_telemetry::default();
+            player_telemetry(&Frame::new(&vars, &data), &SessionInfo::default(), &mut out);
+            out
+        };
+        // Turning left at speed, sliding outwards, nose down, wheel a quarter turn left of a
+        // span of two turns, the wheel pulling back right, heading west
+        let out = player(&[
+            ("VelocityX", 30.0),
+            ("VelocityY", -3.0),
+            ("VelocityZ", 0.5),
+            ("LongAccel", -4.0),
+            ("LatAccel", 12.0),
+            ("VertAccel", 9.8),
+            ("Pitch", 0.02),
+            ("PitchRate", 0.1),
+            ("YawRate", 0.4),
+            ("YawNorth", 1.5 * PI),
+            ("SteeringWheelAngle", PI / 2.0),
+            ("SteeringWheelAngleMax", 4.0 * PI),
+            ("SteeringWheelTorque", -5.0),
+        ]);
+        let get = |v: bono_sim::sys::bono_opt_f64| v.get().unwrap();
+        assert_eq!(get(out.velocity_longitudinal), 30.0);
+        assert_eq!(get(out.velocity_lateral), 3.0);
+        assert_eq!(get(out.velocity_vertical), 0.5);
+        assert_eq!(get(out.acceleration_longitudinal), -4.0);
+        assert_eq!(get(out.acceleration_lateral), -12.0);
+        assert_eq!(get(out.acceleration_vertical), 9.8);
+        assert_eq!(get(out.pitch), -0.02);
+        assert_eq!(get(out.pitch_rate), -0.1);
+        assert_eq!(get(out.yaw_rate), -0.4);
+        assert!((get(out.heading) + PI / 2.0).abs() < 1e-9);
+        // Sliding right of where it points: travel's a little right of west
+        let slip = (3.0f64).atan2(30.0);
+        assert!((get(out.course) - (-PI / 2.0 + slip)).abs() < 1e-9);
+        assert!((get(out.steering) + 0.25).abs() < 1e-9);
+        assert_eq!(get(out.steering_shaft_torque), 5.0);
+        assert_eq!(out.roll.get(), None);
+        assert_eq!(out.roll_rate.get(), None);
+
+        // Reversing: travel's behind the nose. Too slow, and there's no telling
+        let out = player(&[("VelocityX", -5.0), ("VelocityY", 0.0), ("YawNorth", 0.0)]);
+        assert!((get(out.course).abs() - PI).abs() < 1e-9);
+        let out = player(&[("VelocityX", 0.5), ("VelocityY", 0.0), ("YawNorth", 0.0)]);
+        assert_eq!(out.course.get(), None);
+        // No span, no steering; past the lock, at the lock
+        let out = player(&[("SteeringWheelAngle", 1.0)]);
+        assert_eq!(out.steering.get(), None);
+        let out = player(&[("SteeringWheelAngle", -9.0), ("SteeringWheelAngleMax", 4.0)]);
+        assert_eq!(get(out.steering), 1.0);
+    }
+
+    #[test]
+    fn the_wind_blows_from_its_bearing() {
+        use std::f64::consts::PI;
+        let wind = |speed: f64, from: f64| {
+            let (vars, data) =
+                super::super::sdk::Vars::doubles(&[("WindVel", speed), ("WindDir", from)]);
+            wind(&Frame::new(&vars, &data))
+        };
+        // From the north: the air moves south, +z
+        assert_eq!(wind(8.0, 0.0), (Some(0.0), Some(8.0)));
+        // From the east: west, +x
+        assert_eq!(wind(8.0, PI / 2.0), (Some(8.0), Some(0.0)));
+        // From the south-west: north-east, -x and -z
+        assert_eq!(wind(4.0, 1.25 * PI), (Some(-3.0), Some(-3.0)));
+        assert_eq!(wind(-1.0, 0.0), (None, None));
     }
 
     #[test]

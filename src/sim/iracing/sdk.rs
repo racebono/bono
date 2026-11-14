@@ -201,6 +201,26 @@ struct Var {
 pub struct Vars(HashMap<String, Var>);
 
 impl Vars {
+    /// Doubles named `names`, one after another, for tests: the variables and an update of
+    /// `values` in them.
+    #[cfg(test)]
+    pub fn doubles(values: &[(&str, f64)]) -> (Self, Vec<u8>) {
+        let mut vars = HashMap::new();
+        let mut data = Vec::new();
+        for (name, value) in values {
+            vars.insert(
+                (*name).to_owned(),
+                Var {
+                    kind: Kind::Double,
+                    offset: data.len(),
+                    count: 1,
+                },
+            );
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        (Self(vars), data)
+    }
+
     /// The variables `header` describes in `bytes` (the memory or file it's the header of). Those
     /// that don't fit in an update are left out.
     pub fn parse(bytes: &[u8], header: &Header) -> Option<Self> {

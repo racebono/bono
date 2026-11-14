@@ -537,7 +537,7 @@ mod tests {
     fn axis_conventions_hold_on_saved_laps() {
         use std::f64::consts::PI;
         let wrap = |a: f64| (a + PI).rem_euclid(2.0 * PI) - PI;
-        let mut checked = 0;
+        let (mut checked, mut calmed, mut climbed, mut winded) = (0, 0, 0, 0);
         for path in saved_files() {
             let ibt = Ibt::open(&path).unwrap();
             let n = ibt.records();
@@ -560,6 +560,10 @@ mod tests {
                 "Lat",
                 "Lon",
                 "Alt",
+                "ThrottleRaw",
+                "BrakeRaw",
+                "WindVel",
+                "WindDir",
             ];
             if n == 0 || ibt.tick_rate() <= 0 {
                 continue;
@@ -569,12 +573,17 @@ mod tests {
                 continue;
             }
             let at = |i: usize, name: &str| ibt.frame(i).f64(name).unwrap_or(f64::NAN);
-            let finite = |i: usize| channels.iter().all(|c| at(i, c).is_finite());
-            // Driving, with room either side for the rates, every channel a number
+            // How many updates up to each have a channel that isn't a number
+            let mut broken = vec![0usize; n + 1];
+            for i in 0..n {
+                let finite = channels.iter().all(|c| at(i, c).is_finite());
+                broken[i + 1] = broken[i] + usize::from(!finite);
+            }
+            // Driving, with room either side for the rates, every channel a number throughout
             let k = 30;
             let samples: Vec<usize> = (k..n.saturating_sub(k))
                 .filter(|&i| ibt.frame(i).bool("IsOnTrack") == Some(true) && at(i, "Speed") > 10.0)
-                .filter(|&i| finite(i - k) && finite(i) && finite(i + k))
+                .filter(|&i| broken[i + k + 1] == broken[i - k])
                 .collect();
             if samples.len() < 600 {
                 continue;
@@ -638,11 +647,14 @@ mod tests {
                 .filter(|&&i| at(i, "LatAccel").abs() < 2.0 && at(i, "LongAccel").abs() < 2.0)
                 .map(|&i| at(i, "VertAccel"))
                 .collect();
-            let up = calm.iter().sum::<f64>() / calm.len() as f64;
-            assert!(
-                (8.0..11.5).contains(&up),
-                "{name}: VertAccel isn't + up with gravity"
-            );
+            if calm.len() >= 60 {
+                calmed += 1;
+                let up = calm.iter().sum::<f64>() / calm.len() as f64;
+                assert!(
+                    (8.0..11.5).contains(&up),
+                    "{name}: VertAccel isn't + up with gravity"
+                );
+            }
             let pitch_rate = pairs(&|i| (at(i, "PitchRate"), rate(i, "Pitch")));
             assert!(
                 correlation(&pitch_rate) > 0.9,
@@ -653,17 +665,73 @@ mod tests {
                 (l.min(at(i, "Alt")), h.max(at(i, "Alt")))
             });
             if high - low >= 5.0 {
+                climbed += 1;
                 let climb = |i: usize| (at(i + 3, "Alt") - at(i - 3, "Alt")) / (6.0 * dt);
                 let pitch = pairs(&|i| (at(i, "Pitch"), climb(i) / at(i, "Speed")));
                 assert!(correlation(&pitch) < 0.0, "{name}: Pitch isn't + nose down");
+                // Nose up, gravity pulls back on the car: the accelerometer reads it forward
+                let gravity = pairs(&|i| (at(i, "Pitch"), at(i, "LongAccel") - rate(i, "Speed")));
+                assert!(
+                    correlation(&gravity) < 0.0,
+                    "{name}: Pitch isn't + nose down by gravity"
+                );
                 let vertical = pairs(&|i| {
                     let nose = at(i, "VelocityX") * (-at(i, "Pitch")).sin();
                     (at(i, "VelocityZ"), climb(i) - nose)
                 });
                 assert!(correlation(&vertical) > 0.0, "{name}: VelocityZ isn't + up");
+
+                // The wind, by what it does flat out on the straights: a tailwind is less drag
+                let wind =
+                    samples.iter().map(|&i| at(i, "WindVel")).sum::<f64>() / samples.len() as f64;
+                let gear = |i: usize| ibt.frame(i).i32("Gear");
+                let flat_out = |i: usize| {
+                    [i - 6, i, i + 6].iter().all(|&j| {
+                        at(j, "ThrottleRaw") >= 0.99
+                            && at(j, "BrakeRaw") <= 0.01
+                            && gear(j).is_some()
+                            && gear(j) == gear(i)
+                    }) && at(i, "LatAccel").abs() < 2.0
+                        && at(i, "Speed") > 20.0
+                };
+                // How much faster than the car usually goes at that gear and speed, uphill or not
+                let gains: Vec<_> = samples
+                    .iter()
+                    .filter(|&&i| flat_out(i))
+                    .map(|&i| {
+                        let v = at(i, "Speed");
+                        let gain = (at(i + 6, "Speed") - at(i - 6, "Speed")) / (12.0 * dt)
+                            + 9.81 * (at(i + 6, "Alt") - at(i - 6, "Alt")) / (12.0 * dt) / v;
+                        ((gear(i), v.round() as i64), gain, i)
+                    })
+                    .collect();
+                let mut usual = std::collections::HashMap::<_, (f64, usize)>::new();
+                for (key, gain, _) in &gains {
+                    let entry = usual.entry(*key).or_default();
+                    *entry = (entry.0 + gain, entry.1 + 1);
+                }
+                let tail = gains
+                    .iter()
+                    .filter(|(key, _, _)| usual[key].1 >= 20)
+                    .map(|(key, gain, i)| {
+                        let (sum, count) = usual[key];
+                        let from = at(*i, "WindDir") - at(*i, "YawNorth");
+                        (-at(*i, "WindVel") * from.cos(), gain - sum / count as f64)
+                    })
+                    .collect::<Vec<_>>();
+                if wind >= 3.0 && tail.len() >= 2000 {
+                    winded += 1;
+                    assert!(
+                        correlation(&tail) > 0.0,
+                        "{name}: WindDir isn't where the wind blows from"
+                    );
+                }
             }
         }
         assert!(checked > 0, "no saved laps long enough to check");
+        assert!(calmed > 0, "no saved laps calm enough to check gravity");
+        assert!(climbed > 0, "no saved laps climb enough to check pitch");
+        assert!(winded > 0, "no saved laps windy enough to check the wind");
     }
 
     #[test]
