@@ -96,6 +96,12 @@ jobs:
                   # PR caches can't be restored by other PRs; only master's are shared.
                   save-if: ${{ github.ref == 'refs/heads/master' }}
 
+            # ort-sys's build script puts ONNX Runtime's DLLs in the profile's folder and its
+            # `examples` and `deps` folders, and fails when one doesn't exist yet (a fresh build)
+            # and it can make symlinks
+            - name: Create ONNX Runtime DLL folders
+              run: New-Item -ItemType Directory -Force -Path target/debug/examples, target/debug/deps | Out-Null
+
             # Synthesizer tests talk to the phonemizer, so it must be built first.
             - name: Build phonemizer
               run: |

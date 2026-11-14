@@ -192,6 +192,10 @@ jobs:
                   }
                   New-Item -ItemType Junction -Path $short -Target $env:GITHUB_WORKSPACE | Out-Null
                   Set-Location -LiteralPath $short
+                  # ort-sys's build script puts ONNX Runtime's DLLs in the profile's folder and its
+                  # `examples` and `deps` folders, and fails when one doesn't exist yet (a fresh
+                  # build) and it can make symlinks
+                  New-Item -ItemType Directory -Force -Path target/release/examples, target/release/deps | Out-Null
                   cargo run --locked --release --package xtask -- dist
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
