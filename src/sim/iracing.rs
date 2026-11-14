@@ -514,6 +514,113 @@ mod tests {
         }
     }
 
+    /// Pearson's correlation of the pairs.
+    fn correlation(pairs: &[(f64, f64)]) -> f64 {
+        let n = pairs.len() as f64;
+        let (ma, mb) = pairs
+            .iter()
+            .fold((0.0, 0.0), |(a, b), (x, y)| (a + x / n, b + y / n));
+        let (mut ab, mut aa, mut bb) = (0.0, 0.0, 0.0);
+        for (x, y) in pairs {
+            ab += (x - ma) * (y - mb);
+            aa += (x - ma).powi(2);
+            bb += (y - mb).powi(2);
+        }
+        ab / (aa * bb).sqrt()
+    }
+
+    /// The directions the converter takes iRacing's axes and rotations to have (see `convert`),
+    /// against what's physical on the laps iRacing saved: the GPS track (`Lat`, `Lon`, `Alt`, in
+    /// saved telemetry only), speed and gravity. Should iRacing turn an axis round, this fails.
+    #[test]
+    #[ignore = "needs iRacing's saved telemetry (.ibt files) in BONO_IRACING_TELEMETRY"]
+    fn axis_conventions_hold_on_saved_laps() {
+        use std::f64::consts::PI;
+        let wrap = |a: f64| (a + PI).rem_euclid(2.0 * PI) - PI;
+        let mut checked = 0;
+        for path in saved_files() {
+            let ibt = Ibt::open(&path).unwrap();
+            let n = ibt.records();
+            let at = |i: usize, name: &str| ibt.frame(i).f64(name).unwrap_or(f64::NAN);
+            // Driving, with room either side for the rates
+            let k = 30;
+            let samples: Vec<usize> = (k..n.saturating_sub(k))
+                .filter(|&i| ibt.frame(i).bool("IsOnTrack") == Some(true) && at(i, "Speed") > 10.0)
+                .collect();
+            if samples.len() < 600 {
+                continue;
+            }
+            checked += 1;
+            let dt = 1.0 / 60.0;
+            let rate = |i: usize, name: &str| (at(i + 1, name) - at(i - 1, name)) / (2.0 * dt);
+            let lat0 = at(samples[0], "Lat").to_radians();
+            // Clockwise from north, as the GPS track goes
+            let bearing = |i: usize| {
+                let dx = (at(i + 3, "Lon") - at(i - 3, "Lon")) * lat0.cos();
+                dx.atan2(at(i + 3, "Lat") - at(i - 3, "Lat"))
+            };
+            let pairs = |f: &dyn Fn(usize) -> (f64, f64)| -> Vec<(f64, f64)> {
+                samples.iter().map(|&i| f(i)).collect()
+            };
+            let name = path.display();
+
+            // How much the GPS track turned (clockwise) around each update
+            let turn = pairs(&|i| {
+                let turned = wrap(bearing(i + k - 3) - bearing(i - k + 3));
+                (at(i, "YawRate"), turned)
+            });
+            assert!(correlation(&turn) < -0.8, "{name}: YawRate isn't + left");
+            let yaw = pairs(&|i| (at(i, "YawRate"), wrap(at(i + 1, "Yaw") - at(i - 1, "Yaw"))));
+            assert!(correlation(&yaw) > 0.9, "{name}: YawRate isn't Yaw's rate");
+            let north = samples
+                .iter()
+                .map(|&i| (at(i, "YawNorth") - bearing(i)).cos())
+                .sum::<f64>()
+                / samples.len() as f64;
+            assert!(north > 0.9, "{name}: YawNorth isn't a compass heading");
+            let steer = pairs(&|i| (at(i, "SteeringWheelAngle"), at(i, "YawRate")));
+            assert!(correlation(&steer) > 0.7, "{name}: steering isn't + left");
+            let torque = pairs(&|i| (at(i, "SteeringWheelTorque"), at(i, "SteeringWheelAngle")));
+            assert!(
+                correlation(&torque) < -0.5,
+                "{name}: steering torque isn't against the angle"
+            );
+            let lateral = pairs(&|i| (at(i, "LatAccel"), at(i, "Speed") * at(i, "YawRate")));
+            assert!(correlation(&lateral) > 0.8, "{name}: LatAccel isn't + left");
+            let slip = pairs(&|i| {
+                let slip = wrap(bearing(i) - at(i, "YawNorth"));
+                (at(i, "VelocityY").atan2(at(i, "VelocityX")), slip)
+            });
+            assert!(correlation(&slip) < -0.7, "{name}: VelocityY isn't + left");
+            let forward = samples
+                .iter()
+                .map(|&i| at(i, "VelocityX") / at(i, "Speed"))
+                .sum::<f64>()
+                / samples.len() as f64;
+            assert!(forward > 0.95, "{name}: VelocityX isn't + forward");
+            let longitudinal = pairs(&|i| (at(i, "LongAccel"), rate(i, "Speed")));
+            assert!(
+                correlation(&longitudinal) > 0.9,
+                "{name}: LongAccel isn't + forward"
+            );
+            let up =
+                samples.iter().map(|&i| at(i, "VertAccel")).sum::<f64>() / samples.len() as f64;
+            assert!(
+                (8.0..11.5).contains(&up),
+                "{name}: VertAccel isn't + up with gravity"
+            );
+            let climb = |i: usize| (at(i + 3, "Alt") - at(i - 3, "Alt")) / (6.0 * dt);
+            let pitch = pairs(&|i| (at(i, "Pitch"), climb(i) / at(i, "Speed")));
+            assert!(correlation(&pitch) < 0.0, "{name}: Pitch isn't + nose down");
+            let vertical = pairs(&|i| {
+                let nose = at(i, "VelocityX") * (-at(i, "Pitch")).sin();
+                (at(i, "VelocityZ"), climb(i) - nose)
+            });
+            assert!(correlation(&vertical) > 0.0, "{name}: VelocityZ isn't + up");
+        }
+        assert!(checked > 0, "no saved laps long enough to check");
+    }
+
     #[test]
     fn the_start_counts_count_only_when_they_are_counts() {
         use sdk::Buf;

@@ -7,10 +7,30 @@
 //! speed, pit stops, and the gaps between the cars. It gives no positions in the world, only
 //! distances around the lap.
 //!
-//! The enum values and bits are `irsdk_defines.h`'s. The SDK doesn't document which way its car
-//! axes and rotations point (forward, left or right, up or down), so the values whose meaning
-//! depends on that (orientation, rates, accelerations, the steering angle and torque) aren't
-//! recorded.
+//! The enum values and bits are `irsdk_defines.h`'s.
+//!
+//! The SDK doesn't document which way its car axes and rotations point. They're taken from what
+//! iRacing's own saved laps show (`.ibt` files, which also have the car's GPS position), each
+//! checked against something physical, in every file checked, and turned into the recording's
+//! conventions (lateral, yaw and steering positive to the right, pitch positive nose up):
+//!
+//! - `Yaw` and `YawRate` are positive turning left: over a lap, `YawRate` turns the opposite way
+//!   to the GPS track, and matches how `Yaw` changes. `YawNorth` is a compass heading, clockwise
+//!   from north, as the GPS bearing is.
+//! - `SteeringWheelAngle` is positive to the left: it has the yaw rate's sign. The docs say right,
+//!   which the laps contradict. `SteeringWheelTorque` is on the same axis, against the angle.
+//!   `SteeringWheelAngleMax` is taken for the wheel's span lock to lock: no lap reaches it, and as
+//!   one side's lock it would make the cars' steering several turns each way.
+//! - `LatAccel` and `VelocityY` are positive to the left: the acceleration has the sign of speed
+//!   times yaw rate, and the velocity's angle is opposite to the GPS track's slip from the heading.
+//! - `VelocityX` and `LongAccel` are positive forward, `VelocityZ` and `VertAccel` up (the
+//!   accelerations including gravity: `VertAccel` reads about 9.8 driving on the flat).
+//! - `Pitch` and `PitchRate` are positive nose down: pitch goes against the GPS climb rate and
+//!   against gravity's pull on `LongAccel`.
+//! - `Roll` isn't recorded: the laps don't say which way it points (it mixes how the car leans
+//!   with the track's camber, and the two anchors disagree between tracks).
+//!
+//! `sim::iracing::tests::axis_conventions_hold_on_saved_laps` checks these against saved laps.
 
 use super::{
     sdk::{Frame, UNLIMITED_LAPS, UNLIMITED_TIME},
@@ -74,6 +94,8 @@ const SPEED_WINDOW: f64 = 0.25;
 /// How close (s) a lap timed here must be to the game's best lap to be taken for it: the line
 /// crossing is worked out between updates, from the lap distance, which the game's timing isn't.
 const BEST_LAP_MATCH: f64 = 0.1;
+/// Slower than this (m/s), which way a car moves is noise.
+const MIN_DIRECTION_SPEED: f64 = 1.0;
 /// Slower than this (m/s), a car in its pit box has stopped there.
 const STOPPED: f64 = 0.5;
 /// How far apart (laps) the lap count going up and the car crossing the line may be, either way
@@ -669,6 +691,38 @@ fn player_telemetry(frame: &Frame<'_>, info: &SessionInfo, out: &mut bono_teleme
     let clutch = |name: &str| pedal(name).map(|engaged| 1.0 - engaged);
 
     out.speed = f("Speed").map(f64::abs).into();
+    // Axes and rotations as the module's doc says iRacing's point: left, nose down and turning
+    // left are positive there, the other way round here
+    let negated = |name: &str| f(name).map(|v| -v);
+    out.velocity_longitudinal = f("VelocityX").into();
+    out.velocity_lateral = negated("VelocityY").into();
+    out.velocity_vertical = f("VelocityZ").into();
+    out.acceleration_longitudinal = f("LongAccel").into();
+    out.acceleration_lateral = negated("LatAccel").into();
+    out.acceleration_vertical = f("VertAccel").into();
+    out.pitch = negated("Pitch").into();
+    out.pitch_rate = negated("PitchRate").into();
+    out.yaw_rate = negated("YawRate").into();
+    // A compass heading: 0 north, turning right positive. Travel is off the nose by the slip
+    let heading = f("YawNorth").map(|h| h.sin().atan2(h.cos()));
+    out.heading = heading.into();
+    out.course = heading
+        .zip(f("VelocityX").zip(f("VelocityY")))
+        .filter(|(_, (x, y))| x.hypot(*y) >= MIN_DIRECTION_SPEED)
+        .map(|(h, (x, y))| {
+            let course = h + (-y).atan2(x);
+            course.sin().atan2(course.cos())
+        })
+        .into();
+    // Half the span either way
+    let half_lock = f("SteeringWheelAngleMax")
+        .filter(|max| *max > 0.0)
+        .map(|max| max / 2.0);
+    out.steering = negated("SteeringWheelAngle")
+        .zip(half_lock)
+        .map(|(angle, half)| (angle / half).clamp(-1.0, 1.0))
+        .into();
+    out.steering_shaft_torque = negated("SteeringWheelTorque").into();
     out.delta_best = f("LapDeltaToBestLap")
         .filter(|_| frame.bool("LapDeltaToBestLap_OK") == Some(true))
         .into();

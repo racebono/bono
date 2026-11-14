@@ -43,7 +43,7 @@
     X(f64, position_x)                                                                                   \
     X(f64, position_y)                                                                                   \
     X(f64, position_z)                                                                                   \
-    X(f64, heading) /* radians the car body points: 0 along world -z, + turning right; see the schema guide for opponents */ \
+    X(f64, heading) /* radians the car body points: 0 along world -z, + turning right; see the schema guide for opponents. iRacing: a compass heading, 0 north */ \
     X(f64, course) /* radians of the direction of travel, same convention; NULL below 1 m/s */ \
     X(i64, cars_left) /* player: cars alongside on the left as the simulator reports them, 0-2; NULL when it doesn't (the spotter works it out from positions) */ \
     X(i64, cars_right) /* the same on the right; set both or neither */ \
@@ -55,7 +55,7 @@
     X(f64, velocity_vertical)                                                                            \
     X(f64, acceleration_longitudinal)                                                                    \
     X(f64, acceleration_lateral)                                                                         \
-    X(f64, acceleration_vertical)                                                                        \
+    X(f64, acceleration_vertical)           /* iRacing: the three including gravity */                   \
     X(f64, pitch_rate)                                                                                   \
     X(f64, yaw_rate)                                                                                     \
     X(f64, roll_rate)                                                                                    \
@@ -71,7 +71,7 @@
     X(f64, brake_filtered)                                                                               \
     X(f64, steering_filtered)                                                                            \
     X(f64, clutch_filtered)                                                                              \
-    X(f64, steering_shaft_torque)           /* Nm */                                                     \
+    X(f64, steering_shaft_torque)           /* Nm (iRacing: + towards the right) */                      \
     /* Powertrain */                                                                                     \
     X(i64, gear)                            /* -1 reverse, 0 neutral */                                  \
     X(f64, engine_rpm)                                                                                   \
@@ -135,7 +135,7 @@
     X(boolean, headlights)                                                                               \
     X(i64, wipers)                                                                                       \
     X(i64, scheduled_pit_stops)                                                                          \
-    X(f64, steering_wheel_range) /* physical; RaceRoom: degrees, full left to full right; LMU: unit and span not documented; iRacing: degrees, span not documented */ \
+    X(f64, steering_wheel_range) /* physical; RaceRoom: degrees, full left to full right; LMU: unit and span not documented; iRacing: degrees, taken for lock to lock (its span isn't documented) */ \
     X(f64, engine_max_rpm) /* rev limit, not the best shift point */ \
     X(i64, max_gears) /* forward gears */ \
     /* The highest value of each control, which does not prove every step differs */ \
