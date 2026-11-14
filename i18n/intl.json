@@ -735,6 +735,16 @@
         "es": "La voz a texto se ejecuta en la tarjeta gráfica, que es más rápida salvo que el simulador la tenga ocupada. Desactivado, se ejecuta en el procesador",
         "ca": "La veu a text s'executa a la targeta gràfica, que és més ràpida tret que el simulador la tingui ocupada. Desactivat, s'executa al processador"
     },
+    "audio.voice_gpu": {
+        "en": "Use the GPU",
+        "es": "Usar la GPU",
+        "ca": "Fer servir la GPU"
+    },
+    "audio.voice_gpu_hover": {
+        "en": "Voices run on the graphics card, which can be slower while the simulator keeps it busy. If it can't, or when this is off, they run on the processor",
+        "es": "Las voces se ejecutan en la tarjeta gráfica, que puede ser más lenta mientras el simulador la tiene ocupada. Si no puede, o cuando esto está desactivado, se ejecutan en el procesador",
+        "ca": "Les veus s'executen a la targeta gràfica, que pot ser més lenta mentre el simulador la té ocupada. Si no pot, o quan això està desactivat, s'executen al processador"
+    },
     "audio.model": {
         "en": "Model",
         "es": "Modelo",
