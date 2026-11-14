@@ -2,6 +2,13 @@
 //! and a column per field: `telemetry`, `telemetry_wheel`, `car_state`, `session`,
 //! `session_sector`, `standings`, `standing_sector` and `forecast`. The columns come from the
 //! headers' column lists (see `build.rs`).
+//!
+//! A recording is split into epochs (the `epoch` table): a session, a restart or anything else that
+//! breaks the timeline starts a new one. The `telemetry`, `session` and `standings` rows carry the
+//! epoch they were recorded in, and each epoch's rows come after every earlier epoch's, so an
+//! epoch's rows are those from its `*_from` ids on. Readers look at the newest epoch (see
+//! [`active_epoch`]) to keep one session's laps, standings and car state from mixing with
+//! another's.
 
 use crate::sys::{
     bono_car_state, bono_forecast_point, bono_session_info, bono_session_sector, bono_standing,
@@ -75,7 +82,12 @@ sim_wheel_telemetry_columns!(columns!(bono_wheel_telemetry));
 
 pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(&format!(
-        "CREATE TABLE IF NOT EXISTS telemetry (id INTEGER PRIMARY KEY{telemetry});
+        "-- An epoch's rows are each table's from its *_from id on (until the next epoch's)
+        CREATE TABLE IF NOT EXISTS epoch (
+            id INTEGER PRIMARY KEY, reason TEXT NOT NULL, telemetry_from INTEGER NOT NULL,
+            session_from INTEGER NOT NULL, standings_from INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS telemetry (id INTEGER PRIMARY KEY, epoch INTEGER{telemetry});
 
         -- wheel: 0 = front left, 1 = front right, 2 = rear left, 3 = rear right
         CREATE TABLE IF NOT EXISTS telemetry_wheel (
@@ -93,12 +105,12 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         -- sector: zero-based, a row per sector of the session's sector_count; standing_sector's
         -- are telemetry's, session_sector's in the order the simulator reports them, which may
         -- not be telemetry's: the two aren't to be joined on it
-        CREATE TABLE IF NOT EXISTS session (id INTEGER PRIMARY KEY{session});
+        CREATE TABLE IF NOT EXISTS session (id INTEGER PRIMARY KEY, epoch INTEGER{session});
         CREATE TABLE IF NOT EXISTS session_sector (
             session_id INTEGER NOT NULL REFERENCES session(id), sector INTEGER NOT NULL{session_sector},
             PRIMARY KEY (session_id, sector)
         ) WITHOUT ROWID;
-        CREATE TABLE IF NOT EXISTS standings (id INTEGER PRIMARY KEY{standing});
+        CREATE TABLE IF NOT EXISTS standings (id INTEGER PRIMARY KEY, epoch INTEGER{standing});
         CREATE TABLE IF NOT EXISTS standing_sector (
             standing_id INTEGER NOT NULL REFERENCES standings(id), sector INTEGER NOT NULL{standing_sector},
             PRIMARY KEY (standing_id, sector)
@@ -114,6 +126,105 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         forecast = bono_forecast_point::DEFINITIONS,
     ))?;
     Ok(())
+}
+
+/// Why an epoch began, in the `epoch` table's `reason`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpochReason {
+    /// Recording started
+    Start,
+    /// What was recorded was deleted (another event, or the app asked)
+    Cleared,
+    /// The simulator reported another session (its identity changed)
+    Session,
+    /// The session's clock went back: a restart, or a jump the timeline can't follow
+    ClockRollback,
+    /// Back from a replay without the live timeline carrying on where it left off
+    Replay,
+    /// A writer restarted after an error found its epoch's row missing
+    Resumed,
+}
+
+impl EpochReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Cleared => "cleared",
+            Self::Session => "session",
+            Self::ClockRollback => "clock_rollback",
+            Self::Replay => "replay",
+            Self::Resumed => "resumed",
+        }
+    }
+}
+
+/// Starts epoch `id`: its rows are those written from now on. Nothing happens if it's already
+/// there (a writer restarted in the same epoch).
+pub fn begin_epoch(conn: &Connection, id: i64, reason: EpochReason) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO epoch (id, reason, telemetry_from, session_from, standings_from) \
+         VALUES (?1, ?2, (SELECT coalesce(max(id), 0) + 1 FROM telemetry), \
+         (SELECT coalesce(max(id), 0) + 1 FROM session), \
+         (SELECT coalesce(max(id), 0) + 1 FROM standings))",
+    )?
+    .execute(rusqlite::params![id, reason.as_str()])?;
+    Ok(())
+}
+
+/// The newest epoch of a recording: where its rows start in each table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Epoch {
+    /// `None` for recordings made before epochs, or before the first one's row is written: their
+    /// rows all count, from 1
+    pub id: Option<i64>,
+    pub telemetry_from: i64,
+    pub session_from: i64,
+    pub standings_from: i64,
+}
+
+impl Epoch {
+    /// The whole recording, for one without epochs.
+    pub const ALL: Self = Self {
+        id: None,
+        telemetry_from: 1,
+        session_from: 1,
+        standings_from: 1,
+    };
+}
+
+impl Default for Epoch {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+/// The newest epoch, or [`Epoch::ALL`] for recordings without any. The recording may be attached
+/// to `conn` under another schema name.
+pub fn active_epoch(conn: &Connection) -> rusqlite::Result<Epoch> {
+    let exists = conn
+        .prepare_cached("SELECT 1 FROM pragma_table_list WHERE name = 'epoch' AND type = 'table'")?
+        .exists([])?;
+    if !exists {
+        return Ok(Epoch::ALL);
+    }
+    let epoch = conn
+        .prepare_cached(
+            "SELECT id, telemetry_from, session_from, standings_from FROM epoch \
+             ORDER BY id DESC LIMIT 1",
+        )?
+        .query_row([], |row| {
+            Ok(Epoch {
+                id: Some(row.get(0)?),
+                telemetry_from: row.get(1)?,
+                session_from: row.get(2)?,
+                standings_from: row.get(3)?,
+            })
+        });
+    match epoch {
+        Ok(epoch) => Ok(epoch),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(Epoch::ALL),
+        Err(e) => Err(e),
+    }
 }
 
 /// Indexes for reading a recording once it's exported (see https://github.com/racebono/bono-export),
@@ -201,7 +312,7 @@ impl<'conn> TelemetryWriter<'conn> {
     pub fn new(conn: &'conn Connection) -> rusqlite::Result<Self> {
         Ok(Self {
             conn,
-            insert_car: prepare_insert::<bono_telemetry>(conn, "telemetry", &[])?,
+            insert_car: prepare_insert::<bono_telemetry>(conn, "telemetry", &["epoch"])?,
             insert_wheel: prepare_insert::<bono_wheel_telemetry>(
                 conn,
                 "telemetry_wheel",
@@ -220,8 +331,11 @@ impl<'conn> TelemetryWriter<'conn> {
         self.last_states.clear();
     }
 
-    pub fn write(&mut self, telemetry: &bono_telemetry) -> rusqlite::Result<()> {
-        telemetry.bind(&mut self.insert_car, 1)?;
+    /// Writes an update of epoch `epoch`. Call `reset` when the epoch changes, so each epoch has
+    /// its cars' state of its own.
+    pub fn write(&mut self, epoch: i64, telemetry: &bono_telemetry) -> rusqlite::Result<()> {
+        self.insert_car.raw_bind_parameter(1, epoch)?;
+        telemetry.bind(&mut self.insert_car, 2)?;
         self.insert_car.raw_execute()?;
         let telemetry_id = self.conn.last_insert_rowid();
 
@@ -302,13 +416,13 @@ impl<'conn> ScoringWriter<'conn> {
     pub fn new(conn: &'conn Connection) -> rusqlite::Result<Self> {
         Ok(Self {
             conn,
-            insert_session: prepare_insert::<bono_session_info>(conn, "session", &[])?,
+            insert_session: prepare_insert::<bono_session_info>(conn, "session", &["epoch"])?,
             insert_session_sector: prepare_insert::<bono_session_sector>(
                 conn,
                 "session_sector",
                 &["session_id", "sector"],
             )?,
-            insert_standing: prepare_insert::<bono_standing>(conn, "standings", &[])?,
+            insert_standing: prepare_insert::<bono_standing>(conn, "standings", &["epoch"])?,
             insert_standing_sector: prepare_insert::<bono_standing_sector>(
                 conn,
                 "standing_sector",
@@ -324,8 +438,11 @@ impl<'conn> ScoringWriter<'conn> {
         self.last_standings.clear();
     }
 
+    /// Writes an update of epoch `epoch`. Call `reset` when the epoch changes, so each epoch starts
+    /// with every car's standing.
     pub fn write(
         &mut self,
+        epoch: i64,
         session: bono_session_info,
         standings: Vec<bono_standing>,
     ) -> rusqlite::Result<()> {
@@ -343,7 +460,8 @@ impl<'conn> ScoringWriter<'conn> {
         if self.last_session.as_ref().is_none_or(|last| {
             session.changed(last) || sectors_changed(&session.sectors, &last.sectors, count)
         }) {
-            session.bind(&mut self.insert_session, 1)?;
+            self.insert_session.raw_bind_parameter(1, epoch)?;
+            session.bind(&mut self.insert_session, 2)?;
             self.insert_session.raw_execute()?;
             let id = self.conn.last_insert_rowid();
             write_sectors(&mut self.insert_session_sector, id, &session.sectors, count)?;
@@ -358,7 +476,8 @@ impl<'conn> ScoringWriter<'conn> {
                 continue;
             }
 
-            standing.bind(&mut self.insert_standing, 1)?;
+            self.insert_standing.raw_bind_parameter(1, epoch)?;
+            standing.bind(&mut self.insert_standing, 2)?;
             self.insert_standing.raw_execute()?;
             let id = self.conn.last_insert_rowid();
             write_sectors(
@@ -446,11 +565,11 @@ mod tests {
         car.pit_service_refuel_selected = Some(true).into();
         car.pit_service_refuel_active = Some(false).into();
         writer
-            .write(bono_session_info::default(), vec![car.clone()])
+            .write(1, bono_session_info::default(), vec![car.clone()])
             .unwrap();
         car.pit_service_refuel_active = Some(true).into();
         writer
-            .write(bono_session_info::default(), vec![car])
+            .write(1, bono_session_info::default(), vec![car])
             .unwrap();
         let result: (i64, bool, f64, bool, bool, Option<bool>, Option<String>) = conn.query_row(
             "SELECT (SELECT COUNT(*) FROM standings), penalty_drive_through_active, penalty_stop_and_go_seconds, pit_service_refuel_selected, pit_service_refuel_active, pit_service_front_tires_active, simulator_metadata FROM standings ORDER BY id DESC LIMIT 1", [],
@@ -477,7 +596,7 @@ mod tests {
         let mut car = bono_standing::default();
         car.vehicle_id = Some(1).into();
         car.sectors[0].last_lap = Some(30.0).into();
-        writer.write(session.clone(), vec![car.clone()]).unwrap();
+        writer.write(1, session.clone(), vec![car.clone()]).unwrap();
         assert_eq!(count("session_sector"), 16);
         assert_eq!(count("standing_sector"), 16);
         let yellow: i64 = conn
@@ -490,12 +609,12 @@ mod tests {
         assert_eq!(yellow, 15);
 
         // Nothing changed: nothing written
-        writer.write(session.clone(), vec![car.clone()]).unwrap();
+        writer.write(1, session.clone(), vec![car.clone()]).unwrap();
         assert_eq!((count("session"), count("standings")), (1, 1));
 
         // A sector's time alone is a change
         car.sectors[1].last_lap = Some(35.0).into();
-        writer.write(session.clone(), vec![car.clone()]).unwrap();
+        writer.write(1, session.clone(), vec![car.clone()]).unwrap();
         assert_eq!((count("session"), count("standings")), (1, 2));
         let (last, standing): (f64, i64) = conn
             .query_row(
@@ -510,22 +629,64 @@ mod tests {
         // Fewer sectors: only theirs are written, and only theirs compared
         session.sector_count = Some(2).into();
         session.sectors[15].local_yellow = Some(false).into();
-        writer.write(session.clone(), vec![car.clone()]).unwrap();
+        writer.write(1, session.clone(), vec![car.clone()]).unwrap();
         assert_eq!(count("session"), 2);
         assert_eq!(count("session_sector"), 18);
         // The new count's sectors for every car, changed or not
         assert_eq!(count("standings"), 3);
         assert_eq!(count("standing_sector"), 34);
         car.sectors[5].last_lap = Some(40.0).into();
-        writer.write(session.clone(), vec![car.clone()]).unwrap();
+        writer.write(1, session.clone(), vec![car.clone()]).unwrap();
         assert_eq!(count("standings"), 3);
 
         // A session without a count has none
         session.sector_count = None.into();
-        writer.write(session, vec![car]).unwrap();
+        writer.write(1, session, vec![car]).unwrap();
         assert_eq!(count("session"), 3);
         assert_eq!(count("session_sector"), 18);
         assert_eq!((count("standings"), count("standing_sector")), (4, 34));
+    }
+
+    #[test]
+    fn finds_the_newest_epoch_wherever_the_recording_is() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Recordings made before epochs are all one
+        conn.execute_batch("CREATE TABLE telemetry (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        assert_eq!(active_epoch(&conn).unwrap(), Epoch::ALL);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recording.db");
+        let recording = Connection::open(&path).unwrap();
+        create_tables(&recording).unwrap();
+        // Before its first epoch's row
+        assert_eq!(active_epoch(&recording).unwrap(), Epoch::ALL);
+        TelemetryWriter::new(&recording)
+            .unwrap()
+            .write(1, &bono_telemetry::default())
+            .unwrap();
+        begin_epoch(&recording, 1, EpochReason::Start).unwrap();
+        begin_epoch(&recording, 2, EpochReason::Session).unwrap();
+        // Already there: it keeps where it started
+        TelemetryWriter::new(&recording)
+            .unwrap()
+            .write(2, &bono_telemetry::default())
+            .unwrap();
+        begin_epoch(&recording, 2, EpochReason::Resumed).unwrap();
+        let newest = Epoch {
+            id: Some(2),
+            telemetry_from: 2,
+            session_from: 1,
+            standings_from: 1,
+        };
+        assert_eq!(active_epoch(&recording).unwrap(), newest);
+
+        // Attached, as the engineer reads it
+        let attached = Connection::open_in_memory().unwrap();
+        attached
+            .execute("ATTACH DATABASE ?1 AS recording", [path.to_str().unwrap()])
+            .unwrap();
+        assert_eq!(active_epoch(&attached).unwrap(), newest);
     }
 
     #[test]
@@ -547,10 +708,14 @@ mod tests {
         assert!(!conn.column_exists(None, "telemetry", "obsolete").unwrap());
         assert!(conn.column_exists(None, "forecast", "generation").unwrap());
         let mut telemetry = TelemetryWriter::new(&conn).unwrap();
-        telemetry.write(&bono_telemetry::default()).unwrap();
+        telemetry.write(1, &bono_telemetry::default()).unwrap();
         ScoringWriter::new(&conn)
             .unwrap()
-            .write(bono_session_info::default(), vec![bono_standing::default()])
+            .write(
+                1,
+                bono_session_info::default(),
+                vec![bono_standing::default()],
+            )
             .unwrap();
         ForecastWriter::new(&conn)
             .unwrap()

@@ -6,6 +6,7 @@
 
 use crate::{provider::ToolHandler, sqlite::pool::Pool};
 use anyhow::{Context as _, bail};
+use bono_sim::sql::{Epoch, active_epoch};
 use rusqlite::{
     Connection, Params, params,
     types::{FromSql, Value},
@@ -183,6 +184,8 @@ impl Engineer {
         let conn = self.inner.db.get().await?;
         let shared = self.inner.shared.clone();
         conn.run(move |conn| {
+            // One snapshot of the recording: the epoch and its rows as of the same write
+            let _snapshot = conn.unchecked_transaction()?;
             let ctx = Ctx::new(conn, &shared)?;
             let mut out = String::new();
             cmd_quick(&ctx, &mut out)?;
@@ -551,6 +554,8 @@ fn pit_window(ctx: &Ctx) -> anyhow::Result<(Option<String>, bool)> {
 struct Ctx<'a> {
     conn: &'a Connection,
     shared: &'a Shared,
+    /// The recording's newest epoch: the session the answers are about
+    epoch: Epoch,
     vehicle: i64,
     last_id: i64,
     /// The player's newest telemetry row, with its car_state values
@@ -560,13 +565,17 @@ struct Ctx<'a> {
 
 impl<'a> Ctx<'a> {
     fn new(conn: &'a Connection, shared: &'a Shared) -> anyhow::Result<Self> {
+        let epoch = active_epoch(conn)?;
+        // Only this session's: a car the player drove in an earlier one says nothing of now
         let Some(row_) = row(
             conn,
-            "SELECT id, vehicle_id FROM telemetry WHERE is_player = 1 ORDER BY id DESC LIMIT 1",
-            [],
+            "SELECT id, vehicle_id FROM telemetry WHERE is_player = 1 AND id >= ?              ORDER BY id DESC LIMIT 1",
+            [epoch.telemetry_from],
         )?
         else {
-            bail!("no rows flagged is_player = 1 (spectating, or the player isn't in a car yet)");
+            bail!(
+                "no rows flagged is_player = 1 in this session (spectating, or the player isn't in a car yet)"
+            );
         };
         let vehicle = row_
             .i("vehicle_id")
@@ -580,6 +589,7 @@ impl<'a> Ctx<'a> {
         Ok(Self {
             conn,
             shared,
+            epoch,
             vehicle,
             last_id,
             player,
@@ -600,7 +610,10 @@ impl<'a> Ctx<'a> {
         let rows = rows(
             self.conn,
             "SELECT * FROM telemetry WHERE id BETWEEN ? AND ? ORDER BY id",
-            params![self.last_id - FRAME_SCAN, self.last_id + FRAME_WINDOW],
+            params![
+                (self.last_id - FRAME_SCAN).max(self.epoch.telemetry_from),
+                self.last_id + FRAME_WINDOW
+            ],
         )?;
 
         let t = self.player.f("session_time").unwrap_or(0.0);
@@ -681,7 +694,11 @@ impl Scoring {
 
     fn new(ctx: &Ctx) -> anyhow::Result<Self> {
         let conn = ctx.conn;
-        let session = row(conn, "SELECT * FROM session ORDER BY id DESC LIMIT 1", [])?;
+        let session = row(
+            conn,
+            "SELECT * FROM session WHERE id >= ? ORDER BY id DESC LIMIT 1",
+            [ctx.epoch.session_from],
+        )?;
         let yellow_sectors = match session.as_ref().and_then(|s| s.i("id")) {
             Some(id) => rows(
                 conn,
@@ -699,12 +716,14 @@ impl Scoring {
             .and_then(|s| s.i("vehicle_count"))
             .filter(|n| *n > 0);
 
-        // Walk back from the newest standings row until every car is found or the session starts
+        // Walk back from the newest standings row until every car is found or the session starts:
+        // the epoch's first row, or the clock going back before it in recordings without epochs
+        let first = ctx.epoch.standings_from.max(1);
         let mut cars = BTreeMap::new();
         let mut hi = scalar::<i64>(conn, "SELECT MAX(id) FROM standings", [])?.unwrap_or(0);
         let (mut newer_t, mut scanned) = (None::<f64>, 0);
-        while hi > 0 && scanned < Self::MAX_ROWS {
-            let lo = (hi - Self::SCAN + 1).max(1);
+        while hi >= first && scanned < Self::MAX_ROWS {
+            let lo = (hi - Self::SCAN + 1).max(first);
             let mut boundary = false;
             for r in rows(
                 conn,
@@ -2845,6 +2864,28 @@ mod tests {
             .run(serde_json::from_value(input).unwrap())
             .await
             .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quick_is_about_the_newest_epoch_only() {
+        let (dir, engineer) = race();
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(out.starts_with("QUICK"), "{out}");
+
+        // Another session starts, spectating: no row of it is the player's
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        bono_sim::sql::begin_epoch(&conn, i64::MAX, bono_sim::sql::EpochReason::Session).unwrap();
+        conn.execute(
+            "INSERT INTO telemetry (vehicle_id, is_player, session_time) VALUES (1, 0, 5000)",
+            [],
+        )
+        .unwrap();
+        let error = engineer
+            .run(serde_json::from_value(serde_json::json!({"command": "quick"})).unwrap())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("in this session"), "{error}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

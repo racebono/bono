@@ -527,12 +527,16 @@ namespace {
         // The database is created when the first session loads (while the pilot is still in the garage), not
         // when the game starts. It lives in UserData\bono, where the app and the skill's scripts look
         // for it while the game runs, holds a whole weekend, and is deleted when the game closes.
+        // Each session is an epoch of its own (a recording just started is one already), so its laps,
+        // standings and car state aren't taken for the last session's, even if the clock doesn't go back.
         void StartSession() override {
             {
                 std::lock_guard lock(_contexts_mutex);
                 _contexts.clear();
             }
+            const bool recording = _recorder != nullptr;
             start_recording();
+            if (recording && _recorder) bono_lmu_begin_session(_recorder);
         }
 
         // A track loading is a new weekend (its sessions come and go without loading it again): the last

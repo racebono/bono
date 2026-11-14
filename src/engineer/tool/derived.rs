@@ -10,6 +10,7 @@
 //! they're read, so they're written just before each query.
 
 use super::*;
+use bono_sim::sql::{Epoch, active_epoch};
 use rusqlite::{
     hooks::{AuthAction, AuthContext, Authorization},
     limits::Limit,
@@ -327,7 +328,13 @@ fn thread(shared: &Shared, requests: &mpsc::Receiver<Request>) {
             Some(request) => {
                 let result = match request.job {
                     Job::Sql { query, limit } => data.sql(shared, &query, limit),
-                    Job::Track => track_json(&data.conn, shared, &mut data.stream),
+                    Job::Track => {
+                        // Following the recording's newest epoch, for the session it's about
+                        if let Err(e) = data.stream.tick(&data.conn, shared) {
+                            log::debug!("The engineer's tables didn't update: {e:#}");
+                        }
+                        track_json(&data.conn, shared, &mut data.stream)
+                    }
                     #[cfg(test)]
                     Job::Sync => data.sync(shared).map(|()| String::new()),
                 };
@@ -428,6 +435,12 @@ impl Data {
         };
 
         let conn = &self.conn;
+        // The query reads one snapshot of the recording, of the epoch the tables were just written
+        // for: another one since (a clear reusing the row ids, say) wouldn't match them
+        let snapshot = conn.unchecked_transaction()?;
+        if active_epoch(conn)?.id != self.stream.epoch.id {
+            bail!("the recording moved on to another session: just retry");
+        }
         conn.authorizer(Some(authorize))?;
         let result = (|| {
             let previous = conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, SQL_MAX_VALUE_BYTES)?;
@@ -438,6 +451,7 @@ impl Data {
             result
         })();
         conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+        drop(snapshot);
         result
     }
 }
@@ -503,9 +517,12 @@ fn run_query(
         .unwrap_or(stream.cursor);
     say!(
         out,
-        "-- player vehicle_id={}, session_first_id={}, latest_telemetry_id={latest}",
+        "-- player vehicle_id={}, session_first_id={}, latest_telemetry_id={latest}, \
+         standings_first_id={}, session_row_first_id={}",
         int(stream.player),
         stream.session_start,
+        stream.epoch.standings_from,
+        stream.epoch.session_from,
     );
     if stream.behind || stream.failed {
         say!(
@@ -1974,6 +1991,8 @@ pub(super) struct Stream {
     /// The last tick failed: the tables may be behind, whatever `behind` says
     pub failed: bool,
     pub session_start: i64,
+    /// The recording's epoch the tables are about: its rows are the session's, whatever the clock
+    pub epoch: Epoch,
     /// The last telemetry row read
     pub cursor: i64,
     /// (session_time, vehicle_id) of the row at `cursor`, to notice a recreated file
@@ -2012,10 +2031,17 @@ impl Stream {
 
     fn advance(&mut self, conn: &Connection, shared: &Shared) -> anyhow::Result<()> {
         self.behind = false;
+        let epoch = active_epoch(conn)?;
         if !self.started {
-            self.session_start = session_start(conn)?;
+            self.epoch = epoch;
+            self.standings_cursor = epoch.standings_from - 1;
+            self.session_start = session_start(conn, epoch.telemetry_from)?;
             self.cursor = self.session_start - 1;
             self.started = true;
+        } else if epoch.id != self.epoch.id {
+            // Another session (or another part of the timeline), with or without the player's
+            // rows or the clock going back to say so
+            self.enter_epoch(conn, epoch)?;
         }
         self.notice_recreated_file(conn)?;
         if self
@@ -2025,14 +2051,21 @@ impl Stream {
             self.check_layout(conn, shared)?;
         }
 
-        // Read first: a failed read (the logger mid-checkpoint, say) changes nothing
+        // One snapshot of the recording from here on. Read first: a failed read (the logger
+        // mid-checkpoint, say) changes nothing
+        let tx = conn.unchecked_transaction()?;
+        // Another epoch written since it was looked at: its rows aren't this one's, and the next
+        // tick starts it
+        if active_epoch(conn)?.id != self.epoch.id {
+            self.behind = true;
+            return Ok(());
+        }
         let samples = conn
             .prepare_cached(&format!(
                 "SELECT {SAMPLE_COLUMNS} FROM telemetry WHERE id > ? ORDER BY id LIMIT ?"
             ))?
             .query_map(params![self.cursor, CHUNK], sample)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let tx = conn.unchecked_transaction()?;
         let standings_from = self.standings_cursor;
         let standings_behind = match self.read_standings(conn) {
             Ok(behind) => behind,
@@ -2138,12 +2171,27 @@ impl Stream {
         if same && top("standings")? >= self.standings_cursor {
             return Ok(());
         }
-        self.standings_cursor = 0;
+        let epoch = active_epoch(conn)?;
+        self.enter_epoch(conn, epoch)
+    }
+
+    /// Everything is read again from `epoch`'s first rows: nothing of another epoch's cars,
+    /// drivers or laps carries over, even in the same slots.
+    fn enter_epoch(&mut self, conn: &Connection, epoch: Epoch) -> rusqlite::Result<()> {
+        // Read before anything changes: failing, it's tried again next tick
+        let start = session_start(conn, epoch.telemetry_from)?;
+        self.epoch = epoch;
+        self.standings_cursor = epoch.standings_from - 1;
         self.standings_t = None;
         self.laps_completed.clear();
         self.official.clear();
         self.drivers = Drivers::default();
-        let start = session_start(conn)?;
+        // Whose car is whose, the epoch's player rows say again
+        self.player = None;
+        // Maybe another track: its layout is looked for before the epoch's rows are read, and its
+        // timing lines again
+        self.checked_layout = None;
+        self.timing = None;
         self.start_session(conn, start)
     }
 
@@ -2420,7 +2468,11 @@ impl Stream {
     /// The description's layout, if it isn't the one in use: everything's read again with it.
     fn check_layout(&mut self, conn: &Connection, shared: &Shared) -> rusqlite::Result<()> {
         self.checked_layout = Some(Instant::now());
-        let session = row(conn, "SELECT * FROM session ORDER BY id DESC LIMIT 1", [])?;
+        let session = row(
+            conn,
+            "SELECT * FROM session WHERE id >= ? ORDER BY id DESC LIMIT 1",
+            [self.epoch.session_from],
+        )?;
         let name = session.as_ref().and_then(|s| s.text("track"));
         let session_length = session.as_ref().and_then(|s| s.f("track_length"));
         // Without one, the layout comes from the player's lap (see `find_braking_zones`)
@@ -2464,9 +2516,19 @@ impl Stream {
         if all_laps == 0 || self.calibrated_laps.is_some_and(|before| before >= laps) {
             return Ok(());
         }
+        // One snapshot of the recording, of the epoch the laps are from: another one's track isn't
+        // fitted to them (the next tick starts it)
+        let snapshot = conn.unchecked_transaction()?;
+        if active_epoch(conn)?.id != self.epoch.id {
+            return Ok(());
+        }
         self.calibrated_laps = Some(laps);
 
-        let session = row(conn, "SELECT * FROM session ORDER BY id DESC LIMIT 1", [])?;
+        let session = row(
+            conn,
+            "SELECT * FROM session WHERE id >= ? ORDER BY id DESC LIMIT 1",
+            [self.epoch.session_from],
+        )?;
         let name = session.as_ref().and_then(|s| s.text("track"));
         let session_length = session.as_ref().and_then(|s| s.f("track_length"));
         let Some(track) = read_track(&shared.path, name) else {
@@ -2478,6 +2540,8 @@ impl Stream {
         let Some(calibration) = self.fit_calibration(conn, shared, &track, length)? else {
             return Ok(());
         };
+        // Read: the layout below may write
+        drop(snapshot);
         let applied = applied_shift(shared, &track);
         if applied.is_some_and(|applied| (applied - calibration.shift).abs() < SHIFT_MIN) {
             return Ok(());
@@ -2588,8 +2652,8 @@ impl Stream {
         self.zones_from = Some(tried);
         let session_length = scalar::<f64>(
             conn,
-            "SELECT track_length FROM session ORDER BY id DESC LIMIT 1",
-            [],
+            "SELECT track_length FROM session WHERE id >= ? ORDER BY id DESC LIMIT 1",
+            [self.epoch.session_from],
         )
         .ok()
         .flatten()
@@ -2647,6 +2711,14 @@ impl Stream {
             conn.execute(&format!("DELETE FROM {table}"), [])?;
         }
         let mut problems = Vec::new();
+        // How things are now, of the epoch the stream tables are about (the transaction reads one
+        // snapshot of the recording)
+        if active_epoch(conn)?.id != self.epoch.id {
+            tx.commit()?;
+            return Ok(Some(
+                "the recording moved on to another session since: ask again".to_owned(),
+            ));
+        }
         let mut fresh = Fresh {
             stints: self.stints(conn, &mut problems),
             ..Fresh::default()
@@ -3632,11 +3704,12 @@ fn write_forecast(conn: &Connection, sc: &Scoring, now: Option<f64>) -> rusqlite
     Ok(())
 }
 
-/// Where the newest session starts: the player's clock last went back, on a scan of the whole
-/// file, only done once.
-fn session_start(conn: &Connection) -> rusqlite::Result<i64> {
+/// Where the newest session starts: the epoch's first row (`from`), or after it where the player's
+/// clock last went back (the only sign of a session in recordings without epochs), on a scan of the
+/// epoch's rows, only done once.
+fn session_start(conn: &Connection, from: i64) -> rusqlite::Result<i64> {
     let top = scalar::<i64>(conn, "SELECT MAX(id) FROM telemetry", [])?.unwrap_or(0);
-    let (mut start, mut player_t, mut lo) = (1, None::<f64>, 1);
+    let (mut start, mut player_t, mut lo) = (from, None::<f64>, from);
     while lo <= top {
         let hi = top.min(lo + 200_000 - 1);
         for r in rows(
@@ -3803,7 +3876,16 @@ pub(super) fn track_turns(track: &Json, length: f64) -> Vec<Turn> {
 
 /// `track`: the description as it's published, its positions lined up with the laps.
 fn track_json(conn: &Connection, shared: &Shared, stream: &mut Stream) -> anyhow::Result<String> {
-    let session = row(conn, "SELECT * FROM session ORDER BY id DESC LIMIT 1", [])?;
+    // One snapshot of the recording, of the epoch the stream follows
+    let _snapshot = conn.unchecked_transaction()?;
+    if active_epoch(conn)?.id != stream.epoch.id {
+        bail!("the recording moved on to another session: just retry");
+    }
+    let session = row(
+        conn,
+        "SELECT * FROM session WHERE id >= ? ORDER BY id DESC LIMIT 1",
+        [stream.epoch.session_from],
+    )?;
     let name = session.as_ref().and_then(|s| s.text("track"));
     let session_length = session.as_ref().and_then(|s| s.f("track_length"));
     let Some(mut track) = read_track(&shared.path, name) else {
@@ -4645,6 +4727,48 @@ mod tests {
         assert_eq!(gone(&drivers, "Bea Costa"), [false]);
         drivers.seen(2, "Ana Lopes", 990.0, 990);
         assert_eq!(gone(&drivers, "Ana Lopes"), [true, false]);
+    }
+
+    #[test]
+    fn another_epoch_inherits_nothing_of_a_reused_slot() {
+        use bono_sim::sql::{EpochReason, begin_epoch};
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        let insert = |t: f64, driver: &str, laps: i64| {
+            conn.execute(
+                "INSERT INTO standings (session_time, vehicle_id, driver, laps_completed) \
+                 VALUES (?, 2, ?, ?)",
+                params![t, driver, laps],
+            )
+            .unwrap();
+        };
+        let mut stream = Stream::default();
+        begin_epoch(&conn, 1, EpochReason::Start).unwrap();
+        stream
+            .enter_epoch(&conn, active_epoch(&conn).unwrap())
+            .unwrap();
+        insert(100.0, "Ana Lopes", 10);
+        stream.read_standings(&conn).unwrap();
+        assert_eq!(stream.drivers.runs(2).len(), 1);
+
+        stream.player = Some(2);
+
+        // Another session: the clock and the lap count carry on, so only the epoch tells
+        begin_epoch(&conn, 2, EpochReason::Session).unwrap();
+        insert(300.0, "Ana Lopes", 12);
+        insert(400.0, "Ana Lopes", 13);
+        stream
+            .enter_epoch(&conn, active_epoch(&conn).unwrap())
+            .unwrap();
+        stream.read_standings(&conn).unwrap();
+        let runs = stream.drivers.runs(2);
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].first, runs[0].last), (300.0, 400.0));
+        assert_eq!(stream.drivers.known.len(), 1);
+        assert_eq!(stream.laps_completed[&2].0, 13);
+        // Nor is car 2 the player's until this epoch's rows say so
+        assert_eq!(stream.player, None);
     }
 
     #[test]
@@ -5610,6 +5734,49 @@ mod tests {
         .unwrap();
         let first = number(&engineer, "SELECT session_first_id FROM race_state").await;
         assert!(first > 1.0, "{first}");
+        assert_eq!(
+            number(
+                &engineer,
+                "SELECT COUNT(*) FROM lap_stats WHERE vehicle_id = 1"
+            )
+            .await,
+            1.0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_epoch_starts_the_tables_over_without_the_players_clock() {
+        let (dir, engineer) = race();
+        assert_eq!(
+            number(
+                &engineer,
+                "SELECT COUNT(*) FROM lap_stats WHERE vehicle_id = 1"
+            )
+            .await,
+            4.0
+        );
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        // Another session: no row of it yet, the player's or anyone's
+        bono_sim::sql::begin_epoch(&conn, i64::MAX, bono_sim::sql::EpochReason::Session).unwrap();
+        engineer.sync().await.unwrap();
+        // Told the current-state tables have no player yet, before the rows
+        for table in ["lap_stats", "cars_now"] {
+            let rows = query(&engineer, &format!("SELECT COUNT(*) FROM {table}")).await;
+            assert_eq!(rows.last(), Some(&vec!["0".to_owned()]), "{table}");
+        }
+        // Its first row: the same slot, the clock later than the last session's
+        conn.execute(
+            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_start_time) VALUES (1, 1, 5000, 0, 5000)",
+            [],
+        )
+        .unwrap();
+        let top: i64 = conn
+            .query_row("SELECT MAX(id) FROM telemetry", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            number(&engineer, "SELECT session_first_id FROM race_state").await,
+            top as f64
+        );
         assert_eq!(
             number(
                 &engineer,
