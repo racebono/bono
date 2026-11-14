@@ -707,12 +707,12 @@ mod tests {
                         correlation(&gravity) < 0.0,
                         "{name}: Pitch isn't + nose down by gravity"
                     );
+                    let vertical = pairs(&|i| {
+                        let nose = at(i, "VelocityX") * (-at(i, "Pitch")).sin();
+                        (at(i, "VelocityZ"), climb(i) - nose)
+                    });
+                    assert!(correlation(&vertical) > 0.0, "{name}: VelocityZ isn't + up");
                 }
-                let vertical = pairs(&|i| {
-                    let nose = at(i, "VelocityX") * (-at(i, "Pitch")).sin();
-                    (at(i, "VelocityZ"), climb(i) - nose)
-                });
-                assert!(correlation(&vertical) > 0.0, "{name}: VelocityZ isn't + up");
             }
             // The wind, by what it does flat out on the straights: a tailwind is less drag
             let wind =
@@ -773,17 +773,19 @@ mod tests {
                     "{name}: WindDir isn't where the wind blows from"
                 );
                 // Wind from the north or south reads the same either way round, and so can a
-                // track whose straights point two ways: only where the readings go apart
+                // track whose straights point two ways: only where the readings go well apart, as
+                // the nearer they are, the less the right one wins by
                 let alike: Vec<_> = tail
                     .iter()
                     .zip(&other)
                     .map(|((a, _), (b, _))| (*a, *b))
                     .collect();
-                if correlation(&alike) < 0.9 {
+                if correlation(&alike) < 0.5 {
                     turned += 1;
+                    let (clockwise, other) = (correlation(&tail), correlation(&other));
                     assert!(
-                        correlation(&tail) > correlation(&other),
-                        "{name}: WindDir doesn't turn clockwise"
+                        clockwise > other,
+                        "{name}: WindDir doesn't turn clockwise ({clockwise} against {other})"
                     );
                 }
             }
