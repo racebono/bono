@@ -22,6 +22,9 @@ use sdk::{Frame, HEADER_LEN, Header, MEMORY_NAME, VERSION, Vars};
 use session::SessionInfo;
 use std::{path::PathBuf, time::Instant};
 
+/// How often the session info is read again while its update count stays the same.
+const INFO_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub struct IRacing(Recording);
 
 impl IRacing {
@@ -66,10 +69,12 @@ struct Game {
     /// The variables, and the header values they were read for (their count, where they're
     /// described, an update's length, and the session info's update count)
     vars: Option<((i32, i32, i32, i32), Vars)>,
-    /// The session info, and its update count
-    info: Option<(i32, SessionInfo)>,
+    /// The session info: its update count, its text as copied, and what it says
+    info: Option<(i32, Vec<u8>, SessionInfo)>,
     /// The session info as last copied, and its update count, until a later copy confirms it
     pending_info: Option<(i32, Vec<u8>)>,
+    /// When the session info was last found to be what was read
+    info_checked: Option<Instant>,
     /// The tick count of the last update read
     last_tick: Option<i32>,
     /// The last update read
@@ -96,6 +101,7 @@ impl Source for Game {
             self.vars = None;
             self.info = None;
             self.pending_info = None;
+            self.info_checked = None;
             return Read::Unavailable;
         }
         if header.version != VERSION {
@@ -113,21 +119,25 @@ impl Source for Game {
         // kept only if the game didn't change it while it was copied (the header is the same
         // after, and for the session info, a copy on a later read is too)
         let update = header.session_info_update;
+        let layout = |h: &Header| {
+            (
+                h.version,
+                h.var_count,
+                h.var_header_offset,
+                h.buf_count,
+                h.buf_len,
+                h.session_info_offset,
+                h.session_info_len,
+                h.session_info_update,
+            )
+        };
         let key = (
             header.var_count,
             header.var_header_offset,
             header.buf_len,
             update,
         );
-        let same = |again: &Header| {
-            again.connected()
-                && (
-                    again.var_count,
-                    again.var_header_offset,
-                    again.buf_len,
-                    again.session_info_update,
-                ) == key
-        };
+        let same = |again: &Header| again.connected() && layout(again) == layout(&header);
         if self.vars.as_ref().is_none_or(|(last, _)| *last != key) {
             self.vars = None;
             let (Some(headers), Some(buf_len)) = (
@@ -141,33 +151,57 @@ impl Source for Game {
             }
             self.vars = Some((key, Vars::from_headers(&headers, buf_len)));
         }
-        if self.info.as_ref().is_none_or(|(last, _)| *last != update) {
+        // A new update's waited for; the one read is looked at again now and then, in case it was
+        // read before the game wrote it (it may count the update before it does)
+        let stale = self.info.as_ref().is_none_or(|(last, ..)| *last != update);
+        if stale {
             self.info = None;
-            let Some(bytes) = header.session_info().and_then(|range| memory.copy(range)) else {
-                return Read::Idle;
-            };
-            if !memory.header().is_some_and(|again| same(&again)) {
-                self.pending_info = None;
-                return Read::Idle;
-            }
-            // The same on a later read too: the game isn't writing it (it may count the update
-            // before it does)
-            match self.pending_info.take() {
-                Some((pending, earlier)) if pending == update && earlier == bytes => {
-                    let doc = yaml::parse(&yaml::decode(&bytes));
-                    self.info = Some((update, SessionInfo::new(&doc)));
+        }
+        let due = stale
+            || self
+                .info_checked
+                .is_none_or(|at| now.duration_since(at) >= INFO_RECHECK);
+        if due {
+            let copied = header
+                .session_info()
+                .and_then(|range| memory.copy(range))
+                .filter(|_| memory.header().is_some_and(|again| same(&again)));
+            match copied {
+                None => self.pending_info = None,
+                Some(bytes)
+                    if self
+                        .info
+                        .as_ref()
+                        .is_some_and(|(_, read, _)| *read == bytes) =>
+                {
+                    self.pending_info = None;
+                    self.info_checked = Some(now);
                 }
-                _ => {
-                    self.pending_info = Some((update, bytes));
-                    return Read::Idle;
-                }
+                // Kept once a later read finds the same: the game isn't writing it
+                Some(bytes) => match self.pending_info.take() {
+                    Some((pending, earlier)) if pending == update && earlier == bytes => {
+                        let info = SessionInfo::new(&yaml::read(&bytes));
+                        self.info = Some((update, bytes, info));
+                        self.info_checked = Some(now);
+                    }
+                    _ => self.pending_info = Some((update, bytes)),
+                },
             }
+        }
+        if self.info.is_none() {
+            return Read::Idle;
         }
 
         let Some((tick, offset)) = header.latest() else {
             return Read::Idle;
         };
         if self.last_tick == Some(tick) {
+            return Read::Idle;
+        }
+        // Like the SDK's own reader, the update there on connecting is taken as where to start
+        // from: it may be the last session's
+        if self.last_tick.is_none() {
+            self.last_tick = Some(tick);
             return Read::Idle;
         }
         let Some(len) = header.buf_len() else {
@@ -179,13 +213,13 @@ impl Source for Game {
             || !memory.copy_into(offset..offset + len, &mut self.buffer)
             || !memory
                 .header()
-                .is_some_and(|again| again.holds(tick, offset))
+                .is_some_and(|again| again.holds(tick, offset) && same(&again))
         {
             return Read::Idle;
         }
         self.last_tick = Some(tick);
 
-        let (Some((_, vars)), Some((_, info))) = (&self.vars, &self.info) else {
+        let (Some((_, vars)), Some((_, _, info))) = (&self.vars, &self.info) else {
             return Read::Idle;
         };
         match self
@@ -302,7 +336,7 @@ mod tests {
     /// how many updates were recorded.
     fn record_file(path: &Path, dir: &Path) -> usize {
         let ibt = Ibt::open(path).unwrap();
-        let info = SessionInfo::new(&yaml::parse(&yaml::decode(ibt.session_info())));
+        let info = SessionInfo::new(&yaml::read(ibt.session_info()));
         let recorder = Recorder::new(dir, None).unwrap();
         let mut converter = Converter::default();
         let start = Instant::now();

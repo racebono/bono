@@ -76,8 +76,17 @@ const SPEED_WINDOW: f64 = 0.25;
 const BEST_LAP_MATCH: f64 = 0.1;
 /// Slower than this (m/s), a car in its pit box has stopped there.
 const STOPPED: f64 = 0.5;
-/// How far apart (s) the lap count going up and the car crossing the line may be for one lap.
-const LINE_MATCH: f64 = 1.0;
+/// How far on (laps) the lap count may go up after the car crossed the line, for that crossing to
+/// start the lap.
+const LINE_NEAR: f64 = 0.1;
+/// How far on (laps) the car may cross the line after the lap count went up, for that crossing to
+/// start the lap: a little more than between a finish and a start line apart.
+const COUNT_FAR: f64 = 0.5;
+/// Longer than this (s) between two updates, a car's progress isn't known to be driven.
+const MAX_GAP: f64 = 5.0;
+/// How far apart (s) a lap timed here must finish from the game's best changing to be the lap
+/// that set it: the game gives the time a moment after the line.
+const BEST_LAP_WINDOW: f64 = 5.0;
 /// How many of each car's last whole laps are kept, to find its best among.
 const RECENT_LAPS: usize = 4;
 
@@ -166,6 +175,8 @@ impl Converter {
                 let pct = car
                     .f64("CarIdxLapDistPct", "LapDistPct")
                     .filter(|pct| (0.0..=1.0).contains(pct))
+                    // All the way round is at the line
+                    .map(|pct| if pct >= 1.0 { 0.0 } else { pct })
                     .filter(|_| surface != Some(NOT_IN_WORLD));
                 let on_pit_road = car.bool("CarIdxOnPitRoad", "OnPitRoad");
                 let official_best = car
@@ -186,7 +197,7 @@ impl Converter {
                     length,
                     &info.sectors,
                 );
-                let lap_offset = track.lap_offset(time);
+                let lap_offset = track.lap_offset();
                 Car {
                     idx,
                     driver,
@@ -472,7 +483,11 @@ impl Converter {
             out.flag = car_flag(bits).map(str::to_owned).into();
             // A local yellow: a full course one is the session's `full_course_yellow`, which the
             // spotter calls on its own
-            out.under_yellow = Some(bits & (FLAG_YELLOW | FLAG_YELLOW_WAVING) != 0).into();
+            out.under_yellow = Some(
+                bits & (FLAG_YELLOW | FLAG_YELLOW_WAVING) != 0
+                    && bits & (FLAG_CAUTION | FLAG_CAUTION_WAVING) == 0,
+            )
+            .into();
             out.penalties = Some(i64::from(bits & FLAG_BLACK != 0)).into();
             if bits & FLAG_DISQUALIFY != 0 {
                 out.finish_status = Some("disqualified".to_owned()).into();
@@ -880,12 +895,12 @@ fn follow_gap(behind: &Car<'_>, ahead: &Car<'_>) -> Option<f64> {
     let same_class =
         behind.driver.class_id.is_some() && behind.driver.class_id == ahead.driver.class_id;
     if same_class && let (Some(from_est), Some(to_est)) = (behind.est, ahead.est) {
-        // The one ahead is past the line: the rest of the lap closes the gap
-        let across = match to < from {
-            true => lap?,
-            false => 0.0,
+        // The one ahead past the line (whether or not its estimate is yet): round the lap
+        let gap = to_est - from_est;
+        return match lap {
+            Some(lap) => Some(gap.rem_euclid(lap)),
+            None => Some(gap).filter(|gap| *gap >= 0.0),
         };
-        return Some(to_est - from_est + across).filter(|gap| *gap >= 0.0);
     }
     Some((to - from).rem_euclid(1.0) * lap?)
 }
@@ -926,12 +941,17 @@ struct CarTrack {
     lap: Option<i32>,
     /// When the current lap started: when the car crossed the line, or else when the count went up
     lap_start: Option<f64>,
-    /// When the car last crossed the line, while no lap count has gone up for it yet
-    line: Option<f64>,
-    /// When the lap count last went up, while the car hasn't been seen crossing the line for it
-    counted: Option<f64>,
+    /// When the car last crossed the line, and its distance there, while no lap count has gone
+    /// up for it yet
+    line: Option<(f64, f64)>,
+    /// When the lap count last went up, and the car's distance then, while it hasn't been seen
+    /// crossing the line for it
+    counted: Option<(f64, f64)>,
     sector: Option<usize>,
-    /// When the car entered its sector, if it was seen to
+    /// The sector it's being timed in: the last boundary it was seen crossing (going back a
+    /// little over one doesn't take it back)
+    timing: Option<usize>,
+    /// When the car entered the sector it's being timed in, if it was seen to
     sector_start: Option<f64>,
     /// This lap's sector times so far
     current: Vec<Option<f64>>,
@@ -939,12 +959,16 @@ struct CarTrack {
     /// The sectors of the lap the game has for the car's best
     best_lap: Vec<Option<f64>>,
     best_lap_total: Option<f64>,
+    /// The game's best lap the sectors are looked for (or found) for, and when it was set
+    best_official: Option<(f64, f64)>,
     /// The best time of each sector, of any lap
     best: Vec<Option<f64>>,
-    /// The last whole laps timed here: their total and sectors
-    recent: Vec<(f64, Vec<Option<f64>>)>,
+    /// The last whole laps timed here: their total, sectors and when they finished
+    recent: Vec<(f64, Vec<Option<f64>>, f64)>,
     /// Laps gone, counted from when it was first seen, for its speed
     distance: f64,
+    /// The furthest it's been: a boundary is crossed only going past it
+    furthest: f64,
     /// When and at what distance its speed was last worked out
     anchor: Option<(f64, f64)>,
     speed: Option<f64>,
@@ -976,23 +1000,27 @@ impl CarTrack {
             self.best_lap = vec![None; n];
             self.best = vec![None; n];
             self.best_lap_total = None;
+            self.best_official = None;
             self.recent.clear();
             self.sector = None;
+            self.timing = None;
             self.sector_start = None;
         }
 
-        self.best_lap_matching(official_best);
+        self.best_lap_matching(official_best, time);
 
         let Some(pct) = pct else {
             // Out of the world (in the garage, disconnected): where it comes back says nothing
             // about how it got there, and this lap's times so far can't be completed
             self.last = None;
             self.sector = None;
+            self.timing = None;
             self.sector_start = None;
             self.current = vec![None; n];
             self.line = None;
             self.counted = None;
             self.lap_start = None;
+            self.furthest = self.distance;
             self.lap = lap.or(self.lap);
             self.anchor = None;
             self.speed = None;
@@ -1012,17 +1040,33 @@ impl CarTrack {
             }
             (t0, p0, time - t0, dp)
         });
-        let continuous = step.is_some_and(|(_, _, dt, dp)| {
-            dt > 0.0 && dp * length >= -MAX_BACK && dp * length <= MAX_SPEED * dt + MAX_JUMP
-        });
+        // A count going up by more than a lap is a car moved too
+        let skipped = matches!((self.lap, lap), (Some(previous), Some(lap)) if lap > previous + 1);
+        let continuous = !skipped
+            && step.is_some_and(|(_, _, dt, dp)| {
+                dt > 0.0
+                    && dt <= MAX_GAP
+                    && dp * length >= -MAX_BACK
+                    && dp * length <= MAX_SPEED * dt + MAX_JUMP
+            });
+        let (before, furthest) = (self.distance, self.furthest);
         // How far along the update a boundary at `boundary` was crossed, and when: driven over
-        // it, from just past where the car was (where it was is the update before's crossing)
+        // it, from just past where the car was (where it was is the update before's crossing),
+        // and further than it had been (back over it and on again isn't crossing it again)
         let passed = |boundary: f64| {
             let (t0, p0, dt, dp) = step?;
             let along = (boundary - p0).rem_euclid(1.0);
             // Landing on the line is crossing it, whatever the rounding
-            (continuous && dp > 0.0 && along > 0.0 && along <= dp * (1.0 + 1e-9) + 1e-12)
+            (continuous
+                && dp > 0.0
+                && along > 0.0
+                && along <= dp * (1.0 + 1e-9) + 1e-12
+                && before + along > furthest)
                 .then(|| (along, t0 + (along / dp).min(1.0) * dt))
+        };
+        let after = match step {
+            Some((_, _, _, dp)) if continuous => before + dp,
+            _ => before,
         };
 
         // Pit stops: stopping in its box after it was seen driving into the pit lane (starting in
@@ -1040,8 +1084,10 @@ impl CarTrack {
             *counted = false;
         }
         // In its box is where it is: stopped there is a stop
-        let stopped_in_box =
-            surface == Some(IN_PIT_STALL) && self.speed.is_some_and(|speed| speed < STOPPED);
+        let still = continuous
+            && step.is_some_and(|(_, _, dt, dp)| (dp * length).abs() <= STOPPED * dt)
+            && self.speed.is_some_and(|speed| speed < STOPPED);
+        let stopped_in_box = surface == Some(IN_PIT_STALL) && still;
         if let Some((counted, stopped)) = &mut self.visit
             && stopped_in_box
             && !*stopped
@@ -1062,7 +1108,8 @@ impl CarTrack {
         // The lap starts at the line. The count and the distance can go round an update or so
         // apart: the crossing waits a moment for the count, and the count for the next crossing
         // (on tracks whose laps finish elsewhere than they start, that's a while)
-        let line = passed(0.0).map(|(_, at)| at);
+        let line = passed(0.0).map(|(along, at)| (at, before + along));
+        let near = |line: &(f64, f64)| after - line.1 <= LINE_NEAR;
         let counted_back = matches!((self.lap, lap), (Some(previous), Some(lap)) if lap < previous);
         let rose = matches!((self.lap, lap), (Some(previous), Some(lap)) if lap > previous);
         if counted_back {
@@ -1080,18 +1127,16 @@ impl CarTrack {
                 self.lap_start = None;
             }
         } else if rose {
-            let crossed = line.or(self.line.filter(|at| time - at <= LINE_MATCH));
+            let crossed = line.or(self.line.filter(near)).map(|(at, _)| at);
             self.lap_start = Some(crossed.unwrap_or(time));
-            self.counted = crossed.is_none().then_some(time);
+            self.counted = crossed.is_none().then_some((time, after));
             self.line = None;
-        } else if let Some(at) = line {
-            self.line = Some(at);
-            if let Some(counted) = self.counted.take() {
-                self.lap_start = Some(at);
-                // Long after the count, it's the next lap's start too, if the count follows
-                if at - counted <= LINE_MATCH {
-                    self.line = None;
-                }
+        } else if let Some((at, at_distance)) = line {
+            match self.counted.take() {
+                // The lap counted before the car got to the line (an update before it, or a bit
+                // before on tracks whose laps finish elsewhere than they start) starts here
+                Some((_, counted)) if after - counted <= COUNT_FAR => self.lap_start = Some(at),
+                _ => self.line = Some((at, at_distance)),
             }
         }
         if lap.is_some() {
@@ -1101,10 +1146,12 @@ impl CarTrack {
         // Sector times, from boundary to boundary: every boundary crossed, in order
         let sector = sector_of(pct, sectors);
         if !continuous {
-            // Moved, not driven: this lap's times so far can't be completed
+            // Moved, not driven: this lap's times so far can't be completed, and it's timed from
+            // where it is
             self.sector_start = None;
             self.current = vec![None; n];
-        } else if let Some(mut previous) = self.sector {
+            self.timing = sector;
+        } else if let Some(mut previous) = self.timing {
             let mut from = 0.0;
             for _ in 0..n {
                 let next = (previous + 1) % n;
@@ -1122,26 +1169,25 @@ impl CarTrack {
                     }
                 }
                 if next == 0 {
-                    self.finish_lap();
+                    self.finish_lap(at);
                 }
                 self.sector_start = Some(at);
                 previous = next;
             }
-            // Not where its crossings put it (it went back over a boundary): its time isn't known
-            if Some(previous) != sector {
-                self.sector_start = None;
-            }
+            self.timing = Some(previous);
+        } else {
+            self.timing = sector;
         }
         self.sector = sector;
 
         // Speed, over at least SPEED_WINDOW
-        match step {
-            Some((_, _, _, dp)) if continuous => self.distance += dp,
-            _ => {
-                self.anchor = None;
-                self.speed = None;
-            }
+        self.distance = after;
+        if !continuous {
+            self.anchor = None;
+            self.speed = None;
+            self.furthest = after;
         }
+        self.furthest = self.furthest.max(after);
         match self.anchor {
             Some((t, d)) if time - t >= SPEED_WINDOW => {
                 self.speed = Some(((self.distance - d) * length / (time - t)).max(0.0));
@@ -1153,59 +1199,66 @@ impl CarTrack {
         self.last = Some((time, pct));
     }
 
-    /// What to add to the lap count for the lap the car is on by its distance at `time`: while
-    /// the count went up before the car crossed the line (-1), or the car crossed it before the
-    /// count did (1).
-    fn lap_offset(&self, time: f64) -> i64 {
-        let recent = |at: Option<f64>| at.is_some_and(|at| time - at <= LINE_MATCH);
+    /// What to add to the lap count for the lap the car is on by its distance: while the count
+    /// went up before the car crossed the line (-1, until it does, a little way on at most), or
+    /// the car crossed it just before the count did (1).
+    fn lap_offset(&self) -> i64 {
+        let gone = |(_, at): (f64, f64)| self.distance - at;
         match () {
-            _ if recent(self.counted) => -1,
-            _ if recent(self.line) => 1,
+            _ if self
+                .counted
+                .is_some_and(|counted| gone(counted) <= COUNT_FAR) =>
+            {
+                -1
+            }
+            _ if self.line.is_some_and(|line| gone(line) <= LINE_NEAR) => 1,
             _ => 0,
         }
     }
 
-    /// The lap just completed: its sectors are the last lap's.
-    fn finish_lap(&mut self) {
+    /// The lap just completed at `time`: its sectors are the last lap's.
+    fn finish_lap(&mut self, time: f64) {
         let n = self.current.len();
         self.last_lap = std::mem::replace(&mut self.current, vec![None; n]);
         if let Some(total) = self.last_lap.iter().copied().sum::<Option<f64>>() {
             if self.recent.len() >= RECENT_LAPS {
                 self.recent.remove(0);
             }
-            self.recent.push((total, self.last_lap.clone()));
+            self.recent.push((total, self.last_lap.clone(), time));
         }
     }
 
-    /// The best lap's sectors: of the lap timed here that's the game's best (its best lap
-    /// may not count every lap, so the fastest here isn't always it). Not known when it's a lap
-    /// that wasn't seen whole.
-    fn best_lap_matching(&mut self, official: Option<f64>) {
+    /// The best lap's sectors: of the lap that set the game's best (its best lap may not count
+    /// every lap, so the fastest here isn't always it), the lap timed here that finished around
+    /// when the game's best changed and adds up to it. Not known when it's a lap that wasn't seen
+    /// whole.
+    fn best_lap_matching(&mut self, official: Option<f64>, time: f64) {
         let Some(official) = official else {
             return;
         };
-        if self
-            .best_lap_total
-            .is_some_and(|total| (total - official).abs() <= BEST_LAP_MATCH)
-        {
+        if self.best_official.is_none_or(|(best, _)| best != official) {
+            self.best_official = Some((official, time));
+            self.best_lap_total = None;
+            self.best_lap = vec![None; self.current.len()];
+        }
+        let Some((_, set_at)) = self.best_official else {
+            return;
+        };
+        // Found, or the lap's long gone by
+        if self.best_lap_total.is_some() || time - set_at > BEST_LAP_WINDOW {
             return;
         }
         let off = |total: f64| (total - official).abs();
-        match self
+        if let Some((total, sectors, _)) = self
             .recent
             .iter()
-            .filter(|(total, _)| off(*total) <= BEST_LAP_MATCH)
+            .filter(|(total, _, finished)| {
+                off(*total) <= BEST_LAP_MATCH && (finished - set_at).abs() <= BEST_LAP_WINDOW
+            })
             .min_by(|a, b| off(a.0).total_cmp(&off(b.0)))
         {
-            Some((total, sectors)) => {
-                self.best_lap_total = Some(*total);
-                self.best_lap = sectors.clone();
-            }
-            // A best lap this didn't time whole (yet: it's looked for again on every update)
-            None => {
-                self.best_lap_total = None;
-                self.best_lap = vec![None; self.current.len()];
-            }
+            self.best_lap_total = Some(*total);
+            self.best_lap = sectors.clone();
         }
     }
 }
@@ -1276,7 +1329,7 @@ mod tests {
         assert_eq!(track.recent.len(), 1);
 
         // The game's best lap is the one timed here
-        track.best_lap_matching(Some(20.01));
+        track.best_lap_matching(Some(20.01), time);
         assert!((track.best_lap_total.unwrap() - 20.0).abs() < 1e-6);
         assert!((track.best[1].unwrap() - 8.0).abs() < 1e-6);
     }
@@ -1373,12 +1426,25 @@ mod tests {
         track.current = vec![None; 3];
         track.best_lap = vec![Some(30.0), Some(30.0), Some(30.0)];
         track.best_lap_total = Some(90.0);
-        track.recent = vec![(88.0, vec![Some(29.0), Some(30.0), Some(29.0)])];
-        track.best_lap_matching(Some(89.0));
+        track.best_official = Some((90.0, 50.0));
+        let sectors = vec![Some(29.0), Some(30.0), Some(29.0)];
+        track.recent = vec![(88.0, sectors.clone(), 100.0)];
+        // A best this timed none of
+        track.best_lap_matching(Some(89.0), 101.0);
         assert_eq!(track.best_lap_total, None);
         assert!(track.best_lap.iter().all(Option::is_none));
-        track.best_lap_matching(Some(88.05));
+        track.best_lap_matching(Some(88.05), 101.0);
         assert_eq!(track.best_lap_total, Some(88.0));
+
+        // A little better: the lap that just set it, not the one before within as little
+        track.recent.push((87.97, sectors.clone(), 150.0));
+        track.best_lap_matching(Some(87.98), 150.5);
+        assert_eq!(track.best_lap_total, Some(87.97));
+        // Looked for a moment only: a lap finished long after isn't it
+        track.best_lap_matching(Some(87.9), 160.0);
+        track.recent.push((87.9, sectors, 200.0));
+        track.best_lap_matching(Some(87.9), 200.0);
+        assert_eq!(track.best_lap_total, None);
     }
 
     #[test]
@@ -1469,7 +1535,7 @@ mod tests {
         update(&mut track, 3.0, Some(0.05), 2, &one);
         assert_eq!(track.sector_start, Some(2.0));
         assert!(track.recent.is_empty());
-        assert_eq!(track.lap_offset(3.0), 0);
+        assert_eq!(track.lap_offset(), 0);
     }
 
     #[test]

@@ -291,8 +291,9 @@ and left on right tyres), and `tire_inner_*` is a layer under the tread, not the
 in `telemetry`; `lap_invalidated` is the current lap's state; `lap_distance` can jump back a little;
 `sector` is zero-based there and in `standings`; `delta_best` positive is slower. On iRacing,
 rivals' speed, lap starts, sector times and pit stops are worked out from their progress around the
-lap, and no car has a world position: positions, headings, `ahead_of_player_m` and
-`right_of_player_m` are NULL.
+lap, and no car has a world position: `position_x/y/z`, `heading`, `course`, `ahead_of_player_m`
+and `right_of_player_m` are NULL (places in the standings are there). It has no sector yellows:
+`race_state.local_yellow` is NULL, and `cars_now.under_yellow` is the yellow shown to the car.
 
 ## Evidence that fits the question
 

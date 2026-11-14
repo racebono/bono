@@ -660,6 +660,8 @@ struct Scoring {
     session: Option<Row>,
     /// The session row's sectors under a local yellow, zero-based, in the simulator's order
     yellow_sectors: Vec<i64>,
+    /// Whether the simulator says which sectors are yellow (iRacing doesn't)
+    sector_yellows: bool,
     cars: BTreeMap<i64, Row>,
     player: Option<Row>,
 }
@@ -682,17 +684,22 @@ impl Scoring {
     fn new(ctx: &Ctx) -> anyhow::Result<Self> {
         let conn = ctx.conn;
         let session = row(conn, "SELECT * FROM session ORDER BY id DESC LIMIT 1", [])?;
-        let yellow_sectors = match session.as_ref().and_then(|s| s.i("id")) {
-            Some(id) => rows(
-                conn,
-                "SELECT sector FROM session_sector WHERE session_id = ? AND local_yellow \
-                 ORDER BY sector",
-                [id],
-            )?
-            .iter()
-            .filter_map(|r| r.i("sector"))
-            .collect(),
-            None => Vec::new(),
+        let (yellow_sectors, sector_yellows) = match session.as_ref().and_then(|s| s.i("id")) {
+            Some(id) => {
+                let sectors = rows(
+                    conn,
+                    "SELECT sector, local_yellow FROM session_sector WHERE session_id = ? \
+                     AND local_yellow IS NOT NULL ORDER BY sector",
+                    [id],
+                )?;
+                let yellow = sectors
+                    .iter()
+                    .filter(|r| r.b("local_yellow"))
+                    .filter_map(|r| r.i("sector"))
+                    .collect();
+                (yellow, !sectors.is_empty())
+            }
+            None => (Vec::new(), false),
         };
         let expected = session
             .as_ref()
@@ -741,6 +748,7 @@ impl Scoring {
         Ok(Self {
             session,
             yellow_sectors,
+            sector_yellows,
             cars,
             player,
         })

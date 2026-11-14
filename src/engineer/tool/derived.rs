@@ -2922,7 +2922,14 @@ impl Stream {
                 ),
                 ("derived_catching_up", flag(self.behind || self.failed)),
                 ("full_course_yellow", copy(s, "full_course_yellow")),
-                ("local_yellow", flag(!sc.yellow_sectors.is_empty())),
+                // Unknown where the simulator doesn't say (the player's flag is in cars_now)
+                (
+                    "local_yellow",
+                    match sc.sector_yellows {
+                        true => flag(!sc.yellow_sectors.is_empty()),
+                        false => Value::Null,
+                    },
+                ),
                 ("sector_count", copy(s, "sector_count")),
                 ("start_light", copy(s, "start_light")),
                 ("air_c", copy(s, "ambient_temperature")),
@@ -4010,6 +4017,7 @@ mod tests {
         let sc = Scoring {
             session: Some(session),
             yellow_sectors: Vec::new(),
+            sector_yellows: false,
             cars: BTreeMap::from([(1, me.clone()), (2, leader)]),
             player: Some(me),
         };

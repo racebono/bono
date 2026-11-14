@@ -83,7 +83,21 @@ const CP1252: [Option<char>; 32] = [
 /// are only control characters there, which names don't hold: they're read as Windows-1252's
 /// letters and punctuation (`š`, `Ž`, curly quotes), which ISO-8859-1 has no room for, and as a
 /// space where it has none. A document saying it's UTF-8 is read as UTF-8.
+#[cfg(test)]
 pub fn decode(bytes: &[u8]) -> String {
+    decoded(bytes).0
+}
+
+/// The session info read: decoded (see `decode`) and parsed. A UTF-8 document quotes its values
+/// as YAML does, so its outer quotes are taken off whatever's inside them; ISO-8859-1 ones write
+/// names as they are (see `unquote`).
+pub fn read(bytes: &[u8]) -> Node {
+    let (text, utf8) = decoded(bytes);
+    parse_as(&text, utf8)
+}
+
+/// The session info's text, and whether it's UTF-8.
+fn decoded(bytes: &[u8]) -> (String, bool) {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     let bytes = &bytes[..end];
     let latin1: String = bytes
@@ -101,8 +115,8 @@ pub fn decode(bytes: &[u8]) -> String {
             encoding == "utf8"
         });
     match utf8 {
-        true => String::from_utf8_lossy(bytes).into_owned(),
-        false => latin1,
+        true => (String::from_utf8_lossy(bytes).into_owned(), true),
+        false => (latin1, false),
     }
 }
 
@@ -117,7 +131,7 @@ struct Line<'a> {
     value: &'a str,
 }
 
-fn lines(text: &str) -> Vec<Line<'_>> {
+fn lines(text: &str, quoted: bool) -> Vec<Line<'_>> {
     let mut out = Vec::new();
     for raw in text.lines() {
         let raw = raw.trim_end_matches('\r');
@@ -148,7 +162,10 @@ fn lines(text: &str) -> Vec<Line<'_>> {
             indent,
             dash,
             key,
-            value: unquote(value),
+            value: match quoted {
+                true => unwrap_quotes(value),
+                false => unquote(value),
+            },
         });
     }
     out
@@ -164,9 +181,22 @@ fn unquote(value: &str) -> &str {
         .unwrap_or(value)
 }
 
+/// A value without the quotes around it, whatever's inside them.
+fn unwrap_quotes(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value)
+}
+
 /// Reads the document. Lines that don't fit where they are (indented under nothing) are skipped.
 pub fn parse(text: &str) -> Node {
-    let lines = lines(text);
+    parse_as(text, false)
+}
+
+/// Reads the document, taking values' outer quotes off whatever's inside them when `quoted`.
+fn parse_as(text: &str, quoted: bool) -> Node {
+    let lines = lines(text, quoted);
     let mut pos = 0;
     let mut entries = Vec::new();
     while pos < lines.len() {
@@ -347,6 +377,15 @@ DriverInfo:
             r#""Speedy" Bob "Jones""#
         );
         assert_eq!(unquote(r#""007""#), "007");
+
+        // A UTF-8 document's quotes are YAML's
+        let quoted = "WeekendInfo:\n Encoding: UTF-8\nDriverInfo:\n Name: \"Bob \"Fast\" Jones\"\n";
+        assert_eq!(
+            read(quoted.as_bytes())
+                .at(&["DriverInfo", "Name"])
+                .and_then(Node::str),
+            Some("Bob \"Fast\" Jones")
+        );
 
         let utf8 = "WeekendInfo:\n Encoding: UTF-8\nDriverInfo:\n Name: Ana Müller\n";
         assert_eq!(

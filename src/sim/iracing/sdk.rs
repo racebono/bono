@@ -55,7 +55,8 @@ pub struct Buf {
     pub tick: i32,
     pub offset: i32,
     /// Set before the game starts writing an update into it, in SDK versions that have it (the
-    /// int after the offset, which older ones have as padding)
+    /// int after the offset, which older ones have as padding; pyirsdk, which follows the SDK's
+    /// header, names it `tick_count_begin`, "updated BEFORE write starts")
     pub tick_begin: i32,
 }
 
@@ -95,11 +96,15 @@ impl Header {
         self.status & STATUS_CONNECTED != 0
     }
 
-    /// The buffer holding the latest update: its tick count and offset.
+    /// The buffer holding the latest update: its tick count and offset. None before the game
+    /// has written one (no tick yet, or no place for it past the header).
     pub fn latest(&self) -> Option<(i32, usize)> {
         let count = usize::try_from(self.buf_count).ok()?.min(MAX_BUFS);
         let buf = self.bufs[..count].iter().max_by_key(|buf| buf.tick)?;
-        Some((buf.tick, usize::try_from(buf.offset).ok()?))
+        let offset = usize::try_from(buf.offset)
+            .ok()
+            .filter(|o| *o >= HEADER_LEN)?;
+        (buf.tick > 0).then_some((buf.tick, offset))
     }
 
     /// Whether the buffer at `offset` still holds update `tick`, and when the game says when it
