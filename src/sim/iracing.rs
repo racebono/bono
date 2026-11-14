@@ -369,12 +369,19 @@ mod tests {
             if let Some(update) = converter.convert(&frame, &info, now) {
                 // Faster than the game: the writer's queue would fill, and drop scoring updates
                 while update.scoring.is_some() && recorder.queued_scoring() >= 50 {
+                    assert!(!recorder.failed(), "the recorder stopped writing");
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 record(&recorder, update);
                 recorded += 1;
             }
         }
+        // A writer that stopped would leave the recording short
+        assert!(
+            !recorder.failed(),
+            "{}: the recorder stopped writing",
+            path.display()
+        );
         drop(recorder);
         recorded
     }
@@ -669,21 +676,35 @@ mod tests {
                 (l.min(at(i, "Alt")), h.max(at(i, "Alt")))
             });
             if high - low >= 5.0 {
-                climbed += 1;
                 let climb = |i: usize| (at(i + 3, "Alt") - at(i - 3, "Alt")) / (6.0 * dt);
                 // Without braking or accelerating hard: the nose dives and squats more than slopes
-                let pitch: Vec<_> = samples
+                let steady: Vec<_> = samples
                     .iter()
-                    .filter(|&&i| rate(i, "Speed").abs() < 1.0)
+                    .copied()
+                    .filter(|&i| rate(i, "Speed").abs() < 1.0)
+                    .collect();
+                let pitch: Vec<_> = steady
+                    .iter()
                     .map(|&i| (at(i, "Pitch"), climb(i) / at(i, "Speed")))
                     .collect();
-                assert!(correlation(&pitch) < 0.0, "{name}: Pitch isn't + nose down");
-                // Nose up, gravity pulls back on the car: the accelerometer reads it forward
-                let gravity = pairs(&|i| (at(i, "Pitch"), at(i, "LongAccel") - rate(i, "Speed")));
-                assert!(
-                    correlation(&gravity) < 0.0,
-                    "{name}: Pitch isn't + nose down by gravity"
-                );
+                // Enough of them, over slopes that differ (half a percent), to tell
+                let slopes = pitch.len().max(1) as f64;
+                let mean = pitch.iter().map(|(_, s)| s).sum::<f64>() / slopes;
+                let spread =
+                    (pitch.iter().map(|(_, s)| (s - mean).powi(2)).sum::<f64>() / slopes).sqrt();
+                if pitch.len() >= 600 && spread >= 0.005 {
+                    climbed += 1;
+                    assert!(correlation(&pitch) < 0.0, "{name}: Pitch isn't + nose down");
+                    // Nose up, gravity pulls back on the car: the accelerometer reads it forward
+                    let gravity: Vec<_> = steady
+                        .iter()
+                        .map(|&i| (at(i, "Pitch"), at(i, "LongAccel") - rate(i, "Speed")))
+                        .collect();
+                    assert!(
+                        correlation(&gravity) < 0.0,
+                        "{name}: Pitch isn't + nose down by gravity"
+                    );
+                }
                 let vertical = pairs(&|i| {
                     let nose = at(i, "VelocityX") * (-at(i, "Pitch")).sin();
                     (at(i, "VelocityZ"), climb(i) - nose)
@@ -748,9 +769,14 @@ mod tests {
                     correlation(&tail) > 0.0,
                     "{name}: WindDir isn't where the wind blows from"
                 );
-                // Wind from the north or south reads the same either way round
-                let apart = rms(&mut tail.iter().zip(&other).map(|((a, _), (b, _))| a - b));
-                if apart >= 0.5 {
+                // Wind from the north or south reads the same either way round, and so can a
+                // track whose straights point two ways: only where the readings go apart
+                let alike: Vec<_> = tail
+                    .iter()
+                    .zip(&other)
+                    .map(|((a, _), (b, _))| (*a, *b))
+                    .collect();
+                if correlation(&alike) < 0.9 {
                     assert!(
                         correlation(&tail) > correlation(&other),
                         "{name}: WindDir doesn't turn clockwise"
