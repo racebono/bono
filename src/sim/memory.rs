@@ -147,13 +147,10 @@ impl Recording {
         if !running {
             // Stopped without waiting: the recorder writes what it has and lets go of the file on
             // its own thread, and nothing deletes or restarts the recording until it has.
+            // Its recording is deleted once it has, whether or not it was served yet
             if let Some(reader) = self.reader.take() {
                 self.stopped = Some(reader.stop());
-            }
-            self.cleaned.reset_when_idle();
-            self.ready.reset();
-            if let Some(pool) = self.live.take() {
-                let stopped = self.stopped.clone();
+                let (pool, stopped) = (self.live.take(), self.stopped.clone());
                 if let Some(old) = self.cleanup.replace(tokio::spawn(remove_when_closed(
                     self.name,
                     self.dir.clone(),
@@ -163,6 +160,8 @@ impl Recording {
                     old.abort();
                 }
             }
+            self.cleaned.reset_when_idle();
+            self.ready.reset();
             return None;
         }
 
@@ -262,11 +261,11 @@ async fn write_settings(
 }
 
 /// Deletes the database in `dir` once nothing has it open, after the reader that recorded it has
-/// stopped (`stopped`).
+/// stopped (`stopped`). `pool` is the app's connections to it, if it was served.
 async fn remove_when_closed(
     name: &'static str,
     dir: PathBuf,
-    pool: Pool,
+    pool: Option<Pool>,
     stopped: Option<Arc<AtomicBool>>,
 ) {
     drop(pool);
@@ -594,6 +593,22 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn removes_a_recording_never_served_once_its_reader_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(DATABASE), "recording").unwrap();
+        let mut sim = recording(dir.path());
+        let (reader, done) = finishing_reader();
+        sim.reader = Some(reader);
+        assert!(sim.live.is_none());
+
+        sim.database(false);
+        done.store(true, Ordering::Release);
+        let cleanup = sim.cleanup.take().expect("no cleanup started");
+        cleanup.await.unwrap();
+        assert!(!dir.path().join(DATABASE).exists());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn removes_the_recording_only_after_the_reader_stopped() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DATABASE);
@@ -607,7 +622,7 @@ mod tests {
         let task = tokio::spawn(remove_when_closed(
             "Test",
             dir.path().to_path_buf(),
-            pool,
+            Some(pool),
             Some(done.clone()),
         ));
 

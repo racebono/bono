@@ -55,7 +55,7 @@ pub struct Buf {
     pub tick: i32,
     pub offset: i32,
     /// Set before the game starts writing an update into it, in SDK versions that have it (the
-    /// int after the offset, which older ones leave 0)
+    /// int after the offset, which older ones have as padding)
     pub tick_begin: i32,
 }
 
@@ -102,14 +102,30 @@ impl Header {
         Some((buf.tick, usize::try_from(buf.offset).ok()?))
     }
 
-    /// Whether the buffer at `offset` still holds update `tick`, written whole: the game hasn't
-    /// started writing another one into it (in SDK versions that say when it starts).
+    /// Whether the buffer at `offset` still holds update `tick`, and when the game says when it
+    /// starts writing one (see `begins`), written whole: it hasn't started writing another into it.
     pub fn holds(&self, tick: i32, offset: usize) -> bool {
+        let begins = self.begins();
         self.bufs.iter().any(|buf| {
             buf.tick == tick
                 && usize::try_from(buf.offset) == Ok(offset)
-                && (buf.tick_begin == 0 || buf.tick_begin == tick)
+                && (!begins || buf.tick_begin == tick)
         })
+    }
+
+    /// Whether the start counts are counts: every buffer written to has one at its tick count, or
+    /// a few updates past it while it's being written. Older SDK versions have padding there
+    /// instead, which then reads as no count at all.
+    fn begins(&self) -> bool {
+        let count = usize::try_from(self.buf_count).unwrap_or(0).min(MAX_BUFS);
+        let written: Vec<_> = self.bufs[..count]
+            .iter()
+            .filter(|buf| buf.tick > 0)
+            .collect();
+        !written.is_empty()
+            && written.iter().all(|buf| {
+                buf.tick_begin >= buf.tick && buf.tick_begin - buf.tick <= 2 * MAX_BUFS as i32
+            })
     }
 
     /// Where the session info is, as a range of the bytes.

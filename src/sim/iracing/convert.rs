@@ -74,6 +74,8 @@ const SPEED_WINDOW: f64 = 0.25;
 /// How close (s) a lap timed here must be to the game's best lap to be taken for it: the line
 /// crossing is worked out between updates, from the lap distance, which the game's timing isn't.
 const BEST_LAP_MATCH: f64 = 0.1;
+/// Slower than this (m/s), a car in its pit box has stopped there.
+const STOPPED: f64 = 0.5;
 /// How far apart (s) the lap count going up and the car crossing the line may be for one lap.
 const LINE_MATCH: f64 = 1.0;
 /// How many of each car's last whole laps are kept, to find its best among.
@@ -1014,7 +1016,17 @@ impl CarTrack {
         let continuous = step.is_some_and(|(_, _, dt, dp)| {
             dt > 0.0 && dp * length >= -MAX_BACK && dp * length <= MAX_SPEED * dt + MAX_JUMP
         });
-        // Pit stops: a stop in its box after it was seen driving into the pit lane (starting in
+        // How far along the update a boundary at `boundary` was crossed, and when: driven over
+        // it, from just past where the car was (where it was is the update before's crossing)
+        let passed = |boundary: f64| {
+            let (t0, p0, dt, dp) = step?;
+            let along = (boundary - p0).rem_euclid(1.0);
+            // Landing on the line is crossing it, whatever the rounding
+            (continuous && dp > 0.0 && along > 0.0 && along <= dp * (1.0 + 1e-9) + 1e-12)
+                .then(|| (along, t0 + (along / dp).min(1.0) * dt))
+        };
+
+        // Pit stops: stopping in its box after it was seen driving into the pit lane (starting in
         // the pits, coming out of the garage or being towed there isn't one)
         if let Some(on) = on_pit_road {
             match (self.on_pit_road, on) {
@@ -1025,9 +1037,14 @@ impl CarTrack {
             }
             self.on_pit_road = Some(on);
         }
-        let in_stall = surface == Some(IN_PIT_STALL);
+        if !continuous && let Some((counted, _)) = &mut self.visit {
+            *counted = false;
+        }
+        // In its box is where it is: stopped there is a stop
+        let stopped_in_box =
+            surface == Some(IN_PIT_STALL) && self.speed.is_some_and(|speed| speed < STOPPED);
         if let Some((counted, stopped)) = &mut self.visit
-            && in_stall
+            && stopped_in_box
             && !*stopped
         {
             *stopped = true;
@@ -1037,23 +1054,16 @@ impl CarTrack {
         }
         self.pit_state = match (self.visit, on_pit_road) {
             (_, None) => None,
-            (Some(_), _) if in_stall => Some("stopped"),
+            (Some(_), _) if stopped_in_box => Some("stopped"),
             (Some((_, true)), _) => Some("exiting"),
             (Some(_), _) | (None, Some(true)) => Some("entering"),
             (None, Some(false)) => Some("none"),
         };
 
-        let crossing = |boundary: f64| {
-            let (t0, p0, dt, dp) = step?;
-            let along = (boundary - p0).rem_euclid(1.0);
-            // Landing on the line is crossing it, whatever the rounding
-            (continuous && dp > 0.0 && along <= dp * (1.0 + 1e-9) + 1e-12)
-                .then(|| t0 + (along / dp).min(1.0) * dt)
-        };
-
         // The lap starts at the line. The count and the distance can go round an update or so
-        // apart: either one waits for the other, a moment at most
-        let line = crossing(0.0);
+        // apart: the crossing waits a moment for the count, and the count for the next crossing
+        // (on tracks whose laps finish elsewhere than they start, that's a while)
+        let line = passed(0.0).map(|(_, at)| at);
         let counted_back = matches!((self.lap, lap), (Some(previous), Some(lap)) if lap < previous);
         let rose = matches!((self.lap, lap), (Some(previous), Some(lap)) if lap > previous);
         if counted_back {
@@ -1061,53 +1071,66 @@ impl CarTrack {
             self.lap_start = None;
             self.line = None;
             self.counted = None;
+            self.sector_start = None;
             self.current = vec![None; n];
-        } else if rose && !continuous {
-            // Counted while it was moved, not driven: when it crossed isn't known
-            self.lap_start = None;
+        } else if !continuous {
+            // Moved, not driven: a crossing or count before it says nothing about after it
             self.line = None;
             self.counted = None;
+            if rose {
+                self.lap_start = None;
+            }
         } else if rose {
             let crossed = line.or(self.line.filter(|at| time - at <= LINE_MATCH));
             self.lap_start = Some(crossed.unwrap_or(time));
             self.counted = crossed.is_none().then_some(time);
             self.line = None;
         } else if let Some(at) = line {
-            match self.counted.take() {
-                Some(counted) if at - counted <= LINE_MATCH => self.lap_start = Some(at),
-                _ => self.line = Some(at),
+            self.line = Some(at);
+            if let Some(counted) = self.counted.take() {
+                self.lap_start = Some(at);
+                // Long after the count, it's the next lap's start too, if the count follows
+                if at - counted <= LINE_MATCH {
+                    self.line = None;
+                }
             }
         }
         if lap.is_some() {
             self.lap = lap;
         }
 
-        // Sector times, from boundary to boundary
+        // Sector times, from boundary to boundary: every boundary crossed, in order
         let sector = sector_of(pct, sectors);
         if !continuous {
             // Moved, not driven: this lap's times so far can't be completed
             self.sector_start = None;
             self.current = vec![None; n];
-        } else if let Some(previous) = self.sector {
-            let next = (previous + 1) % n;
-            match crossing(sectors[next]) {
-                Some(at) => {
-                    if let Some(start) = self.sector_start {
-                        let split = at - start;
-                        self.current[previous] = Some(split);
-                        let best = &mut self.best[previous];
-                        if best.is_none_or(|best| split < best) {
-                            *best = Some(split);
-                        }
+        } else if let Some(mut previous) = self.sector {
+            let mut from = 0.0;
+            for _ in 0..n {
+                let next = (previous + 1) % n;
+                let Some((along, at)) = passed(sectors[next]).filter(|(along, _)| *along > from)
+                else {
+                    break;
+                };
+                from = along;
+                if let Some(start) = self.sector_start {
+                    let split = at - start;
+                    self.current[previous] = Some(split);
+                    let best = &mut self.best[previous];
+                    if best.is_none_or(|best| split < best) {
+                        *best = Some(split);
                     }
-                    if next == 0 {
-                        self.finish_lap();
-                    }
-                    self.sector_start = Some(at);
                 }
-                // A sector skipped: its time isn't known
-                None if sector != Some(previous) => self.sector_start = None,
-                None => {}
+                if next == 0 {
+                    self.finish_lap();
+                }
+                self.sector_start = Some(at);
+                previous = next;
+            }
+            // Not where its crossings put it (it went back over a boundary): its time isn't known
+            if Some(previous) != sector {
+                self.sector_start = None;
             }
         }
         self.sector = sector;
@@ -1375,8 +1398,13 @@ mod tests {
             );
             track.pit_state
         };
-        // Starting in its box isn't a stop
-        assert_eq!(update(&mut track, 1.0, true, IN_PIT_STALL), Some("stopped"));
+        // Starting in its box isn't a stop. It's stopped there once it's seen not moving
+        assert_eq!(
+            update(&mut track, 0.5, true, IN_PIT_STALL),
+            Some("entering")
+        );
+        update(&mut track, 1.0, true, IN_PIT_STALL);
+        assert_eq!(update(&mut track, 1.5, true, IN_PIT_STALL), Some("stopped"));
         assert_eq!(update(&mut track, 2.0, true, 2), Some("exiting"));
         assert_eq!(update(&mut track, 3.0, false, 3), Some("none"));
         assert_eq!(track.pit_stops, 0);
@@ -1390,6 +1418,84 @@ mod tests {
         update(&mut track, 9.0, true, 2);
         update(&mut track, 10.0, false, 3);
         assert_eq!(track.pit_stops, 1);
+
+        // Nor is driving through its box
+        let mut track = CarTrack::default();
+        let (mut time, mut pct) = (0.0, 0.05);
+        for surface in [3, 2, 2, IN_PIT_STALL, IN_PIT_STALL, 2] {
+            time += 0.5;
+            pct += 0.01;
+            let pit = surface != 3;
+            track.update(
+                time,
+                Some(pct),
+                Some(1),
+                Some(pit),
+                Some(surface),
+                None,
+                LENGTH,
+                &SECTORS,
+            );
+        }
+        assert_eq!(track.pit_stops, 0);
+        assert_eq!(track.pit_state, Some("entering"));
+    }
+
+    #[test]
+    fn times_every_sector_an_update_goes_through() {
+        let mut track = CarTrack::default();
+        update(&mut track, 0.0, Some(0.25), 1, &SECTORS);
+        // Into the second sector at 0.5 s
+        update(&mut track, 1.0, Some(0.35), 1, &SECTORS);
+        update(&mut track, 5.0, Some(0.65), 1, &SECTORS);
+        // Through the third sector's start (5.5 s) and the line (8.5 s) in one update
+        update(&mut track, 9.0, Some(0.05), 2, &SECTORS);
+        assert_eq!(track.last_lap[0], None);
+        assert!((track.last_lap[1].unwrap() - 5.0).abs() < 1e-9);
+        assert!((track.last_lap[2].unwrap() - 3.0).abs() < 1e-9);
+        assert!((track.lap_start.unwrap() - 8.5).abs() < 1e-9);
+        assert_eq!(track.sector, Some(0));
+    }
+
+    #[test]
+    fn landing_on_a_line_crosses_it_once() {
+        let mut track = CarTrack::default();
+        let one = [0.0];
+        update(&mut track, 0.0, Some(0.9), 1, &one);
+        update(&mut track, 1.0, Some(0.95), 1, &one);
+        update(&mut track, 2.0, Some(0.0), 2, &one);
+        assert_eq!(track.sector_start, Some(2.0));
+        assert_eq!(track.lap_start, Some(2.0));
+        // Leaving it isn't crossing it again
+        update(&mut track, 3.0, Some(0.05), 2, &one);
+        assert_eq!(track.sector_start, Some(2.0));
+        assert!(track.recent.is_empty());
+        assert_eq!(track.lap_offset(3.0), 0);
+    }
+
+    #[test]
+    fn a_lap_counted_away_from_the_line_starts_at_it() {
+        // A track whose laps finish before the line they start at
+        let mut track = CarTrack::default();
+        update(&mut track, 0.0, Some(0.80), 1, &SECTORS);
+        update(&mut track, 1.0, Some(0.85), 2, &SECTORS);
+        assert_eq!(track.lap_start, Some(1.0));
+        for (time, pct) in [(2.0, 0.9), (3.0, 0.95), (4.0, 0.99)] {
+            update(&mut track, time, Some(pct), 2, &SECTORS);
+        }
+        update(&mut track, 5.0, Some(0.03), 2, &SECTORS);
+        assert!((track.lap_start.unwrap() - 4.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn counting_back_drops_the_sector_being_timed() {
+        let mut track = CarTrack::default();
+        update(&mut track, 0.0, Some(0.25), 3, &SECTORS);
+        update(&mut track, 1.0, Some(0.35), 3, &SECTORS);
+        assert!(track.sector_start.is_some());
+        update(&mut track, 2.0, Some(0.45), 0, &SECTORS);
+        assert_eq!(track.sector_start, None);
+        assert_eq!(track.lap_start, None);
     }
 
     #[test]

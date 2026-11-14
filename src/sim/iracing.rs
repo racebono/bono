@@ -68,6 +68,8 @@ struct Game {
     vars: Option<((i32, i32, i32, i32), Vars)>,
     /// The session info, and its update count
     info: Option<(i32, SessionInfo)>,
+    /// The session info as last copied, and its update count, until a later copy confirms it
+    pending_info: Option<(i32, Vec<u8>)>,
     /// The tick count of the last update read
     last_tick: Option<i32>,
     /// The last update read
@@ -93,6 +95,7 @@ impl Source for Game {
             self.last_tick = None;
             self.vars = None;
             self.info = None;
+            self.pending_info = None;
             return Read::Unavailable;
         }
         if header.version != VERSION {
@@ -108,7 +111,7 @@ impl Source for Game {
 
         // The variables and the session info, read again when the session info changes. Each is
         // kept only if the game didn't change it while it was copied (the header is the same
-        // after, and for the session info, two copies one after the other are)
+        // after, and for the session info, a copy on a later read is too)
         let update = header.session_info_update;
         let key = (
             header.var_count,
@@ -140,18 +143,25 @@ impl Source for Game {
         }
         if self.info.as_ref().is_none_or(|(last, _)| *last != update) {
             self.info = None;
-            let Some(range) = header.session_info() else {
+            let Some(bytes) = header.session_info().and_then(|range| memory.copy(range)) else {
                 return Read::Idle;
             };
-            let (Some(first), Some(second)) = (memory.copy(range.clone()), memory.copy(range))
-            else {
-                return Read::Idle;
-            };
-            if first != second || !memory.header().is_some_and(|again| same(&again)) {
+            if !memory.header().is_some_and(|again| same(&again)) {
+                self.pending_info = None;
                 return Read::Idle;
             }
-            let doc = yaml::parse(&yaml::decode(&first));
-            self.info = Some((update, SessionInfo::new(&doc)));
+            // The same on a later read too: the game isn't writing it (it may count the update
+            // before it does)
+            match self.pending_info.take() {
+                Some((pending, earlier)) if pending == update && earlier == bytes => {
+                    let doc = yaml::parse(&yaml::decode(&bytes));
+                    self.info = Some((update, SessionInfo::new(&doc)));
+                }
+                _ => {
+                    self.pending_info = Some((update, bytes));
+                    return Read::Idle;
+                }
+            }
         }
 
         let Some((tick, offset)) = header.latest() else {
@@ -255,21 +265,17 @@ impl SharedMemory {
     }
 
     /// Copies `range` into `out`, if it's in the memory. The game writes it as it pleases, so a
-    /// copy can mix two of its writes: callers check it didn't.
+    /// copy can mix two of its writes: callers check it didn't. Read volatile, so every copy
+    /// (and every check after one) really reads the memory, in order.
     fn copy_into(&self, range: std::ops::Range<usize>, out: &mut Vec<u8>) -> bool {
         if range.start > range.end || range.end > self.len {
             return false;
         }
         out.clear();
         out.reserve(range.len());
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.view.Value.cast::<u8>().add(range.start),
-                out.as_mut_ptr(),
-                range.len(),
-            );
-            out.set_len(range.len());
-        }
+        let base = self.view.Value.cast::<u8>().cast_const();
+        // In the mapping (checked above), which stays mapped while `self` lives
+        out.extend(range.map(|at| unsafe { base.add(at).read_volatile() }));
         true
     }
 }
@@ -450,6 +456,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_start_counts_count_only_when_they_are_counts() {
+        use sdk::Buf;
+        let header = |bufs: [(i32, i32, i32); 3]| {
+            let mut header = Header::parse(&[0u8; HEADER_LEN]).unwrap();
+            header.buf_count = 3;
+            for (buf, (tick, offset, tick_begin)) in header.bufs.iter_mut().zip(bufs) {
+                *buf = Buf {
+                    tick,
+                    offset,
+                    tick_begin,
+                };
+            }
+            header
+        };
+        // Padding (zero, or anything that isn't a count): the tick count alone
+        assert!(header([(5, 100, 0), (6, 200, 0), (7, 300, 0)]).holds(7, 300));
+        assert!(header([(5, 100, 9999), (6, 200, 9999), (7, 300, 9999)]).holds(7, 300));
+        // Counts: a buffer being written isn't held whole, the others are
+        let writing = header([(8, 100, 8), (6, 200, 9), (7, 300, 7)]);
+        assert!(!writing.holds(6, 200));
+        assert!(writing.holds(7, 300));
+        assert!(!writing.holds(7, 100));
     }
 
     #[test]
