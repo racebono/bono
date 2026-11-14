@@ -76,11 +76,9 @@ const SPEED_WINDOW: f64 = 0.25;
 const BEST_LAP_MATCH: f64 = 0.1;
 /// Slower than this (m/s), a car in its pit box has stopped there.
 const STOPPED: f64 = 0.5;
-/// How far on (laps) the lap count may go up after the car crossed the line, for that crossing to
-/// start the lap.
-const LINE_NEAR: f64 = 0.1;
-/// How far on (laps) the car may cross the line after the lap count went up, for that crossing to
-/// start the lap: a little more than between a finish and a start line apart.
+/// How far apart (laps) the lap count going up and the car crossing the line may be, either way
+/// round, for that crossing to start that lap: more than a finish and a start line apart, short of
+/// another lap's.
 const COUNT_FAR: f64 = 0.5;
 /// Longer than this (s) between two updates, a car's progress isn't known to be driven.
 const MAX_GAP: f64 = 5.0;
@@ -894,15 +892,24 @@ fn follow_gap(behind: &Car<'_>, ahead: &Car<'_>) -> Option<f64> {
     let lap = behind.driver.class_lap_time;
     let same_class =
         behind.driver.class_id.is_some() && behind.driver.class_id == ahead.driver.class_id;
+    let apart = lap.map(|lap| (to - from).rem_euclid(1.0) * lap);
     if same_class && let (Some(from_est), Some(to_est)) = (behind.est, ahead.est) {
         // The one ahead past the line (whether or not its estimate is yet): round the lap
         let gap = to_est - from_est;
-        return match lap {
-            Some(lap) => Some(gap.rem_euclid(lap)),
-            None => Some(gap).filter(|gap| *gap >= 0.0),
+        return match (lap, apart) {
+            // Far from how far apart they are (a car beside it, the estimates' noise taking
+            // the gap round the lap): how far apart they are
+            (Some(lap), Some(apart)) => {
+                let gap = gap.rem_euclid(lap);
+                Some(match (gap - apart).abs() > lap / 4.0 {
+                    true => apart,
+                    false => gap,
+                })
+            }
+            _ => Some(gap).filter(|gap| *gap >= 0.0),
         };
     }
-    Some((to - from).rem_euclid(1.0) * lap?)
+    apart
 }
 
 /// In races, each car's gaps to the places ahead and behind, in seconds, from the game's time
@@ -1109,7 +1116,7 @@ impl CarTrack {
         // apart: the crossing waits a moment for the count, and the count for the next crossing
         // (on tracks whose laps finish elsewhere than they start, that's a while)
         let line = passed(0.0).map(|(along, at)| (at, before + along));
-        let near = |line: &(f64, f64)| after - line.1 <= LINE_NEAR;
+        let near = |line: &(f64, f64)| after - line.1 <= COUNT_FAR;
         let counted_back = matches!((self.lap, lap), (Some(previous), Some(lap)) if lap < previous);
         let rose = matches!((self.lap, lap), (Some(previous), Some(lap)) if lap > previous);
         if counted_back {
@@ -1129,7 +1136,9 @@ impl CarTrack {
         } else if rose {
             let crossed = line.or(self.line.filter(near)).map(|(at, _)| at);
             self.lap_start = Some(crossed.unwrap_or(time));
-            self.counted = crossed.is_none().then_some((time, after));
+            // Waiting for the line only while the car is still coming up to it: past it, its
+            // crossing wasn't seen (dropped with a move), and the count's the lap it's on
+            self.counted = (crossed.is_none() && pct > 0.5).then_some((time, after));
             self.line = None;
         } else if let Some((at, at_distance)) = line {
             match self.counted.take() {
@@ -1197,11 +1206,13 @@ impl CarTrack {
             _ => {}
         }
         self.last = Some((time, pct));
+        // Again, with a lap finished just now
+        self.best_lap_matching(official_best, time);
     }
 
     /// What to add to the lap count for the lap the car is on by its distance: while the count
-    /// went up before the car crossed the line (-1, until it does, a little way on at most), or
-    /// the car crossed it just before the count did (1).
+    /// went up before the car crossed the line (-1), or the car crossed it before the count did
+    /// (1), until the other follows, half a lap on at most.
     fn lap_offset(&self) -> i64 {
         let gone = |(_, at): (f64, f64)| self.distance - at;
         match () {
@@ -1211,7 +1222,7 @@ impl CarTrack {
             {
                 -1
             }
-            _ if self.line.is_some_and(|line| gone(line) <= LINE_NEAR) => 1,
+            _ if self.line.is_some_and(|line| gone(line) <= COUNT_FAR) => 1,
             _ => 0,
         }
     }
@@ -1244,8 +1255,8 @@ impl CarTrack {
         let Some((_, set_at)) = self.best_official else {
             return;
         };
-        // Found, or the lap's long gone by
-        if self.best_lap_total.is_some() || time - set_at > BEST_LAP_WINDOW {
+        // Found already. A lap finishing long after the best changed isn't it (see below)
+        if self.best_lap_total.is_some() {
             return;
         }
         let off = |total: f64| (total - official).abs();
@@ -1393,6 +1404,13 @@ mod tests {
         // Later crossings without a count aren't this lap's
         update(&mut track, 40.0, Some(0.02), 2, &SECTORS);
         assert!((track.lap_start.unwrap() - 10.75).abs() < 1e-9);
+
+        // Counted past the line, its crossing not seen: the count's the lap it's on
+        let mut track = CarTrack::default();
+        update(&mut track, 10.0, Some(0.02), 1, &SECTORS);
+        update(&mut track, 10.5, Some(0.04), 2, &SECTORS);
+        assert_eq!(track.lap_start, Some(10.5));
+        assert_eq!(track.lap_offset(), 0);
     }
 
     #[test]
@@ -1418,6 +1436,33 @@ mod tests {
         assert!(track.current[0].is_some());
         update(&mut track, time + 1.0, None, lap, &SECTORS);
         assert!(track.current.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn gaps_go_round_the_lap_only_when_the_cars_are_apart() {
+        let driver = super::super::session::Driver {
+            class_id: Some(1),
+            class_lap_time: Some(90.0),
+            ..Default::default()
+        };
+        let car = |pct: f64, est: f64| Car {
+            idx: 0,
+            driver: &driver,
+            pct: Some(pct),
+            on_pit_road: Some(false),
+            laps_completed: Some(1),
+            lap_offset: 0,
+            position: None,
+            est: Some(est),
+            f2: None,
+        };
+        // Side by side, the estimates a hair the wrong way round
+        let gap = follow_gap(&car(0.5, 45.0), &car(0.5001, 44.99)).unwrap();
+        assert!(gap < 0.1, "{gap}");
+        // Across the line, the estimate goes round the lap
+        let gap = follow_gap(&car(0.99, 89.1), &car(0.01, 0.9)).unwrap();
+        assert!((gap - 1.8).abs() < 1e-9, "{gap}");
+        assert!((follow_gap(&car(0.2, 18.0), &car(0.3, 27.5)).unwrap() - 9.5).abs() < 1e-9);
     }
 
     #[test]

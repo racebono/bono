@@ -81,6 +81,7 @@ struct Game {
     buffer: Vec<u8>,
     converter: Converter,
     warned_version: bool,
+    warned_range: bool,
 }
 
 impl Source for Game {
@@ -138,6 +139,19 @@ impl Source for Game {
             update,
         );
         let same = |again: &Header| again.connected() && layout(again) == layout(&header);
+        // What the header says is where it can't be: nothing's read until it says otherwise
+        let fits =
+            |range: Option<std::ops::Range<usize>>| range.is_some_and(|r| r.end <= memory.len);
+        if !(fits(header.var_headers()) && fits(header.session_info())) {
+            if !self.warned_range {
+                log::warn!(
+                    "iRacing's shared memory header points past the memory: not recording it"
+                );
+                self.warned_range = true;
+            }
+            return Read::Idle;
+        }
+
         if self.vars.as_ref().is_none_or(|(last, _)| *last != key) {
             self.vars = None;
             let (Some(headers), Some(buf_len)) = (
