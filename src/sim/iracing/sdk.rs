@@ -196,6 +196,15 @@ struct Var {
     count: usize,
 }
 
+/// A value of a test's update (see `Vars::of`).
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub enum Value {
+    Double(f64),
+    Int(i32),
+    Bool(bool),
+}
+
 /// The variables an update has, by name.
 #[derive(Debug, Default)]
 pub struct Vars(HashMap<String, Var>);
@@ -205,18 +214,34 @@ impl Vars {
     /// `values` in them.
     #[cfg(test)]
     pub fn doubles(values: &[(&str, f64)]) -> (Self, Vec<u8>) {
+        let values: Vec<_> = values
+            .iter()
+            .map(|(n, v)| (*n, Value::Double(*v)))
+            .collect();
+        Self::of(&values)
+    }
+
+    /// Variables of the values' types, one after another, for tests: the variables and an update
+    /// of `values` in them.
+    #[cfg(test)]
+    pub fn of(values: &[(&str, Value)]) -> (Self, Vec<u8>) {
         let mut vars = HashMap::new();
         let mut data = Vec::new();
         for (name, value) in values {
+            let (kind, bytes) = match value {
+                Value::Double(v) => (Kind::Double, v.to_le_bytes().to_vec()),
+                Value::Int(v) => (Kind::Int, v.to_le_bytes().to_vec()),
+                Value::Bool(v) => (Kind::Bool, vec![u8::from(*v)]),
+            };
             vars.insert(
                 (*name).to_owned(),
                 Var {
-                    kind: Kind::Double,
+                    kind,
                     offset: data.len(),
                     count: 1,
                 },
             );
-            data.extend_from_slice(&value.to_le_bytes());
+            data.extend_from_slice(&bytes);
         }
         (Self(vars), data)
     }

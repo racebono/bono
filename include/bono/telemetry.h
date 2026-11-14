@@ -156,7 +156,7 @@
     X(boolean, push_to_pass_equipped) \
     X(boolean, push_to_pass_charged) /* NULL on cars without a charge cycle; false while charging */ \
     X(boolean, push_to_pass_engaged) \
-    X(i64, push_to_pass_activations_left) /* NULL when unlimited or unknown */ \
+    X(i64, push_to_pass_activations_left) /* NULL when unlimited or unknown. iRacing: races only; 0 also on cars without it */ \
     X(i64, push_to_pass_activations_total) \
     /* Fuel */                                                                                           \
     X(f64, fuel_capacity)                   /* liters */                                                 \

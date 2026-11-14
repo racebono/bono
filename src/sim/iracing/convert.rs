@@ -284,6 +284,15 @@ impl Converter {
                 .filter(|rpm| *rpm >= 0.0)
                 .into();
             out.state.incident_points = car.driver.team_incidents.map(|n| n as f64).into();
+            // Push to pass, on cars that have it: whether it's on, and in races what's left (its
+            // count is the uses outside races, "or remaining in Race")
+            let per_car = PerCar::new(frame, car.idx, player);
+            out.state.push_to_pass_engaged = per_car.bool("CarIdxP2P_Status", "P2P_Status").into();
+            out.state.push_to_pass_activations_left = per_car
+                .i32("CarIdxP2P_Count", "P2P_Count")
+                .filter(|count| race && *count >= 0)
+                .map(i64::from)
+                .into();
             if Some(car.idx) == player {
                 player_telemetry(frame, info, &mut out);
             }
@@ -811,7 +820,6 @@ fn player_telemetry(frame: &Frame<'_>, info: &SessionInfo, out: &mut bono_teleme
         .filter(|n| *n >= 0)
         .map(f64::from)
         .into();
-    state.push_to_pass_engaged = frame.bool("P2P_Status").into();
 
     let compound = frame.i32("PlayerTireCompound").filter(|c| *c >= 0);
     for (wheel, prefix) in out.wheels.iter_mut().zip(WHEELS) {
@@ -1695,6 +1703,43 @@ mod tests {
         update(&mut track, 2.0, Some(0.45), 0, &SECTORS);
         assert_eq!(track.sector_start, None);
         assert_eq!(track.lap_start, None);
+    }
+
+    /// Push to pass on and, in races, how much is left, from the player's own variables where
+    /// there are no arrays.
+    #[test]
+    fn push_to_pass_left_only_in_races() {
+        use super::super::sdk::{Value, Vars};
+        use super::super::session::{Driver, Session};
+        let info = |kind: &'static str| SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: HashMap::from([(0, Driver::default())]),
+            sessions: vec![Session {
+                num: 0,
+                kind: Some(kind),
+                number: 1,
+                results: HashMap::new(),
+            }],
+            ..Default::default()
+        };
+        let (vars, data) = Vars::of(&[
+            ("SessionTime", Value::Double(10.0)),
+            ("SessionNum", Value::Int(0)),
+            ("PlayerCarIdx", Value::Int(0)),
+            ("LapDistPct", Value::Double(0.5)),
+            ("P2P_Status", Value::Bool(true)),
+            ("P2P_Count", Value::Int(5)),
+        ]);
+        let frame = Frame::new(&vars, &data);
+        for (kind, left) in [("race", Some(5)), ("practice", None)] {
+            let update = Converter::default()
+                .convert(&frame, &info(kind), Instant::now())
+                .unwrap();
+            let state = update.telemetry[0].state;
+            assert_eq!(state.push_to_pass_engaged.get(), Some(true), "{kind}");
+            assert_eq!(state.push_to_pass_activations_left.get(), left, "{kind}");
+        }
     }
 
     /// The player's axes and rotations, from iRacing's directions (see the module's doc) to the
