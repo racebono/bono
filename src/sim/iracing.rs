@@ -63,8 +63,9 @@ impl Simulator for IRacing {
 #[derive(Default)]
 struct Game {
     memory: Option<SharedMemory>,
-    /// The variables, and the header values they were read for
-    vars: Option<((i32, i32, i32), Vars)>,
+    /// The variables, and the header values they were read for (their count, where they're
+    /// described, an update's length, and the session info's update count)
+    vars: Option<((i32, i32, i32, i32), Vars)>,
     /// The session info, and its update count
     info: Option<(i32, SessionInfo)>,
     /// The tick count of the last update read
@@ -86,6 +87,14 @@ impl Source for Game {
         let Some(header) = memory.header() else {
             return Read::Unavailable;
         };
+        // In the menus, or between sessions (or not filled in yet). What was read for the last
+        // session may not be the next one's
+        if !header.connected() {
+            self.last_tick = None;
+            self.vars = None;
+            self.info = None;
+            return Read::Unavailable;
+        }
         if header.version != VERSION {
             if !self.warned_version {
                 log::warn!(
@@ -96,32 +105,52 @@ impl Source for Game {
             }
             return Read::Unavailable;
         }
-        // In the menus, or between sessions
-        if !header.connected() {
-            self.last_tick = None;
-            return Read::Unavailable;
-        }
 
-        let key = (header.var_count, header.var_header_offset, header.buf_len);
+        // The variables and the session info, read again when the session info changes. Each is
+        // kept only if the game didn't change it while it was copied (the header is the same
+        // after, and for the session info, two copies one after the other are)
+        let update = header.session_info_update;
+        let key = (
+            header.var_count,
+            header.var_header_offset,
+            header.buf_len,
+            update,
+        );
+        let same = |again: &Header| {
+            again.connected()
+                && (
+                    again.var_count,
+                    again.var_header_offset,
+                    again.buf_len,
+                    again.session_info_update,
+                ) == key
+        };
         if self.vars.as_ref().is_none_or(|(last, _)| *last != key) {
+            self.vars = None;
             let (Some(headers), Some(buf_len)) = (
                 header.var_headers().and_then(|range| memory.copy(range)),
                 header.buf_len(),
             ) else {
-                return Read::Unavailable;
+                return Read::Idle;
             };
+            if !memory.header().is_some_and(|again| same(&again)) {
+                return Read::Idle;
+            }
             self.vars = Some((key, Vars::from_headers(&headers, buf_len)));
         }
-
-        // Read whole: kept only if the game didn't change it meanwhile
-        let update = header.session_info_update;
-        if self.info.as_ref().is_none_or(|(last, _)| *last != update)
-            && let Some(bytes) = header.session_info().and_then(|range| memory.copy(range))
-            && memory
-                .header()
-                .is_some_and(|again| again.session_info_update == update)
-        {
-            let doc = yaml::parse(&yaml::decode(&bytes));
+        if self.info.as_ref().is_none_or(|(last, _)| *last != update) {
+            self.info = None;
+            let Some(range) = header.session_info() else {
+                return Read::Idle;
+            };
+            let (Some(first), Some(second)) = (memory.copy(range.clone()), memory.copy(range))
+            else {
+                return Read::Idle;
+            };
+            if first != second || !memory.header().is_some_and(|again| same(&again)) {
+                return Read::Idle;
+            }
+            let doc = yaml::parse(&yaml::decode(&first));
             self.info = Some((update, SessionInfo::new(&doc)));
         }
 
@@ -135,14 +164,12 @@ impl Source for Game {
             return Read::Idle;
         };
         // The SDK's way: copy the latest buffer, and keep it if the game didn't write over it
-        // meanwhile (its tick count is still the same)
-        if !memory.copy_into(offset..offset + len, &mut self.buffer)
-            || !memory.header().is_some_and(|again| {
-                again
-                    .bufs
-                    .iter()
-                    .any(|&(t, o)| t == tick && o as usize == offset)
-            })
+        // meanwhile (it still holds the same update, and no other one was started in it)
+        if !header.holds(tick, offset)
+            || !memory.copy_into(offset..offset + len, &mut self.buffer)
+            || !memory
+                .header()
+                .is_some_and(|again| again.holds(tick, offset))
         {
             return Read::Idle;
         }
@@ -178,8 +205,8 @@ impl SharedMemory {
         use windows_sys::Win32::{
             Foundation::CloseHandle,
             System::Memory::{
-                FILE_MAP_READ, MEMORY_BASIC_INFORMATION, MapViewOfFile, OpenFileMappingW,
-                UnmapViewOfFile, VirtualQuery,
+                FILE_MAP_READ, MEM_COMMIT, MEMORY_BASIC_INFORMATION, MapViewOfFile,
+                OpenFileMappingW, PAGE_GUARD, PAGE_NOACCESS, UnmapViewOfFile, VirtualQuery,
             },
         };
 
@@ -197,10 +224,13 @@ impl SharedMemory {
             unsafe { CloseHandle(handle) };
             return None;
         }
+        // Only as much as can be read from the start: committed, and neither guarded nor
+        // inaccessible
         let mut info = unsafe { std::mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
         let queried =
             unsafe { VirtualQuery(view.Value, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
-        if queried == 0 || info.RegionSize < HEADER_LEN {
+        let readable = info.State == MEM_COMMIT && info.Protect & (PAGE_GUARD | PAGE_NOACCESS) == 0;
+        if queried == 0 || !readable || info.RegionSize < HEADER_LEN {
             unsafe {
                 UnmapViewOfFile(view);
                 CloseHandle(handle);

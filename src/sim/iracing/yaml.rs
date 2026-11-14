@@ -69,13 +69,30 @@ pub fn number(text: &str) -> Option<f64> {
         .filter(|n| n.is_finite())
 }
 
+/// Windows-1252's characters for 0x80 to 0x9F (`None` where it has none).
+#[rustfmt::skip]
+const CP1252: [Option<char>; 32] = [
+    Some('€'), None, Some('‚'), Some('ƒ'), Some('„'), Some('…'), Some('†'), Some('‡'),
+    Some('ˆ'), Some('‰'), Some('Š'), Some('‹'), Some('Œ'), None, Some('Ž'), None,
+    None, Some('‘'), Some('’'), Some('“'), Some('”'), Some('•'), Some('–'), Some('—'),
+    Some('˜'), Some('™'), Some('š'), Some('›'), Some('œ'), None, Some('ž'), Some('Ÿ'),
+];
+
 /// The session info's text. The document says its own encoding (`WeekendInfo: Encoding:`), which
-/// iRacing gives as ISO-8859-1: each byte is the character of the same code. A document saying
-/// it's UTF-8 is read as UTF-8.
+/// iRacing gives as ISO-8859-1: each byte is the character of the same code. Bytes 0x80 to 0x9F
+/// are only control characters there, which names don't hold: they're read as Windows-1252's
+/// letters and punctuation (`š`, `Ž`, curly quotes), which ISO-8859-1 has no room for, and as a
+/// space where it has none. A document saying it's UTF-8 is read as UTF-8.
 pub fn decode(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     let bytes = &bytes[..end];
-    let latin1: String = bytes.iter().map(|&b| b as char).collect();
+    let latin1: String = bytes
+        .iter()
+        .map(|&b| match b {
+            0x80..=0x9F => CP1252[usize::from(b - 0x80)].unwrap_or(' '),
+            _ => b as char,
+        })
+        .collect();
     let utf8 = parse(&latin1)
         .at(&["WeekendInfo", "Encoding"])
         .and_then(Node::str)
@@ -137,11 +154,13 @@ fn lines(text: &str) -> Vec<Line<'_>> {
     out
 }
 
-/// A value without the double quotes iRacing puts around some (`"1"`).
+/// A value without the double quotes iRacing puts around some (`"1"`). A value with quotes inside
+/// is a name as written (`"Speedy" Bob "Jones"`).
 fn unquote(value: &str) -> &str {
     value
         .strip_prefix('"')
         .and_then(|v| v.strip_suffix('"'))
+        .filter(|inner| !inner.contains('"'))
         .unwrap_or(value)
 }
 
@@ -315,6 +334,19 @@ DriverInfo:
             parse(&text).at(&["DriverInfo", "Name"]).and_then(Node::str),
             Some("Ana Müller")
         );
+        // Windows-1252's letters and quotes, and a space for what it hasn't got
+        let cp1252 = b"DriverInfo:\n Name: Tom\xe1\x9a \x93Fast\x94\x81\n";
+        assert_eq!(
+            parse(&decode(cp1252))
+                .at(&["DriverInfo", "Name"])
+                .and_then(Node::str),
+            Some("Tomáš “Fast”")
+        );
+        assert_eq!(
+            unquote(r#""Speedy" Bob "Jones""#),
+            r#""Speedy" Bob "Jones""#
+        );
+        assert_eq!(unquote(r#""007""#), "007");
 
         let utf8 = "WeekendInfo:\n Encoding: UTF-8\nDriverInfo:\n Name: Ana Müller\n";
         assert_eq!(

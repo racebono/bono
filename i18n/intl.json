@@ -1496,9 +1496,9 @@
         "ca": "Bono segueix la cursa des del joc. Alguns jocs necessiten un plugin per fer-ho: instal·la'l aquí, amb el joc tancat."
     },
     "onboarding.no_simulator": {
-        "en": "None of these games was found in Steam's libraries. You can still continue and check the Simulators menu after installing one through Steam.",
-        "es": "No se ha encontrado ninguno de estos juegos en las bibliotecas de Steam. Puedes continuar y consultar el menú Simuladores después de instalar uno con Steam.",
-        "ca": "No s'ha trobat cap d'aquests jocs a les biblioteques de Steam. Pots continuar i consultar el menú Simuladors després d'instal·lar-ne un amb Steam."
+        "en": "None of the Steam games was found in Steam's libraries, and no game is running. You can still continue: iRacing is found once it runs, and the Simulators menu shows the others after installing one through Steam.",
+        "es": "No se ha encontrado ninguno de los juegos de Steam en sus bibliotecas y no hay ningún juego en marcha. Puedes continuar: iRacing se detecta en cuanto se inicia, y el menú Simuladores muestra los demás después de instalar uno con Steam.",
+        "ca": "No s'ha trobat cap dels jocs de Steam a les seves biblioteques i no hi ha cap joc en marxa. Pots continuar: iRacing es detecta tan bon punt s'inicia, i el menú Simuladors mostra els altres després d'instal·lar-ne un amb Steam."
     },
     "error.download": {
         "en": "Error downloading",

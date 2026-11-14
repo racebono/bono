@@ -45,8 +45,18 @@ pub struct Header {
     pub buf_count: i32,
     /// The length of one update
     pub buf_len: i32,
-    /// Each buffer's tick count (which update it holds) and offset
-    pub bufs: [(i32, i32); MAX_BUFS],
+    pub bufs: [Buf; MAX_BUFS],
+}
+
+/// One of the buffers the game writes its updates into, in turn (`irsdk_varBuf`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Buf {
+    /// Which update it holds: set once the game has written it
+    pub tick: i32,
+    pub offset: i32,
+    /// Set before the game starts writing an update into it, in SDK versions that have it (the
+    /// int after the offset, which older ones leave 0)
+    pub tick_begin: i32,
 }
 
 fn int(bytes: &[u8], at: usize) -> Option<i32> {
@@ -57,9 +67,13 @@ impl Header {
     /// The header at the start of `bytes`, if they're long enough to hold one.
     pub fn parse(bytes: &[u8]) -> Option<Self> {
         let at = |i: usize| int(bytes, i * 4);
-        let mut bufs = [(0, 0); MAX_BUFS];
+        let mut bufs = [Buf::default(); MAX_BUFS];
         for (i, buf) in bufs.iter_mut().enumerate() {
-            *buf = (at(12 + i * 4)?, at(13 + i * 4)?);
+            *buf = Buf {
+                tick: at(12 + i * 4)?,
+                offset: at(13 + i * 4)?,
+                tick_begin: at(14 + i * 4)?,
+            };
         }
         Some(Self {
             version: at(0)?,
@@ -84,8 +98,18 @@ impl Header {
     /// The buffer holding the latest update: its tick count and offset.
     pub fn latest(&self) -> Option<(i32, usize)> {
         let count = usize::try_from(self.buf_count).ok()?.min(MAX_BUFS);
-        let (tick, offset) = self.bufs[..count].iter().max_by_key(|(tick, _)| *tick)?;
-        Some((*tick, usize::try_from(*offset).ok()?))
+        let buf = self.bufs[..count].iter().max_by_key(|buf| buf.tick)?;
+        Some((buf.tick, usize::try_from(buf.offset).ok()?))
+    }
+
+    /// Whether the buffer at `offset` still holds update `tick`, written whole: the game hasn't
+    /// started writing another one into it (in SDK versions that say when it starts).
+    pub fn holds(&self, tick: i32, offset: usize) -> bool {
+        self.bufs.iter().any(|buf| {
+            buf.tick == tick
+                && usize::try_from(buf.offset) == Ok(offset)
+                && (buf.tick_begin == 0 || buf.tick_begin == tick)
+        })
     }
 
     /// Where the session info is, as a range of the bytes.
@@ -299,7 +323,7 @@ impl Ibt {
         let records = int(&data, HEADER_LEN + 8 + 8 + 8 + 4)
             .and_then(|count| usize::try_from(count).ok())
             .ok_or_else(invalid)?;
-        let first = usize::try_from(header.bufs[0].1).map_err(|_| invalid())?;
+        let first = usize::try_from(header.bufs[0].offset).map_err(|_| invalid())?;
         let len = header.buf_len().ok_or_else(invalid)?;
         let records = records.min(data.len().saturating_sub(first) / len);
         let session_info = header

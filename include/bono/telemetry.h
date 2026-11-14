@@ -152,7 +152,7 @@
     X(i64, drs_activations_left) /* this lap; NULL when unlimited or unknown */ \
     X(boolean, drs_activations_unlimited) \
     X(i64, drs_activations_total) \
-    X(f64, incident_points) /* points against the limit, can be fractional. RaceRoom: its incident points. LMU: track-limit points, as it has no collision penalties. iRacing: the team's incident count */ \
+    X(f64, incident_points) /* points against the limit, can be fractional. RaceRoom: its incident points. LMU: track-limit points, as it has no collision penalties. iRacing: the team's incident count, else the driver's */ \
     X(boolean, push_to_pass_equipped) \
     X(boolean, push_to_pass_charged) /* NULL on cars without a charge cycle; false while charging */ \
     X(boolean, push_to_pass_engaged) \
@@ -216,7 +216,7 @@
     X(f64, tire_inner_temperature_right)                                                                 \
     X(f64, tire_carcass_temperature)                                                                     \
     X(f64, tire_optimal_temperature)        /* unit as reported by the simulator */                     \
-    X(f64, tire_wear)                       /* fraction worn */                                         \
+    X(f64, tire_wear)                       /* fraction worn (LMU and iRacing: what's left; see the engineer's wear_remaining) */ \
     X(f64, tire_vertical_deflection)                                                                     \
     X(i64, tire_compound) /* index of the compound for this car */ \
     X(i64, tire_compound_type)                                                                           \

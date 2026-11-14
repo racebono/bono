@@ -263,7 +263,9 @@ impl Onboarding {
             ui.set_width(ui.available_width());
             self.simulators.update(rt, ui, simulators);
         });
-        if !self.simulators.any_installed() {
+        // Games found by their process alone (iRacing) aren't looked for on the disk
+        let running = simulators.simulators().any(|sim| sim.is_running());
+        if !self.simulators.any_installed() && !running {
             ui.weak(t!("onboarding.no_simulator"));
         }
 
