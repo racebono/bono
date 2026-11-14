@@ -1,0 +1,457 @@
+//! iRacing. It has no plugins: while it runs, it publishes its telemetry in shared memory (see
+//! `sdk`) with the session's description as a YAML document (see `yaml` and `session`), which a
+//! thread of ours reads and records like LMU's plugin does (see `memory`).
+//!
+//! iRacing is installed by its own launcher (or Steam), anywhere: it's followed by its process
+//! alone, and its folder isn't looked for (nothing needs it).
+
+mod convert;
+mod sdk;
+mod session;
+mod yaml;
+
+use crate::{
+    sim::{
+        Simulator, SimulatorInfo, SimulatorSettings,
+        memory::{Read, Recording, Source},
+    },
+    sqlite::pool::Pool,
+};
+use convert::Converter;
+use sdk::{Frame, HEADER_LEN, Header, MEMORY_NAME, VERSION, Vars};
+use session::SessionInfo;
+use std::{path::PathBuf, time::Instant};
+
+pub struct IRacing(Recording);
+
+impl IRacing {
+    pub fn new() -> Self {
+        Self(Recording::new(Self::NAME, "iracing", || {
+            Box::new(Game::default())
+        }))
+    }
+}
+
+impl SimulatorInfo for IRacing {
+    const NAME: &'static str = "iRacing";
+    /// Lovely Sim Racing's track data's id for it
+    const TRACK_DATA_ID: &'static str = "iracing";
+    /// Mostly installed with its own launcher; Steam reporting it running isn't needed to follow
+    /// it, since its process is
+    const APP_ID: Option<u32> = None;
+    /// The current DirectX 11 build, and the older 64-bit and 32-bit ones
+    const EXECUTABLES: &'static [&'static str] =
+        &["iRacingSim64DX11.exe", "iRacingSim64.exe", "iRacingSim.exe"];
+    const INSTALL_DIR: Option<fn() -> Option<PathBuf>> = None;
+}
+
+impl Simulator for IRacing {
+    fn database(&mut self, running: bool) -> Option<&Pool> {
+        self.0.database(running)
+    }
+
+    fn apply(&mut self, settings: &SimulatorSettings) {
+        self.0.apply(settings);
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// Reading the game's shared memory, on the reader thread.
+#[derive(Default)]
+struct Game {
+    memory: Option<SharedMemory>,
+    /// The variables, and the header values they were read for
+    vars: Option<((i32, i32, i32), Vars)>,
+    /// The session info, and its update count
+    info: Option<(i32, SessionInfo)>,
+    /// The tick count of the last update read
+    last_tick: Option<i32>,
+    /// The last update read
+    buffer: Vec<u8>,
+    converter: Converter,
+    warned_version: bool,
+}
+
+impl Source for Game {
+    fn read(&mut self, now: Instant) -> Read {
+        if self.memory.is_none() {
+            self.memory = SharedMemory::open();
+        }
+        let Some(memory) = &self.memory else {
+            return Read::Unavailable;
+        };
+        let Some(header) = memory.header() else {
+            return Read::Unavailable;
+        };
+        if header.version != VERSION {
+            if !self.warned_version {
+                log::warn!(
+                    "iRacing's shared memory is version {}, not {VERSION}: not recording it",
+                    header.version
+                );
+                self.warned_version = true;
+            }
+            return Read::Unavailable;
+        }
+        // In the menus, or between sessions
+        if !header.connected() {
+            self.last_tick = None;
+            return Read::Unavailable;
+        }
+
+        let key = (header.var_count, header.var_header_offset, header.buf_len);
+        if self.vars.as_ref().is_none_or(|(last, _)| *last != key) {
+            let (Some(headers), Some(buf_len)) = (
+                header.var_headers().and_then(|range| memory.copy(range)),
+                header.buf_len(),
+            ) else {
+                return Read::Unavailable;
+            };
+            self.vars = Some((key, Vars::from_headers(&headers, buf_len)));
+        }
+
+        // Read whole: kept only if the game didn't change it meanwhile
+        let update = header.session_info_update;
+        if self.info.as_ref().is_none_or(|(last, _)| *last != update)
+            && let Some(bytes) = header.session_info().and_then(|range| memory.copy(range))
+            && memory
+                .header()
+                .is_some_and(|again| again.session_info_update == update)
+        {
+            let doc = yaml::parse(&yaml::decode(&bytes));
+            self.info = Some((update, SessionInfo::new(&doc)));
+        }
+
+        let Some((tick, offset)) = header.latest() else {
+            return Read::Idle;
+        };
+        if self.last_tick == Some(tick) {
+            return Read::Idle;
+        }
+        let Some(len) = header.buf_len() else {
+            return Read::Idle;
+        };
+        // The SDK's way: copy the latest buffer, and keep it if the game didn't write over it
+        // meanwhile (its tick count is still the same)
+        if !memory.copy_into(offset..offset + len, &mut self.buffer)
+            || !memory.header().is_some_and(|again| {
+                again
+                    .bufs
+                    .iter()
+                    .any(|&(t, o)| t == tick && o as usize == offset)
+            })
+        {
+            return Read::Idle;
+        }
+        self.last_tick = Some(tick);
+
+        let (Some((_, vars)), Some((_, info))) = (&self.vars, &self.info) else {
+            return Read::Idle;
+        };
+        match self
+            .converter
+            .convert(&Frame::new(vars, &self.buffer), info, now)
+        {
+            Some(update) => Read::Update(update),
+            None => Read::Idle,
+        }
+    }
+}
+
+/// The game's shared memory, mapped read-only.
+struct SharedMemory {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    view: windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS,
+    /// How much of it is mapped
+    len: usize,
+}
+
+// Only read, by copying
+unsafe impl Send for SharedMemory {}
+
+impl SharedMemory {
+    /// `None` while the game hasn't made it (it isn't running yet, or hasn't loaded).
+    fn open() -> Option<Self> {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Memory::{
+                FILE_MAP_READ, MEMORY_BASIC_INFORMATION, MapViewOfFile, OpenFileMappingW,
+                UnmapViewOfFile, VirtualQuery,
+            },
+        };
+
+        let name = MEMORY_NAME
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let handle = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, name.as_ptr()) };
+        if handle.is_null() {
+            return None;
+        }
+        // All of it: its size is the game's to choose
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 0) };
+        if view.Value.is_null() {
+            unsafe { CloseHandle(handle) };
+            return None;
+        }
+        let mut info = unsafe { std::mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
+        let queried =
+            unsafe { VirtualQuery(view.Value, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+        if queried == 0 || info.RegionSize < HEADER_LEN {
+            unsafe {
+                UnmapViewOfFile(view);
+                CloseHandle(handle);
+            }
+            return None;
+        }
+        Some(Self {
+            handle,
+            view,
+            len: info.RegionSize,
+        })
+    }
+
+    fn header(&self) -> Option<Header> {
+        Header::parse(&self.copy(0..HEADER_LEN)?)
+    }
+
+    /// A copy of `range`, if it's in the memory.
+    fn copy(&self, range: std::ops::Range<usize>) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        self.copy_into(range, &mut out).then_some(out)
+    }
+
+    /// Copies `range` into `out`, if it's in the memory. The game writes it as it pleases, so a
+    /// copy can mix two of its writes: callers check it didn't.
+    fn copy_into(&self, range: std::ops::Range<usize>, out: &mut Vec<u8>) -> bool {
+        if range.start > range.end || range.end > self.len {
+            return false;
+        }
+        out.clear();
+        out.reserve(range.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.view.Value.cast::<u8>().add(range.start),
+                out.as_mut_ptr(),
+                range.len(),
+            );
+            out.set_len(range.len());
+        }
+        true
+    }
+}
+
+impl Drop for SharedMemory {
+    fn drop(&mut self) {
+        use windows_sys::Win32::{Foundation::CloseHandle, System::Memory::UnmapViewOfFile};
+        unsafe {
+            UnmapViewOfFile(self.view);
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::memory::record;
+    use bono_sim::recorder::{DATABASE, Recorder};
+    use sdk::Ibt;
+    use std::{path::Path, time::Duration};
+
+    /// Records a saved telemetry file as if the game were sharing it live, into `dir`. Returns
+    /// how many updates were recorded.
+    fn record_file(path: &Path, dir: &Path) -> usize {
+        let ibt = Ibt::open(path).unwrap();
+        let info = SessionInfo::new(&yaml::parse(&yaml::decode(ibt.session_info())));
+        let recorder = Recorder::new(dir, None).unwrap();
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        let mut recorded = 0;
+        for i in 0..ibt.records() {
+            let frame = ibt.frame(i);
+            let now = start + Duration::from_secs_f64(i as f64 / 60.0);
+            if let Some(update) = converter.convert(&frame, &info, now) {
+                record(&recorder, update);
+                recorded += 1;
+            }
+        }
+        drop(recorder);
+        recorded
+    }
+
+    /// What iRacing saved on this computer: every `.ibt` file in `BONO_IRACING_TELEMETRY`.
+    fn saved_files() -> Vec<PathBuf> {
+        let Some(dir) = std::env::var_os("BONO_IRACING_TELEMETRY") else {
+            return Vec::new();
+        };
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| Some(entry.ok()?.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "ibt"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Every column of the recording's tables, and how many of its rows have it set, for the
+    /// player's car where the table has cars.
+    fn filled(conn: &rusqlite::Connection) -> Vec<(String, String, i64, i64)> {
+        let mut out = Vec::new();
+        for (table, filter) in [
+            ("telemetry", "WHERE is_player = 1"),
+            (
+                "telemetry_wheel",
+                "WHERE telemetry_id IN (SELECT id FROM telemetry WHERE is_player = 1)",
+            ),
+            (
+                "car_state",
+                "WHERE vehicle_id IN (SELECT vehicle_id FROM telemetry WHERE is_player = 1)",
+            ),
+            ("session", ""),
+            ("session_sector", ""),
+            ("standings", "WHERE is_player = 1"),
+            (
+                "standing_sector",
+                "WHERE standing_id IN (SELECT id FROM standings WHERE is_player = 1)",
+            ),
+        ] {
+            let columns: Vec<String> = conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            for column in columns {
+                let (set, rows): (i64, i64) = conn
+                    .query_row(
+                        &format!("SELECT count({column}), count(*) FROM {table} {filter}"),
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                out.push((table.to_owned(), column, set, rows));
+            }
+        }
+        out
+    }
+
+    /// Records the telemetry iRacing saved, as if it were live, and checks what the engineer and
+    /// spotter need is there. Prints which columns each file filled (`--nocapture`).
+    #[test]
+    #[ignore = "needs iRacing's saved telemetry (.ibt files) in BONO_IRACING_TELEMETRY"]
+    fn records_saved_telemetry() {
+        let files = saved_files();
+        assert!(!files.is_empty(), "no .ibt files in BONO_IRACING_TELEMETRY");
+        for path in files {
+            let dir = tempfile::tempdir().unwrap();
+            let recorded = record_file(&path, dir.path());
+            let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+            let count = |sql: &str| conn.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap();
+            let player_rows = count("SELECT count(*) FROM telemetry WHERE is_player = 1");
+            println!(
+                "{}: {recorded} updates, {player_rows} player rows",
+                path.display()
+            );
+            assert!(player_rows > 0, "{}", path.display());
+            assert_eq!(count("SELECT count(*) FROM session WHERE track IS NULL"), 0);
+            for (table, column, set, rows) in filled(&conn) {
+                println!("  {table}.{column}: {set}/{rows}");
+            }
+
+            // Whole laps were driven: they're timed, sector by sector
+            let laps = count(
+                "SELECT count(DISTINCT lap) FROM telemetry WHERE is_player = 1 \
+                 AND lap_start_time IS NOT NULL",
+            );
+            if laps >= 3 {
+                assert!(
+                    count(
+                        "SELECT count(*) FROM standings WHERE is_player = 1 AND last_lap_time > 0"
+                    ) > 0
+                );
+                assert!(
+                    count(
+                        "SELECT count(*) FROM standing_sector JOIN standings ON standings.id = standing_id \
+                         WHERE is_player = 1 AND last_lap > 0"
+                    ) > 0
+                );
+            }
+        }
+    }
+
+    /// The sectors timed here add up to the lap times the game gives, to within what timing the
+    /// line between updates allows. Not a session's first lap: the game may time it from the start
+    /// rather than the line.
+    #[test]
+    #[ignore = "needs iRacing's saved telemetry (.ibt files) in BONO_IRACING_TELEMETRY"]
+    fn sector_times_add_up_to_the_games_lap_times() {
+        for path in saved_files() {
+            let dir = tempfile::tempdir().unwrap();
+            record_file(&path, dir.path());
+            let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+            // Each lap's sectors, against the game's time for that lap (the next lap's rows)
+            let mut statement = conn
+                .prepare(
+                    "SELECT s.laps_completed, s.last_lap_time, \
+                     (SELECT sum(last_lap) FROM standing_sector WHERE standing_id = s.id), \
+                     (SELECT count(*) FROM standing_sector WHERE standing_id = s.id AND last_lap IS NULL) \
+                     FROM standings s WHERE is_player = 1 AND last_lap_time > 0 \
+                     GROUP BY s.laps_completed HAVING s.id = max(s.id)",
+                )
+                .unwrap();
+            let rows: Vec<(i64, f64, Option<f64>, i64)> = statement
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            for (lap, official, sum, missing) in rows {
+                println!("{}: lap {lap} {official} vs {sum:?}", path.display());
+                if let (Some(sum), 0, 2..) = (sum, missing, lap) {
+                    assert!(
+                        (sum - official).abs() < 0.1,
+                        "{}: lap {lap}: {sum} vs {official}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reads_the_layout_of_a_header() {
+        let mut bytes = vec![0u8; HEADER_LEN + 144];
+        let ints = [2, 1, 60, 7, 10, 300, 1, HEADER_LEN as i32, 3, 16];
+        for (i, v) in ints.iter().enumerate() {
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        for (i, (tick, offset)) in [(5, 1000), (7, 2000), (6, 3000)].iter().enumerate() {
+            let at = 48 + i * 16;
+            bytes[at..at + 4].copy_from_slice(&i32::to_le_bytes(*tick));
+            bytes[at + 4..at + 8].copy_from_slice(&i32::to_le_bytes(*offset));
+        }
+        // One double at offset 8 of each update
+        let var = HEADER_LEN;
+        bytes[var..var + 4].copy_from_slice(&5i32.to_le_bytes());
+        bytes[var + 4..var + 8].copy_from_slice(&8i32.to_le_bytes());
+        bytes[var + 8..var + 12].copy_from_slice(&1i32.to_le_bytes());
+        bytes[var + 16..var + 27].copy_from_slice(b"SessionTime");
+
+        let header = Header::parse(&bytes).unwrap();
+        assert!(header.connected());
+        assert_eq!(header.latest(), Some((7, 2000)));
+        assert_eq!(header.session_info(), Some(300..310));
+        let vars = Vars::parse(&bytes, &header).unwrap();
+        let mut update = vec![0u8; 16];
+        update[8..].copy_from_slice(&123.5f64.to_le_bytes());
+        let frame = Frame::new(&vars, &update);
+        assert_eq!(frame.f64("SessionTime"), Some(123.5));
+        assert_eq!(frame.i32("SessionTime"), None);
+        assert_eq!(frame.f64("Speed"), None);
+        assert_eq!(frame.f64_at("SessionTime", 1), None);
+    }
+}

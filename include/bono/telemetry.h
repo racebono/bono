@@ -30,7 +30,7 @@
     X(f64, time_since_last_update)                                                                       \
     X(i64, lap)                                                                                          \
     X(f64, lap_start_time)                  /* session time the current lap started */                   \
-    X(f64, lap_distance)                    /* metres from the start/finish line (LMU: estimated, see the plugin) */ \
+    X(f64, lap_distance)                    /* metres from the start/finish line (LMU: estimated, see the plugin; iRacing: its lap fraction times the track's length) */ \
     X(i64, sector)                          /* zero-based */                                             \
     X(boolean, in_pit_lane)                                                                              \
     X(boolean, lap_invalidated)                                                                          \
@@ -135,7 +135,7 @@
     X(boolean, headlights)                                                                               \
     X(i64, wipers)                                                                                       \
     X(i64, scheduled_pit_stops)                                                                          \
-    X(f64, steering_wheel_range) /* physical; RaceRoom: degrees, full left to full right; LMU: unit and span not documented */ \
+    X(f64, steering_wheel_range) /* physical; RaceRoom: degrees, full left to full right; LMU: unit and span not documented; iRacing: degrees, span not documented */ \
     X(f64, engine_max_rpm) /* rev limit, not the best shift point */ \
     X(i64, max_gears) /* forward gears */ \
     /* The highest value of each control, which does not prove every step differs */ \
@@ -152,7 +152,7 @@
     X(i64, drs_activations_left) /* this lap; NULL when unlimited or unknown */ \
     X(boolean, drs_activations_unlimited) \
     X(i64, drs_activations_total) \
-    X(f64, incident_points) /* points against the limit, can be fractional. RaceRoom: its incident points. LMU: track-limit points, as it has no collision penalties */ \
+    X(f64, incident_points) /* points against the limit, can be fractional. RaceRoom: its incident points. LMU: track-limit points, as it has no collision penalties. iRacing: the team's incident count */ \
     X(boolean, push_to_pass_equipped) \
     X(boolean, push_to_pass_charged) /* NULL on cars without a charge cycle; false while charging */ \
     X(boolean, push_to_pass_engaged) \

@@ -289,7 +289,10 @@ is Kelvin; `*_left/center/right` are edges seen from behind the car (inside is r
 and left on right tyres), and `tire_inner_*` is a layer under the tread, not the inside edge;
 `rear_brake_bias` is the rear's share; `session_time` restarts each session; lap time isn't stored
 in `telemetry`; `lap_invalidated` is the current lap's state; `lap_distance` can jump back a little;
-`sector` is zero-based there and in `standings`; `delta_best` positive is slower.
+`sector` is zero-based there and in `standings`; `delta_best` positive is slower. On iRacing,
+rivals' speed, lap starts, sector times and pit stops are worked out from their progress around the
+lap, and no car has a world position: positions, headings, `ahead_of_player_m` and
+`right_of_player_m` are NULL.
 
 ## Evidence that fits the question
 
