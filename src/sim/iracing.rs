@@ -541,17 +541,46 @@ mod tests {
         for path in saved_files() {
             let ibt = Ibt::open(&path).unwrap();
             let n = ibt.records();
+            let name = path.display();
+            let channels = [
+                "Speed",
+                "Yaw",
+                "YawNorth",
+                "YawRate",
+                "Pitch",
+                "PitchRate",
+                "SteeringWheelAngle",
+                "SteeringWheelTorque",
+                "LatAccel",
+                "LongAccel",
+                "VertAccel",
+                "VelocityX",
+                "VelocityY",
+                "VelocityZ",
+                "Lat",
+                "Lon",
+                "Alt",
+            ];
+            if n == 0 || ibt.tick_rate() <= 0 {
+                continue;
+            }
+            if let Some(missing) = channels.iter().find(|c| ibt.frame(0).count(c) == 0) {
+                println!("{name}: no {missing}, not checked");
+                continue;
+            }
             let at = |i: usize, name: &str| ibt.frame(i).f64(name).unwrap_or(f64::NAN);
-            // Driving, with room either side for the rates
+            let finite = |i: usize| channels.iter().all(|c| at(i, c).is_finite());
+            // Driving, with room either side for the rates, every channel a number
             let k = 30;
             let samples: Vec<usize> = (k..n.saturating_sub(k))
                 .filter(|&i| ibt.frame(i).bool("IsOnTrack") == Some(true) && at(i, "Speed") > 10.0)
+                .filter(|&i| finite(i - k) && finite(i) && finite(i + k))
                 .collect();
             if samples.len() < 600 {
                 continue;
             }
             checked += 1;
-            let dt = 1.0 / 60.0;
+            let dt = 1.0 / f64::from(ibt.tick_rate());
             let rate = |i: usize, name: &str| (at(i + 1, name) - at(i - 1, name)) / (2.0 * dt);
             let lat0 = at(samples[0], "Lat").to_radians();
             // Clockwise from north, as the GPS track goes
@@ -562,7 +591,6 @@ mod tests {
             let pairs = |f: &dyn Fn(usize) -> (f64, f64)| -> Vec<(f64, f64)> {
                 samples.iter().map(|&i| f(i)).collect()
             };
-            let name = path.display();
 
             // How much the GPS track turned (clockwise) around each update
             let turn = pairs(&|i| {
@@ -603,20 +631,37 @@ mod tests {
                 correlation(&longitudinal) > 0.9,
                 "{name}: LongAccel isn't + forward"
             );
-            let up =
-                samples.iter().map(|&i| at(i, "VertAccel")).sum::<f64>() / samples.len() as f64;
+            // Gravity alone: driving straight on, neither cornering nor braking hard (banking
+            // adds the cornering to the vertical)
+            let calm: Vec<f64> = samples
+                .iter()
+                .filter(|&&i| at(i, "LatAccel").abs() < 2.0 && at(i, "LongAccel").abs() < 2.0)
+                .map(|&i| at(i, "VertAccel"))
+                .collect();
+            let up = calm.iter().sum::<f64>() / calm.len() as f64;
             assert!(
                 (8.0..11.5).contains(&up),
                 "{name}: VertAccel isn't + up with gravity"
             );
-            let climb = |i: usize| (at(i + 3, "Alt") - at(i - 3, "Alt")) / (6.0 * dt);
-            let pitch = pairs(&|i| (at(i, "Pitch"), climb(i) / at(i, "Speed")));
-            assert!(correlation(&pitch) < 0.0, "{name}: Pitch isn't + nose down");
-            let vertical = pairs(&|i| {
-                let nose = at(i, "VelocityX") * (-at(i, "Pitch")).sin();
-                (at(i, "VelocityZ"), climb(i) - nose)
+            let pitch_rate = pairs(&|i| (at(i, "PitchRate"), rate(i, "Pitch")));
+            assert!(
+                correlation(&pitch_rate) > 0.9,
+                "{name}: PitchRate isn't Pitch's rate"
+            );
+            // Climbing says which way the nose points only where the track climbs
+            let (low, high) = samples.iter().fold((f64::MAX, f64::MIN), |(l, h), &i| {
+                (l.min(at(i, "Alt")), h.max(at(i, "Alt")))
             });
-            assert!(correlation(&vertical) > 0.0, "{name}: VelocityZ isn't + up");
+            if high - low >= 5.0 {
+                let climb = |i: usize| (at(i + 3, "Alt") - at(i - 3, "Alt")) / (6.0 * dt);
+                let pitch = pairs(&|i| (at(i, "Pitch"), climb(i) / at(i, "Speed")));
+                assert!(correlation(&pitch) < 0.0, "{name}: Pitch isn't + nose down");
+                let vertical = pairs(&|i| {
+                    let nose = at(i, "VelocityX") * (-at(i, "Pitch")).sin();
+                    (at(i, "VelocityZ"), climb(i) - nose)
+                });
+                assert!(correlation(&vertical) > 0.0, "{name}: VelocityZ isn't + up");
+            }
         }
         assert!(checked > 0, "no saved laps long enough to check");
     }

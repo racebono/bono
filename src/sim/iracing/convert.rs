@@ -703,7 +703,9 @@ fn player_telemetry(frame: &Frame<'_>, info: &SessionInfo, out: &mut bono_teleme
     out.pitch = negated("Pitch").into();
     out.pitch_rate = negated("PitchRate").into();
     out.yaw_rate = negated("YawRate").into();
-    // A compass heading: 0 north, turning right positive. Travel is off the nose by the slip
+    // A compass heading: 0 north, turning right positive. Travel is off the nose by the slip,
+    // taken in the car's own plane: on a slope or banking that's a little off the ground's (the
+    // more the car slides), as roll's direction isn't known to tilt it back level
     let heading = f("YawNorth").map(|h| h.sin().atan2(h.cos()));
     out.heading = heading.into();
     out.course = heading

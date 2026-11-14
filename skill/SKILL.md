@@ -293,8 +293,10 @@ in `telemetry`; `lap_invalidated` is the current lap's state; `lap_distance` can
 rivals' speed, lap starts, sector times and pit stops are worked out from their progress around the
 lap, and no car has a world position: `position_x/y/z`, `ahead_of_player_m` and
 `right_of_player_m` are NULL (places in the standings are there). The player's `heading` and
-`course` are compass bearings, 0 north; `roll` and `roll_rate` are NULL, and the accelerations
-include gravity. It has no sector yellows:
+`course` are compass bearings in radians, 0 north and clockwise positive (-pi to pi); `roll` and
+`roll_rate` are NULL, and the accelerations are as an accelerometer reads them, gravity included
+(about 9.8 vertical standing still, and some lateral or longitudinal on banking or a slope, not
+only cornering or braking). It has no sector yellows:
 `race_state.local_yellow` is NULL (as on any simulator that doesn't say), and
 `cars_now.under_yellow` is the yellow shown to the car.
 

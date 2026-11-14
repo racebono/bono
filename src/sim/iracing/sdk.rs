@@ -331,6 +331,7 @@ pub struct Ibt {
     len: usize,
     records: usize,
     session_info: std::ops::Range<usize>,
+    tick_rate: i32,
 }
 
 #[cfg(test)]
@@ -358,11 +359,17 @@ impl Ibt {
             len,
             records,
             session_info,
+            tick_rate: header.tick_rate,
         })
     }
 
     pub fn records(&self) -> usize {
         self.records
+    }
+
+    /// Updates a second.
+    pub fn tick_rate(&self) -> i32 {
+        self.tick_rate
     }
 
     /// The session info the game saved with the file (as it was when it closed it).
