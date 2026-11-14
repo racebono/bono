@@ -1744,9 +1744,11 @@ impl Trace {
         time: Option<f64>,
         length: f64,
     ) -> Self {
+        let crossing = derived::line_crossing_after_start(samples, start, length);
         let rows = samples
             .iter()
             .filter(|s| s.lap_distance.is_some() && s.session_time.is_some())
+            .filter(|s| crossing.is_none_or(|crossing| s.session_time.unwrap() >= crossing))
             .collect::<Vec<_>>();
 
         let start = start
@@ -1766,6 +1768,9 @@ impl Trace {
             ok: false,
             points: 1,
         };
+        if let Some(crossing) = crossing {
+            trace.t[0] = crossing;
+        }
 
         let mut top = 0.0f64;
         for s in &rows {
