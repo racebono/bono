@@ -18,13 +18,14 @@ use crate::{
 use anyhow::{Context, bail};
 use bono_i18n::t;
 use camino::{Utf8Path, Utf8PathBuf};
-use ort::{session::Session, value::Tensor};
+use ort::{environment::Environment, session::Session, value::Tensor};
 use sdl3::audio::{AudioFormat, AudioSpec, AudioStream, AudioStreamOwner};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     mem::ManuallyDrop,
     num::NonZeroUsize,
+    sync::{Mutex, OnceLock, PoisonError},
     task::Poll,
     time::{Duration, Instant},
 };
@@ -493,6 +494,25 @@ pub struct Voice {
     beep: Vec<f32>,
 }
 
+/// The ONNX Runtime environment every voice's session is created in.
+///
+/// ONNX Runtime allows one environment per process, and `ort` refuses to build another even after the first is
+/// dropped, so it's built once and kept. A failed build is retried by the next voice.
+fn environment() -> ort::Result<&'static Environment> {
+    static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
+    static BUILDING: Mutex<()> = Mutex::new(());
+
+    if let Some(environment) = ENVIRONMENT.get() {
+        return Ok(environment);
+    }
+    let _building = BUILDING.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(environment) = ENVIRONMENT.get() {
+        return Ok(environment);
+    }
+    let environment = ort::init().build()?;
+    Ok(ENVIRONMENT.get_or_init(|| environment))
+}
+
 impl Voice {
     /// Loads the model at `model` and its config at `{model}.json`, using at most 8 intra-op threads.
     ///
@@ -532,7 +552,7 @@ impl Voice {
         phonemize("", &config.espeak.voice)?;
 
         let session = (|| {
-            Session::builder()?
+            Session::builder(environment()?)?
                 .with_intra_threads(threads.get().min(8))?
                 .commit_from_file(model)
         })()
