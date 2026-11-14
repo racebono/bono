@@ -921,55 +921,71 @@ fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scor
         .prepare_cached(
             "SELECT full_course_yellow, phase, \
              EXISTS (SELECT 1 FROM session_sector WHERE session_id = session.id AND local_yellow), \
-             rain, track_wetness_average, session_type, session_end_time \
+             rain, track_wetness_average, session_type, session_end_time, \
+             EXISTS (SELECT 1 FROM session_sector WHERE session_id = session.id \
+                 AND local_yellow IS NOT NULL) \
              FROM session WHERE ?1 IS NULL OR session_time <= ?1 ORDER BY id DESC LIMIT 1",
         )?
         .query_row([upto], |row| {
-            Ok(Scoring {
-                full_course_yellow: row.get(0)?,
-                phase: row.get(1)?,
-                yellow: row.get(2)?,
-                rain: row.get(3)?,
-                wetness: row.get(4)?,
-                session_type: row.get(5)?,
-                session_end_time: row.get(6)?,
-                ..Scoring::default()
-            })
+            Ok((
+                Scoring {
+                    full_course_yellow: row.get(0)?,
+                    phase: row.get(1)?,
+                    yellow: row.get(2)?,
+                    rain: row.get(3)?,
+                    wetness: row.get(4)?,
+                    session_type: row.get(5)?,
+                    session_end_time: row.get(6)?,
+                    ..Scoring::default()
+                },
+                row.get::<_, bool>(7)?,
+            ))
         })
         .optional()?;
-    let Some(mut scoring) = session else {
+    let Some((mut scoring, sector_yellows)) = session else {
         return Ok(None);
     };
 
+    // The yellow shown to the player, for simulators that don't say which sectors are yellow
+    // (older recordings have no such column)
+    let under_yellow = match conn.column_exists(None, "standings", "under_yellow")? {
+        true => "under_yellow",
+        false => "NULL",
+    };
+    let columns = format!("flag, penalties, {under_yellow}");
+    let read = |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?, row.get(2)?));
     // Live, try the newest rows first, then look further back if the player has been in the garage
-    let standing = match upto {
+    let standing: Option<(Option<String>, Option<i64>, Option<bool>)> = match upto {
         None => conn
-            .prepare_cached(
-                "SELECT flag, penalties FROM standings WHERE is_player = 1 \
+            .prepare_cached(&format!(
+                "SELECT {columns} FROM standings WHERE is_player = 1 \
                  AND id > (SELECT coalesce(max(id), 0) - 5000 FROM standings) \
-                 ORDER BY id DESC LIMIT 1",
-            )?
-            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+                 ORDER BY id DESC LIMIT 1"
+            ))?
+            .query_row([], read)
             .optional()?
             .map(|standing| Ok(Some(standing)))
             .unwrap_or_else(|| {
-                conn.prepare_cached(
-                    "SELECT flag, penalties FROM standings WHERE is_player = 1 ORDER BY id DESC LIMIT 1",
-                )?
-                .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+                conn.prepare_cached(&format!(
+                    "SELECT {columns} FROM standings WHERE is_player = 1 ORDER BY id DESC LIMIT 1"
+                ))?
+                .query_row([], read)
                 .optional()
             })?,
         Some(upto) => conn
-            .prepare_cached(
-                "SELECT flag, penalties FROM standings WHERE is_player = 1 AND session_time <= ?1 \
-                 ORDER BY id DESC LIMIT 1",
-            )?
-            .query_row([upto], |row| Ok((row.get(0)?, row.get(1)?)))
+            .prepare_cached(&format!(
+                "SELECT {columns} FROM standings WHERE is_player = 1 AND session_time <= ?1 \
+                 ORDER BY id DESC LIMIT 1"
+            ))?
+            .query_row([upto], read)
             .optional()?,
     };
-    if let Some((flag, penalties)) = standing {
+    if let Some((flag, penalties, under_yellow)) = standing {
         scoring.flag = flag;
         scoring.penalties = penalties;
+        if !sector_yellows {
+            scoring.yellow = under_yellow.unwrap_or(false);
+        }
     }
 
     // The forecast is LMU's only, written as a whole set of rows when it changes
@@ -2877,6 +2893,38 @@ mod tests {
         )
         .unwrap();
         assert!(scoring(&conn, None).unwrap().unwrap().yellow);
+    }
+
+    /// Simulators that don't say which sectors are yellow (iRacing) give the yellow shown to the
+    /// player; the sectors' say wins where there is one.
+    #[test]
+    fn takes_the_players_yellow_without_sector_yellows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id INTEGER PRIMARY KEY, session_time REAL,
+             full_course_yellow TEXT, phase TEXT, rain REAL, track_wetness_average REAL,
+             session_type TEXT, session_end_time REAL);
+             CREATE TABLE session_sector (session_id INTEGER, sector INTEGER,
+             local_yellow INTEGER);
+             CREATE TABLE standings (id INTEGER PRIMARY KEY, is_player INTEGER,
+             session_time REAL, flag TEXT, penalties INTEGER, under_yellow INTEGER);
+             INSERT INTO session (session_time) VALUES (0);
+             INSERT INTO session_sector VALUES (1, 0, NULL), (1, 1, NULL);
+             INSERT INTO standings VALUES (1, 1, 0, 'green', 0, 1);",
+        )
+        .unwrap();
+        assert!(scoring(&conn, None).unwrap().unwrap().yellow);
+        conn.execute_batch("INSERT INTO standings VALUES (2, 1, 1, 'green', 0, 0);")
+            .unwrap();
+        assert!(!scoring(&conn, None).unwrap().unwrap().yellow);
+
+        // Sectors that say they're clear outweigh the player's flag
+        conn.execute_batch(
+            "UPDATE session_sector SET local_yellow = 0;
+             INSERT INTO standings VALUES (3, 1, 2, 'green', 0, 1);",
+        )
+        .unwrap();
+        assert!(!scoring(&conn, None).unwrap().unwrap().yellow);
     }
 
     #[test]

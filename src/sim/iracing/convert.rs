@@ -470,10 +470,9 @@ impl Converter {
         };
         if let Some(bits) = flags {
             out.flag = car_flag(bits).map(str::to_owned).into();
-            out.under_yellow = Some(
-                bits & (FLAG_YELLOW | FLAG_YELLOW_WAVING | FLAG_CAUTION | FLAG_CAUTION_WAVING) != 0,
-            )
-            .into();
+            // A local yellow: a full course one is the session's `full_course_yellow`, which the
+            // spotter calls on its own
+            out.under_yellow = Some(bits & (FLAG_YELLOW | FLAG_YELLOW_WAVING) != 0).into();
             out.penalties = Some(i64::from(bits & FLAG_BLACK != 0)).into();
             if bits & FLAG_DISQUALIFY != 0 {
                 out.finish_status = Some("disqualified".to_owned()).into();
