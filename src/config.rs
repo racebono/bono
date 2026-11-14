@@ -300,6 +300,9 @@ settings! {
         /// Whether speech to text runs on the GPU, when Bono was built with a GPU backend. Off, it
         /// stays off the GPU the simulator renders on
         pub whisper_gpu: bool = true,
+        /// Whether voices run on the GPU, with DirectML (Windows only). Off by default: voices are
+        /// quick on the processor, and the GPU is the simulator's
+        pub voice_gpu: bool = false,
         pub text_scale: f32 = 1.3,
         pub min_confidence: f32 = 0.1,
         /// The setup guide's version the pilot last finished (or skipped): an older one shows it
@@ -359,7 +362,7 @@ impl RawConfig {
             .inner
             .entry(lang)
             .or_insert_with(|| SynthesizerInner::new(rt.clone()))
-            .set_model(model);
+            .set_model(model, *self.voice_gpu());
     }
 }
 
