@@ -686,12 +686,14 @@ fn poll(
         logic.mute(config);
         return Ok(Vec::new());
     }
-    *last_id = Some(car.id);
 
+    // Only once it's all read: a row that failed is tried again, rather than left unfollowed
+    let id = car.id;
     let player = player(conn, car)?;
     let others = frame(conn, &player.car, frequency)?;
     let wheels = wheels(conn, player.car.id)?;
     let scoring = scoring(conn, None)?;
+    *last_id = Some(id);
     Ok(logic.update(config, &player, &others, &wheels, scoring.as_ref()))
 }
 
@@ -2742,6 +2744,43 @@ mod tests {
         config.qualifying.set(false);
         assert!(!logic.mute(&config));
         assert!(logic.prev.is_some());
+    }
+
+    #[test]
+    fn follows_a_row_that_failed_to_read_once_it_can() {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::recreate_tables(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO session (session_time, session_type) VALUES (0, 'qualifying');
+             INSERT INTO telemetry (vehicle_id, is_player, session_time, speed)
+             VALUES (1, 1, 10, 50);
+             ALTER TABLE session RENAME TO broken;",
+        )
+        .unwrap();
+        let mut config = SpotterConfig::default();
+        let mut logic = Logic::default();
+        let mut last_id = None;
+
+        assert!(poll(&conn, &mut logic, &config, 5, &mut last_id).is_err());
+        assert_eq!(last_id, None);
+
+        // The same row (the game paused) is read once it can be, so switching qualifying off
+        // still quiets it
+        conn.execute_batch("ALTER TABLE broken RENAME TO session;")
+            .unwrap();
+        assert!(
+            poll(&conn, &mut logic, &config, 5, &mut last_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(last_id.is_some());
+        config.qualifying.set(false);
+        assert!(
+            poll(&conn, &mut logic, &config, 5, &mut last_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(logic.muted);
     }
 
     #[test]
