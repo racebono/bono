@@ -1213,9 +1213,9 @@ impl Trail {
         if !(t.is_finite() && d.is_finite()) {
             return;
         }
-        // Stopped on track (on the grid, after a spin): where it went before isn't how it got
-        // anywhere it goes next. A stop in the pits is part of the gap
-        if !sample.in_pit && sample.speed.is_some_and(|v| v < MOVING) {
+        // Stopped (on the grid, after a spin, in its pit box): how long ago it was somewhere
+        // before then says how long it stopped, not how far ahead it is
+        if sample.speed.is_some_and(|v| v < MOVING) {
             self.0.clear();
             return;
         }
@@ -1237,7 +1237,7 @@ impl Trail {
 
     /// Seconds before `now` the car was last at `spot` metres into the lap, `at` being where it is
     /// now. `None` when its rows don't show it driving through there: a hole in them, a reset or a
-    /// tow, or too short a trail.
+    /// tow, a stop (or a crawl) on the way, or too short a trail.
     fn since_at(&self, now: f64, at: f64, spot: f64, length: f64) -> Option<f64> {
         // Rows from well after now: the trail is of another session's clock, which the stream
         // hasn't caught up to the end of yet
@@ -1260,7 +1260,7 @@ impl Trail {
                 if length - step > TRAIL_JITTER {
                     return None;
                 }
-            } else if step > TRAIL_TELEPORT * dt {
+            } else if step > TRAIL_TELEPORT * dt || step < MOVING * dt {
                 return None;
             } else if step > 0.0 {
                 let into = (spot - older.1).rem_euclid(length);
@@ -2255,6 +2255,41 @@ impl Writer<'_> {
     }
 }
 
+/// Who's led the standings: a car's time behind the leader is against whoever led when its row
+/// was written, and one leader's gaps don't subtract from another's.
+#[derive(Default)]
+struct Leaders {
+    leader: Option<i64>,
+    /// Changes of leader so far
+    changes: u64,
+    /// Each car's last standings row (its id) and how many changes of leader there had been by it
+    rows: HashMap<i64, (i64, u64)>,
+}
+
+impl Leaders {
+    fn read(&mut self, r: &Row) {
+        let Some(vehicle) = r.i("vehicle_id") else {
+            return;
+        };
+        if r.i("position") == Some(1) && self.leader != Some(vehicle) {
+            self.leader = Some(vehicle);
+            self.changes += 1;
+        }
+        if let Some(id) = r.i("id") {
+            self.rows.insert(vehicle, (id, self.changes));
+        }
+    }
+
+    /// Whether the two standings rows were written under the same leader, as far as is known.
+    fn same(&self, a: &Row, b: &Row) -> bool {
+        let under = |r: &Row| {
+            let (id, changes) = self.rows.get(&r.i("vehicle_id")?)?;
+            (r.i("id") == Some(*id)).then_some(*changes)
+        };
+        under(a).is_some_and(|a| under(b) == Some(a))
+    }
+}
+
 /// Follows the recording, from its current session on.
 #[derive(Default)]
 pub(super) struct Stream {
@@ -2284,8 +2319,8 @@ pub(super) struct Stream {
     standings_t: Option<f64>,
     /// The standings' laps completed, by car, and when that last changed
     laps_completed: HashMap<i64, (i64, f64)>,
-    /// The car leading the standings, and since when
-    leader: Option<(i64, f64)>,
+    /// Who's led the standings, as of each car's last row
+    leaders: Leaders,
     official: HashMap<i64, Vec<Official>>,
     drivers: Drivers,
     stint_ids: StintIds,
@@ -2434,7 +2469,7 @@ impl Stream {
         self.standings_cursor = 0;
         self.standings_t = None;
         self.laps_completed.clear();
-        self.leader = None;
+        self.leaders = Leaders::default();
         self.official.clear();
         self.drivers = Drivers::default();
         let start = session_start(conn)?;
@@ -2464,17 +2499,13 @@ impl Stream {
                 self.laps_completed.clear();
                 self.official.clear();
                 self.drivers = Drivers::default();
-                self.leader = None;
+                self.leaders = Leaders::default();
                 everyone = true;
             }
             if t.is_some() {
                 self.standings_t = t;
             }
-            if let (Some(1), Some(vehicle), Some(t)) = (r.i("position"), r.i("vehicle_id"), t)
-                && self.leader.is_none_or(|(leader, _)| leader != vehicle)
-            {
-                self.leader = Some((vehicle, t));
-            }
+            self.leaders.read(&r);
             // Fewer laps than the car had: another car in the slot. Found here, the standings'
             // drivers and its cut-off are always in the same session
             if let (Some(vehicle), Some(laps), Some(t)) =
@@ -3333,8 +3364,8 @@ impl Stream {
                 // When the leader took the lead: times behind one leader don't subtract from
                 // another's
                 extra.push((
-                    "leader_since".to_owned(),
-                    real(self.leader.filter(|_| current).map(|(_, since)| since)),
+                    "same_leader".to_owned(),
+                    flag(current && self.leaders.same(me, st)),
                 ));
                 let session = session.with(extra);
                 // A lap count only counts race distance once a lap of it's been seen to end:
@@ -3555,13 +3586,10 @@ impl ToPlayer {
         let race_distance = || Some(progress(car)? - progress(me)?);
         // How long ago the leading car (and where it is now, as a share of the lap) was at the
         // spot: measured, so it holds whatever either car's pace and class
+        // Level (by the share of the lap `apart`): there now, whatever its rows say of before
+        let level = |apart: f64| length.is_some_and(|length| apart.abs() * length < LEVEL);
         let passed = |(leading, at): (Seen<'_>, f64), spot: f64| {
             let length = length?;
-            // Level: there now, whatever its rows say of before
-            let lead = (at - spot).rem_euclid(1.0) * length;
-            if lead.min(length - lead) < LEVEL {
-                return Some(0.0);
-            }
             if !leading.1.f("speed").is_some_and(|v| v >= MOVING) {
                 return None;
             }
@@ -3577,6 +3605,9 @@ impl ToPlayer {
             // The nearest way round
             let ahead = (theirs - mine).rem_euclid(1.0);
             let ahead = if ahead > 0.5 { ahead - 1.0 } else { ahead };
+            if level(ahead) {
+                return Some(0.0);
+            }
             let (leading, following, sign) = match ahead >= 0.0 {
                 true => ((car, theirs), (me, mine), 1.0),
                 false => ((me, mine), (car, theirs), -1.0),
@@ -3593,6 +3624,9 @@ impl ToPlayer {
             if d.abs() >= 1.0 {
                 return None;
             }
+            if level(d) {
+                return Some(0.0);
+            }
             let (mine, theirs) = (along(me.1)?, along(car.1)?);
             match d >= 0.0 {
                 true => passed((car, theirs), mine),
@@ -3605,8 +3639,7 @@ impl ToPlayer {
             // or of another class
             race_gap: race
                 .then(|| {
-                    measured_race_gap()
-                        .or_else(|| race_gap(me.0, car.0, session.f("leader_since")?))
+                    measured_race_gap().or_else(|| race_gap(me.0, car.0, session.b("same_leader")))
                 })
                 .flatten(),
             race_laps: race.then(race_distance).flatten().map(|d| d.trunc() as i64),
@@ -3625,12 +3658,10 @@ fn is_race(session: &Row) -> bool {
 /// laps and all, while others give a time beside the laps down. Subtracting the two is right either
 /// way only when both are the same number of laps down, so otherwise there's no time from them.
 /// Nor is there when the rows are from moments apart (each is only written when something else
-/// about its car changes), or the lead changed between them (`leader_since`, when the leader took
-/// it): one leader's gaps don't subtract from another's.
-fn race_gap(me: &Row, car: &Row, leader_since: f64) -> Option<f64> {
+/// about its car changes), or not known to be `same_leader` (see `Leaders`).
+fn race_gap(me: &Row, car: &Row, same_leader: bool) -> Option<f64> {
     let (mine, theirs) = (me.f("session_time")?, car.f("session_time")?);
-    let (older, newer) = (mine.min(theirs), mine.max(theirs));
-    if newer - older > STANDINGS_SKEW || (older < leader_since && leader_since <= newer) {
+    if !same_leader || (mine - theirs).abs() > STANDINGS_SKEW {
         return None;
     }
     let behind = |r: &Row| {
@@ -4620,7 +4651,7 @@ mod tests {
     fn session(conn: &Connection, kind: &str) -> Row {
         columns(
             conn,
-            &format!("'{kind}' AS session_type, 1000.0 AS track_length, 0.0 AS leader_since"),
+            &format!("'{kind}' AS session_type, 1000.0 AS track_length, 1 AS same_leader"),
         )
     }
 
@@ -4839,7 +4870,7 @@ mod tests {
         ));
 
         // No track length
-        let lengthless = columns(&conn, "'race' AS session_type, 0.0 AS leader_since");
+        let lengthless = columns(&conn, "'race' AS session_type, 1 AS same_leader");
         let car = standing(&conn, "GT3", 4, (Some(0), Some(10.0)), Some(100.0), None);
         let to = estimated(&lengthless, (&me, &my_lap), (&car, &lap), now);
         assert!(close(to.race_gap, 10.0));
@@ -4880,6 +4911,38 @@ mod tests {
         let to = estimated(&race, (&me, &my_lap), (&car, &crossed), Some(500.0));
         assert_eq!(to.race_laps, Some(0));
         assert!(close(to.track_gap, 50.0), "{to:?}");
+    }
+
+    #[test]
+    fn standings_rows_are_known_by_the_leader_they_were_written_under() {
+        let conn = Connection::open_in_memory().unwrap();
+        let standing = |id: i64, vehicle: i64, position: i64| {
+            columns(
+                &conn,
+                &format!("{id} AS id, {vehicle} AS vehicle_id, {position} AS position"),
+            )
+        };
+        let mut leaders = Leaders::default();
+        let (lead, me, them) = (standing(1, 9, 1), standing(2, 1, 5), standing(3, 2, 4));
+        for r in [&lead, &me, &them] {
+            leaders.read(r);
+        }
+        assert!(leaders.same(&me, &them));
+        // The lead changes, their next row comes, and the lead goes back: the player's row and
+        // theirs are under different leaders, though the first leader leads again
+        let (taken, theirs_later, back) = (standing(4, 7, 1), standing(5, 2, 4), standing(6, 9, 1));
+        for r in [&taken, &theirs_later, &back] {
+            leaders.read(r);
+        }
+        assert!(!leaders.same(&me, &theirs_later));
+        // A row the stream hasn't read as a car's last, or a car it hasn't read, isn't known
+        assert!(!leaders.same(&me, &them));
+        assert!(!leaders.same(&me, &standing(99, 3, 6)));
+        // The player's next row is under the leader since, not theirs
+        let mine_later = standing(7, 1, 5);
+        leaders.read(&mine_later);
+        assert!(!leaders.same(&mine_later, &theirs_later));
+        assert!(leaders.same(&mine_later, &back));
     }
 
     #[test]
@@ -4948,6 +5011,17 @@ mod tests {
         // Towed 300 m on in a second: it never drove through 900 m
         let towed = Trail([(499.0, 800.0), (500.0, 100.0), (501.0, 110.0)].into());
         assert_eq!(towed.since_at(501.0, 110.0, 900.0, 1000.0), None);
+        // Stopped on the way (its speed not reported): how long ago it was there before says how
+        // long it stopped, not how far ahead it is
+        let paused = Trail(
+            [(495.0, 200.0), (497.5, 250.0), (500.0, 300.0)]
+                .into_iter()
+                .chain((1..=350).map(|i| (500.0 + f64::from(i) / 10.0, 300.0)))
+                .chain([(537.5, 350.0), (540.0, 400.0)])
+                .collect(),
+        );
+        assert_eq!(paused.since_at(540.0, 400.0, 250.0, 1000.0), None);
+        assert!(close(paused.since_at(540.0, 400.0, 375.0, 1000.0), 1.25));
         // Reset 100 m back: where it was before isn't where it drove to here
         let reset = Trail(
             [
@@ -4999,24 +5073,25 @@ mod tests {
         // Back in time: started over
         trail.push(&sample(3.0, 30.0));
         assert_eq!(trail.0, [(3.0, 30.0)]);
-        // Stopped in the pits: kept, the stop is part of the gap
-        trail.push(&Sample {
-            speed: Some(0.0),
-            in_pit: true,
-            ..sample(4.0, 31.0)
-        });
-        assert_eq!(trail.0, [(3.0, 30.0), (4.0, 31.0)]);
-        // Stopped on track, as on the grid: nothing before it counts
-        trail.push(&Sample {
-            speed: Some(1.0),
-            ..sample(5.0, 31.5)
-        });
-        assert!(trail.0.is_empty());
-        trail.push(&Sample {
-            speed: Some(20.0),
-            ..sample(6.0, 40.0)
-        });
-        assert_eq!(trail.0, [(6.0, 40.0)]);
+        // Stopped, on the grid or in its pit box: nothing before it counts
+        for in_pit in [false, true] {
+            trail.push(&Sample {
+                speed: Some(20.0),
+                ..sample(4.0, 31.0)
+            });
+            trail.push(&Sample {
+                speed: Some(1.0),
+                in_pit,
+                ..sample(5.0, 31.5)
+            });
+            assert!(trail.0.is_empty(), "in the pits: {in_pit}");
+            trail.push(&Sample {
+                speed: Some(20.0),
+                ..sample(6.0, 40.0)
+            });
+            assert_eq!(trail.0, [(6.0, 40.0)]);
+            trail.0.clear();
+        }
     }
 
     #[test]
@@ -5058,7 +5133,7 @@ mod tests {
         );
         assert!(close(to.track_gap, 0.2 * 100.0), "{to:?}");
         // Stopped 10 m ahead after arriving there 30 s ago: not a 30 s gap, the distance's
-        // (stopped in its pit box, so with every row kept)
+        // (every row kept, as when its speed isn't reported)
         let stopped_trail = Trail(
             [(469.0, 890.0)]
                 .into_iter()
@@ -5155,6 +5230,29 @@ mod tests {
         );
         assert!(close(to.race_gap, 2.5), "{to:?}");
 
+        // A hair short of a lap ahead in the race, so level on track: nearly a lap's time ahead in
+        // the race, level on track
+        let almost_lap = Trail(
+            (0..=2000)
+                .map(|i| {
+                    let t = 400.0 + f64::from(i) * 0.05;
+                    (t, ((t - 400.0) * 10.0 - 500.005).rem_euclid(1000.0))
+                })
+                .collect(),
+        );
+        let me_mid = on_lap(&conn, 10, 500.0);
+        let to = ToPlayer::new(
+            &race,
+            (&me, &me_mid, None),
+            (&ahead, &on_lap(&conn, 11, 499.995), Some(&almost_lap)),
+            now,
+        );
+        assert!(
+            to.race_gap.is_some_and(|gap| (gap - 99.9995).abs() < 1e-6),
+            "{to:?}"
+        );
+        assert_eq!((to.race_laps, to.track_gap), (Some(0), Some(0.0)), "{to:?}");
+
         // Measured first, the standings' snapshots only without it
         let me_timed = standing(&conn, "GT3", 5, (Some(0), Some(30.0)), Some(100.0), None);
         let ahead_timed = standing(&conn, "GT3", 4, (Some(0), Some(27.0)), Some(100.0), None);
@@ -5172,15 +5270,8 @@ mod tests {
             now,
         );
         assert!(close(to.race_gap, 3.0), "{to:?}");
-        // A new leader between the two rows: one leader's gaps don't subtract from another's
-        let me_before = columns(
-            &conn,
-            "497.0 AS session_time, 5 AS position, 0 AS laps_behind_leader, \
-             30.0 AS time_behind_leader",
-        );
-        assert_eq!(race_gap(&me_before, &ahead_timed, 498.0), None);
-        assert!(close(race_gap(&me_before, &ahead_timed, 400.0), 3.0));
-        assert!(close(race_gap(&me_before, &ahead_timed, 500.5), 3.0));
+        // Under different leaders: one leader's gaps don't subtract from another's
+        assert_eq!(race_gap(&me_timed, &ahead_timed, false), None);
         // Unknown leader, no standings gap
         let unknown_leader = columns(&conn, "'race' AS session_type, 1000.0 AS track_length");
         let to = ToPlayer::new(
@@ -5234,8 +5325,8 @@ mod tests {
             now,
         );
         assert!(close(to.race_gap, 2.5), "{to:?}");
-        assert!(close(race_gap(&me_old, &me_old, 0.0), 0.0));
-        assert_eq!(race_gap(&me_old, &ahead_new, 0.0), None);
+        assert!(close(race_gap(&me_old, &me_old, true), 0.0));
+        assert_eq!(race_gap(&me_old, &ahead_new, true), None);
 
         // Out of the race or finished: no place in it to measure from, even with a time
         for status in ["dnf", "finished", "disqualified"] {
