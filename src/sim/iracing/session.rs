@@ -33,8 +33,6 @@ pub struct SessionInfo {
     pub sectors: Vec<f64>,
     /// Each car's place in qualifying, from 1: the grid a race starts from
     pub qualifying: HashMap<i64, i64>,
-    /// Each car's place in qualifying within its class, from 1
-    pub qualifying_class: HashMap<i64, i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -251,19 +249,6 @@ impl SessionInfo {
             .enumerate()
             .map(|(rank, (_, car))| (car, rank as i64 + 1))
             .collect();
-        let mut grid: Vec<_> = info
-            .qualifying
-            .iter()
-            .map(|(car, place)| (*place, *car))
-            .collect();
-        grid.sort();
-        let mut in_class = HashMap::<Option<i64>, i64>::new();
-        for (_, car) in grid {
-            let class = info.drivers.get(&car).and_then(|d| d.class_id);
-            let place = in_class.entry(class).or_default();
-            *place += 1;
-            info.qualifying_class.insert(car, *place);
-        }
 
         info
     }
@@ -273,6 +258,25 @@ impl SessionInfo {
     }
 
     /// The cars racing (not the pace car or spectators), by car index.
+    /// The grid a race starts from, by qualifying: each car's place overall and in its class, from
+    /// 1, among the cars there are (a qualifier who's left, or watches, leaves no gap).
+    pub fn grid(&self) -> HashMap<i64, (i64, i64)> {
+        let mut grid: Vec<_> = self
+            .cars()
+            .filter_map(|(car, driver)| Some((*self.qualifying.get(&car)?, car, driver.class_id)))
+            .collect();
+        grid.sort();
+        let mut in_class = HashMap::<Option<i64>, i64>::new();
+        grid.into_iter()
+            .enumerate()
+            .map(|(place, (_, car, class))| {
+                let in_class = in_class.entry(class).or_default();
+                *in_class += 1;
+                (car, (place as i64 + 1, *in_class))
+            })
+            .collect()
+    }
+
     pub fn cars(&self) -> impl Iterator<Item = (i64, &Driver)> {
         self.drivers
             .iter()
@@ -460,10 +464,12 @@ SplitTimeInfo:
  - Position: 0
    CarIdx: 2
  - Position: 1
-   CarIdx: 0
+   CarIdx: 5
  - Position: 2
-   CarIdx: 1
+   CarIdx: 0
  - Position: 3
+   CarIdx: 1
+ - Position: 4
    CarIdx: 3
 DriverInfo:
  Drivers:
@@ -501,11 +507,14 @@ DriverInfo:
         assert_eq!(class(2), None);
         assert_eq!(class(3), None);
         assert_eq!(class(4), Some("GR86"));
-        // The grid: overall, and in the class
-        assert_eq!([0, 1, 2, 3].map(|car| info.qualifying[&car]), [2, 3, 1, 4]);
+        // The grid, overall and in the class, among the cars there are: the one who's left (5,
+        // qualified second) leaves no gap
+        assert_eq!([0, 1, 2, 3].map(|car| info.qualifying[&car]), [3, 4, 1, 5]);
+        let grid = info.grid();
         assert_eq!(
-            [0, 1, 2, 3].map(|car| info.qualifying_class[&car]),
-            [1, 2, 1, 2]
+            [0, 1, 2, 3].map(|car| grid[&car]),
+            [(2, 1), (3, 2), (1, 1), (4, 2)]
         );
+        assert!(!grid.contains_key(&5));
     }
 }

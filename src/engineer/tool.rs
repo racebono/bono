@@ -1172,15 +1172,24 @@ fn positions(
             )
         }
     };
-    // A car the standings give no place has none, rather than one after every placed car
-    let placed = |v: &i64| !exact || sc.cars.get(v).is_some_and(|r| r.i("position").is_some());
-    let place = ids
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| placed(v))
-        .map(|(i, v)| (*v, i + 1))
-        .collect();
+    // The standings' own places, gaps and all: a car they don't place has none, rather than one
+    // after every placed car
+    let place = match exact {
+        true => ids
+            .iter()
+            .filter_map(|v| {
+                let p = sc.cars.get(v)?.i("position")?;
+                Some((*v, usize::try_from(p).ok().filter(|p| *p > 0)?))
+            })
+            .collect(),
+        false => ids.iter().enumerate().map(|(i, v)| (*v, i + 1)).collect(),
+    };
     Ok((ids, place, exact))
+}
+
+/// The car in a place, if any.
+fn at_place(place: &HashMap<i64, usize>, p: usize) -> Option<i64> {
+    place.iter().find(|(_, q)| **q == p).map(|(v, _)| *v)
 }
 
 fn place_text(sc: &Scoring, vehicle: i64, place: &HashMap<i64, usize>, exact: bool) -> String {
@@ -2084,8 +2093,8 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     let sc = ctx.scoring()?;
     let (ids, place, exact) = positions(ctx, &frame)?;
     let pos = place.get(&ctx.vehicle).copied();
-    let ahead = pos.filter(|p| *p > 1).map(|p| ids[p - 2]);
-    let behind = pos.filter(|p| *p < ids.len()).map(|p| ids[p]);
+    let ahead = pos.and_then(|p| at_place(&place, p.checked_sub(1)?));
+    let behind = pos.and_then(|p| at_place(&place, p + 1));
     let age = staleness(&ctx.shared.path);
 
     say!(
@@ -2879,6 +2888,48 @@ mod tests {
         let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
         assert!(out.contains("| ~P"), "{out}");
         assert!(!out.contains("| P1/"), "{out}");
+    }
+
+    /// Places with a gap in them are the standings' own, and neighbours are the cars in the
+    /// places either side: a car without a place is nobody's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn places_are_the_standings_own() {
+        let (dir, engineer) = race();
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute("UPDATE standings SET position = 3 WHERE vehicle_id = 1", [])
+            .unwrap();
+        conn.execute("UPDATE standings SET position = 1 WHERE vehicle_id = 2", [])
+            .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        // P3 with nobody in P2 or P4
+        assert!(out.contains("| P3/2 |"), "{out}");
+        assert!(out.contains("(nobody) behind"), "{out}");
+
+        // The other car unplaced: not the one behind, and no place in its class
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute("UPDATE standings SET position = 1 WHERE vehicle_id = 1", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE standings SET position = NULL, class_position = NULL WHERE vehicle_id = 2",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(out.contains("| P1/2 |"), "{out}");
+        assert!(out.trim_end().contains("behind -s (nobody)"), "{out}");
+        let out = run(
+            &engineer,
+            serde_json::json!({"command": "sql", "query":
+                "SELECT COALESCE(p.place_behind_vehicle_id, -7) AS behind,                  COALESCE(o.class_position, -7) AS class FROM cars_now p, cars_now o                  WHERE p.vehicle_id = 1 AND o.vehicle_id = 2"}),
+        )
+        .await;
+        assert!(out.contains("-7 | -7"), "{out}");
     }
 
     /// A player the standings give no place, while others have theirs, has none either: not one

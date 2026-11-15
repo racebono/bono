@@ -2971,7 +2971,7 @@ impl Stream {
         vehicle: i64,
         telemetry: Option<&Row>,
         now: Option<f64>,
-        (ids, place, exact): (&[i64], &HashMap<i64, usize>, bool),
+        (_, place, exact): (&[i64], &HashMap<i64, usize>, bool),
         current_stint: Option<i64>,
     ) -> rusqlite::Result<()> {
         let empty = Row {
@@ -2981,8 +2981,7 @@ impl Stream {
         let t = telemetry.unwrap_or(&empty);
         let st = sc.cars.get(&vehicle).unwrap_or(&empty);
         let position = place.get(&vehicle).copied();
-        let neighbour =
-            |p: Option<usize>| integer(p.and_then(|p| ids.get(p.checked_sub(1)?)).copied());
+        let neighbour = |p: Option<usize>| integer(p.and_then(|p| at_place(place, p)));
         let relative = telemetry
             .filter(|_| vehicle != ctx.vehicle)
             .and_then(|r| rel(&ctx.player, r));

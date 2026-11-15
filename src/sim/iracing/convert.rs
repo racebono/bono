@@ -224,6 +224,10 @@ impl Converter {
             && frame
                 .i32("SessionState")
                 .is_some_and(|state| (STATE_GET_IN_CAR..STATE_RACING).contains(&state));
+        let grid = match gridded {
+            true => info.grid(),
+            false => HashMap::new(),
+        };
         let mut cars: Vec<_> = info.cars().collect();
         cars.sort_by_key(|(idx, _)| *idx);
         let cars: Vec<Car<'_>> = cars
@@ -277,20 +281,12 @@ impl Converter {
                         .i32("CarIdxPosition", "PlayerCarPosition")
                         .filter(|p| *p > 0)
                         .map(i64::from)
-                        .or_else(|| {
-                            gridded
-                                .then(|| info.qualifying.get(&idx).copied())
-                                .flatten()
-                        }),
+                        .or_else(|| grid.get(&idx).map(|(place, _)| *place)),
                     class_position: car
                         .i32("CarIdxClassPosition", "PlayerCarClassPosition")
                         .filter(|p| *p > 0)
                         .map(i64::from)
-                        .or_else(|| {
-                            gridded
-                                .then(|| info.qualifying_class.get(&idx).copied())
-                                .flatten()
-                        }),
+                        .or_else(|| grid.get(&idx).map(|(_, place)| *place)),
                     est: frame
                         .f64_at("CarIdxEstTime", idx as usize)
                         .filter(|t| *t >= 0.0),
@@ -1632,7 +1628,6 @@ mod tests {
                 results: HashMap::new(),
             }],
             qualifying: HashMap::from([(2, 1), (0, 2), (1, 3)]),
-            qualifying_class: HashMap::from([(2, 1), (0, 2), (1, 3)]),
             ..Default::default()
         };
         let update = |info: &SessionInfo, state: i32, places: [i32; 3], behind: [f64; 3]| {
