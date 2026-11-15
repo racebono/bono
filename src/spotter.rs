@@ -603,13 +603,21 @@ fn follow(
     };
 
     let mut logic = Logic::default();
+    let mut sizes = Sizes::default();
     let mut last_id = None;
     let mut failing = false;
     while !stop.load(Ordering::Relaxed) {
         let start = Instant::now();
         let (config, frequency) = settings.borrow().clone();
 
-        match poll(&conn, &mut logic, &config, frequency, &mut last_id) {
+        match poll(
+            &conn,
+            &mut logic,
+            &mut sizes,
+            &config,
+            frequency,
+            &mut last_id,
+        ) {
             Ok(raised) => {
                 failing = false;
                 for call in raised {
@@ -644,11 +652,12 @@ fn open(db: &Path) -> rusqlite::Result<Connection> {
 fn poll(
     conn: &Connection,
     logic: &mut Logic,
+    sizes: &mut Sizes,
     config: &SpotterConfig,
     frequency: u32,
     last_id: &mut Option<i64>,
 ) -> rusqlite::Result<Vec<Raised>> {
-    let Some(car) = latest(conn)? else {
+    let Some(mut car) = latest(conn)? else {
         return Ok(Vec::new());
     };
     if Some(car.id) == *last_id {
@@ -656,8 +665,11 @@ fn poll(
     }
     *last_id = Some(car.id);
 
+    sizes.update(conn, None)?;
+    sizes.apply(&mut car);
     let player = player(conn, car)?;
-    let others = frame(conn, &player.car, frequency)?;
+    let mut others = frame(conn, &player.car, frequency)?;
+    others.iter_mut().for_each(|other| sizes.apply(other));
     let wheels = wheels(conn, player.car.id)?;
     let scoring = scoring(conn, None)?;
     Ok(logic.update(config, &player, &others, &wheels, scoring.as_ref()))
@@ -676,11 +688,15 @@ pub fn replay(db: &Path, config: &SpotterConfig) -> rusqlite::Result<Vec<Raised>
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut logic = Logic::default();
+    let mut sizes = Sizes::default();
     let mut calls = Vec::new();
-    for car in cars.into_iter().filter(|car| car.time.is_some()) {
+    for mut car in cars.into_iter().filter(|car| car.time.is_some()) {
         let time = car.time;
+        sizes.update(&conn, time)?;
+        sizes.apply(&mut car);
         let player = player(&conn, car)?;
-        let others = frame(&conn, &player.car, 5)?;
+        let mut others = frame(&conn, &player.car, 5)?;
+        others.iter_mut().for_each(|other| sizes.apply(other));
         let wheels = wheels(&conn, player.car.id)?;
         let scoring = scoring(&conn, time)?;
         calls.extend(logic.update(config, &player, &others, &wheels, scoring.as_ref()));
@@ -704,6 +720,87 @@ struct Car {
     y: Option<f64>,
     z: Option<f64>,
     heading: Option<f64>,
+    /// The car's size, when its slot's newest standing gives a plausible one
+    size: Option<Size>,
+}
+
+/// The car size the overlap distances in [`SpotterConfig`] are for (metres): both cars about a
+/// GT3 car's size.
+const REFERENCE_LENGTH: f64 = 4.8;
+const REFERENCE_WIDTH: f64 = 2.0;
+/// Recorded sizes outside these (metres) aren't trusted: the car's taken to be the reference size.
+const PLAUSIBLE_LENGTH: std::ops::RangeInclusive<f64> = 2.0..=7.0;
+const PLAUSIBLE_WIDTH: std::ops::RangeInclusive<f64> = 1.2..=2.6;
+
+/// A car's size in metres.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Size {
+    width: f64,
+    length: f64,
+}
+
+impl Size {
+    /// Both recorded dimensions, when both are there and plausible.
+    fn plausible(width: Option<f64>, length: Option<f64>) -> Option<Size> {
+        let (width, length) = (width?, length?);
+        (PLAUSIBLE_WIDTH.contains(&width) && PLAUSIBLE_LENGTH.contains(&length))
+            .then_some(Size { width, length })
+    }
+}
+
+/// Every car's size, from the newest standing of its slot. A slot taken by another car takes that
+/// car's size (or none) with the first standing written for it.
+#[derive(Debug, Default)]
+struct Sizes {
+    /// The newest standing read
+    last_id: i64,
+    /// Vehicle -> size; a vehicle missing has none
+    sizes: HashMap<i64, Size>,
+    /// The recording has the columns (recordings made before them don't)
+    recorded: bool,
+}
+
+impl Sizes {
+    /// Reads the standings written since the last call (only up to session time `upto`, when
+    /// replaying).
+    fn update(&mut self, conn: &Connection, upto: Option<f64>) -> rusqlite::Result<()> {
+        if !self.recorded {
+            self.recorded = conn
+                .prepare_cached(
+                    "SELECT count(*) FROM pragma_table_info('standings') \
+                     WHERE name IN ('vehicle_width', 'vehicle_length')",
+                )?
+                .query_row([], |row| row.get::<_, i64>(0))?
+                == 2;
+            if !self.recorded {
+                return Ok(());
+            }
+        }
+        let mut statement = conn.prepare_cached(
+            "SELECT id, vehicle_id, session_time, vehicle_width, vehicle_length FROM standings \
+             WHERE id > ?1 ORDER BY id",
+        )?;
+        let mut rows = statement.query([self.last_id])?;
+        while let Some(row) = rows.next()? {
+            let time = row.get::<_, Option<f64>>(2)?;
+            if upto.zip(time).is_some_and(|(upto, time)| time > upto) {
+                break;
+            }
+            self.last_id = row.get(0)?;
+            let Some(vehicle) = row.get::<_, Option<i64>>(1)? else {
+                continue;
+            };
+            match Size::plausible(row.get(3)?, row.get(4)?) {
+                Some(size) => self.sizes.insert(vehicle, size),
+                None => self.sizes.remove(&vehicle),
+            };
+        }
+        Ok(())
+    }
+
+    fn apply(&self, car: &mut Car) {
+        car.size = self.sizes.get(&car.vehicle).copied();
+    }
 }
 
 /// The player's car, with what only the player's own alerts need.
@@ -741,6 +838,7 @@ fn car(row: &Row) -> rusqlite::Result<Car> {
         y: row.get(6)?,
         z: row.get(7)?,
         heading: row.get(8)?,
+        size: None,
     })
 }
 
@@ -1072,6 +1170,36 @@ enum Proximity {
     Known { left: u8, right: u8 },
 }
 
+/// How far from the player another car overlaps (enter) and stops overlapping (exit), along the
+/// car and to the side. The configured distances are for two cars of the reference size; when both
+/// cars' sizes are known, they move by how much longer or wider the two are on average than it.
+/// `min_across` (in line rather than beside) doesn't depend on the cars' size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Reach {
+    enter_along: f64,
+    exit_along: f64,
+    enter_across: f64,
+    exit_across: f64,
+}
+
+impl Reach {
+    fn new(config: &SpotterConfig, player: &Car, other: &Car) -> Self {
+        let (along, across) = match (player.size, other.size) {
+            (Some(mine), Some(theirs)) => (
+                (mine.length + theirs.length) / 2.0 - REFERENCE_LENGTH,
+                (mine.width + theirs.width) / 2.0 - REFERENCE_WIDTH,
+            ),
+            _ => (0.0, 0.0),
+        };
+        Self {
+            enter_along: (*config.enter_along() + along).max(0.0),
+            exit_along: (*config.exit_along() + along).max(0.0),
+            enter_across: (*config.enter_across() + across).max(0.0),
+            exit_across: (*config.exit_across() + across).max(0.0),
+        }
+    }
+}
+
 /// Works out the cars beside the player from everyone's positions, following each car: it counts
 /// once it's been there `debounce`, and stops counting past the (wider) exit distances.
 #[derive(Debug, Default)]
@@ -1134,10 +1262,11 @@ impl Geometry {
                 Side::Left
             };
             let (along, across) = (along.abs(), across.abs());
+            let reach = Reach::new(config, player, other);
 
             if let Some(overlap) = self.overlap.get(&other.vehicle) {
-                if along <= *config.exit_along()
-                    && (*config.min_across()..=*config.exit_across()).contains(&across)
+                if along <= reach.exit_along
+                    && (*config.min_across()..=reach.exit_across).contains(&across)
                     && side == *overlap
                 {
                     seen.push(other.vehicle);
@@ -1145,8 +1274,8 @@ impl Geometry {
                 continue;
             }
 
-            if along <= *config.enter_along()
-                && (*config.min_across()..=*config.enter_across()).contains(&across)
+            if along <= reach.enter_along
+                && (*config.min_across()..=reach.enter_across).contains(&across)
             {
                 match self.pending.get(&other.vehicle) {
                     Some(&(pending, since)) if pending == side => {
@@ -2411,13 +2540,26 @@ mod tests {
 
     /// Runs the logic at 30 Hz from `from` to `to` with the same cars, returning the calls.
     fn run(logic: &mut Logic, from: f64, to: f64, others: &[Car]) -> Vec<&'static str> {
+        run_sized(logic, from, to, None, others)
+    }
+
+    /// [`run`], with the player's car of size `size`.
+    fn run_sized(
+        logic: &mut Logic,
+        from: f64,
+        to: f64,
+        size: Option<Size>,
+        others: &[Car],
+    ) -> Vec<&'static str> {
         let config = SpotterConfig::default();
         let mut calls = Vec::new();
         let mut t = from;
         while t < to {
+            let mut player = player(t);
+            player.car.size = size;
             calls.extend(texts(logic.update(
                 &config,
-                &player(t),
+                &player,
                 others,
                 &Wheels::default(),
                 None,
@@ -2552,6 +2694,177 @@ mod tests {
             run(&mut logic, 3.0, 3.5, &[other(2, 6.5, 3.0)]),
             ["clear right"]
         );
+    }
+
+    fn size(width: f64, length: f64) -> Option<Size> {
+        Some(Size { width, length })
+    }
+
+    fn sized(mut car: Car, size: Option<Size>) -> Car {
+        car.size = size;
+        car
+    }
+
+    #[test]
+    fn sizes_the_overlap_to_the_cars() {
+        let short = size(1.8, 3.8);
+        // 4.5 m ahead: within the reference cars' 4.8 m...
+        let ahead = other(2, 4.5, 3.0);
+        assert_eq!(
+            run(&mut Logic::default(), 0.0, 1.0, &[ahead.clone()]),
+            ["car right"]
+        );
+        // ...but past where two 3.8 m cars overlap
+        assert!(
+            run_sized(
+                &mut Logic::default(),
+                0.0,
+                1.0,
+                short,
+                &[sized(ahead, short)]
+            )
+            .is_empty()
+        );
+
+        // A 4.8 m car beside a 6 m one: they overlap up to 5.4 m apart
+        let ahead = other(2, 5.2, 3.0);
+        assert!(run(&mut Logic::default(), 0.0, 1.0, &[ahead.clone()]).is_empty());
+        let long = sized(ahead, size(2.0, 6.0));
+        let mut logic = Logic::default();
+        assert_eq!(
+            run_sized(&mut logic, 0.0, 1.0, size(2.0, 4.8), &[long.clone()]),
+            ["car right"]
+        );
+        // And stop overlapping past 6.4 m (the way out moves with them)
+        let mut further = long.clone();
+        further.z = Some(-6.2);
+        assert!(run_sized(&mut logic, 1.0, 2.0, size(2.0, 4.8), &[further]).is_empty());
+        let mut gone = long;
+        gone.z = Some(-6.6);
+        assert_eq!(
+            run_sized(&mut logic, 2.0, 2.5, size(2.0, 4.8), &[gone]),
+            ["clear right"]
+        );
+
+        // Two wide cars still count 6 m to the side
+        let wide = size(2.6, 4.8);
+        let beside = other(2, 0.0, 6.0);
+        assert!(run(&mut Logic::default(), 0.0, 1.0, &[beside.clone()]).is_empty());
+        assert_eq!(
+            run_sized(
+                &mut Logic::default(),
+                0.0,
+                1.0,
+                wide,
+                &[sized(beside, wide)]
+            ),
+            ["car right"]
+        );
+    }
+
+    #[test]
+    fn keeps_the_configured_overlap_without_both_sizes() {
+        let short = size(1.8, 3.8);
+        let ahead = other(2, 4.5, 3.0);
+        // Only the player's size, or only the other car's: as if neither were known
+        assert_eq!(
+            run_sized(&mut Logic::default(), 0.0, 1.0, short, &[ahead.clone()]),
+            ["car right"]
+        );
+        assert_eq!(
+            run(&mut Logic::default(), 0.0, 1.0, &[sized(ahead, short)]),
+            ["car right"]
+        );
+
+        let config = SpotterConfig::default();
+        let reach = Reach::new(&config, &player(0.0).car, &other(2, 0.0, 0.0));
+        assert_eq!(
+            reach,
+            Reach {
+                enter_along: *config.enter_along(),
+                exit_along: *config.exit_along(),
+                enter_across: *config.enter_across(),
+                exit_across: *config.exit_across(),
+            }
+        );
+    }
+
+    #[test]
+    fn distrusts_implausible_sizes() {
+        assert_eq!(Size::plausible(Some(1.78), Some(4.13)), size(1.78, 4.13));
+        for (width, length) in [
+            (None, Some(4.5)),
+            (Some(1.9), None),
+            (Some(0.0), Some(4.5)),
+            (Some(1.9), Some(-4.5)),
+            // Centimetres, or another unit
+            (Some(190.0), Some(450.0)),
+            (Some(0.019), Some(0.045)),
+            (Some(f64::NAN), Some(4.5)),
+            (Some(1.9), Some(f64::INFINITY)),
+        ] {
+            assert_eq!(
+                Size::plausible(width, length),
+                None,
+                "{width:?} by {length:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sizes_follow_the_slots_occupant() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A recording from before the columns existed
+        conn.execute_batch(
+            "CREATE TABLE standings (id INTEGER PRIMARY KEY, vehicle_id INTEGER, \
+             session_time REAL);
+             INSERT INTO standings VALUES (1, 2, 1.0);",
+        )
+        .unwrap();
+        let mut sizes = Sizes::default();
+        sizes.update(&conn, None).unwrap();
+        assert!(sizes.sizes.is_empty());
+
+        let size_of = |sizes: &Sizes, vehicle| {
+            let mut car = Car {
+                vehicle,
+                ..Car::default()
+            };
+            sizes.apply(&mut car);
+            car.size
+        };
+        conn.execute_batch(
+            "ALTER TABLE standings ADD COLUMN vehicle_width REAL;
+             ALTER TABLE standings ADD COLUMN vehicle_length REAL;
+             INSERT INTO standings VALUES (2, 2, 2.0, 1.8, 4.5), (3, 3, 2.0, 2.0, 5.0);",
+        )
+        .unwrap();
+        sizes.update(&conn, None).unwrap();
+        assert_eq!(size_of(&sizes, 2), size(1.8, 4.5));
+        assert_eq!(size_of(&sizes, 3), size(2.0, 5.0));
+        assert_eq!(size_of(&sizes, 4), None);
+
+        // Slot 2 taken by a car without a size, then by another car; slot 3 by an implausible one
+        conn.execute("INSERT INTO standings VALUES (4, 2, 3.0, NULL, NULL)", [])
+            .unwrap();
+        sizes.update(&conn, None).unwrap();
+        assert_eq!(size_of(&sizes, 2), None);
+        conn.execute_batch(
+            "INSERT INTO standings VALUES (5, 2, 4.0, 1.9, 4.7), (6, 3, 4.0, 190, 470);",
+        )
+        .unwrap();
+        sizes.update(&conn, None).unwrap();
+        assert_eq!(size_of(&sizes, 2), size(1.9, 4.7));
+        assert_eq!(size_of(&sizes, 3), None);
+
+        // Replaying, standings after the player's time aren't read yet
+        let mut replaying = Sizes::default();
+        replaying.update(&conn, Some(3.5)).unwrap();
+        assert_eq!(size_of(&replaying, 2), None);
+        assert_eq!(size_of(&replaying, 3), size(2.0, 5.0));
+        replaying.update(&conn, Some(4.0)).unwrap();
+        assert_eq!(size_of(&replaying, 2), size(1.9, 4.7));
+        assert_eq!(size_of(&replaying, 3), None);
     }
 
     #[test]

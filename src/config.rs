@@ -556,7 +556,9 @@ settings! {
         // Cars alongside. A car overlaps when its centre is within `enter_along` of yours along
         // the car, and `min_across` to `enter_across` to the side (beside you rather than in line
         // with you). It stops overlapping past the exit distances, which are wider so a car at the
-        // edge doesn't make the spotter chatter
+        // edge doesn't make the spotter chatter. They're for two cars about a GT3 car's size (4.8
+        // by 2 m): when the simulator records both cars' sizes, all but `min_across` move by how
+        // much longer or wider the two are on average
         pub enter_along: f64 = 4.8,
         pub exit_along: f64 = 5.8,
         pub min_across: f64 = 0.8,
