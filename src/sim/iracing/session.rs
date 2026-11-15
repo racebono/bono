@@ -257,7 +257,6 @@ impl SessionInfo {
         self.sessions.iter().find(|session| session.num == num)
     }
 
-    /// The cars racing (not the pace car or spectators), by car index.
     /// The grid a race starts from, by qualifying: each car's place overall and in its class, from
     /// 1, among the cars there are (a qualifier who's left, or watches, leaves no gap).
     pub fn grid(&self) -> HashMap<i64, (i64, i64)> {
@@ -277,6 +276,7 @@ impl SessionInfo {
             .collect()
     }
 
+    /// The cars racing (not the pace car or spectators), by car index.
     pub fn cars(&self) -> impl Iterator<Item = (i64, &Driver)> {
         self.drivers
             .iter()
