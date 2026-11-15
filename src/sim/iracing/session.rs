@@ -31,8 +31,10 @@ pub struct SessionInfo {
     pub car: PlayerCar,
     /// Where each timing sector starts, as a fraction of the lap
     pub sectors: Vec<f64>,
-    /// Each car's place in qualifying, from 1
+    /// Each car's place in qualifying, from 1: the grid a race starts from
     pub qualifying: HashMap<i64, i64>,
+    /// Each car's place in qualifying within its class, from 1
+    pub qualifying_class: HashMap<i64, i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -208,6 +210,34 @@ impl SessionInfo {
         sectors.dedup();
         info.sectors = sectors;
 
+        // A class without a name (AI ones have none) goes by its car's, when every car in it is the
+        // same model
+        let mut models = HashMap::<i64, Option<&str>>::new();
+        for driver in info
+            .drivers
+            .values()
+            .filter(|d| !d.pace_car && !d.spectator)
+        {
+            if let Some(id) = driver.class_id {
+                let car = driver.car.as_deref();
+                models
+                    .entry(id)
+                    .and_modify(|model| *model = model.filter(|m| Some(*m) == car))
+                    .or_insert(car);
+            }
+        }
+        let models: HashMap<i64, String> = models
+            .into_iter()
+            .filter_map(|(id, model)| Some((id, model?.to_owned())))
+            .collect();
+        for driver in info.drivers.values_mut() {
+            if driver.class.is_none()
+                && let Some(model) = driver.class_id.and_then(|id| models.get(&id))
+            {
+                driver.class = Some(model.clone());
+            }
+        }
+
         // Ranked by the positions given, so it doesn't matter where they count from
         let mut qualifying: Vec<(i64, i64)> = doc
             .at(&["QualifyResultsInfo", "Results"])
@@ -221,6 +251,19 @@ impl SessionInfo {
             .enumerate()
             .map(|(rank, (_, car))| (car, rank as i64 + 1))
             .collect();
+        let mut grid: Vec<_> = info
+            .qualifying
+            .iter()
+            .map(|(car, place)| (*place, *car))
+            .collect();
+        grid.sort();
+        let mut in_class = HashMap::<Option<i64>, i64>::new();
+        for (_, car) in grid {
+            let class = info.drivers.get(&car).and_then(|d| d.class_id);
+            let place = in_class.entry(class).or_default();
+            *place += 1;
+            info.qualifying_class.insert(car, *place);
+        }
 
         info
     }
@@ -405,5 +448,64 @@ SplitTimeInfo:
         assert_eq!(driver.car_number.as_deref(), Some("07"));
         assert_eq!(driver.team_incidents, None);
         assert_eq!(info.sectors, [0.0, 0.442307]);
+    }
+
+    /// AI classes have no names: one goes by its car's, when it's the only model in it, and the
+    /// grid's places count within each class too.
+    #[test]
+    fn nameless_classes_go_by_their_car() {
+        let doc = parse(
+            "QualifyResultsInfo:
+ Results:
+ - Position: 0
+   CarIdx: 2
+ - Position: 1
+   CarIdx: 0
+ - Position: 2
+   CarIdx: 1
+ - Position: 3
+   CarIdx: 3
+DriverInfo:
+ Drivers:
+ - CarIdx: 0
+   CarScreenName: FIA F4
+   CarClassID: 3188
+   CarClassShortName: 
+ - CarIdx: 1
+   CarScreenName: FIA F4
+   CarClassID: 3188
+   CarClassShortName: 
+ - CarIdx: 2
+   CarScreenName: Cadillac V-Series.R
+   CarClassID: 4024
+   CarClassShortName: 
+ - CarIdx: 3
+   CarScreenName: Porsche 963
+   CarClassID: 4024
+   CarClassShortName: 
+ - CarIdx: 4
+   CarScreenName: Toyota GR86
+   CarClassID: 77
+   CarClassShortName: GR86
+ - CarIdx: 64
+   CarScreenName: safety pcsedan
+   CarClassID: 3188
+   CarIsPaceCar: 1
+",
+        );
+        let info = SessionInfo::new(&doc);
+        let class = |car: i64| info.drivers[&car].class.as_deref();
+        assert_eq!(class(0), Some("FIA F4"));
+        assert_eq!(class(1), Some("FIA F4"));
+        // Two models: no name to go by
+        assert_eq!(class(2), None);
+        assert_eq!(class(3), None);
+        assert_eq!(class(4), Some("GR86"));
+        // The grid: overall, and in the class
+        assert_eq!([0, 1, 2, 3].map(|car| info.qualifying[&car]), [2, 3, 1, 4]);
+        assert_eq!(
+            [0, 1, 2, 3].map(|car| info.qualifying_class[&car]),
+            [1, 2, 1, 2]
+        );
     }
 }

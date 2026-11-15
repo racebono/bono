@@ -1136,14 +1136,15 @@ fn at_time(r: Row, t: f64) -> Row {
 }
 
 /// Vehicle ids in running order, each one's place, and whether that's the official order (from
-/// the standings) or an estimate from telemetry: more laps first, then whoever started the
-/// current lap earlier, exact at the line but possibly wrong mid-lap.
+/// the standings, when they give any car a place) or an estimate from telemetry: more laps first,
+/// then whoever started the current lap earlier, exact at the line but possibly wrong mid-lap.
 fn positions(
     ctx: &Ctx,
     frame: &BTreeMap<i64, Row>,
 ) -> anyhow::Result<(Vec<i64>, HashMap<i64, usize>, bool)> {
     let sc = ctx.scoring()?;
-    let (ids, exact) = match sc.cars.is_empty() {
+    let placed = sc.cars.values().any(|r| r.i("position").is_some());
+    let (ids, exact) = match !placed {
         false => (
             sc.order()
                 .iter()
@@ -2853,6 +2854,22 @@ mod tests {
             .run(serde_json::from_value(input).unwrap())
             .await
             .unwrap()
+    }
+
+    /// Standings that give no car a place (a race before its start, on some simulators) aren't
+    /// an order: the snapshot's place is only an estimate then.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn standings_without_places_are_no_order() {
+        let (dir, engineer) = race();
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute("UPDATE standings SET position = NULL", [])
+            .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(out.contains("| ~P"), "{out}");
+        assert!(!out.contains("| P1/"), "{out}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

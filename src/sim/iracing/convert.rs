@@ -148,6 +148,7 @@ struct Car<'a> {
     /// and the distance go round the line an update or so apart
     lap_offset: i64,
     position: Option<i64>,
+    class_position: Option<i64>,
     /// The game's estimate of how long into the lap it is where it is
     est: Option<f64>,
     /// Race time behind the leader
@@ -155,6 +156,12 @@ struct Car<'a> {
 }
 
 impl Car<'_> {
+    /// Race time behind the leader. 0 is also what the game gives a car it hasn't timed yet (before
+    /// it's crossed the line): only the leader's is a time.
+    fn race_time(&self) -> Option<f64> {
+        self.f2.filter(|t| *t > 0.0 || self.position == Some(1))
+    }
+
     /// How far it's gone in laps, for laps behind.
     fn progress(&self) -> Option<f64> {
         Some((self.laps_completed? + self.lap_offset) as f64 + self.pct.unwrap_or(0.0))
@@ -194,6 +201,15 @@ impl Converter {
         self.session = Some(session);
 
         let player = frame.i32("PlayerCarIdx").map(i64::from).or(info.player);
+        let current = frame
+            .i32("SessionNum")
+            .and_then(|num| info.session(num.into()));
+        let race = current.and_then(|session| session.kind) == Some("race");
+        // Before a race's green the game gives no places: they're the grid's, qualifying's order
+        let gridded = race
+            && frame
+                .i32("SessionState")
+                .is_some_and(|state| (STATE_GET_IN_CAR..STATE_RACING).contains(&state));
         let mut cars: Vec<_> = info.cars().collect();
         cars.sort_by_key(|(idx, _)| *idx);
         let cars: Vec<Car<'_>> = cars
@@ -246,7 +262,21 @@ impl Converter {
                     position: car
                         .i32("CarIdxPosition", "PlayerCarPosition")
                         .filter(|p| *p > 0)
-                        .map(i64::from),
+                        .map(i64::from)
+                        .or_else(|| {
+                            gridded
+                                .then(|| info.qualifying.get(&idx).copied())
+                                .flatten()
+                        }),
+                    class_position: car
+                        .i32("CarIdxClassPosition", "PlayerCarClassPosition")
+                        .filter(|p| *p > 0)
+                        .map(i64::from)
+                        .or_else(|| {
+                            gridded
+                                .then(|| info.qualifying_class.get(&idx).copied())
+                                .flatten()
+                        }),
                     est: frame
                         .f64_at("CarIdxEstTime", idx as usize)
                         .filter(|t| *t >= 0.0),
@@ -257,10 +287,6 @@ impl Converter {
             })
             .collect();
 
-        let current = frame
-            .i32("SessionNum")
-            .and_then(|num| info.session(num.into()));
-        let race = current.and_then(|session| session.kind) == Some("race");
         let gaps = track_gaps(&cars);
         let places = place_gaps(&cars, race);
 
@@ -454,11 +480,7 @@ impl Converter {
         out.car_number = d.car_number.clone().into();
         out.position = car.position.into();
         let per_car = PerCar::new(frame, car.idx, is_player.then_some(car.idx));
-        out.class_position = per_car
-            .i32("CarIdxClassPosition", "PlayerCarClassPosition")
-            .filter(|p| *p > 0)
-            .map(i64::from)
-            .into();
+        out.class_position = car.class_position.into();
         out.qualifying_position = info.qualifying.get(&car.idx).copied().into();
         out.laps_completed = car.laps_completed.into();
         out.lap_start_time = track.and_then(|t| t.lap_start).map(round_ms).into();
@@ -502,7 +524,7 @@ impl Converter {
 
         // In races, the gaps in the standings and laps down
         if race {
-            out.time_behind_leader = car.f2.into();
+            out.time_behind_leader = car.race_time().into();
             out.time_behind_next = places.get(&car.idx).and_then(|(ahead, _)| *ahead).into();
             let leader = cars.iter().find(|c| c.position == Some(1));
             let next = car
@@ -1033,7 +1055,7 @@ fn place_gaps(cars: &[Car<'_>], race: bool) -> HashMap<i64, (Option<f64>, Option
             continue;
         };
         let gap = |ahead: Option<&&Car<'_>>, behind: &Car<'_>| {
-            Some(behind.f2? - ahead?.f2?).filter(|gap| *gap >= 0.0)
+            Some(behind.race_time()? - ahead?.race_time()?).filter(|gap| *gap >= 0.0)
         };
         let ahead = gap(by_place.get(&(place - 1)), car);
         let behind = by_place
@@ -1566,6 +1588,7 @@ mod tests {
             laps_completed: Some(1),
             lap_offset: 0,
             position: None,
+            class_position: None,
             est: Some(est),
             f2: None,
         };
@@ -1576,6 +1599,83 @@ mod tests {
         let gap = follow_gap(&car(0.99, 89.1), &car(0.01, 0.9)).unwrap();
         assert!((gap - 1.8).abs() < 1e-9, "{gap}");
         assert!((follow_gap(&car(0.2, 18.0), &car(0.3, 27.5)).unwrap() - 9.5).abs() < 1e-9);
+    }
+
+    /// Before a race's green the places are the grid's; and a car the game hasn't timed yet (0 behind
+    /// the leader, before it's crossed the line) has no gaps rather than none at all.
+    #[test]
+    fn races_start_from_the_grid_and_untimed_cars_have_no_gaps() {
+        use super::super::sdk::{Value, Vars};
+        use super::super::session::{Driver, Session};
+        let info = SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: (0..3).map(|car| (car, Driver::default())).collect(),
+            sessions: vec![Session {
+                num: 0,
+                kind: Some("race"),
+                number: 1,
+                results: HashMap::new(),
+            }],
+            qualifying: HashMap::from([(2, 1), (0, 2), (1, 3)]),
+            qualifying_class: HashMap::from([(2, 1), (0, 2), (1, 3)]),
+            ..Default::default()
+        };
+        let update = |state: i32, places: [i32; 3], behind: [f64; 3]| {
+            let (vars, data) = Vars::of(&[
+                ("SessionTime", Value::Double(10.0)),
+                ("SessionNum", Value::Int(0)),
+                ("SessionState", Value::Int(state)),
+                ("PlayerCarIdx", Value::Int(0)),
+                ("CarIdxLapDistPct", Value::Doubles(vec![0.5, 0.4, 0.6])),
+                ("CarIdxLapCompleted", Value::Ints(vec![0, 0, 0])),
+                ("CarIdxPosition", Value::Ints(places.to_vec())),
+                ("CarIdxClassPosition", Value::Ints(places.to_vec())),
+                ("CarIdxF2Time", Value::Doubles(behind.to_vec())),
+            ]);
+            Converter::default()
+                .convert(&Frame::new(&vars, &data), &info, Instant::now())
+                .unwrap()
+        };
+        let standing = |update: &Update, car: i64| {
+            let (_, standings) = update.scoring.as_ref().unwrap();
+            let row = standings
+                .iter()
+                .find(|s| s.vehicle_id.get() == Some(car))
+                .unwrap();
+            (
+                row.position.get(),
+                row.class_position.get(),
+                row.time_behind_leader.get(),
+            )
+        };
+        let ahead = |update: &Update, car: i64| {
+            let row = update
+                .telemetry
+                .iter()
+                .find(|t| t.vehicle_id.get() == Some(car))
+                .unwrap();
+            row.gap_to_place_ahead.get()
+        };
+
+        // On the parade laps: the grid, and nobody's timed but the leader
+        let parade = update(STATE_PARADE_LAPS, [0; 3], [0.0; 3]);
+        assert_eq!(standing(&parade, 2), (Some(1), Some(1), Some(0.0)));
+        assert_eq!(standing(&parade, 0), (Some(2), Some(2), None));
+        assert_eq!(standing(&parade, 1), (Some(3), Some(3), None));
+        assert_eq!(ahead(&parade, 0), None);
+
+        // Green, the game's places, but no lap timed yet: no gaps (not 0)
+        let green = update(STATE_RACING, [2, 3, 1], [0.0; 3]);
+        assert_eq!(standing(&green, 0), (Some(2), Some(2), None));
+        assert_eq!((ahead(&green, 0), ahead(&green, 1)), (None, None));
+        // Over the line
+        let timed = update(STATE_RACING, [2, 3, 1], [1.5, 3.0, 0.0]);
+        assert_eq!(standing(&timed, 0), (Some(2), Some(2), Some(1.5)));
+        assert_eq!((ahead(&timed, 0), ahead(&timed, 1)), (Some(1.5), Some(1.5)));
+        // After the green, a car without a place has none, not the grid's
+        let unplaced = update(STATE_RACING, [0, 3, 1], [1.5, 3.0, 0.0]);
+        assert_eq!(standing(&unplaced, 0).0, None);
     }
 
     #[test]
