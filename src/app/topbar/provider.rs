@@ -19,8 +19,11 @@ use tokio::runtime::Handle;
 
 const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 const OLLAMA_EFFORTS: [&str; 4] = ["none", "low", "medium", "high"];
-/// Empty: `reasoning_effort` left out, the model's default
-const OPENAI_EFFORTS: [&str; 5] = ["", "none", "low", "medium", "high"];
+/// Empty: `reasoning_effort` left out, the model's default. Each model takes some of the rest
+/// (OpenAI's `minimal` and `xhigh`, `max` on others...), so all are offered
+const OPENAI_EFFORTS: [&str; 8] = [
+    "", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+];
 
 /// Where Claude API keys are made
 const CLAUDE_KEYS_URL: &str = "https://platform.claude.com/settings/keys";
@@ -50,6 +53,7 @@ fn effort_name(effort: &str) -> String {
     match effort {
         "" => t!("effort.default"),
         "none" => t!("effort.none"),
+        "minimal" => t!("effort.minimal"),
         "low" => t!("effort.low"),
         "medium" => t!("effort.medium"),
         "high" => t!("effort.high"),
@@ -376,13 +380,28 @@ impl ProviderTopbar {
         let mut changed = self.base_url(ui, config);
         changed |= self.openai_api_key(ui, config);
         changed |= self.model(rt, ui, config.model().clone(), &mut config.model);
+        // The model's own levels, when the server lists them: any, otherwise. One picked before
+        // that the model doesn't list stays picked (the list may be wrong), but is pointed out
+        let listed = self.listed_efforts(rt, config.model());
+        let efforts = match &listed {
+            Some(efforts) => std::iter::once(String::new())
+                .chain(efforts.iter().cloned())
+                .collect(),
+            None => OPENAI_EFFORTS.map(str::to_owned).to_vec(),
+        };
         changed |= pick(
             ui,
             t!("provider.effort"),
             config.effort().clone(),
             &mut config.effort,
-            OPENAI_EFFORTS.map(|effort| (effort.to_owned(), effort_name(effort))),
-            |effort| effort_name(effort),
+            efforts.into_iter().map(|effort| {
+                let name = effort_name(&effort);
+                (effort, name)
+            }),
+            |effort| match listed {
+                Some(_) => t!("provider.effort_unlisted", effort = effort_name(effort)),
+                None => effort_name(effort),
+            },
         )
         .on_hover_text(t!("provider.openai_effort_hover"))
         .changed();
@@ -568,6 +587,13 @@ impl ProviderTopbar {
             self.cloud = None;
         }
         changed
+    }
+
+    /// The effort levels the provider lists for `model`, if it's been asked and says.
+    fn listed_efforts(&mut self, rt: &Handle, model: &str) -> Option<Vec<String>> {
+        let list = self.models.as_mut()?.list.update(rt)?.as_ref().ok()?;
+        let option = list.iter().find(|option| option.name == model)?;
+        option.efforts.clone()
     }
 
     /// Asks for the provider's models again if it's another provider, or another address.
