@@ -2991,6 +2991,58 @@ mod tests {
         assert_eq!(size_of(&sizes, 4), size(2.1, 5.1));
     }
 
+    /// What a poll calls over a recording with a 6 m car 5.2 m ahead and 3 m right of the
+    /// player's 4.8 m one (only beside it once their sizes are known), recorded with `sizes`.
+    fn poll_beside_a_long_car(sizes: bool) -> Vec<&'static str> {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        let (mine, theirs) = if sizes {
+            ((Some(2.0), Some(4.8)), (Some(2.0), Some(6.0)))
+        } else {
+            ((None, None), (None, None))
+        };
+        for (vehicle, (width, length), is_player) in [(1, mine, true), (2, theirs, false)] {
+            conn.execute(
+                "INSERT INTO standings (vehicle_id, session_time, is_player, vehicle_width, \
+                 vehicle_length) VALUES (?1, 0, ?2, ?3, ?4)",
+                rusqlite::params![vehicle, is_player, width, length],
+            )
+            .unwrap();
+        }
+
+        let (mut logic, mut sizes, mut last_id) = (Logic::default(), Sizes::default(), None);
+        let mut calls = Vec::new();
+        for tick in 0..30 {
+            let t = f64::from(tick) / 30.0;
+            for (vehicle, is_player, x, ahead) in [(2, false, -3.0, 5.2), (1, true, 0.0, 0.0)] {
+                conn.execute(
+                    "INSERT INTO telemetry (vehicle_id, session_time, is_player, in_pit_lane, \
+                     speed, position_x, position_y, position_z, heading) \
+                     VALUES (?1, ?2, ?3, 0, 50, ?4, 0, ?5, 0)",
+                    rusqlite::params![vehicle, t, is_player, x, -50.0 * t - ahead],
+                )
+                .unwrap();
+            }
+            let raised = poll(
+                &conn,
+                &mut logic,
+                &mut sizes,
+                &SpotterConfig::default(),
+                5,
+                &mut last_id,
+            )
+            .unwrap();
+            calls.extend(texts(raised));
+        }
+        calls
+    }
+
+    #[test]
+    fn polls_with_the_recorded_sizes() {
+        assert_eq!(poll_beside_a_long_car(true), ["car right"]);
+        assert!(poll_beside_a_long_car(false).is_empty());
+    }
+
     #[test]
     fn ignores_cars_in_line_and_says_still_there() {
         let mut logic = Logic::default();
