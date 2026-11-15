@@ -1,6 +1,7 @@
 //! The spotter: follows the running simulator's telemetry about thirty times a second and calls
 //! cars alongside, flags, the car's own alerts and the weather the moment they happen, without
-//! anyone asking. A port of my-engineer's `spotter.cpp`.
+//! anyone asking (and, if asked to, the pilot's lap times in qualifying). A port of my-engineer's
+//! `spotter.cpp`.
 //!
 //! It reads the database on a thread of its own, with a read-only connection of its own (closed as
 //! soon as the game stops, so the plugin can delete the file), and turns what changed into calls.
@@ -42,11 +43,21 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(200);
 /// How long a call is still worth saying.
 const URGENT_FOR: Duration = Duration::from_millis(1500);
 const OTHER_FOR: Duration = Duration::from_secs(10);
+/// A lap's time is still news well into the next lap, after an engineer's long answer
+const LAP_TIME_FOR: Duration = Duration::from_secs(30);
 const WARM_RETRY_AFTER: Duration = Duration::from_secs(5);
 /// A gap behind called this close is "close behind" rather than "within a second".
 const CLOSE_BEHIND: f64 = 0.15;
 /// The gap behind isn't called in the session's first seconds (the start, the field nose to tail).
 const GAP_BEHIND_AFTER: f64 = 20.0;
+/// The lap count and the lap's time can come a few rows apart, either way round: within this
+/// (in session time), they're the same lap's.
+const LAP_MATCH: f64 = 3.0;
+/// The lap invalidated just past the line is the lap before, until the simulator clears it;
+/// invalidated for longer, the lap after is too.
+const LAP_INVALID_GRACE: f64 = 1.0;
+/// A lap's time: its number is in milliseconds.
+const LAP_TIME: &str = "lap time {}";
 /// Calls synthesized ahead, so the first of each is said without waiting for the voice.
 const WARM: [&str; 6] = [
     "car left",
@@ -72,7 +83,12 @@ pub struct Raised {
 
 impl Raised {
     fn valid_at(&self, at: Instant, now: Instant) -> bool {
-        now.duration_since(at) < if self.urgent { URGENT_FOR } else { OTHER_FOR }
+        now.duration_since(at)
+            < match self.urgent {
+                true => URGENT_FOR,
+                false if self.text == LAP_TIME => LAP_TIME_FOR,
+                false => OTHER_FOR,
+            }
     }
 
     /// Traffic updates replace the state of the sides they describe. Unrelated alerts do not.
@@ -91,9 +107,32 @@ impl Raised {
     pub fn words(&self, lang: ArrayStr<2>) -> String {
         let text = translate(self.text, lang);
         match self.number {
+            Some(millis) if self.text == LAP_TIME => {
+                text.replacen("{}", &lap_time(millis, lang), 1)
+            }
             Some(number) => text.replacen("{}", &number.to_string(), 1),
             None => text.to_owned(),
         }
+    }
+
+    /// Worth keeping synthesized for next time: a lap time is hardly ever said again.
+    fn said_again(&self) -> bool {
+        self.text != LAP_TIME
+    }
+}
+
+/// A lap time to the tenth, as it's said: "1 42.3" (one forty-two point three), with `lang`'s
+/// decimal separator so the voice reads it as a number.
+fn lap_time(millis: i64, lang: ArrayStr<2>) -> String {
+    let tenths = (millis.max(0) + 50) / 100;
+    let (minutes, seconds, tenth) = (tenths / 600, tenths % 600 / 10, tenths % 10);
+    let point = match &*lang {
+        "en" | "ja" | "zh" | "ko" | "hi" | "th" => '.',
+        _ => ',',
+    };
+    match minutes {
+        0 => format!("{seconds}{point}{tenth}"),
+        _ => format!("{minutes} {seconds:02}{point}{tenth}"),
     }
 }
 
@@ -478,10 +517,14 @@ impl Spotter {
 
         // The call being said
         match &mut self.saying {
-            Some(Saying::Synthesizing { key, recv, .. }) => match recv.try_recv() {
+            Some(Saying::Synthesizing {
+                key, recv, call, ..
+            }) => match recv.try_recv() {
                 Ok(Ok(speech)) => {
                     let speech = Arc::new(speech);
-                    self.cache.insert(key.clone(), speech.clone());
+                    if call.said_again() {
+                        self.cache.insert(key.clone(), speech.clone());
+                    }
                     if let Some(Saying::Synthesizing { call, .. }) = self.saying.take() {
                         self.saying = self.play(config, speaker, &speech, call);
                     }
@@ -793,6 +836,9 @@ struct Scoring {
     /// The flag shown to the player
     flag: Option<String>,
     penalties: Option<i64>,
+    /// The player's laps, and the time of the last one
+    laps_completed: Option<i64>,
+    last_lap_time: Option<f64>,
     /// 0-1
     rain: Option<f64>,
     /// 0-1
@@ -1004,34 +1050,38 @@ fn scoring(
     let standing = match upto {
         None => conn
             .prepare_cached(
-                "SELECT flag, penalties FROM standings WHERE is_player = 1 \
+                "SELECT flag, penalties, laps_completed, last_lap_time FROM standings \
+                 WHERE is_player = 1 \
                  AND id > (SELECT coalesce(max(id), 0) - 5000 FROM standings) AND id >= ?1 \
                  ORDER BY id DESC LIMIT 1",
             )?
-            .query_row([epoch.standings_from], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_row([epoch.standings_from], standing)
             .optional()?
             .map(|standing| Ok(Some(standing)))
             .unwrap_or_else(|| {
                 conn.prepare_cached(
-                    "SELECT flag, penalties FROM standings WHERE is_player = 1 AND id >= ?1 \
-                     ORDER BY id DESC LIMIT 1",
+                    "SELECT flag, penalties, laps_completed, last_lap_time FROM standings \
+                     WHERE is_player = 1 AND id >= ?1 ORDER BY id DESC LIMIT 1",
                 )?
-                .query_row([epoch.standings_from], |row| Ok((row.get(0)?, row.get(1)?)))
+                .query_row([epoch.standings_from], standing)
                 .optional()
             })?,
         Some(upto) => conn
             .prepare_cached(
-                "SELECT flag, penalties FROM standings WHERE is_player = 1 AND session_time <= ?1 \
-                 AND id >= ?2 ORDER BY id DESC LIMIT 1",
+                "SELECT flag, penalties, laps_completed, last_lap_time FROM standings \
+                 WHERE is_player = 1 AND session_time <= ?1 AND id >= ?2 \
+                 ORDER BY id DESC LIMIT 1",
             )?
-            .query_row(rusqlite::params![upto, epoch.standings_from], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
+            .query_row(rusqlite::params![upto, epoch.standings_from], standing)
             .optional()?,
     };
-    if let Some((flag, penalties)) = standing {
-        scoring.flag = flag;
-        scoring.penalties = penalties;
+    if let Some(standing) = standing {
+        (
+            scoring.flag,
+            scoring.penalties,
+            scoring.laps_completed,
+            scoring.last_lap_time,
+        ) = standing;
     }
 
     // The forecast is LMU's only, written as a whole set of rows when it changes
@@ -1058,6 +1108,13 @@ fn scoring(
         }
     }
     Ok(Some(scoring))
+}
+
+/// The player's flag, penalties, laps and last lap time, from a standings row.
+type Standing = (Option<String>, Option<i64>, Option<i64>, Option<f64>);
+
+fn standing(row: &Row) -> rusqlite::Result<Standing> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
 }
 
 /// The other car relative to the player in metres: (+ahead, +right). Forward is (-sin h, -cos h)
@@ -1251,6 +1308,16 @@ struct Logic {
     prev_wet: usize,
     /// Forecast points already called: (session type, how far through it)
     forecast_called: HashSet<(String, u64)>,
+    /// The lap the player's on was invalidated, or has been through the pit lane: its time
+    /// isn't called
+    lap_invalidated: bool,
+    lap_in_pit_lane: bool,
+    /// The player's last lap ended (when; whether its time is called)...
+    lap_ended: Option<(f64, bool)>,
+    /// ...and its time came (when; the time)
+    lap_timed: Option<(f64, f64)>,
+    /// When the player's lap last ended
+    lap_started: Option<f64>,
 }
 
 impl Default for Logic {
@@ -1271,6 +1338,11 @@ impl Default for Logic {
             last_patch_call: f64::NEG_INFINITY,
             prev_wet: 0,
             forecast_called: HashSet::new(),
+            lap_invalidated: false,
+            lap_in_pit_lane: false,
+            lap_ended: None,
+            lap_timed: None,
+            lap_started: None,
         }
     }
 }
@@ -1339,6 +1411,15 @@ impl Logic {
             self.geometry.update(config, p, others, t)
         };
         self.traffic(config, proximity, t, &mut calls);
+        // Invalidated as it's driven (or already, when the spotter starts mid-lap)
+        if player.lap_invalidated
+            && self
+                .lap_started
+                .is_none_or(|started| t - started > LAP_INVALID_GRACE)
+        {
+            self.lap_invalidated = true;
+        }
+        self.lap_in_pit_lane |= p.in_pit_lane;
         if let Some(prev) = self.prev.take() {
             let race = scoring.is_some_and(|s| s.session_type.as_deref() == Some("race"));
             self.alerts(
@@ -1352,6 +1433,7 @@ impl Logic {
             );
         }
         if let Some(scoring) = scoring {
+            self.lap_times(config, scoring, p.in_pit_lane, t, &mut calls);
             self.flags(scoring, &mut calls);
             self.weather(config, scoring, wheels.wet, t, stopped, &mut calls);
         }
@@ -1525,6 +1607,49 @@ impl Logic {
                 },
                 false,
             );
+        }
+    }
+
+    /// In qualifying, the time of each lap the pilot finishes, once both the lap count and the
+    /// lap's time have come. Not of laps invalidated, or through the pit lane (in and out laps).
+    fn lap_times(
+        &mut self,
+        config: &SpotterConfig,
+        now: &Scoring,
+        in_pit_lane: bool,
+        t: f64,
+        calls: &mut Calls,
+    ) {
+        // The first we hear of the player says nothing about a lap ending
+        let Some(last) = &self.prev_scoring else {
+            return;
+        };
+        if let (Some(before), Some(laps)) = (last.laps_completed, now.laps_completed)
+            && laps > before
+        {
+            let timed = !self.lap_invalidated && !self.lap_in_pit_lane;
+            self.lap_ended = Some((t, timed));
+            self.lap_started = Some(t);
+            self.lap_invalidated = false;
+            self.lap_in_pit_lane = in_pit_lane;
+        }
+        // The first we hear of the player's standing is a lap done long ago
+        if let Some(time) = now.last_lap_time.filter(|time| *time > 0.0)
+            && last.laps_completed.is_some()
+            && last.last_lap_time != Some(time)
+        {
+            self.lap_timed = Some((t, time));
+        }
+
+        self.lap_ended = self.lap_ended.filter(|(at, _)| t - at <= LAP_MATCH);
+        self.lap_timed = self.lap_timed.filter(|(at, _)| t - at <= LAP_MATCH);
+        if let (Some((_, timed)), Some((_, time))) = (self.lap_ended, self.lap_timed) {
+            self.lap_ended = None;
+            self.lap_timed = None;
+            let qualifying = now.session_type.as_deref() == Some("qualifying");
+            if timed && qualifying && *config.qualifying_lap_times() {
+                calls.raise_number(LAP_TIME, Some((time * 1000.0).round() as i64), false);
+            }
         }
     }
 
@@ -1732,6 +1857,7 @@ pub fn translate(text: &'static str, lang: ArrayStr<2>) -> &'static str {
         "wet patch" => t!("call.wet_patch": lang),
         "rain likely in about {} minutes" => t!("call.rain_in_minutes": lang),
         "rain likely in about a minute" => t!("call.rain_in_a_minute": lang),
+        LAP_TIME => t!("call.lap_time": lang),
         _ => text,
     }
 }
@@ -2911,9 +3037,10 @@ mod tests {
              CREATE TABLE session_sector (session_id INTEGER, sector INTEGER,
              local_yellow INTEGER);
              CREATE TABLE standings (id INTEGER PRIMARY KEY, is_player INTEGER,
-             session_time REAL, flag TEXT, penalties INTEGER);
+             session_time REAL, flag TEXT, penalties INTEGER, laps_completed INTEGER,
+             last_lap_time REAL);
              INSERT INTO session (session_time) VALUES (0);
-             INSERT INTO standings VALUES (1, 1, 0, 'blue', 1);",
+             INSERT INTO standings VALUES (1, 1, 0, 'blue', 1, 0, NULL);",
         )
         .unwrap();
         let config = SpotterConfig::default();
@@ -2927,11 +3054,11 @@ mod tests {
         assert!(step(0.0).is_empty());
         conn.execute_batch(
             "WITH RECURSIVE ids(id) AS (SELECT 2 UNION ALL SELECT id + 1 FROM ids WHERE id < 5001)
-             INSERT INTO standings SELECT id, 0, 1, 'green', 0 FROM ids;",
+             INSERT INTO standings SELECT id, 0, 1, 'green', 0, 0, NULL FROM ids;",
         )
         .unwrap();
         assert!(step(1800.0).is_empty());
-        conn.execute_batch("INSERT INTO standings VALUES (5002, 1, 1801, 'blue', 1);")
+        conn.execute_batch("INSERT INTO standings VALUES (5002, 1, 1801, 'blue', 1, 0, NULL);")
             .unwrap();
         assert!(step(1801.0).is_empty());
         // The recorder clears the tables for a new session.
@@ -3100,6 +3227,223 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The lap times called in a session of `session_type`, given the player's rows (`t`, laps,
+    /// last lap time, in the pit lane, lap invalidated).
+    fn lap_calls(
+        config: &SpotterConfig,
+        session_type: &str,
+        rows: &[(f64, i64, Option<f64>, bool, bool)],
+    ) -> Vec<String> {
+        let mut logic = Logic::default();
+        let mut calls = Vec::new();
+        for &(t, laps, last, in_pit_lane, invalidated) in rows {
+            let scoring = Scoring {
+                session_type: Some(session_type.into()),
+                laps_completed: Some(laps),
+                last_lap_time: last,
+                ..Scoring::default()
+            };
+            let mut p = player(t);
+            p.car.in_pit_lane = in_pit_lane;
+            p.lap_invalidated = invalidated;
+            calls.extend(
+                logic
+                    .update(config, &p, &[], &Wheels::default(), Some(&scoring))
+                    .into_iter()
+                    .filter(|call| call.text == LAP_TIME)
+                    .map(|call| call.words(arrstr!("en"))),
+            );
+        }
+        calls
+    }
+
+    fn lap_times_on() -> SpotterConfig {
+        let mut config = SpotterConfig::default();
+        config.qualifying_lap_times.set(true);
+        config
+    }
+
+    #[test]
+    fn calls_lap_times_in_qualifying() {
+        let config = lap_times_on();
+        // The count and the time together, the count first, then the time first
+        assert_eq!(
+            lap_calls(
+                &config,
+                "qualifying",
+                &[
+                    (10.0, 0, None, false, false),
+                    (110.0, 1, Some(100.25), false, false),
+                    (210.0, 2, Some(100.25), false, false),
+                    (210.2, 2, Some(99.96), false, false),
+                    (309.8, 2, Some(99.5), false, false),
+                    (310.0, 3, Some(99.5), false, false),
+                ]
+            ),
+            ["lap time 1 40.3", "lap time 1 40.0", "lap time 1 39.5"]
+        );
+        // Each lap once, however many rows it's on
+        assert_eq!(
+            lap_calls(
+                &config,
+                "qualifying",
+                &[
+                    (10.0, 0, None, false, false),
+                    (110.0, 1, Some(100.0), false, false),
+                    (110.2, 1, Some(100.0), false, false),
+                    (111.0, 1, Some(100.0), false, false),
+                ]
+            ),
+            ["lap time 1 40.0"]
+        );
+        // A time that doesn't come with a lap ending is someone's correction, not a lap
+        assert!(
+            lap_calls(
+                &config,
+                "qualifying",
+                &[
+                    (10.0, 0, None, false, false),
+                    (110.0, 1, None, false, false),
+                    (120.0, 1, Some(100.0), false, false),
+                ]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_first_standing_heard_of_is_no_new_lap_time() {
+        let config = lap_times_on();
+        let mut logic = Logic::default();
+        let mut step = |t, laps, last| {
+            let scoring = Scoring {
+                session_type: Some("qualifying".into()),
+                laps_completed: laps,
+                last_lap_time: last,
+                ..Scoring::default()
+            };
+            logic
+                .update(&config, &player(t), &[], &Wheels::default(), Some(&scoring))
+                .into_iter()
+                .map(|call| call.words(arrstr!("en")))
+                .collect::<Vec<_>>()
+        };
+        // The session before the player's standing, which comes with a lap done long ago
+        assert!(step(10.0, None, None).is_empty());
+        assert!(step(108.0, Some(5), Some(100.0)).is_empty());
+        // The lap ends: its own time, not that one
+        assert!(step(110.0, Some(6), Some(100.0)).is_empty());
+        assert_eq!(step(110.2, Some(6), Some(99.0)), ["lap time 1 39.0"]);
+    }
+
+    #[test]
+    fn calls_no_lap_times_invalidated_or_through_the_pits() {
+        let config = lap_times_on();
+        assert_eq!(
+            lap_calls(
+                &config,
+                "qualifying",
+                &[
+                    (10.0, 0, None, false, false),
+                    // Invalidated on the way round, and still a moment past the line
+                    (50.0, 0, None, false, true),
+                    (110.0, 1, Some(100.0), false, true),
+                    (110.5, 1, Some(100.0), false, false),
+                    // The next lap's clean
+                    (210.0, 2, Some(99.0), false, false),
+                    // Into the pits: the in lap...
+                    (300.0, 2, Some(99.0), true, false),
+                    (320.0, 3, Some(120.0), true, false),
+                    // ...and the out lap
+                    (330.0, 3, Some(120.0), false, false),
+                    (430.0, 4, Some(110.0), false, false),
+                    // Then a flying lap
+                    (530.0, 5, Some(98.0), false, false),
+                    // Cut at the end, invalidating the next lap as well
+                    (620.0, 5, Some(98.0), false, true),
+                    (630.0, 6, Some(100.0), false, true),
+                    (632.0, 6, Some(100.0), false, true),
+                    (640.0, 6, Some(100.0), false, false),
+                    (730.0, 7, Some(101.0), false, false),
+                    (830.0, 8, Some(97.0), false, false),
+                ]
+            ),
+            ["lap time 1 39.0", "lap time 1 38.0", "lap time 1 37.0"]
+        );
+        // Following from a lap already invalidated
+        assert_eq!(
+            lap_calls(
+                &config,
+                "qualifying",
+                &[
+                    (50.0, 0, None, false, true),
+                    (110.0, 1, Some(100.0), false, true),
+                    (110.5, 1, Some(100.0), false, false),
+                    (210.0, 2, Some(99.0), false, false),
+                ]
+            ),
+            ["lap time 1 39.0"]
+        );
+    }
+
+    #[test]
+    fn calls_lap_times_only_in_qualifying_when_asked() {
+        let rows = [
+            (10.0, 0, None, false, false),
+            (110.0, 1, Some(100.0), false, false),
+        ];
+        for session in ["practice", "warmup", "race", "test"] {
+            assert!(
+                lap_calls(&lap_times_on(), session, &rows).is_empty(),
+                "{session}"
+            );
+        }
+        assert!(lap_calls(&SpotterConfig::default(), "qualifying", &rows).is_empty());
+        assert_eq!(
+            lap_calls(&lap_times_on(), "qualifying", &rows),
+            ["lap time 1 40.0"]
+        );
+    }
+
+    #[test]
+    fn says_lap_times_as_numbers_in_each_language() {
+        let call = |millis| Raised {
+            text: LAP_TIME,
+            number: Some(millis),
+            urgent: false,
+            session_time: 0.0,
+        };
+        assert_eq!(call(102_349).words(arrstr!("en")), "lap time 1 42.3");
+        assert_eq!(call(102_350).words(arrstr!("en")), "lap time 1 42.4");
+        assert_eq!(call(65_000).words(arrstr!("en")), "lap time 1 05.0");
+        assert_eq!(call(119_960).words(arrstr!("en")), "lap time 2 00.0");
+        assert_eq!(call(58_712).words(arrstr!("en")), "lap time 58.7");
+        assert_eq!(
+            call(102_349).words(arrstr!("es")),
+            "tiempo de vuelta 1 42,3"
+        );
+        assert_eq!(call(102_349).words(arrstr!("ca")), "temps de volta 1 42,3");
+        assert_eq!(call(102_349).words(arrstr!("it")), "tempo sul giro 1 42,3");
+        // Without a translation, in English, read with the voice's own decimal separator
+        assert_eq!(call(102_349).words(arrstr!("fr")), "lap time 1 42,3");
+        assert!(!call(102_349).said_again());
+    }
+
+    #[test]
+    fn a_lap_time_waits_longer_than_other_news() {
+        let at = Instant::now();
+        let lap = Raised {
+            text: LAP_TIME,
+            number: Some(100_000),
+            urgent: false,
+            session_time: 0.0,
+        };
+        // An engineer's long answer: other news is out of date by its end, the lap time isn't
+        assert!(!call("penalty", false).valid_at(at, at + OTHER_FOR));
+        assert!(lap.valid_at(at, at + OTHER_FOR));
+        assert!(!lap.valid_at(at, at + LAP_TIME_FOR));
     }
 
     #[test]

@@ -209,6 +209,18 @@ impl Recorder {
         self.shared.failed.load(Ordering::Relaxed)
     }
 
+    /// Whether the car is the one the player drives, as of the last scoring update.
+    #[inline]
+    pub fn is_player(&self, vehicle_id: i64) -> bool {
+        vehicle_id == self.shared.player_id.load(Ordering::Relaxed)
+    }
+
+    /// The car the player drives as of the last scoring update, `None` when no car is theirs.
+    #[inline]
+    pub fn player(&self) -> Option<i64> {
+        Some(self.shared.player_id.load(Ordering::Relaxed)).filter(|id| *id >= 0)
+    }
+
     /// Called for every telemetry update of every car, before converting it: moves the car on, and
     /// returns whether this update is recorded (opponents are kept at every Nth update). If it is,
     /// pass it to `push_telemetry` next.
@@ -229,7 +241,7 @@ impl Recorder {
             return false;
         }
         tracking.advance(vehicle_id, session_time, speed);
-        if vehicle_id == self.shared.player_id.load(Ordering::Relaxed) {
+        if self.is_player(vehicle_id) {
             return true;
         }
 

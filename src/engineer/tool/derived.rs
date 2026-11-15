@@ -55,6 +55,16 @@ const FIRST_DISTANCE: f64 = 0.9;
 const SEEN_FROM_THE_START: f64 = 0.05;
 /// A lap with more of it than this unseen, as a share of the lap, isn't relied on
 pub(super) const WIDEST_GAP: f64 = 0.05;
+/// Seconds a row can be before its lap's start and still be the lap's: starts are rounded
+const LAP_START_SLACK: f64 = 0.01;
+/// Longer than this after the timer started before reaching the line is a real approach: the
+/// first rows of a lap can carry the old lap's distance, even several of them advancing, but not
+/// for this long. A shorter approach can't be told from them and is taken for an ordinary lap
+/// (its time that much long).
+const LINE_APPROACH_SECONDS: f64 = 1.0;
+/// Allow clock rounding and a delayed first telemetry frame when deciding whether the start
+/// was observed. A recording joined later must retain its partial corner evidence.
+const START_OBSERVED_SECONDS: f64 = 0.1;
 
 const TABLES: &str = "
 CREATE TABLE lap_stats (
@@ -133,7 +143,7 @@ CREATE TABLE cars_now (
     front_brake_bias_pct REAL, brake_migration INTEGER, front_arb INTEGER, rear_arb INTEGER,
     limiter_on INTEGER,
     engine_damage REAL, transmission_damage REAL, aero_damage REAL, suspension_damage REAL,
-    parts_detached INTEGER, dents TEXT, last_impact_ago_s REAL, last_impact_magnitude REAL,
+    parts_detached INTEGER, body_damage TEXT, last_impact_ago_s REAL, last_impact_magnitude REAL,
     in_pit_lane INTEGER, in_pits INTEGER, in_garage INTEGER, pit_state TEXT, pit_stops INTEGER,
     scheduled_pit_stops INTEGER, pit_services_selected TEXT, pit_services_active TEXT,
     pit_min_duration_left_s REAL,
@@ -721,16 +731,17 @@ fn wear_remaining(laps: &[Lap]) -> bool {
     true
 }
 
-/// Representative laps for finding and aligning corners: clean first, with invalidated laps
-/// still usable when no clean trace is available. Invalidation doesn't erase the geometry.
+/// Candidates for finding and aligning corners. A full trace is checked separately: a race's
+/// opening lap can supply geometry even when its run to the line excludes it from pace averages.
 fn best_laps(laps: &[Lap]) -> Vec<&Lap> {
     let mut laps = laps
         .iter()
-        .filter(|lap| lap.green && lap.time.is_some())
+        .filter(|lap| lap.complete && !lap.pit && !lap.refuelled && lap.time.is_some())
         .collect::<Vec<_>>();
     laps.sort_by(|a, b| {
         a.invalid
             .cmp(&b.invalid)
+            .then_with(|| b.green.cmp(&a.green))
             .then_with(|| a.time.partial_cmp(&b.time).unwrap_or(Ordering::Equal))
     });
     laps
@@ -771,6 +782,82 @@ pub(super) fn believable(top: f64, d: f64, length: f64) -> bool {
     }
 }
 
+/// When the car crossed the line after its lap's timer started, if it drove a run to the line
+/// under the lap's number before a full circuit (RaceRoom's opening lap). The first wrap of the
+/// lap distance the car was seen driving up to decides (before it, stale rows of the old lap's
+/// distance are only a lead-in); the crossing's interpolated between the rows either side of the
+/// line.
+///
+/// A full circuit after the wrap, under the same number, makes the lap longer than one, unless
+/// the rows before the wrap are only the old lap's distance: the car must be seen advancing to
+/// the line for a while after the timer started. Until a circuit's done, the wrap is the lap's
+/// end (the distance can wrap before the lap number does) unless the timer was seen starting
+/// just short of the line and the car advancing to it.
+pub(super) fn line_crossing_after_start(
+    samples: &[Sample],
+    start: Option<f64>,
+    length: f64,
+) -> Option<f64> {
+    let start = start?;
+    let rows = samples
+        .iter()
+        .filter_map(|sample| Some((sample.lap_distance?, sample.session_time?)))
+        .collect::<Vec<_>>();
+    // One pass, however many lead-ins: the rows since the last one, the furthest believable
+    // distance among them (as the trace believes distances), and whether they advanced
+    let mut from = 0;
+    let mut top = 0.0f64;
+    let mut advanced = false;
+    for (i, &(d, t)) in rows.iter().enumerate() {
+        if i > from {
+            let (before_d, before_t) = rows[i - 1];
+            if before_d > length * FIRST_DISTANCE && d <= length * SEEN_FROM_THE_START {
+                let (first_d, first_t) = rows[from];
+                let approached = first_d > length * FIRST_DISTANCE
+                    && advanced
+                    && before_t - start > LINE_APPROACH_SECONDS;
+                // Not a stale row after the first either
+                let drove_to_line = top > length * FIRST_DISTANCE;
+                if approached || drove_to_line {
+                    // Round the lap, not a distance back and forth at the line: through
+                    // mid-lap, and on to where a lap's last rows are (a sparse recording can
+                    // miss its last few per cent)
+                    let after = &rows[i..];
+                    let circuit_after = after
+                        .iter()
+                        .position(|(d, _)| (length * 0.25..=length * 0.75).contains(d))
+                        .is_some_and(|mid| {
+                            after[mid..]
+                                .iter()
+                                .any(|(d, _)| *d > length * FIRST_DISTANCE)
+                        });
+                    if !circuit_after && !(approached && first_t <= start + START_OBSERVED_SECONDS)
+                    {
+                        return None;
+                    }
+                    let distance = (length - before_d).max(0.0);
+                    return Some(if distance + d > 0.0 {
+                        before_t + (t - before_t) * distance / (distance + d)
+                    } else {
+                        t
+                    });
+                }
+                // Only the old lap's distance: the lap goes on from the wrap
+                from = i;
+                top = 0.0;
+                advanced = false;
+            } else if d > before_d {
+                advanced = true;
+            }
+        }
+        let d = d.min(length);
+        if believable(top, d, length) {
+            top = top.max(d);
+        }
+    }
+    None
+}
+
 /// What temperatures rose by in one corner section, for one wheel.
 #[derive(Clone, Copy, Default)]
 struct Rises {
@@ -798,10 +885,14 @@ struct LapBuild {
     gap_ahead_end: Option<f64>,
     gap_behind_end: Option<f64>,
     samples: Vec<Sample>,
+    /// The observed opening crossing, once enough evidence distinguishes it from a late wrap.
+    line_crossing: Option<f64>,
     /// The furthest believable lap distance so far
     top: f64,
     /// The furthest lap distance of its rows
     furthest: Option<f64>,
+    /// The track's length, as the layout the rows were added with has it
+    length: Option<f64>,
     /// What's been written of each corner's pass: how many of its marks the car has passed
     marks_passed: Vec<u8>,
     /// The next distance at which something of a pass can be written
@@ -828,8 +919,10 @@ impl LapBuild {
             gap_ahead_end: None,
             gap_behind_end: None,
             samples: Vec::new(),
+            line_crossing: None,
             top: 0.0,
             furthest: None,
+            length: None,
             marks_passed: vec![0; corners],
             next_mark: layout.map_or(f64::INFINITY, |layout| next_mark(layout, 0.0)),
             rises: vec![[Rises::default(); 4]; corners],
@@ -860,8 +953,42 @@ impl LapBuild {
         if let Some(d) = sample.lap_distance {
             self.furthest = Some(self.furthest.map_or(d, |furthest| furthest.max(d)));
         }
+        if length.is_some() {
+            self.length = length;
+        }
         if let (Some(d), Some(length)) = (sample.lap_distance, length) {
             let d = d.min(length);
+            // The last row `line_crossing_after_start` can use: a row without a distance or a
+            // time can't hide a wrap from the check
+            let previous = self
+                .samples
+                .iter()
+                .rev()
+                .skip(1)
+                .find(|s| s.lap_distance.is_some() && s.session_time.is_some());
+            // Inspect only a possible wrap or the point where a post-wrap circuit becomes
+            // complete enough to identify a late-recorded opening lap. Avoid rescanning per row.
+            if self.line_crossing.is_none()
+                && previous.is_some_and(|before| {
+                    before.lap_distance.is_some_and(|before_d| {
+                        (before_d > length * FIRST_DISTANCE && d <= length * SEEN_FROM_THE_START)
+                            || (before_d <= length * FIRST_DISTANCE && d > length * FIRST_DISTANCE)
+                    })
+                })
+            {
+                self.line_crossing = line_crossing_after_start(&self.samples, self.start, length);
+            }
+            if self.line_crossing.is_some_and(|crossing| {
+                previous
+                    .and_then(|s| s.session_time)
+                    .is_some_and(|before| crossing > before)
+                    && sample.session_time.is_some_and(|now| crossing <= now)
+            }) {
+                self.top = 0.0;
+                self.rises.fill([Rises::default(); 4]);
+                self.marks_passed.fill(0);
+                self.next_mark = 0.0;
+            }
             if believable(self.top, d, length) {
                 self.top = self.top.max(d);
             }
@@ -911,6 +1038,59 @@ impl LapBuild {
         }
     }
 
+    /// Whether rows came before the lap's start. A car can drive under a lap's number before its
+    /// timer runs (RaceRoom's first lap starts with the session's clock, wherever the car is):
+    /// those rows aren't the lap's, and would cover distance it never drove.
+    fn has_rows_before_start(&self) -> bool {
+        self.start.is_some_and(|start| {
+            // A row without a time says nothing: the rows after it do
+            self.samples
+                .iter()
+                .find_map(|sample| sample.session_time)
+                .is_some_and(|t| t < start - LAP_START_SLACK)
+        })
+    }
+
+    /// The lap again from its start, without the rows before it (see `has_rows_before_start`).
+    /// Read retained temperatures again too: the start may arrive in a later telemetry chunk.
+    fn restarted(
+        self,
+        conn: &Connection,
+        layout: Option<&Layout>,
+        player: Option<i64>,
+    ) -> rusqlite::Result<Self> {
+        let start = self.start.unwrap_or(f64::NEG_INFINITY) - LAP_START_SLACK;
+        let mut kept = self
+            .samples
+            .iter()
+            .skip_while(|sample| sample.session_time.is_none_or(|t| t < start))
+            .copied()
+            .collect::<Vec<_>>();
+        // The row that said when the lap started is the lap's, whatever the clocks say
+        if kept.is_empty() {
+            kept.extend(self.samples.last().copied());
+        }
+        let temperatures = match (layout, player) {
+            (Some(_), Some(player)) if player == kept[0].vehicle => {
+                wheel_temperatures(conn, player, kept[0].id, kept.last().unwrap().id)?
+            }
+            _ => HashMap::new(),
+        };
+        let mut build = LapBuild::new(&kept[0], self.lap, layout);
+        // Earlier retained rows may not carry the start yet; the replay must know it at the
+        // first crossing so geometry and temperature sections reset there.
+        build.start = self.start;
+        build.line_crossing =
+            layout.and_then(|layout| line_crossing_after_start(&kept, self.start, layout.length));
+        for sample in &kept {
+            build.add(sample, layout.map(|layout| layout.length));
+            if let (Some(layout), Some(temperatures)) = (layout, temperatures.get(&sample.id)) {
+                add_rises(&mut build, layout, temperatures, sample);
+            }
+        }
+        Ok(build)
+    }
+
     /// The lap as it stands, `next` being the lap after it (if it's finished).
     fn lap(
         &self,
@@ -952,6 +1132,23 @@ impl LapBuild {
                 .is_some_and(|d| d <= furthest * SEEN_FROM_THE_START)
                 && rest.any(|d| d >= furthest * FIRST_DISTANCE)
         });
+        // The length the lap's traces are built with: the layout's, or else the session's, as
+        // corners are found with; the lap's own furthest distance only without either
+        let length = match self.length {
+            Some(length) => Some(length),
+            None => scalar::<f64>(
+                conn,
+                "SELECT track_length FROM session ORDER BY id DESC LIMIT 1",
+                [],
+            )
+            .ok()
+            .flatten()
+            .filter(|length| *length > 0.0)
+            .or(self.furthest),
+        };
+        let extended = length.is_some_and(|length| {
+            line_crossing_after_start(&self.samples, self.start, length).is_some()
+        });
         Ok(Lap {
             lap: self.lap,
             first_id: self.first_id,
@@ -965,7 +1162,7 @@ impl LapBuild {
             refuelled,
             contact: impact.is_some_and(|impact| impact > 0.0) && impact != previous_impact,
             // A pit lap is an in or out lap: the pit lane flag was set at some point during the lap
-            green: next_lap && seen_from_the_start && !self.pit && !refuelled,
+            green: next_lap && seen_from_the_start && !extended && !self.pit && !refuelled,
             impact,
             track_limit_steps: state
                 .as_ref()
@@ -2006,8 +2203,9 @@ pub(super) struct Stream {
     calibrated_laps: Option<(usize, usize)>,
     /// How many laps the player had when braking zones were last looked for (car and laps)
     zones_from: Option<(i64, usize)>,
-    /// A fallback layout must be replaced when a usable clean lap becomes available.
-    zones_from_invalid: bool,
+    /// The braking zones are a fallback, from a lap that isn't a pace reference (invalidated,
+    /// or a run to the line and a circuit): replaced when a clean green lap's are available.
+    zones_from_fallback: bool,
     standings_cursor: i64,
     standings_t: Option<f64>,
     /// The standings' laps completed, by car, and when that last changed
@@ -2138,7 +2336,7 @@ impl Stream {
         self.projections.clear();
         self.calibrated_laps = None;
         self.zones_from = None;
-        self.zones_from_invalid = false;
+        self.zones_from_fallback = false;
         if self
             .layout
             .as_ref()
@@ -2417,7 +2615,37 @@ impl Stream {
                 continue;
             };
             let was_invalid = current.invalid;
+            let before_top = current.top;
+            let before_crossing = current.line_crossing;
+            let start_was_unknown = current.start.is_none();
             current.add(sample, length);
+            let before_start = current.has_rows_before_start();
+            // A start first reported after crossing requires replay even if recording began
+            // exactly at that start: no pre-timer rows need dropping, but geometry needs reset.
+            let replay = before_start
+                || before_crossing != current.line_crossing
+                || (start_was_unknown
+                    && length.is_some_and(|length| {
+                        line_crossing_after_start(&current.samples, current.start, length).is_some()
+                    }));
+            if replay || current.top < before_top {
+                // What was written of the lap is from before it started
+                for table in ["corner_passes", "corner_pass_wheels"] {
+                    conn.prepare_cached(&format!(
+                        "DELETE FROM {table} WHERE vehicle_id = ? AND lap = ?"
+                    ))?
+                    .execute(params![sample.vehicle, lap])?;
+                }
+            }
+            if replay {
+                current = current.restarted(conn, writer.layout, writer.player)?;
+                // Without the rows before its start, the lap may not have been in the pits
+                laps_changed = true;
+            } else if let (Some(layout), Some(temperatures)) =
+                (writer.layout, temperatures.get(&sample.id))
+            {
+                add_rises(&mut current, layout, temperatures, sample);
+            }
             if current.invalid && !was_invalid {
                 // Earlier corners may already be queryable before a later cut invalidates the
                 // lap. Keep their flag current so they cannot look like clean references.
@@ -2426,12 +2654,6 @@ impl Stream {
                 )?
                 .execute(params![sample.vehicle, lap])?;
             }
-            if let (Some(layout), Some(temperatures)) =
-                (writer.layout, temperatures.get(&sample.id))
-            {
-                add_rises(&mut current, layout, temperatures, sample);
-            }
-
             // The next lap's start says this one's time
             if let Some(waiting) = car.waiting.take() {
                 let started = current
@@ -2632,7 +2854,7 @@ impl Stream {
         if self
             .layout
             .as_ref()
-            .is_some_and(|layout| layout.source != "braking zones" || !self.zones_from_invalid)
+            .is_some_and(|layout| layout.source != "braking zones" || !self.zones_from_fallback)
         {
             return Ok(());
         }
@@ -2673,10 +2895,10 @@ impl Stream {
             return Ok(());
         };
         // Keep the fallback stable while replaying it; replace it only with clean evidence.
-        if self.layout.is_some() && lap.invalid {
+        let fallback = lap.invalid || !lap.green;
+        if self.layout.is_some() && fallback {
             return Ok(());
         }
-        let invalid = lap.invalid;
         let turns = trace
             .braking_zones()
             .into_iter()
@@ -2694,7 +2916,7 @@ impl Stream {
             return Ok(());
         }
         self.layout = Some(layout(turns, length, "braking zones"));
-        self.zones_from_invalid = invalid;
+        self.zones_from_fallback = fallback;
         self.rewind(conn)?;
         Ok(())
     }
@@ -3056,16 +3278,7 @@ impl Stream {
             .zip(t.f("lap_start_time"))
             .map(|(t, s)| t - s);
         let impact = t.f("last_impact_time").filter(|t| *t != 0.0);
-        let dents = (0..8)
-            .map(|i| t.i(&format!("dent_severity_{i}")))
-            .collect::<Vec<_>>();
-        let dents = dents.iter().any(Option::is_some).then(|| {
-            dents
-                .iter()
-                .map(|d| d.unwrap_or(0).to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        });
+        let body = body_damage(t);
         let (selected, active) = pit_services(st);
         insert(
             ctx.conn,
@@ -3155,7 +3368,7 @@ impl Stream {
                 ("aero_damage", copy(t, "aerodynamics_damage")),
                 ("suspension_damage", copy(t, "suspension_damage")),
                 ("parts_detached", copy(t, "parts_detached")),
-                ("dents", text_or_null(dents.as_deref())),
+                ("body_damage", text_or_null(body.as_deref())),
                 (
                     "last_impact_ago_s",
                     real(now.zip(impact).map(|(now, impact)| now - impact)),
@@ -3787,6 +4000,14 @@ fn add_rises(
     temperatures: &[[Option<f64>; 2]; 4],
     sample: &Sample,
 ) {
+    // Ignore the approach to the line, just as the distance trace does.
+    if build.top == 0.0
+        && sample
+            .lap_distance
+            .is_some_and(|d| d > layout.length * FIRST_DISTANCE)
+    {
+        return;
+    }
     let Some(section) = layout
         .corners
         .iter()
@@ -4468,7 +4689,7 @@ mod tests {
             ..Stream::default()
         };
         stream.find_braking_zones(&conn).unwrap();
-        assert!(stream.zones_from_invalid);
+        assert!(stream.zones_from_fallback);
         let fallback = stream.layout.as_ref().unwrap().corners[0].start;
         // Replaying the same invalid evidence doesn't regenerate/rewind the layout.
         stream.cars.insert(1, car(vec![invalid.clone()]));
@@ -4484,12 +4705,12 @@ mod tests {
             .cars
             .insert(1, car(vec![invalid, second_invalid, clean]));
         stream.find_braking_zones(&conn).unwrap();
-        assert!(!stream.zones_from_invalid);
+        assert!(!stream.zones_from_fallback);
         assert!(stream.layout.as_ref().unwrap().corners[0].start > fallback + 100.0);
         assert!(stream.cars.is_empty());
         // A clean-sourced layout stays stable after the rebuild.
         stream.find_braking_zones(&conn).unwrap();
-        assert!(!stream.zones_from_invalid);
+        assert!(!stream.zones_from_fallback);
     }
 
     #[test]
@@ -4607,6 +4828,711 @@ mod tests {
                 Place::Unknown => -1,
             })
             .collect()
+    }
+
+    /// A car at 60 m/s round a 2000 m lap, every 5 m from `from` m on: `laps` of (lap number, how
+    /// far it's driven to under it, when its timer started given a row's time and lap distance).
+    type DrivenLap<'a> = (i64, f64, &'a dyn Fn(f64, f64) -> Option<f64>);
+
+    fn driven(from: f64, laps: &[DrivenLap]) -> Vec<Sample> {
+        let mut samples = Vec::new();
+        let mut travelled = 0.0;
+        let mut d = from;
+        for (lap, end, start) in laps {
+            while d <= *end {
+                let t = travelled / 60.0;
+                let mut sample = partial(0.0)[0];
+                sample.id = samples.len() as i64 + 1;
+                sample.session_time = Some(t);
+                sample.lap = Some(*lap);
+                sample.lap_start = start(t, d % 2000.0);
+                sample.lap_distance = Some(d % 2000.0);
+                sample.fuel = Some(50.0 - travelled / 1000.0);
+                samples.push(sample);
+                travelled += 5.0;
+                d += 5.0;
+            }
+        }
+        samples
+    }
+
+    fn stream_with(turns: Vec<Turn>) -> (Connection, Stream) {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        let stream = Stream {
+            player: Some(1),
+            layout: Some(layout(turns, 2000.0, TRACK_DATA)),
+            ..Stream::default()
+        };
+        (conn, stream)
+    }
+
+    fn turn_at(apex: f64) -> Turn {
+        Turn {
+            label: format!("T{apex}"),
+            direction: None,
+            scale: None,
+            start: apex - 50.0,
+            apex,
+            end: apex + 50.0,
+        }
+    }
+
+    #[test]
+    fn rows_before_a_laps_timer_starts_arent_the_laps() {
+        // Out on track from 1400 m under lap 0's number before its timer starts at 1850 m: then
+        // round to the line, a whole lap, and into lap 1
+        let timer = 450.0 / 60.0;
+        let lap_1 = (450.0 + 150.0 + 2000.0) / 60.0;
+        let samples = driven(
+            1400.0,
+            &[
+                (0, 3995.0, &|t, _| (t >= timer).then_some(timer)),
+                (1, 4300.0, &|_, _| Some(lap_1)),
+            ],
+        );
+        let (conn, mut stream) = stream_with(vec![turn_at(1700.0)]);
+        // A row at a time, as the recording's followed
+        for sample in &samples {
+            stream.apply_telemetry(&conn, &[*sample]).unwrap();
+        }
+        let first_timed = samples
+            .iter()
+            .find(|sample| sample.lap_start.is_some())
+            .unwrap();
+
+        let lap = &stream.cars[&1].finished[0];
+        assert_eq!(lap.first_id, first_timed.id);
+        assert_eq!(lap.start, Some(timer));
+        assert_eq!(lap.fuel_start, first_timed.fuel);
+        assert!(
+            !lap.green,
+            "the run to the line isn't a representative pace lap"
+        );
+        let rows = samples
+            .iter()
+            .filter(|sample| (lap.first_id..=lap.last_id).contains(&sample.id))
+            .copied()
+            .collect::<Vec<_>>();
+        let trace = Trace::build(&rows, lap.start, lap.time, 2000.0);
+        assert!(trace.ok, "the full circuit still supplies corner geometry");
+        assert!((trace.time_at(0.0) - 600.0 / 60.0).abs() < 0.01);
+        assert!((trace.span(0.0, 100.0) - 100.0 / 60.0).abs() < 0.01);
+        assert!((trace.time_at(2000.0) - lap_1).abs() < 0.01);
+
+        // The turn passed before the timer started isn't the lap's pass of it: that one's left at
+        // its exit after 350 m, the lap's after 600 m to the line and 1750 m more
+        let passes = conn
+            .prepare(
+                "SELECT first_id, exited_at_s FROM corner_passes WHERE vehicle_id = 1 AND lap = 0",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(passes.len(), 1, "{passes:?}");
+        assert!(passes[0].0 >= first_timed.id, "{passes:?}");
+        assert!((passes[0].1 - 2350.0 / 60.0).abs() < 0.1, "{passes:?}");
+
+        // All of it in one go reads the same
+        let (conn, mut stream) = stream_with(vec![turn_at(1700.0)]);
+        stream.apply_telemetry(&conn, &samples).unwrap();
+        assert_eq!(stream.cars[&1].finished[0].first_id, first_timed.id);
+    }
+
+    #[test]
+    fn an_opening_lap_supplies_geometry_without_becoming_a_pace_reference() {
+        for timed_distance in [1700.0, 1850.0] {
+            let timer = (timed_distance - 1400.0) / 60.0;
+            let next = 2600.0 / 60.0;
+            let mut samples = driven(
+                1400.0,
+                &[
+                    (0, 3995.0, &|t, _| (t >= timer).then_some(timer)),
+                    (1, 4300.0, &|_, _| Some(next)),
+                ],
+            );
+            let (conn, mut stream) = stream_with(vec![]);
+            stream.layout = None;
+            conn.execute("INSERT INTO session (track_length) VALUES (2000)", [])
+                .unwrap();
+            for sample in &mut samples {
+                let d = sample.lap_distance.unwrap();
+                sample.brake = Some(if (100.0..200.0).contains(&d) {
+                    1.0
+                } else {
+                    0.0
+                });
+                sample.speed = Some(20.0 + (d - 250.0).abs().min(40.0));
+                conn.execute(
+                    "INSERT INTO telemetry (id, vehicle_id, is_player, session_time, lap, lap_start_time, lap_distance, in_pit_lane, lap_invalidated, speed, brake, throttle, gear) VALUES (?, 1, 1, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
+                    params![sample.id, sample.session_time, sample.lap, sample.lap_start,
+                        sample.lap_distance, sample.speed, sample.brake, sample.throttle, sample.gear],
+                ).unwrap();
+            }
+            stream.apply_telemetry(&conn, &samples).unwrap();
+            assert!(!stream.cars[&1].finished[0].green);
+            stream.find_braking_zones(&conn).unwrap();
+            let layout = stream.layout.unwrap();
+            assert_eq!(layout.source, "braking zones");
+            assert_eq!(layout.corners.len(), 1);
+            assert_eq!(layout.corners[0].apex, 250.0);
+        }
+    }
+
+    #[test]
+    fn an_opening_laps_braking_zones_give_way_to_a_green_laps() {
+        let timer = 450.0 / 60.0;
+        let mut samples = driven(
+            1400.0,
+            &[
+                (0, 3995.0, &|t, _| (t >= timer).then_some(timer)),
+                (1, 5995.0, &|_, _| Some(2600.0 / 60.0)),
+                (2, 6300.0, &|_, _| Some(4600.0 / 60.0)),
+            ],
+        );
+        let (conn, mut stream) = stream_with(vec![]);
+        stream.layout = None;
+        conn.execute("INSERT INTO session (track_length) VALUES (2000)", [])
+            .unwrap();
+        for sample in &mut samples {
+            let d = sample.lap_distance.unwrap();
+            // Lap 0 brakes for 250 m, lap 1 for 1050 m
+            let apex = if sample.lap == Some(0) { 250.0 } else { 1050.0 };
+            sample.brake = Some(if (apex - 150.0..apex - 50.0).contains(&d) {
+                1.0
+            } else {
+                0.0
+            });
+            sample.speed = Some(20.0 + (d - apex).abs().min(40.0));
+            conn.execute(
+                "INSERT INTO telemetry (id, vehicle_id, is_player, session_time, lap, lap_start_time, lap_distance, in_pit_lane, lap_invalidated, speed, brake, throttle, gear) VALUES (?, 1, 1, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
+                params![sample.id, sample.session_time, sample.lap, sample.lap_start,
+                    sample.lap_distance, sample.speed, sample.brake, sample.throttle, sample.gear],
+            ).unwrap();
+        }
+        // Lap 0 over: its zones are all there is
+        let lap_1 = samples.iter().position(|s| s.lap == Some(1)).unwrap();
+        stream
+            .apply_telemetry(&conn, &samples[..lap_1 + 10])
+            .unwrap();
+        stream.find_braking_zones(&conn).unwrap();
+        assert_eq!(stream.layout.as_ref().unwrap().corners[0].apex, 250.0);
+        assert!(stream.zones_from_fallback);
+        // Read again from the start, with lap 1 over too
+        stream.apply_telemetry(&conn, &samples).unwrap();
+        stream.find_braking_zones(&conn).unwrap();
+        let layout = stream.layout.as_ref().unwrap();
+        assert_eq!(layout.corners.len(), 1);
+        assert_eq!(layout.corners[0].apex, 1050.0);
+        assert!(!stream.zones_from_fallback);
+    }
+
+    #[test]
+    fn late_recorded_and_short_opening_approaches_keep_full_geometry() {
+        // From just over a second short of the line too
+        for (from, start) in [(1700.0, -10.0), (1950.0, -10.0), (1920.0, 0.0)] {
+            let next = (4000.0 - from) / 60.0;
+            let samples = driven(
+                from,
+                &[
+                    (0, 3995.0, &|_, _| Some(start)),
+                    (1, 4300.0, &|_, _| Some(next)),
+                ],
+            );
+            for chunk_size in [1, samples.len()] {
+                let (conn, mut stream) = stream_with(vec![turn_at(250.0), turn_at(1500.0)]);
+                stream.apply_telemetry(&conn, &samples[..1]).unwrap();
+                for chunk in samples[1..].chunks(chunk_size) {
+                    stream.apply_telemetry(&conn, chunk).unwrap();
+                }
+                let lap = &stream.cars[&1].finished[0];
+                assert!(!lap.green, "approach from {from}, start {start}");
+                let trace = Trace::build(
+                    &samples[..lap.last_id as usize],
+                    lap.start,
+                    lap.time,
+                    2000.0,
+                );
+                assert!(trace.ok);
+                let crossing = (2000.0 - from) / 60.0;
+                assert!((trace.time_at(0.0) - crossing).abs() < 0.01);
+                let entered: f64 = conn
+                    .query_row(
+                        "SELECT entered_at_s FROM corner_passes WHERE lap = 0 AND turn_index = 0",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!((entered - crossing).abs() < 0.01);
+            }
+        }
+    }
+
+    #[test]
+    fn a_late_start_preserves_timed_temperature_rises_across_chunks() {
+        let start = 300.0 / 60.0;
+        let samples = driven(
+            1400.0,
+            &[(0, 4005.0, &|t, _| (t >= 1100.0 / 60.0).then_some(start))],
+        );
+        for with_prestart in [true, false] {
+            let samples = samples
+                .iter()
+                .filter(|s| with_prestart || s.session_time.unwrap() >= start)
+                .copied()
+                .map(|mut s| {
+                    if !with_prestart {
+                        s.session_time = s.session_time.map(|t| t - start);
+                        s.lap_start = s.lap_start.map(|t| t - start);
+                    }
+                    s
+                })
+                .collect::<Vec<_>>();
+            for chunk_size in [1, 37, samples.len()] {
+                let (conn, mut stream) = stream_with(vec![turn_at(250.0), turn_at(1500.0)]);
+                for sample in &samples {
+                    conn.execute(
+                        "INSERT INTO telemetry (id, vehicle_id) VALUES (?, 1)",
+                        [sample.id],
+                    )
+                    .unwrap();
+                    let t = sample.session_time.unwrap() + if with_prestart { 0.0 } else { start };
+                    // Pre-start heat must be discarded. The timed rise happens before the start
+                    // is reported, then cools before the reporting row: endpoints alone lose it.
+                    let brake = if t < start {
+                        900.0
+                    } else if t < 800.0 / 60.0 {
+                        100.0
+                    } else if t < 900.0 / 60.0 {
+                        300.0
+                    } else {
+                        200.0
+                    };
+                    conn.execute(
+                        "INSERT INTO telemetry_wheel (telemetry_id, wheel, brake_temperature) VALUES (?, 0, ?)",
+                        params![sample.id, brake],
+                    ).unwrap();
+                }
+                for chunk in samples.chunks(chunk_size) {
+                    stream.apply_telemetry(&conn, chunk).unwrap();
+                }
+                let (rise, end): (f64, f64) = conn.query_row(
+                    "SELECT brake_rise_c, brake_end_c FROM corner_pass_wheels WHERE vehicle_id = 1 AND lap = 0 AND wheel = 0 AND turn_index = 0",
+                    [], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).unwrap();
+                assert_eq!((rise, end), (200.0, 200.0), "chunk size {chunk_size}");
+                let later_rise: f64 = conn.query_row(
+                    "SELECT brake_rise_c FROM corner_pass_wheels WHERE vehicle_id = 1 AND lap = 0 AND wheel = 0 AND turn_index = 1",
+                    [], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(later_rise, 0.0, "heat belongs to the first section");
+            }
+        }
+    }
+
+    #[test]
+    fn a_timer_started_just_past_the_line_still_finds_a_second_circuit() {
+        // Lap 0's timer starts 50 m past the line, and its number holds for another circuit
+        let samples = driven(
+            50.0,
+            &[
+                (0, 3995.0, &|_, _| Some(0.0)),
+                (1, 4300.0, &|_, _| Some(3950.0 / 60.0)),
+            ],
+        );
+        for chunk_size in [1, samples.len()] {
+            let (conn, mut stream) = stream_with(vec![turn_at(500.0)]);
+            for chunk in samples.chunks(chunk_size) {
+                stream.apply_telemetry(&conn, chunk).unwrap();
+            }
+            let lap = &stream.cars[&1].finished[0];
+            assert!(!lap.green, "two circuits aren't a pace lap");
+            let trace = Trace::build(
+                &samples[..lap.last_id as usize],
+                lap.start,
+                lap.time,
+                2000.0,
+            );
+            assert!(trace.ok);
+            assert!((trace.time_at(0.0) - 1950.0 / 60.0).abs() < 0.01);
+            let entered: Vec<f64> = conn
+                .prepare("SELECT entered_at_s FROM corner_passes WHERE lap = 0")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(entered.len(), 1, "chunk size {chunk_size}");
+            assert!((entered[0] - 1950.0 / 60.0).abs() < 0.01, "{entered:?}");
+        }
+    }
+
+    #[test]
+    fn a_stale_first_row_in_a_sparse_recording_is_still_an_ordinary_lap() {
+        let dense = driven(
+            0.0,
+            &[
+                (0, 1995.0, &|_, _| Some(0.0)),
+                (1, 3995.0, &|_, _| Some(2000.0 / 60.0)),
+                (2, 4300.0, &|_, _| Some(4000.0 / 60.0)),
+            ],
+        );
+        // Every half second, and lap 1's first row still has lap 0's distance
+        let mut samples = dense
+            .iter()
+            .filter(|sample| sample.lap != Some(1) || (sample.id - 401) % 6 == 0)
+            .copied()
+            .collect::<Vec<_>>();
+        let first = samples.iter().position(|s| s.lap == Some(1)).unwrap();
+        samples[first].lap_distance = Some(1995.0);
+        let (conn, mut stream) = stream_with(vec![turn_at(500.0)]);
+        stream.apply_telemetry(&conn, &samples).unwrap();
+        let lap = &stream.cars[&1].finished[1];
+        assert_eq!(lap.lap, 1);
+        assert!(lap.green);
+    }
+
+    #[test]
+    fn several_stale_first_rows_are_still_an_ordinary_lap() {
+        let dense = driven(
+            0.0,
+            &[
+                (0, 1995.0, &|_, _| Some(0.0)),
+                (1, 3995.0, &|_, _| Some(2000.0 / 60.0)),
+                (2, 4300.0, &|_, _| Some(4000.0 / 60.0)),
+            ],
+        );
+        // Lap 1's first half second still has lap 0's distance, advancing
+        let mut samples = dense.clone();
+        for (k, sample) in samples
+            .iter_mut()
+            .filter(|s| s.lap == Some(1))
+            .take(6)
+            .enumerate()
+        {
+            sample.lap_distance = Some(1970.0 + 5.0 * k as f64);
+        }
+        for chunk_size in [1, samples.len()] {
+            let (conn, mut stream) = stream_with(vec![turn_at(500.0)]);
+            for chunk in samples.chunks(chunk_size) {
+                stream.apply_telemetry(&conn, chunk).unwrap();
+            }
+            let lap = &stream.cars[&1].finished[1];
+            assert_eq!(lap.lap, 1);
+            assert!(lap.green, "chunk size {chunk_size}");
+            let rows = samples
+                .iter()
+                .filter(|s| (lap.first_id..=lap.last_id).contains(&s.id))
+                .copied()
+                .collect::<Vec<_>>();
+            let trace = Trace::build(&rows, lap.start, lap.time, 2000.0);
+            assert_eq!(trace.time_at(0.0), 2000.0 / 60.0);
+        }
+    }
+
+    #[test]
+    fn a_stale_row_after_the_first_is_still_an_ordinary_lap() {
+        let mut samples = driven(
+            0.0,
+            &[
+                (0, 1995.0, &|_, _| Some(0.0)),
+                (1, 3995.0, &|_, _| Some(2000.0 / 60.0)),
+                (2, 4300.0, &|_, _| Some(4000.0 / 60.0)),
+            ],
+        );
+        let second = samples.iter().position(|s| s.lap == Some(1)).unwrap() + 1;
+        samples[second].lap_distance = Some(1995.0);
+        for chunk_size in [1, samples.len()] {
+            let (conn, mut stream) = stream_with(vec![turn_at(500.0)]);
+            for chunk in samples.chunks(chunk_size) {
+                stream.apply_telemetry(&conn, chunk).unwrap();
+            }
+            let lap = &stream.cars[&1].finished[1];
+            assert_eq!(lap.lap, 1);
+            assert!(lap.green, "chunk size {chunk_size}");
+        }
+    }
+
+    #[test]
+    fn a_gap_across_the_line_is_judged_by_the_tracks_length() {
+        // Timer from 50 m, nothing recorded from 1995 m to 100 m of the next circuit: 100 m is
+        // within 5 per cent of the track, not of the furthest row
+        let samples = driven(
+            50.0,
+            &[
+                (0, 3995.0, &|_, _| Some(0.0)),
+                (1, 4300.0, &|_, _| Some(3950.0 / 60.0)),
+            ],
+        )
+        .into_iter()
+        .filter(|s| !(1945.0..2050.0).contains(&(s.session_time.unwrap() * 60.0)))
+        .collect::<Vec<_>>();
+        for with_layout in [true, false] {
+            let (conn, mut stream) = stream_with(vec![turn_at(500.0)]);
+            if !with_layout {
+                stream.layout = None;
+                conn.execute("INSERT INTO session (track_length) VALUES (2000)", [])
+                    .unwrap();
+            }
+            stream.apply_telemetry(&conn, &samples).unwrap();
+            let lap = &stream.cars[&1].finished[0];
+            assert!(!lap.green, "with layout {with_layout}");
+        }
+    }
+
+    #[test]
+    fn a_stale_first_row_doesnt_hide_a_second_circuit() {
+        // Lap 0's timer starts at the line, its first row has the old lap's distance, and its
+        // number holds for two circuits
+        let mut samples = driven(
+            0.0,
+            &[
+                (0, 3995.0, &|_, _| Some(0.0)),
+                (1, 4300.0, &|_, _| Some(4000.0 / 60.0)),
+            ],
+        );
+        samples[0].lap_distance = Some(1995.0);
+        for chunk_size in [1, samples.len()] {
+            let (conn, mut stream) = stream_with(vec![turn_at(500.0)]);
+            for chunk in samples.chunks(chunk_size) {
+                stream.apply_telemetry(&conn, chunk).unwrap();
+            }
+            let lap = &stream.cars[&1].finished[0];
+            assert!(!lap.green, "two circuits aren't a pace lap");
+            let entered: Vec<f64> = conn
+                .prepare("SELECT entered_at_s FROM corner_passes WHERE lap = 0")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(entered.len(), 1, "chunk size {chunk_size}");
+            assert!((entered[0] - 2000.0 / 60.0).abs() < 0.01, "{entered:?}");
+        }
+    }
+
+    #[test]
+    fn a_crossing_at_a_rows_time_keeps_the_rise_after_it() {
+        // The run to the line ends exactly at the row at 0 m: the rise from it to the next row
+        // is the circuit's
+        let samples = driven(
+            1850.0,
+            &[
+                (0, 3995.0, &|_, _| Some(0.0)),
+                (1, 4300.0, &|_, _| Some(2150.0 / 60.0)),
+            ],
+        );
+        let at_line = samples
+            .iter()
+            .position(|s| s.lap_distance == Some(0.0))
+            .unwrap();
+        for chunk_size in [1, samples.len()] {
+            let (conn, mut stream) = stream_with(vec![turn_at(250.0)]);
+            for (k, sample) in samples.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO telemetry (id, vehicle_id) VALUES (?, 1)",
+                    [sample.id],
+                )
+                .unwrap();
+                let brake = if k <= at_line { 100.0 } else { 120.0 };
+                conn.execute(
+                    "INSERT INTO telemetry_wheel (telemetry_id, wheel, brake_temperature) VALUES (?, 0, ?)",
+                    params![sample.id, brake],
+                )
+                .unwrap();
+            }
+            for chunk in samples.chunks(chunk_size) {
+                stream.apply_telemetry(&conn, chunk).unwrap();
+            }
+            let rise: f64 = conn
+                .query_row(
+                    "SELECT brake_rise_c FROM corner_pass_wheels WHERE lap = 0 AND wheel = 0 AND turn_index = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rise, 20.0, "chunk size {chunk_size}");
+        }
+    }
+
+    #[test]
+    fn a_first_row_without_a_time_doesnt_keep_the_rows_before_the_start() {
+        let timer = 450.0 / 60.0;
+        let mut samples = driven(
+            1400.0,
+            &[
+                (0, 3995.0, &|t, _| (t >= timer).then_some(timer)),
+                (1, 4300.0, &|_, _| Some(2600.0 / 60.0)),
+            ],
+        );
+        samples[0].session_time = None;
+        let (conn, mut stream) = stream_with(vec![turn_at(1700.0)]);
+        stream.apply_telemetry(&conn, &samples).unwrap();
+        let first_timed = samples.iter().find(|s| s.lap_start.is_some()).unwrap();
+        let lap = &stream.cars[&1].finished[0];
+        assert_eq!(lap.first_id, first_timed.id);
+        assert_eq!(lap.fuel_start, first_timed.fuel);
+    }
+
+    #[test]
+    fn a_sparse_opening_lap_is_found_without_a_row_at_its_end() {
+        // Once a second (60 m), starting a moment after the timer, and never in the lap's last
+        // 2 per cent: 1955 m is the furthest row of the circuit
+        let timer = 440.0 / 60.0;
+        let samples = driven(
+            1400.0,
+            &[
+                (0, 3995.0, &|t, _| (t >= timer).then_some(timer)),
+                (1, 4300.0, &|_, _| Some(2600.0 / 60.0)),
+            ],
+        )
+        .into_iter()
+        .filter(|sample| (sample.id - 1) % 12 == 7)
+        .collect::<Vec<_>>();
+        for chunk_size in [1, samples.len()] {
+            let (conn, mut stream) = stream_with(vec![turn_at(500.0)]);
+            for chunk in samples.chunks(chunk_size) {
+                stream.apply_telemetry(&conn, chunk).unwrap();
+            }
+            let lap = &stream.cars[&1].finished[0];
+            assert!(!lap.green);
+            let rows = samples
+                .iter()
+                .filter(|s| (lap.first_id..=lap.last_id).contains(&s.id))
+                .copied()
+                .collect::<Vec<_>>();
+            let trace = Trace::build(&rows, lap.start, lap.time, 2000.0);
+            assert!((trace.time_at(0.0) - 600.0 / 60.0).abs() < 0.01);
+            let entered: f64 = conn
+                .query_row(
+                    "SELECT entered_at_s FROM corner_passes WHERE lap = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                (entered - 600.0 / 60.0).abs() < 0.01,
+                "chunk size {chunk_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_without_a_distance_doesnt_hide_the_circuit_from_the_live_lap() {
+        // Recorded from 1700 m of a lap whose timer started earlier: the run to the line is
+        // believable, so the circuit only shows once it's past 1800 m; that row of it has no
+        // distance
+        let mut samples = driven(1700.0, &[(0, 3995.0, &|_, _| Some(-10.0))]);
+        let missing = samples
+            .iter()
+            .position(|s| s.session_time.unwrap() > 10.0 && s.lap_distance == Some(1800.0))
+            .unwrap();
+        samples[missing].lap_distance = None;
+        for chunk_size in [1, samples.len()] {
+            let (conn, mut stream) = stream_with(vec![turn_at(250.0)]);
+            for chunk in samples.chunks(chunk_size) {
+                stream.apply_telemetry(&conn, chunk).unwrap();
+            }
+            // The lap's still under way
+            let entered: Vec<f64> = conn
+                .prepare("SELECT entered_at_s FROM corner_passes WHERE lap = 0")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(entered.len(), 1, "chunk size {chunk_size}");
+            assert!((entered[0] - 300.0 / 60.0).abs() < 0.01, "{entered:?}");
+        }
+    }
+
+    #[test]
+    fn a_lap_seen_from_mid_lap_keeps_its_passes_when_its_distance_wraps_first() {
+        // Out of the pits at 200 m with the timer starting, the distance wraps before the number
+        let samples = driven(
+            200.0,
+            &[
+                (0, 2005.0, &|_, _| Some(0.0)),
+                (1, 2300.0, &|_, _| Some(1800.0 / 60.0)),
+            ],
+        );
+        for chunk_size in [1, samples.len()] {
+            let (conn, mut stream) = stream_with(vec![turn_at(1500.0)]);
+            for chunk in samples.chunks(chunk_size) {
+                stream.apply_telemetry(&conn, chunk).unwrap();
+            }
+            let passes: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM corner_passes WHERE vehicle_id = 1 AND lap = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(passes, 1, "chunk size {chunk_size}");
+        }
+    }
+
+    #[test]
+    fn a_lap_start_told_late_keeps_the_rows_since_it() {
+        // The timer ran from the line, but the first rows didn't say so
+        let samples = driven(
+            0.0,
+            &[
+                (0, 1995.0, &|_, d| (d >= 20.0).then_some(0.0)),
+                (1, 2300.0, &|_, _| Some(2000.0 / 60.0)),
+            ],
+        );
+        let (conn, mut stream) = stream_with(vec![turn_at(500.0)]);
+        stream.apply_telemetry(&conn, &samples).unwrap();
+        let lap = &stream.cars[&1].finished[0];
+        assert_eq!(lap.first_id, 1);
+        assert!(lap.green);
+    }
+
+    #[test]
+    fn a_midway_join_keeps_passes_when_distance_wraps_before_the_counter() {
+        let samples = driven(
+            700.0,
+            &[
+                (0, 2005.0, &|_, _| Some(-700.0 / 60.0)),
+                (1, 2300.0, &|_, _| Some(1300.0 / 60.0)),
+            ],
+        );
+        for chunk_size in [1, samples.len()] {
+            let (conn, mut stream) = stream_with(vec![turn_at(500.0), turn_at(1500.0)]);
+            for chunk in samples.chunks(chunk_size) {
+                stream.apply_telemetry(&conn, chunk).unwrap();
+            }
+            let lap = &stream.cars[&1].finished[0];
+            assert!(!lap.green);
+            let (passes, imprecise): (i64, i64) = conn.query_row(
+                "SELECT COUNT(*), MIN(low_precision) FROM corner_passes WHERE vehicle_id = 1 AND lap = 0 AND turn_index = 1",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!((passes, imprecise), (1, 1));
+        }
+    }
+
+    #[test]
+    fn a_lap_joined_midway_is_still_not_whole() {
+        // The timer ran from the line, but the car was only seen from 700 m
+        let samples = driven(
+            700.0,
+            &[
+                (0, 1995.0, &|_, _| Some(-700.0 / 60.0)),
+                (1, 2300.0, &|_, _| Some(1300.0 / 60.0)),
+            ],
+        );
+        let (conn, mut stream) = stream_with(vec![turn_at(500.0)]);
+        stream.apply_telemetry(&conn, &samples).unwrap();
+        let lap = &stream.cars[&1].finished[0];
+        assert_eq!(lap.first_id, 1);
+        assert!(!lap.green);
+        let rows = &samples[..lap.last_id as usize];
+        assert!(!Trace::build(rows, lap.start, lap.time, 2000.0).ok);
     }
 
     #[test]

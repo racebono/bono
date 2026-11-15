@@ -90,6 +90,14 @@ const BORROWED: &[Borrowed] = &[
         from_name: "iRacing",
         layout: "silverstone 2019 gp",
     },
+    // RaceRoom's Grand Prix layout: LMU's turns line up with its braking corners
+    Borrowed {
+        sim: "rrre",
+        track: "Autodromo Internacional do Algarve - Grand Prix",
+        from: "lmu",
+        from_name: "Le Mans Ultimate",
+        layout: "algarve international circuit",
+    },
 ];
 
 /// How much a borrowed layout's length may differ from the simulator's lap: more, and it's taken
@@ -813,29 +821,36 @@ mod tests {
         assert!(track.get("borrowed").is_none());
     }
 
-    /// Every borrowed layout is in the real data, as long as LMU's lap (from its results files).
+    /// Every borrowed layout is in the real data, as long as the simulator's lap (LMU's from its
+    /// results files).
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "downloads from GitHub"]
     async fn borrows_every_layout_from_the_real_data() {
-        let lmu_lengths = [
-            ("Circuit de Barcelona", 4655.1),
-            ("WeatherTech Raceway Laguna Seca", 3590.4),
-            ("Michelin Raceway Road Atlanta", 4083.5),
-            ("Silverstone Grand Prix Circuit - WEC", 5869.2),
-            ("Silverstone Grand Prix Circuit - ELMS", 5869.2),
+        let lengths = [
+            ("lmu", "Circuit de Barcelona", 4655.1),
+            ("lmu", "WeatherTech Raceway Laguna Seca", 3590.4),
+            ("lmu", "Michelin Raceway Road Atlanta", 4083.5),
+            ("lmu", "Silverstone Grand Prix Circuit - WEC", 5869.2),
+            ("lmu", "Silverstone Grand Prix Circuit - ELMS", 5869.2),
+            // RaceRoom's lap distance at the line
+            (
+                "rrre",
+                "Autodromo Internacional do Algarve - Grand Prix",
+                4628.3,
+            ),
         ];
-        assert_eq!(BORROWED.len(), lmu_lengths.len());
+        assert_eq!(BORROWED.len(), lengths.len());
 
         let prefs = tempfile::tempdir().unwrap();
         let mut manifest = Manifest::new(reqwest::Client::new(), prefs.path())
             .await
             .unwrap();
-        for (name, length) in lmu_lengths {
+        for (sim, name, length) in lengths {
             assert!(
-                manifest.track("lmu", name).await.unwrap().is_none(),
-                "LMU's data has {name} now: no need to borrow it"
+                manifest.track(sim, name).await.unwrap().is_none(),
+                "{sim}'s data has {name} now: no need to borrow it"
             );
-            let track = TrackData::new("lmu")
+            let track = TrackData::new(sim)
                 .get(&mut manifest, name, Some(length))
                 .await
                 .unwrap()

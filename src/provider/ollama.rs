@@ -70,6 +70,7 @@ pub async fn models(
         .map(|tag| ModelOption {
             name: tag.name,
             size: tag.size,
+            efforts: None,
         })
         .collect::<Vec<_>>();
     models.sort_by(|a, b| a.name.cmp(&b.name));
