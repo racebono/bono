@@ -197,8 +197,15 @@ type CacheKey = (ArrayStr<2>, PathBuf, u32, String);
 struct Running {
     db: PathBuf,
     settings: watch::Sender<(SpotterConfig, u32)>,
-    calls: mpsc::Receiver<Raised>,
+    calls: mpsc::Receiver<Heard>,
     stop: Arc<AtomicBool>,
+}
+
+/// What the thread sends, in order.
+enum Heard {
+    Call(Raised),
+    /// It's gone quiet (qualifying, with the spotter off for it): nothing from before is said
+    Muted,
 }
 
 impl Drop for Running {
@@ -275,17 +282,28 @@ impl Spotter {
 
         let lang = self.language(config, &settings, engineer);
         if self.running.is_some() {
-            while let Some(call) = self
+            while let Some(heard) = self
                 .running
                 .as_ref()
                 .and_then(|running| running.calls.try_recv().ok())
             {
-                self.hear(call, Instant::now());
+                self.heard(heard, Instant::now());
             }
             self.warm(rt, config, synth, lang);
         }
 
         self.say(rt, config, synth, speaker, engineer, lang);
+    }
+
+    fn heard(&mut self, heard: Heard, at: Instant) {
+        match heard {
+            Heard::Call(call) => self.hear(call, at),
+            // The calls waiting, and the one being said
+            Heard::Muted => {
+                self.queue.clear();
+                self.saying = None;
+            }
+        }
     }
 
     /// The speaker `which` is gone (unplugged): the call on it is dropped, so the spotter says the
@@ -591,7 +609,7 @@ impl Running {
 fn follow(
     db: &Path,
     settings: watch::Receiver<(SpotterConfig, u32)>,
-    calls: mpsc::Sender<Raised>,
+    calls: mpsc::Sender<Heard>,
     stop: &AtomicBool,
 ) {
     let conn = match open(db) {
@@ -605,6 +623,7 @@ fn follow(
     let mut logic = Logic::default();
     let mut last_id = None;
     let mut failing = false;
+    let mut muted = false;
     while !stop.load(Ordering::Relaxed) {
         let start = Instant::now();
         let (config, frequency) = settings.borrow().clone();
@@ -612,8 +631,8 @@ fn follow(
         match poll(&conn, &mut logic, &config, frequency, &mut last_id) {
             Ok(raised) => {
                 failing = false;
-                for call in raised {
-                    if calls.send(call).is_err() {
+                for heard in outgoing(raised, logic.muted, &mut muted) {
+                    if calls.send(heard).is_err() {
                         return;
                     }
                 }
@@ -629,6 +648,17 @@ fn follow(
         let period = Duration::from_secs_f64(config.poll_interval().clamp(0.005, 1.0));
         std::thread::sleep(period.saturating_sub(start.elapsed()));
     }
+}
+
+/// What a poll sends: its calls, then [`Heard::Muted`] if it's just gone quiet.
+fn outgoing(raised: Vec<Raised>, muted: bool, was_muted: &mut bool) -> Vec<Heard> {
+    let went_quiet = muted && !*was_muted;
+    *was_muted = muted;
+    let mut heard = raised.into_iter().map(Heard::Call).collect::<Vec<_>>();
+    if went_quiet {
+        heard.push(Heard::Muted);
+    }
+    heard
 }
 
 fn open(db: &Path) -> rusqlite::Result<Connection> {
@@ -1189,6 +1219,8 @@ struct Logic {
     prev_wet: usize,
     /// Forecast points already called: (session type, how far through it)
     forecast_called: HashSet<(String, u64)>,
+    /// Keeping quiet: qualifying, with the spotter off for it
+    muted: bool,
 }
 
 impl Default for Logic {
@@ -1209,6 +1241,7 @@ impl Default for Logic {
             last_patch_call: f64::NEG_INFINITY,
             prev_wet: 0,
             forecast_called: HashSet::new(),
+            muted: false,
         }
     }
 }
@@ -1268,9 +1301,13 @@ impl Logic {
         if !*config.qualifying()
             && scoring.is_some_and(|s| s.session_type.as_deref() == Some("qualifying"))
         {
-            *self = Logic::default();
+            *self = Logic {
+                muted: true,
+                ..Logic::default()
+            };
             return Vec::new();
         }
+        self.muted = false;
 
         let stopped = p.speed.unwrap_or(0.0) < *config.min_speed() || p.in_pit_lane;
         // On the formation lap cars weave and run side by side on purpose
@@ -2646,20 +2683,77 @@ mod tests {
         let mut config = SpotterConfig::default();
         config.qualifying.set(false);
         let mut logic = Logic::default();
-        let mut step = |config: &SpotterConfig, t: f64, scoring: &Scoring| {
+        let step = |logic: &mut Logic, config: &SpotterConfig, t: f64, scoring: &Scoring| {
             texts(logic.update(config, &player(t), &[], &Wheels::default(), Some(scoring)))
         };
 
-        assert!(step(&config, 0.0, &scoring).is_empty());
+        assert!(step(&mut logic, &config, 0.0, &scoring).is_empty());
         // The blue flag came while it was off: it isn't called once it's back on
         scoring.flag = Some("blue".into());
-        assert!(step(&config, 0.1, &scoring).is_empty());
+        assert!(step(&mut logic, &config, 0.1, &scoring).is_empty());
+        assert!(logic.muted);
         config.qualifying.set(true);
-        assert!(step(&config, 0.2, &scoring).is_empty());
+        assert!(step(&mut logic, &config, 0.2, &scoring).is_empty());
+        assert!(!logic.muted);
         scoring.flag = Some("green".into());
-        assert!(step(&config, 0.3, &scoring).is_empty());
+        assert!(step(&mut logic, &config, 0.3, &scoring).is_empty());
         scoring.flag = Some("blue".into());
-        assert_eq!(step(&config, 0.4, &scoring), ["blue flag"]);
+        assert_eq!(step(&mut logic, &config, 0.4, &scoring), ["blue flag"]);
+    }
+
+    #[test]
+    fn says_it_went_quiet_once_after_the_calls_before() {
+        let call = |text| Raised {
+            text,
+            urgent: true,
+            number: None,
+            session_time: 0.0,
+        };
+        let texts = |heard: Vec<Heard>| {
+            heard
+                .into_iter()
+                .map(|heard| match heard {
+                    Heard::Call(call) => call.text,
+                    Heard::Muted => "muted",
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut muted = false;
+        assert_eq!(
+            texts(outgoing(vec![call("car right")], false, &mut muted)),
+            ["car right"]
+        );
+        assert_eq!(texts(outgoing(Vec::new(), true, &mut muted)), ["muted"]);
+        assert!(texts(outgoing(Vec::new(), true, &mut muted)).is_empty());
+        // Back on, its calls go through: it says so again only once it next goes quiet
+        assert_eq!(
+            texts(outgoing(vec![call("car left")], false, &mut muted)),
+            ["car left"]
+        );
+        assert_eq!(texts(outgoing(Vec::new(), true, &mut muted)), ["muted"]);
+    }
+
+    #[test]
+    fn going_quiet_drops_the_calls_waiting_and_being_said() {
+        let at = Instant::now();
+        let call = |text| Raised {
+            text,
+            urgent: false,
+            number: None,
+            session_time: 0.0,
+        };
+        let (mut spotter, send) = pending_call("car right", true, at);
+        spotter.heard(Heard::Call(call("blue flag")), at);
+        assert_eq!(spotter.queue.len(), 1);
+
+        spotter.heard(Heard::Muted, at);
+        assert!(spotter.queue.is_empty());
+        assert!(spotter.saying.is_none());
+        assert!(send.is_closed());
+
+        // What comes after it's back on is said
+        spotter.heard(Heard::Call(call("rain starting")), at);
+        assert_eq!(spotter.queue.len(), 1);
     }
 
     /// Runs the logic at 30 Hz from `from` to `to` with the simulator reporting the cars
