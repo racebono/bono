@@ -595,9 +595,17 @@ mod tests {
             }
             // Driving, with room either side for the rates, every channel a number throughout
             let k = 30;
-            let samples: Vec<usize> = (k..n.saturating_sub(k))
+            let driving: Vec<usize> = (k..n.saturating_sub(k))
                 .filter(|&i| ibt.frame(i).bool("IsOnTrack") == Some(true) && at(i, "Speed") > 10.0)
                 .filter(|&i| broken[i + k + 1] == broken[i - k])
+                .collect();
+            // Gripping throughout: a car sliding or spinning turns without its track turning,
+            // against its steering, and its speed changes along its track, not its nose
+            let slip = |i: usize| at(i, "VelocityY").atan2(at(i, "VelocityX")).abs();
+            let samples: Vec<usize> = driving
+                .iter()
+                .copied()
+                .filter(|&i| [i - k, i, i + k].iter().all(|&j| slip(j) < 0.1))
                 .collect();
             if samples.len() < 600 {
                 continue;
@@ -638,10 +646,14 @@ mod tests {
             );
             let lateral = pairs(&|i| (at(i, "LatAccel"), at(i, "Speed") * at(i, "YawRate")));
             assert!(correlation(&lateral) > 0.8, "{name}: LatAccel isn't + left");
-            let slip = pairs(&|i| {
-                let slip = wrap(bearing(i) - at(i, "YawNorth"));
-                (at(i, "VelocityY").atan2(at(i, "VelocityX")), slip)
-            });
+            // Sliding included: it's the slip that's checked
+            let slip: Vec<_> = driving
+                .iter()
+                .map(|&i| {
+                    let slip = wrap(bearing(i) - at(i, "YawNorth"));
+                    (at(i, "VelocityY").atan2(at(i, "VelocityX")), slip)
+                })
+                .collect();
             assert!(correlation(&slip) < -0.7, "{name}: VelocityY isn't + left");
             let forward = samples
                 .iter()
