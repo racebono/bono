@@ -130,16 +130,19 @@ to the player: another car's row of those never gives the player's gap, and don'
 across rows. For how far a car is from the player, read that car's row of these three, each
 positive when it's ahead of the player, negative when behind, and 0 on the player's row:
 
-- `race_gap_to_player_s`: seconds in the race order. Races only. From the standings (as of each
-  car's last scoring row) when they have it; else, when the two are under a lap apart, how long ago
-  the one ahead in the race was where the other is now. NULL a lap or more apart, and when neither
-  is known.
+- `race_gap_to_player_s`: seconds in the race order. Races only. From the standings when both
+  cars' rows are from about the same moment and the same laps down on the leader; else, when the
+  two are under a lap apart, how long ago the one ahead in the race was where the other is now.
+  NULL when neither is known, a lap or more apart, and for a car out of the race, finished or in
+  its garage (or when the player is).
 - `race_laps_to_player`: whole laps of race distance between them (2: two laps up on the player;
-  0: under a lap apart). Races only; NULL without live telemetry.
+  0: under a lap apart, even if the standings count one more lap down on the leader). Races only;
+  NULL without live telemetry, and when the race gap is NULL for being out, finished or garaged.
 - `track_gap_to_player_s`: seconds on track, the nearest way round the lap, in any session and
   whatever the race order (a car lapping the player can be just behind): how long ago the one in
   front was where the other is now. Estimated from the distance at the follower's own pace when
-  the recording doesn't show it passing there. NULL without live telemetry, or with neither.
+  the recording doesn't show it driving through there, or it's stopped. NULL without live
+  telemetry, with neither, or with either car in its garage.
 
 For the next car in the player's class, take the car of the same `vehicle_class` one
 `class_position` ahead and give its `race_gap_to_player_s`. When that's NULL, a car laps ahead has
