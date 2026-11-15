@@ -205,8 +205,22 @@ impl Converter {
             .i32("SessionNum")
             .and_then(|num| info.session(num.into()));
         let race = current.and_then(|session| session.kind) == Some("race");
-        // Before a race's green the game gives no places: they're the grid's, qualifying's order
+        // Before a race's green the game gives no places: they're the grid's, qualifying's order,
+        // when it's the event's only race (heats and features start from grids of their own).
+        // All of them or none: the game's places aren't mixed with the grid's
+        let races = info
+            .sessions
+            .iter()
+            .filter(|s| s.kind == Some("race"))
+            .count();
+        let placed = info.cars().any(|(idx, _)| {
+            PerCar::new(frame, idx, player)
+                .i32("CarIdxPosition", "PlayerCarPosition")
+                .is_some_and(|p| p > 0)
+        });
         let gridded = race
+            && races == 1
+            && !placed
             && frame
                 .i32("SessionState")
                 .is_some_and(|state| (STATE_GET_IN_CAR..STATE_RACING).contains(&state));
@@ -1607,7 +1621,7 @@ mod tests {
     fn races_start_from_the_grid_and_untimed_cars_have_no_gaps() {
         use super::super::sdk::{Value, Vars};
         use super::super::session::{Driver, Session};
-        let info = SessionInfo {
+        let mut info = SessionInfo {
             track_length: Some(1000.0),
             player: Some(0),
             drivers: (0..3).map(|car| (car, Driver::default())).collect(),
@@ -1621,7 +1635,7 @@ mod tests {
             qualifying_class: HashMap::from([(2, 1), (0, 2), (1, 3)]),
             ..Default::default()
         };
-        let update = |state: i32, places: [i32; 3], behind: [f64; 3]| {
+        let update = |info: &SessionInfo, state: i32, places: [i32; 3], behind: [f64; 3]| {
             let (vars, data) = Vars::of(&[
                 ("SessionTime", Value::Double(10.0)),
                 ("SessionNum", Value::Int(0)),
@@ -1634,7 +1648,7 @@ mod tests {
                 ("CarIdxF2Time", Value::Doubles(behind.to_vec())),
             ]);
             Converter::default()
-                .convert(&Frame::new(&vars, &data), &info, Instant::now())
+                .convert(&Frame::new(&vars, &data), info, Instant::now())
                 .unwrap()
         };
         let standing = |update: &Update, car: i64| {
@@ -1659,23 +1673,39 @@ mod tests {
         };
 
         // On the parade laps: the grid, and nobody's timed but the leader
-        let parade = update(STATE_PARADE_LAPS, [0; 3], [0.0; 3]);
+        let parade = update(&info, STATE_PARADE_LAPS, [0; 3], [0.0; 3]);
         assert_eq!(standing(&parade, 2), (Some(1), Some(1), Some(0.0)));
         assert_eq!(standing(&parade, 0), (Some(2), Some(2), None));
         assert_eq!(standing(&parade, 1), (Some(3), Some(3), None));
         assert_eq!(ahead(&parade, 0), None);
 
         // Green, the game's places, but no lap timed yet: no gaps (not 0)
-        let green = update(STATE_RACING, [2, 3, 1], [0.0; 3]);
+        let green = update(&info, STATE_RACING, [2, 3, 1], [0.0; 3]);
         assert_eq!(standing(&green, 0), (Some(2), Some(2), None));
         assert_eq!((ahead(&green, 0), ahead(&green, 1)), (None, None));
         // Over the line
-        let timed = update(STATE_RACING, [2, 3, 1], [1.5, 3.0, 0.0]);
+        let timed = update(&info, STATE_RACING, [2, 3, 1], [1.5, 3.0, 0.0]);
         assert_eq!(standing(&timed, 0), (Some(2), Some(2), Some(1.5)));
         assert_eq!((ahead(&timed, 0), ahead(&timed, 1)), (Some(1.5), Some(1.5)));
         // After the green, a car without a place has none, not the grid's
-        let unplaced = update(STATE_RACING, [0, 3, 1], [1.5, 3.0, 0.0]);
+        let unplaced = update(&info, STATE_RACING, [0, 3, 1], [1.5, 3.0, 0.0]);
         assert_eq!(standing(&unplaced, 0).0, None);
+
+        // Heats then a feature: their grids aren't qualifying's, so no places before the green
+        info.sessions.push(Session {
+            num: 1,
+            kind: Some("race"),
+            number: 2,
+            results: HashMap::new(),
+        });
+        let heat = update(&info, STATE_PARADE_LAPS, [0; 3], [0.0; 3]);
+        assert_eq!(standing(&heat, 2), (None, None, None));
+        info.sessions.pop();
+
+        // The game placing a car already: its places only, none of the grid's beside them
+        let some = update(&info, STATE_PARADE_LAPS, [1, 0, 0], [0.0; 3]);
+        assert_eq!(standing(&some, 0).0, Some(1));
+        assert_eq!((standing(&some, 1).0, standing(&some, 2).0), (None, None));
     }
 
     #[test]

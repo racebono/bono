@@ -607,6 +607,16 @@ mod tests {
                 .copied()
                 .filter(|&i| [i - k, i, i + k].iter().all(|&j| slip(j) < 0.1))
                 .collect();
+            // Forward before anything goes by grip: a VelocityX the other way round would leave no
+            // sample gripping, and the file unchecked
+            if driving.len() >= 600 {
+                let forward = driving
+                    .iter()
+                    .map(|&i| at(i, "VelocityX") / at(i, "Speed"))
+                    .sum::<f64>()
+                    / driving.len() as f64;
+                assert!(forward > 0.95, "{name}: VelocityX isn't + forward");
+            }
             if samples.len() < 600 {
                 continue;
             }
@@ -655,12 +665,6 @@ mod tests {
                 })
                 .collect();
             assert!(correlation(&slip) < -0.7, "{name}: VelocityY isn't + left");
-            let forward = samples
-                .iter()
-                .map(|&i| at(i, "VelocityX") / at(i, "Speed"))
-                .sum::<f64>()
-                / samples.len() as f64;
-            assert!(forward > 0.95, "{name}: VelocityX isn't + forward");
             let longitudinal = pairs(&|i| (at(i, "LongAccel"), rate(i, "Speed")));
             assert!(
                 correlation(&longitudinal) > 0.9,

@@ -772,6 +772,8 @@ impl Scoring {
     }
 
     fn class_position(&self, r: &Row) -> Option<usize> {
+        // Unplaced, it has no place in its class either
+        r.i("position")?;
         let class = r.s("vehicle_class");
         self.order()
             .into_iter()
@@ -1170,7 +1172,14 @@ fn positions(
             )
         }
     };
-    let place = ids.iter().enumerate().map(|(i, v)| (*v, i + 1)).collect();
+    // A car the standings give no place has none, rather than one after every placed car
+    let placed = |v: &i64| !exact || sc.cars.get(v).is_some_and(|r| r.i("position").is_some());
+    let place = ids
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| placed(v))
+        .map(|(i, v)| (*v, i + 1))
+        .collect();
     Ok((ids, place, exact))
 }
 
@@ -2870,6 +2879,24 @@ mod tests {
         let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
         assert!(out.contains("| ~P"), "{out}");
         assert!(!out.contains("| P1/"), "{out}");
+    }
+
+    /// A player the standings give no place, while others have theirs, has none either: not one
+    /// after every placed car.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_player_without_a_place_has_none() {
+        let (dir, engineer) = race();
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute(
+            "UPDATE standings SET position = NULL WHERE is_player = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(out.contains("| P?/2 |"), "{out}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
