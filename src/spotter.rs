@@ -682,6 +682,8 @@ fn poll(
         return Ok(Vec::new());
     };
     if Some(car.id) == *last_id {
+        // Switched off for qualifying while no new rows come (the game paused): quiet all the same
+        logic.mute(config);
         return Ok(Vec::new());
     }
     *last_id = Some(car.id);
@@ -1219,6 +1221,8 @@ struct Logic {
     prev_wet: usize,
     /// Forecast points already called: (session type, how far through it)
     forecast_called: HashSet<(String, u64)>,
+    /// The newest update was in qualifying
+    qualifying: bool,
     /// Keeping quiet: qualifying, with the spotter off for it
     muted: bool,
 }
@@ -1241,6 +1245,7 @@ impl Default for Logic {
             last_patch_call: f64::NEG_INFINITY,
             prev_wet: 0,
             forecast_called: HashSet::new(),
+            qualifying: false,
             muted: false,
         }
     }
@@ -1268,6 +1273,21 @@ impl Calls {
 }
 
 impl Logic {
+    /// Keeps quiet if switched off for the qualifying session it's in. Nothing's followed then, so
+    /// it starts afresh (as in a new session) once it's on again, instead of calling what changed
+    /// while it was off. Whether it's quiet.
+    fn mute(&mut self, config: &SpotterConfig) -> bool {
+        self.muted = self.qualifying && !*config.qualifying();
+        if self.muted {
+            *self = Logic {
+                qualifying: true,
+                muted: true,
+                ..Logic::default()
+            };
+        }
+        self.muted
+    }
+
     /// The calls for the player's newest row, given the other cars at the same time.
     fn update(
         &mut self,
@@ -1296,18 +1316,10 @@ impl Logic {
             *self = Logic::default();
         }
 
-        // Switched off for qualifying: nothing's followed, so it starts afresh (as in a new
-        // session) once it's on again, instead of calling what changed while it was off
-        if !*config.qualifying()
-            && scoring.is_some_and(|s| s.session_type.as_deref() == Some("qualifying"))
-        {
-            *self = Logic {
-                muted: true,
-                ..Logic::default()
-            };
+        self.qualifying = scoring.is_some_and(|s| s.session_type.as_deref() == Some("qualifying"));
+        if self.mute(config) {
             return Vec::new();
         }
-        self.muted = false;
 
         let stopped = p.speed.unwrap_or(0.0) < *config.min_speed() || p.in_pit_lane;
         // On the formation lap cars weave and run side by side on purpose
@@ -2699,6 +2711,37 @@ mod tests {
         assert!(step(&mut logic, &config, 0.3, &scoring).is_empty());
         scoring.flag = Some("blue".into());
         assert_eq!(step(&mut logic, &config, 0.4, &scoring), ["blue flag"]);
+    }
+
+    #[test]
+    fn goes_quiet_when_switched_off_without_a_new_row() {
+        let qualifying = Scoring {
+            session_type: Some("qualifying".into()),
+            ..Scoring::default()
+        };
+        let mut config = SpotterConfig::default();
+        let mut logic = Logic::default();
+        logic.update(
+            &config,
+            &player(0.0),
+            &[],
+            &Wheels::default(),
+            Some(&qualifying),
+        );
+        assert!(!logic.mute(&config));
+
+        config.qualifying.set(false);
+        assert!(logic.mute(&config));
+        assert!(logic.prev.is_none());
+        config.qualifying.set(true);
+        assert!(!logic.mute(&config));
+
+        // Not in qualifying, it isn't quiet whatever the setting
+        let mut logic = Logic::default();
+        logic.update(&config, &player(0.0), &[], &Wheels::default(), None);
+        config.qualifying.set(false);
+        assert!(!logic.mute(&config));
+        assert!(logic.prev.is_some());
     }
 
     #[test]
