@@ -177,10 +177,12 @@ pub unsafe extern "C" fn bono_lmu_clear(recorder: *const LmuRecorder) {
 /// `recorder` must come from `bono_lmu_open`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bono_lmu_begin_session(recorder: *const LmuRecorder) {
-    let LmuRecorder(recorder, _, track_limits) = unsafe { &*recorder };
+    let LmuRecorder(recorder, _, track_limits, condition) = unsafe { &*recorder };
     guard((), || {
         // The session's rule, its scoring says again: until then, points are unknown
         track_limits.clear();
+        // The last session's damage isn't this one's: it's asked again once the player drives
+        condition.clear();
         recorder.begin_epoch(EpochReason::Session)
     })
 }
