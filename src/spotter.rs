@@ -1263,6 +1263,15 @@ impl Logic {
             *self = Logic::default();
         }
 
+        // Switched off for qualifying: nothing's followed, so it starts afresh (as in a new
+        // session) once it's on again, instead of calling what changed while it was off
+        if !*config.qualifying()
+            && scoring.is_some_and(|s| s.session_type.as_deref() == Some("qualifying"))
+        {
+            *self = Logic::default();
+            return Vec::new();
+        }
+
         let stopped = p.speed.unwrap_or(0.0) < *config.min_speed() || p.in_pit_lane;
         // On the formation lap cars weave and run side by side on purpose
         let formation_lap = scoring.is_some_and(|s| s.phase.as_deref() == Some("formation_lap"));
@@ -2592,6 +2601,65 @@ mod tests {
             );
             assert!(calls.is_empty());
         }
+    }
+
+    #[test]
+    fn stays_quiet_in_qualifying_only_when_switched_off_for_it() {
+        let qualifying = Scoring {
+            session_type: Some("qualifying".into()),
+            ..Scoring::default()
+        };
+        let race = Scoring {
+            session_type: Some("race".into()),
+            ..Scoring::default()
+        };
+        let mut off = SpotterConfig::default();
+        off.qualifying.set(false);
+        let run = |config: &SpotterConfig, scoring: &Scoring| {
+            let mut logic = Logic::default();
+            let mut calls = Vec::new();
+            for i in 0..30 {
+                calls.extend(texts(logic.update(
+                    config,
+                    &player(i as f64 / 30.0),
+                    &[other(2, 0.0, 3.0)],
+                    &Wheels::default(),
+                    Some(scoring),
+                )));
+            }
+            calls
+        };
+
+        assert!(*SpotterConfig::default().qualifying());
+        assert_eq!(run(&SpotterConfig::default(), &qualifying), ["car right"]);
+        assert!(run(&off, &qualifying).is_empty());
+        assert_eq!(run(&off, &race), ["car right"]);
+    }
+
+    #[test]
+    fn starts_afresh_when_qualifying_is_switched_back_on() {
+        let mut scoring = Scoring {
+            session_type: Some("qualifying".into()),
+            flag: Some("green".into()),
+            ..Scoring::default()
+        };
+        let mut config = SpotterConfig::default();
+        config.qualifying.set(false);
+        let mut logic = Logic::default();
+        let mut step = |config: &SpotterConfig, t: f64, scoring: &Scoring| {
+            texts(logic.update(config, &player(t), &[], &Wheels::default(), Some(scoring)))
+        };
+
+        assert!(step(&config, 0.0, &scoring).is_empty());
+        // The blue flag came while it was off: it isn't called once it's back on
+        scoring.flag = Some("blue".into());
+        assert!(step(&config, 0.1, &scoring).is_empty());
+        config.qualifying.set(true);
+        assert!(step(&config, 0.2, &scoring).is_empty());
+        scoring.flag = Some("green".into());
+        assert!(step(&config, 0.3, &scoring).is_empty());
+        scoring.flag = Some("blue".into());
+        assert_eq!(step(&config, 0.4, &scoring), ["blue flag"]);
     }
 
     /// Runs the logic at 30 Hz from `from` to `to` with the simulator reporting the cars

@@ -440,6 +440,16 @@
         "es": "Avisa por sí solo de los coches a tu lado, las banderas, las alertas del coche y el tiempo, en cuanto ocurren",
         "ca": "Avisa tot sol dels cotxes al teu costat, les banderes, les alertes del cotxe i el temps, tan bon punt passen"
     },
+    "spotter.qualifying": {
+        "en": "In qualifying",
+        "es": "En clasificación",
+        "ca": "A la classificació"
+    },
+    "spotter.qualifying_hover": {
+        "en": "Whether it calls in qualifying sessions too. Off, it stays quiet until the session ends",
+        "es": "Si también avisa en las sesiones de clasificación. Desactivado, calla hasta que acaba la sesión",
+        "ca": "Si també avisa a les sessions de classificació. Desactivat, calla fins que s'acaba la sessió"
+    },
     "spotter.pilots_language": {
         "en": "The pilot's",
         "es": "La del piloto",
