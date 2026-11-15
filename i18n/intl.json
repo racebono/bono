@@ -455,6 +455,16 @@
         "es": "El idioma de sus avisos: el del piloto es el último en el que preguntó al ingeniero. Los avisos se dicen en catalán, español, italiano o inglés; con las voces de otros idiomas, se dicen en inglés",
         "ca": "L'idioma dels seus avisos: el del pilot és l'últim en què va preguntar a l'enginyer. Els avisos es diuen en català, castellà, italià o anglès; amb les veus d'altres idiomes, es diuen en anglès"
     },
+    "spotter.qualifying_lap_times": {
+        "en": "Lap times in qualifying",
+        "es": "Tiempos de vuelta en clasificación",
+        "ca": "Temps de volta a la classificació"
+    },
+    "spotter.qualifying_lap_times_hover": {
+        "en": "Says the time of each of your laps in qualifying, once it's over. Laps invalidated, or through the pit lane, aren't called",
+        "es": "Dice el tiempo de cada una de tus vueltas en clasificación, en cuanto la acabas. No dice las vueltas invalidadas, ni las que pasan por el pit lane",
+        "ca": "Diu el temps de cadascuna de les teves voltes a la classificació, tan bon punt l'acabes. No diu les voltes invalidades, ni les que passen pel pit lane"
+    },
     "lang.en": {
         "en": "English",
         "es": "Inglés",
@@ -1099,6 +1109,12 @@
         "es": "probable lluvia en un minuto",
         "ca": "probable pluja d'aquí a un minut",
         "it": "pioggia probabile tra circa un minuto"
+    },
+    "call.lap_time": {
+        "en": "lap time {}",
+        "es": "tiempo de vuelta {}",
+        "ca": "temps de volta {}",
+        "it": "tempo sul giro {}"
     },
     "engineer.no_telemetry": {
         "en": "No telemetry yet, get in the car.",
