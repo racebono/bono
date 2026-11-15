@@ -752,8 +752,8 @@ impl Size {
 /// car's size (or none) with the first standing written for it.
 #[derive(Debug, Default)]
 struct Sizes {
-    /// The newest standing read
-    last_id: i64,
+    /// The newest standing read: (id, vehicle, session time), to tell it's still there
+    last: Option<(i64, Option<i64>, Option<f64>)>,
     /// Vehicle -> size; a vehicle missing has none
     sizes: HashMap<i64, Size>,
     /// The recording has the columns (recordings made before them don't)
@@ -762,8 +762,18 @@ struct Sizes {
 
 impl Sizes {
     /// Reads the standings written since the last call (only up to session time `upto`, when
-    /// replaying).
+    /// replaying). A recording cleared since (its rows deleted, their ids reused) is read again
+    /// from the start.
     fn update(&mut self, conn: &Connection, upto: Option<f64>) -> rusqlite::Result<()> {
+        if let Some((id, vehicle, time)) = self.last {
+            let still = conn
+                .prepare_cached("SELECT vehicle_id, session_time FROM standings WHERE id = ?1")?
+                .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+            if still != Some((vehicle, time)) {
+                *self = Sizes::default();
+            }
+        }
         if !self.recorded {
             self.recorded = conn
                 .prepare_cached(
@@ -780,14 +790,22 @@ impl Sizes {
             "SELECT id, vehicle_id, session_time, vehicle_width, vehicle_length FROM standings \
              WHERE id > ?1 ORDER BY id",
         )?;
-        let mut rows = statement.query([self.last_id])?;
+        let mut rows = statement.query([self.last.map_or(0, |(id, ..)| id)])?;
         while let Some(row) = rows.next()? {
+            let vehicle = row.get::<_, Option<i64>>(1)?;
             let time = row.get::<_, Option<f64>>(2)?;
-            if upto.zip(time).is_some_and(|(upto, time)| time > upto) {
-                break;
+            if let (Some(upto), Some(time)) = (upto, time) {
+                // Replaying, a standing whose clock went back starts the next session: it waits
+                // until the player's clock has gone back too
+                let read = self.last.and_then(|(.., read)| read);
+                let next_session = read.is_some_and(|read| time < read - 1.0);
+                let player_there = read.is_some_and(|read| upto < read - 1.0);
+                if time > upto || (next_session && !player_there) {
+                    break;
+                }
             }
-            self.last_id = row.get(0)?;
-            let Some(vehicle) = row.get::<_, Option<i64>>(1)? else {
+            self.last = Some((row.get(0)?, vehicle, time));
+            let Some(vehicle) = vehicle else {
                 continue;
             };
             match Size::plausible(row.get(3)?, row.get(4)?) {
@@ -1184,18 +1202,22 @@ struct Reach {
 
 impl Reach {
     fn new(config: &SpotterConfig, player: &Car, other: &Car) -> Self {
-        let (along, across) = match (player.size, other.size) {
-            (Some(mine), Some(theirs)) => (
-                (mine.length + theirs.length) / 2.0 - REFERENCE_LENGTH,
-                (mine.width + theirs.width) / 2.0 - REFERENCE_WIDTH,
-            ),
-            _ => (0.0, 0.0),
+        let configured = Self {
+            enter_along: *config.enter_along(),
+            exit_along: *config.exit_along(),
+            enter_across: *config.enter_across(),
+            exit_across: *config.exit_across(),
         };
+        let (Some(mine), Some(theirs)) = (player.size, other.size) else {
+            return configured;
+        };
+        let along = (mine.length + theirs.length) / 2.0 - REFERENCE_LENGTH;
+        let across = (mine.width + theirs.width) / 2.0 - REFERENCE_WIDTH;
         Self {
-            enter_along: (*config.enter_along() + along).max(0.0),
-            exit_along: (*config.exit_along() + along).max(0.0),
-            enter_across: (*config.enter_across() + across).max(0.0),
-            exit_across: (*config.exit_across() + across).max(0.0),
+            enter_along: configured.enter_along + along,
+            exit_along: configured.exit_along + along,
+            enter_across: configured.enter_across + across,
+            exit_across: configured.exit_across + across,
         }
     }
 }
@@ -2711,7 +2733,12 @@ mod tests {
         // 4.5 m ahead: within the reference cars' 4.8 m...
         let ahead = other(2, 4.5, 3.0);
         assert_eq!(
-            run(&mut Logic::default(), 0.0, 1.0, &[ahead.clone()]),
+            run(
+                &mut Logic::default(),
+                0.0,
+                1.0,
+                std::slice::from_ref(&ahead)
+            ),
             ["car right"]
         );
         // ...but past where two 3.8 m cars overlap
@@ -2728,11 +2755,25 @@ mod tests {
 
         // A 4.8 m car beside a 6 m one: they overlap up to 5.4 m apart
         let ahead = other(2, 5.2, 3.0);
-        assert!(run(&mut Logic::default(), 0.0, 1.0, &[ahead.clone()]).is_empty());
+        assert!(
+            run(
+                &mut Logic::default(),
+                0.0,
+                1.0,
+                std::slice::from_ref(&ahead)
+            )
+            .is_empty()
+        );
         let long = sized(ahead, size(2.0, 6.0));
         let mut logic = Logic::default();
         assert_eq!(
-            run_sized(&mut logic, 0.0, 1.0, size(2.0, 4.8), &[long.clone()]),
+            run_sized(
+                &mut logic,
+                0.0,
+                1.0,
+                size(2.0, 4.8),
+                std::slice::from_ref(&long)
+            ),
             ["car right"]
         );
         // And stop overlapping past 6.4 m (the way out moves with them)
@@ -2749,7 +2790,15 @@ mod tests {
         // Two wide cars still count 6 m to the side
         let wide = size(2.6, 4.8);
         let beside = other(2, 0.0, 6.0);
-        assert!(run(&mut Logic::default(), 0.0, 1.0, &[beside.clone()]).is_empty());
+        assert!(
+            run(
+                &mut Logic::default(),
+                0.0,
+                1.0,
+                std::slice::from_ref(&beside)
+            )
+            .is_empty()
+        );
         assert_eq!(
             run_sized(
                 &mut Logic::default(),
@@ -2768,7 +2817,13 @@ mod tests {
         let ahead = other(2, 4.5, 3.0);
         // Only the player's size, or only the other car's: as if neither were known
         assert_eq!(
-            run_sized(&mut Logic::default(), 0.0, 1.0, short, &[ahead.clone()]),
+            run_sized(
+                &mut Logic::default(),
+                0.0,
+                1.0,
+                short,
+                std::slice::from_ref(&ahead)
+            ),
             ["car right"]
         );
         assert_eq!(
@@ -2776,17 +2831,23 @@ mod tests {
             ["car right"]
         );
 
-        let config = SpotterConfig::default();
-        let reach = Reach::new(&config, &player(0.0).car, &other(2, 0.0, 0.0));
-        assert_eq!(
-            reach,
-            Reach {
-                enter_along: *config.enter_along(),
-                exit_along: *config.exit_along(),
-                enter_across: *config.enter_across(),
-                exit_across: *config.exit_across(),
-            }
-        );
+        // Whatever's configured, even distances that never let a car in
+        let config: SpotterConfig = serde_json::from_str(
+            r#"{"enter_along": -1.0, "exit_along": 0.5, "enter_across": 1.5, "exit_across": 9.0}"#,
+        )
+        .unwrap();
+        let configured = Reach {
+            enter_along: -1.0,
+            exit_along: 0.5,
+            enter_across: 1.5,
+            exit_across: 9.0,
+        };
+        let mut mine = player(0.0).car;
+        let theirs = other(2, 0.0, 0.0);
+        assert_eq!(Reach::new(&config, &mine, &theirs), configured);
+        mine.size = short;
+        assert_eq!(Reach::new(&config, &mine, &theirs), configured);
+        assert_eq!(Reach::new(&config, &theirs, &mine), configured);
     }
 
     #[test]
@@ -2865,6 +2926,42 @@ mod tests {
         replaying.update(&conn, Some(4.0)).unwrap();
         assert_eq!(size_of(&replaying, 2), size(1.9, 4.7));
         assert_eq!(size_of(&replaying, 3), None);
+
+        // The next session, its clock started again: not read before the player's is there too
+        conn.execute_batch(
+            "INSERT INTO standings VALUES (7, 2, 0.5, 2.0, 5.5), (8, 2, 2.5, 1.8, 4.2);",
+        )
+        .unwrap();
+        replaying.update(&conn, Some(5.0)).unwrap();
+        assert_eq!(size_of(&replaying, 2), size(1.9, 4.7));
+        replaying.update(&conn, Some(1.0)).unwrap();
+        assert_eq!(size_of(&replaying, 2), size(2.0, 5.5));
+        replaying.update(&conn, Some(3.0)).unwrap();
+        assert_eq!(size_of(&replaying, 2), size(1.8, 4.2));
+
+        // The recording cleared, its ids used again: read from the start (slot 3 has no standing
+        // yet, so no size)
+        sizes.update(&conn, None).unwrap();
+        assert_eq!(size_of(&sizes, 2), size(1.8, 4.2));
+        conn.execute_batch(
+            "DELETE FROM standings;
+             INSERT INTO standings VALUES (1, 2, 9.0, 2.0, 4.9), (2, 4, 9.0, 1.9, 4.6);",
+        )
+        .unwrap();
+        sizes.update(&conn, None).unwrap();
+        assert_eq!(size_of(&sizes, 2), size(2.0, 4.9));
+        assert_eq!(size_of(&sizes, 3), None);
+        assert_eq!(size_of(&sizes, 4), size(1.9, 4.6));
+        // Cleared and written past where it had read
+        conn.execute_batch(
+            "DELETE FROM standings;
+             INSERT INTO standings VALUES (1, 2, 12.0, 1.8, 4.3), (2, 3, 12.0, 1.8, 4.3),
+                 (3, 4, 12.0, 2.1, 5.1);",
+        )
+        .unwrap();
+        sizes.update(&conn, None).unwrap();
+        assert_eq!(size_of(&sizes, 2), size(1.8, 4.3));
+        assert_eq!(size_of(&sizes, 4), size(2.1, 5.1));
     }
 
     #[test]
