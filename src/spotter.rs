@@ -758,20 +758,39 @@ struct Sizes {
     sizes: HashMap<i64, Size>,
     /// The recording has the columns (recordings made before them don't)
     recorded: bool,
+    /// Replaying: the sessions (their clocks started again) the player's rows and the standings
+    /// read have gone through, and their latest clocks
+    replay: [(u32, Option<f64>); 2],
+}
+
+/// [`Sizes::replay`]'s, for the player's rows and for the standings.
+const PLAYER: usize = 0;
+const STANDINGS: usize = 1;
+
+/// Session `clock` belongs to, for a recording that's been through `sessions` up to `latest`: a
+/// clock gone back starts the next one.
+fn session_of((sessions, latest): (u32, Option<f64>), clock: f64) -> u32 {
+    sessions + u32::from(latest.is_some_and(|latest| clock < latest - 1.0))
 }
 
 impl Sizes {
-    /// Reads the standings written since the last call (only up to session time `upto`, when
-    /// replaying). A recording cleared since (its rows deleted, their ids reused) is read again
-    /// from the start.
+    /// Reads the standings written since the last call (only up to the player's session time
+    /// `upto`, in the same session, when replaying). A recording cleared since (its rows deleted,
+    /// their ids reused) is read again from the start.
     fn update(&mut self, conn: &Connection, upto: Option<f64>) -> rusqlite::Result<()> {
+        if let Some(upto) = upto {
+            self.replay[PLAYER] = (session_of(self.replay[PLAYER], upto), Some(upto));
+        }
         if let Some((id, vehicle, time)) = self.last {
             let still = conn
                 .prepare_cached("SELECT vehicle_id, session_time FROM standings WHERE id = ?1")?
                 .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
                 .optional()?;
             if still != Some((vehicle, time)) {
-                *self = Sizes::default();
+                *self = Sizes {
+                    replay: self.replay,
+                    ..Sizes::default()
+                };
             }
         }
         if !self.recorded {
@@ -795,14 +814,15 @@ impl Sizes {
             let vehicle = row.get::<_, Option<i64>>(1)?;
             let time = row.get::<_, Option<f64>>(2)?;
             if let (Some(upto), Some(time)) = (upto, time) {
-                // Replaying, a standing whose clock went back starts the next session: it waits
-                // until the player's clock has gone back too
-                let read = self.last.and_then(|(.., read)| read);
-                let next_session = read.is_some_and(|read| time < read - 1.0);
-                let player_there = read.is_some_and(|read| upto < read - 1.0);
-                if time > upto || (next_session && !player_there) {
+                // Replaying, a standing of a later session than the player's waits for the
+                // player's to start, and one of the player's session for its clock. Standings of
+                // an earlier session are behind: read at once
+                let session = session_of(self.replay[STANDINGS], time);
+                let player = self.replay[PLAYER].0;
+                if session > player || (session == player && time > upto) {
                     break;
                 }
+                self.replay[STANDINGS] = (session, Some(time));
             }
             self.last = Some((row.get(0)?, vehicle, time));
             let Some(vehicle) = vehicle else {
@@ -2938,6 +2958,13 @@ mod tests {
         assert_eq!(size_of(&replaying, 2), size(2.0, 5.5));
         replaying.update(&conn, Some(3.0)).unwrap();
         assert_eq!(size_of(&replaying, 2), size(1.8, 4.2));
+        // A third session, which the player's rows join at a later clock than its last standing
+        conn.execute("INSERT INTO standings VALUES (9, 5, 0.3, 2.0, 4.6)", [])
+            .unwrap();
+        replaying.update(&conn, Some(100.0)).unwrap();
+        assert_eq!(size_of(&replaying, 5), None);
+        replaying.update(&conn, Some(20.0)).unwrap();
+        assert_eq!(size_of(&replaying, 5), size(2.0, 4.6));
 
         // The recording cleared, its ids used again: read from the start (slot 3 has no standing
         // yet, so no size)
