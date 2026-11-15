@@ -1248,8 +1248,9 @@ impl Trail {
             return None;
         }
         let mut newer = (now, at);
-        // Seconds slower than a moving car, back to the last row at speed
-        let mut crawl = 0.0;
+        // Seconds and metres on (back counting against) since the last CRAWL's worth: slower than
+        // a moving car over one of those is a stop, however its distance jittered
+        let mut crawl = (0.0, 0.0);
         // A rival's rows can be newer than the player's: they say nothing of before now
         for &older in self.0.iter().rev().skip_while(|(t, _)| *t > now) {
             let dt = newer.0 - older.0;
@@ -1265,14 +1266,22 @@ impl Trail {
                 if length - step > TRAIL_JITTER {
                     return None;
                 }
-            } else if step > TRAIL_TELEPORT * dt {
+            } else if step > TRAIL_TELEPORT * dt + TRAIL_JITTER {
+                // Faster than any car, even with a short step before it put right
                 return None;
+            }
+            // A stop, not a row's short step (an estimated distance put right)
+            let on = if step > length / 2.0 {
+                step - length
             } else {
-                // A stop, not a row's short step (an estimated distance put right)
-                crawl = if step < MOVING * dt { crawl + dt } else { 0.0 };
-                if crawl >= CRAWL {
+                step
+            };
+            crawl = (crawl.0 + dt, crawl.1 + on);
+            if crawl.0 >= CRAWL {
+                if crawl.1 < MOVING * crawl.0 {
                     return None;
                 }
+                crawl = (0.0, 0.0);
             }
             if step > 0.0 && step <= length / 2.0 {
                 let into = (spot - older.1).rem_euclid(length);
@@ -5077,6 +5086,15 @@ mod tests {
         );
         assert_eq!(paused.since_at(540.0, 400.0, 250.0, 1000.0), None);
         assert!(close(paused.since_at(540.0, 400.0, 375.0, 1000.0), 1.25));
+        // Nor does its distance jittering back and forth while stopped hide the stop
+        let jittering = Trail(
+            [(497.5, 250.0), (500.0, 300.0)]
+                .into_iter()
+                .chain((1..=280).map(|i| (500.0 + f64::from(i) / 8.0, 300.0 + f64::from(i % 2))))
+                .chain([(537.5, 350.0), (540.0, 400.0)])
+                .collect(),
+        );
+        assert_eq!(jittering.since_at(540.0, 400.0, 250.0, 1000.0), None);
         // One row's short step, as an estimated distance put right, isn't a stop
         let corrected = Trail(
             [
@@ -5088,6 +5106,20 @@ mod tests {
             .into(),
         );
         assert!(close(corrected.since_at(100.3, 510.0, 501.0, 1000.0), 0.28));
+        // Nor is the long step after it, at 90 m/s, a tow
+        let flat_out = Trail(
+            [
+                (100.0, 500.0),
+                (100.1, 509.0),
+                (100.2, 509.2),
+                (100.3, 527.0),
+            ]
+            .into(),
+        );
+        assert!(close(
+            flat_out.since_at(100.3, 527.0, 505.0, 1000.0),
+            0.3 - 0.1 * 5.0 / 9.0
+        ));
         // Reset 100 m back: where it was before isn't where it drove to here
         let reset = Trail(
             [
