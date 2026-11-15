@@ -27,6 +27,9 @@ pub struct ModelOption {
     pub name: String,
     /// Its size on disk, in bytes, for one run on this PC (or another)
     pub size: Option<u64>,
+    /// The effort levels it takes, lowest first, when the provider says (OpenRouter's
+    /// `reasoning.supported_efforts`). `None`: not said, any may be tried
+    pub efforts: Option<Vec<String>>,
 }
 
 /// The models the provider `config` picks offers (for Ollama, the ones pulled at its host; for

@@ -39,6 +39,9 @@ pub async fn models(
     #[derive(Deserialize)]
     struct Entry {
         id: String,
+        /// OpenRouter's: read loosely, as other servers may use the name for something else
+        #[serde(default)]
+        reasoning: Option<serde_json::Value>,
     }
 
     let base_url = base_url_or_default(base_url);
@@ -60,12 +63,29 @@ pub async fn models(
         .data
         .into_iter()
         .map(|entry| ModelOption {
+            efforts: entry.reasoning.as_ref().and_then(supported_efforts),
             name: entry.id,
             size: None,
         })
         .collect::<Vec<_>>();
     models.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(models)
+}
+
+/// The levels a model's `reasoning` (OpenRouter's) says it takes, lowest first: its
+/// `supported_efforts`, highest first. `None` when it doesn't say (or null: any), or says it
+/// another way. Empty: none but the model's default.
+fn supported_efforts(reasoning: &serde_json::Value) -> Option<Vec<String>> {
+    let mut efforts = reasoning
+        .get("supported_efforts")?
+        .as_array()?
+        .iter()
+        // A null names no level to offer
+        .filter(|effort| !effort.is_null())
+        .map(|effort| effort.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    efforts.reverse();
+    Some(efforts)
 }
 
 /// A conversation with a model behind an OpenAI-compatible API.
@@ -249,7 +269,17 @@ impl Conversation {
             .await
             .with_context(|| t!("provider.openai_unreachable", url = self.base_url))?;
         if !resp.status().is_success() {
-            return Err(ApiError::read(resp).await.into());
+            let mut error = ApiError::read(resp).await;
+            // Which levels a model takes differs by model, even on one server. Only a guess: an
+            // invalid request may be so for other reasons, and the error's text isn't read, as no
+            // server promises its wording
+            if matches!(
+                error.status,
+                StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+            ) {
+                error.effort = self.body.reasoning_effort.clone();
+            }
+            return Err(error.into());
         }
 
         let mut response = Response::default();
@@ -483,6 +513,8 @@ impl Response {
 pub struct ApiError {
     pub status: StatusCode,
     pub message: Option<String>,
+    /// The `reasoning_effort` an invalid request (400, 422) was sent with: the model may not take it
+    pub effort: Option<String>,
 }
 
 impl ApiError {
@@ -506,7 +538,11 @@ impl ApiError {
             .or_else(|| {
                 Some(body).filter(|body| !body.trim().is_empty() && !body.trim().starts_with('<'))
             });
-        Self { status, message }
+        Self {
+            status,
+            message,
+            effort: None,
+        }
     }
 }
 
@@ -515,6 +551,13 @@ impl Display for ApiError {
         write!(f, "Model API error {}", self.status)?;
         if let Some(message) = &self.message {
             write!(f, ": {message}")?;
+        }
+        if let Some(effort) = &self.effort {
+            write!(
+                f,
+                " ({})",
+                t!("provider.openai_effort_rejected", effort = effort)
+            )?;
         }
         Ok(())
     }
@@ -571,9 +614,9 @@ impl ConversationBuilder {
         self
     }
 
-    /// `reasoning_effort`: `low`, `medium` or `high`, or `none` to not think at all (also turning
-    /// thinking off in the chat template of llama.cpp's thinking models). Left out when empty: the
-    /// model's default.
+    /// `reasoning_effort`, as the server names it (`low`, `medium`, `high`, `max`...: each model
+    /// takes its own), or `none` to not think at all (also turning thinking off in the chat
+    /// template of llama.cpp's thinking models). Left out when empty: the model's default.
     #[inline]
     pub fn effort(&mut self, effort: impl Into<String>) -> &mut Self {
         self.effort = effort.into();
@@ -1150,19 +1193,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn points_at_the_effort_when_a_request_is_rejected() {
+        let rejected = json!({"object": "error", "message": "reasoning_effort 'medium' is not supported for this model; supported values: ['low', 'high', 'max']", "type": "invalid_request_invalid_args", "code": "3051"}).to_string();
+        let (url, _) = mock(vec![(400, rejected.clone()), (400, rejected)]).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let mut medium = builder(&url, &calls);
+        medium.effort("medium");
+        let mut conversation = medium.build(reqwest::Client::new()).unwrap();
+        let error = send_streaming(&mut conversation, "Pit?").await.unwrap_err();
+        let error = error.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(error.effort.as_deref(), Some("medium"));
+        assert!(error.to_string().contains("\"medium\""), "{error}");
+
+        // Without one, there's none to point at
+        let mut conversation = builder(&url, &calls).build(reqwest::Client::new()).unwrap();
+        let error = send_streaming(&mut conversation, "Pit?").await.unwrap_err();
+        assert_eq!(error.downcast_ref::<ApiError>().unwrap().effort, None);
+    }
+
+    #[tokio::test]
     async fn lists_the_models() {
         let (url, requests) = mock(vec![(
             200,
-            json!({"object": "list", "data": [{"id": "qwen3.5-9b"}, {"id": "gemma-4"}]})
-                .to_string(),
+            json!({"object": "list", "data": [
+                {"id": "qwen3.5-9b"},
+                {"id": "gemma-4", "reasoning": {"mandatory": true, "supported_efforts": ["max", "high", "low"]}},
+                {"id": "glm-5", "reasoning": {"mandatory": false, "supported_efforts": null}},
+                {"id": "kimi", "reasoning": true},
+                {"id": "mixed", "reasoning": {"supported_efforts": ["high", 2]}},
+                {"id": "nulls", "reasoning": {"supported_efforts": ["high", null, "low"]}},
+                {"id": "empty", "reasoning": {"mandatory": true, "supported_efforts": []}},
+            ]})
+            .to_string(),
         )])
         .await;
         let models = models(Some(&url), Some("test"), &reqwest::Client::new())
             .await
             .unwrap();
         assert_eq!(
-            models.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
-            ["gemma-4", "qwen3.5-9b"]
+            models
+                .iter()
+                .map(|m| (m.name.as_str(), m.efforts.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("empty", Some(&[][..])),
+                (
+                    "gemma-4",
+                    Some(&["low".to_owned(), "high".to_owned(), "max".to_owned()][..])
+                ),
+                ("glm-5", None),
+                ("kimi", None),
+                ("mixed", None),
+                ("nulls", Some(&["low".to_owned(), "high".to_owned()][..])),
+                ("qwen3.5-9b", None),
+            ]
         );
         assert_eq!(requests.lock().unwrap()[0].0, "/v1/models");
     }
