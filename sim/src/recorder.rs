@@ -167,6 +167,12 @@ impl Recorder {
         vehicle_id == self.shared.player_id.load(Ordering::Relaxed)
     }
 
+    /// The car the player drives as of the last scoring update, `None` when no car is theirs.
+    #[inline]
+    pub fn player(&self) -> Option<i64> {
+        Some(self.shared.player_id.load(Ordering::Relaxed)).filter(|id| *id >= 0)
+    }
+
     /// Called for every telemetry update of every car, before converting it: moves the car on, and
     /// returns whether this update is recorded (opponents are kept at every Nth update). If it is,
     /// pass it to `push_telemetry` next.

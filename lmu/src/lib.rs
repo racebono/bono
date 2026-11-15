@@ -136,7 +136,7 @@ pub unsafe extern "C" fn bono_lmu_push_scoring(
     standings: *mut bono_standing,
     count: usize,
 ) {
-    let LmuRecorder(recorder, numbers, track_limits, _) = unsafe { &*recorder };
+    let LmuRecorder(recorder, numbers, track_limits, condition) = unsafe { &*recorder };
     let session = std::mem::take(unsafe { &mut *session });
     let standings = match count {
         0 => Vec::new(),
@@ -151,7 +151,8 @@ pub unsafe extern "C" fn bono_lmu_push_scoring(
         let mut standings = standings;
         numbers.fill(&mut standings);
         class_positions::fill(&mut standings);
-        recorder.push_scoring(session, standings)
+        recorder.push_scoring(session, standings);
+        condition.set_player(recorder.player());
     })
 }
 

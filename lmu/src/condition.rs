@@ -55,8 +55,12 @@ impl VehicleCondition {
     pub fn start() -> Self {
         // It's on this PC, and asked every second: anything slow means it isn't answering. Each step
         // has its own timeout, about 1.5 s in all, and finding localhost none: ureq may look a host up
-        // on a thread of its own when that has a timeout, and such a thread could outlive the DLL
+        // on a thread of its own when that has a timeout, and such a thread could outlive the DLL.
+        // Windows answers for localhost itself. No proxy from the environment and no redirects, so
+        // nothing else is looked up or asked
         let agent: ureq::Agent = ureq::Agent::config_builder()
+            .proxy(None)
+            .max_redirects(0)
             .timeout_connect(Some(Duration::from_millis(300)))
             .timeout_send_request(Some(Duration::from_millis(200)))
             .timeout_recv_response(Some(Duration::from_millis(500)))
@@ -84,6 +88,17 @@ impl VehicleCondition {
         state.forget();
         state.driving = None;
         state.vehicle = None;
+    }
+
+    /// Takes the player's car from a scoring update (`None`: no car is theirs). Another car, or none,
+    /// drops the last answer and stops asking until the player drives.
+    pub fn set_player(&self, vehicle: Option<i64>) {
+        let mut state = lock(&self.shared.state);
+        if state.vehicle != vehicle {
+            state.forget();
+            state.driving = None;
+            state.vehicle = vehicle;
+        }
     }
 
     /// Fills in the player's aero and suspension damage, when the web API answered recently.
@@ -295,6 +310,19 @@ mod tests {
         let condition = answered(parse(BODY).unwrap(), now);
         assert_eq!(damage_of(&condition, 2, true, now), (None, None));
         assert_eq!(damage_of(&condition, 1, true, now), (None, None));
+    }
+
+    #[test]
+    fn changing_the_player_drops_the_answer_and_stops_asking() {
+        let condition = answered(parse(BODY).unwrap(), Instant::now());
+        condition.set_player(Some(1));
+        assert!(lock(&condition.shared.state).answer.is_some());
+        lock(&condition.shared.state).driving = Some(Instant::now());
+        // Spectating, then back in the same car: the answer may have been about another one
+        condition.set_player(None);
+        condition.set_player(Some(1));
+        let state = lock(&condition.shared.state);
+        assert!(state.answer.is_none() && state.driving.is_none());
     }
 
     #[test]

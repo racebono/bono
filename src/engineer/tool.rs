@@ -473,13 +473,14 @@ const DAMAGE_PARTS: [(&str, &str); 4] = [
     ("suspension_damage", "suspension"),
 ];
 
-/// "engine 12%, aero 30%": the parts damaged more than `above` (0-1).
+/// "engine 12%, aero 30%": the parts damaged more than `above` (0-1), leaving out any that would
+/// read 0%.
 fn damage_parts(p: &Row, above: f64) -> String {
     DAMAGE_PARTS
         .iter()
         .filter_map(|(key, name)| {
-            let v = p.f(key).filter(|v| *v > above)?;
-            Some(format!("{name} {:.0}%", v * 100.0))
+            let pct = p.f(key).filter(|v| *v > above)? * 100.0;
+            (pct.round() >= 1.0).then(|| format!("{name} {pct:.0}%"))
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -2365,6 +2366,19 @@ mod tests {
             incident_line(Some(4.0), Some(0.0)).as_deref(),
             Some("incident points 4")
         );
+    }
+
+    #[test]
+    fn damage_too_small_to_read_as_a_percent_is_left_out() {
+        let conn = Connection::open_in_memory().unwrap();
+        let p = row(
+            &conn,
+            "SELECT 0.003 AS aerodynamics_damage, 0.3 AS suspension_damage, 0.0 AS engine_damage",
+            [],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(damage_parts(&p, 0.0), "suspension 30%");
     }
 
     #[test]
