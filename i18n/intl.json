@@ -465,6 +465,16 @@
         "es": "El idioma de sus avisos: el del piloto es el último en el que preguntó al ingeniero. Los avisos se dicen en catalán, español, italiano o inglés; con las voces de otros idiomas, se dicen en inglés",
         "ca": "L'idioma dels seus avisos: el del pilot és l'últim en què va preguntar a l'enginyer. Els avisos es diuen en català, castellà, italià o anglès; amb les veus d'altres idiomes, es diuen en anglès"
     },
+    "spotter.qualifying_lap_times": {
+        "en": "Lap times in qualifying",
+        "es": "Tiempos de vuelta en clasificación",
+        "ca": "Temps de volta a la classificació"
+    },
+    "spotter.qualifying_lap_times_hover": {
+        "en": "Says the time of each of your laps in qualifying, once it's over. Laps invalidated, or through the pit lane, aren't called",
+        "es": "Dice el tiempo de cada una de tus vueltas en clasificación, en cuanto la acabas. No dice las vueltas invalidadas, ni las que pasan por el pit lane",
+        "ca": "Diu el temps de cadascuna de les teves voltes a la classificació, tan bon punt l'acabes. No diu les voltes invalidades, ni les que passen pel pit lane"
+    },
     "lang.en": {
         "en": "English",
         "es": "Inglés",
@@ -669,6 +679,11 @@
         "en": "none",
         "es": "ninguno",
         "ca": "cap"
+    },
+    "effort.minimal": {
+        "en": "minimal",
+        "es": "mínimo",
+        "ca": "mínim"
     },
     "effort.low": {
         "en": "low",
@@ -1110,6 +1125,12 @@
         "ca": "probable pluja d'aquí a un minut",
         "it": "pioggia probabile tra circa un minuto"
     },
+    "call.lap_time": {
+        "en": "lap time {}",
+        "es": "tiempo de vuelta {}",
+        "ca": "temps de volta {}",
+        "it": "tempo sul giro {}"
+    },
     "engineer.no_telemetry": {
         "en": "No telemetry yet, get in the car.",
         "es": "Todavía no hay telemetría, súbete al coche.",
@@ -1411,9 +1432,19 @@
         "ca": "L'ID de l'espai de treball, enviat com a anthropic-workspace-id. ANTHROPIC_WORKSPACE_ID, si està definida, si és buit"
     },
     "provider.openai_effort_hover": {
-        "en": "reasoning_effort: the model's default when unset. None also turns thinking off in llama.cpp's thinking models",
-        "es": "reasoning_effort: el predeterminado del modelo si no se fija. Ninguno también desactiva el razonamiento en los modelos de llama.cpp que piensan",
-        "ca": "reasoning_effort: el predeterminat del model si no es fixa. Cap també desactiva el raonament en els models de llama.cpp que pensen"
+        "en": "reasoning_effort: the model's default when unset. Each model takes only some levels: if the server rejects one, pick another. None also turns thinking off in llama.cpp's thinking models",
+        "es": "reasoning_effort: el predeterminado del modelo si no se fija. Cada modelo acepta solo algunos niveles: si el servidor rechaza uno, elige otro. Ninguno también desactiva el razonamiento en los modelos de llama.cpp que piensan",
+        "ca": "reasoning_effort: el predeterminat del model si no es fixa. Cada model accepta només alguns nivells: si el servidor en rebutja un, tria'n un altre. Cap també desactiva el raonament en els models de llama.cpp que pensen"
+    },
+    "provider.openai_effort_rejected": {
+        "en": "the model may not take effort \"{effort}\": pick another, or the model's default, under Effort in the provider settings",
+        "es": "puede que el modelo no acepte el esfuerzo \"{effort}\": elige otro, o el del modelo, en Esfuerzo, en los ajustes del proveedor",
+        "ca": "potser el model no accepta l'esforç \"{effort}\": tria'n un altre, o el del model, a Esforç, a la configuració del proveïdor"
+    },
+    "provider.effort_unlisted": {
+        "en": "{effort} (not listed for this model)",
+        "es": "{effort} (no figura para este modelo)",
+        "ca": "{effort} (no figura per a aquest model)"
     },
     "effort.default": {
         "en": "model's default",

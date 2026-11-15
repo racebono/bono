@@ -142,7 +142,7 @@ CREATE TABLE cars_now (
     front_brake_bias_pct REAL, brake_migration INTEGER, front_arb INTEGER, rear_arb INTEGER,
     limiter_on INTEGER,
     engine_damage REAL, transmission_damage REAL, aero_damage REAL, suspension_damage REAL,
-    parts_detached INTEGER, dents TEXT, last_impact_ago_s REAL, last_impact_magnitude REAL,
+    parts_detached INTEGER, body_damage TEXT, last_impact_ago_s REAL, last_impact_magnitude REAL,
     in_pit_lane INTEGER, in_pits INTEGER, in_garage INTEGER, pit_state TEXT, pit_stops INTEGER,
     scheduled_pit_stops INTEGER, pit_services_selected TEXT, pit_services_active TEXT,
     pit_min_duration_left_s REAL,
@@ -3206,16 +3206,7 @@ impl Stream {
             .zip(t.f("lap_start_time"))
             .map(|(t, s)| t - s);
         let impact = t.f("last_impact_time").filter(|t| *t != 0.0);
-        let dents = (0..8)
-            .map(|i| t.i(&format!("dent_severity_{i}")))
-            .collect::<Vec<_>>();
-        let dents = dents.iter().any(Option::is_some).then(|| {
-            dents
-                .iter()
-                .map(|d| d.unwrap_or(0).to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        });
+        let body = body_damage(t);
         let (selected, active) = pit_services(st);
         insert(
             ctx.conn,
@@ -3305,7 +3296,7 @@ impl Stream {
                 ("aero_damage", copy(t, "aerodynamics_damage")),
                 ("suspension_damage", copy(t, "suspension_damage")),
                 ("parts_detached", copy(t, "parts_detached")),
-                ("dents", text_or_null(dents.as_deref())),
+                ("body_damage", text_or_null(body.as_deref())),
                 (
                     "last_impact_ago_s",
                     real(now.zip(impact).map(|(now, impact)| now - impact)),

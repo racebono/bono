@@ -150,14 +150,16 @@ static void convert(const TelemInfoV01& in, bono_telemetry_s& out) {
     out.state.rear_flap_status = in.mRearFlapLegalStatus;
 
     out.state.parts_detached = in.mDetached;
-    out.state.dent_severity_0 = in.mDentSeverity[0];
-    out.state.dent_severity_1 = in.mDentSeverity[1];
-    out.state.dent_severity_2 = in.mDentSeverity[2];
-    out.state.dent_severity_3 = in.mDentSeverity[3];
-    out.state.dent_severity_4 = in.mDentSeverity[4];
-    out.state.dent_severity_5 = in.mDentSeverity[5];
-    out.state.dent_severity_6 = in.mDentSeverity[6];
-    out.state.dent_severity_7 = in.mDentSeverity[7];
+    // The SDK doesn't say which dent is where. This is TinyPedal's order, a ring from the nose round the
+    // car's left side, which hitting a wall with the nose, the tail and each corner agreed with
+    out.state.body_damage_front = in.mDentSeverity[0];
+    out.state.body_damage_front_left = in.mDentSeverity[1];
+    out.state.body_damage_left = in.mDentSeverity[2];
+    out.state.body_damage_rear_left = in.mDentSeverity[3];
+    out.state.body_damage_rear = in.mDentSeverity[4];
+    out.state.body_damage_rear_right = in.mDentSeverity[5];
+    out.state.body_damage_right = in.mDentSeverity[6];
+    out.state.body_damage_front_right = in.mDentSeverity[7];
     out.state.last_impact_time = in.mLastImpactET;
     out.state.last_impact_magnitude = in.mLastImpactMagnitude;
     out.state.last_impact_position_x = in.mLastImpactPos.x;

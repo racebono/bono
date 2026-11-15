@@ -596,6 +596,10 @@ settings! {
         pub weather_repeat: f64 = 60.0,
         /// Between two "wet patch" calls
         pub wet_patch_repeat: f64 = 30.0,
+
+        /// The time of each of the pilot's laps in qualifying, said once it's over (not for laps
+        /// invalidated, or through the pit lane)
+        pub qualifying_lap_times: bool = false,
     }
 }
 
@@ -700,7 +704,8 @@ settings! {
         pub api_key: Option<String> = None,
         /// As the server names it (one serving a single model takes any)
         pub model: String = String::new(),
-        /// `reasoning_effort`: `none`, `low`, `medium` or `high`, or empty for the model's default
+        /// `reasoning_effort`, as the server names it (`none`, `low`, `medium`, `high`, `max`...:
+        /// each model takes its own), or empty for the model's default
         pub effort: String = String::new(),
         /// The most tokens in one response, thinking included
         pub max_tokens: NonZeroU32 = NonZeroU32::new(16000).unwrap(),
