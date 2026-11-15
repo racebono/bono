@@ -134,6 +134,7 @@ CREATE TABLE cars_now (
     gap_place_ahead_s REAL, gap_place_behind_s REAL, gap_car_ahead_s REAL, gap_car_behind_s REAL,
     time_behind_leader_s REAL, time_behind_next_s REAL,
     ahead_of_player_m REAL, right_of_player_m REAL,
+    race_gap_to_player_s REAL, race_laps_to_player INTEGER, track_gap_to_player_s REAL,
     last_lap_s REAL, best_lap_s REAL, delta_best_s REAL, lap_invalidated INTEGER,
     speed_kmh REAL, gear INTEGER, fuel_l REAL, fuel_fraction REAL, energy_left_pct REAL,
     battery_pct REAL, front_compound TEXT, rear_compound TEXT,
@@ -3208,6 +3209,14 @@ impl Stream {
         let impact = t.f("last_impact_time").filter(|t| *t != 0.0);
         let body = body_damage(t);
         let (selected, active) = pit_services(st);
+        let session = sc.session.as_ref().unwrap_or(&empty);
+        let to_player = match vehicle == ctx.vehicle {
+            true => ToPlayer::me(session),
+            false => {
+                let me = sc.cars.get(&ctx.vehicle).unwrap_or(&empty);
+                ToPlayer::new(session, (me, &ctx.player), (st, t), now)
+            }
+        };
         insert(
             ctx.conn,
             "cars_now",
@@ -3260,6 +3269,9 @@ impl Stream {
                 ("time_behind_next_s", copy(st, "time_behind_next")),
                 ("ahead_of_player_m", real(relative.map(|(ahead, _)| ahead))),
                 ("right_of_player_m", real(relative.map(|(_, right)| right))),
+                ("race_gap_to_player_s", real(to_player.race_gap)),
+                ("race_laps_to_player", integer(to_player.race_laps)),
+                ("track_gap_to_player_s", real(to_player.track_gap)),
                 ("last_lap_s", copy(st, "last_lap_time")),
                 ("best_lap_s", copy(st, "best_lap_time")),
                 ("delta_best_s", copy(t, "delta_best")),
@@ -3329,6 +3341,138 @@ impl Stream {
             ],
         )
     }
+}
+
+/// A last lap this much slower than the best (a stop, a yellow, a spin) isn't the car's pace
+const SLOW_LAST_LAP: f64 = 1.1;
+/// Seconds a rival's row can be from the player's and still be moved along to it: the frame's rows
+/// are within a second of the player's
+const MOVE_ALONG: f64 = 1.0;
+
+/// How far a car is from the player, each positive when the car is ahead and negative when it's
+/// behind: in the race order (seconds, from the standings, and whole laps of race distance) and on
+/// track. `None` when it isn't known.
+#[derive(Debug, Default, PartialEq)]
+struct ToPlayer {
+    race_gap: Option<f64>,
+    race_laps: Option<i64>,
+    track_gap: Option<f64>,
+}
+
+impl ToPlayer {
+    /// The player's own row.
+    fn me(session: &Row) -> Self {
+        let race = is_race(session);
+        Self {
+            race_gap: race.then_some(0.0),
+            race_laps: race.then_some(0),
+            track_gap: Some(0.0),
+        }
+    }
+
+    /// Another car, from its standings and telemetry rows and the player's (`now` being the
+    /// player's latest).
+    fn new(session: &Row, me: (&Row, &Row), car: (&Row, &Row), now: Option<f64>) -> Self {
+        let race = is_race(session);
+        let length = session
+            .f("track_length")
+            .filter(|l| l.is_finite() && *l > 0.0);
+        let along = |t: &Row| length.and_then(|length| along_lap(t, now, length));
+        let progress = |t: &Row| Some(t.f("lap")? + along(t)?);
+        let race_laps = || Some((progress(car.1)? - progress(me.1)?).trunc() as i64);
+        let track_gap = || {
+            // A car in its garage isn't anywhere on track
+            if me.0.b("in_garage") || car.0.b("in_garage") {
+                return None;
+            }
+            // The nearest way round
+            let ahead = (along(car.1)? - along(me.1)?).rem_euclid(1.0);
+            let ahead = if ahead > 0.5 { ahead - 1.0 } else { ahead };
+            // At the follower's own pace, so one class's laps never measure another's gap
+            let pace = match ahead >= 0.0 {
+                true => follower_pace(me.0, car.0),
+                false => follower_pace(car.0, me.0),
+            };
+            Some(ahead * pace?)
+        };
+        Self {
+            race_gap: race.then(|| race_gap(me.0, car.0)).flatten(),
+            race_laps: race.then(race_laps).flatten(),
+            track_gap: track_gap(),
+        }
+    }
+}
+
+fn is_race(session: &Row) -> bool {
+    session.s("session_type") == Some("race")
+}
+
+/// Seconds a car is ahead of the player in the race order, from each one's last standings row.
+///
+/// The simulators count a lapped car's time behind the leader differently: iRacing's is race time,
+/// laps and all, while others give a time beside the laps down. Subtracting the two is right either
+/// way only when both are the same number of laps down, so otherwise there's no time.
+fn race_gap(me: &Row, car: &Row) -> Option<f64> {
+    let behind = |r: &Row| {
+        let laps = r.i("laps_behind_leader")?;
+        let time = r
+            .f("time_behind_leader")
+            .filter(|t| t.is_finite() && *t >= 0.0)?;
+        // Only the leader is no time behind it: anyone else's zero is a time not given yet
+        (time > 0.0 || r.i("position") == Some(1)).then_some((laps, time))
+    };
+    let ((my_laps, my_time), (laps, time)) = (behind(me)?, behind(car)?);
+    (my_laps == laps).then_some(my_time - time)
+}
+
+/// How far along its lap a car is at `now`, as a share of the lap: its row's distance, moved along
+/// by its speed to the player's time.
+fn along_lap(t: &Row, now: Option<f64>, length: f64) -> Option<f64> {
+    let mut d = t.f("lap_distance").filter(|d| d.is_finite())?;
+    let at = t.f("session_time");
+    // The first rows of a lap can still carry the old lap's distance
+    let into_lap = at.zip(t.f("lap_start_time")).map(|(at, start)| at - start);
+    if into_lap.is_some_and(|s| (0.0..=LINE_APPROACH_SECONDS).contains(&s))
+        && d > length * FIRST_DISTANCE
+    {
+        d = 0.0;
+    }
+    let dt = now
+        .zip(at)
+        .map(|(now, at)| now - at)
+        .filter(|dt| dt.abs() <= MOVE_ALONG)
+        .unwrap_or(0.0);
+    d += t
+        .f("speed")
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0)
+        .max(0.0)
+        * dt;
+    Some(d / length)
+}
+
+/// The lap time a car's gap is measured at: its last lap, unless that was much slower than its
+/// best, then its best, then the simulator's estimate.
+fn lap_pace(st: &Row) -> Option<f64> {
+    let ok = |t: &f64| t.is_finite() && *t > 0.0;
+    let last = st.f("last_lap_time").filter(ok);
+    let best = st.f("best_lap_time").filter(ok);
+    match (last, best) {
+        (Some(last), Some(best)) if last > best * SLOW_LAST_LAP => Some(best),
+        (Some(last), _) => Some(last),
+        (None, best) => best,
+    }
+    .or_else(|| st.f("estimated_lap_time").filter(ok))
+}
+
+/// The follower's pace, or the other car's when the follower has none and they're the same class.
+fn follower_pace(follower: &Row, other: &Row) -> Option<f64> {
+    lap_pace(follower).or_else(|| {
+        let class = follower.text("vehicle_class")?;
+        (other.text("vehicle_class") == Some(class))
+            .then(|| lap_pace(other))
+            .flatten()
+    })
 }
 
 const TRACK_DATA: &str = "track data";
@@ -4244,6 +4388,316 @@ mod tests {
         // Before the clock's end, that lap's end is the flag: one more for us after this one
         let (need, _) = race_need(&sc, &at(960.0), 1, Some(1007.0), 0.92, Some(100.0));
         assert!((need.unwrap() - 1.08).abs() < 1e-9, "{need:?}");
+    }
+
+    /// One row of the given columns, as `SELECT ... AS ...` reads them.
+    fn columns(conn: &Connection, columns: &str) -> Row {
+        row(conn, &format!("SELECT {columns}"), [])
+            .unwrap()
+            .unwrap()
+    }
+
+    fn session(conn: &Connection, kind: &str) -> Row {
+        columns(
+            conn,
+            &format!("'{kind}' AS session_type, 1000.0 AS track_length"),
+        )
+    }
+
+    /// Standings: class, position, laps and time behind the leader, last and best laps.
+    fn standing(
+        conn: &Connection,
+        class: &str,
+        position: i64,
+        behind: (Option<i64>, Option<f64>),
+        last: Option<f64>,
+        best: Option<f64>,
+    ) -> Row {
+        let sql = |v: Option<String>| v.unwrap_or_else(|| "NULL".into());
+        columns(
+            conn,
+            &format!(
+                "'{class}' AS vehicle_class, {position} AS position, {} AS laps_behind_leader, \
+                 {} AS time_behind_leader, {} AS last_lap_time, {} AS best_lap_time, 0 AS in_garage",
+                sql(behind.0.map(|v| v.to_string())),
+                sql(behind.1.map(|v| format!("{v:?}"))),
+                sql(last.map(|v| format!("{v:?}"))),
+                sql(best.map(|v| format!("{v:?}"))),
+            ),
+        )
+    }
+
+    /// Telemetry at session time 500, `distance` metres into lap `lap`, standing still.
+    fn on_lap(conn: &Connection, lap: i64, distance: f64) -> Row {
+        columns(
+            conn,
+            &format!(
+                "500.0 AS session_time, {lap} AS lap, {distance:?} AS lap_distance, \
+                 400.0 AS lap_start_time, 0.0 AS speed"
+            ),
+        )
+    }
+
+    fn close(a: Option<f64>, b: f64) -> bool {
+        a.is_some_and(|a| (a - b).abs() < 1e-9)
+    }
+
+    #[test]
+    fn gaps_to_the_player_are_signed_from_the_players_side() {
+        let conn = Connection::open_in_memory().unwrap();
+        let race = session(&conn, "race");
+        let now = Some(500.0);
+        // The player, a GT3 two laps down on the overall leader, 900 m into lap 10
+        let me = standing(
+            &conn,
+            "GT3",
+            9,
+            (Some(2), Some(40.0)),
+            Some(100.0),
+            Some(99.0),
+        );
+        let my_lap = on_lap(&conn, 10, 900.0);
+
+        // The class car ahead, three places ahead overall and 175 m up the road over the line.
+        // Its own gap to its place ahead says nothing of the player's
+        let ahead = standing(&conn, "GT3", 6, (Some(2), Some(22.5)), Some(100.5), None);
+        let ahead_lap = on_lap(&conn, 11, 75.0);
+        let to = ToPlayer::new(&race, (&me, &my_lap), (&ahead, &ahead_lap), now);
+        assert!(close(to.race_gap, 17.5), "{to:?}");
+        assert_eq!(to.race_laps, Some(0));
+        // 0.175 laps at the player's (the follower's) 100 s
+        assert!(close(to.track_gap, 17.5), "{to:?}");
+
+        // A Hypercar behind on track, 200 m back, though it's laps ahead in the race: on track the
+        // gap is at its own 80 s pace, never the GT3's
+        let fast = standing(
+            &conn,
+            "Hypercar",
+            2,
+            (Some(0), Some(5.0)),
+            Some(80.0),
+            Some(79.5),
+        );
+        let fast_lap = on_lap(&conn, 12, 700.0);
+        let to = ToPlayer::new(&race, (&me, &my_lap), (&fast, &fast_lap), now);
+        // A different number of laps down: no time, rather than a wrong one
+        assert_eq!(to.race_gap, None);
+        // 12.7 - 10.9 laps of race distance: a whole lap ahead
+        assert_eq!(to.race_laps, Some(1));
+        assert!(close(to.track_gap, -0.2 * 80.0), "{to:?}");
+
+        // A car the player has lapped, just behind on track
+        let lapped = standing(
+            &conn,
+            "GT3",
+            20,
+            (Some(4), Some(30.0)),
+            Some(110.0),
+            Some(108.0),
+        );
+        let lapped_lap = on_lap(&conn, 8, 850.0);
+        let to = ToPlayer::new(&race, (&me, &my_lap), (&lapped, &lapped_lap), now);
+        assert_eq!(to.race_gap, None);
+        assert_eq!(to.race_laps, Some(-2));
+        assert!(close(to.track_gap, -0.05 * 110.0), "{to:?}");
+
+        // Behind in the race, the same laps down
+        let behind = standing(&conn, "GT3", 10, (Some(2), Some(51.0)), Some(101.0), None);
+        let behind_lap = on_lap(&conn, 10, 790.0);
+        let to = ToPlayer::new(&race, (&me, &my_lap), (&behind, &behind_lap), now);
+        assert!(close(to.race_gap, -11.0), "{to:?}");
+        assert_eq!(to.race_laps, Some(0));
+        assert!(close(to.track_gap, -0.11 * 101.0), "{to:?}");
+
+        // The player's own row
+        assert_eq!(
+            ToPlayer::me(&race),
+            ToPlayer {
+                race_gap: Some(0.0),
+                race_laps: Some(0),
+                track_gap: Some(0.0)
+            }
+        );
+    }
+
+    #[test]
+    fn outside_a_race_there_is_only_the_gap_on_track() {
+        let conn = Connection::open_in_memory().unwrap();
+        let practice = session(&conn, "practice");
+        let me = standing(&conn, "GT3", 3, (Some(0), Some(2.0)), Some(100.0), None);
+        let car = standing(&conn, "GT3", 1, (Some(0), Some(0.0)), Some(98.0), None);
+        let to = ToPlayer::new(
+            &practice,
+            (&me, &on_lap(&conn, 4, 100.0)),
+            (&car, &on_lap(&conn, 9, 400.0)),
+            Some(500.0),
+        );
+        assert_eq!(to.race_gap, None);
+        assert_eq!(to.race_laps, None);
+        assert!(close(to.track_gap, 30.0), "{to:?}");
+        assert_eq!(
+            ToPlayer::me(&practice),
+            ToPlayer {
+                race_gap: None,
+                race_laps: None,
+                track_gap: Some(0.0)
+            }
+        );
+    }
+
+    #[test]
+    fn gaps_to_the_player_are_null_when_not_known() {
+        let conn = Connection::open_in_memory().unwrap();
+        let race = session(&conn, "race");
+        let now = Some(500.0);
+        let me = standing(&conn, "GT3", 5, (Some(0), Some(20.0)), Some(100.0), None);
+        let my_lap = on_lap(&conn, 3, 500.0);
+        let unknown = ToPlayer {
+            race_gap: None,
+            race_laps: None,
+            track_gap: None,
+        };
+
+        // No standings, no telemetry
+        let empty = columns(&conn, "NULL AS unknown");
+        assert_eq!(
+            ToPlayer::new(&race, (&me, &my_lap), (&empty, &empty), now),
+            unknown
+        );
+        // No time behind the leader, or no laps behind it
+        let lap = on_lap(&conn, 3, 600.0);
+        for behind in [(Some(0), None), (None, Some(10.0))] {
+            let car = standing(&conn, "GT3", 4, behind, Some(100.0), None);
+            let to = ToPlayer::new(&race, (&me, &my_lap), (&car, &lap), now);
+            assert_eq!(to.race_gap, None, "{behind:?}");
+            assert!(to.track_gap.is_some());
+        }
+        // A zero that isn't the leader's is a time not given yet
+        let car = standing(&conn, "GT3", 4, (Some(0), Some(0.0)), Some(100.0), None);
+        assert_eq!(
+            ToPlayer::new(&race, (&me, &my_lap), (&car, &lap), now).race_gap,
+            None
+        );
+        // The leader's zero is real
+        let leader = standing(&conn, "GT3", 1, (Some(0), Some(0.0)), Some(100.0), None);
+        let to = ToPlayer::new(&race, (&me, &my_lap), (&leader, &lap), now);
+        assert!(close(to.race_gap, 20.0), "{to:?}");
+
+        // No lap times for either, or only another class's
+        let car = standing(&conn, "GT3", 4, (Some(0), Some(10.0)), None, None);
+        let slow = standing(&conn, "GT3", 5, (Some(0), Some(20.0)), None, None);
+        assert_eq!(
+            ToPlayer::new(&race, (&slow, &my_lap), (&car, &lap), now).track_gap,
+            None
+        );
+        let other = standing(
+            &conn,
+            "Hypercar",
+            4,
+            (Some(0), Some(10.0)),
+            Some(80.0),
+            None,
+        );
+        assert_eq!(
+            ToPlayer::new(&race, (&slow, &my_lap), (&other, &lap), now).track_gap,
+            None
+        );
+        // The same class's will do
+        assert!(close(
+            ToPlayer::new(
+                &race,
+                (&slow, &my_lap),
+                (
+                    &standing(&conn, "GT3", 4, (Some(0), Some(10.0)), Some(90.0), None),
+                    &lap
+                ),
+                now
+            )
+            .track_gap,
+            9.0
+        ));
+
+        // No track length
+        let lengthless = columns(&conn, "'race' AS session_type");
+        let car = standing(&conn, "GT3", 4, (Some(0), Some(10.0)), Some(100.0), None);
+        let to = ToPlayer::new(&lengthless, (&me, &my_lap), (&car, &lap), now);
+        assert!(close(to.race_gap, 10.0));
+        assert_eq!((to.race_laps, to.track_gap), (None, None));
+
+        // In its garage
+        let garaged = columns(
+            &conn,
+            "'GT3' AS vehicle_class, 4 AS position, 100.0 AS last_lap_time, 1 AS in_garage",
+        );
+        assert_eq!(
+            ToPlayer::new(&race, (&me, &my_lap), (&garaged, &lap), now).track_gap,
+            None
+        );
+    }
+
+    #[test]
+    fn a_rivals_row_is_moved_to_the_players_time() {
+        let conn = Connection::open_in_memory().unwrap();
+        let race = session(&conn, "race");
+        let me = standing(&conn, "GT3", 2, (Some(0), Some(1.0)), Some(100.0), None);
+        let my_lap = on_lap(&conn, 3, 500.0);
+        let car = standing(&conn, "GT3", 1, (Some(0), Some(0.0)), Some(100.0), None);
+        // Half a second old at 50 m/s: 25 m further on by now
+        let old = columns(
+            &conn,
+            "499.5 AS session_time, 3 AS lap, 575.0 AS lap_distance, 400.0 AS lap_start_time, \
+             50.0 AS speed",
+        );
+        let to = ToPlayer::new(&race, (&me, &my_lap), (&car, &old), Some(500.0));
+        assert!(close(to.track_gap, 10.0), "{to:?}");
+        // Just over the line, still with the old lap's distance: at the line, not a lap further on
+        let crossed = columns(
+            &conn,
+            "500.0 AS session_time, 4 AS lap, 995.0 AS lap_distance, 499.7 AS lap_start_time, \
+             0.0 AS speed",
+        );
+        let to = ToPlayer::new(&race, (&me, &my_lap), (&car, &crossed), Some(500.0));
+        assert_eq!(to.race_laps, Some(0));
+        assert!(close(to.track_gap, 50.0), "{to:?}");
+    }
+
+    #[test]
+    fn a_slow_last_lap_isnt_the_pace() {
+        let conn = Connection::open_in_memory().unwrap();
+        let pace = |last: Option<f64>, best: Option<f64>| {
+            lap_pace(&standing(&conn, "GT3", 1, (None, None), last, best))
+        };
+        assert_eq!(pace(Some(102.0), Some(100.0)), Some(102.0));
+        // A stop
+        assert_eq!(pace(Some(130.0), Some(100.0)), Some(100.0));
+        assert_eq!(pace(None, Some(100.0)), Some(100.0));
+        assert_eq!(pace(Some(-1.0), None), None);
+        let estimated = columns(&conn, "95.0 AS estimated_lap_time");
+        assert_eq!(lap_pace(&estimated), Some(95.0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cars_now_gives_each_cars_gap_to_the_player() {
+        let (dir, engineer) = race();
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute_batch(
+            "UPDATE standings SET laps_behind_leader = 0, time_behind_leader = 0.0 WHERE vehicle_id = 1;
+             UPDATE standings SET laps_behind_leader = 0, time_behind_leader = 1.5 WHERE vehicle_id = 2;",
+        )
+        .unwrap();
+        drop(conn);
+        let rows = query(
+            &engineer,
+            "SELECT vehicle_id, race_gap_to_player_s, race_laps_to_player, ROUND(track_gap_to_player_s, 3) \
+             FROM cars_now ORDER BY vehicle_id",
+        )
+        .await;
+        // Fischer, 1.5 s behind the leading player, alongside on track
+        assert_eq!(
+            rows,
+            [["1", "0", "0", "0"], ["2", "-1.5", "0", "0"]],
+            "{rows:?}"
+        );
     }
 
     #[test]

@@ -109,7 +109,7 @@ not reported), `start_light`, `air_c`, `track_c`, `rain_pct`,
 `laps_behind_next`; `gap_place_ahead_s`, `gap_place_behind_s` (standings order, live),
 `gap_car_ahead_s`, `gap_car_behind_s` (nearest on track, any class, live), `time_behind_leader_s`,
 `time_behind_next_s` (as of the car's last scoring row); `ahead_of_player_m`, `right_of_player_m`;
-`last_lap_s`, `best_lap_s` (sector times in `sectors_now`),
+`race_gap_to_player_s`, `race_laps_to_player`, `track_gap_to_player_s` (below); `last_lap_s`, `best_lap_s` (sector times in `sectors_now`),
 `delta_best_s` (positive: slower), `lap_invalidated`; `speed_kmh`, `gear`, `fuel_l`, `fuel_fraction`,
 `energy_left_pct`, `battery_pct`, `front_compound`, `rear_compound`; `water_c`, `oil_c`,
 `engine_overheating`; `tc`, `tc_slip`, `tc_cut`, `abs`, `engine_map`, `front_brake_bias_pct`,
@@ -123,6 +123,26 @@ undamaged, NULL when not reported), `last_impact_ago_s`, `last_impact_magnitude`
 lapped), `under_yellow`, `finish_status`, `penalties`, `penalty_type`, `penalty_reason`,
 `track_limit_steps`, `track_limit_points_left`, `incident_points`. A car with no recent telemetry
 has only its standings. Rivals' rows are slightly older than the player's.
+
+**Gaps to the player.** The other gap columns (`gap_place_*`, `gap_car_*`, `time_behind_leader_s`,
+`time_behind_next_s`, `laps_behind_*`) are each car's own gap to its neighbour or the leader, never
+to the player: another car's row of those never gives the player's gap, and don't subtract them
+across rows. For how far a car is from the player, read that car's row of these three, each
+positive when it's ahead of the player, negative when behind, and 0 on the player's row:
+
+- `race_gap_to_player_s`: seconds in the race order, from the standings (as of each car's last
+  scoring row). Races only. NULL when not known, and when the two are a different number of laps
+  down on the leader.
+- `race_laps_to_player`: whole laps of race distance between them (2: two laps up on the player;
+  0: under a lap apart). Races only; NULL without live telemetry.
+- `track_gap_to_player_s`: seconds on track, the nearest way round the lap, at the follower's own
+  pace, in any session and whatever the race order: a car lapping the player can be just behind.
+  NULL without live telemetry or a lap time.
+
+For the next car in the player's class, take the car of the same `vehicle_class` one
+`class_position` ahead and give its `race_gap_to_player_s`. When that's NULL, a car laps ahead has
+`race_laps_to_player`; one under a lap ahead (`race_laps_to_player` 0) is `track_gap_to_player_s`
+ahead when that's positive, and over half a lap ahead when it isn't.
 
 **`wheels_now`**, one row per car and wheel: `vehicle_id`, `wheel` (0 front left, 1 front right, 2
 rear left, 3 rear right), `wheel_name`; `life_left_pct`, `stint_wear_pct_per_lap`, `compound`,
