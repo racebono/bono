@@ -594,6 +594,10 @@ settings! {
         pub weather_repeat: f64 = 60.0,
         /// Between two "wet patch" calls
         pub wet_patch_repeat: f64 = 30.0,
+
+        /// The time of each of the pilot's laps in qualifying, said once it's over (not for laps
+        /// invalidated, or through the pit lane)
+        pub qualifying_lap_times: bool = false,
     }
 }
 
