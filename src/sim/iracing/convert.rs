@@ -544,12 +544,18 @@ impl Converter {
                 let laps = other?.progress()? - car.progress()?;
                 Some((laps + 1e-9).floor().max(0.0) as i64)
             };
-            out.laps_behind_leader = match car.position {
-                Some(1) => Some(0),
-                _ => behind(leader),
+            // Nobody's a lap down before the green, whatever the laps counted on the way to it
+            let before_green = frame
+                .i32("SessionState")
+                .is_some_and(|state| (STATE_GET_IN_CAR..STATE_RACING).contains(&state));
+            if !before_green {
+                out.laps_behind_leader = match car.position {
+                    Some(1) => Some(0),
+                    _ => behind(leader),
+                }
+                .into();
+                out.laps_behind_next = behind(next).into();
             }
-            .into();
-            out.laps_behind_next = behind(next).into();
         }
 
         // The flags shown to the car: the player's own, or each car's where the game has them
@@ -1670,6 +1676,12 @@ mod tests {
         // On the parade laps: the grid, and nobody's timed but the leader
         let parade = update(&info, STATE_PARADE_LAPS, [0; 3], [0.0; 3]);
         assert_eq!(standing(&parade, 2), (Some(1), Some(1), Some(0.0)));
+        let (_, standings) = parade.scoring.as_ref().unwrap();
+        assert!(
+            standings
+                .iter()
+                .all(|s| s.laps_behind_leader.get().is_none())
+        );
         assert_eq!(standing(&parade, 0), (Some(2), Some(2), None));
         assert_eq!(standing(&parade, 1), (Some(3), Some(3), None));
         assert_eq!(ahead(&parade, 0), None);

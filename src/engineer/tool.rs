@@ -2109,7 +2109,8 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
             ""
         },
         place_text(sc, ctx.vehicle, &place, exact),
-        ids.len(),
+        // The field: the standings' cars, when an estimate can only order those with telemetry
+        ids.len().max(sc.cars.len()),
         fmt(p.f("gap_to_place_ahead"), 1, ""),
         ahead.map_or("nobody".into(), |v| sc.label(v)),
         fmt(p.f("gap_to_place_behind"), 1, ""),
@@ -2888,6 +2889,25 @@ mod tests {
         let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
         assert!(out.contains("| ~P"), "{out}");
         assert!(!out.contains("| P1/"), "{out}");
+
+        // Only the player's car with telemetry: the field is still the standings' two
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        for table in ["telemetry_wheel", "car_state"] {
+            conn.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE telemetry_id IN                      (SELECT id FROM telemetry WHERE vehicle_id = 2)"
+                ),
+                [],
+            )
+            .unwrap();
+        }
+        conn.execute("DELETE FROM telemetry WHERE vehicle_id = 2", [])
+            .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(out.contains("| ~P1/2 |"), "{out}");
     }
 
     /// Places with a gap in them are the standings' own, and neighbours are the cars in the
