@@ -132,14 +132,21 @@ impl VehicleCondition {
     }
 }
 
+impl VehicleCondition {
+    /// Asks the thread to stop after any request in flight, without waiting for it.
+    pub fn stop(&self) {
+        lock(&self.shared.state).stop = true;
+        self.shared.wake.notify_all();
+    }
+}
+
 impl Drop for VehicleCondition {
     /// Waits for the thread, as the DLL may be unloaded next. This runs on the game's thread when the
     /// game closes: a request in flight holds it for up to the request's timeouts, about 1.5 s, and
     /// only if the web API stops answering just then. Not waiting would leave the thread running code
     /// that is gone.
     fn drop(&mut self) {
-        lock(&self.shared.state).stop = true;
-        self.shared.wake.notify_all();
+        self.stop();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }

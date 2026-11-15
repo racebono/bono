@@ -479,8 +479,9 @@ fn damage_parts(p: &Row, above: f64) -> String {
     DAMAGE_PARTS
         .iter()
         .filter_map(|(key, name)| {
-            let pct = p.f(key).filter(|v| *v > above)? * 100.0;
-            (pct.round() >= 1.0).then(|| format!("{name} {pct:.0}%"))
+            // Rounded once, so what's printed is what was checked
+            let pct = (p.f(key).filter(|v| *v > above)? * 100.0).round();
+            (pct >= 1.0).then(|| format!("{name} {pct}%"))
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -2373,12 +2374,12 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let p = row(
             &conn,
-            "SELECT 0.003 AS aerodynamics_damage, 0.3 AS suspension_damage, 0.0 AS engine_damage",
+            "SELECT 0.003 AS aerodynamics_damage, 0.3 AS suspension_damage, 0.0 AS engine_damage,              0.005 AS transmission_damage",
             [],
         )
         .unwrap()
         .unwrap();
-        assert_eq!(damage_parts(&p, 0.0), "suspension 30%");
+        assert_eq!(damage_parts(&p, 0.0), "gearbox 1%, suspension 30%");
     }
 
     #[test]

@@ -75,8 +75,11 @@ pub unsafe extern "C" fn bono_lmu_close(recorder: *mut LmuRecorder) {
     let recorder = unsafe { Box::from_raw(recorder) };
     guard((), move || {
         let dir = recorder.0.dir().to_owned();
-        // Waits for the writer, so the database is closed before it's deleted, and for the damage's
-        // thread (see `VehicleCondition`'s `drop`)
+        // The damage's thread stops first, so its request and the writer's time out together: the
+        // game waits 6 s at most, not one wait after the other. Then this waits for the writer, so
+        // the database is closed before it's deleted, and for the damage's thread (see
+        // `VehicleCondition`'s `drop`)
+        recorder.3.stop();
         drop(recorder);
         recorder::remove_database(&dir);
     })
