@@ -166,14 +166,16 @@
     X(i64, rear_flap_status)                /* 0 not allowed, 1 detected but not allowed yet, 2 allowed */ \
     /* Damage */                                                                                         \
     X(boolean, parts_detached)                                                                           \
-    X(i64, dent_severity_0)                 /* 8 locations around the car: 0 none, 1 some, 2 more */     \
-    X(i64, dent_severity_1)                                                                              \
-    X(i64, dent_severity_2)                                                                              \
-    X(i64, dent_severity_3)                                                                              \
-    X(i64, dent_severity_4)                                                                              \
-    X(i64, dent_severity_5)                                                                              \
-    X(i64, dent_severity_6)                                                                              \
-    X(i64, dent_severity_7)                                                                              \
+    /* Bodywork by where it is around the car, seen from above: 0 none, 1 some, 2 more (not 0-1 like   \
+       the parts below). LMU: its dents */                                                               \
+    X(i64, body_damage_front_left)                                                                       \
+    X(i64, body_damage_front)                                                                            \
+    X(i64, body_damage_front_right)                                                                      \
+    X(i64, body_damage_left)                                                                             \
+    X(i64, body_damage_right)                                                                            \
+    X(i64, body_damage_rear_left)                                                                        \
+    X(i64, body_damage_rear)                                                                             \
+    X(i64, body_damage_rear_right)                                                                       \
     X(f64, last_impact_time)                /* session time */                                           \
     X(f64, last_impact_magnitude)                                                                        \
     X(f64, last_impact_position_x)                                                                       \
@@ -181,8 +183,9 @@
     X(f64, last_impact_position_z)                                                                       \
     X(f64, engine_damage)                   /* 0 none - 1 destroyed */                                   \
     X(f64, transmission_damage)                                                                          \
-    X(f64, aerodynamics_damage)                                                                          \
-    X(f64, suspension_damage)   
+    X(f64, aerodynamics_damage)             /* LMU: player only, its one damage figure for the car, */   \
+                                            /* which its pit menu repairs as aero damage */             \
+    X(f64, suspension_damage)               /* LMU: player only, the worst wheel's */   
 
 #define SIM_WHEEL_TELEMETRY_COLUMNS(X)                                                                   \
     /* Suspension and brakes */                                                                          \

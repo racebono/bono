@@ -473,16 +473,50 @@ const DAMAGE_PARTS: [(&str, &str); 4] = [
     ("suspension_damage", "suspension"),
 ];
 
-/// "engine 12%, aero 30%": the parts damaged more than `above` (0-1).
+/// "engine 12%, aero 30%": the parts damaged more than `above` (0-1), leaving out any that would
+/// read 0%.
 fn damage_parts(p: &Row, above: f64) -> String {
     DAMAGE_PARTS
         .iter()
         .filter_map(|(key, name)| {
-            let v = p.f(key).filter(|v| *v > above)?;
-            Some(format!("{name} {:.0}%", v * 100.0))
+            // Rounded once, so what's printed is what was checked
+            let pct = (p.f(key).filter(|v| *v > above)? * 100.0).round();
+            (pct >= 1.0).then(|| format!("{name} {pct}%"))
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The bodywork zones' columns, and their names in `cars_now` and the snapshot.
+const BODY_ZONES: [(&str, &str); 8] = [
+    ("body_damage_front", "front"),
+    ("body_damage_front_left", "front_left"),
+    ("body_damage_front_right", "front_right"),
+    ("body_damage_left", "left"),
+    ("body_damage_right", "right"),
+    ("body_damage_rear_left", "rear_left"),
+    ("body_damage_rear", "rear"),
+    ("body_damage_rear_right", "rear_right"),
+];
+
+/// "front 2, front_left 1": the damaged bodywork zones (1 some, 2 more), "none" when every zone
+/// reads 0, or `None` when no damage is known and some zone isn't reported.
+fn body_damage(p: &Row) -> Option<String> {
+    let zones = BODY_ZONES
+        .iter()
+        .map(|(key, name)| (*name, p.i(key)))
+        .collect::<Vec<_>>();
+    let damaged = zones
+        .iter()
+        .filter_map(|(name, level)| level.filter(|l| *l > 0).map(|l| format!("{name} {l}")))
+        .collect::<Vec<_>>();
+    match damaged.is_empty() {
+        false => Some(damaged.join(", ")),
+        true => zones
+            .iter()
+            .all(|(_, level)| *level == Some(0))
+            .then(|| "none".into()),
+    }
 }
 
 /// The pit window and the player's mandatory stop (`None` when the simulator reports neither),
@@ -2271,21 +2305,8 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
 
     let (more_alerts, mut info) = scoring_alerts(ctx)?;
     alerts.extend(more_alerts);
-    let dents = (0..8)
-        .map(|i| p.i(&format!("dent_severity_{i}")).unwrap_or(0))
-        .collect::<Vec<_>>();
-    if dents.iter().any(|d| *d != 0) {
-        info.insert(
-            0,
-            format!(
-                "dents [{}]",
-                dents
-                    .iter()
-                    .map(|d| d.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        );
+    if let Some(body) = body_damage(p).filter(|body| body != "none") {
+        info.insert(0, format!("bodywork damage {body} (1 some, 2 more)"));
     }
     let parts = damage_parts(p, 0.0);
     if !parts.is_empty() {
@@ -2346,6 +2367,47 @@ mod tests {
             incident_line(Some(4.0), Some(0.0)).as_deref(),
             Some("incident points 4")
         );
+    }
+
+    #[test]
+    fn damage_too_small_to_read_as_a_percent_is_left_out() {
+        let conn = Connection::open_in_memory().unwrap();
+        let p = row(
+            &conn,
+            "SELECT 0.003 AS aerodynamics_damage, 0.3 AS suspension_damage, 0.0 AS engine_damage,              0.005 AS transmission_damage",
+            [],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(damage_parts(&p, 0.0), "gearbox 1%, suspension 30%");
+    }
+
+    #[test]
+    fn body_damage_names_the_damaged_zones() {
+        let conn = Connection::open_in_memory().unwrap();
+        let body = |values: &str| {
+            let columns = BODY_ZONES
+                .iter()
+                .zip(values.split(','))
+                .map(|((key, _), value)| format!("{value} AS {key}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            body_damage(
+                &row(&conn, &format!("SELECT {columns}"), [])
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+        // front, front_left, front_right, left, right, rear_left, rear, rear_right
+        assert_eq!(
+            body("2,0,0,0,0,1,0,0").as_deref(),
+            Some("front 2, rear_left 1")
+        );
+        assert_eq!(body("0,0,0,0,0,0,0,0").as_deref(), Some("none"));
+        assert_eq!(body("NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL"), None);
+        // An unreported zone isn't undamaged
+        assert_eq!(body("0,0,0,0,0,0,0,NULL"), None);
+        assert_eq!(body("0,1,0,0,0,0,0,NULL").as_deref(), Some("front_left 1"));
     }
 
     #[test]
