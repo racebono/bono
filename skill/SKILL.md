@@ -130,9 +130,10 @@ to the player: another car's row of those never gives the player's gap, and don'
 across rows. For how far a car is from the player, read that car's row of these three, each
 positive when it's ahead of the player, negative when behind, and 0 on the player's row:
 
-- `race_gap_to_player_s`: seconds in the race order, from the standings (as of each car's last
-  scoring row). Races only. NULL when not known, and when the two are a different number of laps
-  down on the leader.
+- `race_gap_to_player_s`: seconds in the race order. Races only. From the standings (as of each
+  car's last scoring row) when they have it; else, when the two are under a lap apart, how long ago
+  the one ahead in the race was where the other is now. NULL a lap or more apart, and when neither
+  is known.
 - `race_laps_to_player`: whole laps of race distance between them (2: two laps up on the player;
   0: under a lap apart). Races only; NULL without live telemetry.
 - `track_gap_to_player_s`: seconds on track, the nearest way round the lap, in any session and
