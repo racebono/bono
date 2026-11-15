@@ -497,24 +497,24 @@ const BODY_ZONES: [(&str, &str); 8] = [
     ("body_damage_rear_right", "rear_right"),
 ];
 
-/// "front 2, front_left 1": the damaged bodywork zones (1 some, 2 more), "none" when none is, or
-/// `None` when the simulator doesn't report bodywork.
+/// "front 2, front_left 1": the damaged bodywork zones (1 some, 2 more), "none" when every zone
+/// reads 0, or `None` when no damage is known and some zone isn't reported.
 fn body_damage(p: &Row) -> Option<String> {
     let zones = BODY_ZONES
         .iter()
         .map(|(key, name)| (*name, p.i(key)))
         .collect::<Vec<_>>();
-    if zones.iter().all(|(_, level)| level.is_none()) {
-        return None;
-    }
     let damaged = zones
         .iter()
         .filter_map(|(name, level)| level.filter(|l| *l > 0).map(|l| format!("{name} {l}")))
         .collect::<Vec<_>>();
-    Some(match damaged.is_empty() {
-        true => "none".into(),
-        false => damaged.join(", "),
-    })
+    match damaged.is_empty() {
+        false => Some(damaged.join(", ")),
+        true => zones
+            .iter()
+            .all(|(_, level)| *level == Some(0))
+            .then(|| "none".into()),
+    }
 }
 
 /// The pit window and the player's mandatory stop (`None` when the simulator reports neither),
@@ -2390,6 +2390,9 @@ mod tests {
         );
         assert_eq!(body("0,0,0,0,0,0,0,0").as_deref(), Some("none"));
         assert_eq!(body("NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL"), None);
+        // An unreported zone isn't undamaged
+        assert_eq!(body("0,0,0,0,0,0,0,NULL"), None);
+        assert_eq!(body("0,1,0,0,0,0,0,NULL").as_deref(), Some("front_left 1"));
     }
 
     #[test]

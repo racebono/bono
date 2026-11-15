@@ -31,6 +31,8 @@ struct State {
     answer: Option<(Condition, Instant)>,
     /// When the player's telemetry last arrived
     driving: Option<Instant>,
+    /// The player's car the answer is for
+    vehicle: Option<i64>,
     /// Bumped by `clear`, so an answer asked for before it is dropped
     generation: u64,
     stop: bool,
@@ -51,10 +53,14 @@ pub struct VehicleCondition {
 impl VehicleCondition {
     /// Starts asking the web API. If its thread can't start, the damage stays unknown.
     pub fn start() -> Self {
-        // It's on this PC, and asked every second: anything slow means it isn't answering
+        // It's on this PC, and asked every second: anything slow means it isn't answering. Each step
+        // has its own timeout, about 1.5 s in all, and finding localhost none: ureq may look a host up
+        // on a thread of its own when that has a timeout, and such a thread could outlive the DLL
         let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_connect(Some(Duration::from_millis(500)))
-            .timeout_global(Some(Duration::from_secs(1)))
+            .timeout_connect(Some(Duration::from_millis(300)))
+            .timeout_send_request(Some(Duration::from_millis(200)))
+            .timeout_recv_response(Some(Duration::from_millis(500)))
+            .timeout_recv_body(Some(Duration::from_millis(500)))
             .build()
             .into();
         Self::with(POLL, move || fetch(&agent))
@@ -72,11 +78,12 @@ impl VehicleCondition {
         Self { shared, thread }
     }
 
-    /// Forgets the last answer, for a new event.
+    /// Forgets the last answer, for a new event: it isn't asked again until the player drives.
     pub fn clear(&self) {
         let mut state = lock(&self.shared.state);
-        state.answer = None;
-        state.generation = state.generation.wrapping_add(1);
+        state.forget();
+        state.driving = None;
+        state.vehicle = None;
     }
 
     /// Fills in the player's aero and suspension damage, when the web API answered recently.
@@ -91,6 +98,12 @@ impl VehicleCondition {
         }
         let answer = {
             let mut state = lock(&self.shared.state);
+            // Another car's answer isn't this one's
+            let vehicle = telemetry.vehicle_id.get();
+            if state.vehicle != vehicle {
+                state.forget();
+                state.vehicle = vehicle;
+            }
             state.driving = Some(now);
             state.answer
         };
@@ -106,14 +119,23 @@ impl VehicleCondition {
 
 impl Drop for VehicleCondition {
     /// Waits for the thread, as the DLL may be unloaded next. This runs on the game's thread when the
-    /// game closes: a request in flight holds it for up to the request's 1 s timeout, and only if the
-    /// web API stops answering just then. Not waiting would leave the thread running code that is gone.
+    /// game closes: a request in flight holds it for up to the request's timeouts, about 1.5 s, and
+    /// only if the web API stops answering just then. Not waiting would leave the thread running code
+    /// that is gone.
     fn drop(&mut self) {
         lock(&self.shared.state).stop = true;
         self.shared.wake.notify_all();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+impl State {
+    /// Drops the answer, and any answer asked for before now.
+    fn forget(&mut self) {
+        self.answer = None;
+        self.generation = self.generation.wrapping_add(1);
     }
 }
 
@@ -199,7 +221,17 @@ mod tests {
         is_player: bool,
         now: Instant,
     ) -> (Option<f64>, Option<f64>) {
+        damage_of(condition, 1, is_player, now)
+    }
+
+    fn damage_of(
+        condition: &VehicleCondition,
+        vehicle: i64,
+        is_player: bool,
+        now: Instant,
+    ) -> (Option<f64>, Option<f64>) {
         let mut telemetry = bono_telemetry::default();
+        telemetry.vehicle_id = Some(vehicle).into();
         condition.fill_at(&mut telemetry, is_player, now);
         (
             telemetry.state.aerodynamics_damage.get(),
@@ -213,7 +245,10 @@ mod tests {
             shared: Arc::new(Shared::default()),
             thread: None,
         };
-        lock(&condition.shared.state).answer = Some((answer, at));
+        let mut state = lock(&condition.shared.state);
+        state.answer = Some((answer, at));
+        state.vehicle = Some(1);
+        drop(state);
         condition
     }
 
@@ -255,6 +290,23 @@ mod tests {
     }
 
     #[test]
+    fn another_car_does_not_get_the_last_answer() {
+        let now = Instant::now();
+        let condition = answered(parse(BODY).unwrap(), now);
+        assert_eq!(damage_of(&condition, 2, true, now), (None, None));
+        assert_eq!(damage_of(&condition, 1, true, now), (None, None));
+    }
+
+    #[test]
+    fn clearing_stops_asking_until_the_player_drives() {
+        let condition = answered(parse(BODY).unwrap(), Instant::now());
+        lock(&condition.shared.state).driving = Some(Instant::now());
+        condition.clear();
+        let state = lock(&condition.shared.state);
+        assert!(state.answer.is_none() && state.driving.is_none());
+    }
+
+    #[test]
     fn an_answer_asked_for_before_clearing_is_dropped() {
         let (asked_tx, asked) = mpsc::channel();
         let (answer, answer_rx) = mpsc::channel::<Condition>();
@@ -272,7 +324,8 @@ mod tests {
         asked.recv().unwrap();
         condition.clear();
         answer.send(first).unwrap();
-        // Asked again: the first answer has been dealt with
+        // Asked again once the player drives: the first answer has been dealt with
+        damage(&condition, true, Instant::now());
         asked.recv().unwrap();
         assert_eq!(damage(&condition, true, Instant::now()), (None, None));
 
