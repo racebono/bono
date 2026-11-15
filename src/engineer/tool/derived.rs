@@ -1180,6 +1180,65 @@ struct Car {
     wear_counts_up: bool,
     /// Its stints as its rows were last written with
     stints: Vec<Segment>,
+    /// Where it's been lately, for the gaps on track
+    trail: Trail,
+}
+
+/// Where a car has been lately: (session time, lap distance), oldest first, at most a row every
+/// `TRAIL_STEP` and going back `TRAIL_SPAN`.
+#[derive(Default)]
+struct Trail(std::collections::VecDeque<(f64, f64)>);
+
+/// Seconds between the rows a trail keeps: enough to place a car to a few metres between them
+const TRAIL_STEP: f64 = 0.1;
+/// Seconds a trail goes back: past half a lap of the slowest car on the longest track
+const TRAIL_SPAN: f64 = 600.0;
+/// Seconds between two rows past which where the car went between them isn't known
+const TRAIL_HOLE: f64 = 5.0;
+
+impl Trail {
+    fn push(&mut self, sample: &Sample) {
+        let (Some(t), Some(d)) = (sample.session_time, sample.lap_distance) else {
+            return;
+        };
+        if !(t.is_finite() && d.is_finite()) {
+            return;
+        }
+        match self.0.back() {
+            // Back in time: another session, or the file started over
+            Some(&(last, _)) if t < last - 1.0 => self.0.clear(),
+            Some(&(last, _)) if t < last + TRAIL_STEP => return,
+            _ => {}
+        }
+        self.0.push_back((t, d));
+        while self
+            .0
+            .front()
+            .is_some_and(|(first, _)| *first < t - TRAIL_SPAN)
+        {
+            self.0.pop_front();
+        }
+    }
+
+    /// Seconds before `now` the car was last at `spot` metres into the lap, `at` being where it is
+    /// now. `None` when its rows don't show it passing there: a hole in them, or too short a trail.
+    fn since_at(&self, now: f64, at: f64, spot: f64, length: f64) -> Option<f64> {
+        let mut newer = (now, at);
+        for &older in self.0.iter().rev() {
+            let dt = newer.0 - older.0;
+            if dt > TRAIL_HOLE {
+                return None;
+            }
+            let step = (newer.1 - older.1).rem_euclid(length);
+            let into = (spot - older.1).rem_euclid(length);
+            // A step back (the distance jittering) passes nothing
+            if dt > 0.0 && step > 0.0 && step < length / 2.0 && into <= step {
+                return Some(now - (older.0 + dt * into / step));
+            }
+            newer = older;
+        }
+        None
+    }
 }
 
 impl Car {
@@ -2550,6 +2609,7 @@ impl Stream {
                 // another session than they are
                 *car = Car::default();
             }
+            car.trail.push(sample);
             if car
                 .current
                 .as_ref()
@@ -3214,7 +3274,13 @@ impl Stream {
             true => ToPlayer::me(session),
             false => {
                 let me = sc.cars.get(&ctx.vehicle).unwrap_or(&empty);
-                ToPlayer::new(session, (me, &ctx.player), (st, t), now)
+                let trail = |vehicle: i64| self.cars.get(&vehicle).map(|car| &car.trail);
+                ToPlayer::new(
+                    session,
+                    (me, &ctx.player, trail(ctx.vehicle)),
+                    (st, t, trail(vehicle)),
+                    now,
+                )
             }
         };
         insert(
@@ -3349,6 +3415,10 @@ const SLOW_LAST_LAP: f64 = 1.1;
 /// are within a second of the player's
 const MOVE_ALONG: f64 = 1.0;
 
+/// What's known of a car for its gap to the player: its standings row, its telemetry row and
+/// where it's been lately.
+type Seen<'a> = (&'a Row, &'a Row, Option<&'a Trail>);
+
 /// How far a car is from the player, each positive when the car is ahead and negative when it's
 /// behind: in the race order (seconds, from the standings, and whole laps of race distance) and on
 /// track. `None` when it isn't known.
@@ -3370,9 +3440,9 @@ impl ToPlayer {
         }
     }
 
-    /// Another car, from its standings and telemetry rows and the player's (`now` being the
-    /// player's latest).
-    fn new(session: &Row, me: (&Row, &Row), car: (&Row, &Row), now: Option<f64>) -> Self {
+    /// Another car, from its standings and telemetry rows and trail and the player's (`now` being
+    /// the player's latest).
+    fn new(session: &Row, me: Seen<'_>, car: Seen<'_>, now: Option<f64>) -> Self {
         let race = is_race(session);
         let length = session
             .f("track_length")
@@ -3385,15 +3455,23 @@ impl ToPlayer {
             if me.0.b("in_garage") || car.0.b("in_garage") {
                 return None;
             }
+            let length = length?;
+            let (mine, theirs) = (along(me.1)?, along(car.1)?);
             // The nearest way round
-            let ahead = (along(car.1)? - along(me.1)?).rem_euclid(1.0);
+            let ahead = (theirs - mine).rem_euclid(1.0);
             let ahead = if ahead > 0.5 { ahead - 1.0 } else { ahead };
-            // At the follower's own pace, so one class's laps never measure another's gap
-            let pace = match ahead >= 0.0 {
-                true => follower_pace(me.0, car.0),
-                false => follower_pace(car.0, me.0),
+            let (leading, following, sign) = match ahead >= 0.0 {
+                true => ((car, theirs), (me, mine), 1.0),
+                false => ((me, mine), (car, theirs), -1.0),
             };
-            Some(ahead * pace?)
+            // How long ago the one in front was where the other is now: measured, so it holds
+            // whatever either car's pace and class
+            let measured = now.zip(leading.0.2).and_then(|(now, trail)| {
+                trail.since_at(now, leading.1 * length, following.1 * length, length)
+            });
+            // Else at the follower's own pace, so one class's laps never measure another's gap
+            let estimated = || Some(ahead.abs() * follower_pace(following.0.0, leading.0.0)?);
+            Some(sign * measured.or_else(estimated)?)
         };
         Self {
             race_gap: race.then(|| race_gap(me.0, car.0)).flatten(),
@@ -4462,7 +4540,7 @@ mod tests {
         // Its own gap to its place ahead says nothing of the player's
         let ahead = standing(&conn, "GT3", 6, (Some(2), Some(22.5)), Some(100.5), None);
         let ahead_lap = on_lap(&conn, 11, 75.0);
-        let to = ToPlayer::new(&race, (&me, &my_lap), (&ahead, &ahead_lap), now);
+        let to = estimated(&race, (&me, &my_lap), (&ahead, &ahead_lap), now);
         assert!(close(to.race_gap, 17.5), "{to:?}");
         assert_eq!(to.race_laps, Some(0));
         // 0.175 laps at the player's (the follower's) 100 s
@@ -4479,7 +4557,7 @@ mod tests {
             Some(79.5),
         );
         let fast_lap = on_lap(&conn, 12, 700.0);
-        let to = ToPlayer::new(&race, (&me, &my_lap), (&fast, &fast_lap), now);
+        let to = estimated(&race, (&me, &my_lap), (&fast, &fast_lap), now);
         // A different number of laps down: no time, rather than a wrong one
         assert_eq!(to.race_gap, None);
         // 12.7 - 10.9 laps of race distance: a whole lap ahead
@@ -4496,7 +4574,7 @@ mod tests {
             Some(108.0),
         );
         let lapped_lap = on_lap(&conn, 8, 850.0);
-        let to = ToPlayer::new(&race, (&me, &my_lap), (&lapped, &lapped_lap), now);
+        let to = estimated(&race, (&me, &my_lap), (&lapped, &lapped_lap), now);
         assert_eq!(to.race_gap, None);
         assert_eq!(to.race_laps, Some(-2));
         assert!(close(to.track_gap, -0.05 * 110.0), "{to:?}");
@@ -4504,7 +4582,7 @@ mod tests {
         // Behind in the race, the same laps down
         let behind = standing(&conn, "GT3", 10, (Some(2), Some(51.0)), Some(101.0), None);
         let behind_lap = on_lap(&conn, 10, 790.0);
-        let to = ToPlayer::new(&race, (&me, &my_lap), (&behind, &behind_lap), now);
+        let to = estimated(&race, (&me, &my_lap), (&behind, &behind_lap), now);
         assert!(close(to.race_gap, -11.0), "{to:?}");
         assert_eq!(to.race_laps, Some(0));
         assert!(close(to.track_gap, -0.11 * 101.0), "{to:?}");
@@ -4526,7 +4604,7 @@ mod tests {
         let practice = session(&conn, "practice");
         let me = standing(&conn, "GT3", 3, (Some(0), Some(2.0)), Some(100.0), None);
         let car = standing(&conn, "GT3", 1, (Some(0), Some(0.0)), Some(98.0), None);
-        let to = ToPlayer::new(
+        let to = estimated(
             &practice,
             (&me, &on_lap(&conn, 4, 100.0)),
             (&car, &on_lap(&conn, 9, 400.0)),
@@ -4561,33 +4639,33 @@ mod tests {
         // No standings, no telemetry
         let empty = columns(&conn, "NULL AS unknown");
         assert_eq!(
-            ToPlayer::new(&race, (&me, &my_lap), (&empty, &empty), now),
+            estimated(&race, (&me, &my_lap), (&empty, &empty), now),
             unknown
         );
         // No time behind the leader, or no laps behind it
         let lap = on_lap(&conn, 3, 600.0);
         for behind in [(Some(0), None), (None, Some(10.0))] {
             let car = standing(&conn, "GT3", 4, behind, Some(100.0), None);
-            let to = ToPlayer::new(&race, (&me, &my_lap), (&car, &lap), now);
+            let to = estimated(&race, (&me, &my_lap), (&car, &lap), now);
             assert_eq!(to.race_gap, None, "{behind:?}");
             assert!(to.track_gap.is_some());
         }
         // A zero that isn't the leader's is a time not given yet
         let car = standing(&conn, "GT3", 4, (Some(0), Some(0.0)), Some(100.0), None);
         assert_eq!(
-            ToPlayer::new(&race, (&me, &my_lap), (&car, &lap), now).race_gap,
+            estimated(&race, (&me, &my_lap), (&car, &lap), now).race_gap,
             None
         );
         // The leader's zero is real
         let leader = standing(&conn, "GT3", 1, (Some(0), Some(0.0)), Some(100.0), None);
-        let to = ToPlayer::new(&race, (&me, &my_lap), (&leader, &lap), now);
+        let to = estimated(&race, (&me, &my_lap), (&leader, &lap), now);
         assert!(close(to.race_gap, 20.0), "{to:?}");
 
         // No lap times for either, or only another class's
         let car = standing(&conn, "GT3", 4, (Some(0), Some(10.0)), None, None);
         let slow = standing(&conn, "GT3", 5, (Some(0), Some(20.0)), None, None);
         assert_eq!(
-            ToPlayer::new(&race, (&slow, &my_lap), (&car, &lap), now).track_gap,
+            estimated(&race, (&slow, &my_lap), (&car, &lap), now).track_gap,
             None
         );
         let other = standing(
@@ -4599,12 +4677,12 @@ mod tests {
             None,
         );
         assert_eq!(
-            ToPlayer::new(&race, (&slow, &my_lap), (&other, &lap), now).track_gap,
+            estimated(&race, (&slow, &my_lap), (&other, &lap), now).track_gap,
             None
         );
         // The same class's will do
         assert!(close(
-            ToPlayer::new(
+            estimated(
                 &race,
                 (&slow, &my_lap),
                 (
@@ -4620,7 +4698,7 @@ mod tests {
         // No track length
         let lengthless = columns(&conn, "'race' AS session_type");
         let car = standing(&conn, "GT3", 4, (Some(0), Some(10.0)), Some(100.0), None);
-        let to = ToPlayer::new(&lengthless, (&me, &my_lap), (&car, &lap), now);
+        let to = estimated(&lengthless, (&me, &my_lap), (&car, &lap), now);
         assert!(close(to.race_gap, 10.0));
         assert_eq!((to.race_laps, to.track_gap), (None, None));
 
@@ -4630,7 +4708,7 @@ mod tests {
             "'GT3' AS vehicle_class, 4 AS position, 100.0 AS last_lap_time, 1 AS in_garage",
         );
         assert_eq!(
-            ToPlayer::new(&race, (&me, &my_lap), (&garaged, &lap), now).track_gap,
+            estimated(&race, (&me, &my_lap), (&garaged, &lap), now).track_gap,
             None
         );
     }
@@ -4648,7 +4726,7 @@ mod tests {
             "499.5 AS session_time, 3 AS lap, 575.0 AS lap_distance, 400.0 AS lap_start_time, \
              50.0 AS speed",
         );
-        let to = ToPlayer::new(&race, (&me, &my_lap), (&car, &old), Some(500.0));
+        let to = estimated(&race, (&me, &my_lap), (&car, &old), Some(500.0));
         assert!(close(to.track_gap, 10.0), "{to:?}");
         // Just over the line, still with the old lap's distance: at the line, not a lap further on
         let crossed = columns(
@@ -4656,7 +4734,7 @@ mod tests {
             "500.0 AS session_time, 4 AS lap, 995.0 AS lap_distance, 499.7 AS lap_start_time, \
              0.0 AS speed",
         );
-        let to = ToPlayer::new(&race, (&me, &my_lap), (&car, &crossed), Some(500.0));
+        let to = estimated(&race, (&me, &my_lap), (&car, &crossed), Some(500.0));
         assert_eq!(to.race_laps, Some(0));
         assert!(close(to.track_gap, 50.0), "{to:?}");
     }
@@ -4672,8 +4750,132 @@ mod tests {
         assert_eq!(pace(Some(130.0), Some(100.0)), Some(100.0));
         assert_eq!(pace(None, Some(100.0)), Some(100.0));
         assert_eq!(pace(Some(-1.0), None), None);
-        let estimated = columns(&conn, "95.0 AS estimated_lap_time");
-        assert_eq!(lap_pace(&estimated), Some(95.0));
+        let estimate = columns(&conn, "95.0 AS estimated_lap_time");
+        assert_eq!(lap_pace(&estimate), Some(95.0));
+    }
+
+    /// The gaps with no trail for either car: estimated on track.
+    fn estimated(session: &Row, me: (&Row, &Row), car: (&Row, &Row), now: Option<f64>) -> ToPlayer {
+        ToPlayer::new(session, (me.0, me.1, None), (car.0, car.1, None), now)
+    }
+
+    /// A car's trail, driving at `speed` m/s round a 1000 m lap from session time `from` to `to`,
+    /// a row every half second, `0` m at `from`.
+    fn trail_at(speed: f64, from: f64, to: f64) -> Trail {
+        let steps = ((to - from) / 0.5).round() as usize;
+        Trail(
+            (0..=steps)
+                .map(|i| {
+                    let t = from + i as f64 * 0.5;
+                    (t, ((t - from) * speed).rem_euclid(1000.0))
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_trail_says_when_the_car_was_at_a_spot() {
+        // 10 m/s from 400 s: 900 m at 490 s
+        let trail = trail_at(10.0, 400.0, 490.0);
+        assert!(close(trail.since_at(490.0, 900.0, 850.0, 1000.0), 5.0));
+        // Between two rows
+        assert!(close(trail.since_at(490.0, 900.0, 852.5, 1000.0), 4.75));
+        // Where it is now, moved along past its last row
+        assert!(close(trail.since_at(490.4, 904.0, 902.0, 1000.0), 0.2));
+        // Across the line: 100 m into its next lap at 510 s, at 950 m on its last at 495 s
+        let trail = trail_at(10.0, 400.0, 510.0);
+        assert!(close(trail.since_at(510.0, 100.0, 950.0, 1000.0), 15.0));
+        // A spot it hasn't been at since its trail began
+        let short = trail_at(10.0, 400.0, 420.0);
+        assert_eq!(short.since_at(420.0, 200.0, 500.0, 1000.0), None);
+        // A hole in its rows where it passed: not a lap earlier instead
+        let mut holed = trail_at(10.0, 300.0, 510.0);
+        holed.0.retain(|(t, _)| !(490.0..=500.0).contains(t));
+        assert_eq!(holed.since_at(510.0, 100.0, 950.0, 1000.0), None);
+        // Its distance jittering back passes nothing, not the rest of the lap
+        let jitter = Trail([(100.0, 500.0), (100.5, 499.0), (101.0, 505.0)].into());
+        assert_eq!(jitter.since_at(101.0, 505.0, 200.0, 1000.0), None);
+        assert!(close(jitter.since_at(101.0, 505.0, 502.0, 1000.0), 0.25));
+    }
+
+    #[test]
+    fn a_trail_keeps_a_row_every_step_for_its_span() {
+        let sample = |t: f64, d: f64| Sample {
+            id: 0,
+            vehicle: 1,
+            is_player: false,
+            session_time: Some(t),
+            lap: Some(0),
+            lap_start: None,
+            lap_distance: Some(d),
+            in_pit: false,
+            invalid: false,
+            speed: None,
+            brake: None,
+            throttle: None,
+            gear: None,
+            fuel: None,
+            energy: None,
+            gap_ahead: None,
+            gap_behind: None,
+        };
+        let mut trail = Trail::default();
+        // A row every 1/16 s: every other one kept
+        for i in 0..=16 {
+            trail.push(&sample(f64::from(i) / 16.0, f64::from(i)));
+        }
+        assert_eq!(trail.0.len(), 9, "{:?}", trail.0);
+        trail.push(&sample(TRAIL_SPAN + 0.5, 0.0));
+        assert_eq!(trail.0.front(), Some(&(0.5, 8.0)));
+        // Without a distance, nothing
+        trail.push(&Sample {
+            lap_distance: None,
+            ..sample(TRAIL_SPAN + 1.0, 0.0)
+        });
+        assert_eq!(trail.0.back(), Some(&(TRAIL_SPAN + 0.5, 0.0)));
+        // Back in time: started over
+        trail.push(&sample(3.0, 30.0));
+        assert_eq!(trail.0, [(3.0, 30.0)]);
+    }
+
+    #[test]
+    fn the_gap_on_track_is_measured_when_the_trail_shows_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        let practice = session(&conn, "practice");
+        let now = Some(500.0);
+        let me = standing(&conn, "GT3", 5, (None, None), Some(100.0), None);
+        let my_lap = on_lap(&conn, 4, 900.0);
+        // A Hypercar 200 m up the road at 80 m/s was where the player is 2.5 s ago, not the 20 s
+        // that 200 m takes at the player's pace
+        let fast = standing(&conn, "Hypercar", 1, (None, None), Some(80.0), None);
+        let fast_lap = on_lap(&conn, 7, 100.0);
+        let fast_trail = Trail([(495.0, 700.0), (497.5, 900.0), (500.0, 100.0)].into());
+        let to = ToPlayer::new(
+            &practice,
+            (&me, &my_lap, None),
+            (&fast, &fast_lap, Some(&fast_trail)),
+            now,
+        );
+        assert!(close(to.track_gap, 2.5), "{to:?}");
+        // Behind, from the player's own trail: the player was where it is 5 s ago
+        let my_trail = Trail([(490.0, 700.0), (495.0, 800.0), (500.0, 900.0)].into());
+        let slow = standing(&conn, "GT3", 6, (None, None), Some(110.0), None);
+        let to = ToPlayer::new(
+            &practice,
+            (&me, &my_lap, Some(&my_trail)),
+            (&slow, &on_lap(&conn, 4, 800.0), None),
+            now,
+        );
+        assert!(close(to.track_gap, -5.0), "{to:?}");
+        // A hole in the trail where it passed: the estimate, at the follower's pace
+        let holed = Trail([(480.0, 700.0), (500.0, 100.0)].into());
+        let to = ToPlayer::new(
+            &practice,
+            (&me, &my_lap, None),
+            (&fast, &fast_lap, Some(&holed)),
+            now,
+        );
+        assert!(close(to.track_gap, 0.2 * 100.0), "{to:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

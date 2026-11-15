@@ -135,9 +135,10 @@ positive when it's ahead of the player, negative when behind, and 0 on the playe
   down on the leader.
 - `race_laps_to_player`: whole laps of race distance between them (2: two laps up on the player;
   0: under a lap apart). Races only; NULL without live telemetry.
-- `track_gap_to_player_s`: seconds on track, the nearest way round the lap, at the follower's own
-  pace, in any session and whatever the race order: a car lapping the player can be just behind.
-  NULL without live telemetry or a lap time.
+- `track_gap_to_player_s`: seconds on track, the nearest way round the lap, in any session and
+  whatever the race order (a car lapping the player can be just behind): how long ago the one in
+  front was where the other is now. Estimated from the distance at the follower's own pace when
+  the recording doesn't show it passing there. NULL without live telemetry, or with neither.
 
 For the next car in the player's class, take the car of the same `vehicle_class` one
 `class_position` ahead and give its `race_gap_to_player_s`. When that's NULL, a car laps ahead has
