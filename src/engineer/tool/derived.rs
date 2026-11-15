@@ -1204,19 +1204,22 @@ const TRAIL_TELEPORT: f64 = 150.0;
 /// Metres a second below which a car is taken as stopped: how long ago a stopped car was somewhere
 /// behind it only says how long it's been stopped
 const MOVING: f64 = 5.0;
+/// Seconds slower than `MOVING` that make a stop on a trail, rather than a row's short step
+const CRAWL: f64 = 1.0;
 
 impl Trail {
     fn push(&mut self, sample: &Sample) {
+        // Stopped (on the grid, after a spin, in its pit box): how long ago it was somewhere
+        // before then says how long it stopped, not how far ahead it is. Whatever else the row
+        // is missing
+        if sample.speed.is_some_and(|v| v < MOVING) {
+            self.0.clear();
+            return;
+        }
         let (Some(t), Some(d)) = (sample.session_time, sample.lap_distance) else {
             return;
         };
         if !(t.is_finite() && d.is_finite()) {
-            return;
-        }
-        // Stopped (on the grid, after a spin, in its pit box): how long ago it was somewhere
-        // before then says how long it stopped, not how far ahead it is
-        if sample.speed.is_some_and(|v| v < MOVING) {
-            self.0.clear();
             return;
         }
         match self.0.back() {
@@ -1245,6 +1248,8 @@ impl Trail {
             return None;
         }
         let mut newer = (now, at);
+        // Seconds slower than a moving car, back to the last row at speed
+        let mut crawl = 0.0;
         // A rival's rows can be newer than the player's: they say nothing of before now
         for &older in self.0.iter().rev().skip_while(|(t, _)| *t > now) {
             let dt = newer.0 - older.0;
@@ -1260,9 +1265,16 @@ impl Trail {
                 if length - step > TRAIL_JITTER {
                     return None;
                 }
-            } else if step > TRAIL_TELEPORT * dt || step < MOVING * dt {
+            } else if step > TRAIL_TELEPORT * dt {
                 return None;
-            } else if step > 0.0 {
+            } else {
+                // A stop, not a row's short step (an estimated distance put right)
+                crawl = if step < MOVING * dt { crawl + dt } else { 0.0 };
+                if crawl >= CRAWL {
+                    return None;
+                }
+            }
+            if step > 0.0 && step <= length / 2.0 {
                 let into = (spot - older.1).rem_euclid(length);
                 if into <= step {
                     return Some(now - (older.0 + dt * into / step));
@@ -2260,10 +2272,11 @@ impl Writer<'_> {
 #[derive(Default)]
 struct Leaders {
     leader: Option<i64>,
-    /// Changes of leader so far
+    /// Changes of leader so far: 0 before any leader's been seen
     changes: u64,
-    /// Each car's last standings row (its id) and how many changes of leader there had been by it
-    rows: HashMap<i64, (i64, u64)>,
+    /// Each car's last standings row (its id and session time) and how many changes of leader
+    /// there had been by it
+    rows: HashMap<i64, (i64, Option<f64>, u64)>,
 }
 
 impl Leaders {
@@ -2271,20 +2284,27 @@ impl Leaders {
         let Some(vehicle) = r.i("vehicle_id") else {
             return;
         };
+        let t = r.f("session_time");
         if r.i("position") == Some(1) && self.leader != Some(vehicle) {
             self.leader = Some(vehicle);
             self.changes += 1;
+            // The rest of its update is against it too, the rows read before the leader's as well
+            for (_, at, changes) in self.rows.values_mut() {
+                if t.is_some() && *at == t {
+                    *changes = self.changes;
+                }
+            }
         }
         if let Some(id) = r.i("id") {
-            self.rows.insert(vehicle, (id, self.changes));
+            self.rows.insert(vehicle, (id, t, self.changes));
         }
     }
 
     /// Whether the two standings rows were written under the same leader, as far as is known.
     fn same(&self, a: &Row, b: &Row) -> bool {
         let under = |r: &Row| {
-            let (id, changes) = self.rows.get(&r.i("vehicle_id")?)?;
-            (r.i("id") == Some(*id)).then_some(*changes)
+            let (id, _, changes) = self.rows.get(&r.i("vehicle_id")?)?;
+            (r.i("id") == Some(*id) && *changes > 0).then_some(*changes)
         };
         under(a).is_some_and(|a| under(b) == Some(a))
     }
@@ -2658,6 +2678,10 @@ impl Stream {
         let length = writer.layout.map(|layout| layout.length);
         for sample in samples {
             let Some(lap) = sample.lap else {
+                // Of no lap, but a stop all the same
+                if let Some(car) = cars.get_mut(&sample.vehicle) {
+                    car.trail.push(sample);
+                }
                 continue;
             };
             let car = cars.entry(sample.vehicle).or_default();
@@ -4943,6 +4967,37 @@ mod tests {
         leaders.read(&mine_later);
         assert!(!leaders.same(&mine_later, &theirs_later));
         assert!(leaders.same(&mine_later, &back));
+
+        // A new leader's row after others of its update: those are against it too
+        let at = |id: i64, vehicle: i64, position: i64, t: f64| {
+            columns(
+                &conn,
+                &format!(
+                    "{id} AS id, {vehicle} AS vehicle_id, {position} AS position, \
+                     {t:?} AS session_time"
+                ),
+            )
+        };
+        let mut leaders = Leaders::default();
+        let (me, them) = (at(2, 1, 5, 100.0), at(3, 3, 4, 100.0));
+        for r in [&at(1, 9, 1, 100.0), &me, &them] {
+            leaders.read(r);
+        }
+        assert!(leaders.same(&me, &them));
+        let (theirs_later, new_leader) = (at(4, 3, 4, 102.0), at(5, 8, 1, 102.0));
+        for r in [&theirs_later, &new_leader] {
+            leaders.read(r);
+        }
+        assert!(!leaders.same(&me, &theirs_later));
+        assert!(leaders.same(&theirs_later, &new_leader));
+
+        // Before any leader's been seen, no two rows are known to be under the same one
+        let mut leaders = Leaders::default();
+        let (me, them) = (at(1, 1, 5, 100.0), at(2, 3, 4, 100.0));
+        for r in [&me, &them] {
+            leaders.read(r);
+        }
+        assert!(!leaders.same(&me, &them));
     }
 
     #[test]
@@ -5022,6 +5077,17 @@ mod tests {
         );
         assert_eq!(paused.since_at(540.0, 400.0, 250.0, 1000.0), None);
         assert!(close(paused.since_at(540.0, 400.0, 375.0, 1000.0), 1.25));
+        // One row's short step, as an estimated distance put right, isn't a stop
+        let corrected = Trail(
+            [
+                (100.0, 500.0),
+                (100.1, 505.0),
+                (100.2, 505.2),
+                (100.3, 510.0),
+            ]
+            .into(),
+        );
+        assert!(close(corrected.since_at(100.3, 510.0, 501.0, 1000.0), 0.28));
         // Reset 100 m back: where it was before isn't where it drove to here
         let reset = Trail(
             [
@@ -5070,6 +5136,14 @@ mod tests {
             ..sample(TRAIL_SPAN + 1.0, 0.0)
         });
         assert_eq!(trail.0.back(), Some(&(TRAIL_SPAN + 0.5, 0.0)));
+        // Unless it's a stop: that counts without a distance too
+        let mut stopped = Trail([(1.0, 10.0), (2.0, 30.0)].into());
+        stopped.push(&Sample {
+            lap_distance: None,
+            speed: Some(0.0),
+            ..sample(3.0, 0.0)
+        });
+        assert!(stopped.0.is_empty());
         // Back in time: started over
         trail.push(&sample(3.0, 30.0));
         assert_eq!(trail.0, [(3.0, 30.0)]);

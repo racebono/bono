@@ -128,7 +128,8 @@ has only its standings. Rivals' rows are slightly older than the player's.
 `time_behind_next_s`, `laps_behind_*`) are each car's own gap to its neighbour or the leader, never
 to the player: another car's row of those never gives the player's gap, and don't subtract them
 across rows. For how far a car is from the player, read that car's row of these three, each
-positive when it's ahead of the player, negative when behind, and 0 on the player's row:
+positive when it's ahead of the player, negative when behind, and always 0 on the player's own
+row; the NULLs below are for the other cars' rows:
 
 - `race_gap_to_player_s`: seconds in the race order. Races only. When the two are under a lap
   apart, how long ago the one ahead in the race was where the other is now, if it drove there
@@ -138,8 +139,8 @@ positive when it's ahead of the player, negative when behind, and 0 on the playe
 - `race_laps_to_player`: whole laps of race distance between them (2: two laps up on the player;
   0: under a lap apart, even if the standings count one more lap down on the leader). Races only;
   NULL without live telemetry, until a lap of each has been seen to end (the opening lap), just
-  past the line while the lap count catches up, and when the race gap is NULL for being out,
-  finished or garaged.
+  past the line while the lap count catches up (or stopped in the pits just past it), and when the
+  race gap is NULL for being out, finished or garaged.
 - `track_gap_to_player_s`: seconds on track, the nearest way round the lap, in any session and
   whatever the race order (a car lapping the player can be just behind): how long ago the one in
   front was where the other is now. Estimated from the distance at the follower's own pace when
@@ -150,7 +151,8 @@ For the next car in the player's class, take the car of the same `vehicle_class`
 `class_position` ahead and give its `race_gap_to_player_s`. When that's NULL, a car laps ahead has
 `race_laps_to_player`; one under a lap ahead (`race_laps_to_player` 0) is `track_gap_to_player_s`
 ahead when that's positive, and over half a lap ahead when it's negative. With those NULL too, the
-gap isn't known: say so.
+gap isn't known: say so. A negative `race_gap_to_player_s` for the car ahead in class means the
+positions are changing: they're side by side.
 
 **`wheels_now`**, one row per car and wheel: `vehicle_id`, `wheel` (0 front left, 1 front right, 2
 rear left, 3 rear right), `wheel_name`; `life_left_pct`, `stint_wear_pct_per_lap`, `compound`,
