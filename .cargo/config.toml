@@ -16,6 +16,11 @@ rustflags = ["-C", "target-feature=+sse4.2,+avx,+avx2,+bmi2,+fma,+f16c"]
 # get built in parallel (CMP0147), so the build step runs before configure has finished.
 # Requires `ninja` on PATH.
 CMAKE_GENERATOR_x86_64_pc_windows_msvc = "Ninja"
+# ggml uses sccache whenever it's on PATH, and MSVC's shared .pdb debug info then fails with
+# C1041. Embed debug info in each object instead (/Z7), which sccache can also cache.
+# whisper-rs-sys passes these to CMake; the policy enables the setting despite ggml's old minimum.
+CMAKE_POLICY_DEFAULT_CMP0141 = "NEW"
+CMAKE_MSVC_DEBUG_INFORMATION_FORMAT = "Embedded"
 # Skip ggml's FlashAttention CUDA kernels, the slowest part of the CUDA build. Whisper only
 # uses them with `flash_attn`, which we leave off (`WhisperContextParameters::default()`)
 GGML_CUDA_FA = "OFF"
