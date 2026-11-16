@@ -1418,7 +1418,7 @@ fn service_details(me: &Row) -> Vec<String> {
     }
     if !choices.is_empty() {
         info.push(format!(
-            "pit service intent only, not completed work: {}",
+            "pit menu for the next stop (not a stop planned, nor work done): {}",
             choices.join(", ")
         ));
     }
@@ -2461,7 +2461,7 @@ mod tests {
             "serving penalty, refueling, front tires",
             "front tires=selected",
             "refueling=unselected",
-            "intent only, not completed work",
+            "pit menu for the next stop (not a stop planned, nor work done)",
             "not proof it is cleared",
             "countdown alone does not authorize leaving",
             "pit_min_duration_left=0.00s",

@@ -119,7 +119,9 @@ simulators report them only for the player), `parts_detached`, `body_damage` (da
 zone around the car, e.g. `front 2, rear_left 1`: 1 some, 2 more, not a fraction; `none` when
 undamaged, NULL when not reported), `last_impact_ago_s`, `last_impact_magnitude`; `in_pit_lane`,
 `in_pits`, `in_garage`, `pit_state`, `pit_stops`, `scheduled_pit_stops`, `pit_services_selected`
-(intent, not work done; `none` when nothing is, NULL when not reported), `pit_services_active`, `pit_min_duration_left_s`; `flag` (blue: being
+(what the pit menu is set to do at the next stop, often by default: not a stop planned, nor
+work done, so don't suggest changing it unless the pilot asks about a stop; `none` when nothing
+is, NULL when not reported), `pit_services_active`, `pit_min_duration_left_s`; `flag` (blue: being
 lapped), `under_yellow`, `finish_status`, `penalties`, `penalty_type`, `penalty_reason`,
 `track_limit_steps`, `track_limit_points_left`, `incident_points`. A car with no recent telemetry
 has only its standings. Rivals' rows are slightly older than the player's.
