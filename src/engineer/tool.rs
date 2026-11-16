@@ -2138,41 +2138,72 @@ fn lap_heat(
 /// measured a gap to on track to be in doubt.
 const NEAREST_DOUBT_M: f64 = 10.0;
 
+/// How fast (m/s) a car whose speed isn't known could be going, for how far off its row can be.
+const UNKNOWN_SPEED: f64 = 100.0;
+
 /// A car on track, from its latest row.
 struct OnTrack {
     vehicle: i64,
     lap_distance: f64,
     session_time: f64,
-    speed: f64,
+    speed: Option<f64>,
 }
 
 /// The car nearest `me` going `forward` (or back) around a lap of `length` m, when it's clear
 /// which: each moved on to `me`'s time at its speed, level cars going by vehicle id (the higher
-/// ahead), as the sims' own order does; none when the next car that way is too close to tell.
+/// ahead), as the sims' own order does. None when it could be the other side of `me`, or another
+/// car could be nearer, for how far off their rows can be.
 fn nearest_on_track(
     me: &OnTrack,
     cars: impl Iterator<Item = OnTrack>,
     length: f64,
     forward: bool,
 ) -> Option<i64> {
-    let mut near = cars
-        .filter_map(|car| {
+    struct Near {
+        vehicle: i64,
+        /// How far it is this way round, and the other: a lap this way for a car level on the
+        /// other side
+        this_way: f64,
+        other_way: f64,
+        /// How far off that can be
+        doubt: f64,
+    }
+    let near = cars
+        .map(|car| {
             let late = me.session_time - car.session_time;
-            let speed = car.speed.max(0.0);
-            let on = (car.lap_distance + speed * late - me.lap_distance).rem_euclid(length);
-            let apart = if forward {
-                on
-            } else {
-                (length - on).rem_euclid(length)
+            let (moved, doubt) = match car.speed {
+                Some(speed) => (speed.max(0.0) * late, speed.max(0.0) * late.abs()),
+                None => (0.0, UNKNOWN_SPEED * late.abs()),
             };
-            let level_this_way = forward == (car.vehicle > me.vehicle);
-            (apart > 0.0 || level_this_way).then_some((apart, speed * late.abs(), car.vehicle))
+            let on = (car.lap_distance + moved - me.lap_distance).rem_euclid(length);
+            let this_way = match forward {
+                true => on,
+                false => (length - on).rem_euclid(length),
+            };
+            let level_other_way = this_way == 0.0 && forward != (car.vehicle > me.vehicle);
+            Near {
+                vehicle: car.vehicle,
+                this_way: if level_other_way { length } else { this_way },
+                other_way: if level_other_way {
+                    0.0
+                } else {
+                    length - this_way
+                },
+                doubt,
+            }
         })
         .collect::<Vec<_>>();
-    near.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let (first, next) = (near.first()?, near.get(1));
-    next.is_none_or(|next| next.0 - first.0 > first.1 + next.1 + NEAREST_DOUBT_M)
-        .then_some(first.2)
+    let first = near
+        .iter()
+        .min_by(|a, b| a.this_way.total_cmp(&b.this_way))?;
+    // Surely this side of `me`, and every other car surely further
+    let this_side = first.this_way > first.doubt || first.doubt == 0.0;
+    let furthest = first.this_way + first.doubt + NEAREST_DOUBT_M;
+    let alone = near.iter().filter(|c| c.vehicle != first.vehicle).all(|c| {
+        // Could it be just this side of `me` after all?
+        c.other_way >= c.doubt && c.this_way - c.doubt > furthest
+    });
+    (this_side && alone).then_some(first.vehicle)
 }
 
 /// The player's gaps to the cars ahead of and behind it on track, as the sim gives them, on the
@@ -2201,14 +2232,14 @@ fn on_track_gaps(
                     vehicle: *v,
                     lap_distance: r.f("lap_distance")?,
                     session_time: r.f("session_time")?,
-                    speed: r.f("speed").unwrap_or(0.0),
+                    speed: r.f("speed"),
                 })
             });
         let me = OnTrack {
             vehicle: ctx.vehicle,
             lap_distance: p.f("lap_distance")?,
             session_time: p.f("session_time")?,
-            speed: 0.0,
+            speed: None,
         };
         nearest_on_track(&me, cars, length?, forward)
     };
@@ -2355,7 +2386,8 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         false => side.join(", "),
     };
     if p.f("position_x").is_none() || p.f("position_z").is_none() {
-        // No world position to place the cars around ours: only the sim's own count alongside
+        // No world position to place the cars around ours: the sim's own count alongside, and
+        // its gaps on track either way
         let alongside = |cars: Option<i64>| match cars {
             None => "not reported".to_owned(),
             Some(0) => "clear".to_owned(),
@@ -2363,9 +2395,10 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         };
         say!(
             out,
-            "TRAFFIC left: {} | right: {} | no car positions from the sim: who else is near isn't known",
+            "TRAFFIC left: {} | right: {}{} | no car positions from the sim: nothing nearer is known",
             alongside(p.i("cars_left")),
-            alongside(p.i("cars_right"))
+            alongside(p.i("cars_right")),
+            on_track_gaps(ctx, sc, &frame, (true, true)).unwrap_or_default()
         );
     } else {
         say!(
@@ -3334,7 +3367,10 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("TRAFFIC left: clear | right: 1 car ALONGSIDE | no car positions"),
+            out.contains(&format!(
+                "TRAFFIC left: clear | right: 1 car ALONGSIDE | on track ahead 20.0s {fischer} \
+                 behind 80.0s {fischer} | no car positions"
+            )),
             "{out}"
         );
         assert!(!out.contains("nobody within 60 m"), "{out}");
@@ -3371,6 +3407,23 @@ mod tests {
             "{out}"
         );
         assert!(!first.contains("80.0s ("), "{out}");
+
+        // A gap to the place ahead only: just the car behind on track; and no tyre rows at all
+        // is no data, not a sim reporting none
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute_batch(
+            "UPDATE telemetry SET gap_to_place_ahead = 1.0 WHERE vehicle_id = 1;
+             DELETE FROM telemetry_wheel;",
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        let first = out.lines().next().unwrap();
+        assert!(first.contains("| on track behind 80.0s"), "{out}");
+        assert!(!first.contains("on track ahead"), "{out}");
+        assert!(out.contains("TYRES no tyre data recorded"), "{out}");
     }
 
     /// The car nearest on track is the sim's next car that way: round the line, each moved on to
@@ -3382,7 +3435,7 @@ mod tests {
             vehicle,
             lap_distance,
             session_time,
-            speed: 50.0,
+            speed: Some(50.0),
         };
         let me = car(5, 990.0, 100.0);
         let near = |cars: Vec<OnTrack>, forward: bool| {
@@ -3398,11 +3451,24 @@ mod tests {
         };
         assert_eq!(near(cars(), true), Some(1));
         assert_eq!(near(cars(), false), Some(2));
-        // A row half a second old, 10 m behind at its time and 15 m ahead now: the car ahead,
-        // not the next one round
-        let moved = || vec![car(1, 980.0, 99.5), car(3, 300.0, 100.0)];
-        assert_eq!(near(moved(), true), Some(1));
-        assert_eq!(near(moved(), false), Some(3));
+        // A row 0.4 s old, 10 m ahead at its time: moved on 20 m, still surely the car ahead
+        let moved = vec![car(1, 0.0, 99.6), car(3, 60.0, 100.0)];
+        assert_eq!(near(moved, true), Some(1));
+        // A row 0.2 s old, 5 m behind at its time and 5 m ahead moved on: it could be either side,
+        // so neither way's nearest is clear
+        let either = || vec![car(1, 985.0, 99.8), car(3, 300.0, 100.0)];
+        assert_eq!(near(either(), true), None);
+        assert_eq!(near(either(), false), None);
+        // A row with no speed is only certain at the player's time
+        let unknown = |session_time: f64| OnTrack {
+            speed: None,
+            ..car(1, 50.0, session_time)
+        };
+        assert_eq!(
+            near(vec![unknown(100.0), car(3, 300.0, 100.0)], true),
+            Some(1)
+        );
+        assert_eq!(near(vec![unknown(99.5), car(3, 75.0, 100.0)], true), None);
         // Level: the higher id ahead, the lower behind
         assert_eq!(
             near(vec![car(7, 990.0, 100.0), car(1, 200.0, 100.0)], true),
