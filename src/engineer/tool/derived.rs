@@ -2374,13 +2374,14 @@ impl Stream {
                 self.standings_t = t;
             }
             // Fewer laps than the car had: another car in the slot. Found here, the standings'
-            // drivers and its cut-off are always in the same session
+            // drivers and its cut-off are always in the same session. iRacing's -1 (no lap
+            // started yet) is no fewer than 0
             if let (Some(vehicle), Some(laps), Some(t)) =
                 (r.i("vehicle_id"), r.i("laps_completed"), t)
                 && self
                     .laps_completed
                     .get(&vehicle)
-                    .is_some_and(|(before, _)| laps < *before)
+                    .is_some_and(|(before, _)| laps.max(0) < (*before).max(0))
             {
                 self.drivers.replaced(vehicle, t);
                 taken_over.insert(vehicle);
@@ -3492,7 +3493,8 @@ fn race_need(
 
     let mut needs = Vec::<(f64, String)>::new();
     if let (Some(max_laps), Some(me)) = (s.i("max_laps").filter(|n| *n != 0), sc.cars.get(&vehicle))
-        && let Some(completed) = me.i("laps_completed")
+        // iRacing's -1 before the line is first crossed: the race's laps are still all to do
+        && let Some(completed) = me.i("laps_completed").map(|laps| laps.max(0))
     {
         // A lapped car finishes when it crosses the line after the leader has done max_laps
         let n = (max_laps - me.i("laps_behind_leader").unwrap_or(0) - completed) as f64 - frac;
