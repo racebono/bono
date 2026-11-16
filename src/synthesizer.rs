@@ -111,6 +111,13 @@ impl Synthesizer {
         self.inner.get(&lang)?.load()
     }
 
+    /// Whether `model`, the voice picked for `lang`, failed to load: picking it again retries.
+    pub fn failed(&self, lang: ArrayStr<2>, model: &Utf8Path) -> bool {
+        self.inner
+            .get(&lang)
+            .is_some_and(|inner| inner.failed(model))
+    }
+
     fn inner(&mut self, rt: &Handle, lang: ArrayStr<2>) -> &SynthesizerInner {
         self.inner
             .entry(lang)
@@ -191,6 +198,8 @@ pub enum VoiceLoad {
 #[derive(Default)]
 struct LoadStatus {
     requested: u64,
+    /// The latest voice given
+    model: Option<Utf8PathBuf>,
     /// `None` until a voice is given
     state: Option<VoiceLoad>,
 }
@@ -229,6 +238,7 @@ impl SynthesizerInner {
         load.requested += 1;
         let loading = model.is_some();
         load.state = loading.then_some(VoiceLoad::Loading);
+        load.model = model.clone();
         let sent = self.model.send(model.map(|model| (load.requested, model)));
         // The worker stopped, so nothing will load it
         if sent.is_err() && loading {
@@ -239,6 +249,12 @@ impl SynthesizerInner {
     /// How the latest voice set loaded: `None` if none was.
     pub fn load(&self) -> Option<VoiceLoad> {
         lock(&self.load).state
+    }
+
+    /// Whether `model` is the voice that last failed to load. One still loading hasn't failed.
+    pub fn failed(&self, model: &Utf8Path) -> bool {
+        let load = lock(&self.load);
+        load.state == Some(VoiceLoad::Failed) && load.model.as_deref() == Some(model)
     }
 
     /// Whether its worker stopped, so it can't load or speak anything.
@@ -1020,6 +1036,42 @@ const fn default_noise_w() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether `done` holds within ten seconds: the worker loads voices in the background.
+    fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn a_voice_that_fails_to_load_is_reported_until_its_picked_again() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| Utf8PathBuf::try_from(dir.path().join(name)).unwrap();
+        let (missing, other) = (path("missing.onnx"), path("other.onnx"));
+
+        let synth = SynthesizerInner::new(rt.handle().clone());
+        assert!(!synth.failed(&missing));
+        synth.set_model(Some(missing.clone()));
+        assert!(wait_until(|| synth.failed(&missing)));
+
+        // Picked again, it fails again. Whether it shows as loading in between isn't checked:
+        // a missing voice fails before a check right after picking it is sure to run
+        synth.set_model(Some(missing.clone()));
+        assert!(wait_until(|| synth.failed(&missing)));
+
+        // Picking another one clears the failure of the one before
+        synth.set_model(Some(other.clone()));
+        assert!(!synth.failed(&missing));
+        assert!(wait_until(|| synth.failed(&other)));
+        assert!(!synth.failed(&missing));
+    }
 
     async fn loaded(inner: &SynthesizerInner) -> Option<VoiceLoad> {
         let deadline = Instant::now() + Duration::from_secs(10);
