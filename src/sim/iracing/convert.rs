@@ -395,7 +395,10 @@ impl Converter {
         if let Some(Some(flag)) = &mut self.flag
             && flag.finish.is_none()
         {
-            flag.finish = flag.leader.and_then(counted).filter(|at| *at >= flag.since);
+            flag.finish = flag
+                .leader
+                .and_then(counted)
+                .filter(|at| *at >= flag.since - FINISH_WINDOW);
         }
         let finished: HashSet<i64> = match &self.flag {
             None => HashSet::new(),
@@ -1397,7 +1400,7 @@ struct CarTrack {
     first_lap_f2: Option<f64>,
     /// Whether the game has given the car a time behind the leader since (see `convert`)
     f2_timed: bool,
-    /// When its lap count last went up
+    /// When its lap count last went up: the crossing it was for, when it was seen driven over
     counted_at: Option<f64>,
     /// In races after the flag, how far it had gone when it finished (see `laps_behind`)
     finish_progress: Option<f64>,
@@ -1604,8 +1607,11 @@ impl CarTrack {
                 _ => self.line = Some((at, at_distance)),
             }
         }
-        if rose {
-            self.counted_at = Some(time);
+        // When the count went up driven over the line: the crossing it's for (worked out between
+        // updates, so cars over the line in one update go in their order), or else now. A count
+        // that came with a move (a reset, a reconnect) isn't a crossing
+        if rose && continuous {
+            self.counted_at = Some(self.lap_start.unwrap_or(time));
         }
         if lap.is_some() {
             self.lap = lap;
@@ -2154,6 +2160,33 @@ mod tests {
         assert_eq!(standing(&cool, 1).1, Some(0));
         assert_eq!(standing(&cool, 0).1, Some(0));
         close(gaps(&cool, 1).0, 3.0);
+    }
+
+    /// Two cars over the line in one update are counted in the order they crossed: a car a lap
+    /// down just ahead of the leader isn't over it after the leader's finish.
+    #[test]
+    fn counts_go_up_in_the_order_cars_crossed() {
+        let (mut lapped, mut leader) = (CarTrack::default(), CarTrack::default());
+        let sectors = [0.0, 0.5];
+        let mut drive = |track: &mut CarTrack, t: f64, pct: f64, lap: i32| {
+            track.update(
+                t,
+                Some(pct),
+                Some(lap),
+                Some(false),
+                None,
+                None,
+                1000.0,
+                &sectors,
+            );
+        };
+        drive(&mut lapped, 1.0, 0.97, 2);
+        drive(&mut leader, 1.0, 0.95, 3);
+        drive(&mut lapped, 2.0, 0.06, 3);
+        drive(&mut leader, 2.0, 0.02, 4);
+        let (lapped, leader) = (lapped.counted_at.unwrap(), leader.counted_at.unwrap());
+        assert!(lapped < leader, "{lapped} {leader}");
+        assert!((lapped - (1.0 + 0.03 / 0.09)).abs() < 1e-6, "{lapped}");
     }
 
     /// A car over the line in the same update as the leader's flag has finished with it.
