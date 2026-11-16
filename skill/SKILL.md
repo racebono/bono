@@ -67,7 +67,10 @@ run, not a race to the flag.
 
 ## The tool
 
-- `quick`: the snapshot again, if time has passed within the turn.
+- `quick`: the snapshot again, if time has passed within the turn. Its gaps ahead and behind are
+  to the places either side; "nobody" there means no car in that place (or no place yet), not an
+  empty track. Without either gap (outside races, or before a place) it adds `on track ahead …
+  behind …`: the cars nearest on track, which may not be racing us for position.
 - `track`: the circuit's description as JSON. Positions are fractions of the lap; multiply by
   `lap_length_m` for metres. They've been lined up with the laps when `calibration` is there; without
   it they can be off, and `borrowed` means they're another simulator's for the same layout, so say
@@ -306,9 +309,11 @@ only cornering or braking). It has no sector yellows:
 `race_state.local_yellow` is NULL (as on any simulator that doesn't say), and
 `cars_now.under_yellow` is the yellow shown to the car. `laps_completed` (and
 `leader_laps_completed`) is -1 until the car first crosses the line after getting in (its out lap,
-or before the start): no lap is done yet, and it then steps from -1 to 0. Tyre wear and carcass
-temperatures aren't reported (iRacing doesn't update them on track): judge the tyres from surface
-temperatures, pressures and lap times, and say wear isn't known.
+or before the start): no lap is done yet, and it then steps from -1 to 0. While driving, iRacing
+reports no tyre temperatures, pressures or wear, and no ride heights: say they aren't known, and
+judge the tyres from lap times and the car's balance. With no car positions, the snapshot's
+`TRAFFIC` only has iRacing's count of cars alongside: for how far the nearest cars are, use the
+gaps on track (`cars_now.gap_car_ahead_s` and `gap_car_behind_s`).
 The best lap is `cars_now.best_lap_s`, iRacing's own, which leaves out laps it doesn't count: a
 quicker `lap_stats` time may be one of those. Don't call such a lap invalid (iRacing doesn't say
 why), and don't call any lap valid: iRacing doesn't report lap validity.

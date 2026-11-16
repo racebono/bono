@@ -2134,6 +2134,47 @@ fn lap_heat(
 
 // --------------------------------------------------------------------------- quick (urgent)
 
+/// The player's gaps to the cars ahead of and behind it on track, as the sim gives them, each
+/// with the car nearest that way around the lap (cars in the pit lane aren't on track); None
+/// when the sim gives neither gap.
+fn on_track_gaps(ctx: &Ctx, sc: &Scoring, frame: &BTreeMap<i64, Row>) -> Option<String> {
+    let p = &ctx.player;
+    let (ahead, behind) = (p.f("gap_to_car_ahead"), p.f("gap_to_car_behind"));
+    if ahead.is_none() && behind.is_none() {
+        return None;
+    }
+    let length = sc
+        .session
+        .as_ref()
+        .and_then(|s| s.f("track_length"))
+        .filter(|l| *l > 0.0);
+    let nearest = |forward: bool| -> Option<i64> {
+        let (length, at) = (length?, p.f("lap_distance")?);
+        frame
+            .iter()
+            .filter(|(v, r)| **v != ctx.vehicle && !r.b("in_pit_lane"))
+            .filter_map(|(v, r)| {
+                let apart = (r.f("lap_distance")? - at).rem_euclid(length);
+                let apart = if forward { apart } else { length - apart };
+                Some((apart, *v)).filter(|(apart, _)| 0.0 < *apart && *apart < length)
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, v)| v)
+    };
+    let side = |gap: Option<f64>, forward: bool| match gap {
+        None => "-s".to_owned(),
+        Some(gap) => format!(
+            "{gap:.1}s{}",
+            nearest(forward).map_or(String::new(), |v| format!(" ({})", sc.label(v)))
+        ),
+    };
+    Some(format!(
+        " | on track ahead {} behind {}",
+        side(ahead, true),
+        side(behind, false)
+    ))
+}
+
 /// Everything urgent from the latest logger frame only: a handful of indexed lookups.
 fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     let p = &ctx.player;
@@ -2145,10 +2186,15 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     let ahead = pos.and_then(|p| at_place(&place, p.checked_sub(1)?));
     let behind = pos.and_then(|p| at_place(&place, p + 1));
     let age = staleness(&ctx.shared.path);
+    // No gap to either place (outside races, or before a place): the cars either side on track
+    let on_track = match (p.f("gap_to_place_ahead"), p.f("gap_to_place_behind")) {
+        (None, None) => on_track_gaps(ctx, sc, &frame),
+        _ => None,
+    };
 
     say!(
         out,
-        "QUICK lap {} S{} | delta {}{} | {}/{} | gap ahead {}s ({}) behind {}s ({}){}",
+        "QUICK lap {} S{} | delta {}{} | {}/{} | gap ahead {}s ({}) behind {}s ({}){}{}",
         int(p.i("lap")),
         p.i("sector").unwrap_or(0) + 1,
         fmt(p.f("delta_best"), 2, "s"),
@@ -2164,6 +2210,7 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         ahead.map_or("nobody".into(), |v| sc.label(v)),
         fmt(p.f("gap_to_place_behind"), 1, ""),
         behind.map_or("nobody".into(), |v| sc.label(v)),
+        on_track.unwrap_or_default(),
         age.map(|age| format!(
             " | data {age:.0}s old{}",
             if age > 10.0 { " STALE" } else { "" }
@@ -2247,24 +2294,39 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         true => "clear".into(),
         false => side.join(", "),
     };
-    say!(
-        out,
-        "TRAFFIC left: {} | right: {}{}",
-        clear(&left),
-        clear(&right),
-        match others.is_empty() {
-            true => " | nobody within 60 m".into(),
-            false => format!(
-                " | {}",
-                others
-                    .iter()
-                    .take(3)
-                    .map(|(_, text)| text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ),
-        }
-    );
+    if p.f("position_x").is_none() || p.f("position_z").is_none() {
+        // No world position to place the cars around ours: only the sim's own count alongside
+        let alongside = |cars: Option<i64>| match cars {
+            None => "not reported".to_owned(),
+            Some(0) => "clear".to_owned(),
+            Some(n) => format!("{n} car{} ALONGSIDE", if n == 1 { "" } else { "s" }),
+        };
+        say!(
+            out,
+            "TRAFFIC left: {} | right: {} | no car positions from the sim: who else is near isn't known",
+            alongside(p.i("cars_left")),
+            alongside(p.i("cars_right"))
+        );
+    } else {
+        say!(
+            out,
+            "TRAFFIC left: {} | right: {}{}",
+            clear(&left),
+            clear(&right),
+            match others.is_empty() {
+                true => " | nobody within 60 m".into(),
+                false => format!(
+                    " | {}",
+                    others
+                        .iter()
+                        .take(3)
+                        .map(|(_, text)| text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            }
+        );
+    }
 
     let ve = match p.f("virtual_energy") {
         None => "-".into(),
@@ -2296,13 +2358,24 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         .filter_map(|w| Some(fmt(wheels.get(&w)?.f("tire_pressure"), 0, "")))
         .collect::<Vec<_>>()
         .join("/");
-    say!(
-        out,
-        "TYRES centre temp C: {temps}{} | pressure kPa FL/FR/RL/RR {pressures}",
-        optimal
-            .map(|o| format!(" (optimal {o:.0})"))
-            .unwrap_or_default()
-    );
+    let reported = wheels.values().any(|r| {
+        r.f("tire_surface_temperature_center").is_some() || r.f("tire_pressure").is_some()
+    });
+    if reported {
+        say!(
+            out,
+            "TYRES centre temp C: {temps}{} | pressure kPa FL/FR/RL/RR {pressures}",
+            optimal
+                .map(|o| format!(" (optimal {o:.0})"))
+                .unwrap_or_default()
+        );
+    } else {
+        // Not "-" a wheel, which reads as not yet received
+        say!(
+            out,
+            "TYRES temperatures and pressures not reported by the sim"
+        );
+    }
 
     let mut alerts = Vec::new();
     if p.b("in_pit_lane") {
@@ -3086,6 +3159,74 @@ mod tests {
         );
         assert!(out.contains("SESSION race | green"), "{out}");
         assert!(out.contains("ALERTS (act now) none"), "{out}");
+    }
+
+    /// Without gaps to the places either side (outside races, or before a place), the snapshot
+    /// gives the sim's gaps on track, naming the car nearest each way round the lap; and a sim
+    /// with no car positions has no traffic within 60 m to claim clear, only its count alongside.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quick_gives_the_gaps_on_track_without_place_gaps() {
+        let (dir, engineer) = race();
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(!out.contains("on track ahead"), "{out}");
+        drop(engineer);
+
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute_batch(
+            "UPDATE telemetry SET gap_to_car_ahead = 20.0, gap_to_car_behind = 80.0,
+                 position_x = NULL, position_z = NULL, cars_left = 0, cars_right = 1
+                 WHERE vehicle_id = 1;
+             UPDATE telemetry SET lap_distance = lap_distance + 200.0 WHERE vehicle_id = 2;
+             UPDATE telemetry_wheel SET tire_surface_temperature_center = NULL,
+                 tire_pressure = NULL;",
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(
+            out.contains("TYRES temperatures and pressures not reported by the sim"),
+            "{out}"
+        );
+        let fischer = "(driver=\"Lena Fischer\" (class=\"Hypercar\", car 2))";
+        assert!(
+            out.contains(&format!(
+                "| on track ahead 20.0s {fischer} behind 80.0s {fischer}"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("TRAFFIC left: clear | right: 1 car ALONGSIDE | no car positions"),
+            "{out}"
+        );
+        assert!(!out.contains("nobody within 60 m"), "{out}");
+
+        // A gap to a place: that, not the cars on track; and a car in the pit lane is no
+        // car on track
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute_batch("UPDATE telemetry SET gap_to_place_behind = 0.3 WHERE vehicle_id = 1;")
+            .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(!out.contains("on track ahead"), "{out}");
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute_batch(
+            "UPDATE telemetry SET gap_to_place_behind = NULL WHERE vehicle_id = 1;
+             UPDATE telemetry SET in_pit_lane = 1 WHERE vehicle_id = 2;",
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        let first = out.lines().next().unwrap();
+        assert!(
+            first.contains("| on track ahead 20.0s behind 80.0s"),
+            "{out}"
+        );
+        assert!(!first.contains("80.0s ("), "{out}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
