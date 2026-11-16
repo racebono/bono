@@ -324,11 +324,15 @@ the laps' life are NULL). Cold pressures (`cold_pressure_kpa`) are the garage se
 running pressures. Judge the tyres now from lap times and the car's balance. With no car positions,
 the snapshot's `TRAFFIC` only has iRacing's count of cars alongside: for how far the nearest cars
 are, use the gaps on track (`cars_now.gap_car_ahead_s` and `gap_car_behind_s`).
+`time_behind_leader_s` is as of each car's last time over the line, and NULL until it has finished
+a lap; the gaps to the places either side are live between cars less than a lap apart.
 The best lap is `cars_now.best_lap_s`, iRacing's own, which leaves out laps it doesn't count: a
 quicker `lap_stats` time may be one of those. Don't call such a lap invalid (iRacing doesn't say
 why), and don't call any lap valid: iRacing doesn't report lap validity.
 Body repair in `pit_services_selected` is iRacing's fast repair: without it a stop still repairs
-the car, only slower.
+the car, only slower. iRacing gives no fuel per lap of its own: `game_fuel_per_lap_l` is the fuel
+used over the last lap's distance driven, so slow or yellow running lowers it, and it's NULL until
+a lap has been driven since the pit lane, a tow or reset, or taking on fuel.
 
 ## Evidence that fits the question
 

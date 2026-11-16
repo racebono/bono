@@ -160,7 +160,7 @@
     X(i64, push_to_pass_activations_total) \
     /* Fuel */                                                                                           \
     X(f64, fuel_capacity)                   /* liters */                                                 \
-    X(f64, fuel_per_lap)                    /* liters, the simulator's own estimate */                   \
+    X(f64, fuel_per_lap)                    /* liters, the simulator's own estimate (iRacing: Bono's) */ \
     X(f64, virtual_energy_per_lap)          /* fraction of a full tank, the simulator's estimate */      \
     /* Chassis and aerodynamics */                                                                       \
     X(i64, rear_flap_status)                /* 0 not allowed, 1 detected but not allowed yet, 2 allowed */ \

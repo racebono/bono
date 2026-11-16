@@ -43,7 +43,10 @@ use super::{
 use crate::sim::memory::{SCORING_EVERY, Update};
 use bono_sim::sys::{bono_session_info, bono_standing, bono_telemetry};
 use serde_json::{Map, Value, json};
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    time::Instant,
+};
 
 /// `irsdk_TrkLoc`
 const NOT_IN_WORLD: i32 = -1;
@@ -116,6 +119,8 @@ const MAX_GAP: f64 = 5.0;
 const BEST_LAP_WINDOW: f64 = 5.0;
 /// How many of each car's last whole laps are kept, to find its best among.
 const RECENT_LAPS: usize = 4;
+/// More fuel than this (litres) than at the update before, the car took fuel on.
+const REFUELLED: f64 = 0.05;
 
 /// What tells events apart: the session info's track, session and sub-session ids, and the track.
 type Event = ((Option<i64>, Option<i64>, Option<i64>), Option<String>);
@@ -168,10 +173,16 @@ struct Car<'a> {
 }
 
 impl Car<'_> {
-    /// Race time behind the leader. 0 is also what the game gives a car it hasn't timed yet (before
-    /// it's crossed the line): only the leader's is a time.
+    /// Race time behind the leader, as of the car's last time over the line. Before a car has
+    /// finished a lap, the game's figure isn't a time yet (0, or a thousandth of a second or so a
+    /// place): only the leader's is, its own 0.
     fn race_time(&self) -> Option<f64> {
-        self.f2.filter(|t| *t > 0.0 || self.position == Some(1))
+        match self.position == Some(1) {
+            true => self.f2,
+            false => self
+                .f2
+                .filter(|t| *t > 0.0 && self.laps_completed.is_some_and(|laps| laps >= 1)),
+        }
     }
 
     /// How far it's gone in laps, for laps behind.
@@ -316,7 +327,16 @@ impl Converter {
             .collect();
 
         let gaps = track_gaps(&cars);
-        let places = place_gaps(&cars, race);
+        let before_green = frame
+            .i32("SessionState")
+            .is_some_and(|state| (STATE_GET_IN_CAR..STATE_RACING).contains(&state));
+        let places = place_gaps(&cars, race, !before_green);
+        let fuel_per_lap = player.and_then(|p| {
+            let fuel = frame.f64("FuelLevel").filter(|l| *l >= 0.0);
+            self.cars
+                .get_mut(&p)?
+                .fuel_per_lap(fuel, frame.bool("OnPitRoad"))
+        });
 
         let mut telemetry = Vec::with_capacity(cars.len());
         for car in cars.iter().filter(|car| car.pct.is_some()) {
@@ -362,6 +382,7 @@ impl Converter {
                 for (wheel, reading) in out.wheels.iter_mut().zip(readings) {
                     wheel.tire_reading_time = reading.into();
                 }
+                out.state.fuel_per_lap = fuel_per_lap.into();
             }
             telemetry.push(out);
         }
@@ -1118,9 +1139,15 @@ fn follow_gap(behind: &Car<'_>, ahead: &Car<'_>) -> Option<f64> {
     apart
 }
 
-/// In races, each car's gaps to the places ahead and behind, in seconds, from the game's time
-/// behind the leader.
-fn place_gaps(cars: &[Car<'_>], race: bool) -> HashMap<i64, (Option<f64>, Option<f64>)> {
+/// In races, each car's gaps to the places ahead and behind, in seconds. Once racing (`green`),
+/// between cars less than a lap apart it's how long the one behind takes to get where the other is
+/// (see `follow_gap`): the game's times behind the leader are only as of each car's last time
+/// over the line. Further apart, or without that, it's the difference in those times.
+fn place_gaps(
+    cars: &[Car<'_>],
+    race: bool,
+    green: bool,
+) -> HashMap<i64, (Option<f64>, Option<f64>)> {
     let mut gaps = HashMap::new();
     if !race {
         return gaps;
@@ -1129,17 +1156,24 @@ fn place_gaps(cars: &[Car<'_>], race: bool) -> HashMap<i64, (Option<f64>, Option
         .iter()
         .filter_map(|car| Some((car.position?, car)))
         .collect();
+    let gap = |ahead: &Car<'_>, behind: &Car<'_>| {
+        let within_a_lap = matches!(
+            (ahead.progress(), behind.progress()),
+            (Some(a), Some(b)) if (0.0..1.0).contains(&(a - b))
+        );
+        (green && within_a_lap)
+            .then(|| follow_gap(behind, ahead))
+            .flatten()
+            .or_else(|| Some(behind.race_time()? - ahead.race_time()?).filter(|gap| *gap >= 0.0))
+    };
     for car in cars {
         let Some(place) = car.position else {
             continue;
         };
-        let gap = |ahead: Option<&&Car<'_>>, behind: &Car<'_>| {
-            Some(behind.race_time()? - ahead?.race_time()?).filter(|gap| *gap >= 0.0)
-        };
-        let ahead = gap(by_place.get(&(place - 1)), car);
+        let ahead = by_place.get(&(place - 1)).and_then(|ahead| gap(ahead, car));
         let behind = by_place
             .get(&(place + 1))
-            .and_then(|behind| gap(Some(&car), behind));
+            .and_then(|behind| gap(car, behind));
         gaps.insert(car.idx, (ahead, behind));
     }
     gaps
@@ -1193,9 +1227,51 @@ struct CarTrack {
     pit_state: Option<&'static str>,
     /// Whether the car was seen to have push to pass (on, or some count) this session
     push_to_pass_seen: bool,
+    /// Whether its last update was driven from the one before (not moved, nor out of the world)
+    driven: bool,
+    /// The player's fuel (litres) at its `distance`, over the last lap's distance driven: since
+    /// it last left the pit lane, was moved or took on fuel
+    fuel_window: VecDeque<(f64, f64)>,
 }
 
 impl CarTrack {
+    /// The fuel (litres) the player's car used over the last lap's distance it drove, once it has
+    /// driven a whole lap since it last left the pit lane, was moved or took on fuel. iRacing gives
+    /// no figure of its own. Called after `update`, with the same update's fuel.
+    fn fuel_per_lap(&mut self, fuel: Option<f64>, on_pit_road: Option<bool>) -> Option<f64> {
+        let Some(fuel) = fuel.filter(|_| self.driven && on_pit_road == Some(false)) else {
+            self.fuel_window.clear();
+            return None;
+        };
+        // Fuel taken on: the distance before it burned other fuel
+        if self
+            .fuel_window
+            .back()
+            .is_some_and(|(_, last)| fuel > last + REFUELLED)
+        {
+            self.fuel_window.clear();
+        }
+        let distance = self.distance;
+        // Standing still adds no distance: the fuel there is the first seen at it
+        if self.fuel_window.back().is_none_or(|(d, _)| distance > *d) {
+            self.fuel_window.push_back((distance, fuel));
+        }
+        let from = distance - 1.0;
+        while self.fuel_window.get(1).is_some_and(|(d, _)| *d <= from) {
+            self.fuel_window.pop_front();
+        }
+        let &(d0, f0) = self.fuel_window.front()?;
+        if d0 > from {
+            return None;
+        }
+        // The fuel a lap back, between the samples either side of it
+        let then = match self.fuel_window.get(1) {
+            Some(&(d1, f1)) if d1 > d0 => f0 + (f1 - f0) * (from - d0) / (d1 - d0),
+            _ => f0,
+        };
+        Some((then - fuel).max(0.0))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn update(
         &mut self,
@@ -1242,6 +1318,7 @@ impl CarTrack {
             self.on_pit_road = None;
             self.visit = None;
             self.pit_state = None;
+            self.driven = false;
             return;
         };
 
@@ -1264,6 +1341,7 @@ impl CarTrack {
                     && dp * length >= -MAX_BACK
                     && dp * length <= MAX_SPEED * dt + MAX_JUMP
             });
+        self.driven = continuous;
         let (before, furthest) = (self.distance, self.furthest);
         // How far along the update a boundary at `boundary` was crossed, and when: driven over
         // it, from just past where the car was (where it was is the update before's crossing),
@@ -1680,8 +1758,54 @@ mod tests {
         assert!((follow_gap(&car(0.2, 18.0), &car(0.3, 27.5)).unwrap() - 9.5).abs() < 1e-9);
     }
 
-    /// Before a race's green the places are the grid's; and a car the game hasn't timed yet (0 behind
-    /// the leader, before it's crossed the line) has no gaps rather than none at all.
+    /// Once racing, the gap to the place ahead is live between cars less than a lap apart, not the
+    /// game's times behind the leader (as of each car's last time over the line); a lap or more
+    /// apart, or before the green, it's those times.
+    #[test]
+    fn place_gaps_are_live_within_a_lap() {
+        let driver = super::super::session::Driver {
+            class_id: Some(1),
+            class_lap_time: Some(90.0),
+            ..Default::default()
+        };
+        let car = |idx: i64, position: i64, laps: i64, pct: f64, est: f64, f2: f64| Car {
+            idx,
+            driver: &driver,
+            pct: Some(pct),
+            on_pit_road: Some(false),
+            laps_completed: Some(laps),
+            lap_offset: 0,
+            position: Some(position),
+            class_position: Some(position),
+            est: Some(est),
+            f2: Some(f2),
+        };
+        // The leader at 60% of lap 3, the next car at 50% of it (9 s back by the estimates, 2 s at
+        // the line), the third over a lap down (91 s back at the line)
+        let cars = [
+            car(0, 1, 3, 0.6, 54.0, 0.0),
+            car(1, 2, 3, 0.5, 45.0, 2.0),
+            car(2, 3, 2, 0.45, 40.5, 91.0),
+        ];
+        let gaps = place_gaps(&cars, true, true);
+        let (ahead, behind) = gaps[&1];
+        assert!(
+            ahead.is_some_and(|gap| (gap - 9.0).abs() < 1e-9),
+            "{ahead:?}"
+        );
+        assert!(
+            behind.is_some_and(|gap| (gap - 89.0).abs() < 1e-9),
+            "{behind:?}"
+        );
+        assert_eq!(gaps[&0].0, None);
+        // Before the green: the game's times
+        assert_eq!(place_gaps(&cars, true, false)[&1].0, Some(2.0));
+        // Not a race: none
+        assert!(place_gaps(&cars, false, true).is_empty());
+    }
+
+    /// Before a race's green the places are the grid's; and a car that hasn't finished a lap (the
+    /// game's time behind the leader not a time yet) has no gaps rather than its placeholder.
     #[test]
     fn races_start_from_the_grid_and_untimed_cars_have_no_gaps() {
         use super::super::sdk::{Value, Vars};
@@ -1699,22 +1823,23 @@ mod tests {
             qualifying: HashMap::from([(2, 1), (0, 2), (1, 3)]),
             ..Default::default()
         };
-        let update = |info: &SessionInfo, state: i32, places: [i32; 3], behind: [f64; 3]| {
-            let (vars, data) = Vars::of(&[
-                ("SessionTime", Value::Double(10.0)),
-                ("SessionNum", Value::Int(0)),
-                ("SessionState", Value::Int(state)),
-                ("PlayerCarIdx", Value::Int(0)),
-                ("CarIdxLapDistPct", Value::Doubles(vec![0.5, 0.4, 0.6])),
-                ("CarIdxLapCompleted", Value::Ints(vec![0, 0, 0])),
-                ("CarIdxPosition", Value::Ints(places.to_vec())),
-                ("CarIdxClassPosition", Value::Ints(places.to_vec())),
-                ("CarIdxF2Time", Value::Doubles(behind.to_vec())),
-            ]);
-            Converter::default()
-                .convert(&Frame::new(&vars, &data), info, Instant::now())
-                .unwrap()
-        };
+        let update =
+            |info: &SessionInfo, state: i32, places: [i32; 3], behind: [f64; 3], laps: i32| {
+                let (vars, data) = Vars::of(&[
+                    ("SessionTime", Value::Double(10.0)),
+                    ("SessionNum", Value::Int(0)),
+                    ("SessionState", Value::Int(state)),
+                    ("PlayerCarIdx", Value::Int(0)),
+                    ("CarIdxLapDistPct", Value::Doubles(vec![0.5, 0.4, 0.6])),
+                    ("CarIdxLapCompleted", Value::Ints(vec![laps; 3])),
+                    ("CarIdxPosition", Value::Ints(places.to_vec())),
+                    ("CarIdxClassPosition", Value::Ints(places.to_vec())),
+                    ("CarIdxF2Time", Value::Doubles(behind.to_vec())),
+                ]);
+                Converter::default()
+                    .convert(&Frame::new(&vars, &data), info, Instant::now())
+                    .unwrap()
+            };
         let standing = |update: &Update, car: i64| {
             let (_, standings) = update.scoring.as_ref().unwrap();
             let row = standings
@@ -1737,7 +1862,7 @@ mod tests {
         };
 
         // On the parade laps: the grid, and nobody's timed but the leader
-        let parade = update(&info, STATE_PARADE_LAPS, [0; 3], [0.0; 3]);
+        let parade = update(&info, STATE_PARADE_LAPS, [0; 3], [0.0; 3], 0);
         assert_eq!(standing(&parade, 2), (Some(1), Some(1), Some(0.0)));
         let (_, standings) = parade.scoring.as_ref().unwrap();
         assert!(
@@ -1749,16 +1874,16 @@ mod tests {
         assert_eq!(standing(&parade, 1), (Some(3), Some(3), None));
         assert_eq!(ahead(&parade, 0), None);
 
-        // Green, the game's places, but no lap timed yet: no gaps (not 0)
-        let green = update(&info, STATE_RACING, [2, 3, 1], [0.0; 3]);
+        // Green, the game's places, but no lap done yet: no gaps (not its placeholder)
+        let green = update(&info, STATE_RACING, [2, 3, 1], [0.001, 0.002, 0.0], 0);
         assert_eq!(standing(&green, 0), (Some(2), Some(2), None));
         assert_eq!((ahead(&green, 0), ahead(&green, 1)), (None, None));
         // Over the line
-        let timed = update(&info, STATE_RACING, [2, 3, 1], [1.5, 3.0, 0.0]);
+        let timed = update(&info, STATE_RACING, [2, 3, 1], [1.5, 3.0, 0.0], 1);
         assert_eq!(standing(&timed, 0), (Some(2), Some(2), Some(1.5)));
         assert_eq!((ahead(&timed, 0), ahead(&timed, 1)), (Some(1.5), Some(1.5)));
         // After the green, a car without a place has none, not the grid's
-        let unplaced = update(&info, STATE_RACING, [0, 3, 1], [1.5, 3.0, 0.0]);
+        let unplaced = update(&info, STATE_RACING, [0, 3, 1], [1.5, 3.0, 0.0], 1);
         assert_eq!(standing(&unplaced, 0).0, None);
 
         // Heats then a feature: their grids aren't qualifying's, so no places before the green
@@ -1768,14 +1893,58 @@ mod tests {
             number: 2,
             results: HashMap::new(),
         });
-        let heat = update(&info, STATE_PARADE_LAPS, [0; 3], [0.0; 3]);
+        let heat = update(&info, STATE_PARADE_LAPS, [0; 3], [0.0; 3], 0);
         assert_eq!(standing(&heat, 2), (None, None, None));
         info.sessions.pop();
 
         // The game placing a car already: its places only, none of the grid's beside them
-        let some = update(&info, STATE_PARADE_LAPS, [1, 0, 0], [0.0; 3]);
+        let some = update(&info, STATE_PARADE_LAPS, [1, 0, 0], [0.0; 3], 0);
         assert_eq!(standing(&some, 0).0, Some(1));
         assert_eq!((standing(&some, 1).0, standing(&some, 2).0), (None, None));
+    }
+
+    /// The fuel per lap is the fuel used over the last lap's distance driven: none until a whole
+    /// lap's been driven, and none again after the pit lane, a move or taking on fuel.
+    #[test]
+    fn fuel_per_lap_is_the_last_laps_distance() {
+        let close = |got: Option<f64>, want: f64| {
+            assert!(got.is_some_and(|got| (got - want).abs() < 1e-9), "{got:?}");
+        };
+        let mut track = CarTrack {
+            driven: true,
+            ..CarTrack::default()
+        };
+        let on_track = Some(false);
+        // 2 l a lap, read every tenth of a lap: a lap's worth once a lap's been driven
+        let drive = |track: &mut CarTrack, from: f64, tenths: usize, per_lap: f64, fuel: f64| {
+            let mut out = Vec::new();
+            for i in 0..=tenths {
+                track.distance = from + i as f64 * 0.1;
+                out.push(track.fuel_per_lap(Some(fuel - per_lap * i as f64 * 0.1), on_track));
+            }
+            out
+        };
+        let out = drive(&mut track, 0.0, 15, 2.0, 50.0);
+        assert!(out[..10].iter().all(Option::is_none), "{out:?}");
+        close(out[10], 2.0);
+        // Mid-sample a lap back, it's worked out between the samples either side
+        track.distance = 1.55;
+        close(track.fuel_per_lap(Some(50.0 - 2.0 * 1.55), on_track), 2.0);
+        // Thirstier running: the window follows
+        let out = drive(&mut track, 1.6, 10, 3.0, 50.0 - 2.0 * 1.6);
+        close(out[10], 3.0);
+
+        // Taking on fuel, the pit lane and a move each start again
+        let out = drive(&mut track, 2.7, 10, 2.0, 80.0);
+        assert!(out[..10].iter().all(Option::is_none), "{out:?}");
+        close(out[10], 2.0);
+        assert_eq!(track.fuel_per_lap(Some(60.0), Some(true)), None);
+        track.distance += 0.1;
+        assert_eq!(track.fuel_per_lap(Some(59.9), on_track), None);
+        track.driven = false;
+        assert_eq!(track.fuel_per_lap(Some(59.8), on_track), None);
+        assert!(track.fuel_window.is_empty());
+        assert_eq!(track.fuel_per_lap(None, on_track), None);
     }
 
     /// Fast repair alone in the pit menu is a service selected, not none; unticked, it's no word on
