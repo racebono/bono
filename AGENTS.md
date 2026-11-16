@@ -56,14 +56,15 @@ including the 260-character limit in some native build tools. `cargo check` and
 - For example, in PowerShell, if `D:\bt\bono-t3` is writable and reserved for this
   checkout:
 
-  ```powershell
-  $env:CARGO_TARGET_DIR = 'D:\bt\bono-t3'
-  cargo build -p bono
-  cargo test -p bono --no-default-features
-  ```
+    ```powershell
+    $env:CARGO_TARGET_DIR = 'D:\bt\bono-t3'
+    cargo build -p bono
+    cargo test -p bono --no-default-features
+    ```
 
-  These are examples of target-directory setup; select packages and features for
-  the task and installed SDKs as described in `README.md`.
+    These are examples of target-directory setup; select packages and features for
+    the task and installed SDKs as described in `README.md`.
+
 - Keep the repository's Ninja configuration in `.cargo/config.toml` and ensure
   Ninja is on `PATH`. It avoids the known MSBuild FileTracker path-length issue
   in Whisper's Vulkan build; do not switch to MSBuild to work around a failure.
@@ -98,3 +99,9 @@ references and evals. Do not cite observed incidents, dates, sessions, quoted
 model answers, or pass/fail outcomes from real or test runs. Describe the
 behavior to follow and the scenarios to evaluate in general terms; record
 specific results in commit messages, pull requests, or issues instead.
+
+## Pull Requests
+
+- Conventional commit titles, plain language: `fix(web): new threads no longer spike CPU`.
+- UI changes need before/after images. Motion or timing needs a short video.
+- Upload PR evidence to GitHub. Never commit PR-only screenshots or assets such as `.github/pr-assets/`.

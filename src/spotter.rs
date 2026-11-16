@@ -1,6 +1,7 @@
 //! The spotter: follows the running simulator's telemetry about thirty times a second and calls
 //! cars alongside, flags, the car's own alerts and the weather the moment they happen, without
-//! anyone asking. A port of my-engineer's `spotter.cpp`.
+//! anyone asking (and, if asked to, the pilot's lap times in qualifying). A port of my-engineer's
+//! `spotter.cpp`.
 //!
 //! It reads the database on a thread of its own, with a read-only connection of its own (closed as
 //! soon as the game stops, so the plugin can delete the file), and turns what changed into calls.
@@ -41,11 +42,21 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(200);
 /// How long a call is still worth saying.
 const URGENT_FOR: Duration = Duration::from_millis(1500);
 const OTHER_FOR: Duration = Duration::from_secs(10);
+/// A lap's time is still news well into the next lap, after an engineer's long answer
+const LAP_TIME_FOR: Duration = Duration::from_secs(30);
 const WARM_RETRY_AFTER: Duration = Duration::from_secs(5);
 /// A gap behind called this close is "close behind" rather than "within a second".
 const CLOSE_BEHIND: f64 = 0.15;
 /// The gap behind isn't called in the session's first seconds (the start, the field nose to tail).
 const GAP_BEHIND_AFTER: f64 = 20.0;
+/// The lap count and the lap's time can come a few rows apart, either way round: within this
+/// (in session time), they're the same lap's.
+const LAP_MATCH: f64 = 3.0;
+/// The lap invalidated just past the line is the lap before, until the simulator clears it;
+/// invalidated for longer, the lap after is too.
+const LAP_INVALID_GRACE: f64 = 1.0;
+/// A lap's time: its number is in milliseconds.
+const LAP_TIME: &str = "lap time {}";
 /// Calls synthesized ahead, so the first of each is said without waiting for the voice.
 const WARM: [&str; 6] = [
     "car left",
@@ -71,7 +82,12 @@ pub struct Raised {
 
 impl Raised {
     fn valid_at(&self, at: Instant, now: Instant) -> bool {
-        now.duration_since(at) < if self.urgent { URGENT_FOR } else { OTHER_FOR }
+        now.duration_since(at)
+            < match self.urgent {
+                true => URGENT_FOR,
+                false if self.text == LAP_TIME => LAP_TIME_FOR,
+                false => OTHER_FOR,
+            }
     }
 
     /// Traffic updates replace the state of the sides they describe. Unrelated alerts do not.
@@ -90,9 +106,32 @@ impl Raised {
     pub fn words(&self, lang: ArrayStr<2>) -> String {
         let text = translate(self.text, lang);
         match self.number {
+            Some(millis) if self.text == LAP_TIME => {
+                text.replacen("{}", &lap_time(millis, lang), 1)
+            }
             Some(number) => text.replacen("{}", &number.to_string(), 1),
             None => text.to_owned(),
         }
+    }
+
+    /// Worth keeping synthesized for next time: a lap time is hardly ever said again.
+    fn said_again(&self) -> bool {
+        self.text != LAP_TIME
+    }
+}
+
+/// A lap time to the tenth, as it's said: "1 42.3" (one forty-two point three), with `lang`'s
+/// decimal separator so the voice reads it as a number.
+fn lap_time(millis: i64, lang: ArrayStr<2>) -> String {
+    let tenths = (millis.max(0) + 50) / 100;
+    let (minutes, seconds, tenth) = (tenths / 600, tenths % 600 / 10, tenths % 10);
+    let point = match &*lang {
+        "en" | "ja" | "zh" | "ko" | "hi" | "th" => '.',
+        _ => ',',
+    };
+    match minutes {
+        0 => format!("{seconds}{point}{tenth}"),
+        _ => format!("{minutes} {seconds:02}{point}{tenth}"),
     }
 }
 
@@ -470,10 +509,14 @@ impl Spotter {
 
         // The call being said
         match &mut self.saying {
-            Some(Saying::Synthesizing { key, recv, .. }) => match recv.try_recv() {
+            Some(Saying::Synthesizing {
+                key, recv, call, ..
+            }) => match recv.try_recv() {
                 Ok(Ok(speech)) => {
                     let speech = Arc::new(speech);
-                    self.cache.insert(key.clone(), speech.clone());
+                    if call.said_again() {
+                        self.cache.insert(key.clone(), speech.clone());
+                    }
                     if let Some(Saying::Synthesizing { call, .. }) = self.saying.take() {
                         self.saying = self.play(config, speaker, &speech, call);
                     }
@@ -603,13 +646,21 @@ fn follow(
     };
 
     let mut logic = Logic::default();
+    let mut sizes = Sizes::default();
     let mut last_id = None;
     let mut failing = false;
     while !stop.load(Ordering::Relaxed) {
         let start = Instant::now();
         let (config, frequency) = settings.borrow().clone();
 
-        match poll(&conn, &mut logic, &config, frequency, &mut last_id) {
+        match poll(
+            &conn,
+            &mut logic,
+            &mut sizes,
+            &config,
+            frequency,
+            &mut last_id,
+        ) {
             Ok(raised) => {
                 failing = false;
                 for call in raised {
@@ -644,11 +695,12 @@ fn open(db: &Path) -> rusqlite::Result<Connection> {
 fn poll(
     conn: &Connection,
     logic: &mut Logic,
+    sizes: &mut Sizes,
     config: &SpotterConfig,
     frequency: u32,
     last_id: &mut Option<i64>,
 ) -> rusqlite::Result<Vec<Raised>> {
-    let Some(car) = latest(conn)? else {
+    let Some(mut car) = latest(conn)? else {
         return Ok(Vec::new());
     };
     if Some(car.id) == *last_id {
@@ -656,8 +708,11 @@ fn poll(
     }
     *last_id = Some(car.id);
 
+    sizes.update(conn, None)?;
+    sizes.apply(&mut car);
     let player = player(conn, car)?;
-    let others = frame(conn, &player.car, frequency)?;
+    let mut others = frame(conn, &player.car, frequency)?;
+    others.iter_mut().for_each(|other| sizes.apply(other));
     let wheels = wheels(conn, player.car.id)?;
     let scoring = scoring(conn, None)?;
     Ok(logic.update(config, &player, &others, &wheels, scoring.as_ref()))
@@ -676,11 +731,15 @@ pub fn replay(db: &Path, config: &SpotterConfig) -> rusqlite::Result<Vec<Raised>
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut logic = Logic::default();
+    let mut sizes = Sizes::default();
     let mut calls = Vec::new();
-    for car in cars.into_iter().filter(|car| car.time.is_some()) {
+    for mut car in cars.into_iter().filter(|car| car.time.is_some()) {
         let time = car.time;
+        sizes.update(&conn, time)?;
+        sizes.apply(&mut car);
         let player = player(&conn, car)?;
-        let others = frame(&conn, &player.car, 5)?;
+        let mut others = frame(&conn, &player.car, 5)?;
+        others.iter_mut().for_each(|other| sizes.apply(other));
         let wheels = wheels(&conn, player.car.id)?;
         let scoring = scoring(&conn, time)?;
         calls.extend(logic.update(config, &player, &others, &wheels, scoring.as_ref()));
@@ -704,6 +763,125 @@ struct Car {
     y: Option<f64>,
     z: Option<f64>,
     heading: Option<f64>,
+    /// The car's size, when its slot's newest standing gives a plausible one
+    size: Option<Size>,
+}
+
+/// The car size the overlap distances in [`SpotterConfig`] are for (metres): both cars about a
+/// GT3 car's size.
+const REFERENCE_LENGTH: f64 = 4.8;
+const REFERENCE_WIDTH: f64 = 2.0;
+/// Recorded sizes outside these (metres) aren't trusted: the car's taken to be the reference size.
+const PLAUSIBLE_LENGTH: std::ops::RangeInclusive<f64> = 2.0..=7.0;
+const PLAUSIBLE_WIDTH: std::ops::RangeInclusive<f64> = 1.2..=2.6;
+
+/// A car's size in metres.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Size {
+    width: f64,
+    length: f64,
+}
+
+impl Size {
+    /// Both recorded dimensions, when both are there and plausible.
+    fn plausible(width: Option<f64>, length: Option<f64>) -> Option<Size> {
+        let (width, length) = (width?, length?);
+        (PLAUSIBLE_WIDTH.contains(&width) && PLAUSIBLE_LENGTH.contains(&length))
+            .then_some(Size { width, length })
+    }
+}
+
+/// Every car's size, from the newest standing of its slot. A slot taken by another car takes that
+/// car's size (or none) with the first standing written for it.
+#[derive(Debug, Default)]
+struct Sizes {
+    /// The newest standing read: (id, vehicle, session time), to tell it's still there
+    last: Option<(i64, Option<i64>, Option<f64>)>,
+    /// Vehicle -> size; a vehicle missing has none
+    sizes: HashMap<i64, Size>,
+    /// The recording has the columns (recordings made before them don't)
+    recorded: bool,
+    /// Replaying: the sessions (their clocks started again) the player's rows and the standings
+    /// read have gone through, and their latest clocks
+    replay: [(u32, Option<f64>); 2],
+}
+
+/// [`Sizes::replay`]'s, for the player's rows and for the standings.
+const PLAYER: usize = 0;
+const STANDINGS: usize = 1;
+
+/// Session `clock` belongs to, for a recording that's been through `sessions` up to `latest`: a
+/// clock gone back starts the next one.
+fn session_of((sessions, latest): (u32, Option<f64>), clock: f64) -> u32 {
+    sessions + u32::from(latest.is_some_and(|latest| clock < latest - 1.0))
+}
+
+impl Sizes {
+    /// Reads the standings written since the last call (only up to the player's session time
+    /// `upto`, in the same session, when replaying). A recording cleared since (its rows deleted,
+    /// their ids reused) is read again from the start.
+    fn update(&mut self, conn: &Connection, upto: Option<f64>) -> rusqlite::Result<()> {
+        if let Some(upto) = upto {
+            self.replay[PLAYER] = (session_of(self.replay[PLAYER], upto), Some(upto));
+        }
+        if let Some((id, vehicle, time)) = self.last {
+            let still = conn
+                .prepare_cached("SELECT vehicle_id, session_time FROM standings WHERE id = ?1")?
+                .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+            if still != Some((vehicle, time)) {
+                *self = Sizes {
+                    replay: self.replay,
+                    ..Sizes::default()
+                };
+            }
+        }
+        if !self.recorded {
+            self.recorded = conn
+                .prepare_cached(
+                    "SELECT count(*) FROM pragma_table_info('standings') \
+                     WHERE name IN ('vehicle_width', 'vehicle_length')",
+                )?
+                .query_row([], |row| row.get::<_, i64>(0))?
+                == 2;
+            if !self.recorded {
+                return Ok(());
+            }
+        }
+        let mut statement = conn.prepare_cached(
+            "SELECT id, vehicle_id, session_time, vehicle_width, vehicle_length FROM standings \
+             WHERE id > ?1 ORDER BY id",
+        )?;
+        let mut rows = statement.query([self.last.map_or(0, |(id, ..)| id)])?;
+        while let Some(row) = rows.next()? {
+            let vehicle = row.get::<_, Option<i64>>(1)?;
+            let time = row.get::<_, Option<f64>>(2)?;
+            if let (Some(upto), Some(time)) = (upto, time) {
+                // Replaying, a standing of a later session than the player's waits for the
+                // player's to start, and one of the player's session for its clock. Standings of
+                // an earlier session are behind: read at once
+                let session = session_of(self.replay[STANDINGS], time);
+                let player = self.replay[PLAYER].0;
+                if session > player || (session == player && time > upto) {
+                    break;
+                }
+                self.replay[STANDINGS] = (session, Some(time));
+            }
+            self.last = Some((row.get(0)?, vehicle, time));
+            let Some(vehicle) = vehicle else {
+                continue;
+            };
+            match Size::plausible(row.get(3)?, row.get(4)?) {
+                Some(size) => self.sizes.insert(vehicle, size),
+                None => self.sizes.remove(&vehicle),
+            };
+        }
+        Ok(())
+    }
+
+    fn apply(&self, car: &mut Car) {
+        car.size = self.sizes.get(&car.vehicle).copied();
+    }
 }
 
 /// The player's car, with what only the player's own alerts need.
@@ -741,6 +919,7 @@ fn car(row: &Row) -> rusqlite::Result<Car> {
         y: row.get(6)?,
         z: row.get(7)?,
         heading: row.get(8)?,
+        size: None,
     })
 }
 
@@ -753,6 +932,9 @@ struct Scoring {
     /// The flag shown to the player
     flag: Option<String>,
     penalties: Option<i64>,
+    /// The player's laps, and the time of the last one
+    laps_completed: Option<i64>,
+    last_lap_time: Option<f64>,
     /// 0-1
     rain: Option<f64>,
     /// 0-1
@@ -952,24 +1134,23 @@ fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scor
         true => "under_yellow",
         false => "NULL",
     };
-    let columns = format!("flag, penalties, {under_yellow}");
-    let read = |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?, row.get(2)?));
+    let columns = format!("flag, penalties, laps_completed, last_lap_time, {under_yellow}");
     // Live, try the newest rows first, then look further back if the player has been in the garage
-    let standing: Option<(Option<String>, Option<i64>, Option<bool>)> = match upto {
+    let standing: Option<Standing> = match upto {
         None => conn
             .prepare_cached(&format!(
                 "SELECT {columns} FROM standings WHERE is_player = 1 \
                  AND id > (SELECT coalesce(max(id), 0) - 5000 FROM standings) \
                  ORDER BY id DESC LIMIT 1"
             ))?
-            .query_row([], read)
+            .query_row([], standing)
             .optional()?
             .map(|standing| Ok(Some(standing)))
             .unwrap_or_else(|| {
                 conn.prepare_cached(&format!(
                     "SELECT {columns} FROM standings WHERE is_player = 1 ORDER BY id DESC LIMIT 1"
                 ))?
-                .query_row([], read)
+                .query_row([], standing)
                 .optional()
             })?,
         Some(upto) => conn
@@ -977,12 +1158,14 @@ fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scor
                 "SELECT {columns} FROM standings WHERE is_player = 1 AND session_time <= ?1 \
                  ORDER BY id DESC LIMIT 1"
             ))?
-            .query_row([upto], read)
+            .query_row([upto], standing)
             .optional()?,
     };
-    if let Some((flag, penalties, under_yellow)) = standing {
+    if let Some((flag, penalties, laps_completed, last_lap_time, under_yellow)) = standing {
         scoring.flag = flag;
         scoring.penalties = penalties;
+        scoring.laps_completed = laps_completed;
+        scoring.last_lap_time = last_lap_time;
         // Not under a full course caution, which is called on its own
         let caution = scoring
             .full_course_yellow
@@ -1017,6 +1200,25 @@ fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scor
         }
     }
     Ok(Some(scoring))
+}
+
+/// The player's flag, penalties, laps, last lap time and own yellow, from a standings row.
+type Standing = (
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<f64>,
+    Option<bool>,
+);
+
+fn standing(row: &Row) -> rusqlite::Result<Standing> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
 }
 
 /// The other car relative to the player in metres: (+ahead, +right). Forward is (-sin h, -cos h)
@@ -1093,6 +1295,40 @@ enum Proximity {
     Known { left: u8, right: u8 },
 }
 
+/// How far from the player another car overlaps (enter) and stops overlapping (exit), along the
+/// car and to the side. The configured distances are for two cars of the reference size; when both
+/// cars' sizes are known, they move by how much longer or wider the two are on average than it.
+/// `min_across` (in line rather than beside) doesn't depend on the cars' size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Reach {
+    enter_along: f64,
+    exit_along: f64,
+    enter_across: f64,
+    exit_across: f64,
+}
+
+impl Reach {
+    fn new(config: &SpotterConfig, player: &Car, other: &Car) -> Self {
+        let configured = Self {
+            enter_along: *config.enter_along(),
+            exit_along: *config.exit_along(),
+            enter_across: *config.enter_across(),
+            exit_across: *config.exit_across(),
+        };
+        let (Some(mine), Some(theirs)) = (player.size, other.size) else {
+            return configured;
+        };
+        let along = (mine.length + theirs.length) / 2.0 - REFERENCE_LENGTH;
+        let across = (mine.width + theirs.width) / 2.0 - REFERENCE_WIDTH;
+        Self {
+            enter_along: configured.enter_along + along,
+            exit_along: configured.exit_along + along,
+            enter_across: configured.enter_across + across,
+            exit_across: configured.exit_across + across,
+        }
+    }
+}
+
 /// Works out the cars beside the player from everyone's positions, following each car: it counts
 /// once it's been there `debounce`, and stops counting past the (wider) exit distances.
 #[derive(Debug, Default)]
@@ -1155,10 +1391,11 @@ impl Geometry {
                 Side::Left
             };
             let (along, across) = (along.abs(), across.abs());
+            let reach = Reach::new(config, player, other);
 
             if let Some(overlap) = self.overlap.get(&other.vehicle) {
-                if along <= *config.exit_along()
-                    && (*config.min_across()..=*config.exit_across()).contains(&across)
+                if along <= reach.exit_along
+                    && (*config.min_across()..=reach.exit_across).contains(&across)
                     && side == *overlap
                 {
                     seen.push(other.vehicle);
@@ -1166,8 +1403,8 @@ impl Geometry {
                 continue;
             }
 
-            if along <= *config.enter_along()
-                && (*config.min_across()..=*config.enter_across()).contains(&across)
+            if along <= reach.enter_along
+                && (*config.min_across()..=reach.enter_across).contains(&across)
             {
                 match self.pending.get(&other.vehicle) {
                     Some(&(pending, since)) if pending == side => {
@@ -1210,6 +1447,16 @@ struct Logic {
     prev_wet: usize,
     /// Forecast points already called: (session type, how far through it)
     forecast_called: HashSet<(String, u64)>,
+    /// The lap the player's on was invalidated, or has been through the pit lane: its time
+    /// isn't called
+    lap_invalidated: bool,
+    lap_in_pit_lane: bool,
+    /// The player's last lap ended (when; whether its time is called)...
+    lap_ended: Option<(f64, bool)>,
+    /// ...and its time came (when; the time)
+    lap_timed: Option<(f64, f64)>,
+    /// When the player's lap last ended
+    lap_started: Option<f64>,
 }
 
 impl Default for Logic {
@@ -1230,6 +1477,11 @@ impl Default for Logic {
             last_patch_call: f64::NEG_INFINITY,
             prev_wet: 0,
             forecast_called: HashSet::new(),
+            lap_invalidated: false,
+            lap_in_pit_lane: false,
+            lap_ended: None,
+            lap_timed: None,
+            lap_started: None,
         }
     }
 }
@@ -1298,6 +1550,15 @@ impl Logic {
             self.geometry.update(config, p, others, t)
         };
         self.traffic(config, proximity, t, &mut calls);
+        // Invalidated as it's driven (or already, when the spotter starts mid-lap)
+        if player.lap_invalidated
+            && self
+                .lap_started
+                .is_none_or(|started| t - started > LAP_INVALID_GRACE)
+        {
+            self.lap_invalidated = true;
+        }
+        self.lap_in_pit_lane |= p.in_pit_lane;
         if let Some(prev) = self.prev.take() {
             let race = scoring.is_some_and(|s| s.session_type.as_deref() == Some("race"));
             self.alerts(
@@ -1311,6 +1572,7 @@ impl Logic {
             );
         }
         if let Some(scoring) = scoring {
+            self.lap_times(config, scoring, p.in_pit_lane, t, &mut calls);
             self.flags(scoring, &mut calls);
             self.weather(config, scoring, wheels.wet, t, stopped, &mut calls);
         }
@@ -1484,6 +1746,49 @@ impl Logic {
                 },
                 false,
             );
+        }
+    }
+
+    /// In qualifying, the time of each lap the pilot finishes, once both the lap count and the
+    /// lap's time have come. Not of laps invalidated, or through the pit lane (in and out laps).
+    fn lap_times(
+        &mut self,
+        config: &SpotterConfig,
+        now: &Scoring,
+        in_pit_lane: bool,
+        t: f64,
+        calls: &mut Calls,
+    ) {
+        // The first we hear of the player says nothing about a lap ending
+        let Some(last) = &self.prev_scoring else {
+            return;
+        };
+        if let (Some(before), Some(laps)) = (last.laps_completed, now.laps_completed)
+            && laps > before
+        {
+            let timed = !self.lap_invalidated && !self.lap_in_pit_lane;
+            self.lap_ended = Some((t, timed));
+            self.lap_started = Some(t);
+            self.lap_invalidated = false;
+            self.lap_in_pit_lane = in_pit_lane;
+        }
+        // The first we hear of the player's standing is a lap done long ago
+        if let Some(time) = now.last_lap_time.filter(|time| *time > 0.0)
+            && last.laps_completed.is_some()
+            && last.last_lap_time != Some(time)
+        {
+            self.lap_timed = Some((t, time));
+        }
+
+        self.lap_ended = self.lap_ended.filter(|(at, _)| t - at <= LAP_MATCH);
+        self.lap_timed = self.lap_timed.filter(|(at, _)| t - at <= LAP_MATCH);
+        if let (Some((_, timed)), Some((_, time))) = (self.lap_ended, self.lap_timed) {
+            self.lap_ended = None;
+            self.lap_timed = None;
+            let qualifying = now.session_type.as_deref() == Some("qualifying");
+            if timed && qualifying && *config.qualifying_lap_times() {
+                calls.raise_number(LAP_TIME, Some((time * 1000.0).round() as i64), false);
+            }
         }
     }
 
@@ -1691,6 +1996,7 @@ pub fn translate(text: &'static str, lang: ArrayStr<2>) -> &'static str {
         "wet patch" => t!("call.wet_patch": lang),
         "rain likely in about {} minutes" => t!("call.rain_in_minutes": lang),
         "rain likely in about a minute" => t!("call.rain_in_a_minute": lang),
+        LAP_TIME => t!("call.lap_time": lang),
         _ => text,
     }
 }
@@ -2432,13 +2738,26 @@ mod tests {
 
     /// Runs the logic at 30 Hz from `from` to `to` with the same cars, returning the calls.
     fn run(logic: &mut Logic, from: f64, to: f64, others: &[Car]) -> Vec<&'static str> {
+        run_sized(logic, from, to, None, others)
+    }
+
+    /// [`run`], with the player's car of size `size`.
+    fn run_sized(
+        logic: &mut Logic,
+        from: f64,
+        to: f64,
+        size: Option<Size>,
+        others: &[Car],
+    ) -> Vec<&'static str> {
         let config = SpotterConfig::default();
         let mut calls = Vec::new();
         let mut t = from;
         while t < to {
+            let mut player = player(t);
+            player.car.size = size;
             calls.extend(texts(logic.update(
                 &config,
-                &player(t),
+                &player,
                 others,
                 &Wheels::default(),
                 None,
@@ -2573,6 +2892,311 @@ mod tests {
             run(&mut logic, 3.0, 3.5, &[other(2, 6.5, 3.0)]),
             ["clear right"]
         );
+    }
+
+    fn size(width: f64, length: f64) -> Option<Size> {
+        Some(Size { width, length })
+    }
+
+    fn sized(mut car: Car, size: Option<Size>) -> Car {
+        car.size = size;
+        car
+    }
+
+    #[test]
+    fn sizes_the_overlap_to_the_cars() {
+        let short = size(1.8, 3.8);
+        // 4.5 m ahead: within the reference cars' 4.8 m...
+        let ahead = other(2, 4.5, 3.0);
+        assert_eq!(
+            run(
+                &mut Logic::default(),
+                0.0,
+                1.0,
+                std::slice::from_ref(&ahead)
+            ),
+            ["car right"]
+        );
+        // ...but past where two 3.8 m cars overlap
+        assert!(
+            run_sized(
+                &mut Logic::default(),
+                0.0,
+                1.0,
+                short,
+                &[sized(ahead, short)]
+            )
+            .is_empty()
+        );
+
+        // A 4.8 m car beside a 6 m one: they overlap up to 5.4 m apart
+        let ahead = other(2, 5.2, 3.0);
+        assert!(
+            run(
+                &mut Logic::default(),
+                0.0,
+                1.0,
+                std::slice::from_ref(&ahead)
+            )
+            .is_empty()
+        );
+        let long = sized(ahead, size(2.0, 6.0));
+        let mut logic = Logic::default();
+        assert_eq!(
+            run_sized(
+                &mut logic,
+                0.0,
+                1.0,
+                size(2.0, 4.8),
+                std::slice::from_ref(&long)
+            ),
+            ["car right"]
+        );
+        // And stop overlapping past 6.4 m (the way out moves with them)
+        let mut further = long.clone();
+        further.z = Some(-6.2);
+        assert!(run_sized(&mut logic, 1.0, 2.0, size(2.0, 4.8), &[further]).is_empty());
+        let mut gone = long;
+        gone.z = Some(-6.6);
+        assert_eq!(
+            run_sized(&mut logic, 2.0, 2.5, size(2.0, 4.8), &[gone]),
+            ["clear right"]
+        );
+
+        // Two wide cars still count 6 m to the side
+        let wide = size(2.6, 4.8);
+        let beside = other(2, 0.0, 6.0);
+        assert!(
+            run(
+                &mut Logic::default(),
+                0.0,
+                1.0,
+                std::slice::from_ref(&beside)
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            run_sized(
+                &mut Logic::default(),
+                0.0,
+                1.0,
+                wide,
+                &[sized(beside, wide)]
+            ),
+            ["car right"]
+        );
+    }
+
+    #[test]
+    fn keeps_the_configured_overlap_without_both_sizes() {
+        let short = size(1.8, 3.8);
+        let ahead = other(2, 4.5, 3.0);
+        // Only the player's size, or only the other car's: as if neither were known
+        assert_eq!(
+            run_sized(
+                &mut Logic::default(),
+                0.0,
+                1.0,
+                short,
+                std::slice::from_ref(&ahead)
+            ),
+            ["car right"]
+        );
+        assert_eq!(
+            run(&mut Logic::default(), 0.0, 1.0, &[sized(ahead, short)]),
+            ["car right"]
+        );
+
+        // Whatever's configured, even distances that never let a car in
+        let config: SpotterConfig = serde_json::from_str(
+            r#"{"enter_along": -1.0, "exit_along": 0.5, "enter_across": 1.5, "exit_across": 9.0}"#,
+        )
+        .unwrap();
+        let configured = Reach {
+            enter_along: -1.0,
+            exit_along: 0.5,
+            enter_across: 1.5,
+            exit_across: 9.0,
+        };
+        let mut mine = player(0.0).car;
+        let theirs = other(2, 0.0, 0.0);
+        assert_eq!(Reach::new(&config, &mine, &theirs), configured);
+        mine.size = short;
+        assert_eq!(Reach::new(&config, &mine, &theirs), configured);
+        assert_eq!(Reach::new(&config, &theirs, &mine), configured);
+    }
+
+    #[test]
+    fn distrusts_implausible_sizes() {
+        assert_eq!(Size::plausible(Some(1.78), Some(4.13)), size(1.78, 4.13));
+        for (width, length) in [
+            (None, Some(4.5)),
+            (Some(1.9), None),
+            (Some(0.0), Some(4.5)),
+            (Some(1.9), Some(-4.5)),
+            // Centimetres, or another unit
+            (Some(190.0), Some(450.0)),
+            (Some(0.019), Some(0.045)),
+            (Some(f64::NAN), Some(4.5)),
+            (Some(1.9), Some(f64::INFINITY)),
+        ] {
+            assert_eq!(
+                Size::plausible(width, length),
+                None,
+                "{width:?} by {length:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sizes_follow_the_slots_occupant() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A recording from before the columns existed
+        conn.execute_batch(
+            "CREATE TABLE standings (id INTEGER PRIMARY KEY, vehicle_id INTEGER, \
+             session_time REAL);
+             INSERT INTO standings VALUES (1, 2, 1.0);",
+        )
+        .unwrap();
+        let mut sizes = Sizes::default();
+        sizes.update(&conn, None).unwrap();
+        assert!(sizes.sizes.is_empty());
+
+        let size_of = |sizes: &Sizes, vehicle| {
+            let mut car = Car {
+                vehicle,
+                ..Car::default()
+            };
+            sizes.apply(&mut car);
+            car.size
+        };
+        conn.execute_batch(
+            "ALTER TABLE standings ADD COLUMN vehicle_width REAL;
+             ALTER TABLE standings ADD COLUMN vehicle_length REAL;
+             INSERT INTO standings VALUES (2, 2, 2.0, 1.8, 4.5), (3, 3, 2.0, 2.0, 5.0);",
+        )
+        .unwrap();
+        sizes.update(&conn, None).unwrap();
+        assert_eq!(size_of(&sizes, 2), size(1.8, 4.5));
+        assert_eq!(size_of(&sizes, 3), size(2.0, 5.0));
+        assert_eq!(size_of(&sizes, 4), None);
+
+        // Slot 2 taken by a car without a size, then by another car; slot 3 by an implausible one
+        conn.execute("INSERT INTO standings VALUES (4, 2, 3.0, NULL, NULL)", [])
+            .unwrap();
+        sizes.update(&conn, None).unwrap();
+        assert_eq!(size_of(&sizes, 2), None);
+        conn.execute_batch(
+            "INSERT INTO standings VALUES (5, 2, 4.0, 1.9, 4.7), (6, 3, 4.0, 190, 470);",
+        )
+        .unwrap();
+        sizes.update(&conn, None).unwrap();
+        assert_eq!(size_of(&sizes, 2), size(1.9, 4.7));
+        assert_eq!(size_of(&sizes, 3), None);
+
+        // Replaying, standings after the player's time aren't read yet
+        let mut replaying = Sizes::default();
+        replaying.update(&conn, Some(3.5)).unwrap();
+        assert_eq!(size_of(&replaying, 2), None);
+        assert_eq!(size_of(&replaying, 3), size(2.0, 5.0));
+        replaying.update(&conn, Some(4.0)).unwrap();
+        assert_eq!(size_of(&replaying, 2), size(1.9, 4.7));
+        assert_eq!(size_of(&replaying, 3), None);
+
+        // The next session, its clock started again: not read before the player's is there too
+        conn.execute_batch(
+            "INSERT INTO standings VALUES (7, 2, 0.5, 2.0, 5.5), (8, 2, 2.5, 1.8, 4.2);",
+        )
+        .unwrap();
+        replaying.update(&conn, Some(5.0)).unwrap();
+        assert_eq!(size_of(&replaying, 2), size(1.9, 4.7));
+        replaying.update(&conn, Some(1.0)).unwrap();
+        assert_eq!(size_of(&replaying, 2), size(2.0, 5.5));
+        replaying.update(&conn, Some(3.0)).unwrap();
+        assert_eq!(size_of(&replaying, 2), size(1.8, 4.2));
+        // A third session, which the player's rows join at a later clock than its last standing
+        conn.execute("INSERT INTO standings VALUES (9, 5, 0.3, 2.0, 4.6)", [])
+            .unwrap();
+        replaying.update(&conn, Some(100.0)).unwrap();
+        assert_eq!(size_of(&replaying, 5), None);
+        replaying.update(&conn, Some(20.0)).unwrap();
+        assert_eq!(size_of(&replaying, 5), size(2.0, 4.6));
+
+        // The recording cleared, its ids used again: read from the start (slot 3 has no standing
+        // yet, so no size)
+        sizes.update(&conn, None).unwrap();
+        assert_eq!(size_of(&sizes, 2), size(1.8, 4.2));
+        conn.execute_batch(
+            "DELETE FROM standings;
+             INSERT INTO standings VALUES (1, 2, 9.0, 2.0, 4.9), (2, 4, 9.0, 1.9, 4.6);",
+        )
+        .unwrap();
+        sizes.update(&conn, None).unwrap();
+        assert_eq!(size_of(&sizes, 2), size(2.0, 4.9));
+        assert_eq!(size_of(&sizes, 3), None);
+        assert_eq!(size_of(&sizes, 4), size(1.9, 4.6));
+        // Cleared and written past where it had read
+        conn.execute_batch(
+            "DELETE FROM standings;
+             INSERT INTO standings VALUES (1, 2, 12.0, 1.8, 4.3), (2, 3, 12.0, 1.8, 4.3),
+                 (3, 4, 12.0, 2.1, 5.1);",
+        )
+        .unwrap();
+        sizes.update(&conn, None).unwrap();
+        assert_eq!(size_of(&sizes, 2), size(1.8, 4.3));
+        assert_eq!(size_of(&sizes, 4), size(2.1, 5.1));
+    }
+
+    /// What a poll calls over a recording with a 6 m car 5.2 m ahead and 3 m right of the
+    /// player's 4.8 m one (only beside it once their sizes are known), recorded with `sizes`.
+    fn poll_beside_a_long_car(sizes: bool) -> Vec<&'static str> {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        let (mine, theirs) = if sizes {
+            ((Some(2.0), Some(4.8)), (Some(2.0), Some(6.0)))
+        } else {
+            ((None, None), (None, None))
+        };
+        for (vehicle, (width, length), is_player) in [(1, mine, true), (2, theirs, false)] {
+            conn.execute(
+                "INSERT INTO standings (vehicle_id, session_time, is_player, vehicle_width, \
+                 vehicle_length) VALUES (?1, 0, ?2, ?3, ?4)",
+                rusqlite::params![vehicle, is_player, width, length],
+            )
+            .unwrap();
+        }
+
+        let (mut logic, mut sizes, mut last_id) = (Logic::default(), Sizes::default(), None);
+        let mut calls = Vec::new();
+        for tick in 0..30 {
+            let t = f64::from(tick) / 30.0;
+            for (vehicle, is_player, x, ahead) in [(2, false, -3.0, 5.2), (1, true, 0.0, 0.0)] {
+                conn.execute(
+                    "INSERT INTO telemetry (vehicle_id, session_time, is_player, in_pit_lane, \
+                     speed, position_x, position_y, position_z, heading) \
+                     VALUES (?1, ?2, ?3, 0, 50, ?4, 0, ?5, 0)",
+                    rusqlite::params![vehicle, t, is_player, x, -50.0 * t - ahead],
+                )
+                .unwrap();
+            }
+            let raised = poll(
+                &conn,
+                &mut logic,
+                &mut sizes,
+                &SpotterConfig::default(),
+                5,
+                &mut last_id,
+            )
+            .unwrap();
+            calls.extend(texts(raised));
+        }
+        calls
+    }
+
+    #[test]
+    fn polls_with_the_recorded_sizes() {
+        assert_eq!(poll_beside_a_long_car(true), ["car right"]);
+        assert!(poll_beside_a_long_car(false).is_empty());
     }
 
     #[test]
@@ -2861,9 +3485,10 @@ mod tests {
              CREATE TABLE session_sector (session_id INTEGER, sector INTEGER,
              local_yellow INTEGER);
              CREATE TABLE standings (id INTEGER PRIMARY KEY, is_player INTEGER,
-             session_time REAL, flag TEXT, penalties INTEGER);
+             session_time REAL, flag TEXT, penalties INTEGER, laps_completed INTEGER,
+             last_lap_time REAL);
              INSERT INTO session (session_time) VALUES (0);
-             INSERT INTO standings VALUES (1, 1, 0, 'blue', 1);",
+             INSERT INTO standings VALUES (1, 1, 0, 'blue', 1, 0, NULL);",
         )
         .unwrap();
         let config = SpotterConfig::default();
@@ -2877,11 +3502,11 @@ mod tests {
         assert!(step(0.0).is_empty());
         conn.execute_batch(
             "WITH RECURSIVE ids(id) AS (SELECT 2 UNION ALL SELECT id + 1 FROM ids WHERE id < 5001)
-             INSERT INTO standings SELECT id, 0, 1, 'green', 0 FROM ids;",
+             INSERT INTO standings SELECT id, 0, 1, 'green', 0, 0, NULL FROM ids;",
         )
         .unwrap();
         assert!(step(1800.0).is_empty());
-        conn.execute_batch("INSERT INTO standings VALUES (5002, 1, 1801, 'blue', 1);")
+        conn.execute_batch("INSERT INTO standings VALUES (5002, 1, 1801, 'blue', 1, 0, NULL);")
             .unwrap();
         assert!(step(1801.0).is_empty());
         // The recorder clears the tables for a new session.
@@ -2912,21 +3537,22 @@ mod tests {
              CREATE TABLE session_sector (session_id INTEGER, sector INTEGER,
              local_yellow INTEGER);
              CREATE TABLE standings (id INTEGER PRIMARY KEY, is_player INTEGER,
-             session_time REAL, flag TEXT, penalties INTEGER, under_yellow INTEGER);
+             session_time REAL, flag TEXT, penalties INTEGER, under_yellow INTEGER,
+             laps_completed INTEGER, last_lap_time REAL);
              INSERT INTO session (session_time) VALUES (0);
              INSERT INTO session_sector VALUES (1, 0, NULL), (1, 1, NULL);
-             INSERT INTO standings VALUES (1, 1, 0, 'green', 0, 1);",
+             INSERT INTO standings VALUES (1, 1, 0, 'green', 0, 1, NULL, NULL);",
         )
         .unwrap();
         assert!(scoring(&conn, None).unwrap().unwrap().yellow);
-        conn.execute_batch("INSERT INTO standings VALUES (2, 1, 1, 'green', 0, 0);")
+        conn.execute_batch("INSERT INTO standings VALUES (2, 1, 1, 'green', 0, 0, NULL, NULL);")
             .unwrap();
         assert!(!scoring(&conn, None).unwrap().unwrap().yellow);
 
         // Sectors that say they're clear outweigh the player's flag
         conn.execute_batch(
             "UPDATE session_sector SET local_yellow = 0;
-             INSERT INTO standings VALUES (3, 1, 2, 'green', 0, 1);",
+             INSERT INTO standings VALUES (3, 1, 2, 'green', 0, 1, NULL, NULL);",
         )
         .unwrap();
         assert!(!scoring(&conn, None).unwrap().unwrap().yellow);
@@ -3038,6 +3664,223 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The lap times called in a session of `session_type`, given the player's rows (`t`, laps,
+    /// last lap time, in the pit lane, lap invalidated).
+    fn lap_calls(
+        config: &SpotterConfig,
+        session_type: &str,
+        rows: &[(f64, i64, Option<f64>, bool, bool)],
+    ) -> Vec<String> {
+        let mut logic = Logic::default();
+        let mut calls = Vec::new();
+        for &(t, laps, last, in_pit_lane, invalidated) in rows {
+            let scoring = Scoring {
+                session_type: Some(session_type.into()),
+                laps_completed: Some(laps),
+                last_lap_time: last,
+                ..Scoring::default()
+            };
+            let mut p = player(t);
+            p.car.in_pit_lane = in_pit_lane;
+            p.lap_invalidated = invalidated;
+            calls.extend(
+                logic
+                    .update(config, &p, &[], &Wheels::default(), Some(&scoring))
+                    .into_iter()
+                    .filter(|call| call.text == LAP_TIME)
+                    .map(|call| call.words(arrstr!("en"))),
+            );
+        }
+        calls
+    }
+
+    fn lap_times_on() -> SpotterConfig {
+        let mut config = SpotterConfig::default();
+        config.qualifying_lap_times.set(true);
+        config
+    }
+
+    #[test]
+    fn calls_lap_times_in_qualifying() {
+        let config = lap_times_on();
+        // The count and the time together, the count first, then the time first
+        assert_eq!(
+            lap_calls(
+                &config,
+                "qualifying",
+                &[
+                    (10.0, 0, None, false, false),
+                    (110.0, 1, Some(100.25), false, false),
+                    (210.0, 2, Some(100.25), false, false),
+                    (210.2, 2, Some(99.96), false, false),
+                    (309.8, 2, Some(99.5), false, false),
+                    (310.0, 3, Some(99.5), false, false),
+                ]
+            ),
+            ["lap time 1 40.3", "lap time 1 40.0", "lap time 1 39.5"]
+        );
+        // Each lap once, however many rows it's on
+        assert_eq!(
+            lap_calls(
+                &config,
+                "qualifying",
+                &[
+                    (10.0, 0, None, false, false),
+                    (110.0, 1, Some(100.0), false, false),
+                    (110.2, 1, Some(100.0), false, false),
+                    (111.0, 1, Some(100.0), false, false),
+                ]
+            ),
+            ["lap time 1 40.0"]
+        );
+        // A time that doesn't come with a lap ending is someone's correction, not a lap
+        assert!(
+            lap_calls(
+                &config,
+                "qualifying",
+                &[
+                    (10.0, 0, None, false, false),
+                    (110.0, 1, None, false, false),
+                    (120.0, 1, Some(100.0), false, false),
+                ]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_first_standing_heard_of_is_no_new_lap_time() {
+        let config = lap_times_on();
+        let mut logic = Logic::default();
+        let mut step = |t, laps, last| {
+            let scoring = Scoring {
+                session_type: Some("qualifying".into()),
+                laps_completed: laps,
+                last_lap_time: last,
+                ..Scoring::default()
+            };
+            logic
+                .update(&config, &player(t), &[], &Wheels::default(), Some(&scoring))
+                .into_iter()
+                .map(|call| call.words(arrstr!("en")))
+                .collect::<Vec<_>>()
+        };
+        // The session before the player's standing, which comes with a lap done long ago
+        assert!(step(10.0, None, None).is_empty());
+        assert!(step(108.0, Some(5), Some(100.0)).is_empty());
+        // The lap ends: its own time, not that one
+        assert!(step(110.0, Some(6), Some(100.0)).is_empty());
+        assert_eq!(step(110.2, Some(6), Some(99.0)), ["lap time 1 39.0"]);
+    }
+
+    #[test]
+    fn calls_no_lap_times_invalidated_or_through_the_pits() {
+        let config = lap_times_on();
+        assert_eq!(
+            lap_calls(
+                &config,
+                "qualifying",
+                &[
+                    (10.0, 0, None, false, false),
+                    // Invalidated on the way round, and still a moment past the line
+                    (50.0, 0, None, false, true),
+                    (110.0, 1, Some(100.0), false, true),
+                    (110.5, 1, Some(100.0), false, false),
+                    // The next lap's clean
+                    (210.0, 2, Some(99.0), false, false),
+                    // Into the pits: the in lap...
+                    (300.0, 2, Some(99.0), true, false),
+                    (320.0, 3, Some(120.0), true, false),
+                    // ...and the out lap
+                    (330.0, 3, Some(120.0), false, false),
+                    (430.0, 4, Some(110.0), false, false),
+                    // Then a flying lap
+                    (530.0, 5, Some(98.0), false, false),
+                    // Cut at the end, invalidating the next lap as well
+                    (620.0, 5, Some(98.0), false, true),
+                    (630.0, 6, Some(100.0), false, true),
+                    (632.0, 6, Some(100.0), false, true),
+                    (640.0, 6, Some(100.0), false, false),
+                    (730.0, 7, Some(101.0), false, false),
+                    (830.0, 8, Some(97.0), false, false),
+                ]
+            ),
+            ["lap time 1 39.0", "lap time 1 38.0", "lap time 1 37.0"]
+        );
+        // Following from a lap already invalidated
+        assert_eq!(
+            lap_calls(
+                &config,
+                "qualifying",
+                &[
+                    (50.0, 0, None, false, true),
+                    (110.0, 1, Some(100.0), false, true),
+                    (110.5, 1, Some(100.0), false, false),
+                    (210.0, 2, Some(99.0), false, false),
+                ]
+            ),
+            ["lap time 1 39.0"]
+        );
+    }
+
+    #[test]
+    fn calls_lap_times_only_in_qualifying_when_asked() {
+        let rows = [
+            (10.0, 0, None, false, false),
+            (110.0, 1, Some(100.0), false, false),
+        ];
+        for session in ["practice", "warmup", "race", "test"] {
+            assert!(
+                lap_calls(&lap_times_on(), session, &rows).is_empty(),
+                "{session}"
+            );
+        }
+        assert!(lap_calls(&SpotterConfig::default(), "qualifying", &rows).is_empty());
+        assert_eq!(
+            lap_calls(&lap_times_on(), "qualifying", &rows),
+            ["lap time 1 40.0"]
+        );
+    }
+
+    #[test]
+    fn says_lap_times_as_numbers_in_each_language() {
+        let call = |millis| Raised {
+            text: LAP_TIME,
+            number: Some(millis),
+            urgent: false,
+            session_time: 0.0,
+        };
+        assert_eq!(call(102_349).words(arrstr!("en")), "lap time 1 42.3");
+        assert_eq!(call(102_350).words(arrstr!("en")), "lap time 1 42.4");
+        assert_eq!(call(65_000).words(arrstr!("en")), "lap time 1 05.0");
+        assert_eq!(call(119_960).words(arrstr!("en")), "lap time 2 00.0");
+        assert_eq!(call(58_712).words(arrstr!("en")), "lap time 58.7");
+        assert_eq!(
+            call(102_349).words(arrstr!("es")),
+            "tiempo de vuelta 1 42,3"
+        );
+        assert_eq!(call(102_349).words(arrstr!("ca")), "temps de volta 1 42,3");
+        assert_eq!(call(102_349).words(arrstr!("it")), "tempo sul giro 1 42,3");
+        // Without a translation, in English, read with the voice's own decimal separator
+        assert_eq!(call(102_349).words(arrstr!("fr")), "lap time 1 42,3");
+        assert!(!call(102_349).said_again());
+    }
+
+    #[test]
+    fn a_lap_time_waits_longer_than_other_news() {
+        let at = Instant::now();
+        let lap = Raised {
+            text: LAP_TIME,
+            number: Some(100_000),
+            urgent: false,
+            session_time: 0.0,
+        };
+        // An engineer's long answer: other news is out of date by its end, the lap time isn't
+        assert!(!call("penalty", false).valid_at(at, at + OTHER_FOR));
+        assert!(lap.valid_at(at, at + OTHER_FOR));
+        assert!(!lap.valid_at(at, at + LAP_TIME_FOR));
     }
 
     #[test]

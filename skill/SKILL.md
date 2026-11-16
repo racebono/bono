@@ -114,8 +114,10 @@ not reported), `start_light`, `air_c`, `track_c`, `rain_pct`,
 `energy_left_pct`, `battery_pct`, `front_compound`, `rear_compound`; `water_c`, `oil_c`,
 `engine_overheating`; `tc`, `tc_slip`, `tc_cut`, `abs`, `engine_map`, `front_brake_bias_pct`,
 `brake_migration`, `front_arb`, `rear_arb`, `limiter_on`; `engine_damage`, `transmission_damage`,
-`aero_damage`, `suspension_damage` (0 none to 1 destroyed), `parts_detached`, `dents` (eight
-locations; 0 none, 1 some, 2 more), `last_impact_ago_s`, `last_impact_magnitude`; `in_pit_lane`,
+`aero_damage`, `suspension_damage` (0 none to 1 destroyed; NULL when not reported, and some
+simulators report them only for the player), `parts_detached`, `body_damage` (damaged bodywork by
+zone around the car, e.g. `front 2, rear_left 1`: 1 some, 2 more, not a fraction; `none` when
+undamaged, NULL when not reported), `last_impact_ago_s`, `last_impact_magnitude`; `in_pit_lane`,
 `in_pits`, `in_garage`, `pit_state`, `pit_stops`, `scheduled_pit_stops`, `pit_services_selected`
 (intent, not work done; `none` when nothing is, NULL when not reported), `pit_services_active`, `pit_min_duration_left_s`; `flag` (blue: being
 lapped), `under_yellow`, `finish_status`, `penalties`, `penalty_type`, `penalty_reason`,

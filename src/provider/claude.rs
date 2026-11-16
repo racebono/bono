@@ -94,6 +94,7 @@ pub(super) async fn list_models(
         models.extend(page.data.into_iter().map(|entry| ModelOption {
             name: entry.id,
             size: None,
+            efforts: None,
         }));
         match (page.has_more, page.last_id) {
             (true, Some(last)) => after = Some(last),

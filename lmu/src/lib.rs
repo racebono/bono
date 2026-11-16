@@ -17,14 +17,16 @@ use std::{
 
 mod car_numbers;
 mod class_positions;
+mod condition;
 mod forecast;
 mod track_limits;
 
 use car_numbers::CarNumbers;
+use condition::VehicleCondition;
 use track_limits::TrackLimits;
 
 /// What `bono_lmu_recorder*` points to.
-pub struct LmuRecorder(Recorder, Arc<CarNumbers>, TrackLimits);
+pub struct LmuRecorder(Recorder, Arc<CarNumbers>, TrackLimits, VehicleCondition);
 
 /// What the recorder's writer thread reads from the web API now and then. Closing the recorder waits
 /// for the writer on the game's thread, so a hung web API can hold the game's exit for both requests'
@@ -49,6 +51,7 @@ pub unsafe extern "C" fn bono_lmu_open(dir: *const u16, len: usize) -> *mut LmuR
                 recorder,
                 numbers,
                 TrackLimits::default(),
+                VehicleCondition::start(),
             ))),
             Err(_) => std::ptr::null_mut(),
         }
@@ -59,7 +62,7 @@ pub unsafe extern "C" fn bono_lmu_open(dir: *const u16, len: usize) -> *mut LmuR
 /// `recorder` must come from `bono_lmu_open`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bono_lmu_restart(recorder: *mut LmuRecorder) {
-    let LmuRecorder(recorder, numbers, _) = unsafe { &mut *recorder };
+    let LmuRecorder(recorder, numbers, ..) = unsafe { &mut *recorder };
     guard((), || {
         let _ = recorder.restart(Some(web_api(numbers.clone())));
     })
@@ -72,7 +75,11 @@ pub unsafe extern "C" fn bono_lmu_close(recorder: *mut LmuRecorder) {
     let recorder = unsafe { Box::from_raw(recorder) };
     guard((), move || {
         let dir = recorder.0.dir().to_owned();
-        // Waits for the writer, so the database is closed before it's deleted
+        // The damage's thread stops first, so its request and the writer's time out together: the
+        // game waits 6 s at most, not one wait after the other. Then this waits for the writer, so
+        // the database is closed before it's deleted, and for the damage's thread (see
+        // `VehicleCondition`'s `drop`)
+        recorder.3.stop();
         drop(recorder);
         recorder::remove_database(&dir);
     })
@@ -108,10 +115,15 @@ pub unsafe extern "C" fn bono_lmu_push_telemetry(
     recorder: *const LmuRecorder,
     telemetry: *const bono_telemetry,
 ) {
-    let LmuRecorder(recorder, _, track_limits) = unsafe { &*recorder };
+    let LmuRecorder(recorder, _, track_limits, condition) = unsafe { &*recorder };
     let mut telemetry = unsafe { *telemetry };
     guard((), || {
         track_limits.fill_telemetry(&mut telemetry);
+        let is_player = telemetry
+            .vehicle_id
+            .get()
+            .is_some_and(|vehicle| recorder.is_player(vehicle));
+        condition.fill_telemetry(&mut telemetry, is_player);
         recorder.push_telemetry(&telemetry)
     })
 }
@@ -127,7 +139,7 @@ pub unsafe extern "C" fn bono_lmu_push_scoring(
     standings: *mut bono_standing,
     count: usize,
 ) {
-    let LmuRecorder(recorder, numbers, track_limits) = unsafe { &*recorder };
+    let LmuRecorder(recorder, numbers, track_limits, condition) = unsafe { &*recorder };
     let session = std::mem::take(unsafe { &mut *session });
     let standings = match count {
         0 => Vec::new(),
@@ -142,7 +154,8 @@ pub unsafe extern "C" fn bono_lmu_push_scoring(
         let mut standings = standings;
         numbers.fill(&mut standings);
         class_positions::fill(&mut standings);
-        recorder.push_scoring(session, standings)
+        recorder.push_scoring(session, standings);
+        condition.set_player(recorder.player());
     })
 }
 
@@ -150,10 +163,11 @@ pub unsafe extern "C" fn bono_lmu_push_scoring(
 /// `recorder` must come from `bono_lmu_open`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bono_lmu_clear(recorder: *const LmuRecorder) {
-    let LmuRecorder(recorder, numbers, track_limits) = unsafe { &*recorder };
+    let LmuRecorder(recorder, numbers, track_limits, condition) = unsafe { &*recorder };
     guard((), || {
         numbers.clear();
         track_limits.clear();
+        condition.clear();
         recorder.clear()
     })
 }
