@@ -329,8 +329,10 @@ the snapshot's `TRAFFIC` has iRacing's count of cars alongside and its gaps on t
 (also `cars_now.gap_car_ahead_s` and `gap_car_behind_s`), and nothing about where any other car
 is: don't call the track clear beyond that count.
 In races, `time_behind_next_s` and the gaps to the places either side are live between cars
-racing less than a lap apart (otherwise iRacing's own, which it updates about once a lap at a timing
-line), and `time_behind_leader_s` adds them up from the leader down.
+racing less than a lap apart, and `time_behind_leader_s` is live while the car and the leader race
+on track (how long it takes to get where the leader is, whole laps at its class's lap time); else
+each is iRacing's own, which it updates about once a lap at a timing line. Between classes the
+gaps don't add up to the time behind the leader.
 The best lap is `cars_now.best_lap_s`, iRacing's own, which leaves out laps it doesn't count: a
 quicker `lap_stats` time may be one of those. Don't call such a lap invalid (iRacing doesn't say
 why), and don't call any lap valid: iRacing doesn't report lap validity.

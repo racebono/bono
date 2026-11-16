@@ -119,6 +119,9 @@ const MAX_GAP: f64 = 5.0;
 const BEST_LAP_WINDOW: f64 = 5.0;
 /// How many of each car's last whole laps are kept, to find its best among.
 const RECENT_LAPS: usize = 4;
+/// How long (s) after a car's crossing of the line its lap count may go up for the count to be timed
+/// at the crossing: a moment, as the count and the distance go round a frame or so apart.
+const COUNT_LAG: f64 = 1.0;
 /// Under this (s), a car's time behind the leader on its first lap may be the game's placeholder.
 const PLACEHOLDER_MAX: f64 = 0.1;
 /// How long (s) before the first update with the flag the winner's lap count may have gone up
@@ -166,8 +169,9 @@ struct Flag {
     /// The first update with the flag, and the most laps any car had then
     since: f64,
     most: Option<i64>,
-    /// When the winner's count went up for its finish, once it has
+    /// When the winner's count went up for its finish, once it has, and the laps it had then
     finish: Option<f64>,
+    laps: Option<i64>,
 }
 
 /// One wheel's carcass temperatures and tread left, and when they took these values.
@@ -390,28 +394,31 @@ impl Converter {
             let most = cars.iter().filter_map(|c| c.laps_completed).max();
             // The winner over the line a moment before the flag came (iRacing's count and state
             // can go round a moment apart): the first with those laps then
-            let finish = cars
+            let winner = cars
                 .iter()
                 .filter(|c| c.laps_completed.is_some() && c.laps_completed == most)
-                .filter_map(|c| counted(c.idx))
-                .filter(|at| time - at <= FINISH_WINDOW)
-                .min_by(f64::total_cmp);
+                .filter_map(|c| Some((counted(c.idx)?, c.laps_completed)))
+                .filter(|(at, _)| time - at <= FINISH_WINDOW)
+                .min_by(|a, b| a.0.total_cmp(&b.0));
             self.flag = Some(Some(Flag {
                 since: time,
                 most,
-                finish,
+                finish: winner.map(|(at, _)| at),
+                laps: winner.and_then(|(_, laps)| laps),
             }));
         }
         if let Some(Some(flag)) = &mut self.flag
             && flag.finish.is_none()
         {
             // The first car over the line since with more laps than anyone had at the flag
-            flag.finish = cars
+            let winner = cars
                 .iter()
                 .filter(|c| c.laps_completed > flag.most)
-                .filter_map(|c| counted(c.idx))
-                .filter(|at| *at >= flag.since - FINISH_WINDOW)
-                .min_by(f64::total_cmp);
+                .filter_map(|c| Some((counted(c.idx)?, c.laps_completed)))
+                .filter(|(at, _)| *at >= flag.since - FINISH_WINDOW)
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            flag.finish = winner.map(|(at, _)| at);
+            flag.laps = winner.and_then(|(_, laps)| laps);
         }
         let finished: HashSet<i64> = match &self.flag {
             None => HashSet::new(),
@@ -433,7 +440,31 @@ impl Converter {
             Some(STATE_CHECKERED) => !finished.contains(&car.idx),
             Some(_) => false,
         };
-        let places = place_gaps(&cars, race, racing);
+        // A car that has finished on the winner's lap: how long after the winner it was over the
+        // line, exactly (iRacing's time behind the leader can stay a lap old for half a minute)
+        if let Some(Some(Flag {
+            finish: Some(finish),
+            laps: Some(laps),
+            ..
+        })) = self.flag
+        {
+            for car in &cars {
+                if let Some(track) = self.cars.get_mut(&car.idx)
+                    && track.finish_gap.is_none()
+                    && finished.contains(&car.idx)
+                    && car.laps_completed == Some(laps)
+                {
+                    track.finish_gap = track.counted_at.map(|at| (at - finish).max(0.0));
+                }
+            }
+        }
+        let finish_gaps: HashMap<i64, f64> = cars
+            .iter()
+            .filter(|c| finished.contains(&c.idx))
+            .filter_map(|c| Some((c.idx, self.cars.get(&c.idx)?.finish_gap?)))
+            .collect();
+        let places = place_gaps(&cars, race, &racing, &finish_gaps);
+        let behind = behind_leader(&cars, race, &racing, &finish_gaps);
         let before_green =
             state.is_some_and(|state| (STATE_GET_IN_CAR..STATE_RACING).contains(&state));
         if race {
@@ -519,7 +550,7 @@ impl Converter {
                     .filter(|t| *t >= 0.0 && *t < UNLIMITED_TIME);
                 self.session_end = session_end(self.session_end, time, remaining);
                 self.wind = steady_wind(self.wind, wind(frame));
-                Some(self.scoring(frame, info, &cars, player, race, time, &places))
+                Some(self.scoring(frame, info, &cars, player, race, time, &places, &behind))
             }
         };
 
@@ -599,6 +630,7 @@ impl Converter {
         race: bool,
         time: f64,
         places: &HashMap<i64, (Option<f64>, Option<f64>)>,
+        behind: &HashMap<i64, f64>,
     ) -> (bono_session_info, Vec<bono_standing>) {
         let num = frame.i32("SessionNum");
         let current = num.and_then(|num| info.session(num.into()));
@@ -661,7 +693,6 @@ impl Converter {
         s.max_incident_points = info.incident_limit.into();
 
         let phase = s.phase.as_deref().map(str::to_owned);
-        let behind = behind_leader(cars, places);
         let standings = cars
             .iter()
             .map(|car| {
@@ -675,7 +706,7 @@ impl Converter {
                     race,
                     time,
                     places,
-                    &behind,
+                    behind,
                     &phase,
                     current.and_then(|c| c.results.get(&car.idx)),
                 )
@@ -1325,6 +1356,7 @@ fn place_gaps(
     cars: &[Car<'_>],
     race: bool,
     racing: impl Fn(&Car<'_>) -> bool,
+    finish_gaps: &HashMap<i64, f64>,
 ) -> HashMap<i64, (Option<f64>, Option<f64>)> {
     let mut gaps = HashMap::new();
     if !race {
@@ -1342,14 +1374,25 @@ fn place_gaps(
             && car.laps_completed.is_some_and(|laps| laps >= 0)
     };
     let gap = |ahead: &Car<'_>, behind: &Car<'_>| {
-        let within_a_lap = matches!(
-            (ahead.progress(), behind.progress()),
-            (Some(a), Some(b)) if (0.0..1.0).contains(&(a - b))
-        );
-        (racing_car(ahead) && racing_car(behind) && within_a_lap)
-            .then(|| follow_gap(behind, ahead))
-            .flatten()
-            .or_else(|| Some(behind.race_time()? - ahead.race_time()?).filter(|gap| *gap >= 0.0))
+        // Both finished on the winner's lap: how far apart they were over the line
+        if let (Some(a), Some(b)) = (finish_gaps.get(&ahead.idx), finish_gaps.get(&behind.idx)) {
+            return Some(b - a).filter(|gap| *gap >= 0.0);
+        }
+        let apart = ahead.progress().zip(behind.progress()).map(|(a, b)| a - b);
+        if racing_car(ahead) && racing_car(behind) {
+            match apart {
+                Some(apart) if (0.0..1.0).contains(&apart) => {
+                    if let Some(gap) = follow_gap(behind, ahead) {
+                        return Some(gap);
+                    }
+                }
+                // By it since the line (the game places cars over the line): no gap to it,
+                // rather than one from before
+                Some(apart) if apart < 0.0 => return None,
+                _ => {}
+            }
+        }
+        Some(behind.race_time()? - ahead.race_time()?).filter(|gap| *gap >= 0.0)
     };
     for car in cars {
         let Some(place) = car.position else {
@@ -1364,33 +1407,55 @@ fn place_gaps(
     gaps
 }
 
-/// In races, each car's time behind the leader, live: the leader's 0, and every other car's the
-/// car a place ahead's and its gap to it (see `place_gaps`), so the two add up. A car whose link
-/// to the car ahead breaks (a place nobody has, a gap not known) has the game's time behind the
-/// leader instead, as of a timing line it last passed, and the cars behind it go on from that.
+/// In races, each car's time behind the leader, live while it and the leader race on track: how
+/// long it takes to get where the leader is (see `follow_gap` for the lap it's on, and its class's
+/// lap time for each whole lap more), on its own, so a pass or a stop behind it doesn't move it.
+/// Otherwise (before the green, finished, in the pit lane, without a class lap time a lap or more
+/// back) the game's, as of a timing line it last passed.
 fn behind_leader(
     cars: &[Car<'_>],
-    places: &HashMap<i64, (Option<f64>, Option<f64>)>,
+    race: bool,
+    racing: impl Fn(&Car<'_>) -> bool,
+    finish_gaps: &HashMap<i64, f64>,
 ) -> HashMap<i64, f64> {
-    let mut placed: Vec<&Car<'_>> = cars.iter().filter(|c| c.position.is_some()).collect();
-    placed.sort_by_key(|c| c.position);
     let mut behind = HashMap::new();
-    // The car a place ahead: its place and time behind the leader
-    let mut ahead: Option<(i64, Option<f64>)> = None;
-    for car in placed {
-        let chained = match (car.position, ahead) {
-            (Some(1), _) => Some(0.0),
-            (Some(p), Some((above, Some(time)))) if p == above + 1 => places
-                .get(&car.idx)
-                .and_then(|(gap, _)| *gap)
-                .map(|gap| time + gap),
-            _ => None,
+    if !race {
+        return behind;
+    }
+    let on_track = |car: &Car<'_>| {
+        racing(car) && car.on_pit_road != Some(true) && car.laps_completed.is_some_and(|l| l >= 0)
+    };
+    let leader = cars
+        .iter()
+        .find(|c| c.position == Some(1))
+        .filter(|c| on_track(c));
+    for car in cars {
+        let live = || {
+            let leader = leader.filter(|_| on_track(car))?;
+            let laps = leader.progress()? - car.progress()?;
+            // By the leader since the line (the game places cars over it): leading on the road
+            if laps < 0.0 {
+                return Some(0.0);
+            }
+            let lap = follow_gap(car, leader)?;
+            let whole = laps.floor();
+            match whole > 0.0 {
+                false => Some(lap),
+                true => Some(whole * car.driver.class_lap_time? + lap),
+            }
         };
-        let time = chained.or_else(|| car.race_time());
+        let time = match car.position {
+            Some(1) => Some(0.0),
+            Some(_) => finish_gaps
+                .get(&car.idx)
+                .copied()
+                .or_else(live)
+                .or_else(|| car.race_time()),
+            None => None,
+        };
         if let Some(time) = time {
             behind.insert(car.idx, time);
         }
-        ahead = car.position.map(|p| (p, time));
     }
     behind
 }
@@ -1460,6 +1525,8 @@ struct CarTrack {
     /// have been worked out since (see `laps_behind`)
     finish_progress: Option<f64>,
     laps_final: bool,
+    /// Finished on the winner's lap: how long after the winner it was over the line
+    finish_gap: Option<f64>,
     /// In races, its laps behind the leader and the car a place ahead (see `laps_behind`)
     laps_behind: Option<(Option<i64>, Option<i64>)>,
 }
@@ -1663,12 +1730,16 @@ impl CarTrack {
                 _ => self.line = Some((at, at_distance)),
             }
         }
-        // When the count went up, driven: the crossing this update (worked out between updates,
-        // so cars over the line in one update go in their order), or else now (the count can go
-        // up at a finish line elsewhere than the start). A count that came with a move (a reset,
-        // a reconnect) isn't a crossing
+        // When the count went up, driven: the crossing it's for, worked out between updates (so
+        // cars over the line together go in their order), when that was a moment before; or else
+        // now (the count can go up at a finish line elsewhere than the start). A count that came
+        // with a move (a reset, a reconnect) isn't a crossing
         if rose && continuous {
-            self.counted_at = Some(line.map_or(time, |(at, _)| at));
+            self.counted_at = Some(
+                self.lap_start
+                    .filter(|at| time - at <= COUNT_LAG)
+                    .unwrap_or(time),
+            );
         }
         if lap.is_some() {
             self.lap = lap;
@@ -1997,6 +2068,70 @@ mod tests {
     /// Once racing, the gap to the place ahead is live between cars less than a lap apart, not the
     /// game's times behind the leader (as of each car's last time over the line); a lap or more
     /// apart, or before the green, it's those times.
+    /// The time behind the leader is each car's own live time to get where the leader is: across
+    /// classes at the follower's lap time, so a pass between classes doesn't move it; a lap or
+    /// more back, whole laps at its class's lap time; in the pit lane, the game's.
+    #[test]
+    fn the_time_behind_the_leader_is_each_cars_own() {
+        let fast = super::super::session::Driver {
+            class_id: Some(1),
+            class_lap_time: Some(100.0),
+            ..Default::default()
+        };
+        let slow = super::super::session::Driver {
+            class_id: Some(2),
+            class_lap_time: Some(200.0),
+            ..Default::default()
+        };
+        let car = |idx: i64, driver, position: i64, laps: i64, pct: f64, f2: f64| Car {
+            idx,
+            driver,
+            pct: Some(pct),
+            on_pit_road: Some(false),
+            laps_completed: Some(laps),
+            lap_offset: 0,
+            position: Some(position),
+            class_position: Some(position),
+            est: Some(pct * 100.0),
+            f2: Some(f2),
+        };
+        let close = |got: Option<&f64>, want: f64| {
+            assert!(got.is_some_and(|got| (got - want).abs() < 1e-6), "{got:?}");
+        };
+        // The leader (fast) at 80%, a slow car at 60%, a fast car just behind it at 59%, and a
+        // fast car a lap down at 70%
+        let cars = [
+            car(0, &fast, 1, 5, 0.8, 0.0),
+            car(1, &slow, 2, 5, 0.6, 30.0),
+            car(2, &fast, 3, 5, 0.59, 31.0),
+            car(3, &fast, 4, 4, 0.7, 120.0),
+        ];
+        let behind = behind_leader(&cars, true, |_| true, &HashMap::new());
+        close(behind.get(&0), 0.0);
+        close(behind.get(&1), 40.0);
+        close(behind.get(&2), 21.0);
+        close(behind.get(&3), 110.0);
+        // The fast car by the slow one: its time moves on as it does, not by the slow car's
+        let mut passed = cars.clone();
+        passed[1] = car(1, &slow, 3, 5, 0.6, 30.0);
+        passed[2] = car(2, &fast, 2, 5, 0.61, 31.0);
+        let behind = behind_leader(&passed, true, |_| true, &HashMap::new());
+        close(behind.get(&2), 19.0);
+        close(behind.get(&1), 40.0);
+        // In the pit lane, the game's; not racing (finished, before the green), the game's
+        let mut pitted = cars.clone();
+        pitted[3].on_pit_road = Some(true);
+        close(
+            behind_leader(&pitted, true, |_| true, &HashMap::new()).get(&3),
+            120.0,
+        );
+        close(
+            behind_leader(&cars, true, |_| false, &HashMap::new()).get(&2),
+            31.0,
+        );
+        assert!(behind_leader(&cars, false, |_| true, &HashMap::new()).is_empty());
+    }
+
     #[test]
     fn place_gaps_are_live_within_a_lap() {
         let driver = super::super::session::Driver {
@@ -2023,7 +2158,7 @@ mod tests {
             car(1, 2, 3, 0.5, 45.0, 2.0),
             car(2, 3, 2, 0.45, 40.5, 91.0),
         ];
-        let gaps = place_gaps(&cars, true, |_| true);
+        let gaps = place_gaps(&cars, true, |_| true, &HashMap::new());
         let (ahead, behind) = gaps[&1];
         assert!(
             ahead.is_some_and(|gap| (gap - 9.0).abs() < 1e-9),
@@ -2035,16 +2170,25 @@ mod tests {
         );
         assert_eq!(gaps[&0].0, None);
         // Not racing (before the green, or finished): the game's times
-        assert_eq!(place_gaps(&cars, true, |_| false)[&1].0, Some(2.0));
+        assert_eq!(
+            place_gaps(&cars, true, |_| false, &HashMap::new())[&1].0,
+            Some(2.0)
+        );
         // Either car in the pit lane, or not yet counting laps: the game's times too
         let mut pitted = cars.clone();
         pitted[0].on_pit_road = Some(true);
-        assert_eq!(place_gaps(&pitted, true, |_| true)[&1].0, Some(2.0));
+        assert_eq!(
+            place_gaps(&pitted, true, |_| true, &HashMap::new())[&1].0,
+            Some(2.0)
+        );
         let mut starting = cars.clone();
         starting[1].laps_completed = Some(-1);
-        assert_eq!(place_gaps(&starting, true, |_| true)[&1].0, None);
+        assert_eq!(
+            place_gaps(&starting, true, |_| true, &HashMap::new())[&1].0,
+            None
+        );
         // Not a race: none
-        assert!(place_gaps(&cars, false, |_| true).is_empty());
+        assert!(place_gaps(&cars, false, |_| true, &HashMap::new()).is_empty());
     }
 
     /// Through a race's end: the first lap's placeholder isn't a time until the game changes it,
@@ -2181,7 +2325,9 @@ mod tests {
         );
         assert_eq!(standing(&cool, 1).1, Some(0));
         assert_eq!(standing(&cool, 0).1, Some(0));
-        close(gaps(&cool, 1).0, 3.0);
+        // Both finished on the winner's lap: how far apart they were over the line, exactly
+        // (car 0 over it at 5.83 s, car 1 at 6.71 s), not the game's times
+        close(gaps(&cool, 1).0, (6.0 + 0.05 / 0.07) - (5.0 + 0.05 / 0.06));
     }
 
     /// Two cars over the line in one update are counted in the order they crossed: a car a lap
