@@ -543,17 +543,24 @@ impl Language {
 
                             row.col(|ui| {
                                 if on_disk {
-                                    // Allow selecting the configured voice again after a failed load.
-                                    if ui.button(t!("audio.use")).clicked() {
-                                        config.set_voice(
-                                            rt,
-                                            code,
-                                            Some(voice.path.to_path_buf()),
-                                            synth,
-                                        );
-                                        picked = true;
-                                        updated = true;
-                                    }
+                                    let used =
+                                        config.voices().get(&code).map(|path| path.as_path())
+                                            == Some(&*voice.path);
+                                    // The voice in use can be picked again only if it failed to
+                                    // load, to retry
+                                    let usable = !used || synth.failed(code, &voice.path);
+                                    ui.add_enabled_ui(usable, |ui| {
+                                        if ui.button(t!("audio.use")).clicked() {
+                                            config.set_voice(
+                                                rt,
+                                                code,
+                                                Some(voice.path.to_path_buf()),
+                                                synth,
+                                            );
+                                            picked = true;
+                                            updated = true;
+                                        }
+                                    });
                                 } else if let Some(progress) = voice.progress() {
                                     egui::ProgressBar::new(progress as f32)
                                         .show_percentage()

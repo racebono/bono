@@ -27,15 +27,19 @@ choose a documented alternative.
 
 Run tests with the `cuda` and `vulkan` features disabled unless the changes
 involve those features or their backend behavior. Both are enabled by default,
-so use `cargo test -p bono --no-default-features` for ordinary application tests.
+so use `just test` for ordinary application tests: it builds the phonemizer and
+runs `cargo test -p bono --no-default-features`, passing any extra arguments on
+(for example `just test synthesizer -- --nocapture`). Prefer it over other
+commands, so every worktree builds the same dependencies and the build slots
+(below) stay warm.
 If other features are needed, enable them explicitly with `--features` while
 keeping CUDA and Vulkan disabled.
 
 When changes involve CUDA or Vulkan, also run relevant tests with the affected
 feature explicitly enabled, for example
-`cargo test -p bono --no-default-features --features vulkan` (or `cuda`, or
-`cuda,vulkan` when both are involved). Report any missing SDK or hardware that
-prevents the relevant validation.
+`just slot cargo test -p bono --no-default-features --features vulkan` (or
+`cuda`, or `cuda,vulkan` when both are involved). Report any missing SDK or
+hardware that prevents the relevant validation.
 
 ## Windows build and test paths
 
@@ -45,25 +49,25 @@ directories; a long checkout or worktree path can cause maximum-path errors,
 including the 260-character limit in some native build tools. `cargo check` and
 `cargo test` can also trigger these native builds.
 
-- Before building on Windows, choose a short, writable, absolute Cargo target
-  directory, unique to this checkout. Use it consistently for build, check, test,
-  and packaging commands so they reuse the same artifacts. Respect sandbox write
-  permissions when choosing the location.
-- Prefer a short symlink to the current worktree whenever possible and run
-  build/test commands through that path. Verify that it targets this worktree,
-  not another checkout. If symlinks are unavailable or native tools resolve
-  them back to the long path, use another suitable short-path arrangement.
-- For example, in PowerShell, if `D:\bt\bono-t3` is writable and reserved for this
-  checkout:
-
-  ```powershell
-  $env:CARGO_TARGET_DIR = 'D:\bt\bono-t3'
-  cargo build -p bono
-  cargo test -p bono --no-default-features
-  ```
-
-  These are examples of target-directory setup; select packages and features for
-  the task and installed SDKs as described in `README.md`.
+- On Windows, run Cargo build, check, test, and packaging commands through a
+  build slot: `just test`, or `just slot <command>` for anything else (for
+  example `just slot cargo check -p bono --no-default-features`).
+  `scripts/slot.ps1` locks a free slot, points its short symlink
+  (`<root>\slotN`) at this worktree, and runs the command there with the slot's
+  target directory (`<root>\slotN-t`). The root is `BONO_SLOT_ROOT`
+  (default `D:\worktrees\bt`). The short paths keep native builds under the
+  path-length limits.
+- Slots stay between tasks and worktrees, so dependencies are built once and
+  reused; when a slot changes worktrees, the script rebuilds only the workspace
+  crates. Don't set `CARGO_TARGET_DIR` yourself or create per-task target
+  directories, which rebuild every dependency from scratch.
+- A command waits, and says so, while every slot is busy. Run long commands in
+  the background rather than killing them: a killed command releases its slot,
+  but its Cargo processes may keep the target directory locked until they
+  finish.
+- Select packages and features for the task and installed SDKs as described in
+  `README.md`. Building other features in a slot rebuilds the affected
+  dependencies there, so keep to `just test` when it covers the change.
 - Keep the repository's Ninja configuration in `.cargo/config.toml` and ensure
   Ninja is on `PATH`. It avoids the known MSBuild FileTracker path-length issue
   in Whisper's Vulkan build; do not switch to MSBuild to work around a failure.
@@ -76,6 +80,10 @@ including the 260-character limit in some native build tools. `cargo check` and
   checks actually completed; do not claim tests passed when compilation failed.
 
 ## Clean up temporary build paths
+
+Build slots (`<root>\slotN`, `<root>\slotN-t` and their `.lock` and `.owner`
+files) and the shared compiler cache are not task-owned: never delete them as
+part of cleanup. Everything below applies to other paths a task creates.
 
 Track temporary build directories, Cargo target/cache directories, and short
 symlinks created for the task. Reuse them while the work is active, then remove
@@ -98,3 +106,9 @@ references and evals. Do not cite observed incidents, dates, sessions, quoted
 model answers, or pass/fail outcomes from real or test runs. Describe the
 behavior to follow and the scenarios to evaluate in general terms; record
 specific results in commit messages, pull requests, or issues instead.
+
+## Pull Requests
+
+- Conventional commit titles, plain language: `fix(web): new threads no longer spike CPU`.
+- UI changes need before/after images. Motion or timing needs a short video.
+- Upload PR evidence to GitHub. Never commit PR-only screenshots or assets such as `.github/pr-assets/`.
