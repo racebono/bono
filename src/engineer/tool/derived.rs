@@ -1185,9 +1185,10 @@ struct Car {
 }
 
 /// Where a car has been lately: (session time, lap distance), oldest first, at most a row every
-/// `TRAIL_STEP` and going back `TRAIL_SPAN`.
+/// `TRAIL_STEP` and going back `TRAIL_SPAN`; and whether a row since it was last cleared came
+/// without a speed (with one on every row, it was seen moving on every row).
 #[derive(Default)]
-struct Trail(std::collections::VecDeque<(f64, f64)>);
+struct Trail(std::collections::VecDeque<(f64, f64)>, bool);
 
 /// Seconds between the rows a trail keeps: enough to place a car to a few metres between them
 const TRAIL_STEP: f64 = 0.1;
@@ -1214,6 +1215,7 @@ impl Trail {
         // is missing
         if sample.speed.is_some_and(|v| v < MOVING) {
             self.0.clear();
+            self.1 = false;
             return;
         }
         let (Some(t), Some(d)) = (sample.session_time, sample.lap_distance) else {
@@ -1224,10 +1226,17 @@ impl Trail {
         }
         match self.0.back() {
             // Back in time: another session, or the file started over
-            Some(&(last, _)) if t < last - 1.0 => self.0.clear(),
-            Some(&(last, _)) if t < last + TRAIL_STEP => return,
+            Some(&(last, _)) if t < last - 1.0 => {
+                self.0.clear();
+                self.1 = false;
+            }
+            Some(&(last, _)) if t < last + TRAIL_STEP => {
+                self.1 |= sample.speed.is_none();
+                return;
+            }
             _ => {}
         }
+        self.1 |= sample.speed.is_none();
         self.0.push_back((t, d));
         while self
             .0
@@ -1248,10 +1257,15 @@ impl Trail {
             return None;
         }
         let mut newer = (now, at);
-        // The steps (seconds, metres on with back counting against) of the latest CRAWL's worth,
-        // sliding along the trail: slower than a moving car over any one of those is a stop,
-        // however its distance jittered, and faster than any car (but for one row's correction)
-        // is a reset or a tow, however small each of its steps
+        // Seconds back and metres on (back counting against) from now, and the least of metres on
+        // less what a car could have driven by each row so far: further on than any car drives
+        // between two rows, however small the steps between, is a reset or a tow. Only once: a
+        // distance that's put right is out by as much at most, however many times it's put right
+        let (mut back, mut on_since) = (0.0, 0.0);
+        let mut least = 0.0f64;
+        // Without a speed on every row, the steps (seconds, metres on) of the latest CRAWL's
+        // worth, sliding along the trail: slower than a moving car over any one of those is a
+        // stop, however its distance jittered. A row's speed says it wasn't stopped
         let mut window = std::collections::VecDeque::new();
         let mut crawl = (0.0, 0.0);
         // A rival's rows can be newer than the player's: they say nothing of before now
@@ -1279,19 +1293,25 @@ impl Trail {
             } else {
                 step
             };
-            window.push_back((dt, on));
-            crawl = (crawl.0 + dt, crawl.1 + on);
-            while window
-                .front()
-                .is_some_and(|&(first, _)| window.len() > 1 && crawl.0 - first >= CRAWL)
-            {
-                let (first, first_on) = window.pop_front().unwrap_or_default();
-                crawl = (crawl.0 - first, crawl.1 - first_on);
-            }
-            if crawl.0 >= CRAWL
-                && (crawl.1 < MOVING * crawl.0 || crawl.1 > TRAIL_TELEPORT * crawl.0 + TRAIL_JITTER)
-            {
+            (back, on_since) = (back + dt, on_since + on);
+            let past = on_since - TRAIL_TELEPORT * back;
+            if past - least > TRAIL_JITTER {
                 return None;
+            }
+            least = least.min(past);
+            if self.1 {
+                window.push_back((dt, on));
+                crawl = (crawl.0 + dt, crawl.1 + on);
+                while window
+                    .front()
+                    .is_some_and(|&(first, _)| window.len() > 1 && crawl.0 - first >= CRAWL)
+                {
+                    let (first, first_on) = window.pop_front().unwrap_or_default();
+                    crawl = (crawl.0 - first, crawl.1 - first_on);
+                }
+                if crawl.0 >= CRAWL && crawl.1 < MOVING * crawl.0 {
+                    return None;
+                }
             }
             if step > 0.0 && step <= length / 2.0 {
                 let into = (spot - older.1).rem_euclid(length);
@@ -5039,11 +5059,16 @@ mod tests {
         ToPlayer::new(session, (me.0, me.1, None), (car.0, car.1, None), now)
     }
 
+    /// A trail of `rows` without their speeds.
+    fn unclocked(rows: std::collections::VecDeque<(f64, f64)>) -> Trail {
+        Trail(rows, true)
+    }
+
     /// A car's trail, driving at `speed` m/s round a 1000 m lap from session time `from` to `to`,
     /// a row every half second, `0` m at `from`.
     fn trail_at(speed: f64, from: f64, to: f64) -> Trail {
         let steps = ((to - from) / 0.5).round() as usize;
-        Trail(
+        unclocked(
             (0..=steps)
                 .map(|i| {
                     let t = from + i as f64 * 0.5;
@@ -5073,21 +5098,21 @@ mod tests {
         holed.0.retain(|(t, _)| !(490.0..=500.0).contains(t));
         assert_eq!(holed.since_at(510.0, 100.0, 950.0, 1000.0), None);
         // Its distance jittering back passes nothing, not the rest of the lap
-        let jitter = Trail([(100.0, 500.0), (100.5, 499.0), (101.0, 505.0)].into());
+        let jitter = unclocked([(100.0, 500.0), (100.5, 499.0), (101.0, 505.0)].into());
         assert_eq!(jitter.since_at(101.0, 505.0, 200.0, 1000.0), None);
         assert!(close(jitter.since_at(101.0, 505.0, 502.0, 1000.0), 0.25));
         // Rows newer than the player's say nothing of before now: never a pass still to come
-        let newer = Trail([(499.5, 495.0), (500.0, 500.0), (500.5, 510.0)].into());
+        let newer = unclocked([(499.5, 495.0), (500.0, 500.0), (500.5, 510.0)].into());
         assert!(close(newer.since_at(500.0, 505.0, 504.0, 1000.0), 0.05));
         // A trail running on far past now is another session's: none of it counts
         let other_session = trail_at(10.0, 0.0, 3600.0);
         assert_eq!(other_session.since_at(30.0, 300.0, 250.0, 1000.0), None);
         // Towed 300 m on in a second: it never drove through 900 m
-        let towed = Trail([(499.0, 800.0), (500.0, 100.0), (501.0, 110.0)].into());
+        let towed = unclocked([(499.0, 800.0), (500.0, 100.0), (501.0, 110.0)].into());
         assert_eq!(towed.since_at(501.0, 110.0, 900.0, 1000.0), None);
         // Stopped on the way (its speed not reported): how long ago it was there before says how
         // long it stopped, not how far ahead it is
-        let paused = Trail(
+        let paused = unclocked(
             [(495.0, 200.0), (497.5, 250.0), (500.0, 300.0)]
                 .into_iter()
                 .chain((1..=350).map(|i| (500.0 + f64::from(i) / 10.0, 300.0)))
@@ -5097,7 +5122,7 @@ mod tests {
         assert_eq!(paused.since_at(540.0, 400.0, 250.0, 1000.0), None);
         assert!(close(paused.since_at(540.0, 400.0, 375.0, 1000.0), 1.25));
         // Nor does its distance jittering back and forth while stopped hide the stop
-        let jittering = Trail(
+        let jittering = unclocked(
             [(497.5, 250.0), (500.0, 300.0)]
                 .into_iter()
                 .chain((1..=280).map(|i| (500.0 + f64::from(i) / 8.0, 300.0 + f64::from(i % 2))))
@@ -5107,7 +5132,7 @@ mod tests {
         assert_eq!(jittering.since_at(540.0, 400.0, 250.0, 1000.0), None);
         // Nor does a short stop hide between seconds counted from now: a row every 0.125 s at
         // 20 m/s, stopped from 1.5 to 2.75 s
-        let short_stop = Trail(
+        let short_stop = unclocked(
             (0..=24)
                 .map(|i| {
                     let t = f64::from(i) * 0.125;
@@ -5118,14 +5143,33 @@ mod tests {
         assert_eq!(short_stop.since_at(3.125, 37.5, 10.0, 1000.0), None);
         assert!(close(short_stop.since_at(3.125, 37.5, 35.0, 1000.0), 0.125));
         // Steps each short enough for a correction but faster than any car together: 320 m/s
-        let racing_off = Trail(
+        let racing_off = unclocked(
             (0..=8)
                 .map(|i| (f64::from(i) * 0.125, f64::from(i) * 40.0))
                 .collect(),
         );
         assert_eq!(racing_off.since_at(1.0, 320.0, 0.0, 1000.0), None);
+        // Nor slower for longer, each second within a correction of what a car drives: 190 m/s
+        let towed_along = unclocked(
+            (0..=16)
+                .map(|i| (f64::from(i) * 0.125, f64::from(i) * 0.125 * 190.0))
+                .collect(),
+        );
+        assert_eq!(towed_along.since_at(2.0, 380.0, 0.0, 1000.0), None);
+        // An estimated distance put back and then on again, at 20 m/s: with its speed on every
+        // row it wasn't stopped. Without, it's slower than a moving car for a second, and no
+        // time's known rather than a wrong one
+        let rows = (0..=64)
+            .map(|i| {
+                let t = f64::from(i) * 0.125;
+                (t, if i == 52 { 490.0 } else { 400.0 + 20.0 * t })
+            })
+            .collect::<std::collections::VecDeque<_>>();
+        let clocked = Trail(rows.clone(), false);
+        assert!(close(clocked.since_at(8.125, 562.5, 450.0, 1000.0), 5.625));
+        assert_eq!(unclocked(rows).since_at(8.125, 562.5, 450.0, 1000.0), None);
         // One row's short step, as an estimated distance put right, isn't a stop
-        let corrected = Trail(
+        let corrected = unclocked(
             [
                 (100.0, 500.0),
                 (100.1, 505.0),
@@ -5136,7 +5180,7 @@ mod tests {
         );
         assert!(close(corrected.since_at(100.3, 510.0, 501.0, 1000.0), 0.28));
         // Nor is the long step after it, at 90 m/s, a tow
-        let flat_out = Trail(
+        let flat_out = unclocked(
             [
                 (100.0, 500.0),
                 (100.1, 509.0),
@@ -5150,7 +5194,7 @@ mod tests {
             0.3 - 0.1 * 5.0 / 9.0
         ));
         // Reset 100 m back: where it was before isn't where it drove to here
-        let reset = Trail(
+        let reset = unclocked(
             [
                 (498.0, 640.0),
                 (499.0, 800.0),
@@ -5198,7 +5242,7 @@ mod tests {
         });
         assert_eq!(trail.0.back(), Some(&(TRAIL_SPAN + 0.5, 0.0)));
         // Unless it's a stop: that counts without a distance too
-        let mut stopped = Trail([(1.0, 10.0), (2.0, 30.0)].into());
+        let mut stopped = unclocked([(1.0, 10.0), (2.0, 30.0)].into());
         stopped.push(&Sample {
             lap_distance: None,
             speed: Some(0.0),
@@ -5225,6 +5269,11 @@ mod tests {
                 ..sample(6.0, 40.0)
             });
             assert_eq!(trail.0, [(6.0, 40.0)]);
+            // Seen moving on every row since, until a row without a speed (even one not kept)
+            assert!(!trail.1);
+            trail.push(&sample(6.05, 41.0));
+            assert_eq!(trail.0.len(), 1);
+            assert!(trail.1);
             trail.0.clear();
         }
     }
@@ -5240,7 +5289,7 @@ mod tests {
         // that 200 m takes at the player's pace
         let fast = standing(&conn, "Hypercar", 1, (None, None), Some(80.0), None);
         let fast_lap = on_lap(&conn, 7, 100.0);
-        let fast_trail = Trail([(495.0, 700.0), (497.5, 900.0), (500.0, 100.0)].into());
+        let fast_trail = unclocked([(495.0, 700.0), (497.5, 900.0), (500.0, 100.0)].into());
         let to = ToPlayer::new(
             &practice,
             (&me, &my_lap, None),
@@ -5249,7 +5298,7 @@ mod tests {
         );
         assert!(close(to.track_gap, 2.5), "{to:?}");
         // Behind, from the player's own trail: the player was where it is 5 s ago
-        let my_trail = Trail([(490.0, 700.0), (495.0, 800.0), (500.0, 900.0)].into());
+        let my_trail = unclocked([(490.0, 700.0), (495.0, 800.0), (500.0, 900.0)].into());
         let slow = standing(&conn, "GT3", 6, (None, None), Some(110.0), None);
         let to = ToPlayer::new(
             &practice,
@@ -5259,7 +5308,7 @@ mod tests {
         );
         assert!(close(to.track_gap, -5.0), "{to:?}");
         // A hole in the trail where it passed: the estimate, at the follower's pace
-        let holed = Trail([(480.0, 700.0), (500.0, 100.0)].into());
+        let holed = unclocked([(480.0, 700.0), (500.0, 100.0)].into());
         let to = ToPlayer::new(
             &practice,
             (&me, &my_lap, None),
@@ -5269,7 +5318,7 @@ mod tests {
         assert!(close(to.track_gap, 0.2 * 100.0), "{to:?}");
         // Stopped 10 m ahead after arriving there 30 s ago: not a 30 s gap, the distance's
         // (every row kept, as when its speed isn't reported)
-        let stopped_trail = Trail(
+        let stopped_trail = unclocked(
             [(469.0, 890.0)]
                 .into_iter()
                 .chain((0..=300).map(|i| (470.0 + f64::from(i) / 10.0, 910.0)))
@@ -5288,7 +5337,7 @@ mod tests {
         );
         assert!(close(to.track_gap, 0.01 * 100.0), "{to:?}");
         // Level, its distance having jittered back a metre and with no lap time: level
-        let jittered = Trail([(498.0, 890.0), (499.0, 901.0), (500.0, 900.0)].into());
+        let jittered = unclocked([(498.0, 890.0), (499.0, 901.0), (500.0, 900.0)].into());
         let timeless = standing(&conn, "GT3", 4, (None, None), None, None);
         let to = ToPlayer::new(
             &practice,
@@ -5307,11 +5356,11 @@ mod tests {
         // No time behind the leader, as on RaceRoom
         let me = standing(&conn, "GT3", 5, (None, None), Some(100.0), None);
         let my_lap = on_lap(&conn, 10, 900.0);
-        let my_trail = Trail([(490.0, 700.0), (495.0, 800.0), (500.0, 900.0)].into());
+        let my_trail = unclocked([(490.0, 700.0), (495.0, 800.0), (500.0, 900.0)].into());
 
         // Ahead in the race, 0.2 laps up the road over the line: when it was where the player is
         let ahead = standing(&conn, "GT3", 4, (None, None), Some(100.0), None);
-        let ahead_trail = Trail([(495.0, 700.0), (497.5, 900.0), (500.0, 100.0)].into());
+        let ahead_trail = unclocked([(495.0, 700.0), (497.5, 900.0), (500.0, 100.0)].into());
         let to = ToPlayer::new(
             &race,
             (&me, &my_lap, Some(&my_trail)),
@@ -5333,7 +5382,7 @@ mod tests {
 
         // Ahead in the race but 0.7 laps on, so behind on track the nearest way round: the race
         // gap is still from its pass of the player's spot, the track gap the player's of its
-        let far_trail = Trail(
+        let far_trail = unclocked(
             [
                 (490.0, 500.0),
                 (494.0, 900.0),
@@ -5367,7 +5416,7 @@ mod tests {
 
         // A hair short of a lap ahead in the race, so level on track: nearly a lap's time ahead in
         // the race, level on track
-        let almost_lap = Trail(
+        let almost_lap = unclocked(
             (0..=2000)
                 .map(|i| {
                     let t = 400.0 + f64::from(i) * 0.05;
@@ -5428,7 +5477,7 @@ mod tests {
         assert_eq!((to.race_gap, to.race_laps), (None, Some(1)));
 
         // No trail, or a hole where it passed, or in its garage: no time rather than an estimate
-        let holed = Trail([(480.0, 700.0), (500.0, 100.0)].into());
+        let holed = unclocked([(480.0, 700.0), (500.0, 100.0)].into());
         for (trail, garage) in [(None, 0), (Some(&holed), 0), (Some(&ahead_trail), 1)] {
             let car = columns(
                 &conn,
