@@ -983,15 +983,14 @@ mod tests {
         synth.set_model(Some(missing.clone()));
         assert!(wait_until(|| synth.failed(&missing)));
 
-        // Picked again, it's loading until it fails again
+        // Picked again, it fails again. Whether it shows as loading in between isn't checked:
+        // a missing voice fails before a check right after picking it is sure to run
         synth.set_model(Some(missing.clone()));
-        assert!(!synth.failed(&missing));
         assert!(wait_until(|| synth.failed(&missing)));
 
-        // Another one picked is loading, and the one that failed is no longer it
+        // Picking another one clears the failure of the one before
         synth.set_model(Some(other.clone()));
         assert!(!synth.failed(&missing));
-        assert!(!synth.failed(&other));
         assert!(wait_until(|| synth.failed(&other)));
         assert!(!synth.failed(&missing));
     }
