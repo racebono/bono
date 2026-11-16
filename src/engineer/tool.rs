@@ -2380,10 +2380,13 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         };
         say!(
             out,
-            "TYRES last reading {}, not live: carcass C {}, tread left {} | garage cold pressure              kPa FL/FR/RL/RR {}",
+            "TYRES last reading {}, not live: carcass C {}, tread left {} | garage cold pressure \
+             kPa FL/FR/RL/RR {}",
+            // At least: it's from when it was first seen, if it hasn't changed since (see the
+            // header), so rounded down
             match now.map(|now| (now - reading).max(0.0)) {
-                Some(age) if age < 60.0 => format!("{age:.0} s ago"),
-                Some(age) => format!("{:.0} min ago", age / 60.0),
+                Some(age) if age < 60.0 => format!("at least {:.0} s old", age.floor()),
+                Some(age) => format!("at least {:.0} min old", (age / 60.0).floor()),
                 None => "of unknown age".into(),
             },
             per_wheel(&|r| fmt(r.f("tire_carcass_temperature"), 0, "")),
@@ -3207,7 +3210,7 @@ mod tests {
         let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
         assert!(
             out.contains(
-                "TYRES last reading 6 min ago, not live: carcass C FL 80 FR 81 RL 82 RR 83, \
+                "TYRES last reading at least 6 min old, not live: carcass C FL 80 FR 81 RL 82 RR 83, \
                  tread left FL 97.0% FR 96.0% RL 95.0% RR 94.0% | garage cold pressure kPa \
                  FL/FR/RL/RR 172/171/170/169"
             ),

@@ -41,7 +41,7 @@ use super::{
     session::SessionInfo,
 };
 use crate::sim::memory::{SCORING_EVERY, Update};
-use bono_sim::sys::{bono_session_info, bono_standing, bono_telemetry, bono_wheel_telemetry};
+use bono_sim::sys::{bono_session_info, bono_standing, bono_telemetry};
 use serde_json::{Map, Value, json};
 use std::{collections::HashMap, time::Instant};
 
@@ -135,8 +135,8 @@ pub struct Converter {
     session_end: Option<f64>,
     /// The wind as last recorded (see `steady_wind`)
     wind: Option<(f64, f64)>,
-    /// The player's tyre readings as last seen, by wheel (see `stamp_readings`)
-    tyre_readings: [Option<TyreReading>; 4],
+    /// The player's car and its tyre readings as last seen, by wheel (see `stamp_readings`)
+    tyre_readings: (Option<i64>, [Option<TyreReading>; 4]),
 }
 
 /// One wheel's carcass temperatures and tread left, and when they took these values.
@@ -214,6 +214,12 @@ impl Converter {
         self.session = Some(session);
 
         let player = frame.i32("PlayerCarIdx").map(i64::from).or(info.player);
+        // Every update, the car in the world or not: a reading can change in the garage. Another
+        // car's readings are its own
+        if self.tyre_readings.0 != player {
+            self.tyre_readings = (player, Default::default());
+        }
+        let readings = stamp_readings(&mut self.tyre_readings.1, frame, time);
         let current = frame
             .i32("SessionNum")
             .and_then(|num| info.session(num.into()));
@@ -353,7 +359,9 @@ impl Converter {
                 .into();
             if Some(car.idx) == player {
                 player_telemetry(frame, info, &mut out);
-                stamp_readings(&mut self.tyre_readings, frame, time, &mut out.wheels);
+                for (wheel, reading) in out.wheels.iter_mut().zip(readings) {
+                    wheel.tire_reading_time = reading.into();
+                }
             }
             telemetry.push(out);
         }
@@ -924,17 +932,16 @@ fn average(values: &[Option<f64>]) -> Option<f64> {
 /// The values a wheel's reading is made of: its carcass temperatures and tread left, across it.
 const READING: [&str; 6] = ["tempCL", "tempCM", "tempCR", "wearL", "wearM", "wearR"];
 
-/// Gives each wheel's carcass temperatures and tread left the session time any of them last
-/// changed at (`last` holds each wheel's reading as last seen), the first time they're seen
-/// counting as a change: the game doesn't say when it updates them. A wheel with none of them has
-/// no reading.
+/// The session time each wheel's carcass temperatures and tread left last changed at, by wheel
+/// (`last` holds each wheel's reading as last seen), the first time they're seen counting as a
+/// change: the game doesn't say when it updates them. A wheel with none of them has no reading.
 fn stamp_readings(
     last: &mut [Option<TyreReading>; 4],
     frame: &Frame<'_>,
     time: f64,
-    wheels: &mut [bono_wheel_telemetry; 4],
-) {
-    for ((last, wheel), prefix) in last.iter_mut().zip(wheels).zip(WHEELS) {
+) -> [Option<f64>; 4] {
+    let mut times = [None; 4];
+    for ((last, out), prefix) in last.iter_mut().zip(&mut times).zip(WHEELS) {
         // NaN would be a change every update
         let values = READING.map(|name| {
             frame
@@ -950,8 +957,9 @@ fn stamp_readings(
             _ => TyreReading { values, time },
         };
         *last = Some(reading);
-        wheel.tire_reading_time = Some(reading.time).into();
+        *out = Some(reading.time);
     }
+    times
 }
 
 /// Which way the air moves, in m/s, in the world the player's heading points in (`heading` 0 is
@@ -2098,24 +2106,30 @@ mod tests {
     }
 
     /// The carcass temperatures and tread left are a reading, stamped with when it last changed:
-    /// the first update seen, then whenever any of a wheel's values changes, and held otherwise.
+    /// the first update seen, then whenever any of a wheel's values changes, and held otherwise,
+    /// the car in the world or not. Another car's are its own.
     #[test]
     fn stamps_the_tyres_last_reading() {
+        use super::super::sdk::{Value, Vars};
         use super::super::session::Driver;
         let info = SessionInfo {
             track_length: Some(1000.0),
             player: Some(0),
-            drivers: HashMap::from([(0, Driver::default())]),
+            drivers: HashMap::from([(0, Driver::default()), (1, Driver::default())]),
             ..Default::default()
         };
         let mut converter = Converter::default();
-        // The front, left rear readings at `time`, the front left's tread in the middle `lf_wear`;
-        // nothing for the rear right
-        let mut update = |time: f64, lf_wear: f64| {
-            let mut values: Vec<(String, f64)> = vec![
-                ("SessionTime".into(), time),
-                ("SessionNum".into(), 0.0),
-                ("LapDistPct".into(), 0.5),
+        // The player's front and left rear readings at `time`, the front left's tread in the
+        // middle `lf_wear`, nothing for the rear right; out of the world without `in_world`
+        let mut update = |time: f64, lf_wear: f64, in_world: bool, player: i32| {
+            let mut values: Vec<(String, Value)> = vec![
+                ("SessionTime".into(), Value::Double(time)),
+                ("SessionNum".into(), Value::Int(0)),
+                ("PlayerCarIdx".into(), Value::Int(player)),
+                (
+                    "LapDistPct".into(),
+                    Value::Double(if in_world { 0.5 } else { -1.0 }),
+                ),
             ];
             for prefix in ["LF", "RF", "LR"] {
                 let wear = if prefix == "LF" { lf_wear } else { 0.96 };
@@ -2128,33 +2142,56 @@ mod tests {
                     ("wearR", 0.95),
                     ("coldPressure", 172.0),
                 ] {
-                    values.push((format!("{prefix}{name}"), value));
+                    values.push((format!("{prefix}{name}"), Value::Double(value)));
                 }
             }
-            let values: Vec<(&str, f64)> = values.iter().map(|(n, v)| (n.as_str(), *v)).collect();
-            let (vars, data) = super::super::sdk::Vars::doubles(&values);
+            let values: Vec<(&str, Value)> =
+                values.iter().map(|(n, v)| (n.as_str(), v.clone())).collect();
+            let (vars, data) = Vars::of(&values);
             let update = converter
                 .convert(&Frame::new(&vars, &data), &info, Instant::now())
                 .unwrap();
-            update.telemetry[0].wheels
+            update
+                .telemetry
+                .first()
+                .map(|t| t.wheels.map(|w| w.tire_reading_time.get()))
         };
+        let (vars, data) = Vars::doubles(&[
+            ("LFtempCL", 80.0),
+            ("LFtempCM", 84.0),
+            ("LFtempCR", 88.0),
+            ("LFwearL", 0.97),
+            ("LFwearM", 0.96),
+            ("LFwearR", 0.95),
+            ("LFcoldPressure", 172.0),
+        ]);
+        let mut out = bono_telemetry::default();
+        player_telemetry(&Frame::new(&vars, &data), &SessionInfo::default(), &mut out);
+        let wheel = &out.wheels[0];
+        assert_eq!(wheel.tire_carcass_temperature.get(), Some(84.0));
+        assert_eq!(wheel.tire_inner_temperature_left.get(), Some(80.0));
+        assert!((wheel.tire_wear.get().unwrap() - 0.96).abs() < 1e-9);
+        assert_eq!(wheel.tire_cold_pressure.get(), Some(172.0));
+        assert_eq!(wheel.tire_reading_time.get(), None);
 
-        let wheels = update(10.0, 0.96);
-        let reading = |wheels: &[bono_wheel_telemetry; 4]| {
-            wheels.map(|w| w.tire_reading_time.get())
-        };
         // Seen first: from now. The rear right has no reading
-        assert_eq!(reading(&wheels), [Some(10.0), Some(10.0), Some(10.0), None]);
-        assert_eq!(wheels[0].tire_carcass_temperature.get(), Some(84.0));
-        assert_eq!(wheels[0].tire_inner_temperature_left.get(), Some(80.0));
-        assert!((wheels[0].tire_wear.get().unwrap() - 0.96).abs() < 1e-9);
-        assert_eq!(wheels[0].tire_cold_pressure.get(), Some(172.0));
+        let first = [Some(10.0), Some(10.0), Some(10.0), None];
+        assert_eq!(update(10.0, 0.96, true, 0), Some(first));
         // Held while nothing changes
-        assert_eq!(reading(&update(10.1, 0.96)), reading(&wheels));
+        assert_eq!(update(10.1, 0.96, true, 0), Some(first));
         // One value of one wheel changes: that wheel's reading is new, the others' held
         let changed = [Some(10.2), Some(10.0), Some(10.0), None];
-        assert_eq!(reading(&update(10.2, 0.9)), changed);
-        assert_eq!(reading(&update(30.0, 0.9)), changed);
+        assert_eq!(update(10.2, 0.9, true, 0), Some(changed));
+        assert_eq!(update(30.0, 0.9, true, 0), Some(changed));
+        // Changed out of the world (in the garage, say): from then, not from when it's back
+        assert_eq!(update(40.0, 0.8, false, 0), None);
+        let garage = [Some(40.0), Some(10.0), Some(10.0), None];
+        assert_eq!(update(50.0, 0.8, true, 0), Some(garage));
+        // Another car, with the same values: from when it's first seen
+        assert_eq!(
+            update(60.0, 0.8, true, 1),
+            Some([Some(60.0), Some(60.0), Some(60.0), None])
+        );
     }
 
     /// The player's axes and rotations, from iRacing's directions (see the module's doc) to the
