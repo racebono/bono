@@ -300,7 +300,9 @@ lap, and no car has a world position: `position_x/y/z`, `ahead_of_player_m` and
 (about 9.8 vertical standing still, and some lateral or longitudinal on banking or a slope, not
 only cornering or braking). It has no sector yellows:
 `race_state.local_yellow` is NULL (as on any simulator that doesn't say), and
-`cars_now.under_yellow` is the yellow shown to the car.
+`cars_now.under_yellow` is the yellow shown to the car. `laps_completed` (and
+`leader_laps_completed`) is -1 until the car first crosses the line after getting in (its out lap,
+or before the start): no lap is done yet, and it then steps from -1 to 0.
 
 ## Evidence that fits the question
 

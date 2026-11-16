@@ -143,6 +143,8 @@ struct Car<'a> {
     /// Around the lap, 0-1; `None` while it isn't in the world
     pct: Option<f64>,
     on_pit_road: Option<bool>,
+    /// -1 before its first lap starts (out of the pits), as the game gives it: the standings keep
+    /// it, so that the out lap's end is a lap ending there too
     laps_completed: Option<i64>,
     /// What to add to `laps_completed` for the lap it's on by its distance, while the lap count
     /// and the distance go round the line an update or so apart
@@ -164,7 +166,7 @@ impl Car<'_> {
 
     /// How far it's gone in laps, for laps behind.
     fn progress(&self) -> Option<f64> {
-        Some((self.laps_completed? + self.lap_offset) as f64 + self.pct.unwrap_or(0.0))
+        Some((self.laps_completed?.max(0) + self.lap_offset) as f64 + self.pct.unwrap_or(0.0))
     }
 }
 
@@ -271,11 +273,10 @@ impl Converter {
                     driver,
                     pct,
                     on_pit_road,
-                    // -1 before the first lap starts (out of the pits), and out of the world
-                    // (disconnected), where it's no count at all
+                    // -1 out of the world too (disconnected), where it's no count at all
                     laps_completed: completed
                         .filter(|laps| *laps >= 0 || pct.is_some())
-                        .map(|laps| i64::from(laps.max(0))),
+                        .map(i64::from),
                     lap_offset,
                     position: car
                         .i32("CarIdxPosition", "PlayerCarPosition")
@@ -308,7 +309,7 @@ impl Converter {
             out.vehicle_id = Some(car.idx).into();
             out.session_time = Some(time).into();
             out.time_since_last_update = dt.into();
-            out.lap = car.laps_completed.into();
+            out.lap = car.laps_completed.map(|laps| laps.max(0)).into();
             out.lap_start_time = track.lap_start.into();
             out.lap_distance = car.pct.map(|pct| pct * length).into();
             out.sector = track.sector.map(|s| s as i64).into();
@@ -1713,6 +1714,51 @@ mod tests {
         let some = update(&info, STATE_PARADE_LAPS, [1, 0, 0], [0.0; 3]);
         assert_eq!(standing(&some, 0).0, Some(1));
         assert_eq!((standing(&some, 1).0, standing(&some, 2).0), (None, None));
+    }
+
+    /// The out lap is the game's -1 laps done: the standings keep it, so the line that ends the out
+    /// lap is a lap ending there, but the telemetry's lap and laps behind go from none done.
+    #[test]
+    fn the_out_lap_is_no_lap_done_yet() {
+        use super::super::sdk::{Value, Vars};
+        use super::super::session::{Driver, Session};
+        let info = SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: (0..2).map(|car| (car, Driver::default())).collect(),
+            sessions: vec![Session {
+                num: 0,
+                kind: Some("qualifying"),
+                number: 1,
+                results: HashMap::new(),
+            }],
+            ..Default::default()
+        };
+        let (vars, data) = Vars::of(&[
+            ("SessionTime", Value::Double(10.0)),
+            ("SessionNum", Value::Int(0)),
+            ("SessionState", Value::Int(STATE_RACING)),
+            ("PlayerCarIdx", Value::Int(0)),
+            ("CarIdxLapDistPct", Value::Doubles(vec![0.1, 0.5])),
+            ("CarIdxLapCompleted", Value::Ints(vec![-1, 3])),
+        ]);
+        let update = Converter::default()
+            .convert(&Frame::new(&vars, &data), &info, Instant::now())
+            .unwrap();
+        let (_, standings) = update.scoring.as_ref().unwrap();
+        let laps = |car: i64| {
+            let standing = standings.iter().find(|s| s.vehicle_id.get() == Some(car));
+            let telemetry = update
+                .telemetry
+                .iter()
+                .find(|t| t.vehicle_id.get() == Some(car));
+            (
+                standing.unwrap().laps_completed.get(),
+                telemetry.unwrap().lap.get(),
+            )
+        };
+        assert_eq!(laps(0), (Some(-1), Some(0)));
+        assert_eq!(laps(1), (Some(3), Some(3)));
     }
 
     #[test]

@@ -868,7 +868,9 @@ impl Scoring {
             let done = self
                 .order()
                 .first()
-                .and_then(|leader| leader.i("laps_completed"));
+                .and_then(|leader| leader.i("laps_completed"))
+                // iRacing counts -1 before the line is first crossed
+                .map(|done| done.max(0));
             parts.push(format!(
                 "{max_laps} laps{}",
                 done.map(|done| format!(", leader has done {done}"))
