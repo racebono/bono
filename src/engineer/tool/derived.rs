@@ -880,6 +880,8 @@ struct LapBuild {
     mid_lap: bool,
     /// When its distance first went round past the line, before any row in the middle of the lap
     first_wrap: Option<f64>,
+    /// When its distance last went round past the line
+    last_wrap: Option<f64>,
     /// Its rows have a hole a circuit could have gone unseen in: rows without a distance say
     /// nothing of where it went
     hole: bool,
@@ -918,6 +920,7 @@ impl LapBuild {
             furthest: None,
             mid_lap: false,
             first_wrap: None,
+            last_wrap: None,
             hole: false,
             seen_at: None,
             length: None,
@@ -973,8 +976,11 @@ impl LapBuild {
                 && previous
                     .and_then(|before| before.lap_distance)
                     .is_some_and(|before_d| before_d > length * FIRST_DISTANCE);
-            if wrapped && self.first_wrap.is_none() && !self.mid_lap {
-                self.first_wrap = sample.session_time;
+            if wrapped {
+                if self.first_wrap.is_none() && !self.mid_lap {
+                    self.first_wrap = sample.session_time;
+                }
+                self.last_wrap = sample.session_time.or(self.last_wrap);
             }
             // Inspect only a possible wrap or the point where a post-wrap circuit becomes
             // complete enough to identify a late-recorded opening lap. Avoid rescanning per row.
@@ -3573,12 +3579,17 @@ impl Stream {
             let stayed = at.is_some_and(|at| at - crossing > LINE_APPROACH_SECONDS);
             let counted = (stayed && !self.opening_lap.run_only)
                 || counting() == Some(Counting::RunAndCircuit);
-            // Until it's been round to the middle of the lap, or there's a hole in its rows it
-            // could have been round in: from there its distance can wrap again before its lap
-            // count goes to 1
+            // Until it's been round to the middle of the lap, or round past the line again (a fast
+            // car's rows of the middle can be missing without a hole), or there's a hole in its
+            // rows it could have been round in: from there its distance can wrap again before its
+            // lap count goes to 1. Against the row its crossing wrapped on: the crossing's put
+            // between it and the one before, however far apart
+            let again = build.last_wrap.is_some_and(|wrap| {
+                wrap > build.first_wrap.unwrap_or(crossing) + LINE_APPROACH_SECONDS
+            });
             return counted.then_some(RaceLap {
                 lap: 0,
-                past_its_crossing: !build.mid_lap && !build.hole,
+                past_its_crossing: !build.mid_lap && !again && !build.hole,
             });
         }
         // A wrap past the line with the lap's start unseen, which `crossed` can't tell from the
@@ -6217,6 +6228,32 @@ mod tests {
         let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
         stream.apply_telemetry(&conn, &unseen).unwrap();
         let row = counted_at(&conn, &stream, &unseen, 2);
+        assert_eq!(row.i("lap"), Some(0));
+        assert!(!row.b(PAST_ITS_CROSSING));
+
+        // With no rows of the middle of the lap, passed fast enough to leave no hole: the wrap
+        // again says it's been round
+        let mut fast = samples
+            .iter()
+            .filter(|s| !(400.0..1600.0).contains(&s.lap_distance.unwrap()))
+            .copied()
+            .collect::<Vec<_>>();
+        let after = fast
+            .windows(2)
+            .position(|w| {
+                w[0].lap_distance.unwrap() < 400.0 && w[1].lap_distance.unwrap() >= 1600.0
+            })
+            .unwrap()
+            + 1;
+        let shift = fast[after].session_time.unwrap() - fast[after - 1].session_time.unwrap() - 4.0;
+        for sample in &mut fast[after..] {
+            sample.session_time = sample.session_time.map(|t| t - shift);
+        }
+        let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
+        stream.apply_telemetry(&conn, &fast).unwrap();
+        let build = stream.cars[&2].current.as_ref().unwrap();
+        assert!(!build.mid_lap && !build.hole);
+        let row = counted_at(&conn, &stream, &fast, 2);
         assert_eq!(row.i("lap"), Some(0));
         assert!(!row.b(PAST_ITS_CROSSING));
 
