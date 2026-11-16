@@ -134,9 +134,13 @@ has only its standings. Rivals' rows are slightly older than the player's.
 **`wheels_now`**, one row per car and wheel: `vehicle_id`, `wheel` (0 front left, 1 front right, 2
 rear left, 3 rear right), `wheel_name`; `life_left_pct`, `stint_wear_pct_per_lap`, `compound`,
 `flat`, `detached`; `surface_inner_c`, `surface_middle_c`, `surface_outer_c`, `core_c` (inner
-rubber, a better read of working temperature), `carcass_c`, `optimal_c`, `surface_vs_optimal_c`;
-`pressure_kpa`, `brake_c`, `brake_optimal_c`, `surface_type` (0 dry, 1 wet, 2 grass, 3 dirt, 4
-gravel, 5 kerb, 6 special; on RaceRoom 0 means paved, wetness unknown), `sliding_fraction`.
+rubber, a better read of working temperature), `carcass_c`, `reading_age_s` (how long the life
+left, core and carcass have been unchanged, at least, where they're a reading the simulator updates
+only now and then: counted from when they were first seen, so the reading can be older; NULL where
+they're live), `optimal_c`, `surface_vs_optimal_c`; `pressure_kpa`, `cold_pressure_kpa` (the
+cold pressure set in the garage, not the running pressure), `brake_c`, `brake_optimal_c`,
+`surface_type` (0 dry, 1 wet, 2 grass, 3 dirt, 4 gravel, 5 kerb, 6 special; on RaceRoom 0 means
+paved, wetness unknown), `sliding_fraction`.
 
 **`sectors_now`**, one row per car and timing sector, as the simulator last scored it: `vehicle_id`,
 `sector` (from 1), `last_lap_s` (on the last lap), `best_lap_s` (on the best lap), `best_s` (the
@@ -283,7 +287,9 @@ session_first_id`; the other tables number their rows separately (`telemetry_id`
   `ride_height`, `camber`, `toe` (rad), `brake_temperature`, `brake_pressure`, `rotation_speed`,
   `lateral_force`, `longitudinal_force`, `tire_load`, `sliding_fraction`, `surface_type`,
   `tire_pressure`, `tire_surface_temperature_left/center/right`,
-  `tire_inner_temperature_left/center/right`, `tire_carcass_temperature`, `tire_wear`, `tire_flat`.
+  `tire_inner_temperature_left/center/right`, `tire_carcass_temperature`, `tire_wear`,
+  `tire_reading_time` (session time the inner, carcass and wear values last changed, or were first
+  seen, where they're a reading rather than live), `tire_cold_pressure` (garage cold pressure), `tire_flat`.
 - `car_state`: settings, pit stops, track-limit steps, damage, impacts, written only when one
   changes; a car's value at row X is its latest row with `telemetry_id <= X` (indexed on
   `(vehicle_id, telemetry_id)`). A setting change is a new row: use it for when a setting changed.
@@ -310,10 +316,14 @@ only cornering or braking). It has no sector yellows:
 `cars_now.under_yellow` is the yellow shown to the car. `laps_completed` (and
 `leader_laps_completed`) is -1 until the car first crosses the line after getting in (its out lap,
 or before the start): no lap is done yet, and it then steps from -1 to 0. While driving, iRacing
-reports no tyre temperatures, pressures or wear, and no ride heights: say they aren't known, and
-judge the tyres from lap times and the car's balance. With no car positions, the snapshot's
-`TRAFFIC` only has iRacing's count of cars alongside: for how far the nearest cars are, use the
-gaps on track (`cars_now.gap_car_ahead_s` and `gap_car_behind_s`).
+reports no live surface temperatures, running pressures or ride heights: say they aren't known.
+Carcass temperatures and tread left (`carcass_c`, `core_c`, `life_left_pct`, and the snapshot's
+`TYRES last reading`) are the last reading, not current values: give their age as at least
+`reading_age_s`, don't treat them as the tyres now, and take no wear rate from them (`stint_wear_pct_per_lap` and
+the laps' life are NULL). Cold pressures (`cold_pressure_kpa`) are the garage setting, not the
+running pressures. Judge the tyres now from lap times and the car's balance. With no car positions,
+the snapshot's `TRAFFIC` only has iRacing's count of cars alongside: for how far the nearest cars
+are, use the gaps on track (`cars_now.gap_car_ahead_s` and `gap_car_behind_s`).
 The best lap is `cars_now.best_lap_s`, iRacing's own, which leaves out laps it doesn't count: a
 quicker `lap_stats` time may be one of those. Don't call such a lap invalid (iRacing doesn't say
 why), and don't call any lap valid: iRacing doesn't report lap validity.

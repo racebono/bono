@@ -2354,20 +2354,55 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         })
         .collect::<Vec<_>>()
         .join(" ");
-    let pressures = (0..4)
-        .filter_map(|w| Some(fmt(wheels.get(&w)?.f("tire_pressure"), 0, "")))
-        .collect::<Vec<_>>()
-        .join("/");
-    let reported = wheels.values().any(|r| {
-        r.f("tire_surface_temperature_center").is_some() || r.f("tire_pressure").is_some()
-    });
-    if reported {
+    let pressures = |column| {
+        (0..4)
+            .filter_map(|w| Some(fmt(wheels.get(&w)?.f(column), 0, "")))
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    let live = wheels
+        .values()
+        .any(|r| r.f("tire_surface_temperature_center").is_some());
+    let reported = live || wheels.values().any(|r| r.f("tire_pressure").is_some());
+    // Without live surface temperatures, the carcass and tread a simulator updates only now and
+    // then (see the header's tire_reading_time) are what there is: aged by the newest wheel's,
+    // which every wheel's is at least as old as
+    let reading = wheels
+        .values()
+        .filter_map(|r| r.f("tire_reading_time"))
+        .reduce(f64::max)
+        .filter(|_| !live);
+    if let Some(reading) = reading {
+        let per_wheel = |value: &dyn Fn(&Row) -> String| {
+            (0..4)
+                .filter_map(|w| Some(format!("{} {}", WHEELS[w], value(wheels.get(&w)?))))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         say!(
             out,
-            "TYRES centre temp C: {temps}{} | pressure kPa FL/FR/RL/RR {pressures}",
+            "TYRES last reading {}, not live: carcass C {}, tread left {} | garage cold pressure \
+             kPa FL/FR/RL/RR {}",
+            // At least: it's from when it was first seen, if it hasn't changed since (see the
+            // header), so rounded down
+            match now.map(|now| (now - reading).max(0.0)) {
+                Some(age) if age < 60.0 => format!("at least {:.0} s old", age.floor()),
+                Some(age) => format!("at least {:.0} min old", (age / 60.0).floor()),
+                None => "of unknown age".into(),
+            },
+            per_wheel(&|r| fmt(r.f("tire_carcass_temperature"), 0, "")),
+            // What's left, on the simulators with a reading (see the header's tire_wear)
+            per_wheel(&|r| pct(r.f("tire_wear"))),
+            pressures("tire_cold_pressure")
+        );
+    } else if reported {
+        say!(
+            out,
+            "TYRES centre temp C: {temps}{} | pressure kPa FL/FR/RL/RR {}",
             optimal
                 .map(|o| format!(" (optimal {o:.0})"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            pressures("tire_pressure")
         );
     } else {
         // Not "-" a wheel, which reads as not yet received
@@ -3145,6 +3180,44 @@ mod tests {
         let engineer = reopen(&dir);
         let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
         assert!(out.contains("| P1 (P1 in \"Hypercar\")/2 |"), "{out}");
+    }
+
+    /// With live surface temperatures the tyres are those; with only a reading the simulator
+    /// updates now and then (iRacing's carcass and tread), they're that reading, with its age, and
+    /// the pressures are the garage's cold ones.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quick_tells_a_last_tyre_reading_from_live_tyres() {
+        let (dir, engineer) = race();
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(out.contains("TYRES centre temp C: FL "), "{out}");
+        assert!(out.contains("(optimal 85) | pressure kPa FL/FR/RL/RR 170/170/170/170"), "{out}");
+        assert!(!out.contains("last reading"), "{out}");
+        drop(engineer);
+
+        // As on iRacing live: no surface temperatures or running pressures, readings 6 minutes old
+        // on the front left and older on the others, and the garage's pressures
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute_batch(
+            "UPDATE telemetry_wheel SET tire_surface_temperature_left = NULL,
+                 tire_surface_temperature_center = NULL, tire_surface_temperature_right = NULL,
+                 tire_pressure = NULL, tire_carcass_temperature = 80 + wheel,
+                 tire_wear = 0.97 - wheel / 100.0, tire_cold_pressure = 172 - wheel,
+                 tire_reading_time = (SELECT session_time - 360 - 600 * wheel FROM telemetry
+                                      WHERE id = telemetry_id);",
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(
+            out.contains(
+                "TYRES last reading at least 6 min old, not live: carcass C FL 80 FR 81 RL 82 RR 83, \
+                 tread left FL 97.0% FR 96.0% RL 95.0% RR 94.0% | garage cold pressure kPa \
+                 FL/FR/RL/RR 172/171/170/169"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("centre temp"), "{out}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

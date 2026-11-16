@@ -154,8 +154,8 @@ CREATE TABLE wheels_now (
     vehicle_id INTEGER NOT NULL, wheel INTEGER NOT NULL, wheel_name TEXT,
     life_left_pct REAL, stint_wear_pct_per_lap REAL, compound, flat INTEGER, detached INTEGER,
     surface_inner_c REAL, surface_middle_c REAL, surface_outer_c REAL, core_c REAL, carcass_c REAL,
-    optimal_c REAL, surface_vs_optimal_c REAL,
-    pressure_kpa REAL, brake_c REAL, brake_optimal_c REAL, surface_type INTEGER,
+    reading_age_s REAL, optimal_c REAL, surface_vs_optimal_c REAL,
+    pressure_kpa REAL, cold_pressure_kpa REAL, brake_c REAL, brake_optimal_c REAL, surface_type INTEGER,
     sliding_fraction REAL,
     PRIMARY KEY (vehicle_id, wheel)
 ) WITHOUT ROWID;
@@ -1088,7 +1088,8 @@ impl LapBuild {
             let mut wear = [None; 4];
             for (wheel, r) in wheels_at(conn, id)? {
                 if let Some(w) = wear.get_mut(wheel) {
-                    *w = r.f("tire_wear");
+                    // A last reading (see the header's tire_reading_time) isn't the lap's wear
+                    *w = r.f("tire_wear").filter(|_| r.f("tire_reading_time").is_none());
                 }
             }
             Ok(wear)
@@ -3768,6 +3769,12 @@ fn write_wheels(
             true => wear * 100.0,
             false => (1.0 - wear) * 100.0,
         });
+        // How old the life left and the core and carcass temperatures are, where they're a
+        // reading rather than live
+        let reading_age = r
+            .f("tire_reading_time")
+            .zip(telemetry.f("session_time"))
+            .map(|(reading, now)| (now - reading).max(0.0));
         insert(
             ctx.conn,
             "wheels_now",
@@ -3785,6 +3792,7 @@ fn write_wheels(
                 ("surface_outer_c", real(strips[2])),
                 ("core_c", copy(&r, "tire_inner_temperature_center")),
                 ("carcass_c", copy(&r, "tire_carcass_temperature")),
+                ("reading_age_s", real(reading_age)),
                 ("optimal_c", real(optimal)),
                 (
                     "surface_vs_optimal_c",
@@ -3795,6 +3803,7 @@ fn write_wheels(
                     ),
                 ),
                 ("pressure_kpa", copy(&r, "tire_pressure")),
+                ("cold_pressure_kpa", copy(&r, "tire_cold_pressure")),
                 ("brake_c", copy(&r, "brake_temperature")),
                 ("brake_optimal_c", copy(&r, "brake_optimal_temperature")),
                 ("surface_type", copy(&r, "surface_type")),
@@ -4359,6 +4368,53 @@ mod tests {
         // The left edge is the hot one: outside on a left tyre, inside on a right tyre
         assert_eq!(rows[0], ["\"FL\"", "-8", "85", "100"]);
         assert_eq!(rows[3], ["\"RR\"", "8", "85", "100"]);
+    }
+
+    /// Tread left and carcass temperatures from a reading the simulator updates now and then are
+    /// that reading's, with its age, and no lap's wear; the garage's cold pressures are apart from
+    /// the running ones.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_last_tyre_reading_has_its_age_and_is_no_laps_wear() {
+        let (dir, engineer) = race();
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute_batch(
+            "UPDATE telemetry_wheel SET tire_wear = 0.97, tire_carcass_temperature = 80,
+                 tire_cold_pressure = 172,
+                 tire_reading_time = (SELECT MIN(session_time) FROM telemetry);",
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let rows = query(
+            &engineer,
+            "SELECT wheel_name, ROUND(life_left_pct), stint_wear_pct_per_lap, ROUND(carcass_c), \
+                    reading_age_s = (SELECT session_time_s - (SELECT MIN(session_time) FROM telemetry) \
+                                     FROM race_state), \
+                    ROUND(pressure_kpa), ROUND(cold_pressure_kpa) \
+             FROM wheels_now WHERE vehicle_id = 1 ORDER BY wheel",
+        )
+        .await;
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0], ["\"FL\"", "97", "NULL", "80", "1", "170", "172"]);
+        let rows = query(
+            &engineer,
+            "SELECT COUNT(life_start_pct), COUNT(life_end_pct), COUNT(*) FROM lap_wheel_stats \
+             WHERE vehicle_id = 1",
+        )
+        .await;
+        assert_eq!(rows[0][..2], ["0", "0"]);
+        assert_ne!(rows[0][2], "0");
+
+        // Live wheels have no age
+        let (_dir, engineer) = race();
+        let rows = query(
+            &engineer,
+            "SELECT COUNT(reading_age_s), COUNT(cold_pressure_kpa), COUNT(life_left_pct) \
+             FROM wheels_now WHERE vehicle_id = 1",
+        )
+        .await;
+        assert_eq!(rows[0], ["0", "0", "4"]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
