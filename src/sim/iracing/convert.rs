@@ -121,9 +121,10 @@ const BEST_LAP_WINDOW: f64 = 5.0;
 const RECENT_LAPS: usize = 4;
 /// Under this (s), a car's time behind the leader on its first lap may be the game's placeholder.
 const PLACEHOLDER_MAX: f64 = 0.1;
-/// How long (s) before the first update with the flag a car's lap may have started for it to
-/// have finished already: the leader's count and the session's state go round a moment apart.
-const FINISH_WINDOW: f64 = 1.0;
+/// How long (s) before the first update with the flag the leader's lap count may have gone up for
+/// that to be its finish: its count and the session's state go round a moment apart (its count
+/// before that was a lap before).
+const FINISH_WINDOW: f64 = 10.0;
 /// More fuel than this (litres) than at the update before, the car took fuel on: fuel is taken on
 /// a little at a time, and driving never adds any.
 const REFUELLED: f64 = 0.001;
@@ -148,8 +149,20 @@ pub struct Converter {
     wind: Option<(f64, f64)>,
     /// The player's car and its tyre readings as last seen, by wheel (see `stamp_readings`)
     tyre_readings: (Option<i64>, [Option<TyreReading>; 4]),
-    /// Since a race's flag: the leader then, and each car's laps then (see `finished`)
-    flag: Option<(Option<i64>, HashMap<i64, i64>)>,
+    /// Since a race's flag (see `Flag`); `None` in it when the race wasn't seen before the flag
+    flag: Option<Option<Flag>>,
+    /// Whether this session's race was seen running before its flag
+    raced: bool,
+}
+
+/// A race's flag, for who has finished: the leader when it came, and when its lap count went up for
+/// its finish (once it has). Another car has finished once its count has gone up since then: over
+/// the line after the leader (a car a lap down too, its race done at the flag).
+struct Flag {
+    leader: Option<i64>,
+    /// The first update with the flag
+    since: f64,
+    finish: Option<f64>,
 }
 
 /// One wheel's carcass temperatures and tread left, and when they took these values.
@@ -232,6 +245,7 @@ impl Converter {
             self.wind = None;
             self.tyre_readings = Default::default();
             self.flag = None;
+            self.raced = false;
         }
         self.session = Some(session);
 
@@ -356,42 +370,45 @@ impl Converter {
 
         let gaps = track_gaps(&cars);
         // Who's racing: everyone between the green and the flag; after the flag, the cars still
-        // to finish (each finishes over the line: the leader then has, and the others when their
-        // count goes up), until the cool-down. Those that have keep their finishing gaps and laps
-        // down, whatever the cool-down lap does
+        // to finish (each over the line after the leader, see `Flag`), until the cool-down. Those
+        // that have keep their finishing gaps and laps down, whatever the cool-down lap does
         let state = frame.i32("SessionState");
         let flagged = race && matches!(state, Some(STATE_CHECKERED | STATE_COOL_DOWN));
+        self.raced |= race && state == Some(STATE_RACING);
+        let counted = |idx: i64| self.cars.get(&idx).and_then(|t| t.counted_at);
         if !flagged {
             self.flag = None;
+        } else if self.flag.is_none() && !self.raced {
+            // Recording only from after the flag: who has finished, and with what, isn't known
+            self.flag = Some(None);
         } else if self.flag.is_none() {
             let leader = cars.iter().find(|c| c.position == Some(1)).map(|c| c.idx);
-            let laps = cars
-                .iter()
-                .filter_map(|c| {
-                    let laps = c.laps_completed?;
-                    // Over the line just before the flag came: with the leader, finished (a car
-                    // a lap down over it just ahead of the leader too, its last lap's figures
-                    // held a lap early)
-                    let just_over = self
-                        .cars
-                        .get(&c.idx)
-                        .and_then(|t| t.lap_start)
-                        .is_some_and(|start| time - start <= FINISH_WINDOW);
-                    Some((c.idx, if just_over { laps - 1 } else { laps }))
-                })
-                .collect();
-            self.flag = Some((leader, laps));
+            self.flag = Some(Some(Flag {
+                leader,
+                since: time,
+                // Its count up a moment before the flag came, or still to go up
+                finish: leader
+                    .and_then(counted)
+                    .filter(|at| time - at <= FINISH_WINDOW),
+            }));
+        }
+        if let Some(Some(flag)) = &mut self.flag
+            && flag.finish.is_none()
+        {
+            flag.finish = flag.leader.and_then(counted).filter(|at| *at >= flag.since);
         }
         let finished: HashSet<i64> = match &self.flag {
             None => HashSet::new(),
-            Some((leader, laps)) => cars
+            // Not seen racing: taken for finished, all of them
+            Some(None) => cars.iter().map(|c| c.idx).collect(),
+            Some(Some(flag)) => cars
                 .iter()
                 .filter(|c| {
                     state == Some(STATE_COOL_DOWN)
-                        || *leader == Some(c.idx)
-                        || laps
-                            .get(&c.idx)
-                            .is_none_or(|then| c.laps_completed.is_none_or(|now| now > *then))
+                        || flag.leader == Some(c.idx)
+                        || flag
+                            .finish
+                            .is_some_and(|finish| counted(c.idx).is_some_and(|at| at >= finish))
                 })
                 .map(|c| c.idx)
                 .collect(),
@@ -500,14 +517,16 @@ impl Converter {
 
     /// Each car's laps behind the leader and the car a place ahead, from how far each has gone:
     /// none before the green (whatever the laps counted on the way to it), and as they were when
-    /// it finished for a car that has. A car that has finished has gone the laps it had then, not
-    /// its cool-down lap's.
+    /// it finished for a car that has (none when recording began after the flag). A car that has
+    /// finished has gone as far as it had when it did, not its cool-down lap.
     fn laps_behind(&mut self, cars: &[Car<'_>], before_green: bool, finished: &HashSet<i64>) {
+        if matches!(self.flag, Some(None)) {
+            return;
+        }
         for car in cars {
             if let Some(track) = self.cars.get_mut(&car.idx) {
                 track.finish_progress = match finished.contains(&car.idx) {
-                    // Just over the line: its laps then, whole
-                    true => track.finish_progress.or(car.progress().map(f64::round)),
+                    true => track.finish_progress.or(car.progress()),
                     false => None,
                 };
             }
@@ -1378,7 +1397,9 @@ struct CarTrack {
     first_lap_f2: Option<f64>,
     /// Whether the game has given the car a time behind the leader since (see `convert`)
     f2_timed: bool,
-    /// In races after the flag, its laps gone when it finished (see `laps_behind`)
+    /// When its lap count last went up
+    counted_at: Option<f64>,
+    /// In races after the flag, how far it had gone when it finished (see `laps_behind`)
     finish_progress: Option<f64>,
     /// In races, its laps behind the leader and the car a place ahead (see `laps_behind`)
     laps_behind: Option<(Option<i64>, Option<i64>)>,
@@ -1582,6 +1603,9 @@ impl CarTrack {
                 Some((_, counted)) if after - counted <= COUNT_FAR => self.lap_start = Some(at),
                 _ => self.line = Some((at, at_distance)),
             }
+        }
+        if rose {
+            self.counted_at = Some(time);
         }
         if lap.is_some() {
             self.lap = lap;
@@ -2081,12 +2105,12 @@ mod tests {
         let racing = frame(
             4.0,
             STATE_RACING,
-            [0.5, 0.4, 0.6],
+            [0.8, 0.75, 0.9],
             [3, 3, 3],
             [2.0, 5.0, 0.0],
         );
         close(gaps(&racing, 0).0, 9.0);
-        close(gaps(&racing, 0).1, 9.0);
+        close(gaps(&racing, 0).1, 4.5);
         // On track too, with the car each gap is to
         let player = racing
             .telemetry
@@ -2190,6 +2214,37 @@ mod tests {
             .find(|t| t.vehicle_id.get() == Some(1))
             .unwrap();
         assert_eq!(row.gap_to_place_ahead.get(), Some(3.0));
+
+        // Recording from after the flag: who has finished isn't known, so nobody's racing (the
+        // game's gaps) and nobody's laps down are known
+        let mut late = Converter::default();
+        let (vars, data) = Vars::of(&[
+            ("SessionTime", Value::Double(50.0)),
+            ("SessionNum", Value::Int(0)),
+            ("SessionState", Value::Int(STATE_CHECKERED)),
+            ("PlayerCarIdx", Value::Int(0)),
+            ("CarIdxLapDistPct", Value::Doubles(vec![0.6, 0.55, 0.7])),
+            ("CarIdxLapCompleted", Value::Ints(vec![4, 4, 5])),
+            ("CarIdxPosition", Value::Ints(vec![2, 3, 1])),
+            ("CarIdxClassPosition", Value::Ints(vec![2, 3, 1])),
+            ("CarIdxEstTime", Value::Doubles(vec![54.0, 49.5, 63.0])),
+            ("CarIdxF2Time", Value::Doubles(vec![2.0, 5.0, 0.0])),
+        ]);
+        let update = late
+            .convert(&Frame::new(&vars, &data), &info, start)
+            .unwrap();
+        let row = update
+            .telemetry
+            .iter()
+            .find(|t| t.vehicle_id.get() == Some(1))
+            .unwrap();
+        assert_eq!(row.gap_to_place_ahead.get(), Some(3.0));
+        let (_, standings) = update.scoring.as_ref().unwrap();
+        assert!(
+            standings
+                .iter()
+                .all(|s| s.laps_behind_leader.get().is_none())
+        );
     }
 
     /// Before a race's green the places are the grid's; and a car that hasn't finished a lap (the
