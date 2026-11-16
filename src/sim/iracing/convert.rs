@@ -881,23 +881,10 @@ fn player_telemetry(frame: &Frame<'_>, info: &SessionInfo, out: &mut bono_teleme
         wheel.tire_surface_temperature_left = w("tempL").into();
         wheel.tire_surface_temperature_center = w("tempM").into();
         wheel.tire_surface_temperature_right = w("tempR").into();
-        let carcass = [w("tempCL"), w("tempCM"), w("tempCR")];
-        wheel.tire_inner_temperature_left = carcass[0].into();
-        wheel.tire_inner_temperature_center = carcass[1].into();
-        wheel.tire_inner_temperature_right = carcass[2].into();
-        wheel.tire_carcass_temperature = average(&carcass).into();
-        // Tread left, across the tyre: what's left, like LMU's (see the header)
-        wheel.tire_wear = average(&[w("wearL"), w("wearM"), w("wearR")])
-            .map(|left| left.clamp(0.0, 1.0))
-            .into();
+        // Not the carcass temperatures (tempC*) or the tread left (wear*): they hold still on
+        // track, so they'd read as a stint that doesn't warm or wear the tyres
         wheel.tire_compound = compound.map(i64::from).into();
     }
-}
-
-/// The mean of the values, all known.
-fn average(values: &[Option<f64>]) -> Option<f64> {
-    let sum = values.iter().copied().sum::<Option<f64>>()?;
-    Some(sum / values.len() as f64)
 }
 
 /// Which way the air moves, in m/s, in the world the player's heading points in (`heading` 0 is

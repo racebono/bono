@@ -808,6 +808,14 @@ impl Scoring {
     fn class_position(&self, r: &Row) -> Option<usize> {
         // Unplaced, it has no place in its class either
         r.i("position")?;
+        // The simulator's own, when it gives one: its standings may not place every car
+        if let Some(p) = r
+            .i("class_position")
+            .and_then(|p| usize::try_from(p).ok())
+            .filter(|p| *p > 0)
+        {
+            return Some(p);
+        }
         let class = r.s("vehicle_class");
         self.order()
             .into_iter()
@@ -3037,6 +3045,33 @@ mod tests {
         let engineer = reopen(&dir);
         let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
         assert!(out.contains("| P?/2 |"), "{out}");
+    }
+
+    /// The class place is the simulator's when it gives one: its standings may not place the
+    /// player's class rivals, who'd leave the player first among those placed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_class_place_is_the_simulators() {
+        let (dir, engineer) = race();
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute_batch(
+            "UPDATE standings SET vehicle_class = 'LMGT3' WHERE vehicle_id = 2;
+             UPDATE standings SET class_position = 3 WHERE is_player = 1;",
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(out.contains("| P1 (P3 in \"Hypercar\")/2 |"), "{out}");
+
+        // Without it, the place among the class's placed cars
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute("UPDATE standings SET class_position = NULL", [])
+            .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(out.contains("| P1 (P1 in \"Hypercar\")/2 |"), "{out}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

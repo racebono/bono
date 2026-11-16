@@ -219,7 +219,7 @@
     X(f64, tire_inner_temperature_right)                                                                 \
     X(f64, tire_carcass_temperature)                                                                     \
     X(f64, tire_optimal_temperature)        /* unit as reported by the simulator */                     \
-    X(f64, tire_wear)                       /* fraction worn (LMU and iRacing: what's left; see the engineer's wear_remaining) */ \
+    X(f64, tire_wear)                       /* fraction worn (LMU: what's left; see the engineer's wear_remaining) */ \
     X(f64, tire_vertical_deflection)                                                                     \
     X(i64, tire_compound) /* index of the compound for this car */ \
     X(i64, tire_compound_type)                                                                           \
