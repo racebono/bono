@@ -120,8 +120,10 @@ zone around the car, e.g. `front 2, rear_left 1`: 1 some, 2 more, not a fraction
 undamaged, NULL when not reported), `last_impact_ago_s`, `last_impact_magnitude`; `in_pit_lane`,
 `in_pits`, `in_garage`, `pit_state`, `pit_stops`, `scheduled_pit_stops`, `pit_services_selected`
 (what the pit menu is set to do at the next stop, often by default: not work done, nor a stop
-planned unless `pit_state` says one is requested or underway, so don't suggest changing it unless
-the pilot asks about a stop or one is; `none` when nothing is, NULL when not reported), `pit_services_active`, `pit_min_duration_left_s`; `flag` (blue: being
+planned unless `pit_state` is `requested`, `entering` or `stopped`, so don't suggest changing it
+unless the pilot asks about a stop or one is coming; `entering` can also be a drive-through or just
+the pit lane, and from `exiting` on the menu is the next stop's; `none` when nothing is, NULL when
+not reported), `pit_services_active`, `pit_min_duration_left_s`; `flag` (blue: being
 lapped), `under_yellow`, `finish_status`, `penalties`, `penalty_type`, `penalty_reason`,
 `track_limit_steps`, `track_limit_points_left`, `incident_points`. A car with no recent telemetry
 has only its standings. Rivals' rows are slightly older than the player's.
@@ -310,6 +312,8 @@ temperatures, pressures and lap times, and say wear isn't known.
 The best lap is `cars_now.best_lap_s`, iRacing's own, which leaves out laps it doesn't count: a
 quicker `lap_stats` time may be one of those. Don't call such a lap invalid (iRacing doesn't say
 why), and don't call any lap valid: iRacing doesn't report lap validity.
+Body repair in `pit_services_selected` is iRacing's fast repair: without it a stop still repairs
+the car, only slower.
 
 ## Evidence that fits the question
 

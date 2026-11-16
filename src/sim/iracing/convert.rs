@@ -655,8 +655,10 @@ impl Converter {
                 selected(SERVICE_LF_TIRE | SERVICE_RF_TIRE).into();
             out.pit_service_rear_tires_selected =
                 selected(SERVICE_LR_TIRE | SERVICE_RR_TIRE).into();
-            // Fast repair mends all the damage: the nearest the recording has is body repair
-            out.pit_service_body_repair_selected = selected(SERVICE_FAST_REPAIR).into();
+            // Fast repair mends all the damage: the nearest the recording has is body repair.
+            // Only when it's ticked: unticked, a stop still repairs, just not at once
+            out.pit_service_body_repair_selected =
+                selected(SERVICE_FAST_REPAIR).filter(|on| *on).into();
             out.fuel_fraction = frame.f64("FuelLevelPct").map(|f| f.clamp(0.0, 1.0)).into();
 
             put("pit_service_flags", json!(services));
@@ -1706,7 +1708,8 @@ mod tests {
         assert_eq!((standing(&some, 1).0, standing(&some, 2).0), (None, None));
     }
 
-    /// Fast repair alone in the pit menu is a service selected, not none.
+    /// Fast repair alone in the pit menu is a service selected, not none; unticked, it's no word on
+    /// repairs.
     #[test]
     fn fast_repair_is_a_pit_service() {
         use super::super::sdk::{Value, Vars};
@@ -1743,6 +1746,27 @@ mod tests {
         assert_eq!(me.pit_service_body_repair_selected.get(), Some(true));
         assert_eq!(me.pit_service_refuel_selected.get(), Some(false));
         assert_eq!(me.pit_service_front_tires_selected.get(), Some(false));
+
+        // Unticked, it isn't "no repair": a stop still repairs, slowly
+        let (vars, data) = Vars::of(&[
+            ("SessionTime", Value::Double(10.0)),
+            ("SessionNum", Value::Int(0)),
+            ("SessionState", Value::Int(STATE_RACING)),
+            ("PlayerCarIdx", Value::Int(0)),
+            ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
+            ("CarIdxLapCompleted", Value::Ints(vec![2])),
+            ("PitSvFlags", Value::Int(SERVICE_FUEL as i32)),
+        ]);
+        let update = Converter::default()
+            .convert(&Frame::new(&vars, &data), &info, Instant::now())
+            .unwrap();
+        let (_, standings) = update.scoring.as_ref().unwrap();
+        let me = standings
+            .iter()
+            .find(|s| s.vehicle_id.get() == Some(0))
+            .unwrap();
+        assert_eq!(me.pit_service_body_repair_selected.get(), None);
+        assert_eq!(me.pit_service_refuel_selected.get(), Some(true));
     }
 
     /// The out lap is the game's -1 laps done: the standings keep it, so the line that ends the out

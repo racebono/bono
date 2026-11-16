@@ -1418,7 +1418,7 @@ fn service_details(me: &Row) -> Vec<String> {
     }
     if !choices.is_empty() {
         info.push(format!(
-            "pit menu for the next stop (not work done, nor a stop planned unless the pit state says one is): {}",
+            "pit menu for the next stop (not work done, nor a stop planned unless the pit state is requested, entering or stopped): {}",
             choices.join(", ")
         ));
     }
@@ -2461,7 +2461,7 @@ mod tests {
             "serving penalty, refueling, front tires",
             "front tires=selected",
             "refueling=unselected",
-            "pit menu for the next stop (not work done, nor a stop planned unless the pit state says one is)",
+            "pit menu for the next stop (not work done, nor a stop planned unless the pit state is requested, entering or stopped)",
             "not proof it is cleared",
             "countdown alone does not authorize leaving",
             "pit_min_duration_left=0.00s",
