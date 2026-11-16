@@ -132,6 +132,10 @@ const PLACEHOLDER_MAX: f64 = 0.1;
 /// a longer window would take a count a lap before (a timed race's flag just after the leader
 /// started its last lap) for the finish.
 const FINISH_WINDOW: f64 = 2.0;
+/// How far (laps) behind the car furthest on when the flag comes a car may be for its count, a
+/// moment before, to be the winner's: cars over the line together, not one most of a lap behind on
+/// the lead lap just over it (whose count reaches the leader's).
+const ALONGSIDE: f64 = 0.1;
 /// More fuel than this (litres) than at the update before, the car took fuel on: fuel is taken on
 /// a little at a time, and driving never adds any.
 const REFUELLED: f64 = 0.001;
@@ -168,10 +172,11 @@ pub struct Converter {
 /// finished once its count has gone up since the winner's did: over the line after it (a car a lap
 /// down too, its race done at the flag).
 struct Flag {
-    /// The first update with the flag, the most laps any car had then, and the car furthest on
+    /// The first update with the flag, the most laps any car had then, and the cars furthest on
+    /// (see `ALONGSIDE`)
     since: f64,
     most: Option<i64>,
-    furthest: Option<i64>,
+    leading: Vec<i64>,
     /// When the winner's count went up for its finish, once it has, the laps it had then, and
     /// which car it is
     finish: Option<f64>,
@@ -400,17 +405,21 @@ impl Converter {
         } else if self.flag.is_none() {
             let furthest = cars
                 .iter()
-                .filter(|c| c.progress().is_some())
-                .max_by(|a, b| {
-                    a.progress()
-                        .unwrap_or(0.0)
-                        .total_cmp(&b.progress().unwrap_or(0.0))
+                .filter_map(|c| c.progress())
+                .max_by(f64::total_cmp);
+            let leading = cars
+                .iter()
+                .filter(|c| {
+                    c.progress()
+                        .zip(furthest)
+                        .is_some_and(|(gone, furthest)| furthest - gone <= ALONGSIDE)
                 })
-                .map(|c| c.idx);
+                .map(|c| c.idx)
+                .collect();
             self.flag = Some(Some(Flag {
                 since: time,
                 most: cars.iter().filter_map(|c| c.laps_completed).max(),
-                furthest,
+                leading,
                 finish: None,
                 laps: None,
                 winner: None,
@@ -429,20 +438,20 @@ impl Converter {
                 .filter_map(|c| Some((counted(c.idx)?, c.laps_completed, c.idx)))
                 .filter(|(at, _, _)| *at >= flag.since - FINISH_WINDOW);
             // Or over the line a moment before the flag came (iRacing's count and state can go
-            // round a moment apart), its count up to those laps then or since: only the car
-            // furthest on then, as with the flag early a car most of a lap behind on the lead lap
-            // can have been over the line a moment before too
-            let furthest = flag
-                .furthest
-                .and_then(|idx| cars.iter().find(|c| c.idx == idx))
+            // round a moment apart), its count up to those laps then or since: only a car among
+            // the furthest on then, as with the flag early a car most of a lap behind on the lead
+            // lap can have been over the line a moment before too
+            let leading = cars
+                .iter()
+                .filter(|c| flag.leading.contains(&c.idx))
                 .filter(|c| c.laps_completed.is_some() && c.laps_completed == flag.most)
-                .and_then(|c| Some((counted(c.idx)?, c.laps_completed, c.idx)))
+                .filter_map(|c| Some((counted(c.idx)?, c.laps_completed, c.idx)))
                 .filter(|(at, _, _)| *at >= flag.since - FINISH_WINDOW);
             let taken = flag
                 .winner
                 .and_then(|idx| Some((counted(idx)?, flag.laps, idx)));
             if let Some((at, laps, idx)) = first
-                .chain(furthest)
+                .chain(leading)
                 .chain(taken)
                 .min_by(|a, b| a.0.total_cmp(&b.0))
             {
@@ -450,6 +459,13 @@ impl Converter {
                 flag.laps = laps;
                 flag.winner = Some(idx);
             }
+        }
+        // The winner's finish timed at the line once it's over (see `CarTrack::update`), however
+        // long after the moment above
+        if let Some(Some(flag)) = &mut self.flag
+            && let Some(at) = flag.winner.and_then(|w| self.cars.get(&w)?.finish_at)
+        {
+            flag.finish = Some(at);
         }
         // Over the line since the winner was: finished, as are all in the cool-down
         let over_line: HashSet<i64> = match &self.flag {
@@ -489,10 +505,11 @@ impl Converter {
         {
             for car in &cars {
                 // Decided as it finishes (its laps down worked out then too): a car a lap down
-                // reaches the winner's laps on its cool-down lap, which isn't its finish
+                // reaches the winner's laps on its cool-down lap, which isn't its finish. Only one
+                // seen over the line: the cool-down finishes the rest with no crossing of theirs
                 if let Some(track) = self.cars.get_mut(&car.idx)
                     && track.finish_progress.is_none()
-                    && finished.contains(&car.idx)
+                    && over_line.contains(&car.idx)
                     && car.laps_completed == Some(laps)
                 {
                     track.finish_at = track.counted_at;
@@ -3000,6 +3017,93 @@ mod tests {
         let end = race_end(&steady(0.1, 3.35, [2.7, 2.75, 1.5], 2.0), [0.0, 0.3, 50.0]);
         close(behind(&end, 0), 0.5);
         close(behind(&end, 1), 0.0);
+    }
+
+    /// The winner's count up well before the line, the car slowing then speeding up to it: its
+    /// finish is timed at the line once it's over, past the moment the winner can change.
+    #[test]
+    fn the_winners_early_count_is_timed_at_the_line() {
+        let close = |got: Option<f64>, want: f64| {
+            assert!(got.is_some_and(|got| (got - want).abs() < 1e-6), "{got:?}");
+        };
+        // Car 0's count up at 1 s, over at 1.8 s; car 1 over at 2.5 s
+        let end = race_end(
+            &[
+                (0.5, STATE_RACING, [0.895, 0.8, 0.3], [2, 2, 1]),
+                (0.75, STATE_CHECKERED, [0.898, 0.825, 0.31], [2, 2, 1]),
+                (1.0, STATE_CHECKERED, [0.9, 0.85, 0.32], [3, 2, 1]),
+                (1.25, STATE_CHECKERED, [0.95, 0.875, 0.33], [3, 2, 1]),
+                (1.5, STATE_CHECKERED, [0.99, 0.9, 0.34], [3, 2, 1]),
+                (1.75, STATE_CHECKERED, [0.995, 0.925, 0.35], [3, 2, 1]),
+                (2.05, STATE_CHECKERED, [0.025, 0.955, 0.36], [3, 2, 1]),
+                (2.35, STATE_CHECKERED, [0.055, 0.985, 0.37], [3, 2, 1]),
+                (2.6, STATE_CHECKERED, [0.08, 0.01, 0.38], [3, 3, 1]),
+            ],
+            [0.0, 0.3, 50.0],
+        );
+        let (_, standings) = end.scoring.as_ref().unwrap();
+        let behind = |car: i64| {
+            standings
+                .iter()
+                .find(|s| s.vehicle_id.get() == Some(car))
+                .unwrap()
+                .time_behind_leader
+                .get()
+        };
+        close(behind(0), 0.0);
+        close(behind(1), 2.5 - 1.8);
+    }
+
+    /// Both over the line before the flag, the first passed just after it: the first over is
+    /// the winner, not the car furthest on when the flag comes.
+    #[test]
+    fn the_winner_over_before_the_flag_is_the_first_over() {
+        let end = race_end(
+            &[
+                (0.25, STATE_RACING, [0.97, 0.965, 0.3], [2, 2, 1]),
+                (0.5, STATE_RACING, [0.005, 0.99, 0.31], [3, 2, 1]),
+                (0.75, STATE_RACING, [0.025, 0.02, 0.32], [3, 3, 1]),
+                (1.0, STATE_CHECKERED, [0.045, 0.05, 0.33], [3, 3, 1]),
+                (1.25, STATE_CHECKERED, [0.065, 0.08, 0.34], [3, 3, 1]),
+            ],
+            [0.0, 0.3, 50.0],
+        );
+        let (_, standings) = end.scoring.as_ref().unwrap();
+        let behind = standings
+            .iter()
+            .find(|s| s.vehicle_id.get() == Some(1))
+            .unwrap()
+            .time_behind_leader
+            .get();
+        let want = (0.5 + 0.01 / 0.03 * 0.25) - (0.25 + 0.03 / 0.035 * 0.25);
+        assert!(
+            behind.is_some_and(|got| (got - want).abs() < 1e-6),
+            "{behind:?}"
+        );
+    }
+
+    /// A car the cool-down finishes, its crossing not seen (the recording stalled over it), has
+    /// no finishing gap from the crossing before: the game's time behind the leader.
+    #[test]
+    fn the_cool_down_finishes_without_a_crossing() {
+        let end = race_end(
+            &[
+                (0.25, STATE_RACING, [0.925, 0.99, 0.3], [2, 1, 1]),
+                (0.5, STATE_RACING, [0.95, 0.015, 0.325], [2, 2, 1]),
+                (0.75, STATE_CHECKERED, [0.975, 0.04, 0.35], [2, 2, 1]),
+                (1.0, STATE_CHECKERED, [0.005, 0.065, 0.375], [3, 2, 1]),
+                (7.5, STATE_COOL_DOWN, [0.3, 0.1, 0.4], [3, 3, 1]),
+            ],
+            [0.0, 30.0, 50.0],
+        );
+        let (_, standings) = end.scoring.as_ref().unwrap();
+        let behind = standings
+            .iter()
+            .find(|s| s.vehicle_id.get() == Some(1))
+            .unwrap()
+            .time_behind_leader
+            .get();
+        assert_eq!(behind, Some(30.0));
     }
 
     /// iRacing shows the flag a few seconds before the leader is over the line: until it is, the
