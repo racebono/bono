@@ -71,8 +71,8 @@ run, not a race to the flag.
   to the places either side; "nobody" there means no car in that place (or no place yet), not an
   empty track. On a simulator that leaves a side's gap to a place empty (outside races, before a
   place, first or last) and gives gaps on track, that side gets `on track ahead …` or `behind …`:
-  the car nearest that way on track (named when it's clear which), which may not be racing us for
-  position.
+  the car next that way on track (named when the simulator says which), which may not be racing us
+  for position.
 - `track`: the circuit's description as JSON. Positions are fractions of the lap; multiply by
   `lap_length_m` for metres. They've been lined up with the laps when `calibration` is there; without
   it they can be off, and `borrowed` means they're another simulator's for the same layout, so say
@@ -283,7 +283,8 @@ session_first_id`; the other tables number their rows separately (`telemetry_id`
   `throttle`, `brake`, `clutch` (0 to 1), `steering` (-1 left to 1 right), `throttle_filtered`,
   `brake_filtered`, `gear`, `engine_rpm`, `fuel`, `virtual_energy`, `battery_charge`,
   `traction_control_active`, `abs_active`, `front_ride_height`, `rear_ride_height`, `drag`,
-  `gap_to_car_ahead/behind`, `gap_to_place_ahead/behind`, `cars_left/right` (the player's row:
+  `gap_to_car_ahead/behind` (and `car_ahead_id`/`car_behind_id`, the `vehicle_id` each is to, where
+  the simulator says), `gap_to_place_ahead/behind`, `cars_left/right` (the player's row:
   cars alongside as the simulator reports them, 0 to 2; NULL on simulators that don't).
 - `telemetry_wheel`: four rows per `telemetry` row (`telemetry_id`, `wheel`): `suspension_deflection`,
   `ride_height`, `camber`, `toe` (rad), `brake_temperature`, `brake_pressure`, `rotation_speed`,
@@ -325,7 +326,8 @@ Carcass temperatures and tread left (`carcass_c`, `core_c`, `life_left_pct`, and
 the laps' life are NULL). Cold pressures (`cold_pressure_kpa`) are the garage setting, not the
 running pressures. Judge the tyres now from lap times and the car's balance. With no car positions,
 the snapshot's `TRAFFIC` has iRacing's count of cars alongside and its gaps on track either way
-(also `cars_now.gap_car_ahead_s` and `gap_car_behind_s`), and nothing about other cars nearer.
+(also `cars_now.gap_car_ahead_s` and `gap_car_behind_s`), and nothing about where any other car
+is: say so rather than "clear".
 `time_behind_leader_s` is iRacing's, updated about once a lap at a timing line, and NULL until the
 car has finished a lap; `time_behind_next_s` and the gaps to the places either side are live
 between cars racing less than a lap apart, so don't work one out from the other.

@@ -37,6 +37,8 @@
     X(f64, delta_best)                      /* seconds against the best lap */                           \
     X(f64, gap_to_car_ahead)                /* seconds, on track */                                      \
     X(f64, gap_to_car_behind)                                                                            \
+    X(i64, car_ahead_id)                    /* vehicle_id the gap ahead on track is to (or NULL) */      \
+    X(i64, car_behind_id)                                                                                \
     X(f64, gap_to_place_ahead)              /* seconds, in the standings */                              \
     X(f64, gap_to_place_behind)                                                                          \
     /* Position and motion */                                                                            \

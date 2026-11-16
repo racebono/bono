@@ -2134,125 +2134,23 @@ fn lap_heat(
 
 // --------------------------------------------------------------------------- quick (urgent)
 
-/// How close (m) two cars may be, beyond how far their rows could be off, for which one the sim
-/// measured a gap to on track to be in doubt.
-const NEAREST_DOUBT_M: f64 = 10.0;
-
-/// How fast (m/s) a car whose speed isn't known could be going, for how far off its row can be.
-const UNKNOWN_SPEED: f64 = 100.0;
-
-/// A car on track, from its latest row.
-struct OnTrack {
-    vehicle: i64,
-    lap_distance: f64,
-    session_time: f64,
-    speed: Option<f64>,
-}
-
-/// The car nearest `me` going `forward` (or back) around a lap of `length` m, when it's clear
-/// which: each moved on to `me`'s time at its speed, level cars going by vehicle id (the higher
-/// ahead), as the sims' own order does. None when it could be the other side of `me`, or another
-/// car could be nearer, for how far off their rows can be.
-fn nearest_on_track(
-    me: &OnTrack,
-    cars: impl Iterator<Item = OnTrack>,
-    length: f64,
-    forward: bool,
-) -> Option<i64> {
-    struct Near {
-        vehicle: i64,
-        /// How far it is this way round, and the other: a lap this way for a car level on the
-        /// other side
-        this_way: f64,
-        other_way: f64,
-        /// How far off that can be
-        doubt: f64,
-    }
-    let near = cars
-        .map(|car| {
-            let late = me.session_time - car.session_time;
-            let (moved, doubt) = match car.speed {
-                Some(speed) => (speed.max(0.0) * late, speed.max(0.0) * late.abs()),
-                None => (0.0, UNKNOWN_SPEED * late.abs()),
-            };
-            let on = (car.lap_distance + moved - me.lap_distance).rem_euclid(length);
-            let this_way = match forward {
-                true => on,
-                false => (length - on).rem_euclid(length),
-            };
-            let level_other_way = this_way == 0.0 && forward != (car.vehicle > me.vehicle);
-            Near {
-                vehicle: car.vehicle,
-                this_way: if level_other_way { length } else { this_way },
-                other_way: if level_other_way {
-                    0.0
-                } else {
-                    length - this_way
-                },
-                doubt,
-            }
-        })
-        .collect::<Vec<_>>();
-    let first = near
-        .iter()
-        .min_by(|a, b| a.this_way.total_cmp(&b.this_way))?;
-    // Surely this side of `me`, and every other car surely further
-    let this_side = first.this_way > first.doubt || first.doubt == 0.0;
-    let furthest = first.this_way + first.doubt + NEAREST_DOUBT_M;
-    let alone = near.iter().filter(|c| c.vehicle != first.vehicle).all(|c| {
-        // Could it be just this side of `me` after all?
-        c.other_way >= c.doubt && c.this_way - c.doubt > furthest
-    });
-    (this_side && alone).then_some(first.vehicle)
-}
-
 /// The player's gaps to the cars ahead of and behind it on track, as the sim gives them, on the
-/// sides asked for (`ahead`, `behind`). Each names the car nearest that way around the lap when
-/// it's clear which: cars in the pit lane aren't on track, each car is moved on to the player's
-/// time at its speed (its row can be a little older), and level cars go by vehicle id, as the
-/// sims' own order does. None when there's no gap to give.
-fn on_track_gaps(
-    ctx: &Ctx,
-    sc: &Scoring,
-    frame: &BTreeMap<i64, Row>,
-    (ahead, behind): (bool, bool),
-) -> Option<String> {
+/// sides asked for (`ahead`, `behind`), each naming the car the sim says it's to (when it says).
+/// None when there's no gap to give.
+fn on_track_gaps(ctx: &Ctx, sc: &Scoring, (ahead, behind): (bool, bool)) -> Option<String> {
     let p = &ctx.player;
-    let length = sc
-        .session
-        .as_ref()
-        .and_then(|s| s.f("track_length"))
-        .filter(|l| *l > 0.0);
-    let nearest = |forward: bool| -> Option<i64> {
-        let cars = frame
-            .iter()
-            .filter(|(v, r)| **v != ctx.vehicle && !r.b("in_pit_lane"))
-            .filter_map(|(v, r)| {
-                Some(OnTrack {
-                    vehicle: *v,
-                    lap_distance: r.f("lap_distance")?,
-                    session_time: r.f("session_time")?,
-                    speed: r.f("speed"),
-                })
-            });
-        let me = OnTrack {
-            vehicle: ctx.vehicle,
-            lap_distance: p.f("lap_distance")?,
-            session_time: p.f("session_time")?,
-            speed: None,
-        };
-        nearest_on_track(&me, cars, length?, forward)
-    };
-    let side = |wanted: bool, gap: Option<f64>, forward: bool, name: &str| {
-        let gap = gap.filter(|_| wanted)?;
+    let side = |wanted: bool, gap: &str, car: &str, name: &str| {
+        let gap = p.f(gap).filter(|_| wanted)?;
         Some(format!(
             "{name} {gap:.1}s{}",
-            nearest(forward).map_or(String::new(), |v| format!(" ({})", sc.label(v)))
+            p.i(car)
+                .filter(|v| *v != ctx.vehicle)
+                .map_or(String::new(), |v| format!(" ({})", sc.label(v)))
         ))
     };
     let sides = [
-        side(ahead, p.f("gap_to_car_ahead"), true, "ahead"),
-        side(behind, p.f("gap_to_car_behind"), false, "behind"),
+        side(ahead, "gap_to_car_ahead", "car_ahead_id", "ahead"),
+        side(behind, "gap_to_car_behind", "car_behind_id", "behind"),
     ]
     .into_iter()
     .flatten()
@@ -2276,7 +2174,6 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     let on_track = on_track_gaps(
         ctx,
         sc,
-        &frame,
         (
             p.f("gap_to_place_ahead").is_none(),
             p.f("gap_to_place_behind").is_none(),
@@ -2395,10 +2292,10 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         };
         say!(
             out,
-            "TRAFFIC left: {} | right: {}{} | no car positions from the sim: nothing nearer is known",
+            "TRAFFIC left: {} | right: {}{} | no car positions from the sim: where other cars are isn't known",
             alongside(p.i("cars_left")),
             alongside(p.i("cars_right")),
-            on_track_gaps(ctx, sc, &frame, (true, true)).unwrap_or_default()
+            on_track_gaps(ctx, sc, (true, true)).unwrap_or_default()
         );
     } else {
         say!(
@@ -3332,9 +3229,9 @@ mod tests {
         assert!(out.contains("ALERTS (act now) none"), "{out}");
     }
 
-    /// Without gaps to the places either side (outside races, or before a place), the snapshot
-    /// gives the sim's gaps on track, naming the car nearest each way round the lap; and a sim
-    /// with no car positions has no traffic within 60 m to claim clear, only its count alongside.
+    /// A side without a gap to a place (outside races, before a place, first or last) gets the
+    /// sim's gap on track, naming the car the sim says it's to; and a sim with no car positions has
+    /// no traffic within 60 m to claim clear, only its count alongside and its gaps on track.
     #[tokio::test(flavor = "multi_thread")]
     async fn quick_gives_the_gaps_on_track_without_place_gaps() {
         let (dir, engineer) = race();
@@ -3345,9 +3242,9 @@ mod tests {
         let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
         conn.execute_batch(
             "UPDATE telemetry SET gap_to_car_ahead = 20.0, gap_to_car_behind = 80.0,
+                 car_ahead_id = 2, car_behind_id = 2,
                  position_x = NULL, position_z = NULL, cars_left = 0, cars_right = 1
                  WHERE vehicle_id = 1;
-             UPDATE telemetry SET lap_distance = lap_distance + 200.0 WHERE vehicle_id = 2;
              UPDATE telemetry_wheel SET tire_surface_temperature_center = NULL,
                  tire_pressure = NULL;",
         )
@@ -3390,12 +3287,12 @@ mod tests {
         );
         assert!(!first.contains("80.0s"), "{out}");
 
-        // And a car in the pit lane is no car on track
+        // And when the sim doesn't say which car a gap is to, it's named for none
         drop(engineer);
         let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
         conn.execute_batch(
-            "UPDATE telemetry SET gap_to_place_behind = NULL WHERE vehicle_id = 1;
-             UPDATE telemetry SET in_pit_lane = 1 WHERE vehicle_id = 2;",
+            "UPDATE telemetry SET gap_to_place_behind = NULL, car_ahead_id = NULL,
+                 car_behind_id = NULL WHERE vehicle_id = 1;",
         )
         .unwrap();
         drop(conn);
@@ -3424,65 +3321,6 @@ mod tests {
         assert!(first.contains("| on track behind 80.0s"), "{out}");
         assert!(!first.contains("on track ahead"), "{out}");
         assert!(out.contains("TYRES no tyre data recorded"), "{out}");
-    }
-
-    /// The car nearest on track is the sim's next car that way: round the line, each moved on to
-    /// the player's time, level cars by vehicle id, and nobody named when two are too close to
-    /// tell which.
-    #[test]
-    fn the_nearest_car_on_track_is_the_one_the_gap_is_to() {
-        let car = |vehicle: i64, lap_distance: f64, session_time: f64| OnTrack {
-            vehicle,
-            lap_distance,
-            session_time,
-            speed: Some(50.0),
-        };
-        let me = car(5, 990.0, 100.0);
-        let near = |cars: Vec<OnTrack>, forward: bool| {
-            nearest_on_track(&me, cars.into_iter(), 1000.0, forward)
-        };
-        // Round the line both ways, and the far car's not the near one
-        let cars = || {
-            vec![
-                car(1, 30.0, 100.0),
-                car(2, 900.0, 100.0),
-                car(3, 500.0, 100.0),
-            ]
-        };
-        assert_eq!(near(cars(), true), Some(1));
-        assert_eq!(near(cars(), false), Some(2));
-        // A row 0.4 s old, 10 m ahead at its time: moved on 20 m, still surely the car ahead
-        let moved = vec![car(1, 0.0, 99.6), car(3, 60.0, 100.0)];
-        assert_eq!(near(moved, true), Some(1));
-        // A row 0.2 s old, 5 m behind at its time and 5 m ahead moved on: it could be either side,
-        // so neither way's nearest is clear
-        let either = || vec![car(1, 985.0, 99.8), car(3, 300.0, 100.0)];
-        assert_eq!(near(either(), true), None);
-        assert_eq!(near(either(), false), None);
-        // A row with no speed is only certain at the player's time
-        let unknown = |session_time: f64| OnTrack {
-            speed: None,
-            ..car(1, 50.0, session_time)
-        };
-        assert_eq!(
-            near(vec![unknown(100.0), car(3, 300.0, 100.0)], true),
-            Some(1)
-        );
-        assert_eq!(near(vec![unknown(99.5), car(3, 75.0, 100.0)], true), None);
-        // Level: the higher id ahead, the lower behind
-        assert_eq!(
-            near(vec![car(7, 990.0, 100.0), car(1, 200.0, 100.0)], true),
-            Some(7)
-        );
-        assert_eq!(
-            near(vec![car(3, 990.0, 100.0), car(1, 200.0, 100.0)], false),
-            Some(3)
-        );
-        // Two within a few metres of each other: which one isn't clear
-        assert_eq!(
-            near(vec![car(1, 40.0, 100.0), car(2, 45.0, 100.0)], true),
-            None
-        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
