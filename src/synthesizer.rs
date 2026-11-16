@@ -25,6 +25,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     mem::ManuallyDrop,
     num::NonZeroUsize,
+    sync::{Arc, Mutex},
     task::Poll,
     time::{Duration, Instant},
 };
@@ -105,6 +106,13 @@ impl Synthesizer {
         return (SpeechInput(input), SpeechOutput(recv));
     }
 
+    /// Whether `model`, the voice picked for `lang`, failed to load: picking it again retries.
+    pub fn failed(&self, lang: ArrayStr<2>, model: &Utf8Path) -> bool {
+        self.inner
+            .get(&lang)
+            .is_some_and(|inner| inner.failed(model))
+    }
+
     fn inner(&mut self, rt: &Handle, lang: ArrayStr<2>) -> &SynthesizerInner {
         self.inner
             .entry(lang)
@@ -176,6 +184,9 @@ pub struct SynthesizerInner {
     handle: ManuallyDrop<std::thread::JoinHandle<()>>,
     model: ManuallyDrop<watch::Sender<Option<Utf8PathBuf>>>,
     jobs: ManuallyDrop<mpsc::UnboundedSender<Job>>,
+    /// The voice the worker failed to load, if it's still the one picked: cleared once another
+    /// is picked (or the same one again)
+    failed: Arc<Mutex<Option<Utf8PathBuf>>>,
 }
 
 impl SynthesizerInner {
@@ -183,16 +194,32 @@ impl SynthesizerInner {
         let threads = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
         let (model_send, model_recv) = watch::channel(None);
         let (jobs_send, jobs_recv) = mpsc::unbounded_channel();
-        let handle = std::thread::spawn(move || Self::worker(rt, model_recv, jobs_recv, threads));
+        let failed = Arc::new(Mutex::new(None));
+        let handle = std::thread::spawn({
+            let failed = failed.clone();
+            move || Self::worker(rt, model_recv, jobs_recv, threads, failed)
+        });
 
         Self {
             handle: ManuallyDrop::new(handle),
             model: ManuallyDrop::new(model_send),
             jobs: ManuallyDrop::new(jobs_send),
+            failed,
         }
     }
 
+    /// Whether `model` is the voice that last failed to load. One still loading hasn't failed.
+    pub fn failed(&self, model: &Utf8Path) -> bool {
+        // The lock only guards a path: whatever a panic left in it is still one
+        let failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+        failed.as_deref() == Some(model)
+    }
+
     pub fn set_model(&self, model: Option<Utf8PathBuf>) {
+        // Under the lock the worker records failures in, so one of a load this replaces can't
+        // be recorded after it's cleared: a voice picked (again) is loading, not failed
+        let mut failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+        *failed = None;
         let _ = self.model.send(model);
     }
 
@@ -207,6 +234,7 @@ impl SynthesizerInner {
         mut model: watch::Receiver<Option<Utf8PathBuf>>,
         mut jobs: mpsc::UnboundedReceiver<Job>,
         threads: NonZeroUsize,
+        failed: Arc<Mutex<Option<Utf8PathBuf>>>,
     ) {
         let mut voice = None::<Voice>;
         // The transmission being spoken: one at a time, the others wait their turn
@@ -281,12 +309,18 @@ impl SynthesizerInner {
                     stream = None;
                     // Cloned so the load doesn't hold the read lock `set_model` waits on
                     let path = model.borrow_and_update().clone();
-                    match path {
-                        Some(path) => match Voice::load(&path, threads) {
-                            Ok(next_voice) => voice = Some(next_voice),
-                            Err(e) => error(t!("error.tts_model"), e),
-                        },
-                        None => return,
+                    let Some(path) = path else { return };
+                    match Voice::load(&path, threads) {
+                        Ok(next_voice) => voice = Some(next_voice),
+                        Err(e) => {
+                            let mut last_failed = failed.lock().unwrap_or_else(|e| e.into_inner());
+                            // Unless another voice was picked meanwhile, which is loaded next
+                            if !model.has_changed().unwrap_or(true) {
+                                *last_failed = Some(path);
+                            }
+                            drop(last_failed);
+                            error(t!("error.tts_model"), e);
+                        }
                     }
                 }
                 Some(Event::Job(Job::Speech {
@@ -924,6 +958,42 @@ const fn default_noise_w() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether `done` holds within ten seconds: the worker loads voices in the background.
+    fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn a_voice_that_fails_to_load_is_reported_until_its_picked_again() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| Utf8PathBuf::try_from(dir.path().join(name)).unwrap();
+        let (missing, other) = (path("missing.onnx"), path("other.onnx"));
+
+        let synth = SynthesizerInner::new(rt.handle().clone());
+        assert!(!synth.failed(&missing));
+        synth.set_model(Some(missing.clone()));
+        assert!(wait_until(|| synth.failed(&missing)));
+
+        // Picked again, it fails again. Whether it shows as loading in between isn't checked:
+        // a missing voice fails before a check right after picking it is sure to run
+        synth.set_model(Some(missing.clone()));
+        assert!(wait_until(|| synth.failed(&missing)));
+
+        // Picking another one clears the failure of the one before
+        synth.set_model(Some(other.clone()));
+        assert!(!synth.failed(&missing));
+        assert!(wait_until(|| synth.failed(&other)));
+        assert!(!synth.failed(&missing));
+    }
 
     #[test]
     fn a_stream_that_never_drains_is_given_up_on() {
