@@ -184,7 +184,8 @@ pub struct SynthesizerInner {
     handle: ManuallyDrop<std::thread::JoinHandle<()>>,
     model: ManuallyDrop<watch::Sender<Option<Utf8PathBuf>>>,
     jobs: ManuallyDrop<mpsc::UnboundedSender<Job>>,
-    /// The voice the worker last failed to load: cleared once one loads
+    /// The voice the worker failed to load, if it's still the one picked: cleared once another
+    /// is picked (or the same one again)
     failed: Arc<Mutex<Option<Utf8PathBuf>>>,
 }
 
@@ -209,12 +210,16 @@ impl SynthesizerInner {
 
     /// Whether `model` is the voice that last failed to load. One still loading hasn't failed.
     pub fn failed(&self, model: &Utf8Path) -> bool {
-        // A worker that panicked holding the lock only ever left a path in it
+        // The lock only guards a path: whatever a panic left in it is still one
         let failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
         failed.as_deref() == Some(model)
     }
 
     pub fn set_model(&self, model: Option<Utf8PathBuf>) {
+        // Under the lock the worker records failures in, so one of a load this replaces can't
+        // be recorded after it's cleared: a voice picked (again) is loading, not failed
+        let mut failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+        *failed = None;
         let _ = self.model.send(model);
     }
 
@@ -305,15 +310,14 @@ impl SynthesizerInner {
                     // Cloned so the load doesn't hold the read lock `set_model` waits on
                     let path = model.borrow_and_update().clone();
                     let Some(path) = path else { return };
-                    let loaded = Voice::load(&path, threads);
-                    let mut last_failed = failed.lock().unwrap_or_else(|e| e.into_inner());
-                    match loaded {
-                        Ok(next_voice) => {
-                            voice = Some(next_voice);
-                            *last_failed = None;
-                        }
+                    match Voice::load(&path, threads) {
+                        Ok(next_voice) => voice = Some(next_voice),
                         Err(e) => {
-                            *last_failed = Some(path);
+                            let mut last_failed = failed.lock().unwrap_or_else(|e| e.into_inner());
+                            // Unless another voice was picked meanwhile, which is loaded next
+                            if !model.has_changed().unwrap_or(true) {
+                                *last_failed = Some(path);
+                            }
                             drop(last_failed);
                             error(t!("error.tts_model"), e);
                         }
@@ -968,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn a_voice_that_fails_to_load_is_reported_until_another_is_picked() {
+    fn a_voice_that_fails_to_load_is_reported_until_its_picked_again() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = |name: &str| Utf8PathBuf::try_from(dir.path().join(name)).unwrap();
@@ -979,10 +983,17 @@ mod tests {
         synth.set_model(Some(missing.clone()));
         assert!(wait_until(|| synth.failed(&missing)));
 
-        // Only the voice that failed: another one picked is loading, not failed
+        // Picked again, it's loading until it fails again
+        synth.set_model(Some(missing.clone()));
+        assert!(!synth.failed(&missing));
+        assert!(wait_until(|| synth.failed(&missing)));
+
+        // Another one picked is loading, and the one that failed is no longer it
         synth.set_model(Some(other.clone()));
-        assert!(wait_until(|| !synth.failed(&missing)));
+        assert!(!synth.failed(&missing));
+        assert!(!synth.failed(&other));
         assert!(wait_until(|| synth.failed(&other)));
+        assert!(!synth.failed(&missing));
     }
 
     #[test]
