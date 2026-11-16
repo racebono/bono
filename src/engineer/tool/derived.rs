@@ -1218,10 +1218,14 @@ impl Trail {
             self.1 = false;
             return;
         }
+        // A row without a speed, kept or not: it wasn't seen moving then
+        let unclocked = sample.speed.is_none();
         let (Some(t), Some(d)) = (sample.session_time, sample.lap_distance) else {
+            self.1 |= unclocked;
             return;
         };
         if !(t.is_finite() && d.is_finite()) {
+            self.1 |= unclocked;
             return;
         }
         match self.0.back() {
@@ -1231,12 +1235,12 @@ impl Trail {
                 self.1 = false;
             }
             Some(&(last, _)) if t < last + TRAIL_STEP => {
-                self.1 |= sample.speed.is_none();
+                self.1 |= unclocked;
                 return;
             }
             _ => {}
         }
-        self.1 |= sample.speed.is_none();
+        self.1 |= unclocked;
         self.0.push_back((t, d));
         while self
             .0
@@ -1257,12 +1261,16 @@ impl Trail {
             return None;
         }
         let mut newer = (now, at);
-        // Seconds back and metres on (back counting against) from now, and the least of metres on
-        // less what a car could have driven by each row so far: further on than any car drives
-        // between two rows, however small the steps between, is a reset or a tow. Only once: a
-        // distance that's put right is out by as much at most, however many times it's put right
+        // Seconds back and metres on (back counting against) from now. Between any two rows a
+        // car drives no further than `TRAIL_TELEPORT` a second, and moving no less than `MOVING`
+        // a second, however small the steps between: further is a reset or a tow, and less a
+        // stop, a crawl or the car going backwards, whatever speed its rows say (a speed isn't a
+        // direction). Either give or take a `TRAIL_JITTER` only once: a distance that's put right
+        // is out by as much at most, however many times it's put right. So, by each row so far,
+        // the least of metres on less the most a car drives, and the most of metres on less the
+        // least a moving car does
         let (mut back, mut on_since) = (0.0, 0.0);
-        let mut least = 0.0f64;
+        let (mut least, mut most) = (0.0f64, 0.0f64);
         // Without a speed on every row, the steps (seconds, metres on) of the latest CRAWL's
         // worth, sliding along the trail: slower than a moving car over any one of those is a
         // stop, however its distance jittered. A row's speed says it wasn't stopped
@@ -1283,22 +1291,19 @@ impl Trail {
                 if length - step > TRAIL_JITTER {
                     return None;
                 }
-            } else if step > TRAIL_TELEPORT * dt + TRAIL_JITTER {
-                // Faster than any car, even with a short step before it put right
-                return None;
             }
-            // A stop, not a row's short step (an estimated distance put right)
             let on = if step > length / 2.0 {
                 step - length
             } else {
                 step
             };
             (back, on_since) = (back + dt, on_since + on);
-            let past = on_since - TRAIL_TELEPORT * back;
-            if past - least > TRAIL_JITTER {
+            let (fastest, slowest) = (on_since - TRAIL_TELEPORT * back, on_since - MOVING * back);
+            if fastest - least > TRAIL_JITTER || most - slowest > TRAIL_JITTER {
                 return None;
             }
-            least = least.min(past);
+            (least, most) = (least.min(fastest), most.max(slowest));
+            // Without a speed on every row to say it wasn't stopped, a stop within a second
             if self.1 {
                 window.push_back((dt, on));
                 crawl = (crawl.0 + dt, crawl.1 + on);
@@ -5168,6 +5173,30 @@ mod tests {
         let clocked = Trail(rows.clone(), false);
         assert!(close(clocked.since_at(8.125, 562.5, 450.0, 1000.0), 5.625));
         assert_eq!(unclocked(rows).since_at(8.125, 562.5, 450.0, 1000.0), None);
+        // A speed isn't a direction: past 100 m at 20 m/s, then backwards at 8 m/s for 10 s, it's
+        // 20 m up the road, not 15 s
+        let reversed = Trail(
+            (0..=200)
+                .map(|i| {
+                    let t = f64::from(i) * 0.1;
+                    (t, 20.0 * t.min(10.0) - 8.0 * (t - 10.0).max(0.0))
+                })
+                .collect(),
+            false,
+        );
+        assert_eq!(reversed.since_at(20.0, 120.0, 100.0, 1000.0), None);
+        // Nor that it's going anywhere: its distance stalled from 5 to 35 s at 40 m/s either side
+        let stalled = Trail(
+            (0..=80)
+                .map(|i| {
+                    let t = f64::from(i) * 0.5;
+                    (t, 40.0 * (t.min(5.0) + (t - 35.0).max(0.0)))
+                })
+                .collect(),
+            false,
+        );
+        assert_eq!(stalled.since_at(40.0, 400.0, 150.0, 1000.0), None);
+        assert!(close(stalled.since_at(40.0, 400.0, 350.0, 1000.0), 1.25));
         // One row's short step, as an estimated distance put right, isn't a stop
         let corrected = unclocked(
             [
@@ -5276,6 +5305,18 @@ mod tests {
             assert!(trail.1);
             trail.0.clear();
         }
+        // Nor does a row without a distance hide that it came without a speed
+        let mut unseen = Trail::default();
+        unseen.push(&Sample {
+            speed: Some(20.0),
+            ..sample(1.0, 10.0)
+        });
+        assert!(!unseen.1);
+        unseen.push(&Sample {
+            lap_distance: None,
+            ..sample(2.0, 0.0)
+        });
+        assert!(unseen.1);
     }
 
     #[test]
