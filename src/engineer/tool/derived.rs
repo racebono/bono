@@ -882,8 +882,11 @@ struct LapBuild {
     first_wrap: Option<f64>,
     /// When its distance last went round past the line
     last_wrap: Option<f64>,
-    /// Its rows have a hole a circuit could have gone unseen in
+    /// Its rows have a hole a circuit could have gone unseen in: rows without a distance say
+    /// nothing of where it went
     hole: bool,
+    /// When its last row with a distance was
+    seen_at: Option<f64>,
     /// The track's length, as the layout the rows were added with has it
     length: Option<f64>,
     /// What's been written of each corner's pass: how many of its marks the car has passed
@@ -919,6 +922,7 @@ impl LapBuild {
             first_wrap: None,
             last_wrap: None,
             hole: false,
+            seen_at: None,
             length: None,
             marks_passed: vec![0; corners],
             next_mark: layout.map_or(f64::INFINITY, |layout| next_mark(layout, 0.0)),
@@ -928,14 +932,9 @@ impl LapBuild {
 
     fn add(&mut self, sample: &Sample, length: Option<f64>) {
         self.last_id = sample.id;
-        if let (Some(t), Some(before)) = (
-            sample.session_time,
-            self.samples
-                .iter()
-                .rev()
-                .find_map(|sample| sample.session_time),
-        ) {
-            self.hole |= t - before > TRAIL_HOLE;
+        if let (Some(t), Some(_)) = (sample.session_time, sample.lap_distance) {
+            self.hole |= self.seen_at.is_some_and(|before| t - before > TRAIL_HOLE);
+            self.seen_at = Some(t);
         }
         if sample
             .lap_start
@@ -1099,7 +1098,13 @@ impl LapBuild {
     /// Whether its rows are past its crossing of the line by longer than the lap count can lag
     /// the distance: still under its number, the circuit after the run to the line is the lap's.
     fn stayed_past_its_crossing(&self) -> bool {
-        self.crossed().is_some_and(|crossing| {
+        // A wrap `line_crossing_after_start` left undecided, in the lap's first moments: its first
+        // rows can still carry the old lap's distance, which is no crossing to have stayed past
+        let crossing = self.line_crossing.or(self.crossed().filter(|wrap| {
+            self.start
+                .is_some_and(|start| wrap - start > LINE_APPROACH_SECONDS)
+        }));
+        crossing.is_some_and(|crossing| {
             self.samples
                 .last()
                 .and_then(|sample| sample.session_time)
@@ -1112,13 +1117,9 @@ impl LapBuild {
     /// crossing the line, with no hole in its rows (up to `next`, when the lap after it started) a
     /// circuit could have gone unseen in.
     fn only_a_run_to_the_line(&self, next: Option<f64>) -> bool {
-        let last = self
-            .samples
-            .iter()
-            .rev()
-            .find_map(|sample| sample.session_time);
         let unbroken = !self.hole
-            && last
+            && self
+                .seen_at
                 .zip(next)
                 .is_none_or(|(last, next)| next - last <= TRAIL_HOLE);
         unbroken
@@ -3576,14 +3577,16 @@ impl Stream {
             let counted = (stayed && !self.opening_lap.run_only)
                 || counting() == Some(Counting::RunAndCircuit);
             // Until it's been round to the middle of the lap, or round past the line again (rows of
-            // the middle can be missing): from there its distance can wrap again before its lap
-            // count goes to 1
-            let again = build
-                .last_wrap
-                .is_some_and(|wrap| wrap > crossing + LINE_APPROACH_SECONDS);
+            // the middle can be missing), or there's a hole in its rows it could have been round
+            // in: from there its distance can wrap again before its lap count goes to 1
+            // Against the row its crossing wrapped on: the crossing's put between it and the one
+            // before, however far apart
+            let again = build.last_wrap.is_some_and(|wrap| {
+                wrap > build.first_wrap.unwrap_or(crossing) + LINE_APPROACH_SECONDS
+            });
             return counted.then_some(RaceLap {
                 lap: 0,
-                past_its_crossing: !build.mid_lap && !again,
+                past_its_crossing: !build.mid_lap && !again && !build.hole,
             });
         }
         // A wrap past the line with the lap's start unseen, which `crossed` can't tell from the
@@ -6199,6 +6202,33 @@ mod tests {
         assert_eq!(row.i("lap"), Some(0));
         assert!(!row.b(PAST_ITS_CROSSING));
 
+        // Rows 1.5 s apart at the line: the wrap's row is past the crossing put between them,
+        // which is no wrap again
+        let rows = driven(1900.0, &[(0, 2240.0, &|_, _| Some(0.0))]);
+        let apart = on_the_grid(vec![(
+            2,
+            rows.into_iter()
+                .filter(|s| s.session_time.unwrap() <= 1.5 || s.session_time.unwrap() >= 2.99)
+                .collect(),
+        )]);
+        let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
+        stream.apply_telemetry(&conn, &apart).unwrap();
+        let row = counted_at(&conn, &stream, &apart, 2);
+        assert_eq!(row.i("lap"), Some(0));
+        assert!(row.b(PAST_ITS_CROSSING));
+
+        // Nor with the whole circuit unseen
+        let unseen = samples
+            .iter()
+            .filter(|s| s.session_time.unwrap() <= 3.0 || s.session_time.unwrap() >= 34.99)
+            .copied()
+            .collect::<Vec<_>>();
+        let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
+        stream.apply_telemetry(&conn, &unseen).unwrap();
+        let row = counted_at(&conn, &stream, &unseen, 2);
+        assert_eq!(row.i("lap"), Some(0));
+        assert!(!row.b(PAST_ITS_CROSSING));
+
         // With no rows of the middle of the lap either
         let samples = samples
             .into_iter()
@@ -6241,6 +6271,25 @@ mod tests {
             .filter(|s| s.lap == Some(1) || s.session_time.unwrap() < 0.5 || s.id > 400)
             .filter(|s| s.lap == Some(1) || s.lap_distance.unwrap() > 1800.0)
             .collect::<Vec<_>>();
+        // Or rows all there but without a distance
+        let blank = on_the_grid(vec![(
+            2,
+            driven(
+                1900.0,
+                &[
+                    (0, 3990.0, &|_, _| Some(0.0)),
+                    (1, 4100.0, &|_, _| Some(2100.0 / 60.0)),
+                ],
+            ),
+        )])
+        .into_iter()
+        .map(|mut s| {
+            if s.lap == Some(0) && (6..400).contains(&s.id) {
+                s.lap_distance = None;
+            }
+            s
+        })
+        .collect::<Vec<_>>();
         for samples in [
             samples.clone(),
             samples
@@ -6248,6 +6297,7 @@ mod tests {
                 .filter(|s| s.lap == Some(1) || s.session_time.unwrap() < 0.5)
                 .copied()
                 .collect(),
+            blank,
         ] {
             let (conn, mut stream) = stream_with(vec![turn_at(1800.0)]);
             stream.apply_telemetry(&conn, &samples).unwrap();
@@ -6432,6 +6482,28 @@ mod tests {
         assert_eq!(race_lap_at(&conn, &stream, &samples[..lap_1], 2), None);
         stream.apply_telemetry(&conn, &samples[lap_1..]).unwrap();
         assert_eq!(stream.counting(), Some(Counting::RunOnly));
+
+        // A pit-lane start just past the line whose first rows still carry the old lap's distance:
+        // that wrap is no crossing it stays past
+        let mut stale = driven(40.0, &[(0, 200.0, &|_, _| Some(0.0))]);
+        for s in &mut stale {
+            s.session_time = s.session_time.map(|t| t + 0.1);
+        }
+        let mut first = stale[0];
+        first.lap_distance = Some(1990.0);
+        let mut second = first;
+        first.session_time = Some(0.0);
+        second.session_time = Some(0.05);
+        let samples = on_the_grid(vec![(
+            7,
+            [first, second].into_iter().chain(stale).collect(),
+        )]);
+        let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
+        stream.apply_telemetry(&conn, &samples).unwrap();
+        let build = stream.cars[&7].current.as_ref().unwrap();
+        assert!(build.crossed().is_some());
+        assert!(!build.stayed_past_its_crossing());
+        assert_eq!(stream.counting(), None);
 
         // Nor with the lap's start unseen: its first row 0.3 s after the timer started
         let samples = on_the_grid(vec![(
