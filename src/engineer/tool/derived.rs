@@ -1248,8 +1248,11 @@ impl Trail {
             return None;
         }
         let mut newer = (now, at);
-        // Seconds and metres on (back counting against) since the last CRAWL's worth: slower than
-        // a moving car over one of those is a stop, however its distance jittered
+        // The steps (seconds, metres on with back counting against) of the latest CRAWL's worth,
+        // sliding along the trail: slower than a moving car over any one of those is a stop,
+        // however its distance jittered, and faster than any car (but for one row's correction)
+        // is a reset or a tow, however small each of its steps
+        let mut window = std::collections::VecDeque::new();
         let mut crawl = (0.0, 0.0);
         // A rival's rows can be newer than the player's: they say nothing of before now
         for &older in self.0.iter().rev().skip_while(|(t, _)| *t > now) {
@@ -1276,12 +1279,19 @@ impl Trail {
             } else {
                 step
             };
+            window.push_back((dt, on));
             crawl = (crawl.0 + dt, crawl.1 + on);
-            if crawl.0 >= CRAWL {
-                if crawl.1 < MOVING * crawl.0 {
-                    return None;
-                }
-                crawl = (0.0, 0.0);
+            while window
+                .front()
+                .is_some_and(|&(first, _)| window.len() > 1 && crawl.0 - first >= CRAWL)
+            {
+                let (first, first_on) = window.pop_front().unwrap_or_default();
+                crawl = (crawl.0 - first, crawl.1 - first_on);
+            }
+            if crawl.0 >= CRAWL
+                && (crawl.1 < MOVING * crawl.0 || crawl.1 > TRAIL_TELEPORT * crawl.0 + TRAIL_JITTER)
+            {
+                return None;
             }
             if step > 0.0 && step <= length / 2.0 {
                 let into = (spot - older.1).rem_euclid(length);
@@ -5095,6 +5105,25 @@ mod tests {
                 .collect(),
         );
         assert_eq!(jittering.since_at(540.0, 400.0, 250.0, 1000.0), None);
+        // Nor does a short stop hide between seconds counted from now: a row every 0.125 s at
+        // 20 m/s, stopped from 1.5 to 2.75 s
+        let short_stop = Trail(
+            (0..=24)
+                .map(|i| {
+                    let t = f64::from(i) * 0.125;
+                    (t, 20.0 * (t.min(1.5) + (t - 2.75).max(0.0)))
+                })
+                .collect(),
+        );
+        assert_eq!(short_stop.since_at(3.125, 37.5, 10.0, 1000.0), None);
+        assert!(close(short_stop.since_at(3.125, 37.5, 35.0, 1000.0), 0.125));
+        // Steps each short enough for a correction but faster than any car together: 320 m/s
+        let racing_off = Trail(
+            (0..=8)
+                .map(|i| (f64::from(i) * 0.125, f64::from(i) * 40.0))
+                .collect(),
+        );
+        assert_eq!(racing_off.since_at(1.0, 320.0, 0.0, 1000.0), None);
         // One row's short step, as an estimated distance put right, isn't a stop
         let corrected = Trail(
             [
