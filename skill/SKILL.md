@@ -137,10 +137,15 @@ row; the NULLs below are for the other cars' rows:
   under the same leader, and the same laps down on it. NULL when neither is known (as just after
   a stop), and for a car out of the race, finished or in its garage (or when the player is).
 - `race_laps_to_player`: whole laps of race distance between them (2: two laps up on the player;
-  0: under a lap apart, even if the standings count one more lap down on the leader). Races only;
-  NULL without live telemetry, until a lap of each has been seen to end (the opening lap), just
-  past the line while the lap count catches up (or stopped in the pits just past it), and when the
-  race gap is NULL for being out, finished or garaged.
+  0: under a lap apart, even if the standings count one more lap down on the leader). Races only.
+  On the opening lap, a car still running from the grid to the line is counted short of the line
+  (behind the cars that have crossed it), whether the simulator gives that run a lap number of its
+  own or counts it with the circuit after it. NULL without live telemetry; for a car running to
+  the line in the first second after the green, or before any car's crossing has shown how the
+  session counts that run; for a moment after the first crossings under lap 0; just past the line
+  while the lap count catches up (or stopped in the pits just past it); and when the race gap is
+  NULL for being out, finished or garaged. While it's NULL, `race_gap_to_player_s` only comes
+  from the standings.
 - `track_gap_to_player_s`: seconds on track, the nearest way round the lap, in any session and
   whatever the race order (a car lapping the player can be just behind): how long ago the one in
   front was where the other is now. Estimated from the distance at the follower's own pace when
