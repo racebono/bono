@@ -83,6 +83,7 @@ const SERVICE_RF_TIRE: u32 = 0x02;
 const SERVICE_LR_TIRE: u32 = 0x04;
 const SERVICE_RR_TIRE: u32 = 0x08;
 const SERVICE_FUEL: u32 = 0x10;
+const SERVICE_FAST_REPAIR: u32 = 0x40;
 
 /// The recording's wheels (front left, front right, rear left, rear right) as iRacing names them.
 const WHEELS: [&str; 4] = ["LF", "RF", "LR", "RR"];
@@ -654,6 +655,8 @@ impl Converter {
                 selected(SERVICE_LF_TIRE | SERVICE_RF_TIRE).into();
             out.pit_service_rear_tires_selected =
                 selected(SERVICE_LR_TIRE | SERVICE_RR_TIRE).into();
+            // Fast repair mends all the damage: the nearest the recording has is body repair
+            out.pit_service_body_repair_selected = selected(SERVICE_FAST_REPAIR).into();
             out.fuel_fraction = frame.f64("FuelLevelPct").map(|f| f.clamp(0.0, 1.0)).into();
 
             put("pit_service_flags", json!(services));
@@ -1701,6 +1704,45 @@ mod tests {
         let some = update(&info, STATE_PARADE_LAPS, [1, 0, 0], [0.0; 3]);
         assert_eq!(standing(&some, 0).0, Some(1));
         assert_eq!((standing(&some, 1).0, standing(&some, 2).0), (None, None));
+    }
+
+    /// Fast repair alone in the pit menu is a service selected, not none.
+    #[test]
+    fn fast_repair_is_a_pit_service() {
+        use super::super::sdk::{Value, Vars};
+        use super::super::session::{Driver, Session};
+        let info = SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: HashMap::from([(0, Driver::default())]),
+            sessions: vec![Session {
+                num: 0,
+                kind: Some("race"),
+                number: 1,
+                results: HashMap::new(),
+            }],
+            ..Default::default()
+        };
+        let (vars, data) = Vars::of(&[
+            ("SessionTime", Value::Double(10.0)),
+            ("SessionNum", Value::Int(0)),
+            ("SessionState", Value::Int(STATE_RACING)),
+            ("PlayerCarIdx", Value::Int(0)),
+            ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
+            ("CarIdxLapCompleted", Value::Ints(vec![2])),
+            ("PitSvFlags", Value::Int(SERVICE_FAST_REPAIR as i32)),
+        ]);
+        let update = Converter::default()
+            .convert(&Frame::new(&vars, &data), &info, Instant::now())
+            .unwrap();
+        let (_, standings) = update.scoring.as_ref().unwrap();
+        let me = standings
+            .iter()
+            .find(|s| s.vehicle_id.get() == Some(0))
+            .unwrap();
+        assert_eq!(me.pit_service_body_repair_selected.get(), Some(true));
+        assert_eq!(me.pit_service_refuel_selected.get(), Some(false));
+        assert_eq!(me.pit_service_front_tires_selected.get(), Some(false));
     }
 
     /// The out lap is the game's -1 laps done: the standings keep it, so the line that ends the out
