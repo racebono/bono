@@ -284,7 +284,8 @@ session_first_id`; the other tables number their rows separately (`telemetry_id`
   `brake_filtered`, `gear`, `engine_rpm`, `fuel`, `virtual_energy`, `battery_charge`,
   `traction_control_active`, `abs_active`, `front_ride_height`, `rear_ride_height`, `drag`,
   `gap_to_car_ahead/behind` (and `car_ahead_id`/`car_behind_id`, the `vehicle_id` each is to, where
-  the simulator says), `gap_to_place_ahead/behind`, `cars_left/right` (the player's row:
+  known; RaceRoom has no gaps on track, only those ids, the cars either side round the lap),
+  `gap_to_place_ahead/behind`, `cars_left/right` (the player's row:
   cars alongside as the simulator reports them, 0 to 2; NULL on simulators that don't).
 - `telemetry_wheel`: four rows per `telemetry` row (`telemetry_id`, `wheel`): `suspension_deflection`,
   `ride_height`, `camber`, `toe` (rad), `brake_temperature`, `brake_pressure`, `rotation_speed`,
