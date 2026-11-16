@@ -217,7 +217,8 @@ impl Voices {
             (Some(true), _) if used && failed => SetupState::LoadFailed,
             // On disk but not used, and setup isn't going to: retrying uses it
             (Some(true), _) if self.setup.is_none() && !used => SetupState::Missing,
-            (Some(true), _) if used && load == Some(VoiceLoad::Loading) => SetupState::Loading,
+            // Being loaded, or setup is about to use it
+            (Some(true), _) if !used || load == Some(VoiceLoad::Loading) => SetupState::Loading,
             (Some(true), _) => SetupState::Ready,
             (_, Some(progress)) => SetupState::Downloading(progress),
             _ if voice.failed() => SetupState::Failed,

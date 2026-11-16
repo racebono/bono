@@ -259,15 +259,16 @@ impl SynthesizerInner {
         load: Arc<Mutex<LoadStatus>>,
         threads: NonZeroUsize,
     ) {
+        let mut voice = None::<Voice>;
+        // The transmission being spoken: one at a time, the others wait their turn
+        let mut stream = None::<Stream>;
+        let mut waiting = VecDeque::<Job>::new();
+        // After the voice, so it's dropped first: requests stop before the voice is freed
         let mut stopping = Stopping {
             load: load.clone(),
             model: Some(model),
         };
         let model = stopping.model.as_mut().expect("just set");
-        let mut voice = None::<Voice>;
-        // The transmission being spoken: one at a time, the others wait their turn
-        let mut stream = None::<Stream>;
-        let mut waiting = VecDeque::<Job>::new();
 
         enum Event {
             Model,
