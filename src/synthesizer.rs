@@ -241,6 +241,11 @@ impl SynthesizerInner {
         lock(&self.load).state
     }
 
+    /// Whether its worker stopped, so it can't load or speak anything.
+    pub fn stopped(&self) -> bool {
+        self.model.is_closed()
+    }
+
     fn send(&self, job: Job) {
         if let Err(SendError(job)) = self.jobs.send(job) {
             job.fail(anyhow::Error::msg("channel closed"));
@@ -254,6 +259,7 @@ impl SynthesizerInner {
         load: Arc<Mutex<LoadStatus>>,
         threads: NonZeroUsize,
     ) {
+        let _failed_on_panic = FailedOnPanic(load.clone());
         let mut voice = None::<Voice>;
         // The transmission being spoken: one at a time, the others wait their turn
         let mut stream = None::<Stream>;
@@ -370,6 +376,20 @@ impl SynthesizerInner {
                 }
                 Some(Event::Stopped) => stream = None,
                 None => return,
+            }
+        }
+    }
+}
+
+/// Marks the voice failed if the worker panics, since nothing will load or speak it after.
+struct FailedOnPanic(Arc<Mutex<LoadStatus>>);
+
+impl Drop for FailedOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let mut load = lock(&self.0);
+            if load.state.is_some() {
+                load.state = Some(VoiceLoad::Failed);
             }
         }
     }
@@ -1012,13 +1032,37 @@ mod tests {
         // Once the worker stops, nothing loads it
         inner.set_model(None);
         assert_eq!(inner.load(), None);
+        stopped(&inner).await;
+        inner.set_model(Some(missing));
+        assert_eq!(inner.load(), Some(VoiceLoad::Failed));
+    }
+
+    async fn stopped(inner: &SynthesizerInner) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !inner.model.is_closed() {
+        while !inner.stopped() {
             assert!(Instant::now() < deadline, "timed out");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        inner.set_model(Some(missing));
-        assert_eq!(inner.load(), Some(VoiceLoad::Failed));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn setting_a_voice_starts_a_stopped_synthesizer_again() {
+        let rt = Handle::current();
+        let lang = crate::arrstr!("en");
+        let mut synth = Synthesizer {
+            inner: BTreeMap::new(),
+        };
+        let mut config = RawConfig::default();
+        let missing = std::env::temp_dir().join("bono-missing-voice.onnx");
+        let missing = Utf8PathBuf::from_path_buf(missing).unwrap();
+
+        config.set_voice(&rt, lang, None, &mut synth);
+        stopped(&synth.inner[&lang]).await;
+
+        config.set_voice(&rt, lang, Some(missing), &mut synth);
+        assert_eq!(loaded(&synth.inner[&lang]).await, Some(VoiceLoad::Failed));
+        // It was loaded (and failed) by a worker that's still there for the next
+        assert!(!synth.inner[&lang].stopped());
     }
 
     #[test]

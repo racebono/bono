@@ -355,11 +355,17 @@ impl RawConfig {
         }
         self.voices.set(voices);
 
-        synth
+        let inner = synth
             .inner
             .entry(lang)
-            .or_insert_with(|| SynthesizerInner::new(rt.clone()))
-            .set_model(model);
+            .or_insert_with(|| SynthesizerInner::new(rt.clone()));
+        // One that stopped (or panicked) won't load anything: it's started again
+        if inner.stopped() {
+            let stopped = std::mem::replace(inner, SynthesizerInner::new(rt.clone()));
+            // Dropping it joins its thread
+            rt.spawn_blocking(move || drop(stopped));
+        }
+        inner.set_model(model);
     }
 }
 
