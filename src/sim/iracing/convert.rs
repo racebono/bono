@@ -156,8 +156,9 @@ pub struct Converter {
 }
 
 /// A race's flag, for who has finished: the leader when it came, and when its lap count went up for
-/// its finish (once it has). Another car has finished once its count has gone up since then: over
-/// the line after the leader (a car a lap down too, its race done at the flag).
+/// its finish (once it has: iRacing shows the flag a few seconds before the leader is over the
+/// line). A car, the leader too, has finished once its count has gone up since then: over the line
+/// after the leader (a car a lap down too, its race done at the flag).
 struct Flag {
     leader: Option<i64>,
     /// The first update with the flag
@@ -408,7 +409,6 @@ impl Converter {
                 .iter()
                 .filter(|c| {
                     state == Some(STATE_COOL_DOWN)
-                        || flag.leader == Some(c.idx)
                         || flag
                             .finish
                             .is_some_and(|finish| counted(c.idx).is_some_and(|at| at >= finish))
@@ -2187,6 +2187,70 @@ mod tests {
         let (lapped, leader) = (lapped.counted_at.unwrap(), leader.counted_at.unwrap());
         assert!(lapped < leader, "{lapped} {leader}");
         assert!((lapped - (1.0 + 0.03 / 0.09)).abs() < 1e-6, "{lapped}");
+    }
+
+    /// iRacing shows the flag a few seconds before the leader is over the line: until it is, the
+    /// leader and the cars behind it are still racing, live.
+    #[test]
+    fn the_flag_comes_before_the_leader_is_over_the_line() {
+        use super::super::sdk::{Value, Vars};
+        use super::super::session::{Driver, Session};
+        let driver = Driver {
+            class_id: Some(1),
+            class_lap_time: Some(90.0),
+            ..Default::default()
+        };
+        let info = SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: (0..3).map(|car| (car, driver.clone())).collect(),
+            sessions: vec![Session {
+                num: 0,
+                kind: Some("race"),
+                number: 1,
+                results: HashMap::new(),
+            }],
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let mut converter = Converter::default();
+        let mut gap_ahead = |t: f64, state: i32, pct: [f64; 3], laps: [i32; 3]| {
+            let (vars, data) = Vars::of(&[
+                ("SessionTime", Value::Double(t)),
+                ("SessionNum", Value::Int(0)),
+                ("SessionState", Value::Int(state)),
+                ("PlayerCarIdx", Value::Int(0)),
+                ("CarIdxLapDistPct", Value::Doubles(pct.to_vec())),
+                ("CarIdxLapCompleted", Value::Ints(laps.to_vec())),
+                ("CarIdxPosition", Value::Ints(vec![2, 3, 1])),
+                ("CarIdxClassPosition", Value::Ints(vec![2, 3, 1])),
+                (
+                    "CarIdxEstTime",
+                    Value::Doubles(pct.iter().map(|p| p * 90.0).collect()),
+                ),
+                ("CarIdxF2Time", Value::Doubles(vec![2.0, 5.0, 0.0])),
+            ]);
+            let update = converter
+                .convert(
+                    &Frame::new(&vars, &data),
+                    &info,
+                    start + std::time::Duration::from_secs_f64(t),
+                )
+                .unwrap();
+            let row = update
+                .telemetry
+                .iter()
+                .find(|t| t.vehicle_id.get() == Some(0))
+                .unwrap();
+            row.gap_to_place_ahead.get()
+        };
+        gap_ahead(1.0, STATE_RACING, [0.85, 0.8, 0.9], [3, 3, 3]);
+        // The flag, the leader still short of the line: live
+        let live = gap_ahead(2.0, STATE_CHECKERED, [0.9, 0.85, 0.95], [3, 3, 3]);
+        assert!(live.is_some_and(|gap| (gap - 4.5).abs() < 1e-6), "{live:?}");
+        // The leader over it: finished, its finishing gap
+        let done = gap_ahead(3.0, STATE_CHECKERED, [0.95, 0.9, 0.02], [3, 3, 4]);
+        assert_eq!(done, Some(2.0));
     }
 
     /// A car over the line in the same update as the leader's flag has finished with it.
