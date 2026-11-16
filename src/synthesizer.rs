@@ -254,12 +254,16 @@ impl SynthesizerInner {
 
     fn worker(
         handle: Handle,
-        mut model: watch::Receiver<Option<(u64, Utf8PathBuf)>>,
+        model: watch::Receiver<Option<(u64, Utf8PathBuf)>>,
         mut jobs: mpsc::UnboundedReceiver<Job>,
         load: Arc<Mutex<LoadStatus>>,
         threads: NonZeroUsize,
     ) {
-        let _failed_on_panic = FailedOnPanic(load.clone());
+        let mut stopping = Stopping {
+            load: load.clone(),
+            model: Some(model),
+        };
+        let model = stopping.model.as_mut().expect("just set");
         let mut voice = None::<Voice>;
         // The transmission being spoken: one at a time, the others wait their turn
         let mut stream = None::<Stream>;
@@ -381,16 +385,26 @@ impl SynthesizerInner {
     }
 }
 
-/// Marks the voice failed if the worker panics, since nothing will load or speak it after.
-struct FailedOnPanic(Arc<Mutex<LoadStatus>>);
+/// The worker's voice requests, closed when it stops (or panics): a voice it didn't load, or any
+/// after a panic, is marked failed, since nothing will load or speak it.
+struct Stopping {
+    load: Arc<Mutex<LoadStatus>>,
+    model: Option<watch::Receiver<Option<(u64, Utf8PathBuf)>>>,
+}
 
-impl Drop for FailedOnPanic {
+impl Drop for Stopping {
     fn drop(&mut self) {
-        if std::thread::panicking() {
-            let mut load = lock(&self.0);
-            if load.state.is_some() {
-                load.state = Some(VoiceLoad::Failed);
-            }
+        // Closed while locked, as `set_model` sends while locked: a request is either seen here
+        // or fails to send
+        let mut load = lock(&self.load);
+        drop(self.model.take());
+        let failed = match load.state {
+            Some(VoiceLoad::Loading) => true,
+            Some(VoiceLoad::Loaded) => std::thread::panicking(),
+            Some(VoiceLoad::Failed) | None => false,
+        };
+        if failed {
+            load.state = Some(VoiceLoad::Failed);
         }
     }
 }
