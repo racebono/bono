@@ -9,7 +9,7 @@ use crate::{
     },
     config::{ArrayStr, Config},
     error,
-    synthesizer::Synthesizer,
+    synthesizer::{Synthesizer, VoiceLoad},
     task::MaybeDone,
     updating,
 };
@@ -114,6 +114,8 @@ impl Voices {
             return;
         };
         let picked = config.get().voices().get(&lang).cloned();
+        // A picked voice that didn't load is replaced (or loaded again, if it's the recommended)
+        let failed = synth.load(lang) == Some(VoiceLoad::Failed);
         let Some(Some(catalog)) = self.catalog.update(rt) else {
             return;
         };
@@ -130,6 +132,7 @@ impl Voices {
             None => false,
         };
         if on_disk
+            && !failed
             && picked
                 .as_ref()
                 .is_some_and(|path| !self.setup_started || path.as_path() != &*voice.path)
@@ -147,11 +150,11 @@ impl Voices {
                     let since = *self.replace_since.get_or_insert_with(Instant::now);
                     match self.files.voice_checked_since(picked, Some(since)) {
                         None => return,
-                        Some(true) => {
+                        Some(true) if !failed => {
                             self.setup = None;
                             return;
                         }
-                        Some(false) => {}
+                        Some(_) => {}
                     }
                 }
                 config.update(|raw| raw.set_voice(rt, lang, Some(path), synth));
@@ -177,13 +180,22 @@ impl Voices {
     }
 
     /// The recommended voice for the app's language (`locale`), as the setup guide shows it:
-    /// `None` if there's none, or another is picked.
-    pub fn setup_item(&mut self, rt: &Handle, config: &Config, locale: &str) -> Option<SetupItem> {
+    /// `None` if there's none, or another is picked (and loaded, or loading).
+    pub fn setup_item(
+        &mut self,
+        rt: &Handle,
+        config: &Config,
+        synth: &Synthesizer,
+        locale: &str,
+    ) -> Option<SetupItem> {
         let (lang, name) = self.setup.or_else(|| recommended(locale))?;
         let picked = config.get().voices().get(&lang).cloned();
-        let unusable = picked
-            .as_ref()
-            .is_none_or(|picked| !self.files.voice(picked));
+        let load = synth.load(lang);
+        let failed = load == Some(VoiceLoad::Failed);
+        let unusable = failed
+            || picked
+                .as_ref()
+                .is_none_or(|picked| !self.files.voice(picked));
         let catalog = match self.catalog.update(rt) {
             None => return unusable.then_some(SetupItem::Loading),
             Some(None) => return unusable.then_some(SetupItem::Unavailable),
@@ -191,6 +203,7 @@ impl Voices {
         };
         let voice = find(&mut catalog.languages, lang, name)?;
         if self.setup.is_none()
+            && !failed
             && (picked.as_ref())
                 .is_some_and(|picked| *picked != *voice.path && self.files.voice(picked))
         {
@@ -201,8 +214,10 @@ impl Voices {
             .and_then(|on_disk| on_disk.get(voice.index).copied());
         let used = (picked.as_ref()).is_some_and(|picked| *picked == *voice.path);
         let state = match (on_disk, voice.progress()) {
+            (Some(true), _) if used && failed => SetupState::LoadFailed,
             // On disk but not used, and setup isn't going to: retrying uses it
             (Some(true), _) if self.setup.is_none() && !used => SetupState::Missing,
+            (Some(true), _) if used && load == Some(VoiceLoad::Loading) => SetupState::Loading,
             (Some(true), _) => SetupState::Ready,
             (_, Some(progress)) => SetupState::Downloading(progress),
             _ if voice.failed() => SetupState::Failed,

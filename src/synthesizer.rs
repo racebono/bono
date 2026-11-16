@@ -25,6 +25,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     mem::ManuallyDrop,
     num::NonZeroUsize,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     task::Poll,
     time::{Duration, Instant},
 };
@@ -105,6 +106,11 @@ impl Synthesizer {
         return (SpeechInput(input), SpeechOutput(recv));
     }
 
+    /// How the voice for `lang` loaded: `None` if none was set.
+    pub fn load(&self, lang: ArrayStr<2>) -> Option<VoiceLoad> {
+        self.inner.get(&lang)?.load()
+    }
+
     fn inner(&mut self, rt: &Handle, lang: ArrayStr<2>) -> &SynthesizerInner {
         self.inner
             .entry(lang)
@@ -172,10 +178,29 @@ impl Job {
     }
 }
 
+/// How the latest voice given to a [`SynthesizerInner`] loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceLoad {
+    Loading,
+    Loaded,
+    /// It couldn't be loaded: the voice before it (if any) is still the one speaking
+    Failed,
+}
+
+/// The voices given to a [`SynthesizerInner`], counted, and how the latest loaded.
+#[derive(Default)]
+struct LoadStatus {
+    requested: u64,
+    /// `None` until a voice is given
+    state: Option<VoiceLoad>,
+}
+
 pub struct SynthesizerInner {
     handle: ManuallyDrop<std::thread::JoinHandle<()>>,
-    model: ManuallyDrop<watch::Sender<Option<Utf8PathBuf>>>,
+    /// The voice to load, with its number in [`LoadStatus::requested`]
+    model: ManuallyDrop<watch::Sender<Option<(u64, Utf8PathBuf)>>>,
     jobs: ManuallyDrop<mpsc::UnboundedSender<Job>>,
+    load: Arc<Mutex<LoadStatus>>,
 }
 
 impl SynthesizerInner {
@@ -183,17 +208,34 @@ impl SynthesizerInner {
         let threads = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
         let (model_send, model_recv) = watch::channel(None);
         let (jobs_send, jobs_recv) = mpsc::unbounded_channel();
-        let handle = std::thread::spawn(move || Self::worker(rt, model_recv, jobs_recv, threads));
+        let load = Arc::new(Mutex::new(LoadStatus::default()));
+        let handle = {
+            let load = load.clone();
+            std::thread::spawn(move || Self::worker(rt, model_recv, jobs_recv, load, threads))
+        };
 
         Self {
             handle: ManuallyDrop::new(handle),
             model: ManuallyDrop::new(model_send),
             jobs: ManuallyDrop::new(jobs_send),
+            load,
         }
     }
 
+    /// Loads `model` (again, if it's the one already set), or with `None`, stops.
     pub fn set_model(&self, model: Option<Utf8PathBuf>) {
-        let _ = self.model.send(model);
+        let requested = {
+            let mut load = lock(&self.load);
+            load.requested += 1;
+            load.state = model.is_some().then_some(VoiceLoad::Loading);
+            load.requested
+        };
+        let _ = self.model.send(model.map(|model| (requested, model)));
+    }
+
+    /// How the latest voice set loaded: `None` if none was.
+    pub fn load(&self) -> Option<VoiceLoad> {
+        lock(&self.load).state
     }
 
     fn send(&self, job: Job) {
@@ -204,8 +246,9 @@ impl SynthesizerInner {
 
     fn worker(
         handle: Handle,
-        mut model: watch::Receiver<Option<Utf8PathBuf>>,
+        mut model: watch::Receiver<Option<(u64, Utf8PathBuf)>>,
         mut jobs: mpsc::UnboundedReceiver<Job>,
+        load: Arc<Mutex<LoadStatus>>,
         threads: NonZeroUsize,
     ) {
         let mut voice = None::<Voice>;
@@ -281,12 +324,23 @@ impl SynthesizerInner {
                     stream = None;
                     // Cloned so the load doesn't hold the read lock `set_model` waits on
                     let path = model.borrow_and_update().clone();
-                    match path {
-                        Some(path) => match Voice::load(&path, threads) {
-                            Ok(next_voice) => voice = Some(next_voice),
-                            Err(e) => error(t!("error.tts_model"), e),
-                        },
-                        None => return,
+                    let Some((requested, path)) = path else {
+                        return;
+                    };
+                    let state = match Voice::load(&path, threads) {
+                        Ok(next_voice) => {
+                            voice = Some(next_voice);
+                            VoiceLoad::Loaded
+                        }
+                        Err(e) => {
+                            error(t!("error.tts_model"), e);
+                            VoiceLoad::Failed
+                        }
+                    };
+                    // A voice set during the load is the one shown
+                    let mut load = lock(&load);
+                    if load.requested == requested {
+                        load.state = Some(state);
                     }
                 }
                 Some(Event::Job(Job::Speech {
@@ -316,6 +370,10 @@ impl SynthesizerInner {
             }
         }
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn no_model() -> anyhow::Error {
@@ -924,6 +982,31 @@ const fn default_noise_w() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn loaded(inner: &SynthesizerInner) -> Option<VoiceLoad> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while inner.load() == Some(VoiceLoad::Loading) {
+            assert!(Instant::now() < deadline, "timed out");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        inner.load()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_voice_that_wont_load_is_failed_until_its_loaded_again() {
+        let inner = SynthesizerInner::new(Handle::current());
+        assert_eq!(inner.load(), None);
+
+        let missing = std::env::temp_dir().join("bono-missing-voice.onnx");
+        let missing = Utf8PathBuf::from_path_buf(missing).unwrap();
+        inner.set_model(Some(missing.clone()));
+        assert_eq!(loaded(&inner).await, Some(VoiceLoad::Failed));
+
+        // Setting it again tries again, so it isn't shown as failed meanwhile
+        inner.set_model(Some(missing));
+        assert_eq!(inner.load(), Some(VoiceLoad::Loading));
+        assert_eq!(loaded(&inner).await, Some(VoiceLoad::Failed));
+    }
 
     #[test]
     fn a_stream_that_never_drains_is_given_up_on() {

@@ -1541,6 +1541,16 @@
         "es": "Falló la descarga",
         "ca": "Ha fallat la baixada"
     },
+    "onboarding.loading": {
+        "en": "Loading…",
+        "es": "Cargando…",
+        "ca": "Carregant…"
+    },
+    "onboarding.load_failed": {
+        "en": "Couldn't load it",
+        "es": "No se pudo cargar",
+        "ca": "No s'ha pogut carregar"
+    },
     "onboarding.retry": {
         "en": "Retry",
         "es": "Reintentar",
