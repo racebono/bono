@@ -2365,11 +2365,12 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         .any(|r| r.f("tire_surface_temperature_center").is_some());
     let reported = live || wheels.values().any(|r| r.f("tire_pressure").is_some());
     // Without live surface temperatures, the carcass and tread a simulator updates only now and
-    // then (see the header's tire_reading_time) are what there is: as the oldest wheel's reading
+    // then (see the header's tire_reading_time) are what there is: aged by the newest wheel's,
+    // which every wheel's is at least as old as
     let reading = wheels
         .values()
         .filter_map(|r| r.f("tire_reading_time"))
-        .reduce(f64::min)
+        .reduce(f64::max)
         .filter(|_| !live);
     if let Some(reading) = reading {
         let per_wheel = |value: &dyn Fn(&Row) -> String| {
@@ -3193,15 +3194,15 @@ mod tests {
         assert!(!out.contains("last reading"), "{out}");
         drop(engineer);
 
-        // As on iRacing live: no surface temperatures or running pressures, a reading 6 minutes
-        // old and the garage's pressures
+        // As on iRacing live: no surface temperatures or running pressures, readings 6 minutes old
+        // on the front left and older on the others, and the garage's pressures
         let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
         conn.execute_batch(
             "UPDATE telemetry_wheel SET tire_surface_temperature_left = NULL,
                  tire_surface_temperature_center = NULL, tire_surface_temperature_right = NULL,
                  tire_pressure = NULL, tire_carcass_temperature = 80 + wheel,
                  tire_wear = 0.97 - wheel / 100.0, tire_cold_pressure = 172 - wheel,
-                 tire_reading_time = (SELECT session_time - 360 FROM telemetry
+                 tire_reading_time = (SELECT session_time - 360 - 600 * wheel FROM telemetry
                                       WHERE id = telemetry_id);",
         )
         .unwrap();
