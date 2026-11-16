@@ -69,8 +69,9 @@ run, not a race to the flag.
 
 - `quick`: the snapshot again, if time has passed within the turn. Its gaps ahead and behind are
   to the places either side; "nobody" there means no car in that place (or no place yet), not an
-  empty track. Without either gap (outside races, or before a place) it adds `on track ahead …
-  behind …`: the cars nearest on track, which may not be racing us for position.
+  empty track. Where the simulator gives gaps on track, a side without a gap to a place (outside
+  races, before a place, first or last) gets `on track ahead …` or `behind …`: the car nearest that
+  way on track (named when it's clear which), which may not be racing us for position.
 - `track`: the circuit's description as JSON. Positions are fractions of the lap; multiply by
   `lap_length_m` for metres. They've been lined up with the laps when `calibration` is there; without
   it they can be off, and `borrowed` means they're another simulator's for the same layout, so say
@@ -324,15 +325,16 @@ the laps' life are NULL). Cold pressures (`cold_pressure_kpa`) are the garage se
 running pressures. Judge the tyres now from lap times and the car's balance. With no car positions,
 the snapshot's `TRAFFIC` only has iRacing's count of cars alongside: for how far the nearest cars
 are, use the gaps on track (`cars_now.gap_car_ahead_s` and `gap_car_behind_s`).
-`time_behind_leader_s` is as of each car's last time over the line, and NULL until it has finished
-a lap; the gaps to the places either side are live between cars less than a lap apart.
+`time_behind_leader_s` is iRacing's, updated about once a lap at a timing line, and NULL until the
+car has finished a lap; `time_behind_next_s` and the gaps to the places either side are live
+between cars racing less than a lap apart, so don't work one out from the other.
 The best lap is `cars_now.best_lap_s`, iRacing's own, which leaves out laps it doesn't count: a
 quicker `lap_stats` time may be one of those. Don't call such a lap invalid (iRacing doesn't say
 why), and don't call any lap valid: iRacing doesn't report lap validity.
 Body repair in `pit_services_selected` is iRacing's fast repair: without it a stop still repairs
 the car, only slower. iRacing gives no fuel per lap of its own: `game_fuel_per_lap_l` is the fuel
 used over the last lap's distance driven, so slow or yellow running lowers it, and it's NULL until
-a lap has been driven since the pit lane, a tow or reset, or taking on fuel.
+a lap has been driven since the pit lane, a tow or reset, taking on fuel or getting in the car.
 
 ## Evidence that fits the question
 
