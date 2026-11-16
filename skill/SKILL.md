@@ -331,8 +331,9 @@ is: don't call the track clear beyond that count.
 In races, `time_behind_next_s` and the gaps to the places either side are live between cars
 racing less than a lap apart, and `time_behind_leader_s` is live while the car and the leader race
 on track (how long it takes to get where the leader is, whole laps at its class's lap time). Cars
-finished on the winner's lap have their exact gaps over the line. Otherwise (in the pit lane, a lap
-down at the finish, before the green) each is iRacing's own, which it updates about once a lap at a
+finished on the winner's lap have their exact gaps over the line. Otherwise (in the pit lane, off
+the track, still to finish after the winner, a lap down at the finish, before the green) each is
+iRacing's own, which it updates about once a lap at a
 timing line, so it can jump when a car goes from one to the other. Between classes the gaps don't
 add up to the time behind the leader. iRacing only changes places as cars cross the line: a car by
 the one placed ahead since has no gap to it, and one by the leader is 0 behind it.
