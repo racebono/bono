@@ -548,8 +548,8 @@ settings! {
     #[derive(Debug, PartialEq)]
     pub struct SpotterConfig {
         pub enabled: bool = true,
-        /// Whether it calls in qualifying sessions too
-        pub qualifying: bool = true,
+        /// Whether it calls in qualifying sessions too (off, it keeps quiet in them)
+        pub qualifying: bool = false,
         /// The language of its calls: the pilot's (the last one they asked in) when `None`
         pub language: Option<ArrayStr<2>> = None,
         /// How often it looks at the newest telemetry

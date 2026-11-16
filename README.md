@@ -2,7 +2,7 @@
 
 Bono is a desktop AI race engineer and spotter for sim racing. Ask questions by voice or text and get spoken answers grounded in live telemetry: fuel range, tyre condition, lap times, nearby cars, and race standings.
 
-Built in Rust with SDL3 and egui, Bono uses local Whisper speech recognition and Piper text-to-speech. The engineer supports Bono Cloud, Claude, Ollama, and OpenAI-compatible APIs. An automatic spotter reads telemetry directly to call traffic, flags, car alerts, and weather changes, and, with **Lap times in qualifying** turned on in its menu, the time of each qualifying lap. Turning off **In qualifying** keeps it quiet for the whole of qualifying sessions.
+Built in Rust with SDL3 and egui, Bono uses local Whisper speech recognition and Piper text-to-speech. The engineer supports Bono Cloud, Claude, Ollama, and OpenAI-compatible APIs. An automatic spotter reads telemetry directly to call traffic, flags, car alerts, and weather changes. It keeps quiet in qualifying sessions unless **In qualifying** is turned on in its menu, and with **Lap times in qualifying** on too, it calls the time of each qualifying lap.
 
 ## Simulator support
 

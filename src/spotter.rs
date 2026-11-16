@@ -3281,8 +3281,9 @@ mod tests {
             session_type: Some("race".into()),
             ..Scoring::default()
         };
-        let mut off = SpotterConfig::default();
-        off.qualifying.set(false);
+        let off = SpotterConfig::default();
+        let mut on = SpotterConfig::default();
+        on.qualifying.set(true);
         let run = |config: &SpotterConfig, scoring: &Scoring| {
             let mut logic = Logic::default();
             let mut calls = Vec::new();
@@ -3298,8 +3299,9 @@ mod tests {
             calls
         };
 
-        assert!(*SpotterConfig::default().qualifying());
-        assert_eq!(run(&SpotterConfig::default(), &qualifying), ["car right"]);
+        // Off unless asked for
+        assert!(!*off.qualifying());
+        assert_eq!(run(&on, &qualifying), ["car right"]);
         assert!(run(&off, &qualifying).is_empty());
         assert_eq!(run(&off, &race), ["car right"]);
     }
@@ -3339,6 +3341,7 @@ mod tests {
             ..Scoring::default()
         };
         let mut config = SpotterConfig::default();
+        config.qualifying.set(true);
         let mut logic = Logic::default();
         logic.update(
             &config,
@@ -3375,6 +3378,7 @@ mod tests {
         )
         .unwrap();
         let mut config = SpotterConfig::default();
+        config.qualifying.set(true);
         let mut logic = Logic::default();
         let mut last_id = None;
         let mut sizes = Sizes::default();
@@ -3827,7 +3831,9 @@ mod tests {
 
     #[test]
     fn does_not_call_standings_gaps_outside_races() {
-        let config = SpotterConfig::default();
+        let mut config = SpotterConfig::default();
+        // Not merely quiet in qualifying
+        config.qualifying.set(true);
         for kind in [Some("practice"), Some("qualifying"), Some("warmup"), None] {
             for gap in [0.8, 0.1] {
                 let scoring = Scoring {
@@ -3882,6 +3888,7 @@ mod tests {
 
     fn lap_times_on() -> SpotterConfig {
         let mut config = SpotterConfig::default();
+        config.qualifying.set(true);
         config.qualifying_lap_times.set(true);
         config
     }
