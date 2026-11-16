@@ -11,7 +11,11 @@ use crate::{
     sqlite::pool::Pool,
 };
 use bono_sim::sys::{bono_session_info, bono_standing, bono_telemetry};
-use std::{collections::HashMap, path::PathBuf, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    time::Instant,
+};
 use sys::*;
 
 const STEAM_APP_ID: u32 = 211500;
@@ -379,8 +383,17 @@ impl Converter {
 
 /// The cars next ahead and behind each car on track, by slot, going round the lap by distance. On
 /// track is out of the pit lane, at a known distance, and still on track or finished by the game's
-/// finish status (not out of the race, nor still to start). Only with two or more cars on track.
+/// finish status (not out of the race, nor still to start). Only with two or more cars on track,
+/// and none when a slot is there twice (a read mixing two orders of the cars): which row is where
+/// the car is isn't known.
 fn track_neighbours(drivers: &[r3e_driver_data]) -> HashMap<i32, (i32, i32)> {
+    let mut slots = HashSet::new();
+    if !drivers
+        .iter()
+        .all(|driver| slots.insert(driver.driver_info.slot_id))
+    {
+        return HashMap::new();
+    }
     let mut on_track: Vec<_> = drivers
         .iter()
         .filter(|driver| flag(driver.in_pitlane) == Some(false))
@@ -1956,6 +1969,17 @@ mod tests {
             .unwrap();
         assert_eq!(either_side(&update, 7), (None, None));
         assert_eq!(either_side(&update, 3), (None, None));
+
+        // A read with a slot twice (the cars reordered as it was read): nobody either side
+        let mut game = field(500.06);
+        let mut again = game.all_drivers_data_1[0];
+        again.lap_distance = 5000.0;
+        game.all_drivers_data_1[3] = again;
+        let update = converter
+            .convert(&game, start + Duration::from_millis(60))
+            .unwrap();
+        assert_eq!(either_side(&update, 7), (None, None));
+        assert_eq!(either_side(&update, 9), (None, None));
     }
 
     #[test]
