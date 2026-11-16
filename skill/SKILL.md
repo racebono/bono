@@ -328,10 +328,9 @@ running pressures. Judge the tyres now from lap times and the car's balance. Wit
 the snapshot's `TRAFFIC` has iRacing's count of cars alongside and its gaps on track either way
 (also `cars_now.gap_car_ahead_s` and `gap_car_behind_s`), and nothing about where any other car
 is: don't call the track clear beyond that count.
-`time_behind_leader_s` is iRacing's, updated about once a lap at a timing line, and NULL until the
-car has finished a lap (two, if it was within a tenth of a second of the leader after the first);
-`time_behind_next_s` and the gaps to the places either side are live
-between cars racing less than a lap apart, so don't work one out from the other.
+In races, `time_behind_next_s` and the gaps to the places either side are live between cars
+racing less than a lap apart (otherwise iRacing's own, which it updates about once a lap at a timing
+line), and `time_behind_leader_s` adds them up from the leader down.
 The best lap is `cars_now.best_lap_s`, iRacing's own, which leaves out laps it doesn't count: a
 quicker `lap_stats` time may be one of those. Don't call such a lap invalid (iRacing doesn't say
 why), and don't call any lap valid: iRacing doesn't report lap validity.
