@@ -210,8 +210,9 @@
     X(f64, sliding_fraction)                /* fraction of the contact patch that is sliding */         \
     X(i64, surface_type)                    /* 0 dry (RaceRoom: paved, wetness unknown), 1 wet, 2 grass, 3 dirt, 4 gravel, 5 rumble strip, 6 special */ \
     /* Tire */                                                                                           \
-    X(f64, tire_pressure)                                                                                \
-    X(f64, tire_surface_temperature_left)                                                                \
+    X(f64, tire_pressure)                   /* kPa, running */                                           \
+    X(f64, tire_cold_pressure) /* kPa, the cold pressure set in the garage, not the running pressure (iRacing) */ \
+    X(f64, tire_surface_temperature_left)                                                              \
     X(f64, tire_surface_temperature_center)                                                              \
     X(f64, tire_surface_temperature_right)                                                               \
     X(f64, tire_inner_temperature_left)                                                                  \
@@ -219,7 +220,12 @@
     X(f64, tire_inner_temperature_right)                                                                 \
     X(f64, tire_carcass_temperature)                                                                     \
     X(f64, tire_optimal_temperature)        /* unit as reported by the simulator */                     \
-    X(f64, tire_wear)                       /* fraction worn (LMU: what's left; see the engineer's wear_remaining) */ \
+    X(f64, tire_wear)                       /* fraction worn (LMU and iRacing: what's left; see the engineer's wear_remaining) */ \
+    /* Session time at which the wheel's inner and carcass temperatures and its wear last changed,   \
+       on simulators that update them only now and then rather than live (iRacing): they're that   \
+       reading's, not the current values. The first update seen, when the reading is older. NULL     \
+       where they're live */                                                                             \
+    X(f64, tire_reading_time)                                                                            \
     X(f64, tire_vertical_deflection)                                                                     \
     X(i64, tire_compound) /* index of the compound for this car */ \
     X(i64, tire_compound_type)                                                                           \
