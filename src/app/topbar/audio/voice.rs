@@ -237,13 +237,18 @@ impl Voices {
         ui: &mut egui::Ui,
         synth: &mut Synthesizer,
     ) {
+        // The languages whose voice won't load
+        let load_failed: Vec<ArrayStr<2>> = (config.get().voices().keys().copied())
+            .filter(|&lang| synth.load(lang) == Some(VoiceLoad::Failed))
+            .collect();
         let pending = self.catalog.update(rt).is_none();
         let failed = matches!(self.catalog, MaybeDone::Done(None));
         if pending || failed {
             ui.menu_button(
                 setup_label(
                     config.get().voices().is_empty()
-                        || (config.get().voices().values()).any(|path| !self.files.voice(path)),
+                        || (config.get().voices().values()).any(|path| !self.files.voice(path))
+                        || !load_failed.is_empty(),
                     t!("audio.text_to_speech"),
                 ),
                 |ui| {
@@ -278,7 +283,11 @@ impl Voices {
 
         let mut picked = None;
         ui.add_enabled_ui(catalog.is_some(), |ui| {
-            ui.menu_button(setup_label(missing, t!("audio.text_to_speech")), |ui| {
+            let label = setup_label(
+                missing || !load_failed.is_empty(),
+                t!("audio.text_to_speech"),
+            );
+            ui.menu_button(label, |ui| {
                 let Some(catalog) = catalog else {
                     return;
                 };
@@ -299,8 +308,11 @@ impl Voices {
                                 label = label.strong();
                             }
 
-                            let label =
-                                setup_label(missing && Some(language.code) == suggested, label);
+                            let label = setup_label(
+                                (missing && Some(language.code) == suggested)
+                                    || load_failed.contains(&language.code),
+                                label,
+                            );
                             ui.menu_button(label, |ui| {
                                 if language.update(
                                     rt,

@@ -224,13 +224,16 @@ impl SynthesizerInner {
 
     /// Loads `model` (again, if it's the one already set), or with `None`, stops.
     pub fn set_model(&self, model: Option<Utf8PathBuf>) {
-        let requested = {
-            let mut load = lock(&self.load);
-            load.requested += 1;
-            load.state = model.is_some().then_some(VoiceLoad::Loading);
-            load.requested
-        };
-        let _ = self.model.send(model.map(|model| (requested, model)));
+        // Sent while locked, so the latest request is the one the worker gets last
+        let mut load = lock(&self.load);
+        load.requested += 1;
+        let loading = model.is_some();
+        load.state = loading.then_some(VoiceLoad::Loading);
+        let sent = self.model.send(model.map(|model| (load.requested, model)));
+        // The worker stopped, so nothing will load it
+        if sent.is_err() && loading {
+            load.state = Some(VoiceLoad::Failed);
+        }
     }
 
     /// How the latest voice set loaded: `None` if none was.
@@ -993,7 +996,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_voice_that_wont_load_is_failed_until_its_loaded_again() {
+    async fn a_voice_that_wont_load_is_failed() {
         let inner = SynthesizerInner::new(Handle::current());
         assert_eq!(inner.load(), None);
 
@@ -1002,10 +1005,20 @@ mod tests {
         inner.set_model(Some(missing.clone()));
         assert_eq!(loaded(&inner).await, Some(VoiceLoad::Failed));
 
-        // Setting it again tries again, so it isn't shown as failed meanwhile
-        inner.set_model(Some(missing));
-        assert_eq!(inner.load(), Some(VoiceLoad::Loading));
+        // Setting it again tries again
+        inner.set_model(Some(missing.clone()));
         assert_eq!(loaded(&inner).await, Some(VoiceLoad::Failed));
+
+        // Once the worker stops, nothing loads it
+        inner.set_model(None);
+        assert_eq!(inner.load(), None);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !inner.model.is_closed() {
+            assert!(Instant::now() < deadline, "timed out");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        inner.set_model(Some(missing));
+        assert_eq!(inner.load(), Some(VoiceLoad::Failed));
     }
 
     #[test]
