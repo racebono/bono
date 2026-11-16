@@ -106,3 +106,9 @@ references and evals. Do not cite observed incidents, dates, sessions, quoted
 model answers, or pass/fail outcomes from real or test runs. Describe the
 behavior to follow and the scenarios to evaluate in general terms; record
 specific results in commit messages, pull requests, or issues instead.
+
+## Pull Requests
+
+- Conventional commit titles, plain language: `fix(web): new threads no longer spike CPU`.
+- UI changes need before/after images. Motion or timing needs a short video.
+- Upload PR evidence to GitHub. Never commit PR-only screenshots or assets such as `.github/pr-assets/`.
