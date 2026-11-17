@@ -514,6 +514,8 @@ impl Whisper {
         let picked = config.get().whisper_model().clone();
         let setup = self.setup;
         let failed = self.failed();
+        // The model being loaded
+        let loading = self.loaded.clone().filter(|_| self.loading());
         let unusable = failed
             || picked
                 .as_ref()
@@ -533,11 +535,14 @@ impl Whisper {
         }
 
         let state = match (model.on_disk(), model.download()) {
-            (Some(true), _) if failed && picked.as_ref() == Some(&model.path) => SetupState::Failed,
+            (Some(true), _) if failed && picked.as_ref() == Some(&model.path) => {
+                SetupState::LoadFailed
+            }
             // On disk but not used, and setup isn't going to: retrying uses it
             (Some(true), _) if !setup && picked.as_ref() != Some(&model.path) => {
                 SetupState::Missing
             }
+            (Some(true), _) if loading.as_ref() == Some(&model.path) => SetupState::Loading,
             (Some(true), _) => SetupState::Ready,
             (_, Some(download)) => SetupState::Downloading(download.progress()),
             _ if model.failed() => SetupState::Failed,
@@ -558,6 +563,10 @@ impl Whisper {
 
     pub fn failed(&self) -> bool {
         matches!(self.ctx, Some(MaybeDone::Done(None)))
+    }
+
+    fn loading(&self) -> bool {
+        matches!(self.ctx, Some(MaybeDone::Task(_)))
     }
 
     /// Loads `path`, to run on the GPU if `gpu` (and there's one).
