@@ -8,6 +8,7 @@
 
 #include <Windows.h>
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstddef>
@@ -633,11 +634,14 @@ namespace {
         // Steam reports the game closed, which is after this) keeps it from being deleted: the app deletes it
         // once it has let go, and failing that the next run empties it.
         // Takes the recorder once running updates are done with it, and closes it outside the lock: closing waits
-        // for its threads, which updates shouldn't.
+        // for its threads, which updates shouldn't. Updates hold the lock briefly, so one still held after a second
+        // belongs to a thread the system ended as the game exits: the recorder is left as it is, as closing it
+        // could wait on that thread's other locks too.
         void close() {
             bono_lmu_recorder* recorder;
             {
-                std::unique_lock lock(_recorder_mutex);
+                std::unique_lock lock(_recorder_mutex, std::chrono::seconds(1));
+                if (!lock) return;
                 recorder = std::exchange(_recorder, nullptr);
             }
             if (recorder) bono_lmu_close(recorder);
@@ -646,7 +650,7 @@ namespace {
         std::filesystem::path _user_data;
         // The game may call the updates on other threads than the rest: they use the recorder under a shared
         // lock, and it's only opened, restarted or closed under an exclusive one.
-        std::shared_mutex _recorder_mutex;
+        std::shared_timed_mutex _recorder_mutex;
         bono_lmu_recorder* _recorder = nullptr;
         std::mutex _weather_mutex;
         std::optional<Weather> _weather;
