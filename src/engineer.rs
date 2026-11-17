@@ -1168,15 +1168,15 @@ impl SessionState {
     /// conversation over; the next practice, qualifying or race of the same one doesn't.
     async fn follow_game_session(&mut self, auto_session: bool) {
         let (weekend, current) = match game_session(&self.pool, self.sim).await {
-            Ok(Some(current)) => current,
-            Ok(None) => return,
+            Ok(current) => current,
             Err(e) => {
                 log::warn!("Error reading the game session: {e:#}");
                 return;
             }
         };
 
-        // A recording without epochs can't tell weekends apart: the conversation carries on
+        // A recording without epochs can't tell weekends apart: the conversation carries on. A
+        // clear counts even before the next session's scoring
         if let Some(weekend) = weekend {
             if auto_session && self.weekend.is_some_and(|known| known != weekend) {
                 log::info!("New weekend: the engineer starts over");
@@ -1184,16 +1184,19 @@ impl SessionState {
             }
             self.weekend = Some(weekend);
         }
-        self.conversation.set_game_session(&current);
+        if let Some(current) = current {
+            self.conversation.set_game_session(&current);
+        }
     }
 }
 
 /// The game session in the database (its track, type and number, and how long it's scheduled to
-/// last), with the weekend it's in: the oldest epoch's id, `None` for recordings without epochs.
+/// last), if there's one yet, with the weekend it's in: the oldest epoch's id, `None` for
+/// recordings without epochs.
 async fn game_session(
     pool: &Pool,
     sim: &'static str,
-) -> anyhow::Result<Option<(Option<i64>, GameSession)>> {
+) -> anyhow::Result<(Option<i64>, Option<GameSession>)> {
     let conn = pool.get().await?;
     Ok(conn
         .run(move |conn| {
@@ -1212,23 +1215,25 @@ async fn game_session(
                     .query_row([], |row| row.get::<_, Option<i64>>(0))?,
                 false => None,
             };
-            conn.query_row(
-                "SELECT track, session_type, session_number, session_end_time FROM session \
+            let session = conn
+                .query_row(
+                    "SELECT track, session_type, session_number, session_end_time FROM session \
                  ORDER BY id DESC LIMIT 1",
-                [],
-                |row| {
-                    let session_type = row.get::<_, Option<String>>(1)?.unwrap_or_default();
-                    let key = format!(
-                        "{}|{}|{}",
-                        row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                        session_type,
-                        row.get::<_, Option<i64>>(2)?.unwrap_or_default()
-                    );
-                    let scheduled = row.get::<_, Option<f64>>(3)?;
-                    Ok((weekend, GameSession::new(key, sim, &session_type, scheduled)))
-                },
-            )
-            .optional()
+                    [],
+                    |row| {
+                        let session_type = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+                        let key = format!(
+                            "{}|{}|{}",
+                            row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                            session_type,
+                            row.get::<_, Option<i64>>(2)?.unwrap_or_default()
+                        );
+                        let scheduled = row.get::<_, Option<f64>>(3)?;
+                        Ok(GameSession::new(key, sim, &session_type, scheduled))
+                    },
+                )
+                .optional()?;
+            Ok::<_, rusqlite::Error>((weekend, session))
         })
         .await?)
 }
@@ -2006,9 +2011,13 @@ mod tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
                 state.follow_game_session(auto_session).await;
-                let told = recorded.lock().unwrap().games.last().map(|game| game.key.clone());
-                if told.as_deref() == Some(key) && state.weekend.is_some() && state.weekend != old
-                {
+                let told = recorded
+                    .lock()
+                    .unwrap()
+                    .games
+                    .last()
+                    .map(|game| game.key.clone());
+                if told.as_deref() == Some(key) && state.weekend.is_some() && state.weekend != old {
                     return;
                 }
                 assert!(std::time::Instant::now() < deadline, "{key} not recorded");
@@ -2074,8 +2083,18 @@ mod tests {
 
             // A new weekend clears the recording, even back at the same track and session
             recorder.clear();
+            // Noticed before any scoring comes in (the game paused, say)
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while state.weekend == weekend {
+                assert!(std::time::Instant::now() < deadline, "clear not recorded");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                state.follow_game_session(auto_session).await;
+            }
+            assert_eq!(recorded.lock().unwrap().resets, usize::from(auto_session));
+            let cleared = state.weekend;
             recorder.push_scoring(session("practice", 1), Vec::new());
             follow_until(&mut state, &recorded, auto_session, practice, weekend).await;
+            assert_eq!(state.weekend, cleared);
             drop(recorder);
             state.follow_game_session(auto_session).await;
 
