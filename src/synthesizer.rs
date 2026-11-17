@@ -924,19 +924,20 @@ impl Speech {
 
     /// Starts playing on `device`. Dropping the returned stream stops playback.
     pub fn play(&self, device: &sdl3::audio::AudioDevice) -> Result<AudioStreamOwner, sdl3::Error> {
-        let stream = self.start(device)?;
+        let stream = self.start(device, 0)?;
         stream.flush()?;
         return Ok(stream);
     }
 
-    /// Starts playing on `device`, with more to come: put it on the returned stream, and flush
-    /// it after the last. Dropping the stream stops playback.
+    /// Starts playing on `device` from the sample `skip`, with more to come: put it on the
+    /// returned stream, and flush it after the last. Dropping the stream stops playback.
     pub fn start(
         &self,
         device: &sdl3::audio::AudioDevice,
+        skip: usize,
     ) -> Result<AudioStreamOwner, sdl3::Error> {
         let stream = device.clone().open_device_stream(Some(&self.spec()))?;
-        stream.put_data_f32(&self.samples)?;
+        stream.put_data_f32(&self.samples[skip..])?;
         stream.resume()?;
         return Ok(stream);
     }

@@ -347,6 +347,18 @@ impl Playback {
             && (self.stream.as_ref()).is_none_or(|stream| matches!(stream.queued_bytes(), Ok(0)))
     }
 
+    /// Lets go of its stream: what it hasn't played goes out again, on whichever speaker is
+    /// picked once it's next at the front. An answer [waiting on its
+    /// turn](Self::waiting_on_its_turn) needs none, and holds none behind another.
+    fn close_stream(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            self.sentences.rewind(stream.queued_bytes().ok());
+        }
+        self.flushed = false;
+        self.waiting_since = None;
+        self.drain = Drain::new(Instant::now());
+    }
+
     /// Pauses it, ready to resume [`RESUME_BEHIND`] before where it stopped, or resumes it.
     /// Recorded even without a stream to pause, and nothing is done if it's already so.
     fn set_held(&mut self, held: bool) -> Result<(), sdl3::Error> {
@@ -490,28 +502,23 @@ impl Engineer {
         self.notice(t!("engineer.microphone_removed"));
     }
 
-    /// The speaker `which` is gone (unplugged): the answer being spoken on it stops. One that
-    /// gave way to an answer in its gap keeps its place, and says what it hasn't finished again
-    /// on whichever speaker is picked when its turn comes, as the others play. `picked`: whether
-    /// it's the speaker picked, which the pilot is told about either way.
+    /// The speaker `which` is gone (unplugged): the answer being spoken on it stops. Only the
+    /// front of the line holds a stream (see [`Self::fill_gap`]), and one only waiting on its
+    /// turn there keeps its place: the rest of it plays on whichever speaker is picked, as the
+    /// others do. `picked`: whether it's the speaker picked, which the pilot is told about
+    /// either way.
     pub fn speaker_removed(&mut self, which: u32, picked: bool) {
-        let on_it =
-            |playback: &Playback| (playback.stream.as_ref()).is_some_and(|s| plays_on(s, which));
-        let mut stopped = false;
-        if self.line.front().is_some_and(on_it) {
-            self.line.pop_front();
-            stopped = true;
+        let on_it = (self.line.front())
+            .and_then(|playback| playback.stream.as_ref())
+            .is_some_and(|stream| plays_on(stream, which));
+        if on_it {
+            if self.line[0].waiting_on_its_turn() {
+                self.line[0].close_stream();
+            } else {
+                self.line.pop_front();
+            }
         }
-        for playback in self.line.iter_mut().filter(|playback| on_it(playback)) {
-            playback.stream = None;
-            // Where it was is unknown: its unfinished sentences go out again from their start
-            playback.sentences.rewind(None);
-            playback.flushed = false;
-            playback.waiting_since = None;
-            playback.drain = Drain::new(Instant::now());
-            stopped = true;
-        }
-        if stopped || picked {
+        if on_it || picked {
             self.notice(t!("engineer.speaker_removed"));
         }
     }
@@ -1145,8 +1152,9 @@ impl Engineer {
 
     /// The gap: once the answer at the front has played all it has and waited on its pilot turn
     /// for more for [`GAP_AFTER`], the first complete answer behind it plays. The waiting one
-    /// stays next, and carries on once that's played. This is the one place an answer is moved
-    /// ahead in the line, and only complete ones are, so a gap never opens another.
+    /// stays next, giving up its stream, and carries on once that's played. This is the one
+    /// place an answer is moved ahead in the line, and only complete ones are, so a gap never
+    /// opens another, and only the front holds a stream.
     fn fill_gap(&mut self, now: Instant) {
         let Some(front) = self.line.front_mut() else {
             return;
@@ -1161,6 +1169,7 @@ impl Engineer {
         // An answer starts playing at the front, or here: a check that drops one gone stale
         // before it starts (scheduled requests) goes in both places
         if let Some(complete) = self.line.iter().position(|playback| playback.complete) {
+            self.line[0].close_stream();
             let playback = self.line.remove(complete).expect("just found");
             self.line.push_front(playback);
         }
@@ -1204,12 +1213,11 @@ impl Engineer {
         }
 
         if let Some(speech) = playback.sentences.pending() {
+            let skip = playback.sentences.skip();
             let played = match (&playback.stream, speaker) {
-                (Some(stream), _) => {
-                    stream.put_data_f32(&speech.samples[playback.sentences.skip()..])
-                }
-                // Nothing to skip: only a stream's position can be resumed from
-                (None, Some(speaker)) => speech.start(speaker).and_then(|stream| {
+                (Some(stream), _) => stream.put_data_f32(&speech.samples[skip..]),
+                // On whichever speaker is picked, from where it resumes
+                (None, Some(speaker)) => speech.start(speaker, skip).and_then(|stream| {
                     playback.stream = Some(stream);
                     Ok(())
                 }),
@@ -1894,11 +1902,18 @@ mod tests {
         assert!(!engineer.line[0].flushed);
         assert!(!engineer.line[0].waiting_on_its_turn());
 
-        // Caught up again, it leaves the radio to a complete answer
+        // Caught up again, it leaves the radio to a complete answer, and its stream with it
         engineer.line.push_back(Playback::tone());
         play_until(&mut engineer, |engineer| engineer.line[0].complete);
         assert!(engineer.line[1].writing);
-        assert!(engineer.line[1].flushed);
+        assert!(engineer.line[1].stream.is_none());
+
+        // Back at the front, its next sentence opens another
+        play_until(&mut engineer, |engineer| engineer.line.len() == 1);
+        send.send(Ok(sentence())).unwrap();
+        engineer.play(&config, Some(&device));
+        assert!(engineer.line[0].stream.is_some());
+        assert_eq!(engineer.line[0].sentences.submitted, 1);
     }
 
     #[test]
@@ -1913,20 +1928,6 @@ mod tests {
             let stream = playback.stream.as_ref().unwrap();
             stream.device_id().unwrap().id().0
         };
-
-        // A complete answer plays in the gap of one that said its first sentence
-        let mut gap = Playback::tone();
-        gap.stream = Some(stream());
-        let (_send, mut waiting) = being_written();
-        let said = stream();
-        said.put_data_f32(&piece().samples).unwrap();
-        waiting.stream = Some(said);
-        waiting.sentences.pieces.push_back(piece());
-        waiting.sentences.submitted();
-        waiting.flushed = true;
-        let (gap_on, waiting_on) = (on(&gap), on(&waiting));
-        let mut engineer = Engineer::new(reqwest::Client::new(), None);
-        engineer.line.extend([gap, waiting]);
         let notices = |engineer: &Engineer| {
             (engineer.chat.iter())
                 .filter(|e| {
@@ -1934,27 +1935,46 @@ mod tests {
                 })
                 .count()
         };
+        // An answer that said its first sentence and waits on its turn for more, with an answer
+        // ready behind it (on a stream of its own: SDL removes each logical device)
+        let line = || {
+            let (send, mut waiting) = being_written();
+            waiting.stream = Some(stream());
+            let mut behind = Playback::tone();
+            behind.stream = Some(stream());
+            let ids = (on(&waiting), on(&behind));
+            let mut engineer = Engineer::new(reqwest::Client::new(), None);
+            engineer.line.extend([waiting, behind]);
+            (send, engineer, ids)
+        };
 
-        // The waiting one's speaker is gone: it keeps its place, to say what it said again on
-        // whichever speaker is picked
+        // Nothing is playing on the speaker: the waiting answer keeps its place
+        let (_send, mut engineer, (waiting_on, _)) = line();
         engineer.speaker_removed(waiting_on, false);
         assert_eq!(engineer.line.len(), 2);
-        assert_eq!(notices(&engineer), 1);
-        let waiting = &engineer.line[1];
-        assert!(waiting.stream.is_none());
-        assert!(!waiting.flushed);
-        assert_eq!(waiting.sentences.submitted, 0);
-        assert_eq!(waiting.sentences.skip(), 0);
-        assert_eq!(
-            waiting.sentences.pending().unwrap().samples,
-            piece().samples
-        );
-
-        // The front's is gone: it stops
-        engineer.speaker_removed(gap_on, false);
-        assert_eq!(engineer.line.len(), 1);
-        assert_eq!(notices(&engineer), 2);
         assert!(engineer.line[0].writing);
+        assert!(engineer.line[0].stream.is_none());
+        assert_eq!(notices(&engineer), 1);
+
+        // The answer behind plays in its gap: whichever goes first, only that one stops
+        for gap_first in [true, false] {
+            let (_send, mut engineer, (waiting_on, gap_on)) = line();
+            let now = Instant::now();
+            engineer.fill_gap(now);
+            engineer.fill_gap(now + GAP_AFTER);
+            assert!(engineer.line[0].complete);
+            assert!(engineer.line[1].stream.is_none());
+            let order = match gap_first {
+                true => [gap_on, waiting_on],
+                false => [waiting_on, gap_on],
+            };
+            for which in order {
+                engineer.speaker_removed(which, false);
+            }
+            assert_eq!(engineer.line.len(), 1, "gap first: {gap_first}");
+            assert!(engineer.line[0].writing, "gap first: {gap_first}");
+            assert_eq!(notices(&engineer), 1, "gap first: {gap_first}");
+        }
     }
 
     #[test]
