@@ -89,6 +89,10 @@ pub enum NotListening {
 /// How many times in a row nothing can be understood before the pilot is told what to check.
 const MISHEARD_HINT: u32 = 3;
 
+/// The longest a released talk button holds scheduled turns back while what was said is heard:
+/// a transcription that never comes doesn't keep them from running.
+const HEARING_WAIT: Duration = Duration::from_secs(15);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Speaker {
     Pilot,
@@ -131,6 +135,10 @@ pub struct Engineer {
     spotter_held: bool,
     /// The talk button is held: the front answer waits, as for the spotter
     talking: bool,
+    /// When the talk button was let go, while what was said hasn't been heard: a question may be
+    /// on its way, which would drop a scheduled turn started now. Waited for no longer than
+    /// [`HEARING_WAIT`]
+    hearing: Option<Instant>,
     /// Times in a row nothing was understood on the radio
     misheard: u32,
     /// The pilot's requests for later. They outlive conversations: only a new weekend, the
@@ -162,7 +170,14 @@ pub struct Engineer {
     /// comes when the test sends it
     #[cfg(test)]
     synthesis: Option<Vec<Synthesis>>,
+    /// Makes the conversations started, when a test stands in for the model's provider
+    #[cfg(test)]
+    conversations: Option<Conversations>,
 }
+
+/// Makes a conversation with the tools given, standing in for the model's provider in a test.
+#[cfg(test)]
+type Conversations = Box<dyn Fn(Tools) -> Box<dyn Model> + Send>;
 
 /// A scheduled answer given to the stand-in for the synthesizer, in a test.
 #[cfg(test)]
@@ -596,6 +611,7 @@ impl Engineer {
             line: VecDeque::new(),
             spotter_held: false,
             talking: false,
+            hearing: None,
             misheard: 0,
             schedule: Schedule::new(),
             progress: None,
@@ -608,6 +624,8 @@ impl Engineer {
             clock: None,
             #[cfg(test)]
             synthesis: None,
+            #[cfg(test)]
+            conversations: None,
         }
     }
 
@@ -830,7 +848,13 @@ impl Engineer {
     /// Pauses the answer at the front of the line (and holds one about to start) while the
     /// talk button is held, as [`Self::hold`] does for the spotter, so it doesn't play over the
     /// pilot. It stays paused until both let go.
+    ///
+    /// Its release holds scheduled turns back until what was said is [heard](Self::hear), so one
+    /// doesn't start just to be dropped by the question.
     pub fn talk(&mut self, talking: bool) {
+        if self.talking && !talking {
+            self.hearing = Some(self.now());
+        }
         self.talking = talking;
         self.hold_front();
     }
@@ -946,6 +970,12 @@ impl Engineer {
         };
         let advance = self.schedule.advance(&progress, self.now());
         self.progress = Some(progress);
+        if advance.skipped_stale > 0 {
+            log::debug!(
+                "Skipped {} scheduled requests that went out of date before they were answered",
+                advance.skipped_stale
+            );
+        }
         if advance.cleared {
             // A new weekend: what was being answered or said is about the last one
             self.drop_scheduled();
@@ -1005,6 +1035,8 @@ impl Engineer {
         synth: &mut Synthesizer,
         heard: Heard,
     ) {
+        // Whatever it was: nothing else is on its way
+        self.hearing = None;
         match heard {
             Heard::Question {
                 text,
@@ -1208,7 +1240,14 @@ impl Engineer {
         released: Option<Instant>,
     ) {
         // A scheduled turn gives way, unnoticed: its requests stay due, for the next one once
-        // this question is answered. One that finished meanwhile counts: the conversation kept it
+        // this question is answered. One that finished meanwhile counts: the conversation kept it.
+        // One finishing between this check and the drop below can't be told from one dropped
+        // before it finished: the conversation keeps that exchange, but its answer and changes are
+        // lost with the task. The window is the instant between the reply coming in and the task
+        // ending, against a turn that takes seconds, and it costs little: the requests stay due
+        // and the next scheduled turn answers them again (every message lists what's pending, so
+        // the model sees which changes didn't apply), and the pilot never hears that one answer.
+        // Closing it would take waiting on this thread for the aborted task to end.
         if let Some(scheduled) = &mut self.scheduled
             && let Some(result) = scheduled.task.update(rt)
             && let Some(scheduled) = self.scheduled.take()
@@ -1421,11 +1460,19 @@ impl Engineer {
     /// to become the next (it's asked earlier in the same frame). Nothing here waits: the
     /// conversation is locked, the snapshot taken and the model asked in the turn's task.
     fn run_scheduled(&mut self, rt: &Handle, sim: Option<&mut Sim>, config: &Config) {
-        // A pilot holding the talk button is about to ask something, which would drop it
+        // A pilot holding the talk button is about to ask something, which would drop it, and
+        // one who let go may have: what they said is still being heard
         if self.turn.is_some() || self.scheduled.is_some() || self.talking {
             return;
         }
         let now = self.now();
+        if let Some(released) = self.hearing {
+            if now.saturating_duration_since(released) < HEARING_WAIT {
+                return;
+            }
+            // Lost: no question is coming
+            self.hearing = None;
+        }
         let Some(batch) = self.schedule.take_batch(now) else {
             return;
         };
@@ -1527,8 +1574,7 @@ impl Engineer {
             (batch.requests.iter()).map(|(id, instruction, ..)| (*id, instruction.as_str())),
         );
         // Before its own changes: a request it replaces keeps this answer waiting in its place
-        let progress = self.progress.clone().unwrap_or_default();
-        self.schedule.answered(&batch.fired, &progress);
+        self.schedule.answered(&batch.fired);
         // A one-shot's trigger isn't checked once it's answered
         self.sync_conditions();
         let silent = match reply.stop {
@@ -2031,6 +2077,26 @@ impl Engineer {
         });
     }
 
+    /// A new conversation with `model`, given `tools`.
+    fn conversation(
+        &self,
+        model: &ModelConfig,
+        corner_names: bool,
+        tools: Tools,
+    ) -> anyhow::Result<Box<dyn Model>> {
+        #[cfg(test)]
+        if let Some(make) = &self.conversations {
+            return Ok(make(tools));
+        }
+        provider::conversation(
+            model,
+            self.account.as_ref(),
+            system_prompt(&self.skill, corner_names),
+            tools,
+            self.client.clone(),
+        )
+    }
+
     fn start(
         &self,
         config: &Config,
@@ -2062,13 +2128,7 @@ impl Engineer {
             },
             ModelProvider::Claude | ModelProvider::Ollama | ModelProvider::OpenAi => None,
         };
-        let conversation = provider::conversation(
-            &model,
-            self.account.as_ref(),
-            system_prompt(&self.skill, corner_names),
-            tools,
-            self.client.clone(),
-        )?;
+        let conversation = self.conversation(&model, corner_names, tools)?;
 
         let db = pool.database().path().to_owned();
         log::info!("Engineer session started on {}", db.display());
@@ -3780,6 +3840,43 @@ mod tests {
             self.tick();
         }
 
+        /// Has the engineer start its new conversations as scripted ones, asked as the first one
+        /// is: each one's acts come through the sender the receiver returned gets (see
+        /// [`Self::next_conversation`]).
+        fn new_conversations(&mut self) -> std::sync::mpsc::Receiver<mpsc::UnboundedSender<Act>> {
+            let (made, conversations) = std::sync::mpsc::channel();
+            let asked = self.asked.clone();
+            self.engineer.conversations = Some(Box::new(move |tools| {
+                let (acts, script) = mpsc::unbounded_channel();
+                made.send(acts).unwrap();
+                Box::new(ScriptedModel {
+                    asked: asked.clone(),
+                    acts: script,
+                    steer: None,
+                    tools,
+                })
+            }));
+            conversations
+        }
+
+        /// Runs frames until the engineer starts a new conversation (see
+        /// [`Self::new_conversations`]): the test's acts go to it from then on.
+        fn next_conversation(
+            &mut self,
+            conversations: &std::sync::mpsc::Receiver<mpsc::UnboundedSender<Act>>,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(acts) = conversations.try_recv() {
+                    self.acts = acts;
+                    return;
+                }
+                assert!(Instant::now() < deadline, "never started a conversation");
+                std::thread::sleep(Duration::from_millis(1));
+                self.frame();
+            }
+        }
+
         /// Moves the schedule's wall clock on by `by`, without waiting for it.
         fn wait(&mut self, by: Duration) {
             *self.engineer.clock.as_mut().unwrap() += by;
@@ -4761,6 +4858,107 @@ mod tests {
         assert!(scripted.engineer.scheduled.is_none());
         assert_eq!(scripted.questions().len(), turns);
         scripted.engineer.talk(false);
+        scripted.hear(Heard::TooShort);
+        let message = scripted.scheduled_asked(turns);
+        assert!(message.contains(MARKER), "{message}");
+    }
+
+    #[test]
+    fn no_scheduled_turn_while_what_was_said_is_heard() {
+        // Whatever is heard, nothing else is on its way
+        let heard = |which| match which {
+            0 => Heard::TooShort,
+            1 => Heard::Nothing,
+            _ => Heard::Failed(anyhow::anyhow!("no audio")),
+        };
+        for which in 0..3 {
+            let mut scripted = Scripted::recorded();
+            scripted.falls_due();
+            let turns = scripted.questions().len();
+            scripted.engineer.talk(true);
+            scripted.engineer.talk(false);
+            // A question may be on its way, which would drop a turn started now
+            scripted.wait(schedule::GATHER);
+            for _ in 0..10 {
+                scripted.frame();
+            }
+            assert!(scripted.engineer.scheduled.is_none(), "{which}");
+            assert_eq!(scripted.questions().len(), turns, "{which}");
+            scripted.hear(heard(which));
+            let message = scripted.scheduled_asked(turns);
+            assert!(message.contains(MARKER), "{which}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_lost_transcription_holds_scheduled_turns_back_for_a_while() {
+        let mut scripted = Scripted::recorded();
+        scripted.falls_due();
+        let turns = scripted.questions().len();
+        scripted.engineer.talk(true);
+        scripted.engineer.talk(false);
+        // Nothing is ever heard
+        scripted.wait(HEARING_WAIT - Duration::from_millis(1));
+        for _ in 0..10 {
+            scripted.frame();
+        }
+        assert!(scripted.engineer.scheduled.is_none());
+        scripted.wait(Duration::from_millis(1));
+        let message = scripted.scheduled_asked(turns);
+        assert!(message.contains(MARKER), "{message}");
+    }
+
+    #[test]
+    fn requests_outlive_the_conversation() {
+        // Kept whatever ends the conversation within the weekend: the next scheduled turn runs on
+        // the new one
+        for how in ["signed out", "new model", "corner names"] {
+            let mut scripted = Scripted::recorded_with(r#"{"model": {"provider": "ollama"}}"#);
+            let made = scripted.new_conversations();
+            scripted.falls_due();
+            let old = scripted.engineer.session.as_ref().unwrap().state.clone();
+            match how {
+                "signed out" => {
+                    let session = scripted.engineer.session.as_mut().unwrap();
+                    session.user = Some("pilot".into());
+                    scripted.frame();
+                    assert!(scripted.engineer.session.is_none(), "{how}");
+                    assert!(scripted.noticed(t!("engineer.signed_out")), "{how}");
+                }
+                "new model" => {
+                    (scripted.config).update(|raw| raw.model.ollama.model.set("other".into()))
+                }
+                _ => scripted.config.update(|raw| raw.corner_names.set(true)),
+            }
+            assert_eq!(scripted.pending(), [RequestId(1)], "{how}");
+            let turns = scripted.questions().len();
+            scripted.wait(schedule::GATHER);
+            scripted.next_conversation(&made);
+            let message = scripted.scheduled_asked(turns);
+            assert!(message.contains(MARKER), "{how}: {message}");
+            let new = &scripted.engineer.session.as_ref().unwrap().state;
+            assert!(!Arc::ptr_eq(&old, new), "{how}");
+            scripted.finish_scheduled(Act::Say("Marker: it's set.".into()));
+            let fired = t!("engineer.scheduled", what = marker_fired());
+            assert!(scripted.noticed(&fired), "{how}");
+            assert!(scripted.pending().is_empty(), "{how}");
+        }
+    }
+
+    #[test]
+    fn scheduled_turn_starts_once_the_next_snapshots_are_in() {
+        let mut scripted = Scripted::recorded();
+        scripted.falls_due();
+        let turns = scripted.questions().len();
+        // The schedule's wall clock stands still: only snapshots move it on
+        for _ in 1..schedule::GATHER_SNAPSHOTS {
+            scripted.tick();
+            for _ in 0..10 {
+                scripted.frame();
+            }
+            assert!(scripted.engineer.scheduled.is_none());
+        }
+        scripted.tick();
         let message = scripted.scheduled_asked(turns);
         assert!(message.contains(MARKER), "{message}");
     }

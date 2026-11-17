@@ -378,9 +378,22 @@ fn thread(shared: &Shared, requests: &mpsc::Receiver<Request>) {
             continue;
         };
         match request {
+            // Nobody waits for its answer anymore (a dropped turn's lookup): the jobs after it don't
+            // wait for it either
+            Some(request) if request.reply.is_closed() => {
+                log::debug!("The engineer's data thread skipped a job nobody waits for");
+            }
             Some(request) => {
+                // Shared with a long query, which stops once nobody waits for it
+                let reply = Arc::new(Mutex::new(Some(request.reply)));
+                let abandoned = {
+                    let reply = reply.clone();
+                    move || lock(&reply).as_ref().is_none_or(|reply| reply.is_closed())
+                };
                 let result = match request.job {
-                    Job::Sql { query, limit } => data.sql(shared, &query, limit).map(Answer::Text),
+                    Job::Sql { query, limit } => {
+                        (data.sql(shared, &query, limit, abandoned)).map(Answer::Text)
+                    }
                     Job::Condition { query } => data.condition(shared, &query).map(Answer::Holds),
                     Job::Track => {
                         // Following the recording's newest epoch, for the session it's about
@@ -396,7 +409,9 @@ fn thread(shared: &Shared, requests: &mpsc::Receiver<Request>) {
                         .publish_now(shared)
                         .map(|()| Answer::Text(String::new())),
                 };
-                let _ = request.reply.send(result);
+                if let Some(reply) = lock(&reply).take() {
+                    let _ = reply.send(result);
+                }
             }
             None => {
                 match data.stream.tick(&data.conn, shared) {
@@ -497,11 +512,13 @@ impl Data {
         }
     }
 
+    /// Runs the model's `query`, stopped early once `abandoned` says nobody waits for its answer.
     fn sql(
         &mut self,
         shared: &Shared,
         query: &str,
         limit: Option<usize>,
+        abandoned: impl Fn() -> bool + Send + 'static,
     ) -> anyhow::Result<String> {
         let query = read_only(query)?;
         self.catch_up(shared);
@@ -519,7 +536,7 @@ impl Data {
             bail!("the recording moved on to another session: just retry");
         }
         let result = guarded(conn, || {
-            run_query(conn, &self.stream, query, limit, note.as_deref())
+            run_query(conn, &self.stream, query, limit, note.as_deref(), abandoned)
         });
         drop(snapshot);
         result
@@ -826,12 +843,15 @@ fn real_text(x: f64) -> String {
     }
 }
 
+/// Runs `query`, stopped once it's taken [`SQL_TIME`], or as soon as `abandoned` says nobody waits
+/// for its answer.
 fn run_query(
     conn: &Connection,
     stream: &Stream,
     query: &str,
     limit: Option<usize>,
     note: Option<&str>,
+    abandoned: impl Fn() -> bool + Send + 'static,
 ) -> anyhow::Result<String> {
     let limit = limit.unwrap_or(60).clamp(1, SQL_MAX_ROWS);
     let mut out = String::new();
@@ -864,9 +884,13 @@ fn run_query(
         bail!("only queries that read are allowed");
     }
 
-    // Stopped from inside SQLite: a runaway query would otherwise hold the connection
+    // Stopped from inside SQLite: a runaway query, or one nobody waits for, would otherwise hold
+    // the connection
     let deadline = Instant::now() + SQL_TIME;
-    conn.progress_handler(10_000, Some(move || Instant::now() > deadline))?;
+    conn.progress_handler(
+        10_000,
+        Some(move || abandoned() || Instant::now() > deadline),
+    )?;
     let result = (|| -> rusqlite::Result<()> {
         let names = stmt
             .column_names()
@@ -918,6 +942,9 @@ fn run_query(
         Err(rusqlite::Error::SqliteFailure(e, _))
             if e.code == rusqlite::ErrorCode::OperationInterrupted =>
         {
+            if Instant::now() <= deadline {
+                bail!("the query was stopped: nobody waits for its answer anymore");
+            }
             bail!(
                 "the query took longer than {} seconds and was stopped: scope it by id, or use the derived tables",
                 SQL_TIME.as_secs()
@@ -9866,6 +9893,41 @@ mod tests {
     /// The ids of the conditions a snapshot has a result for
     fn results(progress: &Progress) -> BTreeSet<ConditionId> {
         progress.conditions.keys().copied().collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_nobody_waits_for_is_not_run() {
+        let (_dir, engineer) = race();
+        // From here on, the thread publishes only the snapshots asked for
+        let seq = tick(&engineer).await.seq;
+        // A snapshot asked for by a turn that was dropped before the thread got to it
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        drop(answer);
+        let job = Job::Progress;
+        engineer.inner.data.send(Request { job, reply }).unwrap();
+        // Answered after it
+        query(&engineer, "SELECT 1").await;
+        assert_eq!(engineer.progress_seq(), Some(seq));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_query_stops_once_nobody_waits_for_it() {
+        let (_dir, engineer) = race();
+        tick(&engineer).await;
+        // A dropped turn's lookup, which would run until it's stopped
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let job = Job::Sql {
+            query: SLOW.into(),
+            limit: None,
+        };
+        engineer.inner.data.send(Request { job, reply }).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let dropped = Instant::now();
+        drop(answer);
+        // The next query doesn't wait for it
+        query(&engineer, "SELECT 1").await;
+        let waited = dropped.elapsed();
+        assert!(waited < SQL_TIME / 4, "{waited:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

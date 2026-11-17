@@ -49,11 +49,13 @@ const SMALL_REWIND_S: f64 = 1.0;
 /// The game clock and the laps the pilot completes, added up across sessions. Each observation
 /// adds how far the session clock and the lap count moved forward since the last one, only within
 /// one epoch: a new epoch, or a missing value, starts a new baseline instead of a jump, and a
-/// paused or rewound clock adds nothing.
+/// paused or rewound clock adds nothing. Laps count only past the most seen in the epoch, so a
+/// count that dips and recovers isn't counted twice.
 #[derive(Debug, Default)]
 pub(crate) struct Counters {
     epoch: Option<i64>,
     session_time_s: Option<f64>,
+    /// The most completed laps seen since the baseline
     laps_completed: Option<i64>,
     clock_s: f64,
     laps: u64,
@@ -68,6 +70,7 @@ impl Counters {
         laps_completed: Option<i64>,
     ) {
         let mut session_time_s = session_time_s;
+        let mut laps_completed = laps_completed;
         if epoch == self.epoch {
             if let (Some(last), Some(now)) = (self.session_time_s, session_time_s) {
                 if now > last {
@@ -78,10 +81,11 @@ impl Counters {
                     session_time_s = Some(last);
                 }
             }
-            if let (Some(last), Some(now)) = (self.laps_completed, laps_completed)
-                && now > last
-            {
-                self.laps += (now - last) as u64;
+            if let (Some(most), Some(now)) = (self.laps_completed, laps_completed) {
+                if now > most {
+                    self.laps += (now - most) as u64;
+                }
+                laps_completed = Some(now.max(most));
             }
         }
         self.epoch = epoch;
@@ -174,6 +178,16 @@ mod tests {
             counters.observe(Some(2), None, Some(laps));
         }
         assert_eq!(counters.laps(), 3);
+    }
+
+    #[test]
+    fn laps_dipping_and_recovering_count_once() {
+        // A scoring row with an older lap count, between two newer ones
+        let mut counters = Counters::default();
+        for laps in [3, 4, 3, 4, 5] {
+            counters.observe(Some(1), None, Some(laps));
+        }
+        assert_eq!(counters.laps(), 2);
     }
 
     #[test]

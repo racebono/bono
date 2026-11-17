@@ -11,9 +11,15 @@ use std::{
 
 pub mod tool;
 
-/// How long a scheduled turn waits after the first request falls due, to take in requests that
-/// fire together but are noticed a few checks apart
-pub const GATHER: Duration = Duration::from_secs(1);
+/// How many more progress snapshots a scheduled turn waits for after the one its first request
+/// fell due on, to take in requests that fire together but are noticed a few checks apart (a lap
+/// trigger and a condition at the line). Counted in snapshots, not seconds: they come about a
+/// second apart, and each is a check of every condition
+pub const GATHER_SNAPSHOTS: u64 = 2;
+
+/// The longest a scheduled turn waits for those snapshots, after the first request falls due: one
+/// stalled data thread doesn't hold up requests already due
+pub const GATHER: Duration = Duration::from_secs(3);
 
 /// Failed checks in a row that drop a condition's request
 pub const CONDITION_FAILURES: u32 = 5;
@@ -115,7 +121,7 @@ pub struct Batch {
     pub fired: Vec<Fired>,
 }
 
-/// What [`Schedule::apply`] did with a turn's changes
+/// What [`Schedule::apply_answering`] did with a turn's changes
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Applied {
     /// The requests added or replaced
@@ -154,6 +160,8 @@ pub struct Schedule {
     weekend: Option<Option<i64>>,
     /// The epoch of the last progress stepped through
     epoch: Option<Option<i64>>,
+    /// How many snapshots `advance` has stepped through, for the gathering window
+    steps: u64,
     /// The epoch current when the last boundary was seen: whatever fired in an earlier one is out
     /// of date
     boundary: Option<i64>,
@@ -205,17 +213,20 @@ struct Request {
 enum State {
     /// Waiting for its trigger, counted from `since`
     Armed { since: Progress },
-    /// Fired at `fired`, having counted from `since`, waiting for a scheduled turn
+    /// Fired at `fired`, having counted from `since`, waiting for a scheduled turn: noticed at
+    /// `at`, on the schedule's `step`th snapshot
     Due {
         since: Progress,
         fired: Progress,
         at: Instant,
+        step: u64,
     },
     /// Fired, in the scheduled turn that's out
     InBatch {
         since: Progress,
         fired: Progress,
         at: Instant,
+        step: u64,
     },
     /// It won't fire again, and some of its answers are still waiting to play or be dropped: it
     /// goes once they're resolved
@@ -387,8 +398,6 @@ fn reached(
     }
 }
 
-// Owned by the engineer, which a later task makes use it.
-#[allow(dead_code)]
 impl Schedule {
     pub fn new() -> Self {
         Self {
@@ -397,6 +406,7 @@ impl Schedule {
             next_condition: 1,
             weekend: None,
             epoch: None,
+            steps: 0,
             boundary: None,
             session_start: None,
             last_start: None,
@@ -406,20 +416,24 @@ impl Schedule {
         }
     }
 
+    /// Applies a finished pilot turn's changes, as [`Self::apply_answering`] does, answering
+    /// nothing.
+    #[cfg(test)]
+    pub fn apply(&mut self, changes: Vec<Change>, progress: &Progress) -> Applied {
+        self.apply_answering(changes, progress, &[])
+    }
+
     /// Applies a finished turn's changes, at `progress`. Adds made in another weekend than
     /// `progress`'s are dropped, and reported as such; cancels and replaces of requests that
     /// aren't there anymore change nothing, and are reported as missing.
     ///
     /// A session trigger made before a session start that `advance` saw while the turn ran fires
     /// for that start on the next `advance` (if it's of the type asked for).
-    pub fn apply(&mut self, changes: Vec<Change>, progress: &Progress) -> Applied {
-        self.apply_answering(changes, progress, &[])
-    }
-
-    /// Applies a finished turn's changes, as [`Self::apply`], for a scheduled turn that answered
-    /// `answered`. Its cancel of a request it answered ends the request, which never fires again,
-    /// but keeps it until those answers are resolved: it cancelled what came after them. Any other
-    /// cancel drops the request's answers on their way (see [`Self::is_stale`]).
+    ///
+    /// `answered`: what the turn answered, if it's a scheduled one (a pilot turn answers nothing).
+    /// Its cancel of a request it answered ends the request, which never fires again, but keeps it
+    /// until those answers are resolved: it cancelled what came after them. Any other cancel drops
+    /// the request's answers on their way (see [`Self::is_stale`]).
     pub fn apply_answering(
         &mut self,
         changes: Vec<Change>,
@@ -514,6 +528,7 @@ impl Schedule {
             cleared: self.follow_weekend(progress.weekend) || std::mem::take(&mut self.cleared),
             ..Default::default()
         };
+        self.steps += 1;
 
         let epoch_changed = !progress.new_epochs.is_empty()
             || self.epoch.is_some_and(|epoch| epoch != progress.epoch);
@@ -607,6 +622,7 @@ impl Schedule {
                         since,
                         fired: progress.clone(),
                         at: now,
+                        step: self.steps,
                     };
                 }
                 let State::Due { since, fired, .. } = &request.state else {
@@ -637,21 +653,21 @@ impl Schedule {
         advance
     }
 
-    /// The due requests for a scheduled turn, once `GATHER` has passed since the first fell due,
-    /// with no batch out and no retry pending
+    /// The due requests for a scheduled turn, with no batch out and no retry pending, once they've
+    /// gathered: `GATHER_SNAPSHOTS` more snapshots have been stepped through since the first fell
+    /// due, or `GATHER` has passed since without them
     pub fn take_batch(&mut self, now: Instant) -> Option<Batch> {
         if self.batch_out || self.retry_at.is_some_and(|retry| now < retry) {
             return None;
         }
-        let first = self
-            .requests
-            .iter()
-            .filter_map(|r| match r.state {
-                State::Due { at, .. } => Some(at),
-                _ => None,
-            })
-            .min()?;
-        if now.saturating_duration_since(first) < GATHER {
+        let due = (self.requests.iter()).filter_map(|r| match r.state {
+            State::Due { at, step, .. } => Some((at, step)),
+            _ => None,
+        });
+        let (at, step) = due.reduce(|(a, s), (b, t)| (a.min(b), s.min(t)))?;
+        let gathered = self.steps >= step.saturating_add(GATHER_SNAPSHOTS)
+            || now.saturating_duration_since(at) >= GATHER;
+        if !gathered {
             return None;
         }
 
@@ -660,7 +676,13 @@ impl Schedule {
             fired: Vec::new(),
         };
         for request in &mut self.requests {
-            let State::Due { since, fired, at } = &request.state else {
+            let State::Due {
+                since,
+                fired,
+                at,
+                step,
+            } = &request.state
+            else {
                 continue;
             };
             batch.requests.push((
@@ -677,6 +699,7 @@ impl Schedule {
                 since: since.clone(),
                 fired: fired.clone(),
                 at: *at,
+                step: *step,
             };
         }
         self.batch_out = true;
@@ -695,10 +718,10 @@ impl Schedule {
         self.retry_at = Some(now + RETRY_AFTER);
     }
 
-    /// The scheduled turn answered `fired`, at `progress`: repeating requests are armed again from
-    /// their firing (a timed one from its target), so a slow turn doesn't push the next one back,
-    /// and the others end. Either way each waits for its answer to be resolved.
-    pub fn answered(&mut self, fired: &[Fired], _progress: &Progress) {
+    /// The scheduled turn answered `fired`: repeating requests are armed again from their firing
+    /// (a timed one from its target), so a slow turn doesn't push the next one back, and the others
+    /// end. Either way each waits for its answer to be resolved.
+    pub fn answered(&mut self, fired: &[Fired]) {
         for request in &mut self.requests {
             let State::InBatch {
                 since, fired: at, ..
@@ -930,11 +953,18 @@ impl Schedule {
     /// Puts the batch's requests back to due
     fn return_batch(&mut self) {
         for request in &mut self.requests {
-            if let State::InBatch { since, fired, at } = &request.state {
+            if let State::InBatch {
+                since,
+                fired,
+                at,
+                step,
+            } = &request.state
+            {
                 request.state = State::Due {
                     since: since.clone(),
                     fired: fired.clone(),
                     at: *at,
+                    step: *step,
                 };
             }
         }
@@ -1152,7 +1182,7 @@ mod tests {
         /// A scheduled turn answers every due request, and its answer plays
         fn answer(&mut self) -> Vec<RequestId> {
             let batch = self.take();
-            self.schedule.answered(&batch.fired, &self.last);
+            self.schedule.answered(&batch.fired);
             self.schedule.resolved(&batch.fired);
             batch.fired.iter().map(|f| f.id).collect()
         }
@@ -1536,7 +1566,7 @@ mod tests {
         run.tick(laps(1));
         let batch = run.take();
         assert_eq!(batch.fired.iter().map(|f| f.id).collect::<Vec<_>>(), [lap]);
-        run.schedule.answered(&batch.fired, &run.last);
+        run.schedule.answered(&batch.fired);
         let waiting = batch.fired;
 
         run.tick(new_epoch(laps(1), 2, &["session"]));
@@ -1582,7 +1612,8 @@ mod tests {
     }
 
     #[test]
-    fn gather_window_batches_requests() {
+    fn gather_takes_in_a_request_noticed_on_the_next_snapshot() {
+        // A lap trigger and a timed one at the line, the timed one noticed a snapshot later
         let mut run = Run::new();
         let lap = run.add(request(
             Trigger::Laps { count: 1 },
@@ -1594,16 +1625,19 @@ mod tests {
             Repeat::Once,
             &at(0.0, 0),
         ));
+        // Snapshots come a little over a second apart
+        let apart = Duration::from_millis(1100);
         run.tick(at(5.0, 1));
         let first = run.now;
         assert!(run.schedule.take_batch(first).is_none());
-        run.tick_after(at(10.0, 1), Duration::from_millis(500));
-        assert!(
-            run.schedule
-                .take_batch(first + GATHER - Duration::from_millis(1))
-                .is_none()
-        );
-        let batch = run.schedule.take_batch(first + GATHER).expect("a batch");
+        // The frames before the next snapshot
+        assert!(run.schedule.take_batch(first + apart).is_none());
+        run.tick_after(at(10.0, 1), apart);
+        assert_eq!(run.due(), [lap, timed]);
+        assert!(run.schedule.take_batch(run.now).is_none());
+        run.tick_after(at(11.0, 1), apart);
+        assert!(run.now - first < GATHER);
+        let batch = run.schedule.take_batch(run.now).expect("a batch");
         let ids: Vec<_> = batch.fired.iter().map(|f| f.id).collect();
         assert_eq!(ids, [lap, timed]);
         let listed: Vec<_> = batch.requests.iter().map(|r| r.0).collect();
@@ -1616,6 +1650,44 @@ mod tests {
         );
         // No second batch while this one is out
         assert!(run.schedule.take_batch(first + GATHER * 10).is_none());
+    }
+
+    #[test]
+    fn gather_leaves_a_request_noticed_later_to_the_next_turn() {
+        let mut run = Run::new();
+        let lap = run.add(request(
+            Trigger::Laps { count: 1 },
+            Repeat::Once,
+            &at(0.0, 0),
+        ));
+        let timed = run.add(request(
+            Trigger::Time { seconds: 3.0 },
+            Repeat::Once,
+            &at(0.0, 0),
+        ));
+        run.tick(at(0.0, 1));
+        run.tick(at(1.0, 1));
+        run.tick(at(2.0, 1));
+        let batch = run.schedule.take_batch(run.now).expect("a batch");
+        assert_eq!(batch.fired.iter().map(|f| f.id).collect::<Vec<_>>(), [lap]);
+        // Noticed three snapshots after the first
+        run.tick(at(3.0, 1));
+        assert_eq!(run.due(), [timed]);
+        run.schedule.answered(&batch.fired);
+        assert_eq!(run.answer(), [timed]);
+    }
+
+    #[test]
+    fn gather_waits_no_longer_than_its_cap() {
+        // No snapshot comes after the one it fell due on: the data thread stalled
+        let mut run = Run::new();
+        let id = run.add(request(Trigger::Laps { count: 1 }, Repeat::Once, &laps(0)));
+        run.tick(laps(1));
+        let first = run.now;
+        let just_before = first + GATHER - Duration::from_millis(1);
+        assert!(run.schedule.take_batch(just_before).is_none());
+        let batch = run.schedule.take_batch(first + GATHER).expect("a batch");
+        assert_eq!(batch.fired.iter().map(|f| f.id).collect::<Vec<_>>(), [id]);
     }
 
     #[test]
@@ -1633,7 +1705,7 @@ mod tests {
         assert_eq!(run.due(), [second]);
         assert!(run.schedule.take_batch(run.now + GATHER).is_none());
 
-        run.schedule.answered(&batch.fired, &run.last);
+        run.schedule.answered(&batch.fired);
         assert_eq!(run.answer(), [second]);
     }
 
@@ -1766,7 +1838,7 @@ mod tests {
         let id = run.add(request(Trigger::Laps { count: 1 }, Repeat::Once, &laps(0)));
         run.tick(laps(1));
         let batch = run.take();
-        run.schedule.answered(&batch.fired, &run.last);
+        run.schedule.answered(&batch.fired);
         let applied = run
             .schedule
             .apply(vec![Change::Cancel(id)], &run.last.clone());
@@ -1906,7 +1978,7 @@ mod tests {
         run.add(new);
         run.tick(laps(1));
         let batch = run.take();
-        run.schedule.answered(&batch.fired, &run.last);
+        run.schedule.answered(&batch.fired);
         assert_eq!(run.schedule.len(), 0);
         assert_eq!(run.schedule.conditions().len(), 1);
         run.schedule.resolved(&batch.fired);
@@ -2038,7 +2110,7 @@ mod tests {
         ));
         run.tick(laps(2));
         let batch = run.take();
-        run.schedule.answered(&batch.fired, &run.last);
+        run.schedule.answered(&batch.fired);
         run.tick(laps(3));
         assert_eq!(run.schedule.len(), 0);
         assert!(run.schedule.pending_ids().is_empty());
@@ -2062,7 +2134,7 @@ mod tests {
             let id = run.add(made);
             run.tick(laps(1));
             let batch = run.take();
-            run.schedule.answered(&batch.fired, &run.last);
+            run.schedule.answered(&batch.fired);
             assert!(!run.schedule.is_stale(&batch.fired, &run.last));
             (id, batch.fired)
         };
@@ -2105,7 +2177,7 @@ mod tests {
             let id = run.add(lap());
             run.tick(laps(1));
             let batch = run.take();
-            run.schedule.answered(&batch.fired, &run.last);
+            run.schedule.answered(&batch.fired);
             (id, batch.fired)
         };
 
@@ -2151,7 +2223,7 @@ mod tests {
             run.tick(with(laps(0), trigger, ConditionState::False));
             run.tick(with(laps(0), trigger, ConditionState::True));
             let batch = run.take();
-            run.schedule.answered(&batch.fired, &run.last);
+            run.schedule.answered(&batch.fired);
             batch.fired
         };
 
@@ -2369,7 +2441,7 @@ mod tests {
         assert_eq!(run.schedule.pending_ids(), [once, lap]);
         run.tick(laps(1));
         let batch = run.take();
-        run.schedule.answered(&batch.fired, &run.last);
+        run.schedule.answered(&batch.fired);
         // The one-shot's answer is on its way: it's no longer pending
         assert_eq!(run.schedule.pending_ids(), [lap]);
         assert_eq!(run.schedule.len(), 1);
