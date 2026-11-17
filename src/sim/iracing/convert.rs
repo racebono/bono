@@ -3430,10 +3430,11 @@ mod tests {
 
     /// The first count of the laps done comes ahead of its car's line (timed at the line it's
     /// due at), and the car over the line first has its count come a little after its crossing,
-    /// past a moment after the first count: still the winner, the first over.
+    /// more than a moment after the first count (not after the first car's crossing, nor the
+    /// update that saw it): still the winner, the first over.
     #[test]
     fn the_first_over_wins_however_early_another_count_comes() {
-        // Car 0's count at 10 s, over at 10.875 s; car 1 over at 10.625 s, its count at 11.25 s
+        // Car 0's count at 10 s, over at 10.875 s; car 1 over at 10.625 s, its count at 11.5 s
         let end = race_of(
             &[
                 (9.75, STATE_RACING, [0.955, 0.86, 0.5], [2, 2, 1]),
@@ -3442,8 +3443,9 @@ mod tests {
                 (10.5, STATE_CHECKERED, [0.985, 0.98, 0.53], [3, 2, 1]),
                 (10.75, STATE_CHECKERED, [0.995, 0.02, 0.54], [3, 2, 1]),
                 (11.0, STATE_CHECKERED, [0.005, 0.06, 0.55], [3, 2, 1]),
-                (11.25, STATE_CHECKERED, [0.015, 0.1, 0.56], [3, 3, 1]),
+                (11.25, STATE_CHECKERED, [0.015, 0.1, 0.56], [3, 2, 1]),
                 (11.5, STATE_CHECKERED, [0.025, 0.14, 0.57], [3, 3, 1]),
+                (11.75, STATE_CHECKERED, [0.035, 0.18, 0.58], [3, 3, 1]),
             ],
             [0.0, 0.3, 50.0],
             Some(3),
