@@ -1,30 +1,25 @@
 //! RaceRoom Racing Experience, installed by Steam. It has no plugins: it publishes
 //! its state in a shared memory block (`$R3E`, see `r3e.h`), which a thread of ours reads while the
-//! game runs and records like LMU's plugin does (`bono_sim::recorder`), into a folder of the app's
-//! own. The recording is deleted once the game closes.
+//! game runs and records like LMU's plugin does (see `memory`).
 
 use crate::{
-    sim::{Simulator, SimulatorInfo, SimulatorSettings, probe::Probe, steam_install_dir},
-    sqlite::{Database, pool::Pool},
+    sim::{
+        Simulator, SimulatorInfo, SimulatorSettings,
+        memory::{Read, Recording, SCORING_EVERY, Source, Update},
+        steam_install_dir,
+    },
+    sqlite::pool::Pool,
 };
 use bono_sim::{
-    recorder::{DATABASE, Recorder, SETTINGS, try_remove_database},
     sql::EpochReason,
     sys::{bono_session_info, bono_standing, bono_telemetry},
 };
-use serde_json::{Map, Value};
 use std::{
-    collections::HashMap,
-    num::NonZeroUsize,
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, Instant},
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    time::Instant,
 };
 use sys::*;
-use tokio::sync::mpsc;
 
 const STEAM_APP_ID: u32 = 211500;
 
@@ -32,110 +27,14 @@ const STEAM_APP_ID: u32 = 211500;
 /// the sector times, `track_sector` 1 to 3).
 const SECTORS: usize = 3;
 
-const MAX_IDLE: NonZeroUsize = NonZeroUsize::new(2).unwrap();
-const MAX_OPEN: NonZeroUsize = NonZeroUsize::new(4).unwrap();
-
-/// How often the shared memory is read: the game updates it every frame.
-const POLL: Duration = Duration::from_millis(16);
-/// How often the session and the standings are recorded (LMU's scoring rate).
-const SCORING_EVERY: Duration = Duration::from_millis(200);
-/// How long before looking for the shared memory again, while the game hasn't made it yet.
-const RETRY: Duration = Duration::from_secs(1);
-
-/// Once the game closes, how long the database is left for the connections still reading it.
-const REMOVE_FOR: Duration = Duration::from_secs(60);
-const REMOVE_EVERY: Duration = Duration::from_secs(1);
-/// While the game runs, how often the recording's folder is looked at again: for the earlier
-/// recording to remove before reading, then for the new one.
-const LOOK_EVERY: Duration = Duration::from_secs(1);
-
-pub struct RaceRoom {
-    /// Where the recording goes
-    dir: PathBuf,
-    /// Reading the game while it runs
-    reader: Option<Reader>,
-    /// Set once the last stopped reader has let go of the recording
-    stopped: Option<Arc<AtomicBool>>,
-    /// Deleting the last stopped recording, cancelled when recording restarts so it can't delete
-    /// the new one
-    cleanup: Option<tokio::task::JoinHandle<()>>,
-    /// The database being recorded, read-only
-    live: Option<Pool>,
-    /// Hands changes to settings.json to the task writing them. Started with the first change
-    settings: Option<mpsc::UnboundedSender<SettingsChange>>,
-    /// Whether an earlier run's recording was removed (in the background), before reading
-    cleaned: Probe<bool>,
-    /// Whether the recording is there, as last looked up in the background since reading started
-    ready: Probe<bool>,
-}
+pub struct RaceRoom(Recording);
 
 impl RaceRoom {
     pub fn new() -> Self {
-        Self {
-            dir: std::env::temp_dir().join("bono").join("raceroom"),
-            reader: None,
-            stopped: None,
-            cleanup: None,
-            live: None,
-            settings: None,
-            cleaned: Probe::new(LOOK_EVERY),
-            ready: Probe::new(LOOK_EVERY),
-        }
+        Self(Recording::new(Self::NAME, "raceroom", || {
+            Box::new(Game::default())
+        }))
     }
-
-    /// Changes settings.json in the background, keeping what else is in it (the recorder acts on
-    /// any value that changes). The changes are made one at a time and in order, by a task started
-    /// with the first: two "clear" requests at once would otherwise both read the same count.
-    fn update_settings(
-        &mut self,
-        purpose: &'static str,
-        change: impl FnOnce(&mut Map<String, Value>) + Send + 'static,
-    ) {
-        let settings = self.settings.get_or_insert_with(|| {
-            let (send, mut recv) = mpsc::unbounded_channel::<SettingsChange>();
-            let dir = self.dir.clone();
-            tokio::spawn(async move {
-                while let Some(SettingsChange { change, purpose }) = recv.recv().await {
-                    if let Err(e) = write_settings(&dir, change).await {
-                        log::error!("Error {purpose}: {e}");
-                    }
-                }
-            });
-            send
-        });
-        // Only fails if the task panicked
-        let _ = settings.send(SettingsChange {
-            change: Box::new(change),
-            purpose,
-        });
-    }
-}
-
-/// A change to settings.json, and what it's for (for the log, if it fails).
-struct SettingsChange {
-    change: Box<dyn FnOnce(&mut Map<String, Value>) + Send>,
-    purpose: &'static str,
-}
-
-/// Changes settings.json in `dir`, keeping what else is in it.
-async fn write_settings(
-    dir: &Path,
-    change: impl FnOnce(&mut Map<String, Value>),
-) -> anyhow::Result<()> {
-    let path = dir.join(SETTINGS);
-    let mut settings = tokio::fs::read(&path)
-        .await
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Map<String, Value>>(&bytes).ok())
-        .unwrap_or_default();
-    change(&mut settings);
-
-    tokio::fs::create_dir_all(dir).await?;
-    // Written whole, so the recorder never reads half a file
-    let temp = path.with_extension("json.tmp");
-    tokio::fs::write(&temp, serde_json::to_vec_pretty(&settings)?).await?;
-    tokio::fs::rename(&temp, &path).await?;
-    Ok(())
 }
 
 impl SimulatorInfo for RaceRoom {
@@ -150,280 +49,53 @@ impl SimulatorInfo for RaceRoom {
 }
 
 impl Simulator for RaceRoom {
-    /// The database being recorded while the game runs (once it's on track), started on the first
-    /// call it does. Not running, the reader stops and the recording is deleted.
     fn database(&mut self, running: bool) -> Option<&Pool> {
-        if !running {
-            // Stopped without waiting: the recorder writes what it has and lets go of the file on
-            // its own thread, and nothing deletes or restarts the recording until it has.
-            if let Some(reader) = self.reader.take() {
-                self.stopped = Some(reader.stop());
-            }
-            self.cleaned.reset_when_idle();
-            self.ready.reset();
-            if let Some(pool) = self.live.take() {
-                let stopped = self.stopped.clone();
-                if let Some(old) = self.cleanup.replace(tokio::spawn(remove_when_closed(
-                    self.dir.clone(),
-                    pool,
-                    stopped,
-                ))) {
-                    old.abort();
-                }
-            }
-            return None;
-        }
-
-        if self.reader.is_none() {
-            // The previous reader is still finishing: try again on a later call
-            if self
-                .stopped
-                .as_ref()
-                .is_some_and(|done| !done.load(Ordering::Acquire))
-            {
-                return None;
-            }
-            self.stopped = None;
-            // Removed below instead, before the new recording starts. A removal already under way
-            // only stops at its next await, so try again on a later call until it has.
-            if let Some(cleanup) = &self.cleanup {
-                cleanup.abort();
-                if !cleanup.is_finished() {
-                    return None;
-                }
-                self.cleanup = None;
-            }
-            // Cleanup must complete before recording starts, and never runs on the UI thread.
-            let dir = self.dir.clone();
-            let cleaned = self.cleaned.get(move || {
-                try_remove_database(&dir)
-                    .inspect_err(|e| {
-                        log::warn!("Couldn't remove RaceRoom's previous recording: {e}")
-                    })
-                    .is_ok()
-            });
-            if cleaned != Some(&true) {
-                return None;
-            }
-            self.reader = Some(Reader::start(self.dir.clone()));
-        }
-
-        let path = self.dir.join(DATABASE);
-        let ready = self.ready.get({
-            let path = path.clone();
-            move || path.is_file()
-        });
-        if ready != Some(&true) {
-            return None;
-        }
-        Some(self.live.get_or_insert_with(|| {
-            Pool::new(Database::read_only(Arc::new(path)), MAX_IDLE, MAX_OPEN)
-        }))
+        self.0.database(running)
     }
 
-    /// The recorder reads settings.json when it starts and whenever it changes.
     fn apply(&mut self, settings: &SimulatorSettings) {
-        let frequency = settings.opponent_frequency.get();
-        self.update_settings(
-            "passing the recording settings to RaceRoom's recorder",
-            move |json| {
-                json.insert("opponent_frequency".into(), frequency.into());
-            },
-        );
+        self.0.apply(settings);
     }
 
-    /// The recorder clears its data when the "clear" count in settings.json changes.
     fn clear(&mut self) {
-        self.update_settings("asking RaceRoom's recorder to clear its data", |json| {
-            let clear = json.get("clear").and_then(Value::as_i64).unwrap_or(0);
-            json.insert("clear".into(), (clear + 1).into());
-        });
+        self.0.clear();
     }
 }
 
-/// Deletes the database in `dir` once nothing has it open, after the reader that recorded it has
-/// stopped (`stopped`).
-async fn remove_when_closed(dir: PathBuf, pool: Pool, stopped: Option<Arc<AtomicBool>>) {
-    drop(pool);
-    if let Some(stopped) = stopped {
-        while !stopped.load(Ordering::Acquire) {
-            tokio::time::sleep(REMOVE_EVERY).await;
+/// Reading the game's shared memory, on the reader thread.
+#[derive(Default)]
+struct Game {
+    memory: Option<SharedMemory>,
+    converter: Converter,
+    warned_version: bool,
+}
+
+impl Source for Game {
+    fn read(&mut self, now: Instant) -> Read {
+        if self.memory.is_none() {
+            self.memory = SharedMemory::open();
         }
-    }
-
-    let mut waited = Duration::ZERO;
-    loop {
-        tokio::time::sleep(REMOVE_EVERY).await;
-        waited += REMOVE_EVERY;
-        match try_remove_database(&dir) {
-            Ok(()) => return,
-            Err(e) if waited >= REMOVE_FOR => {
-                log::warn!(
-                    "Couldn't remove RaceRoom's recording in {} (is another program reading \
-                     it?): {e}. It's replaced the next time the game records",
-                    dir.display()
-                );
-                return;
-            }
-            Err(_) => {}
-        }
-    }
-}
-
-/// The thread reading the game into the recorder, told to stop when dropped. Never joined: it
-/// can be sleeping for up to [`RETRY`] and then closing the recorder, so callers on the UI thread
-/// watch [`Reader::stop`]'s flag instead.
-struct Reader {
-    stop: Arc<AtomicBool>,
-    /// Set by the thread once it has returned and dropped its recorder (or never started)
-    done: Arc<AtomicBool>,
-}
-
-impl Reader {
-    fn start(dir: PathBuf) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let done = Arc::new(AtomicBool::new(false));
-        let spawned = std::thread::Builder::new()
-            .name("bono raceroom".into())
-            .spawn({
-                let stop = stop.clone();
-                let done = SetOnDrop(done.clone());
-                move || {
-                    let _done = done;
-                    read(&dir, &stop);
-                }
-            });
-        if let Err(e) = spawned {
-            log::error!("Error starting RaceRoom's reader: {e}");
-            done.store(true, Ordering::Release);
-        }
-        Self { stop, done }
-    }
-
-    /// Tells the thread to stop without waiting, returning the flag set once it has.
-    fn stop(self) -> Arc<AtomicBool> {
-        self.done.clone()
-    }
-}
-
-impl Drop for Reader {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
-}
-
-/// Sets the flag when dropped, also when the thread panics.
-struct SetOnDrop(Arc<AtomicBool>);
-
-impl Drop for SetOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
-    }
-}
-
-/// Reads the shared memory until `stop`, recording what's new.
-fn read(dir: &Path, stop: &AtomicBool) {
-    let mut memory = None::<SharedMemory>;
-    let mut recorder = None::<Recorder>;
-    let mut converter = Converter::default();
-    let mut warned_version = false;
-    let mut retry_at = Instant::now();
-    let mut retry_delay = RETRY;
-    let mut warned_recorder = false;
-    let mut healthy_since = None::<Instant>;
-
-    while !stop.load(Ordering::Relaxed) {
-        if memory.is_none() {
-            memory = SharedMemory::open();
-        }
-        let Some(shared) = &memory else {
-            std::thread::sleep(RETRY);
-            continue;
+        let Some(shared) = &self.memory else {
+            return Read::Unavailable;
         };
 
         let snapshot = shared.read();
         if snapshot.version_major != R3E_VERSION_MAJOR {
-            if !warned_version {
+            if !self.warned_version {
                 log::warn!(
                     "RaceRoom's shared memory is version {}.{}, not {R3E_VERSION_MAJOR}: not \
                      recording it",
                     { snapshot.version_major },
                     { snapshot.version_minor }
                 );
-                warned_version = true;
+                self.warned_version = true;
             }
-            std::thread::sleep(RETRY);
-            continue;
+            return Read::Unavailable;
         }
 
-        let now = Instant::now();
-        if recorder.as_ref().is_some_and(Recorder::failed) && healthy_since.take().is_some() {
-            retry_at = now + retry_delay;
-            retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
-            if !warned_recorder {
-                log::error!("Recording RaceRoom stopped on an error, retrying with backoff");
-                warned_recorder = true;
-            }
-        }
-        if now < retry_at {
-            std::thread::sleep(POLL);
-            continue;
-        }
-
-        let Some(update) = converter.convert(&snapshot, now) else {
-            std::thread::sleep(POLL);
-            continue;
-        };
-
-        // Only once there's something to record, so menus leave no empty database.
-        // A failed writer resumes the same recording, preserving earlier sessions.
-        if recorder.as_ref().is_none_or(Recorder::failed) {
-            let result = match &mut recorder {
-                Some(recorder) => recorder.restart(None),
-                None => Recorder::new(dir, None).map(|new| recorder = Some(new)),
-            };
-            if let Err(e) = result {
-                if !warned_recorder {
-                    log::error!("Error starting to record RaceRoom: {e}");
-                    warned_recorder = true;
-                }
-                retry_at = now + retry_delay;
-                retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
-                std::thread::sleep(POLL);
-                continue;
-            }
-            healthy_since = Some(now);
-        }
-        // Opening a writer thread isn't success yet: only reset after it stays alive.
-        if healthy_since.is_some_and(|since| now.duration_since(since) >= Duration::from_secs(60)) {
-            retry_delay = RETRY;
-            warned_recorder = false;
-        }
-        if let Some(recorder) = &recorder {
-            record(recorder, update);
-        }
-        std::thread::sleep(POLL);
-    }
-}
-
-/// Hands an update to the recorder.
-fn record(recorder: &Recorder, update: Update) {
-    // Another event (track, layout): what was recorded is about something else
-    if update.new_event {
-        recorder.clear();
-    } else if let Some(reason) = update.new_epoch {
-        recorder.begin_epoch(reason);
-    }
-    // Scoring first: it says which car is the player's, which the telemetry needs
-    if let Some((session, standings)) = update.scoring {
-        recorder.push_scoring(session, standings);
-    }
-    for telemetry in &update.telemetry {
-        let vehicle = telemetry.vehicle_id.get().unwrap_or(-1);
-        let time = telemetry.session_time.get().unwrap_or(0.0);
-        let speed = telemetry.speed.get().unwrap_or(0.0);
-        if recorder.wants_telemetry(vehicle, time, speed) {
-            recorder.push_telemetry(telemetry);
+        match self.converter.convert(&snapshot, now) {
+            Some(update) => Read::Update(update),
+            None => Read::Idle,
         }
     }
 }
@@ -485,19 +157,6 @@ impl Drop for SharedMemory {
             CloseHandle(self.handle);
         }
     }
-}
-
-/// One read of the game, for the recorder.
-struct Update {
-    telemetry: Vec<bono_telemetry>,
-    /// Every `SCORING_EVERY`
-    scoring: Option<(bono_session_info, Vec<bono_standing>)>,
-    /// The track or layout changed since the last update
-    new_event: bool,
-    /// The timeline broke since the last update, within the same event: another session, the
-    /// clock going back (a restart), or a replay that didn't end where the live session left off.
-    /// Not set with `new_event`, which starts afresh anyway
-    new_epoch: Option<EpochReason>,
 }
 
 /// Turns reads of the game into the recorder's updates (LMU's units and conventions).
@@ -669,6 +328,7 @@ impl Converter {
         let vehicle_info = shared.vehicle_info;
         let player_slot = vehicle_info.slot_id;
 
+        let neighbours = track_neighbours(drivers);
         let mut telemetry = Vec::with_capacity(drivers.len());
         for driver in drivers {
             let info = driver.driver_info;
@@ -692,6 +352,11 @@ impl Converter {
             out.lap_invalidated = invalid.into();
             out.gap_to_place_ahead = seconds(driver.time_delta_front).into();
             out.gap_to_place_behind = seconds(driver.time_delta_behind).into();
+            // The game gives no gaps on track: only which cars are either side
+            if let Some((ahead, behind)) = neighbours.get(&slot) {
+                out.car_ahead_id = Some(*ahead as i64).into();
+                out.car_behind_id = Some(*behind as i64).into();
+            }
 
             let position = driver.position;
             let (x, y, z) = (position.x as f64, position.y as f64, position.z as f64);
@@ -756,6 +421,52 @@ impl Converter {
             new_epoch,
         })
     }
+}
+
+/// The cars next ahead and behind each car on track, by slot, going round the lap by distance. On
+/// track is out of the pit lane, at a known distance, and still on track or finished by the game's
+/// finish status (not out of the race, nor still to start). Only with two or more cars on track,
+/// and none when a slot is there twice (a read mixing two orders of the cars): which row is where
+/// the car is isn't known.
+fn track_neighbours(drivers: &[r3e_driver_data]) -> HashMap<i32, (i32, i32)> {
+    let mut slots = HashSet::new();
+    if !drivers
+        .iter()
+        .all(|driver| slots.insert(driver.driver_info.slot_id))
+    {
+        return HashMap::new();
+    }
+    let mut on_track: Vec<_> = drivers
+        .iter()
+        .filter(|driver| flag(driver.in_pitlane) == Some(false))
+        .filter(|driver| {
+            matches!(
+                driver.finish_status,
+                R3E_FINISH_STATUS_NONE | R3E_FINISH_STATUS_FINISHED
+            )
+        })
+        .filter_map(|driver| {
+            Some((
+                non_negative(driver.lap_distance)?,
+                driver.driver_info.slot_id,
+            ))
+        })
+        .collect();
+    on_track.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let n = on_track.len();
+    if n < 2 {
+        return HashMap::new();
+    }
+    on_track
+        .iter()
+        .enumerate()
+        .map(|(k, (_, slot))| {
+            (
+                *slot,
+                (on_track[(k + 1) % n].1, on_track[(k + n - 1) % n].1),
+            )
+        })
+        .collect()
 }
 
 /// What only the player's car has: its physics, inputs, engine, tires and settings.
@@ -1422,180 +1133,9 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::num::NonZeroU32;
-
-    async fn wait_for_reader(sim: &mut RaceRoom) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while sim.reader.is_none() {
-                sim.database(true);
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("reader never started after cleanup");
-    }
-
-    #[tokio::test]
-    async fn settings_changes_are_written_in_order_keeping_the_rest() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(SETTINGS), r#"{"other": true, "clear": 3}"#).unwrap();
-        let mut sim = RaceRoom::new();
-        sim.dir = dir.path().to_path_buf();
-
-        sim.clear();
-        sim.apply(&SimulatorSettings {
-            opponent_frequency: NonZeroU32::new(7).unwrap(),
-        });
-        sim.clear();
-        // Changes run in order, so this one runs once the others are written
-        let (done, wait) = tokio::sync::oneshot::channel();
-        sim.update_settings("test", move |_| {
-            let _ = done.send(());
-        });
-        wait.await.unwrap();
-
-        let json: Map<String, Value> =
-            serde_json::from_slice(&std::fs::read(dir.path().join(SETTINGS)).unwrap()).unwrap();
-        assert_eq!(json["clear"], 5);
-        assert_eq!(json["other"], true);
-        assert_eq!(json["opponent_frequency"], 7);
-    }
-
-    #[tokio::test]
-    async fn removes_previous_recording_before_starting_reader() {
-        let dir = tempfile::tempdir().unwrap();
-        for suffix in ["", "-wal", "-shm"] {
-            std::fs::write(dir.path().join(format!("{DATABASE}{suffix}")), "old run").unwrap();
-        }
-        let mut sim = RaceRoom::new();
-        sim.dir = dir.path().to_path_buf();
-
-        // Removed in the background: nothing's served meanwhile
-        assert!(sim.database(true).is_none());
-        assert!(sim.reader.is_none());
-        while sim.reader.is_none() {
-            assert!(sim.database(true).is_none());
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(sim.live.is_none());
-        for suffix in ["", "-wal", "-shm"] {
-            assert!(!dir.path().join(format!("{DATABASE}{suffix}")).exists());
-        }
-    }
-
-    #[tokio::test]
-    async fn does_not_start_reader_when_previous_recording_cannot_be_removed() {
-        let dir = tempfile::tempdir().unwrap();
-        // A directory at the database path makes removal fail without relying on file locks.
-        std::fs::create_dir(dir.path().join(DATABASE)).unwrap();
-        let mut sim = RaceRoom::new();
-        sim.dir = dir.path().to_path_buf();
-
-        for _ in 0..20 {
-            assert!(sim.database(true).is_none());
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(sim.reader.is_none());
-        assert!(sim.live.is_none());
-    }
-
-    /// A reader whose thread is still finishing until `done` is set.
-    fn finishing_reader() -> (Reader, Arc<AtomicBool>) {
-        let done = Arc::new(AtomicBool::new(false));
-        let reader = Reader {
-            stop: Arc::new(AtomicBool::new(false)),
-            done: done.clone(),
-        };
-        (reader, done)
-    }
-
-    #[tokio::test]
-    async fn stopping_tells_the_reader_without_waiting_and_restarts_once_it_has_stopped() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut sim = RaceRoom::new();
-        sim.dir = dir.path().to_path_buf();
-        let (reader, done) = finishing_reader();
-        let stop = reader.stop.clone();
-        sim.reader = Some(reader);
-
-        // Returns while the thread is still finishing
-        assert!(sim.database(false).is_none());
-        assert!(stop.load(Ordering::Relaxed));
-        assert!(sim.reader.is_none());
-
-        // The old recorder may still have the file: it isn't removed nor recorded over yet
-        std::fs::write(dir.path().join(DATABASE), "old run").unwrap();
-        assert!(sim.database(true).is_none());
-        assert!(sim.reader.is_none());
-        assert!(dir.path().join(DATABASE).exists());
-
-        done.store(true, Ordering::Release);
-        assert!(sim.database(true).is_none());
-        wait_for_reader(&mut sim).await;
-        assert!(sim.reader.is_some());
-        assert!(sim.stopped.is_none());
-        assert!(!dir.path().join(DATABASE).exists());
-        sim.database(false);
-    }
-
-    #[test]
-    fn a_stopped_reader_flags_once_its_thread_returns() {
-        let dir = tempfile::tempdir().unwrap();
-        let reader = Reader::start(dir.path().to_path_buf());
-        let done = reader.stop();
-        let start = Instant::now();
-        while !done.load(Ordering::Acquire) {
-            assert!(start.elapsed() < RETRY * 5, "reader didn't stop");
-            std::thread::yield_now();
-        }
-    }
-
-    #[tokio::test]
-    async fn restarting_cancels_the_cleanup_of_the_last_recording() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut sim = RaceRoom::new();
-        sim.dir = dir.path().to_path_buf();
-        let cleanup = tokio::spawn(std::future::pending());
-        let aborted = cleanup.abort_handle();
-        sim.cleanup = Some(cleanup);
-
-        // Not started until the cleanup has actually stopped
-        assert!(sim.database(true).is_none());
-        assert!(sim.reader.is_none());
-        while !aborted.is_finished() {
-            tokio::task::yield_now().await;
-        }
-        assert!(sim.database(true).is_none());
-        assert!(sim.cleanup.is_none());
-        wait_for_reader(&mut sim).await;
-        assert!(sim.reader.is_some());
-        sim.database(false);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn removes_the_recording_only_after_the_reader_stopped() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(DATABASE);
-        std::fs::write(&path, "recording").unwrap();
-        let pool = Pool::new(
-            Database::read_only(Arc::new(path.clone())),
-            MAX_IDLE,
-            MAX_OPEN,
-        );
-        let done = Arc::new(AtomicBool::new(false));
-        let task = tokio::spawn(remove_when_closed(
-            dir.path().to_path_buf(),
-            pool,
-            Some(done.clone()),
-        ));
-
-        tokio::time::sleep(REMOVE_EVERY * 5).await;
-        assert!(path.exists());
-
-        done.store(true, Ordering::Release);
-        task.await.unwrap();
-        assert!(!path.exists());
-    }
+    use crate::sim::memory::record;
+    use bono_sim::recorder::{DATABASE, Recorder};
+    use std::time::Duration;
 
     fn name(s: &str) -> [u8; 64] {
         let mut out = [0u8; 64];
@@ -2420,6 +1960,84 @@ mod tests {
         let (session, _) = update.scoring.unwrap();
         assert_eq!(session.pit_speed_limit.get(), None);
         assert_eq!(session.max_incident_points.get(), None);
+    }
+
+    /// The player (7) and slot 3 with three more cars: slot 9 on track and finished, slot 11 in
+    /// the pit lane and slot 12 out of the race, both beside the player.
+    fn field(time: f64) -> Box<r3e_shared> {
+        let mut game = shared(time, 0.0);
+        game.all_drivers_data_1[0].lap_distance = 6900.0;
+        game.all_drivers_data_1[1].lap_distance = 100.0;
+        let mut finished = driver(9, "Mia Novak", 3, 0.0);
+        finished.lap_distance = 3000.0;
+        finished.finish_status = R3E_FINISH_STATUS_FINISHED;
+        let mut pitting = driver(11, "Jon Berg", 4, 0.0);
+        pitting.lap_distance = 90.0;
+        pitting.in_pitlane = 1;
+        let mut retired = driver(12, "Eva Lind", 5, 0.0);
+        retired.lap_distance = 110.0;
+        retired.finish_status = R3E_FINISH_STATUS_DNF;
+        game.all_drivers_data_1[2] = finished;
+        game.all_drivers_data_1[3] = pitting;
+        game.all_drivers_data_1[4] = retired;
+        game.num_cars = 5;
+        game
+    }
+
+    fn either_side(update: &Update, slot: i64) -> (Option<i64>, Option<i64>) {
+        let car = update
+            .telemetry
+            .iter()
+            .find(|t| t.vehicle_id.get() == Some(slot))
+            .unwrap();
+        // The game gives no gaps on track
+        assert_eq!(car.gap_to_car_ahead.get(), None);
+        assert_eq!(car.gap_to_car_behind.get(), None);
+        (car.car_ahead_id.get(), car.car_behind_id.get())
+    }
+
+    #[test]
+    fn names_the_cars_either_side_on_track() {
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        let update = converter.convert(&field(500.0), start).unwrap();
+        // Round the lap: 7 at 100 m, 9 at 3000 m, 3 at 6900 m, and 7 again over the line
+        assert_eq!(either_side(&update, 7), (Some(9), Some(3)));
+        assert_eq!(either_side(&update, 9), (Some(3), Some(7)));
+        assert_eq!(either_side(&update, 3), (Some(7), Some(9)));
+        // Not on track: neither has cars either side, nor is either side of another
+        assert_eq!(either_side(&update, 11), (None, None));
+        assert_eq!(either_side(&update, 12), (None, None));
+
+        // Two on track: the other car is either side
+        let mut game = field(500.02);
+        game.all_drivers_data_1[2].finish_status = R3E_FINISH_STATUS_DNS;
+        let update = converter
+            .convert(&game, start + Duration::from_millis(20))
+            .unwrap();
+        assert_eq!(either_side(&update, 7), (Some(3), Some(3)));
+        assert_eq!(either_side(&update, 9), (None, None));
+
+        // Not known to be out of the pit lane isn't on track: the player alone, nobody either side
+        let mut game = field(500.04);
+        game.all_drivers_data_1[0].in_pitlane = -1;
+        game.all_drivers_data_1[2].finish_status = R3E_FINISH_STATUS_DNS;
+        let update = converter
+            .convert(&game, start + Duration::from_millis(40))
+            .unwrap();
+        assert_eq!(either_side(&update, 7), (None, None));
+        assert_eq!(either_side(&update, 3), (None, None));
+
+        // A read with a slot twice (the cars reordered as it was read): nobody either side
+        let mut game = field(500.06);
+        let mut again = game.all_drivers_data_1[0];
+        again.lap_distance = 5000.0;
+        game.all_drivers_data_1[3] = again;
+        let update = converter
+            .convert(&game, start + Duration::from_millis(60))
+            .unwrap();
+        assert_eq!(either_side(&update, 7), (None, None));
+        assert_eq!(either_side(&update, 9), (None, None));
     }
 
     #[test]

@@ -30,20 +30,22 @@
     X(f64, time_since_last_update)                                                                       \
     X(i64, lap)                                                                                          \
     X(f64, lap_start_time)                  /* session time the current lap started */                   \
-    X(f64, lap_distance)                    /* metres from the start/finish line (LMU: estimated, see the plugin) */ \
+    X(f64, lap_distance)                    /* metres from the start/finish line (LMU: estimated, see the plugin; iRacing: its lap fraction times the track's length) */ \
     X(i64, sector)                          /* zero-based */                                             \
     X(boolean, in_pit_lane)                                                                              \
     X(boolean, lap_invalidated)                                                                          \
     X(f64, delta_best)                      /* seconds against the best lap */                           \
-    X(f64, gap_to_car_ahead)                /* seconds, on track */                                      \
+    X(f64, gap_to_car_ahead)                /* seconds, on track (RaceRoom: none) */                     \
     X(f64, gap_to_car_behind)                                                                            \
+    X(i64, car_ahead_id) /* vehicle_id the gap ahead on track is to (or NULL), for cars on track with another. RaceRoom: the next car round the lap by lap_distance, though it has no gap; LMU: NULL, its SDK doesn't say which car its gap is to */ \
+    X(i64, car_behind_id)                                                                                \
     X(f64, gap_to_place_ahead)              /* seconds, in the standings */                              \
     X(f64, gap_to_place_behind)                                                                          \
     /* Position and motion */                                                                            \
     X(f64, position_x)                                                                                   \
     X(f64, position_y)                                                                                   \
     X(f64, position_z)                                                                                   \
-    X(f64, heading) /* radians the car body points: 0 along world -z, + turning right; see the schema guide for opponents */ \
+    X(f64, heading) /* radians the car body points: 0 along world -z, + turning right; see the schema guide for opponents. iRacing: a compass heading, 0 north */ \
     X(f64, course) /* radians of the direction of travel, same convention; NULL below 1 m/s */ \
     X(i64, cars_left) /* player: cars alongside on the left as the simulator reports them, 0-2; NULL when it doesn't (the spotter works it out from positions) */ \
     X(i64, cars_right) /* the same on the right; set both or neither */ \
@@ -55,7 +57,7 @@
     X(f64, velocity_vertical)                                                                            \
     X(f64, acceleration_longitudinal)                                                                    \
     X(f64, acceleration_lateral)                                                                         \
-    X(f64, acceleration_vertical)                                                                        \
+    X(f64, acceleration_vertical)           /* iRacing: the three including gravity */                   \
     X(f64, pitch_rate)                                                                                   \
     X(f64, yaw_rate)                                                                                     \
     X(f64, roll_rate)                                                                                    \
@@ -71,7 +73,7 @@
     X(f64, brake_filtered)                                                                               \
     X(f64, steering_filtered)                                                                            \
     X(f64, clutch_filtered)                                                                              \
-    X(f64, steering_shaft_torque)           /* Nm */                                                     \
+    X(f64, steering_shaft_torque)           /* Nm (iRacing: + towards the right) */                      \
     /* Powertrain */                                                                                     \
     X(i64, gear)                            /* -1 reverse, 0 neutral */                                  \
     X(f64, engine_rpm)                                                                                   \
@@ -135,7 +137,7 @@
     X(boolean, headlights)                                                                               \
     X(i64, wipers)                                                                                       \
     X(i64, scheduled_pit_stops)                                                                          \
-    X(f64, steering_wheel_range) /* physical; RaceRoom: degrees, full left to full right; LMU: unit and span not documented */ \
+    X(f64, steering_wheel_range) /* physical; RaceRoom: degrees, full left to full right; LMU: unit and span not documented; iRacing: degrees, taken for lock to lock (its span isn't documented) */ \
     X(f64, engine_max_rpm) /* rev limit, not the best shift point */ \
     X(i64, max_gears) /* forward gears */ \
     /* The highest value of each control, which does not prove every step differs */ \
@@ -152,15 +154,15 @@
     X(i64, drs_activations_left) /* this lap; NULL when unlimited or unknown */ \
     X(boolean, drs_activations_unlimited) \
     X(i64, drs_activations_total) \
-    X(f64, incident_points) /* points against the limit, can be fractional. RaceRoom: its incident points. LMU: track-limit points, as it has no collision penalties */ \
+    X(f64, incident_points) /* points against the limit, can be fractional. RaceRoom: its incident points. LMU: track-limit points, as it has no collision penalties. iRacing: the team's incident count (the player's car: else the driver's) */ \
     X(boolean, push_to_pass_equipped) \
     X(boolean, push_to_pass_charged) /* NULL on cars without a charge cycle; false while charging */ \
-    X(boolean, push_to_pass_engaged) \
-    X(i64, push_to_pass_activations_left) /* NULL when unlimited or unknown */ \
+    X(boolean, push_to_pass_engaged) /* iRacing: every car */ \
+    X(i64, push_to_pass_activations_left) /* NULL when unlimited or unknown. iRacing: every car, in races, once it's shown it has push to pass */ \
     X(i64, push_to_pass_activations_total) \
     /* Fuel */                                                                                           \
     X(f64, fuel_capacity)                   /* liters */                                                 \
-    X(f64, fuel_per_lap)                    /* liters, the simulator's own estimate */                   \
+    X(f64, fuel_per_lap)                    /* liters, the simulator's own estimate (iRacing: Bono's) */ \
     X(f64, virtual_energy_per_lap)          /* fraction of a full tank, the simulator's estimate */      \
     /* Chassis and aerodynamics */                                                                       \
     X(i64, rear_flap_status)                /* 0 not allowed, 1 detected but not allowed yet, 2 allowed */ \
@@ -210,8 +212,9 @@
     X(f64, sliding_fraction)                /* fraction of the contact patch that is sliding */         \
     X(i64, surface_type)                    /* 0 dry (RaceRoom: paved, wetness unknown), 1 wet, 2 grass, 3 dirt, 4 gravel, 5 rumble strip, 6 special */ \
     /* Tire */                                                                                           \
-    X(f64, tire_pressure)                                                                                \
-    X(f64, tire_surface_temperature_left)                                                                \
+    X(f64, tire_pressure)                   /* kPa, running */                                           \
+    X(f64, tire_cold_pressure) /* kPa, the cold pressure set in the garage, not the running pressure (iRacing) */ \
+    X(f64, tire_surface_temperature_left)                                                              \
     X(f64, tire_surface_temperature_center)                                                              \
     X(f64, tire_surface_temperature_right)                                                               \
     X(f64, tire_inner_temperature_left)                                                                  \
@@ -219,7 +222,12 @@
     X(f64, tire_inner_temperature_right)                                                                 \
     X(f64, tire_carcass_temperature)                                                                     \
     X(f64, tire_optimal_temperature)        /* unit as reported by the simulator */                     \
-    X(f64, tire_wear)                       /* fraction worn */                                         \
+    X(f64, tire_wear)                       /* fraction worn (LMU and iRacing: what's left; see the engineer's wear_remaining) */ \
+    /* Session time at which the wheel's inner and carcass temperatures and its wear last changed,   \
+       on simulators that update them only now and then rather than live (iRacing): they're that   \
+       reading's, not the current values. The first update seen, when the reading is older. NULL     \
+       where they're live */                                                                             \
+    X(f64, tire_reading_time)                                                                            \
     X(f64, tire_vertical_deflection)                                                                     \
     X(i64, tire_compound) /* index of the compound for this car */ \
     X(i64, tire_compound_type)                                                                           \

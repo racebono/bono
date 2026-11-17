@@ -43,7 +43,7 @@
     X(i64, cloud_coverage, true)             /* as reported by the simulator */                           \
     X(f64, ambient_temperature, true)                                                                     \
     X(f64, track_temperature, true)                                                                       \
-    X(f64, wind_x, true)                     /* m/s, world coordinates */                                 \
+    X(f64, wind_x, true)                     /* m/s, world coordinates; iRacing: x west, z south, as its heading's 0 is north */ \
     X(f64, wind_y, true)                                                                                  \
     X(f64, wind_z, true)                                                                                  \
     X(f64, wind_max_speed, true)             /* m/s, the weather system's maximum (ground) wind speed */  \
@@ -127,7 +127,7 @@
     X(string, control, true)                 /* player, ai, remote, replay */                             \
     X(string, phase, true)                   /* the car's own phase: the session phases plus after_formation, under_yellow, under_blue */ \
     X(string, flag, true)                    /* the flag shown to the car: green, blue, black, white, checkered */ \
-    X(boolean, under_yellow, true)                                                                        \
+    X(boolean, under_yellow, true) /* iRacing: the local yellow shown to the car, as it has no sector yellows; the spotter falls back to the player's */ \
     X(boolean, lap_counts, true)                                                                          \
     X(boolean, lap_time_counts, true)                                                                     \
     X(boolean, scored, true)                                                                              \
