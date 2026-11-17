@@ -910,7 +910,6 @@ impl Engineer {
         speaker: Option<&AudioDevice>,
     ) {
         self.languages.update(rt, config.get().voices());
-        let mut sim = sim;
         // The game stopped: the conversation lets go of the database, so the plugin can delete it
         if sim.is_none() && self.session.is_some() {
             let interrupted = self.turn.take().is_some();
@@ -987,7 +986,6 @@ impl Engineer {
                 }
                 if !missed.is_empty() {
                     let question = missed.join("\n");
-                    let sim = sim.as_deref_mut();
                     self.send_question(rt, sim, config, synth, question, lang, released);
                 }
             }
