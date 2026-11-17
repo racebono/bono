@@ -25,12 +25,8 @@ struct Car {
 impl CarNumbers {
     /// Fetches them again, keeping what's known if the web API doesn't answer (in time) with cars.
     pub fn refresh(&self) {
-        // It's on this PC: anything slow means it isn't answering
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_connect(Some(Duration::from_secs(1)))
-            .timeout_global(Some(Duration::from_secs(3)))
-            .build()
-            .into();
+        // About 3 s in all
+        let agent = crate::local_agent(Duration::from_millis(750));
         let Some(body) = agent
             .get(URL)
             .call()

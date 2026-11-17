@@ -13,6 +13,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 mod car_numbers;
@@ -37,6 +38,24 @@ fn web_api(numbers: Arc<CarNumbers>) -> ForecastSource {
         numbers.refresh();
         forecast::fetch(session_time)
     })
+}
+
+/// A client for LMU's local web API. It's on this PC: anything slow means it isn't answering, so
+/// connecting, sending, waiting for the answer and reading it each get `step`. Finding the host gets
+/// no timeout, and neither does the request as a whole: ureq documents that a timeout covering the
+/// lookup may make it look the host up on a thread of its own, which nothing waits for and could
+/// outlive the DLL. Windows answers for localhost itself. No proxy from the environment (finding
+/// one is part of connecting) and no redirects, so nothing else is looked up or asked.
+fn local_agent(step: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .proxy(None)
+        .max_redirects(0)
+        .timeout_connect(Some(step))
+        .timeout_send_request(Some(step))
+        .timeout_recv_response(Some(step))
+        .timeout_recv_body(Some(step))
+        .build()
+        .into()
 }
 
 /// # Safety
