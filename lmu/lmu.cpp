@@ -8,6 +8,7 @@
 
 #include <Windows.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -560,9 +561,34 @@ namespace {
             close();
         }
 
+        // Stops recording and deletes the database. A reader that still has it open (the app only lets go once
+        // Steam reports the game closed, which is after this) keeps it from being deleted: the app deletes it
+        // once it has let go, and failing that the next run empties it.
+        // Takes the recorder once running updates are done with it (new ones stop taking the lock), and closes it
+        // outside the lock: closing waits for its threads, which updates shouldn't. Updates hold the lock briefly,
+        // so one still held after a second most likely belongs to a thread the system ended as the game exits.
+        // Then nothing is closed or freed, as that could wait on or free what that thread held: returns false,
+        // and the plugin is left as it is.
+        bool close() {
+            _closing = true;
+            if (_abandoned) return false;
+            bono_lmu_recorder* recorder;
+            {
+                std::unique_lock lock(_recorder_mutex, std::chrono::seconds(1));
+                if (!lock) {
+                    _abandoned = true;
+                    return false;
+                }
+                recorder = std::exchange(_recorder, nullptr);
+            }
+            if (recorder) bono_lmu_close(recorder);
+            return true;
+        }
+
         // Called on the game's simulation thread for every car, so only the updates the recorder keeps are
         // converted.
         void UpdateTelemetry(const TelemInfoV01& info) override {
+            if (_closing) return;
             std::shared_lock lock(_recorder_mutex);
             if (!_recorder) return;
             const double speed = std::hypot(info.mLocalVel.x, info.mLocalVel.y, info.mLocalVel.z);
@@ -581,6 +607,7 @@ namespace {
 
         // About five times a second.
         void UpdateScoring(const ScoringInfoV01& info) override {
+            if (_closing) return;
             std::shared_lock lock(_recorder_mutex);
             if (!_recorder || !info.mVehicle) return;
             bono_session_info_s session = convert(info);
@@ -617,9 +644,11 @@ namespace {
         }
 
         // A recorder that stopped on an error is replaced, so a failure costs a session rather than the rest of
-        // the run. Updates wait meanwhile, which is at most a few file operations and starting the writer.
+        // the run. Updates wait meanwhile, which is at most a few file operations and starting the writer. None is
+        // opened once closing started: nothing would close it.
         void start_recording() {
             std::unique_lock lock(_recorder_mutex);
+            if (_closing) return;
             if (_recorder && bono_lmu_failed(_recorder)) bono_lmu_restart(_recorder);
             if (_recorder) return;
             try {
@@ -630,28 +659,14 @@ namespace {
             }
         }
 
-        // Stops recording and deletes the database. A reader that still has it open (the app only lets go once
-        // Steam reports the game closed, which is after this) keeps it from being deleted: the app deletes it
-        // once it has let go, and failing that the next run empties it.
-        // Takes the recorder once running updates are done with it, and closes it outside the lock: closing waits
-        // for its threads, which updates shouldn't. Updates hold the lock briefly, so one still held after a second
-        // belongs to a thread the system ended as the game exits: the recorder is left as it is, as closing it
-        // could wait on that thread's other locks too.
-        void close() {
-            bono_lmu_recorder* recorder;
-            {
-                std::unique_lock lock(_recorder_mutex, std::chrono::seconds(1));
-                if (!lock) return;
-                recorder = std::exchange(_recorder, nullptr);
-            }
-            if (recorder) bono_lmu_close(recorder);
-        }
-
         std::filesystem::path _user_data;
         // The game may call the updates on other threads than the rest: they use the recorder under a shared
         // lock, and it's only opened, restarted or closed under an exclusive one.
         std::shared_timed_mutex _recorder_mutex;
         bono_lmu_recorder* _recorder = nullptr;
+        // See close().
+        std::atomic<bool> _closing = false;
+        std::atomic<bool> _abandoned = false;
         std::mutex _weather_mutex;
         std::optional<Weather> _weather;
         std::mutex _contexts_mutex;
@@ -678,7 +693,9 @@ __declspec(dllexport) PluginObject* __cdecl CreatePluginObject() {
     return new (std::nothrow) Plugin;
 }
 
+// A plugin that couldn't close is left as it is (see Plugin::close).
 __declspec(dllexport) void __cdecl DestroyPluginObject(PluginObject* object) {
-    delete static_cast<Plugin*>(object);
+    Plugin* plugin = static_cast<Plugin*>(object);
+    if (plugin->close()) delete plugin;
 }
 }
