@@ -379,7 +379,6 @@ fn reached(
         Trigger::Time { seconds } => progress.clock_s >= base.clock_s + seconds - TOLERANCE_S,
         Trigger::Laps { count } => progress.laps >= base.laps.saturating_add(u64::from(*count)),
         Trigger::Session { kind: None } => starts.any,
-        // On the first snapshot that says what the session is
         // On the first snapshot that says what the session is, if it started after the request was
         // armed: one that started in the epoch it was armed in had already begun
         Trigger::Session { kind: Some(kind) } => {
@@ -462,7 +461,14 @@ impl Schedule {
                             .cloned()
                             .unwrap_or_else(|| old.made.clone()),
                     };
-                    let missed = self.missed_start(&new.trigger, &new.made, &since);
+                    // A start the old one missed and hasn't fired for yet still counts for a
+                    // session trigger that replaces it
+                    let missed =
+                        self.missed_start(&new.trigger, &new.made, &since)
+                            .or(match new.trigger {
+                                Trigger::Session { .. } => old.missed_start,
+                                _ => None,
+                            });
                     let mut request = self.request(id, new, since);
                     request.made = old.made;
                     request.waiting = old.waiting;
@@ -2111,6 +2117,32 @@ mod tests {
         typed.session_type = Some("race".into());
         run.tick(typed);
         assert!(run.due().is_empty());
+    }
+
+    #[test]
+    fn a_replace_keeps_a_missed_session_start() {
+        let mut run = Run::new();
+        run.tick(laps(0));
+        // Made before the race's start, applied after it: it would fire on the next step
+        let made = laps(0);
+        run.tick(new_epoch(laps(0), 2, &["session"]));
+        let id = run.add(request(
+            Trigger::Session { kind: None },
+            Repeat::Once,
+            &made,
+        ));
+        // Replaced from a call made after the start, before the next step
+        let mut later = laps(0);
+        later.epoch = Some(2);
+        run.schedule.apply(
+            vec![Change::Replace(
+                id,
+                request(Trigger::Session { kind: None }, Repeat::Once, &later),
+            )],
+            &later,
+        );
+        run.tick(new_epoch(laps(0), 2, &[]));
+        assert_eq!(run.due(), [id]);
     }
 
     #[test]
