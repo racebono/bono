@@ -236,8 +236,15 @@ type CacheKey = (ArrayStr<2>, PathBuf, u32, String);
 struct Running {
     db: PathBuf,
     settings: watch::Sender<(SpotterConfig, u32)>,
-    calls: mpsc::Receiver<Raised>,
+    calls: mpsc::Receiver<Heard>,
     stop: Arc<AtomicBool>,
+}
+
+/// What the thread sends, in order.
+enum Heard {
+    Call(Raised),
+    /// It's gone quiet (qualifying, with the spotter off for it): nothing from before is said
+    Muted,
 }
 
 impl Drop for Running {
@@ -314,17 +321,28 @@ impl Spotter {
 
         let lang = self.language(config, &settings, engineer);
         if self.running.is_some() {
-            while let Some(call) = self
+            while let Some(heard) = self
                 .running
                 .as_ref()
                 .and_then(|running| running.calls.try_recv().ok())
             {
-                self.hear(call, Instant::now());
+                self.heard(heard, Instant::now());
             }
             self.warm(rt, config, synth, lang);
         }
 
         self.say(rt, config, synth, speaker, engineer, lang);
+    }
+
+    fn heard(&mut self, heard: Heard, at: Instant) {
+        match heard {
+            Heard::Call(call) => self.hear(call, at),
+            // The calls waiting, and the one being said
+            Heard::Muted => {
+                self.queue.clear();
+                self.saying = None;
+            }
+        }
     }
 
     /// The speaker `which` is gone (unplugged): the call on it is dropped, so the spotter says the
@@ -634,7 +652,7 @@ impl Running {
 fn follow(
     db: &Path,
     settings: watch::Receiver<(SpotterConfig, u32)>,
-    calls: mpsc::Sender<Raised>,
+    calls: mpsc::Sender<Heard>,
     stop: &AtomicBool,
 ) {
     let conn = match open(db) {
@@ -649,6 +667,7 @@ fn follow(
     let mut sizes = Sizes::default();
     let mut last_id = None;
     let mut failing = false;
+    let mut muted = false;
     while !stop.load(Ordering::Relaxed) {
         let start = Instant::now();
         let (config, frequency) = settings.borrow().clone();
@@ -663,8 +682,8 @@ fn follow(
         ) {
             Ok(raised) => {
                 failing = false;
-                for call in raised {
-                    if calls.send(call).is_err() {
+                for heard in outgoing(raised, logic.muted, &mut muted) {
+                    if calls.send(heard).is_err() {
                         return;
                     }
                 }
@@ -680,6 +699,17 @@ fn follow(
         let period = Duration::from_secs_f64(config.poll_interval().clamp(0.005, 1.0));
         std::thread::sleep(period.saturating_sub(start.elapsed()));
     }
+}
+
+/// What a poll sends: its calls, then [`Heard::Muted`] if it's just gone quiet.
+fn outgoing(raised: Vec<Raised>, muted: bool, was_muted: &mut bool) -> Vec<Heard> {
+    let went_quiet = muted && !*was_muted;
+    *was_muted = muted;
+    let mut heard = raised.into_iter().map(Heard::Call).collect::<Vec<_>>();
+    if went_quiet {
+        heard.push(Heard::Muted);
+    }
+    heard
 }
 
 fn open(db: &Path) -> rusqlite::Result<Connection> {
@@ -704,10 +734,13 @@ fn poll(
         return Ok(Vec::new());
     };
     if Some(car.id) == *last_id {
+        // Switched off for qualifying while no new rows come (the game paused): quiet all the same
+        logic.mute(config);
         return Ok(Vec::new());
     }
-    *last_id = Some(car.id);
 
+    // Only once it's all read: a row that failed is tried again, rather than left unfollowed
+    let id = car.id;
     sizes.update(conn, None)?;
     sizes.apply(&mut car);
     let player = player(conn, car)?;
@@ -715,6 +748,7 @@ fn poll(
     others.iter_mut().for_each(|other| sizes.apply(other));
     let wheels = wheels(conn, player.car.id)?;
     let scoring = scoring(conn, None)?;
+    *last_id = Some(id);
     Ok(logic.update(config, &player, &others, &wheels, scoring.as_ref()))
 }
 
@@ -1429,6 +1463,10 @@ struct Logic {
     lap_timed: Option<(f64, f64)>,
     /// When the player's lap last ended
     lap_started: Option<f64>,
+    /// The newest update was in qualifying
+    qualifying: bool,
+    /// Keeping quiet: qualifying, with the spotter off for it
+    muted: bool,
 }
 
 impl Default for Logic {
@@ -1454,6 +1492,8 @@ impl Default for Logic {
             lap_ended: None,
             lap_timed: None,
             lap_started: None,
+            qualifying: false,
+            muted: false,
         }
     }
 }
@@ -1480,6 +1520,21 @@ impl Calls {
 }
 
 impl Logic {
+    /// Keeps quiet if switched off for the qualifying session it's in. Nothing's followed then, so
+    /// it starts afresh (as in a new session) once it's on again, instead of calling what changed
+    /// while it was off. Whether it's quiet.
+    fn mute(&mut self, config: &SpotterConfig) -> bool {
+        self.muted = self.qualifying && !*config.qualifying();
+        if self.muted {
+            *self = Logic {
+                qualifying: true,
+                muted: true,
+                ..Logic::default()
+            };
+        }
+        self.muted
+    }
+
     /// The calls for the player's newest row, given the other cars at the same time.
     fn update(
         &mut self,
@@ -1506,6 +1561,11 @@ impl Logic {
             .is_some_and(|prev| t < prev - 1.0)
         {
             *self = Logic::default();
+        }
+
+        self.qualifying = scoring.is_some_and(|s| s.session_type.as_deref() == Some("qualifying"));
+        if self.mute(config) {
+            return Vec::new();
         }
 
         let stopped = p.speed.unwrap_or(0.0) < *config.min_speed() || p.in_pit_lane;
@@ -3211,6 +3271,195 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stays_quiet_in_qualifying_only_when_switched_off_for_it() {
+        let qualifying = Scoring {
+            session_type: Some("qualifying".into()),
+            ..Scoring::default()
+        };
+        let race = Scoring {
+            session_type: Some("race".into()),
+            ..Scoring::default()
+        };
+        let off = SpotterConfig::default();
+        let mut on = SpotterConfig::default();
+        on.qualifying.set(true);
+        let run = |config: &SpotterConfig, scoring: &Scoring| {
+            let mut logic = Logic::default();
+            let mut calls = Vec::new();
+            for i in 0..30 {
+                calls.extend(texts(logic.update(
+                    config,
+                    &player(i as f64 / 30.0),
+                    &[other(2, 0.0, 3.0)],
+                    &Wheels::default(),
+                    Some(scoring),
+                )));
+            }
+            calls
+        };
+
+        // Off unless asked for
+        assert!(!*off.qualifying());
+        assert_eq!(run(&on, &qualifying), ["car right"]);
+        assert!(run(&off, &qualifying).is_empty());
+        assert_eq!(run(&off, &race), ["car right"]);
+    }
+
+    #[test]
+    fn starts_afresh_when_qualifying_is_switched_back_on() {
+        let mut scoring = Scoring {
+            session_type: Some("qualifying".into()),
+            flag: Some("green".into()),
+            ..Scoring::default()
+        };
+        let mut config = SpotterConfig::default();
+        config.qualifying.set(false);
+        let mut logic = Logic::default();
+        let step = |logic: &mut Logic, config: &SpotterConfig, t: f64, scoring: &Scoring| {
+            texts(logic.update(config, &player(t), &[], &Wheels::default(), Some(scoring)))
+        };
+
+        assert!(step(&mut logic, &config, 0.0, &scoring).is_empty());
+        // The blue flag came while it was off: it isn't called once it's back on
+        scoring.flag = Some("blue".into());
+        assert!(step(&mut logic, &config, 0.1, &scoring).is_empty());
+        assert!(logic.muted);
+        config.qualifying.set(true);
+        assert!(step(&mut logic, &config, 0.2, &scoring).is_empty());
+        assert!(!logic.muted);
+        scoring.flag = Some("green".into());
+        assert!(step(&mut logic, &config, 0.3, &scoring).is_empty());
+        scoring.flag = Some("blue".into());
+        assert_eq!(step(&mut logic, &config, 0.4, &scoring), ["blue flag"]);
+    }
+
+    #[test]
+    fn goes_quiet_when_switched_off_without_a_new_row() {
+        let qualifying = Scoring {
+            session_type: Some("qualifying".into()),
+            ..Scoring::default()
+        };
+        let mut config = SpotterConfig::default();
+        config.qualifying.set(true);
+        let mut logic = Logic::default();
+        logic.update(
+            &config,
+            &player(0.0),
+            &[],
+            &Wheels::default(),
+            Some(&qualifying),
+        );
+        assert!(!logic.mute(&config));
+
+        config.qualifying.set(false);
+        assert!(logic.mute(&config));
+        assert!(logic.prev.is_none());
+        config.qualifying.set(true);
+        assert!(!logic.mute(&config));
+
+        // Not in qualifying, it isn't quiet whatever the setting
+        let mut logic = Logic::default();
+        logic.update(&config, &player(0.0), &[], &Wheels::default(), None);
+        config.qualifying.set(false);
+        assert!(!logic.mute(&config));
+        assert!(logic.prev.is_some());
+    }
+
+    #[test]
+    fn follows_a_row_that_failed_to_read_once_it_can() {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::recreate_tables(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO session (session_time, session_type) VALUES (0, 'qualifying');
+             INSERT INTO telemetry (vehicle_id, is_player, session_time, speed)
+             VALUES (1, 1, 10, 50);
+             ALTER TABLE session RENAME TO broken;",
+        )
+        .unwrap();
+        let mut config = SpotterConfig::default();
+        config.qualifying.set(true);
+        let mut logic = Logic::default();
+        let mut last_id = None;
+        let mut sizes = Sizes::default();
+
+        assert!(poll(&conn, &mut logic, &mut sizes, &config, 5, &mut last_id).is_err());
+        assert_eq!(last_id, None);
+
+        // The same row (the game paused) is read once it can be, so switching qualifying off
+        // still quiets it
+        conn.execute_batch("ALTER TABLE broken RENAME TO session;")
+            .unwrap();
+        assert!(
+            poll(&conn, &mut logic, &mut sizes, &config, 5, &mut last_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(last_id.is_some());
+        config.qualifying.set(false);
+        assert!(
+            poll(&conn, &mut logic, &mut sizes, &config, 5, &mut last_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(logic.muted);
+    }
+
+    #[test]
+    fn says_it_went_quiet_once_after_the_calls_before() {
+        let call = |text| Raised {
+            text,
+            urgent: true,
+            number: None,
+            session_time: 0.0,
+        };
+        let texts = |heard: Vec<Heard>| {
+            heard
+                .into_iter()
+                .map(|heard| match heard {
+                    Heard::Call(call) => call.text,
+                    Heard::Muted => "muted",
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut muted = false;
+        assert_eq!(
+            texts(outgoing(vec![call("car right")], false, &mut muted)),
+            ["car right"]
+        );
+        assert_eq!(texts(outgoing(Vec::new(), true, &mut muted)), ["muted"]);
+        assert!(texts(outgoing(Vec::new(), true, &mut muted)).is_empty());
+        // Back on, its calls go through: it says so again only once it next goes quiet
+        assert_eq!(
+            texts(outgoing(vec![call("car left")], false, &mut muted)),
+            ["car left"]
+        );
+        assert_eq!(texts(outgoing(Vec::new(), true, &mut muted)), ["muted"]);
+    }
+
+    #[test]
+    fn going_quiet_drops_the_calls_waiting_and_being_said() {
+        let at = Instant::now();
+        let call = |text| Raised {
+            text,
+            urgent: false,
+            number: None,
+            session_time: 0.0,
+        };
+        let (mut spotter, send) = pending_call("car right", true, at);
+        spotter.heard(Heard::Call(call("blue flag")), at);
+        assert_eq!(spotter.queue.len(), 1);
+
+        spotter.heard(Heard::Muted, at);
+        assert!(spotter.queue.is_empty());
+        assert!(spotter.saying.is_none());
+        assert!(send.is_closed());
+
+        // What comes after it's back on is said
+        spotter.heard(Heard::Call(call("rain starting")), at);
+        assert_eq!(spotter.queue.len(), 1);
+    }
+
     /// Runs the logic at 30 Hz from `from` to `to` with the simulator reporting the cars
     /// `alongside` and nobody's position, returning the calls.
     fn run_reported(
@@ -3582,7 +3831,9 @@ mod tests {
 
     #[test]
     fn does_not_call_standings_gaps_outside_races() {
-        let config = SpotterConfig::default();
+        let mut config = SpotterConfig::default();
+        // Not merely quiet in qualifying
+        config.qualifying.set(true);
         for kind in [Some("practice"), Some("qualifying"), Some("warmup"), None] {
             for gap in [0.8, 0.1] {
                 let scoring = Scoring {
@@ -3637,8 +3888,22 @@ mod tests {
 
     fn lap_times_on() -> SpotterConfig {
         let mut config = SpotterConfig::default();
+        config.qualifying.set(true);
         config.qualifying_lap_times.set(true);
         config
+    }
+
+    #[test]
+    fn says_no_lap_times_when_quiet_in_qualifying() {
+        let mut config = lap_times_on();
+        config.qualifying.set(false);
+        let rows = [
+            (10.0, 0, None, false, false),
+            (110.0, 1, Some(100.25), false, false),
+        ];
+        assert!(lap_calls(&config, "qualifying", &rows).is_empty());
+        config.qualifying.set(true);
+        assert_eq!(lap_calls(&config, "qualifying", &rows), ["lap time 1 40.3"]);
     }
 
     #[test]
