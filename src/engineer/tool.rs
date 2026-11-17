@@ -18,7 +18,11 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        mpsc,
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -90,6 +94,9 @@ struct Shared {
     /// The data thread's latest progress snapshot, none while its tables are catching up. Locked
     /// only to copy it or put a new one in, so the UI thread never waits on it.
     progress: Mutex<Option<Progress>>,
+    /// The `seq` of the last snapshot [read](Engineer::progress), 0 before the first: one
+    /// published over an unread one carries its `new_epochs` on. Set with `progress` locked.
+    read: AtomicU64,
     /// The conditions the data thread checks with every snapshot. Locked only to copy or swap.
     conditions: Mutex<Vec<(ConditionId, String)>>,
 }
@@ -102,6 +109,7 @@ impl Engineer {
             path: db.database().path().to_owned(),
             calibration: Mutex::new(None),
             progress: Mutex::new(None),
+            read: AtomicU64::new(0),
             conditions: Mutex::new(Vec::new()),
         });
         let data = derived::spawn(shared.clone());
@@ -166,10 +174,35 @@ impl Engineer {
     }
 
     /// What the data thread last measured for the scheduled requests (see [`Progress`]), without
-    /// waiting for it. `None` until its first snapshot, and while its tables are catching up with
-    /// the recording.
+    /// waiting for it, read to step the schedule through: the next snapshot's `new_epochs` start
+    /// after it. `None` until its first snapshot, and while its tables are catching up with the
+    /// recording.
     pub fn progress(&self) -> Option<Progress> {
+        let progress = lock(&self.inner.shared.progress);
+        let copy = progress.clone();
+        if let Some(copy) = &copy {
+            (self.inner.shared.read).fetch_max(copy.seq, AtomicOrdering::Relaxed);
+        }
+        drop(progress);
+        copy
+    }
+
+    /// The latest snapshot, as [`Self::progress`] has it, without reading it: one that isn't
+    /// read still has its `new_epochs` carried on to the next.
+    pub fn peek_progress(&self) -> Option<Progress> {
         lock(&self.inner.shared.progress).clone()
+    }
+
+    /// The latest snapshot's `seq`, without copying it: whether there's a new one to read.
+    pub fn progress_seq(&self) -> Option<u64> {
+        lock(&self.inner.shared.progress).as_ref().map(|p| p.seq)
+    }
+
+    /// Has the data thread publish a snapshot now, its tables caught up first. It publishes none
+    /// of its own after this: a test's snapshots are the ones it asks for.
+    #[cfg(test)]
+    pub async fn publish_progress(&self) -> anyhow::Result<()> {
+        self.ask(derived::Job::Progress).await.map(|_| ())
     }
 
     /// Takes the progress away, as a tick that falls behind the recording does.

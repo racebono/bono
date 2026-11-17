@@ -1256,6 +1256,11 @@
         "es": "La petición {id} ya había terminado, así que el cambio no se ha aplicado",
         "ca": "La petició {id} ja s'havia acabat, així que el canvi no s'ha aplicat"
     },
+    "engineer.request_dropped": {
+        "en": "Request {id} wasn't kept: a new weekend started while it was being made",
+        "es": "La petición {id} no se ha guardado: empezó un nuevo fin de semana mientras se hacía",
+        "ca": "La petició {id} no s'ha desat: va començar un nou cap de setmana mentre es feia"
+    },
     "engineer.requests_cleared": {
         "en": "Scheduled requests cleared",
         "es": "Peticiones programadas borradas",

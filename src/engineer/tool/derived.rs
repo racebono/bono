@@ -457,6 +457,8 @@ struct Watch {
     counters: Counters,
     /// The last snapshot's `seq`
     seq: u64,
+    /// The last snapshot's `new_epochs`, as published: carried on to the next while it's unread
+    new_epochs: Vec<String>,
     /// The newest epoch the last snapshot saw
     last_epoch: Option<i64>,
     /// Each registered condition's statement and latest result
@@ -577,8 +579,19 @@ impl Data {
     /// epoch: the next tick follows it first.
     fn publish(&mut self, shared: &Shared) -> anyhow::Result<()> {
         let conditions = lock(&shared.conditions).clone();
-        if let Some(progress) = self.measure(shared, &conditions)? {
-            let previous = lock(&shared.progress).replace(progress);
+        if let Some(mut progress) = self.measure(shared, &conditions)? {
+            let mut latest = lock(&shared.progress);
+            // The last one was never read (a UI hitch, a window not updating while minimized), or
+            // was taken unread while the tables caught up: its epochs, and the session starts and
+            // boundaries they tell of, carry on, so this one lists every epoch since the last read
+            if shared.read.load(AtomicOrdering::Relaxed) + 1 < progress.seq {
+                let new = std::mem::take(&mut progress.new_epochs);
+                progress.new_epochs = std::mem::take(&mut self.watch.new_epochs);
+                progress.new_epochs.extend(new);
+            }
+            self.watch.new_epochs.clone_from(&progress.new_epochs);
+            let previous = latest.replace(progress);
+            drop(latest);
             drop(previous);
         }
         Ok(())
@@ -9751,6 +9764,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn unread_snapshots_epochs_carry_over() {
+        use bono_sim::sql::{EpochReason, begin_epoch};
+
+        let (dir, engineer) = race();
+        let first = tick(&engineer).await;
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        let epoch = i64::MAX - 10;
+        begin_epoch(&conn, epoch, EpochReason::Session).unwrap();
+
+        // Published but never read (a UI hitch, a minimized window), then another epoch
+        engineer.ask(Job::Progress).await.unwrap();
+        assert_eq!(engineer.progress_seq(), Some(first.seq + 1));
+        let unread = engineer.peek_progress().unwrap();
+        assert_eq!(unread.new_epochs, ["session"]);
+        begin_epoch(&conn, epoch + 1, EpochReason::Resumed).unwrap();
+
+        // The next one read lists every epoch since the last one read
+        let next = tick(&engineer).await;
+        assert_eq!(next.seq, first.seq + 2);
+        assert_eq!(next.new_epochs, ["session", "resumed"]);
+        // Read, they aren't carried again
+        let after = tick(&engineer).await;
+        assert!(after.new_epochs.is_empty(), "{after:?}");
+
+        // One taken unread while the tables catch up is carried too
+        begin_epoch(&conn, epoch + 2, EpochReason::Session).unwrap();
+        engineer.ask(Job::Progress).await.unwrap();
+        assert!(engineer.take_progress().is_some());
+        let caught_up = tick(&engineer).await;
+        assert_eq!(caught_up.new_epochs, ["session"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_recording_without_epochs_has_no_weekend() {
         let (dir, engineer) = race();
         drop(engineer);
@@ -9971,6 +10017,7 @@ mod tests {
             path: dir.path().join(DATABASE),
             calibration: Mutex::new(None),
             progress: Mutex::new(None),
+            read: Default::default(),
             conditions: Mutex::new(Vec::new()),
         };
         let mut data = Data {

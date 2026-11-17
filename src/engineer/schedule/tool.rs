@@ -237,7 +237,7 @@ impl ScheduleTool {
     async fn wait_for_progress(&self) -> anyhow::Result<Progress> {
         let deadline = tokio::time::Instant::now() + self.progress_wait;
         loop {
-            if let Some(progress) = self.engineer.progress() {
+            if let Some(progress) = self.engineer.peek_progress() {
                 return Ok(progress);
             }
             let now = tokio::time::Instant::now();
@@ -681,6 +681,23 @@ mod tests {
                 Change::Replace(id, _) => ("replace", *id),
             })
             .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adding_leaves_the_snapshot_unread() {
+        use bono_sim::sql::{EpochReason, begin_epoch};
+
+        let (dir, engineer, tool) = recorded().await;
+        engineer.publish_progress().await.unwrap();
+        engineer.progress().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        begin_epoch(&conn, i64::MAX, EpochReason::Session).unwrap();
+        engineer.publish_progress().await.unwrap();
+        // Its baseline is the snapshot the engineer hasn't stepped through yet
+        call(&tool, add(laps(1))).await.unwrap();
+        // So the engineer still hears of the session starting
+        engineer.publish_progress().await.unwrap();
+        assert_eq!(engineer.progress().unwrap().new_epochs, ["session"]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

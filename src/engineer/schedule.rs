@@ -127,6 +127,9 @@ pub struct Applied {
     /// The cancels' and replaces' requests that were gone by the time the turn finished (they
     /// ended, were dropped or went stale while it ran), so their change didn't apply
     pub missing: Vec<RequestId>,
+    /// The adds made in another weekend than the one the turn finished in (the recording was
+    /// cleared while it ran), so they weren't kept
+    pub dropped: Vec<RequestId>,
 }
 
 /// What a step of the schedule did that the engineer tells the pilot about
@@ -393,8 +396,8 @@ impl Schedule {
     }
 
     /// Applies a finished turn's changes, at `progress`. Adds made in another weekend than
-    /// `progress`'s are dropped, as are cancels and replaces of requests that aren't there
-    /// anymore, which it reports as missing.
+    /// `progress`'s are dropped, and reported as such; cancels and replaces of requests that
+    /// aren't there anymore change nothing, and are reported as missing.
     ///
     /// A session trigger made before a session start that `advance` saw while the turn ran fires
     /// for that start on the next `advance` (if it's of the type asked for).
@@ -402,12 +405,15 @@ impl Schedule {
         self.follow_weekend(progress.weekend);
         let mut ids = Vec::new();
         let mut missing = Vec::new();
+        let mut dropped = Vec::new();
         for change in changes {
             match change {
                 Change::Add(id, new) => {
-                    if new.made.weekend != progress.weekend
-                        || self.requests.iter().any(|r| r.id == id)
-                    {
+                    if new.made.weekend != progress.weekend {
+                        dropped.push(id);
+                        continue;
+                    }
+                    if self.requests.iter().any(|r| r.id == id) {
                         continue;
                     }
                     self.next_id = self.next_id.max(id.0 + 1);
@@ -458,7 +464,11 @@ impl Schedule {
                 }
             }
         }
-        Applied { ids, missing }
+        Applied {
+            ids,
+            missing,
+            dropped,
+        }
     }
 
     /// Steps through a new progress snapshot: what fell due, what ended, what went stale, and
@@ -1327,14 +1337,22 @@ mod tests {
         let made = laps(0);
         let mut now = laps(0);
         now.weekend = Some(WEEKEND + 1);
+        let id = schedule.next_id();
         let applied = schedule.apply(
             vec![Change::Add(
-                schedule.next_id(),
+                id,
                 request(Trigger::Laps { count: 1 }, Repeat::Once, &made),
             )],
             &now,
         );
-        assert_eq!(applied, Applied::default());
+        // Reported, as the pilot heard it confirmed
+        assert_eq!(
+            applied,
+            Applied {
+                dropped: vec![id],
+                ..Default::default()
+            }
+        );
         assert_eq!(schedule.len(), 0);
     }
 
@@ -1633,7 +1651,7 @@ mod tests {
             ids,
             Applied {
                 ids: vec![id],
-                missing: Vec::new()
+                ..Default::default()
             }
         );
         assert_eq!(run.schedule.len(), 1);
@@ -1661,8 +1679,8 @@ mod tests {
         assert_eq!(
             ids,
             Applied {
-                ids: Vec::new(),
-                missing: vec![RequestId(99), RequestId(98)]
+                missing: vec![RequestId(99), RequestId(98)],
+                ..Default::default()
             }
         );
     }
@@ -1687,7 +1705,8 @@ mod tests {
             applied,
             Applied {
                 ids: vec![kept],
-                missing: vec![gone, gone]
+                missing: vec![gone, gone],
+                ..Default::default()
             }
         );
         assert_eq!(run.schedule.pending_ids(), [kept]);
