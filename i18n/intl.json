@@ -1271,6 +1271,21 @@
         "es": "Petición {id} descartada, porque su condición fallaba una y otra vez: {instruction}",
         "ca": "Petició {id} descartada, perquè la seva condició fallava una vegada i una altra: {instruction}"
     },
+    "engineer.scheduled": {
+        "en": "Scheduled: {what}",
+        "es": "Programada: {what}",
+        "ca": "Programada: {what}"
+    },
+    "engineer.nothing_to_report": {
+        "en": "Nothing to report: {what}",
+        "es": "Nada que comunicar: {what}",
+        "ca": "Res a comunicar: {what}"
+    },
+    "engineer.scheduled_failed": {
+        "en": "Scheduled requests couldn't be answered, trying again shortly: {error}",
+        "es": "No se han podido responder las peticiones programadas, se reintentará en breve: {error}",
+        "ca": "No s'han pogut respondre les peticions programades, es tornarà a provar aviat: {error}"
+    },
     "engineer.not_understood": {
         "en": "Nothing understood on the radio: say it again, a little louder or closer to the microphone",
         "es": "No se entendió nada por radio: repítelo, un poco más alto o más cerca del micrófono",

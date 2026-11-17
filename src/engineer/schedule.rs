@@ -13,22 +13,19 @@ pub mod tool;
 
 /// How long a scheduled turn waits after the first request falls due, to take in requests that
 /// fire together but are noticed a few checks apart
-// Used by the engineer's scheduled turns, which a later task adds.
-#[allow(dead_code)]
 pub const GATHER: Duration = Duration::from_secs(1);
 
 /// Failed checks in a row that drop a condition's request
-// Used by the engineer's scheduled turns, which a later task adds.
-#[allow(dead_code)]
 pub const CONDITION_FAILURES: u32 = 5;
 
 /// When an answer stops being worth saying, for a request made without its own
 pub const DEFAULT_STALE: Trigger = Trigger::Time { seconds: 30.0 };
 
 /// How long a failed scheduled turn waits before its requests are tried again
-// Used by the engineer's scheduled turns, which a later task adds.
-#[allow(dead_code)]
 pub const RETRY_AFTER: Duration = Duration::from_secs(10);
+
+/// What a scheduled turn replies, anywhere in its reply, when it has nothing worth saying
+pub const SILENCE: &str = "[SILENCE]";
 
 /// The most requests that may be pending, a guard against a model stuck adding them
 pub const MAX_REQUESTS: usize = 50;
@@ -100,8 +97,6 @@ pub enum Change {
 }
 
 /// Where a request fired, which its answer carries to be checked for staleness
-// Used by the engineer's scheduled turns, which a later task adds.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct Fired {
     pub id: RequestId,
@@ -109,8 +104,6 @@ pub struct Fired {
 }
 
 /// The due requests one scheduled turn answers
-// Used by the engineer's scheduled turns, which a later task adds.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct Batch {
     /// Each request's id, instruction, when it was made and why it fired now, as text for the
@@ -791,6 +784,14 @@ impl Schedule {
             .filter(|r| r.pending())
             .map(|r| r.id)
             .collect()
+    }
+
+    /// How many of request `id`'s answers are waiting to play or be dropped
+    #[cfg(test)]
+    pub fn waiting(&self, id: RequestId) -> usize {
+        (self.requests.iter())
+            .find(|r| r.id == id)
+            .map_or(0, |r| r.waiting.len())
     }
 
     fn request(&mut self, id: RequestId, new: NewRequest, since: Progress) -> Request {
