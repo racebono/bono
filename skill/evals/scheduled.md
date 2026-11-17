@@ -9,7 +9,8 @@ in its latest frame only, so there's a gap to the car one place behind but no ga
 They need a harness that registers the `schedule` tool, records its calls in the transcript,
 and understands two fields beside the usual ones:
 
-- `pending`: requests already pending when the question is asked. Each is the `schedule`
+- `pending`: requests already pending when the question is asked (an empty list for the
+  scheduling cases, so their question carries "none" as the app's does). Each is the `schedule`
   tool's input for an add (`instruction`, `trigger`, `repeat`, `until`, `stale_after`) without
   `action`, plus the `id` the pending list gives it: ids number from `#1` in the order listed.
   The harness adds them before the question, so the question carries them in its pending list

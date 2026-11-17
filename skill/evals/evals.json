@@ -340,6 +340,7 @@
       "prompt": "Give me my fuel at the end of every lap for the next five laps.",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
+      "pending": [],
       "session": "race",
       "assertions": [
         "Calls `schedule` with action add: a `laps` trigger of 1, repeat `every`, and `until` 5 laps",
@@ -354,6 +355,7 @@
       "prompt": "Remind me in ten minutes to check my brake bias.",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
+      "pending": [],
       "session": "race",
       "assertions": [
         "Calls `schedule` with action add: a `time` trigger of 600 seconds, with `repeat` once or left out (the default)",
@@ -367,6 +369,7 @@
       "prompt": "At the start of the race, remind me the tyres will be cold.",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
+      "pending": [],
       "session": "practice",
       "assertions": [
         "Calls `schedule` with action add: a `session` trigger with `session_type` race, not a time or lap trigger",
@@ -379,6 +382,7 @@
       "prompt": "Tell me if the car behind gets within a second.",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
+      "pending": [],
       "session": "race",
       "assertions": [
         "Calls `schedule` with action add and a `condition` trigger whose query returns a row only while the gap to the car one place behind in the standings (`gap_place_behind_s`, or the car `place_behind_vehicle_id` names) is under a second, not the nearest car on track (`gap_car_behind_s`)",
@@ -393,6 +397,7 @@
       "prompt": "Let me know when my front left drops below fifty percent.",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
+      "pending": [],
       "session": "race",
       "assertions": [
         "Calls `schedule` with action add and a `condition` trigger over `wheels_now`, for the front left (wheel 0) with `life_left_pct` under 50",
@@ -405,6 +410,7 @@
       "prompt": "Give me the gap to Ruiz every lap until I pit.",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
+      "pending": [],
       "session": "race",
       "assertions": [
         "Calls `schedule` with action add: a `laps` trigger of 1, repeat `every`, and an `until` condition that returns a row once the player is in the pit lane",
