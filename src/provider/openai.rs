@@ -718,6 +718,11 @@ impl ConversationBuilder {
             MaxTokens::MaxTokens(self.max_tokens)
         };
 
+        // Mistral's chunks may carry the tokens unasked, and it rejects fields it doesn't know
+        let stream_options = (!is_mistral(&base_url)).then_some(StreamOptions {
+            include_usage: true,
+        });
+
         let mut messages = Vec::new();
         if !self.system.trim().is_empty() {
             messages.push(serde_json::json!({
@@ -749,9 +754,7 @@ impl ConversationBuilder {
                 messages,
                 tools,
                 stream: true,
-                stream_options: StreamOptions {
-                    include_usage: true,
-                },
+                stream_options,
                 max_tokens,
                 reasoning_effort,
                 chat_template_kwargs,
@@ -821,7 +824,8 @@ struct RequestBody {
     /// Always: answers are spoken as they're written
     stream: bool,
     /// The tokens, in the stream's last event
-    stream_options: StreamOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
     #[serde(flatten)]
     max_tokens: MaxTokens,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1168,6 +1172,12 @@ mod tests {
 
             assert_eq!(body["reasoning_effort"], "none", "{url}");
             assert!(body.get("chat_template_kwargs").is_none(), "{url}");
+            // Mistral's API doesn't take `stream_options`
+            assert_eq!(
+                body.get("stream_options").is_none(),
+                url.contains("mistral.ai"),
+                "{url}"
+            );
         }
     }
 
