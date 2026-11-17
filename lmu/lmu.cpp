@@ -568,7 +568,8 @@ namespace {
         // outside the lock: closing waits for its threads, which updates shouldn't. Updates hold the lock briefly,
         // so one still held after a second most likely belongs to a thread the system ended as the game exits.
         // Then nothing is closed or freed, as that could wait on or free what that thread held: returns false,
-        // and the plugin is left as it is.
+        // and the plugin is left as it is. In case its threads still run, the DLL is pinned, so it stays loaded
+        // until the game exits.
         bool close() {
             _closing = true;
             if (_abandoned) return false;
@@ -577,6 +578,9 @@ namespace {
                 std::unique_lock lock(_recorder_mutex, std::chrono::seconds(1));
                 if (!lock) {
                     _abandoned = true;
+                    HMODULE module;
+                    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                       reinterpret_cast<LPCWSTR>(&bono_lmu_close), &module);
                     return false;
                 }
                 recorder = std::exchange(_recorder, nullptr);
@@ -696,6 +700,6 @@ __declspec(dllexport) PluginObject* __cdecl CreatePluginObject() {
 // A plugin that couldn't close is left as it is (see Plugin::close).
 __declspec(dllexport) void __cdecl DestroyPluginObject(PluginObject* object) {
     Plugin* plugin = static_cast<Plugin*>(object);
-    if (plugin->close()) delete plugin;
+    if (plugin && plugin->close()) delete plugin;
 }
 }
