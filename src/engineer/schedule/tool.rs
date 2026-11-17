@@ -8,10 +8,30 @@ use super::{
     Change, DEFAULT_STALE, MAX_REQUESTS, NewRequest, Repeat, RequestId, Trigger, describe,
     describe_stale,
 };
-use crate::{engineer::tool, provider::ToolHandler};
+use crate::{
+    engineer::tool::{self, Progress},
+    provider::ToolHandler,
+};
 use anyhow::{Context as _, bail};
 use serde::Deserialize;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::{
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::Duration,
+};
+
+/// How long a call waits for a progress snapshot when there's none: the data thread publishes
+/// about once a second, and has none for a moment while its tables catch up or after a failed tick
+const PROGRESS_WAIT: Duration = Duration::from_secs(3);
+
+/// How often a call waiting for a progress snapshot looks for one
+const PROGRESS_POLL: Duration = Duration::from_millis(100);
+
+/// The fewest seconds of game clock between a repeating time trigger's firings: each firing is a
+/// scheduled turn and an answer to speak
+const MIN_REPEAT_S: f64 = 10.0;
+
+/// The session types the simulator adapters write to `race_state.session_type`
+const SESSION_TYPES: [&str; 5] = ["test", "practice", "qualifying", "warmup", "race"];
 
 /// The tool, for one conversation. Cheap to clone; clones stage into the same turn.
 // Inserted into the conversation's tools by the engineer, which a later task makes use it.
@@ -21,6 +41,8 @@ pub struct ScheduleTool {
     engineer: tool::Engineer,
     /// Locked only to push a change or take them, never across a wait
     staging: Arc<Mutex<Staging>>,
+    /// How long a call waits for a progress snapshot when there's none
+    progress_wait: Duration,
 }
 
 /// What the turn holding the conversation has staged
@@ -49,15 +71,25 @@ impl ScheduleTool {
                 next_id: RequestId(1),
                 changes: Vec::new(),
             })),
+            progress_wait: PROGRESS_WAIT,
         }
+    }
+
+    /// With another wait for a progress snapshot, so a test without one needn't wait long
+    #[cfg(test)]
+    fn with_progress_wait(mut self, wait: Duration) -> Self {
+        self.progress_wait = wait;
+        self
     }
 
     pub fn description() -> String {
         "Schedules what the pilot asks you to do later: a check at the end of the lap, a number \
          every lap for a stint, a heads-up when something happens. When a request fires you get a \
          turn of your own, with fresh telemetry, to answer it. `action` picks the change: add a \
-         request, cancel one, or replace one to change it. Changes take effect once your reply is \
-         finished. Every question lists the pending requests and their ids."
+         request, cancel one, or replace one to change it. A replace keeps what's been counted: \
+         its `until` counts from when the request was first made, and its next firing counts on \
+         from its last. To count from now, cancel it and add a new one. Changes take effect once \
+         your reply is finished. Every question lists the pending requests and their ids."
             .into()
     }
 
@@ -135,13 +167,13 @@ impl ScheduleTool {
     ) -> anyhow::Result<T> {
         let mut staging = self.lock();
         if staging.turn != turn {
-            bail!("this turn is over, so nothing was changed");
+            bail!("the turn moved on, so nothing was changed");
         }
         stage(&mut staging)
     }
 
-    async fn run(&self, input: ScheduleInput) -> anyhow::Result<String> {
-        let turn = self.lock().turn;
+    /// Runs a call made in `turn`
+    async fn run(&self, turn: u64, input: ScheduleInput) -> anyhow::Result<String> {
         let replacing = match input.action {
             Action::Cancel => {
                 let id = input.id()?;
@@ -159,9 +191,13 @@ impl ScheduleTool {
             Action::Replace => Some(input.id()?),
         };
         let (instruction, trigger, repeat, stale_after) = input.request()?;
-        let Some(made) = self.engineer.progress() else {
-            bail!("no telemetry yet: requests can be made once the simulator is recording");
-        };
+        // What can be checked at once, before waiting for progress or running conditions. Checked
+        // again when it's staged: another call may have changed the staging meanwhile.
+        self.stage(turn, |staging| match replacing {
+            Some(id) => staging.find(id),
+            None => staging.room(),
+        })?;
+        let made = self.wait_for_progress().await?;
         let new = NewRequest {
             instruction,
             trigger,
@@ -172,6 +208,7 @@ impl ScheduleTool {
         // Outside the lock: the data thread may take a while
         let notes = self.check_conditions(&new).await?;
         let summary = summary(&new);
+        let kept = kept(&new);
         let id = self.stage(turn, |staging| match replacing {
             Some(id) => {
                 staging.find(id)?;
@@ -179,12 +216,7 @@ impl ScheduleTool {
                 Ok(id)
             }
             None => {
-                if staging.pending.len() >= MAX_REQUESTS {
-                    bail!(
-                        "the cap of {MAX_REQUESTS} pending requests is reached, so this one \
-                         wasn't added: ask the pilot which to cancel"
-                    );
-                }
+                staging.room()?;
                 let id = staging.next_id;
                 staging.next_id = RequestId(id.0 + 1);
                 staging.pending.push(id);
@@ -194,14 +226,33 @@ impl ScheduleTool {
         })?;
         Ok(match replacing {
             Some(_) => format!(
-                "Replaced {id}: {summary}. What it has counted carries on: its next firing from \
-                 its last, its `until` from when it was first made.{notes} Confirm the change to \
-                 the pilot in one sentence."
+                "Replaced {id}: {summary}.{kept}{notes} Confirm the change to the pilot in one \
+                 sentence."
             ),
             None => {
                 format!("Added {id}: {summary}.{notes} Confirm it to the pilot in one sentence.")
             }
         })
+    }
+
+    /// The latest progress snapshot, waiting a little for one when there's none: the data thread
+    /// has none for a moment while its tables catch up with the recording, or after a failed tick.
+    /// Polls without blocking, since the snapshot is only ever copied out of shared state.
+    async fn wait_for_progress(&self) -> anyhow::Result<Progress> {
+        let deadline = tokio::time::Instant::now() + self.progress_wait;
+        loop {
+            if let Some(progress) = self.engineer.progress() {
+                return Ok(progress);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                bail!(
+                    "telemetry isn't available right now, so nothing was changed: try again \
+                     shortly"
+                );
+            }
+            tokio::time::sleep((deadline - now).min(PROGRESS_POLL)).await;
+        }
     }
 
     /// Checks each of the request's conditions once now. Returns a note for the model about those
@@ -250,6 +301,17 @@ impl ScheduleTool {
 }
 
 impl Staging {
+    /// Fails if the cap of pending requests is reached
+    fn room(&self) -> anyhow::Result<()> {
+        if self.pending.len() >= MAX_REQUESTS {
+            bail!(
+                "the cap of {MAX_REQUESTS} pending requests is reached, so this one wasn't added: \
+                 ask the pilot which to cancel"
+            );
+        }
+        Ok(())
+    }
+
     /// Fails unless `id` is a request a change can refer to
     fn find(&self, id: RequestId) -> anyhow::Result<()> {
         if self.pending.contains(&id) {
@@ -274,7 +336,10 @@ impl ToolHandler for ScheduleTool {
         input: ScheduleInput,
     ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
         let tool = self.clone();
-        async move { tool.run(input).await }
+        // When the call is made, not when it runs: a call made for a turn that's over by then
+        // stages nothing
+        let turn = self.lock().turn;
+        async move { tool.run(turn, input).await }
     }
 }
 
@@ -290,7 +355,7 @@ fn trigger_schema(description: &str) -> serde_json::Value {
             },
             "seconds": {
                 "type": "number",
-                "description": "time: seconds of game clock, more than 0."
+                "description": format!("time: seconds of game clock, more than 0; at least {MIN_REPEAT_S} for the trigger of a request that repeats.")
             },
             "count": {
                 "type": "integer",
@@ -298,7 +363,8 @@ fn trigger_schema(description: &str) -> serde_json::Value {
             },
             "session_type": {
                 "type": "string",
-                "description": "session: only a session of this type, as race_state.session_type gives it (practice, qualifying, warmup or race). Any session if left out."
+                "enum": SESSION_TYPES,
+                "description": "session: only a session of this type, as race_state.session_type gives it. Any session if left out."
             },
             "query": {
                 "type": "string",
@@ -307,6 +373,22 @@ fn trigger_schema(description: &str) -> serde_json::Value {
         },
         "required": ["kind"]
     })
+}
+
+/// What a replace keeps counting, for the model to confirm: only time and laps count towards a
+/// firing, and only an `until` counts from when the request was made
+fn kept(new: &NewRequest) -> String {
+    let mut kept = String::new();
+    if matches!(new.trigger, Trigger::Time { .. } | Trigger::Laps { .. }) {
+        kept.push_str(
+            " It counts from its last firing, or from when it was first made if it hasn't fired \
+             yet.",
+        );
+    }
+    if let Repeat::Every { until: Some(_) } = new.repeat {
+        kept.push_str(" Its `until` still counts from when it was first made.");
+    }
+    kept
 }
 
 /// A request in one line, for the model to confirm
@@ -338,8 +420,9 @@ pub enum Action {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScheduleInput {
     action: Action,
+    /// Read by hand, so a malformed one gets a clear error
     #[serde(default)]
-    id: Option<IdInput>,
+    id: Option<serde_json::Value>,
     #[serde(default)]
     instruction: Option<String>,
     #[serde(default)]
@@ -350,14 +433,6 @@ pub struct ScheduleInput {
     until: Option<TriggerInput>,
     #[serde(default)]
     stale_after: Option<TriggerInput>,
-}
-
-/// `"#3"` as the schema has it, or `"3"` or `3`, which a model may well send
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum IdInput {
-    Number(u32),
-    Text(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -373,8 +448,9 @@ enum TriggerInput {
     Time {
         seconds: f64,
     },
+    /// A number, so a whole one written as `1.0` is read too
     Laps {
-        count: u32,
+        count: f64,
     },
     Session {
         #[serde(default)]
@@ -386,18 +462,28 @@ enum TriggerInput {
 }
 
 impl ScheduleInput {
+    /// `"#3"` as the schema has it, or `"# 3"`, `"3"`, `3` or `3.0`, which a model may well send
     fn id(&self) -> anyhow::Result<RequestId> {
-        match &self.id {
-            None => bail!("`id` is needed: the pending request's id, like #3"),
-            Some(IdInput::Number(id)) => Ok(RequestId(*id)),
-            Some(IdInput::Text(text)) => {
+        let Some(id) = &self.id else {
+            bail!("`id` is needed: the pending request's id, like #3");
+        };
+        let parsed = match id {
+            serde_json::Value::Number(number) => number.as_u64().or_else(|| {
+                number
+                    .as_f64()
+                    .filter(|n| n.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(n))
+                    .map(|n| n as u64)
+            }),
+            serde_json::Value::String(text) => {
                 let digits = text.trim();
-                let digits = digits.strip_prefix('#').unwrap_or(digits);
-                match digits.parse() {
-                    Ok(id) => Ok(RequestId(id)),
-                    Err(_) => bail!("`id` is a request's id, like #3, not {text:?}"),
-                }
+                let digits = digits.strip_prefix('#').unwrap_or(digits).trim_start();
+                digits.parse::<u32>().ok().map(u64::from)
             }
+            _ => None,
+        };
+        match parsed.and_then(|id| u32::try_from(id).ok()) {
+            Some(id) => Ok(RequestId(id)),
+            None => bail!("`id` is a request's id, like #3, not {id}"),
         }
     }
 
@@ -419,6 +505,14 @@ impl ScheduleInput {
                 bail!("`until` ends a repeating request: set `repeat` to every, or leave it out")
             }
         };
+        if let (Repeat::Every { .. }, Trigger::Time { seconds }) = (&repeat, &trigger)
+            && *seconds < MIN_REPEAT_S
+        {
+            bail!(
+                "`trigger`: a request that repeats needs at least {MIN_REPEAT_S} seconds of game \
+                 clock between firings, not {seconds}; for something sooner, use a condition"
+            );
+        }
         let stale_after = self
             .stale_after
             .map(|stale| stale.parse("stale_after"))
@@ -438,16 +532,35 @@ impl TriggerInput {
                 Trigger::Time { seconds }
             }
             TriggerInput::Laps { count } => {
-                if count == 0 {
-                    bail!("`{field}`: `count` must be at least 1 lap");
+                if !(count.fract() == 0.0 && (1.0..=f64::from(u32::MAX)).contains(&count)) {
+                    bail!(
+                        "`{field}`: `count` must be a whole number of laps, 1 or more, not {count}"
+                    );
                 }
-                Trigger::Laps { count }
+                Trigger::Laps {
+                    count: count as u32,
+                }
             }
-            TriggerInput::Session { session_type } => Trigger::Session {
-                kind: session_type
-                    .map(|kind| kind.trim().to_owned())
-                    .filter(|kind| !kind.is_empty()),
-            },
+            TriggerInput::Session { session_type } => {
+                let kind = session_type
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|kind| !kind.is_empty());
+                let kind = match kind {
+                    None => None,
+                    Some(kind) => match SESSION_TYPES
+                        .iter()
+                        .find(|known| known.eq_ignore_ascii_case(kind))
+                    {
+                        Some(known) => Some((*known).to_owned()),
+                        None => bail!(
+                            "`{field}`: `session_type` is one of {}, not {kind:?}",
+                            SESSION_TYPES.join(", ")
+                        ),
+                    },
+                };
+                Trigger::Session { kind }
+            }
             TriggerInput::Condition { query } => {
                 if query.trim().is_empty() {
                     bail!("`{field}`: `query` is needed, one SELECT or WITH statement");
@@ -481,6 +594,8 @@ mod tests {
     const TRUE: &str = "SELECT 1 FROM cars_now WHERE is_player = 1";
     const FALSE: &str = "SELECT 1 FROM cars_now WHERE is_player = 1 AND speed_kmh > 100";
     const BROKEN: &str = "SELECT 1 FROM nowhere";
+    /// The session types `lmu.cpp` and `rrre.rs` write
+    const WRITTEN: [&str; 5] = ["test", "practice", "qualifying", "warmup", "race"];
 
     fn open(dir: &tempfile::TempDir) -> tool::Engineer {
         let two = NonZeroUsize::new(2).unwrap();
@@ -629,15 +744,25 @@ mod tests {
         let (_dir, _engineer, tool) = recorded().await;
 
         // A query that fails goes back to the model, in the trigger, `until` or `stale_after`
-        let error = call(&tool, add(condition(BROKEN))).await.unwrap_err();
-        assert!(format!("{error:#}").contains("no such table"), "{error:#}");
+        let fails = |field: &str, error: anyhow::Error| {
+            let error = format!("{error:#}");
+            assert!(
+                error.contains(&format!("the `{field}` condition failed")),
+                "{error}"
+            );
+            assert!(error.contains("no such table"), "{error}");
+        };
+        fails(
+            "trigger",
+            call(&tool, add(condition(BROKEN))).await.unwrap_err(),
+        );
         let mut until = add(laps(1));
         until["repeat"] = json!("every");
         until["until"] = condition(BROKEN);
-        call(&tool, until).await.unwrap_err();
+        fails("until", call(&tool, until).await.unwrap_err());
         let mut stale = add(laps(1));
         stale["stale_after"] = condition(BROKEN);
-        call(&tool, stale).await.unwrap_err();
+        fails("stale_after", call(&tool, stale).await.unwrap_err());
         assert!(tool.take().is_empty());
 
         // One that's false now is just added
@@ -772,23 +897,246 @@ mod tests {
         // No recording: the data thread never publishes progress
         let dir = tempfile::tempdir().unwrap();
         let engineer = open(&dir);
-        let tool = ScheduleTool::new(engineer.clone());
+        let wait = Duration::from_millis(200);
+        let tool = ScheduleTool::new(engineer.clone()).with_progress_wait(wait);
         tool.begin(vec![RequestId(1)], RequestId(2));
-        let error = call(&tool, add(laps(1))).await.unwrap_err();
-        assert!(
-            format!("{error:#}").contains("no telemetry yet"),
-            "{error:#}"
-        );
+        // It waits for a snapshot first, then says so without guessing why there's none
+        let unavailable = |error: anyhow::Error| {
+            let error = format!("{error:#}");
+            assert!(error.contains("isn't available right now"), "{error}");
+            assert!(error.contains("try again"), "{error}");
+            assert!(!error.contains("recording"), "{error}");
+        };
+        let started = Instant::now();
+        unavailable(call(&tool, add(laps(1))).await.unwrap_err());
+        assert!(started.elapsed() >= wait);
         let mut replace = add(laps(1));
         replace["action"] = json!("replace");
         replace["id"] = json!("#1");
-        let error = call(&tool, replace).await.unwrap_err();
-        assert!(
-            format!("{error:#}").contains("no telemetry yet"),
-            "{error:#}"
-        );
+        unavailable(call(&tool, replace).await.unwrap_err());
         assert!(tool.take().is_empty());
         assert!(engineer.progress().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn waits_for_progress_through_a_gap() {
+        let (_dir, engineer, tool) = recorded().await;
+        // A tick fell behind the recording: no snapshot until the next one
+        engineer.take_progress().unwrap();
+        let reply = call(&tool, add(laps(1))).await.unwrap();
+        assert!(reply.starts_with("Added #1"), "{reply}");
+        assert_eq!(ids(&tool.take()), [("add", RequestId(1))]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cheap_checks_come_first() {
+        // No recording, and a wait for progress the test would notice
+        let dir = tempfile::tempdir().unwrap();
+        let wait = Duration::from_secs(5);
+        let tool = ScheduleTool::new(open(&dir)).with_progress_wait(wait);
+        let started = Instant::now();
+        tool.begin(vec![RequestId(2)], RequestId(3));
+        let mut replace = add(condition(BROKEN));
+        replace["action"] = json!("replace");
+        replace["id"] = json!("#5");
+        let error = call(&tool, replace).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no pending request #5"),
+            "{error:#}"
+        );
+        tool.begin(
+            (1..=MAX_REQUESTS as u32).map(RequestId).collect(),
+            RequestId(51),
+        );
+        let error = call(&tool, add(condition(BROKEN))).await.unwrap_err();
+        assert!(format!("{error:#}").contains("cap"), "{error:#}");
+        assert!(started.elapsed() < wait);
+        assert!(tool.take().is_empty());
+
+        // Nor does a condition run for an unknown id
+        let (_dir, _engineer, tool) = recorded().await;
+        let mut replace = add(condition(BROKEN));
+        replace["action"] = json!("replace");
+        replace["id"] = json!("#5");
+        let error = call(&tool, replace).await.unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("no pending request #5"), "{error}");
+        assert!(!error.contains("no such table"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_made_for_an_earlier_turn_stages_nothing() {
+        let (_dir, _engineer, tool) = recorded().await;
+        tool.begin(vec![RequestId(1)], RequestId(2));
+        let input = |value| serde_json::from_value::<ScheduleInput>(value).unwrap();
+        // Made in one turn, run once the next has begun
+        let calls = [
+            ToolHandler::handle(&tool, input(add(laps(1)))),
+            ToolHandler::handle(&tool, input(json!({"action": "cancel", "id": "#1"}))),
+        ];
+        tool.begin(vec![RequestId(1)], RequestId(2));
+        for call in calls {
+            let error = call.await.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("the turn moved on"),
+                "{error:#}"
+            );
+        }
+        assert!(tool.take().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replace_says_what_it_keeps() {
+        let description = ScheduleTool::description();
+        assert!(
+            description.contains(
+                "A replace keeps what's been counted: its `until` counts from when the request \
+                 was first made, and its next firing counts on from its last. To count from now, \
+                 cancel it and add a new one."
+            ),
+            "{description}"
+        );
+
+        let (_dir, _engineer, tool) = recorded().await;
+        tool.begin(vec![RequestId(2)], RequestId(3));
+        let mut replace = add(laps(2));
+        replace["action"] = json!("replace");
+        replace["id"] = json!(2);
+        assert_eq!(
+            call(&tool, replace.clone()).await.unwrap(),
+            "Replaced #2: \"Tell the pilot the fuel left.\" It fires after 2 laps, once; its \
+             answer is out of date 0:30 of game clock after it fires. It counts from its last \
+             firing, or from when it was first made if it hasn't fired yet. Confirm the change \
+             to the pilot in one sentence."
+        );
+        // A session trigger counts nothing; its `until` still counts from when it was made
+        replace["trigger"] = json!({"kind": "session"});
+        replace["repeat"] = json!("every");
+        replace["until"] = laps(5);
+        assert_eq!(
+            call(&tool, replace).await.unwrap(),
+            "Replaced #2: \"Tell the pilot the fuel left.\" It fires when the next session \
+             starts, every time, until after 5 laps from when it was made; its answer is out of \
+             date 0:30 of game clock after it fires. Its `until` still counts from when it was \
+             first made. Confirm the change to the pilot in one sentence."
+        );
+        assert_eq!(
+            ids(&tool.take()),
+            [("replace", RequestId(2)), ("replace", RequestId(2))]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_type_is_one_the_simulators_give() {
+        let (_dir, _engineer, tool) = recorded().await;
+        let session = |kind: &str| add(json!({"kind": "session", "session_type": kind}));
+        for wrong in ["quali", "Qualifying 1"] {
+            let error = call(&tool, session(wrong)).await.unwrap_err();
+            let error = format!("{error:#}");
+            for kind in WRITTEN {
+                assert!(error.contains(kind), "{error}");
+            }
+        }
+        assert!(tool.take().is_empty());
+        call(&tool, session("Race")).await.unwrap();
+        call(&tool, session(" WARMUP ")).await.unwrap();
+        let triggers: Vec<_> = tool
+            .take()
+            .into_iter()
+            .map(|change| match change {
+                Change::Add(_, new) => new.trigger,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            triggers,
+            [
+                Trigger::Session {
+                    kind: Some("race".into())
+                },
+                Trigger::Session {
+                    kind: Some("warmup".into())
+                }
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeating_time_triggers_have_a_minimum() {
+        let (_dir, _engineer, tool) = recorded().await;
+        let time = |seconds: f64| json!({"kind": "time", "seconds": seconds});
+        let mut every = add(time(9.5));
+        every["repeat"] = json!("every");
+        let error = call(&tool, every.clone()).await.unwrap_err();
+        assert!(format!("{error:#}").contains("10 seconds"), "{error:#}");
+        assert!(tool.take().is_empty());
+        every["trigger"] = time(10.0);
+        call(&tool, every).await.unwrap();
+        // A one-shot, an `until` and a `stale_after` only need more than 0
+        call(&tool, add(time(1.0))).await.unwrap();
+        let mut until = add(laps(1));
+        until["repeat"] = json!("every");
+        until["until"] = time(1.0);
+        call(&tool, until).await.unwrap();
+        let mut stale = add(laps(1));
+        stale["repeat"] = json!("every");
+        stale["stale_after"] = time(1.0);
+        call(&tool, stale).await.unwrap();
+        assert_eq!(tool.take().len(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ids_and_counts_are_read_leniently() {
+        let (_dir, _engineer, tool) = recorded().await;
+        tool.begin(vec![RequestId(3)], RequestId(4));
+        let replace = |id: serde_json::Value, count: serde_json::Value| {
+            let mut replace = add(json!({"kind": "laps", "count": count}));
+            replace["action"] = json!("replace");
+            replace["id"] = id;
+            replace
+        };
+        for id in [
+            json!("# 3"),
+            json!(" #3 "),
+            json!("3"),
+            json!(3),
+            json!(3.0),
+        ] {
+            let reply = call(&tool, replace(id.clone(), json!(1.0))).await;
+            assert!(reply.unwrap().starts_with("Replaced #3"), "{id}");
+        }
+        for id in [
+            json!(3.5),
+            json!(-3),
+            json!("three"),
+            json!("#"),
+            json!("#3.5"),
+            json!(true),
+            json!([3]),
+            json!(5_000_000_000_u64),
+        ] {
+            let error = call(&tool, replace(id.clone(), json!(1)))
+                .await
+                .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains("like #3"), "{id}: {error}");
+            assert!(!error.contains("variant"), "{id}: {error}");
+        }
+        for count in [json!(1.5), json!(-1), json!(0.0)] {
+            let error = call(&tool, add(json!({"kind": "laps", "count": count})))
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("`count`"),
+                "{count}: {error:#}"
+            );
+        }
+        let changes = tool.take();
+        assert_eq!(changes.len(), 5);
+        assert!(changes.iter().all(|change| matches!(
+            change,
+            Change::Replace(RequestId(3), new) if new.trigger == Trigger::Laps { count: 1 }
+        )));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -892,5 +1240,13 @@ mod tests {
             );
         }
         assert_eq!(schema["required"], json!(["action"]));
+        // As the simulators write them
+        for field in ["trigger", "until", "stale_after"] {
+            assert_eq!(
+                schema["properties"][field]["properties"]["session_type"]["enum"],
+                json!(WRITTEN),
+                "{field}"
+            );
+        }
     }
 }

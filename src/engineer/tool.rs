@@ -174,6 +174,12 @@ impl Engineer {
         lock(&self.inner.shared.progress).clone()
     }
 
+    /// Takes the progress away, as a tick that falls behind the recording does.
+    #[cfg(test)]
+    pub fn take_progress(&self) -> Option<Progress> {
+        lock(&self.inner.shared.progress).take()
+    }
+
     /// Replaces the conditions the data thread checks with every progress snapshot, without
     /// waiting for it.
     // The schedule, which a later task adds, registers them.
