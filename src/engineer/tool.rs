@@ -87,6 +87,11 @@ struct Shared {
     path: PathBuf,
     /// How far the track description has been moved to line up with the laps
     calibration: Mutex<Option<AppliedCalibration>>,
+    /// The data thread's latest progress snapshot, none while its tables are catching up. Locked
+    /// only to copy it or put a new one in, so the UI thread never waits on it.
+    progress: Mutex<Option<Progress>>,
+    /// The conditions the data thread checks with every snapshot. Locked only to copy or swap.
+    conditions: Mutex<Vec<(ConditionId, String)>>,
 }
 
 impl Engineer {
@@ -96,6 +101,8 @@ impl Engineer {
         let shared = Arc::new(Shared {
             path: db.database().path().to_owned(),
             calibration: Mutex::new(None),
+            progress: Mutex::new(None),
+            conditions: Mutex::new(Vec::new()),
         });
         let data = derived::spawn(shared.clone());
         Self {
@@ -158,16 +165,47 @@ impl Engineer {
         }
     }
 
+    /// What the data thread last measured for the scheduled requests (see [`Progress`]), without
+    /// waiting for it. `None` until its first snapshot, and while its tables are catching up with
+    /// the recording.
+    // The schedule, which a later task adds, reads it.
+    #[allow(dead_code)]
+    pub fn progress(&self) -> Option<Progress> {
+        lock(&self.inner.shared.progress).clone()
+    }
+
+    /// Replaces the conditions the data thread checks with every progress snapshot, without
+    /// waiting for it.
+    // The schedule, which a later task adds, registers them.
+    #[allow(dead_code)]
+    pub fn set_conditions(&self, conditions: Vec<(ConditionId, String)>) {
+        let replaced = std::mem::replace(&mut *lock(&self.inner.shared.conditions), conditions);
+        drop(replaced);
+    }
+
+    /// Checks a condition once now, as `sql` would run it and under a condition's time limit:
+    /// whether it returns at least one row.
+    // The `schedule` tool, which a later task adds, checks a request's conditions with it.
+    #[allow(dead_code)]
+    pub async fn check_condition(&self, query: String) -> anyhow::Result<bool> {
+        self.ask(derived::Job::Condition { query }).await?.holds()
+    }
+
     async fn run(&self, input: EngineerInput) -> anyhow::Result<String> {
         match input.command {
             Command::Quick => self.quick().await,
-            Command::Track => self.ask(derived::Job::Track).await,
+            Command::Track => self
+                .ask(derived::Job::Track)
+                .await
+                .and_then(derived::Answer::text),
             Command::Sql => {
                 let Some(query) = input.query else {
                     bail!("sql needs a `query`");
                 };
                 let limit = input.limit;
-                self.ask(derived::Job::Sql { query, limit }).await
+                self.ask(derived::Job::Sql { query, limit })
+                    .await
+                    .and_then(derived::Answer::text)
             }
         }
         .map_err(|e| match e.downcast_ref::<rusqlite::Error>() {
@@ -194,7 +232,7 @@ impl Engineer {
         .await
     }
 
-    async fn ask(&self, job: derived::Job) -> anyhow::Result<String> {
+    async fn ask(&self, job: derived::Job) -> anyhow::Result<derived::Answer> {
         let (reply, answer) = tokio::sync::oneshot::channel();
         self.inner
             .data
@@ -258,8 +296,6 @@ macro_rules! say {
 
 mod derived;
 mod progress;
-// The data thread and the schedule, which later tasks add, use these.
-#[allow(unused_imports)]
 pub use progress::*;
 
 // --------------------------------------------------------------------------- rows

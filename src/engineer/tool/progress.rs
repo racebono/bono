@@ -4,13 +4,9 @@
 use super::*;
 
 /// A scheduled request's condition, as the data thread knows it
-// Used by the condition checks and the schedule, which later tasks add.
-#[allow(dead_code)]
 pub type ConditionId = u64;
 
 /// The latest check of a condition
-// Used by the condition checks and the schedule, which later tasks add.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConditionState {
     /// The statement returned at least one row
@@ -22,7 +18,7 @@ pub enum ConditionState {
 }
 
 /// What the data thread has measured, published about once a second for the engineer's schedule
-// Published by the data thread and read by the schedule, which later tasks add.
+// Read by the schedule, which a later task adds.
 #[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 pub struct Progress {
@@ -46,16 +42,12 @@ pub struct Progress {
 
 /// The furthest the session clock can step back without the recorder starting a new epoch (see
 /// `went_back` in `bono_sim::recorder`), in seconds
-// Used by the data thread through `Counters`, which a later task adds.
-#[allow(dead_code)]
 const SMALL_REWIND_S: f64 = 1.0;
 
 /// The game clock and the laps the pilot completes, added up across sessions. Each observation
 /// adds how far the session clock and the lap count moved forward since the last one, only within
 /// one epoch: a new epoch, or a missing value, starts a new baseline instead of a jump, and a
 /// paused or rewound clock adds nothing.
-// Fed by the data thread, which a later task adds.
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub(crate) struct Counters {
     epoch: Option<i64>,
@@ -65,7 +57,6 @@ pub(crate) struct Counters {
     laps: u64,
 }
 
-#[allow(dead_code)]
 impl Counters {
     /// Takes the newest values of the pilot's session clock and completed laps
     pub(crate) fn observe(

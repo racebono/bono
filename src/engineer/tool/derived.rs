@@ -25,6 +25,14 @@ use std::{
 
 /// How often the thread looks for new rows
 const TICK: Duration = Duration::from_millis(100);
+/// How often the thread publishes its progress for the scheduled requests
+const PROGRESS_EVERY: Duration = Duration::from_secs(1);
+/// A condition still running after this is stopped, and counts as failed: the thread checks every
+/// condition with every progress snapshot, so a slow one would hold up the model's queries
+const CONDITION_TIME: Duration = Duration::from_millis(50);
+/// How long a progress snapshot spends checking conditions, all of them together. The ones it
+/// doesn't reach keep their last result and go first next time.
+const CONDITION_BUDGET: Duration = Duration::from_millis(300);
 /// How often the thread tries again while the recording can't be opened
 const RETRY_OPEN: Duration = Duration::from_secs(1);
 /// How often the track description is looked at again
@@ -270,15 +278,47 @@ pub(super) enum Job {
         query: String,
         limit: Option<usize>,
     },
+    /// Whether a scheduled request's condition holds now
+    Condition {
+        query: String,
+    },
     Track,
     /// Waits for the tables to catch up with the recording
     #[cfg(test)]
     Sync,
+    /// Publishes a progress snapshot now, once the tables have caught up. From then on the thread
+    /// publishes none of its own, so a test's snapshots are the ones it asks for.
+    #[cfg(test)]
+    Progress,
+}
+
+/// What the thread answers.
+pub(super) enum Answer {
+    /// A query's rows or the track's description, for the model
+    Text(String),
+    /// Whether a condition returned a row
+    Holds(bool),
+}
+
+impl Answer {
+    pub fn text(self) -> anyhow::Result<String> {
+        match self {
+            Self::Text(text) => Ok(text),
+            Self::Holds(_) => bail!("the engineer's data thread answered another question"),
+        }
+    }
+
+    pub fn holds(self) -> anyhow::Result<bool> {
+        match self {
+            Self::Holds(holds) => Ok(holds),
+            Self::Text(_) => bail!("the engineer's data thread answered another question"),
+        }
+    }
 }
 
 pub(super) struct Request {
     pub job: Job,
-    pub reply: tokio::sync::oneshot::Sender<anyhow::Result<String>>,
+    pub reply: tokio::sync::oneshot::Sender<anyhow::Result<Answer>>,
 }
 
 /// Starts the thread, which ends once the sender returned is dropped.
@@ -318,6 +358,7 @@ fn thread(shared: &Shared, requests: &mpsc::Receiver<Request>) {
                     data = Some(Data {
                         conn,
                         stream: Stream::default(),
+                        watch: Watch::default(),
                     });
                 }
                 Err(e) => {
@@ -337,28 +378,37 @@ fn thread(shared: &Shared, requests: &mpsc::Receiver<Request>) {
         match request {
             Some(request) => {
                 let result = match request.job {
-                    Job::Sql { query, limit } => data.sql(shared, &query, limit),
+                    Job::Sql { query, limit } => data.sql(shared, &query, limit).map(Answer::Text),
+                    Job::Condition { query } => data.condition(shared, &query).map(Answer::Holds),
                     Job::Track => {
                         // Following the recording's newest epoch, for the session it's about
                         if let Err(e) = data.stream.tick(&data.conn, shared) {
                             log::debug!("The engineer's tables didn't update: {e:#}");
                         }
-                        track_json(&data.conn, shared, &mut data.stream)
+                        track_json(&data.conn, shared, &mut data.stream).map(Answer::Text)
                     }
                     #[cfg(test)]
-                    Job::Sync => data.sync(shared).map(|()| String::new()),
+                    Job::Sync => data.sync(shared).map(|()| Answer::Text(String::new())),
+                    #[cfg(test)]
+                    Job::Progress => data
+                        .publish_now(shared)
+                        .map(|()| Answer::Text(String::new())),
                 };
                 let _ = request.reply.send(result);
             }
-            None => match data.stream.tick(&data.conn, shared) {
-                Ok(()) => failing = false,
-                // The recorder is busy, or hasn't made its tables yet: the next tick tries again
-                Err(e) => {
-                    if !std::mem::replace(&mut failing, true) {
-                        log::debug!("The engineer's tables didn't update: {e:#}");
+            None => {
+                match data.stream.tick(&data.conn, shared) {
+                    Ok(()) => failing = false,
+                    // The recorder is busy, or hasn't made its tables yet: the next tick tries
+                    // again
+                    Err(e) => {
+                        if !std::mem::replace(&mut failing, true) {
+                            log::debug!("The engineer's tables didn't update: {e:#}");
+                        }
                     }
                 }
-            },
+                data.follow_progress(shared);
+            }
         }
     }
 }
@@ -396,6 +446,27 @@ fn open(path: &Path) -> rusqlite::Result<Connection> {
 struct Data {
     conn: Connection,
     stream: Stream,
+    watch: Watch,
+}
+
+/// What the progress snapshots are worked out from, from one to the next.
+#[derive(Default)]
+struct Watch {
+    counters: Counters,
+    /// The last snapshot's `seq`
+    seq: u64,
+    /// The newest epoch the last snapshot saw
+    last_epoch: Option<i64>,
+    /// Each registered condition's statement and latest result
+    results: BTreeMap<ConditionId, (String, ConditionState)>,
+    /// The condition the next snapshot checks first: they take turns, so the ones a snapshot
+    /// doesn't reach in its budget go first next time
+    next: ConditionId,
+    /// When the last snapshot was due
+    published: Option<Instant>,
+    /// Snapshots only when a test asks for them
+    #[cfg(test)]
+    manual: bool,
 }
 
 impl Data {
@@ -428,15 +499,7 @@ impl Data {
         query: &str,
         limit: Option<usize>,
     ) -> anyhow::Result<String> {
-        let query = query.trim().trim_end_matches(';');
-        let lower = without_leading_comments(query).to_lowercase();
-        if !["select", "with", "pragma"]
-            .iter()
-            .any(|p| lower.starts_with(p))
-        {
-            bail!("only SELECT / WITH / PRAGMA queries are allowed");
-        }
-
+        let query = read_only(query)?;
         self.catch_up(shared);
         // Queries of the recording's own tables still work without a player's car
         let note = match self.stream.refresh_now(&self.conn, shared) {
@@ -451,18 +514,236 @@ impl Data {
         if active_epoch(conn)?.id != self.stream.epoch.id {
             bail!("the recording moved on to another session: just retry");
         }
-        conn.authorizer(Some(authorize))?;
-        let result = (|| {
-            let previous = conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, SQL_MAX_VALUE_BYTES)?;
-            let result = run_query(conn, &self.stream, query, limit, note.as_deref());
-            // The worker's own writes and subsequent queries retain their normal limits,
-            // including when this query fails.
-            conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, previous)?;
-            result
-        })();
-        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+        let result = guarded(conn, || {
+            run_query(conn, &self.stream, query, limit, note.as_deref())
+        });
         drop(snapshot);
         result
+    }
+
+    /// Whether a condition holds now: checked as `sql` runs a query, against the tables as of now.
+    fn condition(&mut self, shared: &Shared, query: &str) -> anyhow::Result<bool> {
+        self.catch_up(shared);
+        // A condition on the recording's own tables can still be checked without them
+        if let Err(e) = self.stream.refresh_now(&self.conn, shared) {
+            log::debug!("The engineer's current-state tables didn't update: {e:#}");
+        }
+        let conn = &self.conn;
+        let snapshot = conn.unchecked_transaction()?;
+        if active_epoch(conn)?.id != self.stream.epoch.id {
+            bail!("the recording moved on to another session: just retry");
+        }
+        let holds = guarded(conn, || condition_holds(conn, query));
+        drop(snapshot);
+        holds
+    }
+
+    /// Publishes progress when it's due. Only once the tables have caught up with the recording,
+    /// so the laps don't race through its history: while they're catching up, there's none.
+    fn follow_progress(&mut self, shared: &Shared) {
+        if self.stream.behind {
+            let stale = lock(&shared.progress).take();
+            drop(stale);
+            return;
+        }
+        #[cfg(test)]
+        if self.watch.manual {
+            return;
+        }
+        if self.stream.failed
+            || self
+                .watch
+                .published
+                .is_some_and(|published| published.elapsed() < PROGRESS_EVERY)
+        {
+            return;
+        }
+        self.watch.published = Some(Instant::now());
+        if let Err(e) = self.publish(shared) {
+            log::debug!("The engineer's progress wasn't measured: {e:#}");
+        }
+    }
+
+    #[cfg(test)]
+    fn publish_now(&mut self, shared: &Shared) -> anyhow::Result<()> {
+        self.sync(shared)?;
+        self.watch.manual = true;
+        self.publish(shared)
+    }
+
+    /// Measures progress and publishes it, unless the recording has just moved on to another
+    /// epoch: the next tick follows it first.
+    fn publish(&mut self, shared: &Shared) -> anyhow::Result<()> {
+        let conditions = lock(&shared.conditions).clone();
+        if let Some(progress) = self.measure(shared, &conditions)? {
+            let previous = lock(&shared.progress).replace(progress);
+            drop(previous);
+        }
+        Ok(())
+    }
+
+    fn measure(
+        &mut self,
+        shared: &Shared,
+        conditions: &[(ConditionId, String)],
+    ) -> anyhow::Result<Option<Progress>> {
+        let Self {
+            conn,
+            stream,
+            watch,
+        } = self;
+        // Once for every condition. What it couldn't write (no player's car yet, say) is missing
+        // from the snapshot too.
+        stream.refresh_now(conn, shared)?;
+
+        // One snapshot of the recording, of the epoch the tables were just written for
+        let snapshot = conn.unchecked_transaction()?;
+        if active_epoch(conn)?.id != stream.epoch.id {
+            return Ok(None);
+        }
+        let state = row(
+            conn,
+            "SELECT session_time_s, session_type FROM race_state",
+            [],
+        )?;
+        let session_time_s = state.as_ref().and_then(|state| state.f("session_time_s"));
+        let session_type = state
+            .as_ref()
+            .and_then(|state| state.text("session_type"))
+            .map(str::to_owned);
+        let laps_completed = scalar::<i64>(
+            conn,
+            "SELECT laps_completed FROM cars_now WHERE is_player = 1",
+            [],
+        )?;
+        let epoch = stream.epoch.id;
+        let (weekend, new_epochs) = match epoch {
+            // A recording without epochs: no weekend to tell from the next
+            None => (None, Vec::new()),
+            Some(_) => {
+                // A clear empties the recording and starts an epoch with a newer id: the oldest
+                // one changes exactly when the weekend does
+                let weekend = scalar::<i64>(conn, "SELECT MIN(id) FROM recording.epoch", [])?;
+                // The first snapshot is where counting starts: no epoch is new to it
+                let new_epochs = match watch.seq {
+                    0 => Vec::new(),
+                    _ => conn
+                        .prepare_cached(
+                            "SELECT reason FROM recording.epoch WHERE id > ? ORDER BY id",
+                        )?
+                        .query_map([watch.last_epoch.unwrap_or(i64::MIN)], |row| row.get(0))?
+                        .collect::<rusqlite::Result<Vec<String>>>()?,
+                };
+                (weekend, new_epochs)
+            }
+        };
+
+        // The conditions, by id, as they're registered now
+        let conditions = conditions
+            .iter()
+            .map(|(id, query)| (*id, query.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        watch
+            .results
+            .retain(|id, (query, _)| conditions.get(id) == Some(&query.as_str()));
+        guarded(conn, || {
+            let started = Instant::now();
+            let turn = conditions
+                .range(watch.next..)
+                .chain(conditions.range(..watch.next));
+            for (&id, &query) in turn {
+                if started.elapsed() >= CONDITION_BUDGET {
+                    break;
+                }
+                let state = match condition_holds(conn, query) {
+                    Ok(true) => ConditionState::True,
+                    Ok(false) => ConditionState::False,
+                    Err(e) => {
+                        log::debug!("The engineer's condition {id} failed: {e:#}");
+                        ConditionState::Failed
+                    }
+                };
+                watch.results.insert(id, (query.to_owned(), state));
+                watch.next = id.wrapping_add(1);
+            }
+            Ok(())
+        })?;
+        drop(snapshot);
+
+        watch
+            .counters
+            .observe(epoch, session_time_s, laps_completed);
+        watch.last_epoch = epoch;
+        watch.seq += 1;
+        Ok(Some(Progress {
+            seq: watch.seq,
+            weekend,
+            epoch,
+            new_epochs,
+            session_type,
+            clock_s: watch.counters.clock_s(),
+            laps: watch.counters.laps(),
+            conditions: watch
+                .results
+                .iter()
+                .map(|(id, (_, state))| (*id, *state))
+                .collect(),
+        }))
+    }
+}
+
+/// A model's statement, if it's one that may only read: SELECT, WITH or PRAGMA.
+fn read_only(query: &str) -> anyhow::Result<&str> {
+    let query = query.trim().trim_end_matches(';');
+    let lower = without_leading_comments(query).to_lowercase();
+    if !["select", "with", "pragma"]
+        .iter()
+        .any(|p| lower.starts_with(p))
+    {
+        bail!("only SELECT / WITH / PRAGMA queries are allowed");
+    }
+    Ok(query)
+}
+
+/// Runs `run` on the connection as the model's queries get it: only allowed to read (see
+/// [`authorize`]), and with values capped. Put back afterwards, even when it fails: the thread's
+/// own writes need it.
+fn guarded<T>(conn: &Connection, run: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    conn.authorizer(Some(authorize))?;
+    let result = (|| {
+        let previous = conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, SQL_MAX_VALUE_BYTES)?;
+        let result = run();
+        conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, previous)?;
+        result
+    })();
+    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+    result
+}
+
+/// Whether a condition's statement returns at least one row, stopped once it's taken
+/// [`CONDITION_TIME`]. Run [`guarded`], as the model's queries are.
+fn condition_holds(conn: &Connection, query: &str) -> anyhow::Result<bool> {
+    let query = read_only(query)?;
+    let mut stmt = conn.prepare(query)?;
+    if !stmt.readonly() {
+        bail!("only queries that read are allowed");
+    }
+    // Stopped from inside SQLite, as soon after the deadline as it can be
+    let deadline = Instant::now() + CONDITION_TIME;
+    conn.progress_handler(1_000, Some(move || Instant::now() > deadline))?;
+    let result = stmt.exists([]);
+    conn.progress_handler(0, None::<fn() -> bool>)?;
+    match result {
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::OperationInterrupted =>
+        {
+            bail!(
+                "the condition took longer than {} ms and was stopped: it's checked every second, \
+                 so it must be quick (scope it by id, or use the derived tables)",
+                CONDITION_TIME.as_millis()
+            )
+        }
+        result => Ok(result?),
     }
 }
 
@@ -6888,6 +7169,359 @@ mod tests {
             )
             .await,
             1.0
+        );
+    }
+
+    // ----------------------------------------------------------------------- progress
+
+    use bono_sim::{
+        recorder::Recorder,
+        sys::{bono_session_info, bono_standing, bono_telemetry},
+    };
+
+    /// A session of the player's car alone (vehicle 1, "Ana Lopes"), `t` seconds in and `laps`
+    /// laps completed, as the simulator's scoring has it.
+    fn scoring(kind: &str, t: f64, laps: i64) -> (bono_session_info, Vec<bono_standing>) {
+        let mut session = bono_session_info::default();
+        session.session_time = Some(t).into();
+        session.track = Some("Test Ring".to_owned()).into();
+        session.track_length = Some(1000.0).into();
+        session.session_type = Some(kind.to_owned()).into();
+        session.phase = Some("green".to_owned()).into();
+        let mut standing = bono_standing::default();
+        standing.session_time = Some(t).into();
+        standing.vehicle_id = Some(1).into();
+        standing.is_player = Some(true).into();
+        standing.driver = Some("Ana Lopes".to_owned()).into();
+        standing.laps_completed = Some(laps).into();
+        (session, vec![standing])
+    }
+
+    /// The player's car `t` seconds into a `kind` session with `laps` laps completed, recorded.
+    fn drive(recorder: &Recorder, kind: &str, t: f64, laps: i64) {
+        let (session, standings) = scoring(kind, t, laps);
+        recorder.push_scoring(session, standings);
+        let mut telemetry = bono_telemetry::default();
+        telemetry.vehicle_id = Some(1).into();
+        telemetry.session_time = Some(t).into();
+        telemetry.lap = Some(laps).into();
+        telemetry.lap_distance = Some(t * 10.0 % 1000.0).into();
+        telemetry.speed = Some(10.0).into();
+        if recorder.wants_telemetry(1, t, 10.0) {
+            recorder.push_telemetry(&telemetry);
+        }
+    }
+
+    /// The player's car `t` seconds into the session with `laps` laps completed, going `speed`
+    /// m/s, written straight into the recording in one transaction.
+    fn append(dir: &tempfile::TempDir, t: f64, laps: i64, speed: f64) {
+        let mut conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, speed) \
+             VALUES (1, 1, ?1, ?2, ?3)",
+            params![t, laps, speed],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO standings (vehicle_id, is_player, session_time, laps_completed, driver) \
+             VALUES (1, 1, ?1, ?2, 'Ana Lopes')",
+            params![t, laps],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// A progress snapshot published now, the tables caught up first. The thread publishes none
+    /// of its own after this: a test's snapshots are the ones it asks for.
+    async fn tick(engineer: &Engineer) -> Progress {
+        engineer.ask(Job::Progress).await.unwrap();
+        engineer.progress().expect("a snapshot was just published")
+    }
+
+    /// Asks for snapshots until one is `wanted`, while a recorder is still writing.
+    async fn tick_until(engineer: &Engineer, wanted: impl Fn(&Progress) -> bool) -> Progress {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if engineer.ask(Job::Progress).await.is_ok()
+                && let Some(progress) = engineer.progress()
+                && wanted(&progress)
+            {
+                return progress;
+            }
+            assert!(Instant::now() < deadline, "{:?}", engineer.progress());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Waits for the thread to publish a snapshot on its own that's `wanted`.
+    async fn published(engineer: &Engineer, wanted: impl Fn(&Progress) -> bool) -> Progress {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(progress) = engineer.progress()
+                && wanted(&progress)
+            {
+                return progress;
+            }
+            assert!(Instant::now() < deadline, "{:?}", engineer.progress());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publishes_progress_once_caught_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        let weekend = recorder.epoch();
+        for t in 0..10 {
+            drive(&recorder, "practice", t as f64, 2);
+        }
+        // Another session: another epoch
+        for t in 0..=20 {
+            drive(&recorder, "race", t as f64, 3);
+        }
+        let race = recorder.epoch();
+        assert_ne!(race, weekend);
+        drop(recorder);
+
+        let engineer = reopen(&dir);
+        let first = published(&engineer, |_| true).await;
+        assert_eq!(first.weekend, Some(weekend));
+        assert_eq!(first.epoch, Some(race));
+        assert_eq!(first.session_type.as_deref(), Some("race"));
+        // Counting starts at the first snapshot, once the tables have caught up: nothing of what
+        // was recorded before it
+        assert_eq!((first.clock_s, first.laps), (0.0, 0));
+        assert!(first.new_epochs.is_empty(), "{first:?}");
+        assert!(first.conditions.is_empty());
+
+        // Five seconds and a lap on, as the current-state tables have it
+        append(&dir, 25.0, 4, 10.0);
+        let next = published(&engineer, |progress| progress.laps > 0).await;
+        assert!(next.seq > first.seq);
+        assert_eq!(
+            number(&engineer, "SELECT session_time_s FROM race_state").await,
+            25.0
+        );
+        assert_eq!(
+            number(
+                &engineer,
+                "SELECT laps_completed FROM cars_now WHERE is_player = 1"
+            )
+            .await,
+            4.0
+        );
+        assert_eq!((next.clock_s, next.laps), (5.0, 1));
+        assert_eq!((next.weekend, next.epoch), (Some(weekend), Some(race)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn weekend_changes_on_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        for t in 0..5 {
+            drive(&recorder, "race", t as f64, 0);
+        }
+        let engineer = reopen(&dir);
+        let before = tick_until(&engineer, |progress| {
+            progress.session_type.as_deref() == Some("race")
+        })
+        .await;
+        assert_eq!(before.weekend, Some(recorder.epoch()));
+
+        recorder.clear();
+        let cleared = recorder.epoch();
+        for t in 10..15 {
+            drive(&recorder, "race", t as f64, 1);
+        }
+        let after = tick_until(&engineer, |progress| {
+            progress.weekend.is_some() && progress.weekend != before.weekend
+        })
+        .await;
+        assert_eq!(after.weekend, Some(cleared));
+        assert!(after.weekend > before.weekend);
+        assert_eq!(after.new_epochs, ["cleared"]);
+        drop(recorder);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reports_every_new_epoch_reason() {
+        use bono_sim::sql::{EpochReason, begin_epoch};
+
+        let (dir, engineer) = race();
+        let first = tick(&engineer).await;
+        assert!(first.new_epochs.is_empty(), "{first:?}");
+
+        // A session change, then the writer resuming, both before the next snapshot
+        let mut conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        let tx = conn.transaction().unwrap();
+        begin_epoch(&tx, i64::MAX - 1, EpochReason::Session).unwrap();
+        begin_epoch(&tx, i64::MAX, EpochReason::Resumed).unwrap();
+        tx.commit().unwrap();
+
+        let next = tick(&engineer).await;
+        assert_eq!(next.seq, first.seq + 1);
+        assert_eq!(next.new_epochs, ["session", "resumed"]);
+        assert_eq!(next.epoch, Some(i64::MAX));
+        assert_eq!(next.weekend, first.weekend);
+        let after = tick(&engineer).await;
+        assert!(after.new_epochs.is_empty(), "{after:?}");
+        assert_eq!(after.epoch, Some(i64::MAX));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recording_without_epochs_has_no_weekend() {
+        let (dir, engineer) = race();
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute("DROP TABLE epoch", []).unwrap();
+        drop(conn);
+
+        let engineer = reopen(&dir);
+        let progress = tick(&engineer).await;
+        assert_eq!((progress.weekend, progress.epoch), (None, None));
+        assert!(progress.new_epochs.is_empty());
+        assert_eq!(progress.session_type.as_deref(), Some("race"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn condition_results_follow_the_data() {
+        let (dir, engineer) = race();
+        engineer.set_conditions(vec![
+            (
+                1,
+                "SELECT 1 FROM cars_now WHERE is_player = 1 AND speed_kmh > 100".to_owned(),
+            ),
+            (2, "SELEC 1 FROM cars_now".to_owned()),
+        ]);
+        // 36 km/h
+        append(&dir, 311.0, 3, 10.0);
+        let slow = tick(&engineer).await;
+        assert_eq!(
+            slow.conditions,
+            BTreeMap::from([(1, ConditionState::False), (2, ConditionState::Failed)])
+        );
+        // 180 km/h
+        append(&dir, 312.0, 3, 50.0);
+        let fast = tick(&engineer).await;
+        assert_eq!(
+            fast.conditions,
+            BTreeMap::from([(1, ConditionState::True), (2, ConditionState::Failed)])
+        );
+
+        // One unregistered is gone from the next snapshot, and so is a result of another query
+        engineer.set_conditions(vec![(
+            1,
+            "SELECT 1 FROM cars_now WHERE is_player = 1 AND speed_kmh > 200".to_owned(),
+        )]);
+        let changed = tick(&engineer).await;
+        assert_eq!(
+            changed.conditions,
+            BTreeMap::from([(1, ConditionState::False)])
+        );
+        // Run as the model's queries are, and the thread's own writes still work after
+        assert_eq!(
+            number(&engineer, "SELECT COUNT(*) FROM cars_now").await,
+            2.0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn conditions_stay_within_the_tick_budget() {
+        // Stopped at its deadline, every time
+        const SLOW: &str = "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n) \
+                            SELECT 1 FROM n WHERE x < 0";
+        const COUNT: u64 = 20;
+        let (_dir, engineer) = race();
+        // On this machine, as loaded as it is now: a snapshot without conditions, and a query,
+        // once the tables have caught up
+        tick(&engineer).await;
+        let started = Instant::now();
+        tick(&engineer).await;
+        let bare = started.elapsed();
+        let started = Instant::now();
+        query(&engineer, "SELECT 1").await;
+        let alone = started.elapsed();
+
+        engineer.set_conditions((0..COUNT).map(|id| (id, SLOW.to_owned())).collect());
+        let ticks = (COUNT as u128 * CONDITION_TIME.as_millis())
+            .div_ceil(CONDITION_BUDGET.as_millis()) as usize;
+        // A snapshot spends its budget and at most one condition's time over it, where checking
+        // them all would take a second
+        let bound = bare + alone + CONDITION_BUDGET + CONDITION_TIME + Duration::from_millis(250);
+        let mut checked = Vec::new();
+        for _ in 0..ticks {
+            // The model's query, sent while the snapshot is being worked out, waits for it
+            let (reply, snapshot) = tokio::sync::oneshot::channel();
+            engineer
+                .inner
+                .data
+                .send(Request {
+                    job: Job::Progress,
+                    reply,
+                })
+                .unwrap();
+            let sent = Instant::now();
+            query(&engineer, "SELECT 1").await;
+            let waited = sent.elapsed();
+            snapshot.await.unwrap().unwrap();
+            assert!(waited <= bound, "{waited:?} > {bound:?}");
+            let progress = engineer.progress().unwrap();
+            assert!(
+                progress
+                    .conditions
+                    .values()
+                    .all(|state| *state == ConditionState::Failed)
+            );
+            checked.push(progress.conditions.len());
+        }
+        // The ones a snapshot didn't reach go first in the next, until every one has a result
+        assert!(checked[0] > 0 && checked[0] < COUNT as usize, "{checked:?}");
+        assert!(checked.windows(2).all(|w| w[0] < w[1]), "{checked:?}");
+        assert_eq!(checked.last(), Some(&(COUNT as usize)), "{checked:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_condition_runs_once() {
+        let (_dir, engineer) = race();
+        let check = |query: &str| engineer.check_condition(query.to_owned());
+        assert!(
+            check("SELECT 1 FROM cars_now WHERE is_player = 1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !check("SELECT 1 FROM cars_now WHERE is_player = 1 AND speed_kmh > 100")
+                .await
+                .unwrap()
+        );
+        // As the model's own query would be told
+        for (sql, expected) in [
+            ("DELETE FROM session", "only SELECT"),
+            (
+                "INSERT INTO cars_now (vehicle_id) VALUES (9)",
+                "only SELECT",
+            ),
+            (
+                "WITH x AS (SELECT 1) DELETE FROM lap_stats",
+                "not authorized",
+            ),
+            ("PRAGMA query_only = 1", "not authorized"),
+            ("SELEC 1", "only SELECT"),
+            ("SELECT 1 FROM nowhere", "no such table"),
+            (
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n) \
+                 SELECT 1 FROM n WHERE x < 0",
+                "took longer",
+            ),
+        ] {
+            let error = check(sql).await.unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{sql}: {error:#}");
+        }
+        // Nothing was changed, and the thread's own writes still work
+        assert_eq!(
+            number(&engineer, "SELECT COUNT(*) FROM cars_now").await,
+            2.0
         );
     }
 }
