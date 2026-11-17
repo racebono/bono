@@ -190,6 +190,12 @@ impl SpeechOutput {
             Err(TryRecvError::Disconnected) => Poll::Ready(None),
         }
     }
+
+    /// Whether nothing is ready to [take](Self::try_next): no piece of speech or error, though
+    /// the transmission may be over.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 enum Job {

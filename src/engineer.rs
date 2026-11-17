@@ -139,6 +139,9 @@ struct Turn {
     /// The pilot's questions asked while it runs, for it to take at its next tool hand-back.
     /// What it leaves there is asked next
     steer: Steer,
+    /// The latest of those questions' language and the first one's release, as given to
+    /// [`Engineer::ask`]: what it leaves is asked with them. `None` until one is asked
+    steered: Option<(Option<ArrayStr<2>>, Option<Instant>)>,
 }
 
 /// An answer in the engineer's line: speech played as it's synthesized.
@@ -165,7 +168,15 @@ pub struct Playback {
     /// Its stream was flushed since its last piece went on, so all of it plays out: a stream
     /// that resamples holds some of its input back until then
     flushed: bool,
+    /// Since when it's been [waiting on its turn](Self::waiting_on_its_turn), with nothing
+    /// submitted since: [`Engineer::fill_gap`] waits [`GAP_AFTER`]
+    waiting_since: Option<Instant>,
 }
+
+/// How long the answer at the front waits on its turn, with nothing to play, before another
+/// plays in its gap. The speaker may still be playing what SDL has taken from the stream (its
+/// queued bytes count only what SDL hasn't), and a short pause sounds natural on the radio.
+const GAP_AFTER: Duration = Duration::from_millis(300);
 
 /// How far behind where it was interrupted an answer resumes, in seconds.
 const RESUME_BEHIND: f32 = 0.4;
@@ -280,6 +291,7 @@ impl Playback {
             writing: false,
             held: false,
             flushed: false,
+            waiting_since: None,
         }
     }
 
@@ -326,10 +338,12 @@ impl Playback {
     }
 
     /// Whether it's played all it has so far and waits on its pilot turn for more (e.g. "Copy,
-    /// checking." said, the lookups still running): nothing is playing meanwhile.
+    /// checking." said, the lookups still running): nothing is playing meanwhile, and its next
+    /// piece isn't synthesized yet.
     fn waiting_on_its_turn(&self) -> bool {
         self.writing
             && self.sentences.pending().is_none()
+            && self.speech.is_empty()
             && (self.stream.as_ref()).is_none_or(|stream| matches!(stream.queued_bytes(), Ok(0)))
     }
 
@@ -476,16 +490,28 @@ impl Engineer {
         self.notice(t!("engineer.microphone_removed"));
     }
 
-    /// The speaker `which` is gone (unplugged): the answers being spoken on it stop. The others
-    /// play on whichever speaker is picked when their turn comes. `picked`: whether it's the
-    /// speaker picked, which the pilot is told about either way.
+    /// The speaker `which` is gone (unplugged): the answer being spoken on it stops. One that
+    /// gave way to an answer in its gap keeps its place, and says what it hasn't finished again
+    /// on whichever speaker is picked when its turn comes, as the others play. `picked`: whether
+    /// it's the speaker picked, which the pilot is told about either way.
     pub fn speaker_removed(&mut self, which: u32, picked: bool) {
-        let before = self.line.len();
-        self.line.retain(|playback| {
-            (playback.stream.as_ref()).is_none_or(|stream| !plays_on(stream, which))
-        });
-        let on_it = self.line.len() != before;
-        if on_it || picked {
+        let on_it =
+            |playback: &Playback| (playback.stream.as_ref()).is_some_and(|s| plays_on(s, which));
+        let mut stopped = false;
+        if self.line.front().is_some_and(on_it) {
+            self.line.pop_front();
+            stopped = true;
+        }
+        for playback in self.line.iter_mut().filter(|playback| on_it(playback)) {
+            playback.stream = None;
+            // Where it was is unknown: its unfinished sentences go out again from their start
+            playback.sentences.rewind(None);
+            playback.flushed = false;
+            playback.waiting_since = None;
+            playback.drain = Drain::new(Instant::now());
+            stopped = true;
+        }
+        if stopped || picked {
             self.notice(t!("engineer.speaker_removed"));
         }
     }
@@ -702,24 +728,44 @@ impl Engineer {
         lang: Option<ArrayStr<2>>,
         released: Option<Instant>,
     ) {
-        // Whisper distinguishes Nynorsk (`nn`), but both Norwegian forms use the `no` voice.
-        let lang = lang.map(language::voice_code);
-        let spoken = config.get().engineer_reply_language();
-        let known = lang.is_some() || spoken.is_some();
-        let lang = lang.unwrap_or(self.last_lang);
-        self.last_lang = lang;
-        let lang = spoken.unwrap_or(lang);
+        if let Some(lang) = lang {
+            self.last_lang = language::voice_code(lang);
+        }
         self.chat.push(ChatEntry {
             speaker: Speaker::Pilot,
             text: question.clone(),
             detail: None,
         });
         // The turn hears it at its next tool hand-back, or answers it next
-        if let Some(turn) = &self.turn {
+        if let Some(turn) = &mut self.turn {
             turn.steer.push(question);
+            let first = turn.steered.map_or(released, |(_, first)| first);
+            turn.steered = Some((lang, first));
             return;
         }
+        self.send_question(rt, sim, config, synth, question, lang, released);
+    }
 
+    /// Sends `question` to the model on the running simulator's recording, starting the
+    /// conversation over first if it must be (a new session was asked for, the model settings
+    /// changed, another recording), or answers why it can't be. `lang` and `released`: as given
+    /// to [`Self::ask`], which has taken in `lang`.
+    #[allow(clippy::too_many_arguments)]
+    fn send_question(
+        &mut self,
+        rt: &Handle,
+        sim: Option<&mut Sim>,
+        config: &Config,
+        synth: &mut Synthesizer,
+        question: String,
+        lang: Option<ArrayStr<2>>,
+        released: Option<Instant>,
+    ) {
+        // Whisper distinguishes Nynorsk (`nn`), but both Norwegian forms use the `no` voice.
+        let lang = lang.map(language::voice_code);
+        let spoken = config.get().engineer_reply_language();
+        let known = lang.is_some() || spoken.is_some();
+        let lang = spoken.unwrap_or(lang.unwrap_or(self.last_lang));
         let timeline = Arc::new(Timeline::new(released, Instant::now()));
         let mut sim = sim;
         let database = sim
@@ -842,22 +888,24 @@ impl Engineer {
             text,
             entry: None,
             steer,
+            steered: None,
         });
     }
 
-    /// Called every frame: answers come in, are synthesized and played. `sim_running`: whether a
-    /// simulator is running at all.
+    /// Called every frame: answers come in, are synthesized and played. `sim`: the running
+    /// simulator, if any, for the questions a turn left over.
     pub fn update(
         &mut self,
         rt: &Handle,
-        sim_running: bool,
+        sim: Option<&mut Sim>,
         config: &Config,
         synth: &mut Synthesizer,
         speaker: Option<&AudioDevice>,
     ) {
         self.languages.update(rt, config.get().voices());
+        let mut sim = sim;
         // The game stopped: the conversation lets go of the database, so the plugin can delete it
-        if !sim_running && self.session.is_some() {
+        if sim.is_none() && self.session.is_some() {
             let interrupted = self.turn.take().is_some();
             self.drop_session(rt);
             self.notice(t!("engineer.sim_stopped"));
@@ -907,14 +955,14 @@ impl Engineer {
             if let Some(result) = turn.task.update(rt)
                 && let Some(turn) = self.turn.take()
             {
-                // Questions the turn missed (it was writing its final text) are asked next. A
-                // failed or refused turn was forgotten, and they go with it: they may build on
-                // its question
+                // Questions the turn missed (it was writing its final text) are asked next, as
+                // any question is. A failed or refused turn was forgotten, and they go with it:
+                // they may build on its question
                 let missed = match &result {
                     Ok(reply) if reply.stop != StopReason::Refusal => turn.steer.take(),
                     Ok(_) | Err(_) => Vec::new(),
                 };
-                let lang = turn.lang;
+                let (lang, released) = turn.steered.unwrap_or_default();
                 match result {
                     Ok(reply) => self.answer(rt, config, synth, reply, turn),
                     Err(e) => {
@@ -930,12 +978,10 @@ impl Engineer {
                 for playback in self.incoming.iter_mut().chain(&mut self.line) {
                     playback.writing = false;
                 }
-                // On the same session, so not once it's full (a new one is asked for): they'd
-                // end the same way, and the tone already said the answer was cut off
-                if !missed.is_empty() && !self.new_session {
-                    let timeline = Arc::new(Timeline::new(None, Instant::now()));
+                if !missed.is_empty() {
                     let question = missed.join("\n");
-                    self.start_turn(rt, config, synth, question, lang, true, timeline);
+                    let sim = sim.as_deref_mut();
+                    self.send_question(rt, sim, config, synth, question, lang, released);
                 }
             }
         }
@@ -1097,12 +1143,19 @@ impl Engineer {
         }
     }
 
-    /// The gap: while the answer at the front has played all it has and waits on its pilot turn
-    /// for more, the first complete answer behind it plays. The waiting one stays next, and
-    /// carries on once that's played. This is the one place an answer is moved ahead in the
-    /// line, and only complete ones are, so a gap never opens another.
-    fn fill_gap(&mut self) {
-        if !self.line.front().is_some_and(Playback::waiting_on_its_turn) {
+    /// The gap: once the answer at the front has played all it has and waited on its pilot turn
+    /// for more for [`GAP_AFTER`], the first complete answer behind it plays. The waiting one
+    /// stays next, and carries on once that's played. This is the one place an answer is moved
+    /// ahead in the line, and only complete ones are, so a gap never opens another.
+    fn fill_gap(&mut self, now: Instant) {
+        let Some(front) = self.line.front_mut() else {
+            return;
+        };
+        if !front.waiting_on_its_turn() {
+            front.waiting_since = None;
+            return;
+        }
+        if now.duration_since(*front.waiting_since.get_or_insert(now)) < GAP_AFTER {
             return;
         }
         // An answer starts playing at the front, or here: a check that drops one gone stale
@@ -1174,6 +1227,7 @@ impl Engineer {
             }
             playback.sentences.submitted();
             playback.flushed = false;
+            playback.waiting_since = None;
             if let Some(timeline) = &playback.timeline {
                 timeline.first_audio();
             }
@@ -1190,7 +1244,7 @@ impl Engineer {
         // without SDL saying it was removed doesn't keep it forever, holding up the spotter's calls
         if !playback.done || playback.sentences.pending().is_some() {
             // More to come: something else may play while it waits for it
-            self.fill_gap();
+            self.fill_gap(Instant::now());
             return;
         }
         let drained = match &playback.stream {
@@ -1848,6 +1902,62 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "run alone with SDL_AUDIO_DRIVER=dummy"]
+    fn a_removed_speaker_stops_only_the_answer_playing_on_it() {
+        let sdl = sdl3::init().unwrap();
+        let audio = sdl.audio().unwrap();
+        let spec = piece().spec();
+        let device = audio.open_playback_device(&spec).unwrap();
+        let stream = || device.clone().open_device_stream(Some(&spec)).unwrap();
+        let on = |playback: &Playback| {
+            let stream = playback.stream.as_ref().unwrap();
+            stream.device_id().unwrap().id().0
+        };
+
+        // A complete answer plays in the gap of one that said its first sentence
+        let mut gap = Playback::tone();
+        gap.stream = Some(stream());
+        let (_send, mut waiting) = being_written();
+        let said = stream();
+        said.put_data_f32(&piece().samples).unwrap();
+        waiting.stream = Some(said);
+        waiting.sentences.pieces.push_back(piece());
+        waiting.sentences.submitted();
+        waiting.flushed = true;
+        let (gap_on, waiting_on) = (on(&gap), on(&waiting));
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.line.extend([gap, waiting]);
+        let notices = |engineer: &Engineer| {
+            (engineer.chat.iter())
+                .filter(|e| {
+                    e.speaker == Speaker::Notice && e.text == t!("engineer.speaker_removed")
+                })
+                .count()
+        };
+
+        // The waiting one's speaker is gone: it keeps its place, to say what it said again on
+        // whichever speaker is picked
+        engineer.speaker_removed(waiting_on, false);
+        assert_eq!(engineer.line.len(), 2);
+        assert_eq!(notices(&engineer), 1);
+        let waiting = &engineer.line[1];
+        assert!(waiting.stream.is_none());
+        assert!(!waiting.flushed);
+        assert_eq!(waiting.sentences.submitted, 0);
+        assert_eq!(waiting.sentences.skip(), 0);
+        assert_eq!(
+            waiting.sentences.pending().unwrap().samples,
+            piece().samples
+        );
+
+        // The front's is gone: it stops
+        engineer.speaker_removed(gap_on, false);
+        assert_eq!(engineer.line.len(), 1);
+        assert_eq!(notices(&engineer), 2);
+        assert!(engineer.line[0].writing);
+    }
+
+    #[test]
     fn a_refused_answer_is_replaced_by_say_again() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _entered = runtime.enter();
@@ -1885,6 +1995,7 @@ mod tests {
                     text,
                     entry: None,
                     steer: Steer::default(),
+                    steered: None,
                 },
             );
             assert!(engineer.line.is_empty(), "spoken: {spoken}");
@@ -1947,13 +2058,15 @@ mod tests {
     }
 
     /// Whether `front` is still at the front of the line `[front, behind]` once a gap is looked
-    /// for.
-    fn stays_ahead(mut front: Playback, behind: Playback) -> bool {
+    /// for in a frame, and again `after` that.
+    fn stays_ahead(mut front: Playback, behind: Playback, after: Duration) -> bool {
         let marker = Arc::new(Timeline::new(None, Instant::now()));
         front.timeline = Some(marker.clone());
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
         engineer.line.extend([front, behind]);
-        engineer.fill_gap();
+        let now = Instant::now();
+        engineer.fill_gap(now);
+        engineer.fill_gap(now + after);
         assert_eq!(engineer.line.len(), 2);
         (engineer.line[0].timeline.as_ref()).is_some_and(|first| Arc::ptr_eq(first, &marker))
     }
@@ -1984,28 +2097,43 @@ mod tests {
     #[test]
     fn a_complete_answer_plays_in_the_gap_of_an_answer_being_written() {
         let (_send, front) = being_written();
-        assert!(!stays_ahead(front, Playback::tone()));
+        assert!(!stays_ahead(front, Playback::tone(), GAP_AFTER));
+    }
+
+    #[test]
+    fn the_gap_opens_only_after_a_pause() {
+        let (_send, front) = being_written();
+        let almost = GAP_AFTER - Duration::from_millis(1);
+        assert!(stays_ahead(front, Playback::tone(), almost));
     }
 
     #[test]
     fn nothing_jumps_ahead_of_an_answer_with_speech_to_play() {
         let (_send, mut front) = being_written();
         front.sentences.pieces.push_back(piece());
-        assert!(stays_ahead(front, Playback::tone()));
+        assert!(stays_ahead(front, Playback::tone(), GAP_AFTER));
+    }
+
+    #[test]
+    fn nothing_jumps_ahead_of_an_answer_with_its_next_piece_ready() {
+        // Synthesized, not yet taken from its speech
+        let (send, front) = being_written();
+        send.send(Ok(piece())).unwrap();
+        assert!(stays_ahead(front, Playback::tone(), GAP_AFTER));
     }
 
     #[test]
     fn nothing_jumps_ahead_of_a_finished_turn() {
         let (_send, mut front) = being_written();
         front.writing = false;
-        assert!(stays_ahead(front, Playback::tone()));
+        assert!(stays_ahead(front, Playback::tone(), GAP_AFTER));
     }
 
     #[test]
     fn only_complete_answers_use_the_gap() {
         let (_send, front) = being_written();
         let behind = Playback::new(SpeechOutput::ready(piece()), false);
-        assert!(stays_ahead(front, behind));
+        assert!(stays_ahead(front, behind, GAP_AFTER));
     }
 
     #[test]
@@ -2072,12 +2200,13 @@ mod tests {
             text,
             entry: None,
             steer: Steer::default(),
+            steered: None,
         });
         let deadline = Instant::now() + Duration::from_secs(10);
         while engineer.is_thinking() {
             assert!(Instant::now() < deadline, "the turn never ended");
             std::thread::sleep(Duration::from_millis(1));
-            engineer.update(rt, true, &config, &mut synth, None);
+            engineer.update(rt, None, &config, &mut synth, None);
         }
         assert_eq!(engineer.line.len(), 1);
         assert!(!engineer.line[0].writing);
@@ -2135,6 +2264,7 @@ mod tests {
                     text,
                     entry: None,
                     steer: Steer::default(),
+                    steered: None,
                 },
             );
             assert_eq!(engineer.line.len(), 1, "{stop:?}");
@@ -2191,6 +2321,7 @@ mod tests {
                 text: receiver,
                 entry: None,
                 steer: Steer::default(),
+                steered: None,
             };
             engineer.answer(
                 rt,
@@ -2267,7 +2398,7 @@ mod tests {
                     start.elapsed() < std::time::Duration::from_secs(120),
                     "stuck on {question:?}"
                 );
-                engineer.update(rt, true, &config, &mut synth, None);
+                engineer.update(rt, Some(&mut *sim), &config, &mut synth, None);
                 std::thread::sleep(std::time::Duration::from_millis(16));
             }
             println!("{question:?} answered in {:.1?}", start.elapsed());
@@ -2414,6 +2545,8 @@ mod tests {
         /// It replies without looking at them
         Reply,
         Refuse,
+        /// It replies with the conversation full
+        Full,
         Fail,
     }
 
@@ -2449,6 +2582,7 @@ mod tests {
                     }
                     Some(Act::Reply) => StopReason::EndTurn,
                     Some(Act::Refuse) => StopReason::Refusal,
+                    Some(Act::Full) => StopReason::ContextWindowExceeded,
                     Some(Act::Fail) | None => anyhow::bail!("scripted failure"),
                 };
                 Ok(Reply {
@@ -2485,15 +2619,20 @@ mod tests {
     }
 
     impl Scripted {
+        /// No voices: nothing is synthesized, and tones stand in for "say again".
         fn new() -> Self {
+            Self::with_config("{}")
+        }
+
+        /// With the config `raw`.
+        fn with_config(raw: &str) -> Self {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let _entered = runtime.enter();
             let rt = runtime.handle();
             let dir = tempfile::tempdir().unwrap();
-            // No voices: nothing is synthesized, and tones stand in for "say again"
-            let config = rt
-                .block_on(Config::new(dir.path().join("config.json")))
-                .unwrap();
+            let path = dir.path().join("config.json");
+            std::fs::write(&path, raw).unwrap();
+            let config = rt.block_on(Config::new(&path)).unwrap();
             let synth = Synthesizer::new(rt, &config.get());
             let one = NonZeroUsize::new(1).unwrap();
             let pool = Pool::new(
@@ -2557,8 +2696,8 @@ mod tests {
             while !done(self) {
                 assert!(Instant::now() < deadline, "never {what}");
                 std::thread::sleep(Duration::from_millis(1));
-                let (config, synth) = (&self.config, &mut self.synth);
-                (self.engineer).update(self.runtime.handle(), true, config, synth, None);
+                let (sim, config, synth) = (Some(&mut *self.sim), &self.config, &mut self.synth);
+                (self.engineer).update(self.runtime.handle(), sim, config, synth, None);
             }
         }
 
@@ -2626,6 +2765,47 @@ mod tests {
             scripted.until("answered", |s| !s.engineer.is_thinking());
             assert_eq!(scripted.questions().len(), 1);
         }
+    }
+
+    #[test]
+    fn left_over_steers_start_over_once_the_conversation_is_full() {
+        let mut scripted = Scripted::new();
+        let full = scripted.engineer.session.as_ref().unwrap().state.clone();
+        scripted.ask("How are the fronts?");
+        scripted.ask("And the rears?");
+        scripted.acts.send(Act::Full).unwrap();
+        // Asked on a new conversation, or told why there isn't one (Bono Cloud, signed out)
+        let error = t!(
+            "engineer.error_starting",
+            error = t!("provider.bono_cloud_sign_in")
+        );
+        scripted.until("started over", |s| {
+            let restarted = (s.engineer.session.as_ref())
+                .is_some_and(|session| !Arc::ptr_eq(&session.state, &full));
+            let failed =
+                (s.engineer.chat.iter()).any(|e| e.speaker == Speaker::Notice && e.text == error);
+            restarted || failed
+        });
+        // Not on the full one
+        assert_eq!(scripted.questions().len(), 1);
+    }
+
+    #[test]
+    fn left_over_steers_are_answered_in_their_own_language() {
+        // Voice paths only stand in for installed choices: nothing is synthesized
+        let mut scripted =
+            Scripted::with_config(r#"{"voices": {"en": "en.onnx", "es": "es.onnx"}}"#);
+        let heard = |text: &str, lang| Heard::Question {
+            text: text.into(),
+            lang,
+            released: Instant::now(),
+        };
+        scripted.hear(heard("How are the fronts?", arrstr!("en")));
+        assert_eq!(scripted.engineer.turn.as_ref().unwrap().lang, arrstr!("en"));
+        scripted.hear(heard("¿Y las traseras?", arrstr!("es")));
+        scripted.acts.send(Act::Reply).unwrap();
+        scripted.until("asked again", |s| s.questions().len() == 2);
+        assert_eq!(scripted.engineer.turn.as_ref().unwrap().lang, arrstr!("es"));
     }
 
     #[test]
