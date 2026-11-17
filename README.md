@@ -6,12 +6,13 @@ Built in Rust with SDL3 and egui, Bono uses local Whisper speech recognition and
 
 ## Simulator support
 
-Both current simulator integrations run on Windows:
+All current simulator integrations run on Windows:
 
 - **Le Mans Ultimate:** a plugin records telemetry, scoring, and weather data. Bono can install, update, and enable its plugin from the setup guide or Simulators menu. Close the game before installing or updating it.
 - **RaceRoom Racing Experience:** Bono reads the game's shared memory directly; no Bono plugin is required.
+- **iRacing:** Bono reads the iRacing SDK's shared memory and session info directly; no Bono plugin is required. iRacing shares the player's car in detail but other cars only by lap progress, lap times, places, gear and revs, and it gives no world positions, so the spotter takes cars alongside from iRacing's own left/right report. Sector times, lap starts, opponents' speeds, pit stops and gaps are worked out from that lap progress.
 
-Bono locates Le Mans Ultimate and RaceRoom in Steam's libraries; both games are assumed to be installed through Steam. It follows Steam's running flags and also checks running processes once a second (`Le Mans Ultimate.exe`; `RRRE64.exe` or `RRRE.exe`), so games launched outside Steam are detected too. On Windows, a fresh process-name snapshot every 30 polls catches games hidden by cached names after process-ID reuse, even while another game runs. Recording settings are passed to a game again each time it starts running.
+Bono locates Le Mans Ultimate and RaceRoom in Steam's libraries; both games are assumed to be installed through Steam. It follows Steam's running flags and also checks running processes once a second (`Le Mans Ultimate.exe`; `RRRE64.exe` or `RRRE.exe`; `iRacingSim64DX11.exe`, `iRacingSim64.exe` or `iRacingSim.exe`), so games launched outside Steam are detected too. iRacing is followed by its process alone, wherever it's installed. On Windows, a fresh process-name snapshot every 30 polls catches games hidden by cached names after process-ID reuse, even while another game runs. Recording settings are passed to a game again each time it starts running.
 
 The application contains Linux and macOS build paths, but its current simulator adapters are Windows-only.
 
@@ -226,7 +227,7 @@ cargo test -p bono --no-default-features
 cargo test -p bono-sim -p bono-i18n -p bono-phonemizer
 ```
 
-Some integration tests are ignored by default because they require live provider credentials, a recorded telemetry database, or a voice model. See the tests in `src/provider/`, `src/engineer.rs`, and `src/synthesizer.rs` before enabling them. Building or testing the entire workspace on Windows also builds the LMU plugin and requires its game SDK.
+Some integration tests are ignored by default because they require live provider credentials, a recorded telemetry database, a voice model, or iRacing's saved telemetry (`BONO_IRACING_TELEMETRY`, a folder of `.ibt` files, for `sim::iracing::tests`). See the tests in `src/provider/`, `src/engineer.rs`, and `src/synthesizer.rs` before enabling them. Building or testing the entire workspace on Windows also builds the LMU plugin and requires its game SDK.
 
 Settings are saved as `config.json` in SDL's per-user preference directory for organization/application `bono`/`bono`. Downloaded Whisper models and Piper voices are stored beneath that directory in `whisper/` and `piper/`. Prefer changing settings through the interface.
 

@@ -20,7 +20,11 @@ use std::{
 use tokio::sync::{Mutex, watch};
 
 #[cfg(windows)]
+mod iracing;
+#[cfg(windows)]
 mod lmu;
+#[cfg(windows)]
+mod memory;
 #[cfg(any(windows, test))]
 mod probe;
 #[cfg(windows)]
@@ -553,6 +557,7 @@ fn simulators(programs: &mut Programs) -> Vec<Box<Sim<dyn Simulator>>> {
     {
         add(&mut simulators, programs, lmu::LeMansUltimate::new);
         add(&mut simulators, programs, |_| rrre::RaceRoom::new());
+        add(&mut simulators, programs, |_| iracing::IRacing::new());
     }
     simulators
 }
