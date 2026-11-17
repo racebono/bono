@@ -177,11 +177,18 @@ pub struct Converter {
 /// finished once its count has gone up since the winner's did: over the line after it (a car a lap
 /// down too, its race done at the flag).
 struct Flag {
-    /// The last update before the flag (it came since), the most laps any car had at the first
-    /// with it, and the cars furthest on then (see `ALONGSIDE`)
+    /// The last update before the flag (it came since), the first with it, the most laps any
+    /// car had then, and the cars furthest on then (see `ALONGSIDE`)
     since: f64,
+    seen: f64,
     most: Option<i64>,
     leading: Vec<i64>,
+    /// Whether who won can't be known (see `convert`): none is taken, and nobody finishes but by
+    /// the cool-down
+    undecided: bool,
+    /// The update a winner was first taken at: it can change for a moment after, as counts come
+    /// an update or so after their crossings
+    decided: Option<f64>,
     /// When the winner's count went up for its finish, once it has, the laps it had then, and
     /// which car it is
     finish: Option<f64>,
@@ -427,6 +434,9 @@ impl Converter {
                 .collect();
             self.flag = Some(Some(Flag {
                 since: time - dt.unwrap_or(0.0),
+                seen: time,
+                undecided: false,
+                decided: None,
                 most: cars.iter().filter_map(|c| c.laps_completed).max(),
                 leading,
                 finish: None,
@@ -436,14 +446,23 @@ impl Converter {
         }
         let total = race_laps(frame);
         if let Some(Some(flag)) = &mut self.flag
-            && flag.finish.is_none_or(|at| time - at <= COUNT_LAG)
+            && !flag.undecided
+            && flag.decided.is_none_or(|at| time - at <= COUNT_LAG)
         {
             // A race of so many laps: the first car over the line with them all done, whenever the
-            // flag came (a moment before or after). Until a moment after, as below
+            // flag came (a moment before or after). Until a moment after, as below. Not known
+            // with a car that has them done but wasn't timed over the line (done before the
+            // recording began, or with a move), nor with one already past them (a flag a lap late)
             let done = cars
                 .iter()
                 .filter(|c| total.is_some() && c.laps_completed == total)
                 .filter_map(|c| Some((counted(c.idx)?, c.laps_completed, c.idx)));
+            flag.undecided |= total.is_some_and(|total| {
+                cars.iter().any(|c| {
+                    c.laps_completed.is_some_and(|laps| laps > total)
+                        || (c.laps_completed == Some(total) && counted(c.idx).is_none())
+                })
+            });
             // Else, the first car over the line since with more laps than anyone had at the flag.
             // Until a moment after: a car over the line just before can have its count go up an
             // update after the one that came first, and a count timed ahead of the line is timed
@@ -467,14 +486,22 @@ impl Converter {
                 .winner
                 .and_then(|idx| Some((counted(idx)?, flag.laps, idx)));
             let window = first.chain(leading).filter(|_| total.is_none());
-            if let Some((at, laps, idx)) = done
+            let best = done
                 .chain(window)
                 .chain(taken)
-                .min_by(|a, b| a.0.total_cmp(&b.0))
-            {
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            // A timed race's count from before the first update with the flag, by more than the
+            // moment the two can be apart, only taken as the window runs from the last update
+            // without it: the flag came somewhere in between (the recording held up), and the
+            // count may have started the last lap rather than finished it
+            flag.undecided |= total.is_none()
+                && flag.winner.is_none()
+                && best.is_some_and(|(at, _, _)| at < flag.seen - FINISH_WINDOW);
+            if let Some((at, laps, idx)) = best.filter(|_| !flag.undecided) {
                 flag.finish = Some(at);
                 flag.laps = laps;
                 flag.winner = Some(idx);
+                flag.decided.get_or_insert(time);
             }
         }
         // The winner's finish timed at the line once it's over (see `CarTrack::update`), however
@@ -1582,9 +1609,13 @@ struct CarTrack {
     lap: Option<i32>,
     /// When the current lap started: when the car crossed the line, or else when the count went up
     lap_start: Option<f64>,
+    /// Whether `lap_start` is when the car crossed the line
+    lap_start_at_line: bool,
     /// When the car last crossed the line, and its distance there, while no lap count has gone
     /// up for it yet
     line: Option<(f64, f64)>,
+    /// The update that saw it cross
+    line_seen: f64,
     /// When the lap count last went up, and the car's distance then, while it hasn't been seen
     /// crossing the line for it
     counted: Option<(f64, f64)>,
@@ -1726,7 +1757,14 @@ impl CarTrack {
             self.line = None;
             self.counted = None;
             self.lap_start = None;
+            self.lap_start_at_line = false;
             self.furthest = self.distance;
+            // Counted out of the world: no crossing (see below)
+            if matches!((self.lap, lap), (Some(previous), Some(lap)) if lap > previous)
+                && self.finish_progress.is_none()
+            {
+                self.counted_at = None;
+            }
             self.lap = lap.or(self.lap);
             self.anchor = None;
             self.speed = None;
@@ -1823,14 +1861,23 @@ impl CarTrack {
         // Counted an update or so before the car got to the line: when it gets there, at the speed
         // it's going (cars over together go in their order)
         let mut due = None;
+        // The crossing the count is for, when the count came with it or an update or so after the
+        // update that saw it (however long before the car crossed: the recording can hold up)
+        let mut timed_crossing = None;
         // Counted after a gap too long to tell driving from moving (the recording held up): the
         // crossing, from the game's time for the lap it finished, new since before the gap.
         // Only from a lap start at a crossing seen (as the game's are, but for its first lap,
         // timed from the start), and only a crossing in the gap the car could have driven to and
-        // on from
+        // on from. The game documents only that it's the car's last lap time: that it runs between
+        // the crossings seen here, and changes with the count, is checked by all this, not taken
+        // as given (failing any of it, the count isn't timed)
         let recovered = match (step, self.lap_start, new_lap_time) {
             (Some((t0, p0, dt, _)), Some(start), Some(lap_time))
-                if rose && !skipped && dt > MAX_GAP && lap.is_some_and(|lap| lap >= 2) =>
+                if rose
+                    && !skipped
+                    && dt > MAX_GAP
+                    && self.lap_start_at_line
+                    && lap.is_some_and(|lap| lap >= 2) =>
             {
                 let at = start + lap_time;
                 let reach = |from: f64, to: f64, laps: f64| {
@@ -1848,6 +1895,7 @@ impl CarTrack {
         if counted_back {
             // Another session
             self.lap_start = None;
+            self.lap_start_at_line = false;
             self.line = None;
             self.counted = None;
             self.sector_start = None;
@@ -1858,10 +1906,16 @@ impl CarTrack {
             self.counted = None;
             if rose {
                 self.lap_start = recovered;
+                self.lap_start_at_line = recovered.is_some();
             }
         } else if rose {
             let crossed = line.or(self.line.filter(near)).map(|(at, _)| at);
+            timed_crossing = line.map(|(at, _)| at).or(self
+                .line
+                .filter(|line| near(line) && time - self.line_seen <= COUNT_LAG)
+                .map(|(at, _)| at));
             self.lap_start = Some(crossed.unwrap_or(time));
+            self.lap_start_at_line = crossed.is_some();
             // Waiting for the line only while the car is still coming up to it: past it, its
             // crossing wasn't seen (dropped with a move), and the count's the lap it's on
             self.counted = (crossed.is_none() && pct > 0.5).then_some((time, after));
@@ -1878,6 +1932,7 @@ impl CarTrack {
                 // before on tracks whose laps finish elsewhere than they start) starts here
                 Some((count, counted)) if after - counted <= COUNT_FAR => {
                     self.lap_start = Some(at);
+                    self.lap_start_at_line = true;
                     // Timed ahead of the line, a moment before it got there: timed at it now
                     if at - count <= COUNT_LAG
                         && let Some(was) = self.counted_at.filter(|was| *was >= count)
@@ -1888,23 +1943,23 @@ impl CarTrack {
                         }
                     }
                 }
-                _ => self.line = Some((at, at_distance)),
+                _ => {
+                    self.line = Some((at, at_distance));
+                    self.line_seen = time;
+                }
             }
         }
         // When the count went up, driven: the crossing it's for, worked out between updates (so
-        // cars over the line together go in their order), when that was since the update before
-        // (however long ago: the recording can hold up), a moment before or is a moment after
-        // (`due`); or else now (the count can go up at a finish line elsewhere than the start). A
+        // cars over the line together go in their order), when the count came with it or a moment
+        // after (`timed_crossing`) or a moment before it (`due`); or else now (the count can go up at a finish line elsewhere than the start). A
         // count that came with a move (a reset, a reconnect) isn't a crossing, but for one timed
-        // by the game's lap time after a long gap: none, not the lap before's
+        // by the game's lap time after a long gap: none, not the lap before's (but for a car that
+        // has finished, which stays over the line it was timed over)
         if rose && continuous {
-            self.counted_at = Some(
-                due.or(line.map(|(at, _)| at))
-                    .or(self.lap_start.filter(|at| time - at <= COUNT_LAG))
-                    .unwrap_or(time),
-            );
+            self.counted_at = Some(due.or(timed_crossing).unwrap_or(time));
         } else if rose {
-            self.counted_at = recovered;
+            self.counted_at =
+                recovered.or(self.counted_at.filter(|_| self.finish_progress.is_some()));
         }
         if lap.is_some() {
             self.lap = lap;
@@ -2546,6 +2601,52 @@ mod tests {
             let track = run(first, before, after);
             assert_eq!(track.counted_at, None);
             assert_eq!(track.lap_start, None);
+        }
+
+        // Nor from a lap start that wasn't a crossing seen (the recording began past the line)
+        let mut track = CarTrack::default();
+        let mut step = |time: f64, pct: Option<f64>, lap: i32, lap_time: f64| {
+            track.update(
+                time,
+                pct,
+                Some(lap),
+                Some(false),
+                Some(3),
+                None,
+                Some(lap_time),
+                LENGTH,
+                &SECTORS,
+            );
+        };
+        step(10.0, Some(0.01), 1, 21.0);
+        let mut t = 10.5;
+        while t <= 28.0 {
+            step(t, Some(0.035 + 0.05 * (t - 10.5)), 2, 21.0);
+            t += 0.5;
+        }
+        step(36.0, Some(0.31), 3, 20.0);
+        assert_eq!(track.counted_at, None);
+        assert_eq!(track.lap_start, None);
+    }
+
+    /// A count that goes up out of the world (its car not there to cross the line) isn't timed,
+    /// nor left at the crossing before; a car that has finished keeps the one it finished over.
+    #[test]
+    fn a_count_out_of_the_world_isnt_a_crossing() {
+        for finished in [false, true] {
+            let mut track = CarTrack::default();
+            if finished {
+                track.finish_progress = Some(2.0);
+            }
+            update(&mut track, 10.0, Some(0.98), 1, &SECTORS);
+            update(&mut track, 10.5, Some(0.005), 2, &SECTORS);
+            let crossed = track.counted_at;
+            assert!(
+                crossed.is_some_and(|at| (at - 10.4).abs() < 1e-6),
+                "{crossed:?}"
+            );
+            update(&mut track, 11.0, None, 3, &SECTORS);
+            assert_eq!(track.counted_at, crossed.filter(|_| finished));
         }
     }
 
@@ -3227,25 +3328,107 @@ mod tests {
     }
 
     /// The recording held up across the flag (3 s without an update): each car over the line in
-    /// the gap is timed at its crossing, and the winner found among them. A car a lap down over
-    /// just before the winner is still racing its last lap, not finished.
+    /// the gap is timed at its crossing, and in a race of so many laps the winner found among
+    /// them. A car a lap down over just before the winner is still racing its last lap, not
+    /// finished. In a timed race, who won isn't known: the first over in the gap may have started
+    /// its last lap rather than finished it, and the car after it didn't win.
     #[test]
     fn a_hold_up_across_the_flag_times_each_crossing() {
         // Car 2 over at 3.7 s, car 0 at 4.15 s, car 1 at 4.95 s; no update from 3.6 s to 6.6 s
         let gone = [2.585, 2.505, 1.63];
         let mut updates = steady(0.1, 3.61, gone, 99.0);
         updates.extend(steady(6.6, 8.1, gone, 6.6));
-        let end = race_end(&updates, [0.0, 0.3, 50.0]);
-        let (_, standings) = end.scoring.as_ref().unwrap();
-        let standing = |car: i64| {
+        let standing = |end: &Update, car: i64| {
+            let (_, standings) = end.scoring.as_ref().unwrap();
             standings
                 .iter()
                 .find(|s| s.vehicle_id.get() == Some(car))
                 .unwrap()
+                .clone()
         };
-        let got = standing(1).time_behind_leader.get();
+        let end = race_of(&updates, [0.0, 0.3, 50.0], Some(3));
+        let got = standing(&end, 1).time_behind_leader.get();
         assert!(got.is_some_and(|got| (got - 0.8).abs() < 1e-6), "{got:?}");
-        assert_eq!(standing(2).laps_behind_leader.get(), Some(0));
+        assert_eq!(standing(&end, 2).laps_behind_leader.get(), Some(0));
+
+        // The winner's count an update after the one that saw it over the line: still timed at
+        // its crossing
+        let mut lagging = updates.clone();
+        let after = lagging.iter_mut().find(|u| u.0 == 6.6).unwrap();
+        after.3[0] = 2;
+        let end = race_of(&lagging, [0.0, 0.3, 50.0], Some(3));
+        let got = standing(&end, 1).time_behind_leader.get();
+        assert!(got.is_some_and(|got| (got - 0.8).abs() < 1e-6), "{got:?}");
+
+        // Still racing: Bono's live time behind (0.08 of a 90 s lap), no finishing gap
+        let end = race_end(&updates, [0.0, 0.3, 50.0]);
+        let got = standing(&end, 1).time_behind_leader.get();
+        assert!(got.is_some_and(|got| (got - 7.2).abs() < 1e-6), "{got:?}");
+        assert_eq!(standing(&end, 2).laps_behind_leader.get(), Some(0));
+    }
+
+    /// In a race of so many laps, a car with them all done before the recording began (its
+    /// crossing not seen) leaves who won unknown: the car over the line after it didn't win.
+    #[test]
+    fn a_lap_races_winner_done_before_the_recording_isnt_known() {
+        // Car 0 over before 0.1 s, car 1 over at 1.2 s
+        let updates = steady(0.1, 2.1, [3.05, 2.88, 2.0], 0.6);
+        let end = race_of(&updates, [0.0, 0.3, 50.0], Some(3));
+        let (_, standings) = end.scoring.as_ref().unwrap();
+        let behind = standings
+            .iter()
+            .find(|s| s.vehicle_id.get() == Some(1))
+            .unwrap()
+            .time_behind_leader
+            .get();
+        // Still racing: Bono's live time behind (0.17 of a 90 s lap), no finishing gap of 0
+        assert!(
+            behind.is_some_and(|got| (got - 15.3).abs() < 1e-6),
+            "{behind:?}"
+        );
+    }
+
+    /// In a race of so many laps, a car already past them when the flag comes (a flag a lap
+    /// late) leaves who won unknown: the next car over with them all done didn't win.
+    #[test]
+    fn a_lap_races_winner_past_its_laps_at_the_flag_isnt_known() {
+        // Car 0 over for its fourth lap at 0.5 s, car 1 for its third at 0.7 s, the flag at 1 s
+        let updates = steady(0.1, 2.1, [3.95, 2.93, 2.0], 1.0);
+        let end = race_of(&updates, [0.0, 0.3, 50.0], Some(3));
+        let (_, standings) = end.scoring.as_ref().unwrap();
+        let behind = standings
+            .iter()
+            .find(|s| s.vehicle_id.get() == Some(1))
+            .unwrap()
+            .time_behind_leader
+            .get();
+        // Still racing: Bono's live time behind (a 90 s lap and 0.02 of one), not a finish
+        assert!(
+            behind.is_some_and(|got| (got - 91.8).abs() < 1e-6),
+            "{behind:?}"
+        );
+    }
+
+    /// A car finished stays finished, with its finishing gap, though its next count isn't timed
+    /// (the recording held up longer than a car's driving can be told from a move).
+    #[test]
+    fn a_finished_car_stays_finished_over_a_long_hold_up() {
+        // Car 0 over at 1.15 s, car 1 at 1.95 s; no update from 2.1 s to 13.1 s, both over again
+        let gone = [2.885, 2.805, 1.5];
+        let mut updates = steady(0.1, 2.11, gone, 0.6);
+        updates.extend(steady(13.1, 13.6, gone, 0.6));
+        let end = race_of(&updates, [0.0, 0.3, 50.0], Some(3));
+        let (_, standings) = end.scoring.as_ref().unwrap();
+        let behind = standings
+            .iter()
+            .find(|s| s.vehicle_id.get() == Some(1))
+            .unwrap()
+            .time_behind_leader
+            .get();
+        assert!(
+            behind.is_some_and(|got| (got - 0.8).abs() < 1e-6),
+            "{behind:?}"
+        );
     }
 
     /// A car the cool-down finishes, its crossing not seen (the recording stalled over it), has
