@@ -1,6 +1,9 @@
 //! Models run by Ollama (<https://ollama.com>), on this PC or another, through its chat API.
 
-use super::{Model, ModelOption, Reply, StopReason, ToolHandler, Tools, Usage, text::TextSink};
+use super::{
+    Model, ModelOption, Reply, Steer, StopReason, ToolHandler, Tools, Usage, steer_text,
+    text::TextSink,
+};
 use crate::config::OllamaConfig;
 use anyhow::{Context, bail};
 use futures::future::{BoxFuture, join_all};
@@ -93,6 +96,8 @@ pub struct Conversation {
     tools: Tools,
     /// Every turn's tokens, by the model that answered it
     usage: BTreeMap<String, Usage>,
+    /// Questions the pilot asks while a turn runs (see [`Model::set_steer`])
+    steer: Option<Steer>,
 }
 
 impl Model for Conversation {
@@ -126,6 +131,10 @@ impl Model for Conversation {
     #[inline]
     fn usage(&self) -> &BTreeMap<String, Usage> {
         &self.usage
+    }
+
+    fn set_steer(&mut self, steer: Option<Steer>) {
+        self.steer = steer;
     }
 }
 
@@ -271,7 +280,7 @@ impl Conversation {
             }
 
             let tools = &self.tools;
-            let results = join_all(calls.iter().map(|call| {
+            let mut results = join_all(calls.iter().map(|call| {
                 let function = &call["function"];
                 let name = function["name"].as_str().unwrap_or_default().to_owned();
                 // Usually an object; some models write it as JSON text
@@ -301,6 +310,13 @@ impl Conversation {
                 }
             }))
             .await;
+            // What the pilot asked while the tools ran, taken once: it goes back with the
+            // results, in the last one's content, as the API documents no user message after them
+            let questions = self.steer.as_ref().map(Steer::take).unwrap_or_default();
+            if let (Some(last), false) = (results.last_mut(), questions.is_empty()) {
+                let content = last["content"].as_str().unwrap_or_default();
+                last["content"] = format!("{content}\n\n{}", steer_text(&questions)).into();
+            }
             self.body.messages.extend(results);
         }
 
@@ -688,6 +704,7 @@ impl ConversationBuilder {
             max_requests: self.max_requests,
             tools: self.tools,
             usage: BTreeMap::new(),
+            steer: None,
         });
     }
 }
@@ -966,6 +983,89 @@ mod tests {
         assert_eq!(conversation.body.messages.len(), 5);
         conversation.reset();
         assert_eq!(conversation.body.messages.len(), 1);
+    }
+
+    /// Pushes its question into the slot when it's called, as the pilot asking again while the
+    /// turn's tools run.
+    struct SteerOnCall(Steer, &'static str);
+
+    impl ToolHandler for SteerOnCall {
+        type Input = Value;
+
+        fn handle(
+            &self,
+            _: Value,
+        ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
+            self.0.push(self.1.into());
+            async { Ok("Fronts 80°C.".into()) }
+        }
+    }
+
+    /// A conversation with `lookup` and the `steer` tool, which asks `question` when called.
+    fn steered_conversation(url: &str, steer: &Steer, question: &'static str) -> Conversation {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = builder(url, &calls);
+        builder.tool(
+            "steer",
+            None,
+            json!({"type": "object"}),
+            SteerOnCall(steer.clone(), question),
+        );
+        let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+        conversation.set_steer(Some(steer.clone()));
+        conversation
+    }
+
+    #[tokio::test]
+    async fn steer_goes_after_tool_results() {
+        let (url, requests) = mock(vec![
+            stream(
+                &[],
+                json!([
+                    {"function": {"name": "steer", "arguments": {}}},
+                    {"function": {"name": "lookup", "arguments": {"what": "gap"}}}
+                ]),
+                "stop",
+            ),
+            stream(&["Fronts fine, rears too."], Value::Null, "stop"),
+        ])
+        .await;
+        let steer = Steer::default();
+        let mut conversation = steered_conversation(&url, &steer, "And the rears?");
+
+        send_streaming(&mut conversation, "Tyres?").await.unwrap();
+        let requests = requests.lock().unwrap();
+        let messages = requests[1].1["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[3]["content"], "Fronts 80°C.");
+        // In the last tool result: the API documents no user message after them
+        let steered = format!(
+            "looked up \"gap\"\n\n{}",
+            steer_text(&["And the rears?".into()])
+        );
+        assert_eq!(
+            messages[4],
+            json!({"role": "tool", "tool_name": "lookup", "content": steered})
+        );
+        // Kept in the history, and taken from the slot
+        assert_eq!(conversation.body.messages[4], messages[4]);
+        assert!(steer.take().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_steer_during_the_final_request_stays_in_the_slot() {
+        let (url, requests) = mock(vec![stream(&["Gap 2.1."], Value::Null, "stop")]).await;
+        let steer = Steer::default();
+        let mut conversation = steered_conversation(&url, &steer, "unused");
+
+        steer.push("Fuel?".into());
+        send_streaming(&mut conversation, "Gap?").await.unwrap();
+        // No tool hand-back took it: it's left for the next turn
+        assert_eq!(steer.take(), ["Fuel?"]);
+        let steered = steer_text(&["Fuel?".into()]);
+        for (_, request) in requests.lock().unwrap().iter() {
+            assert!(!request.to_string().contains(&steered));
+        }
     }
 
     #[tokio::test]

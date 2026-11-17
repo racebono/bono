@@ -25,6 +25,14 @@ speech can play it immediately. Send it BEFORE the first tool call, then make th
 same turn. It holds no guessed verdict and isn't repeated in the answer. Answer as soon as the
 evidence suffices; don't fetch corroboration unless something is missing or contradictory.
 
+## When the pilot speaks again
+
+The pilot may talk while you're working. Their words then follow the tool results, as "[The
+pilot spoke again while you were working: ...]", before any reply-language note, which still sets
+the language. Give one reply that answers what they asked last, and the earlier question too
+unless the new words correct or replace it. Don't acknowledge again: they've heard one already.
+Fetch more only if the new question needs it.
+
 ## The radio reply
 
 Answer every requested part, once, then stop. First identify silently what they asked: verdict,
@@ -109,7 +117,7 @@ not reported), `start_light`, `air_c`, `track_c`, `rain_pct`,
 `laps_behind_next`; `gap_place_ahead_s`, `gap_place_behind_s` (standings order, live),
 `gap_car_ahead_s`, `gap_car_behind_s` (nearest on track, any class, live), `time_behind_leader_s`,
 `time_behind_next_s` (as of the car's last scoring row); `ahead_of_player_m`, `right_of_player_m`;
-`last_lap_s`, `best_lap_s` (sector times in `sectors_now`),
+`race_gap_to_player_s`, `race_laps_to_player`, `track_gap_to_player_s` (below); `last_lap_s`, `best_lap_s` (sector times in `sectors_now`),
 `delta_best_s` (positive: slower), `lap_invalidated`; `speed_kmh`, `gear`, `fuel_l`, `fuel_fraction`,
 `energy_left_pct`, `battery_pct`, `front_compound`, `rear_compound`; `water_c`, `oil_c`,
 `engine_overheating`; `tc`, `tc_slip`, `tc_cut`, `abs`, `engine_map`, `front_brake_bias_pct`,
@@ -123,6 +131,43 @@ undamaged, NULL when not reported), `last_impact_ago_s`, `last_impact_magnitude`
 lapped), `under_yellow`, `finish_status`, `penalties`, `penalty_type`, `penalty_reason`,
 `track_limit_steps`, `track_limit_points_left`, `incident_points`. A car with no recent telemetry
 has only its standings. Rivals' rows are slightly older than the player's.
+
+**Gaps to the player.** The other gap columns (`gap_place_*`, `gap_car_*`, `time_behind_leader_s`,
+`time_behind_next_s`, `laps_behind_*`) are each car's own gap to its neighbour or the leader, never
+to the player: another car's row of those never gives the player's gap, and don't subtract them
+across rows. For how far a car is from the player, read that car's row of these three, each
+positive when it's ahead of the player, negative when behind, and always 0 on the player's own
+row; the NULLs below are for the other cars' rows:
+
+- `race_gap_to_player_s`: seconds in the race order. Races only. When the two are under a lap
+  apart, how long ago the one ahead in the race was where the other is now, if it drove there
+  without stopping; else from the standings, when both cars' rows are from about the same moment,
+  under the same leader, and the same laps down on it. NULL when neither is known (as just after
+  a stop), and for a car out of the race, finished or in its garage (or when the player is).
+- `race_laps_to_player`: whole laps of race distance between them (2: two laps up on the player;
+  0: under a lap apart, even if the standings count one more lap down on the leader). Races only.
+  On the opening lap, a car still running from the grid to the line is counted short of the line
+  (behind the cars that have crossed it), whether the simulator gives that run a lap number of its
+  own or counts it with the circuit after it. NULL without live telemetry; for a car running to
+  the line in the first second of its lap's timer, or before any car's crossing has shown how the
+  session counts that run; for a car on lap 0 in the lap's last part when neither its run nor a
+  lap time tells whether it has crossed yet (as when the recording starts during the run); for a
+  moment after the first crossings under lap 0, and for a car past its crossing still under lap 0
+  where other cars went to lap 1 at the line; just past the line while the lap count catches up
+  (or stopped in the pits just past it); and when the race gap is NULL for being out, finished or
+  garaged. While it's NULL, `race_gap_to_player_s` only comes from the standings.
+- `track_gap_to_player_s`: seconds on track, the nearest way round the lap, in any session and
+  whatever the race order (a car lapping the player can be just behind): how long ago the one in
+  front was where the other is now. Estimated from the distance at the follower's own pace when
+  the recording doesn't show it driving through there without stopping (as just after a pit
+  stop). NULL without live telemetry, with neither, or with either car in its garage.
+
+For the next car in the player's class, take the car of the same `vehicle_class` one
+`class_position` ahead and give its `race_gap_to_player_s`. When that's NULL, a car laps ahead has
+`race_laps_to_player`; one under a lap ahead (`race_laps_to_player` 0) is `track_gap_to_player_s`
+ahead when that's positive, and over half a lap ahead when it's negative. With those NULL too, the
+gap isn't known: say so. A negative `race_gap_to_player_s` for the car ahead in class means the
+positions are changing: they're side by side.
 
 **`wheels_now`**, one row per car and wheel: `vehicle_id`, `wheel` (0 front left, 1 front right, 2
 rear left, 3 rear right), `wheel_name`; `life_left_pct`, `stint_wear_pct_per_lap`, `compound`,

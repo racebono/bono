@@ -5,7 +5,11 @@
 use bono_sim::sys::bono_telemetry;
 use serde_json::Value;
 use std::{
-    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -35,13 +39,15 @@ struct State {
     vehicle: Option<i64>,
     /// Bumped by `clear`, so an answer asked for before it is dropped
     generation: u64,
-    stop: bool,
 }
 
 #[derive(Default)]
 struct Shared {
     state: Mutex<State>,
     wake: Condvar,
+    /// Set without the state's lock, as `Recorder`'s is: a wake-up sent just before the thread
+    /// waits is missed, and it stops at its next poll instead
+    stop: AtomicBool,
 }
 
 /// The player's damage the web API reports, as of its last answer.
@@ -53,20 +59,8 @@ pub struct VehicleCondition {
 impl VehicleCondition {
     /// Starts asking the web API. If its thread can't start, the damage stays unknown.
     pub fn start() -> Self {
-        // It's on this PC, and asked every second: anything slow means it isn't answering. Each step
-        // has its own timeout, about 1.5 s in all, and finding localhost none: ureq may look a host up
-        // on a thread of its own when that has a timeout, and such a thread could outlive the DLL.
-        // Windows answers for localhost itself. No proxy from the environment and no redirects, so
-        // nothing else is looked up or asked
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .proxy(None)
-            .max_redirects(0)
-            .timeout_connect(Some(Duration::from_millis(300)))
-            .timeout_send_request(Some(Duration::from_millis(200)))
-            .timeout_recv_response(Some(Duration::from_millis(500)))
-            .timeout_recv_body(Some(Duration::from_millis(500)))
-            .build()
-            .into();
+        // Asked every second: anything slow means it isn't answering. About 1.5 s in all
+        let agent = crate::local_agent(Duration::from_millis(400));
         Self::with(POLL, move || fetch(&agent))
     }
 
@@ -135,7 +129,7 @@ impl VehicleCondition {
 impl VehicleCondition {
     /// Asks the thread to stop after any request in flight, without waiting for it.
     pub fn stop(&self) {
-        lock(&self.shared.state).stop = true;
+        self.shared.stop.store(true, Ordering::Relaxed);
         self.shared.wake.notify_all();
     }
 }
@@ -148,7 +142,8 @@ impl Drop for VehicleCondition {
     fn drop(&mut self) {
         self.stop();
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            // Caught, as in `Recorder`'s drop: joining a thread the system already ended can panic
+            let _ = catch_unwind(AssertUnwindSafe(|| thread.join()));
         }
     }
 }
@@ -167,10 +162,10 @@ impl Shared {
         loop {
             state = self
                 .wake
-                .wait_timeout_while(state, poll, |state| !state.stop)
+                .wait_timeout_while(state, poll, |_| !self.stop.load(Ordering::Relaxed))
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
-            if state.stop {
+            if self.stop.load(Ordering::Relaxed) {
                 return;
             }
             if !state.driving.is_some_and(|at| at.elapsed() < DRIVING) {

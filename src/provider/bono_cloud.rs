@@ -11,7 +11,7 @@
 //! reserved for it up front (`/v1/sessions`). Requests without one count against a rolling
 //! 24-hour ceiling instead, a fraction of the week, which a long race can run into midway.
 
-use super::{Model, ModelOption, Reply, Tools, Usage, claude};
+use super::{Model, ModelOption, Reply, Steer, Tools, Usage, claude};
 use crate::{
     account::{Account, Status},
     config::ClaudeConfig,
@@ -678,6 +678,10 @@ impl Model for Conversation {
     fn set_tool_result_note(&mut self, note: Option<Arc<str>>) {
         self.inner.set_tool_result_note(note);
     }
+
+    fn set_steer(&mut self, steer: Option<Steer>) {
+        self.inner.set_steer(steer);
+    }
 }
 
 impl Drop for Conversation {
@@ -746,7 +750,7 @@ mod tests {
     use super::*;
     use crate::{
         account::tests::{expire_access_token, signed_in, tokens},
-        provider::{StopReason, ToolHandler},
+        provider::{StopReason, ToolHandler, steer_text},
     };
     use reqwest::Url;
     use serde_json::{Value, json};
@@ -1243,6 +1247,47 @@ mod tests {
                 assert_eq!(requests[2].1, last.1);
             }
         }
+    }
+
+    /// Pushes the pilot's next question into the slot when it's called.
+    struct SteerOnCall(Steer);
+
+    impl ToolHandler for SteerOnCall {
+        type Input = Value;
+
+        fn handle(
+            &self,
+            _: Value,
+        ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
+            self.0.push("And the rears?".into());
+            async { Ok("Gap: 2s".into()) }
+        }
+    }
+
+    #[tokio::test]
+    async fn steers_reach_the_conversation() {
+        let call = json!({
+            "model": "claude-sonnet-5-5",
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": "gap-1", "name": "gap", "input": {}}],
+        });
+        let (url, requests) = mock(vec![(200, call.to_string()), answer()]).await;
+        let account = signed_in(url, "access-1");
+        let steer = Steer::default();
+        let mut tools = Tools::default();
+        tools.insert(
+            "gap",
+            None,
+            json!({"type": "object"}),
+            SteerOnCall(steer.clone()),
+        );
+        let mut conversation = conversation(&account, tools);
+        conversation.set_steer(Some(steer));
+
+        assert_eq!(conversation.send("Pit?".into()).await.unwrap().text, "Box.");
+        let requests = requests.lock().unwrap();
+        let content = &requests[1].1["messages"][2]["content"];
+        assert_eq!(content[1]["text"], steer_text(&["And the rears?".into()]));
     }
 
     #[tokio::test]

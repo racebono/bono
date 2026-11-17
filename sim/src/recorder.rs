@@ -167,6 +167,7 @@ impl Recorder {
             session_time: AtomicU64::new(0f64.to_bits()),
             failed: AtomicBool::new(false),
             reset_pending: AtomicBool::new(left_over),
+            stop: AtomicBool::new(false),
         });
 
         let thread = std::thread::Builder::new()
@@ -442,10 +443,13 @@ impl Recorder {
 impl Drop for Recorder {
     /// Writes what's queued, then stops.
     fn drop(&mut self) {
-        lock(&self.shared.queue).stop = true;
+        self.shared.stop.store(true, Ordering::Relaxed);
         self.shared.wake.notify_one();
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            // Joining a thread the system already ended (a game closing its plugins as it exits,
+            // after every other thread is gone) can panic. It's caught here: a panic leaving this
+            // drop could meet another one while unwinding, which aborts the game
+            let _ = catch_unwind(AssertUnwindSafe(|| thread.join()));
         }
     }
 }
@@ -460,6 +464,10 @@ struct Shared {
     session_time: AtomicU64,
     failed: AtomicBool,
     reset_pending: AtomicBool,
+    /// Set without the queue's lock, so stopping can't wait for a lock a thread the system ended
+    /// still holds. A wake-up sent just before the writer waits is missed: it stops at its next
+    /// look at settings.json instead
+    stop: AtomicBool,
 }
 
 /// What's waiting to be written, each update with the epoch it was queued in.
@@ -473,7 +481,6 @@ struct Queue {
     scoring: Vec<(i64, bono_session_info, Vec<bono_standing>)>,
     /// `clear` was called: the writer deletes what was recorded
     clear: bool,
-    stop: bool,
 }
 
 impl Queue {
@@ -653,12 +660,12 @@ impl Writer {
                 let (mut queue, _) = shared
                     .wake
                     .wait_timeout_while(queue, SETTINGS_CHECK, |queue| {
-                        !queue.stop && !queue.clear && queue.is_empty()
+                        !shared.stop.load(Ordering::Relaxed) && !queue.clear && queue.is_empty()
                     })
                     .unwrap_or_else(PoisonError::into_inner);
 
                 // Stopped, and nothing left to write
-                if queue.stop && queue.is_empty() {
+                if shared.stop.load(Ordering::Relaxed) && queue.is_empty() {
                     return Ok(());
                 }
 
@@ -749,8 +756,9 @@ impl Writer {
             }
 
             // The forecast, now and then, after what's waiting has been written. A source that doesn't
-            // answer only skips it this time
+            // answer only skips it this time. Not while stopping: the game waits for the writer then
             if let Some(forecast) = &mut self.forecast
+                && !shared.stop.load(Ordering::Relaxed)
                 && Instant::now() >= next_forecast
             {
                 next_forecast = Instant::now() + FORECAST_CHECK;
@@ -812,7 +820,10 @@ mod tests {
     #[test]
     fn records_into_the_database() {
         let dir = tempfile::tempdir().unwrap();
-        let forecast: ForecastSource = Box::new(|session_time| {
+        // The writer doesn't read the forecast once stopping, so the test waits for it first
+        let (asked_tx, asked) = std::sync::mpsc::channel();
+        let forecast: ForecastSource = Box::new(move |session_time| {
+            let _ = asked_tx.send(());
             let mut point = bono_forecast_point::default();
             point.session_time = Some(session_time).into();
             point.sky_text = Some("Clear".to_owned()).into();
@@ -845,6 +856,7 @@ mod tests {
             .count();
         assert_eq!(kept, 2);
 
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
         drop(recorder);
         let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
         let count = |table: &str| -> i64 {

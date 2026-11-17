@@ -95,6 +95,48 @@ pub trait Model: Send {
     /// answer in: it's then the last thing the model reads before answering, after telemetry in
     /// another language. `None`: no note. Claude's conversations add it as a text block after the results; the others don't.
     fn set_tool_result_note(&mut self, _note: Option<Arc<str>>) {}
+
+    /// Questions the pilot asks while the next turns run, taken at each tool hand-back and added
+    /// after the tool results, before the note (see [`steer_text`]). What's still in the slot when
+    /// a turn ends is left there. `None`: no slot. Claude's conversations add it as a text block;
+    /// OpenAI's and Ollama's to the last tool result's content, as their APIs document no user
+    /// message after tool results.
+    fn set_steer(&mut self, _steer: Option<Steer>) {}
+}
+
+/// The questions the pilot asks while a turn runs, waiting for the turn to take them (see
+/// [`Model::set_steer`]). Clones share the slot; it's locked only to push or take, so a question
+/// is either taken by the turn or left for whoever takes it next, never both.
+#[derive(Clone, Default)]
+pub struct Steer(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl Steer {
+    /// Adds a question after the ones waiting.
+    pub fn push(&self, question: String) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(question);
+    }
+
+    /// Every question waiting, in the order asked, leaving the slot empty.
+    pub fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+/// What the model reads for `questions` the pilot asked while it was working, the same for every
+/// provider.
+pub fn steer_text(questions: &[String]) -> String {
+    let said = questions
+        .iter()
+        .map(|question| format!("\"{question}\""))
+        .collect::<Vec<_>>()
+        .join(", then ");
+    format!(
+        "[The pilot spoke again while you were working: {said}. Give one reply that covers what \
+         they asked.]"
+    )
 }
 
 /// A conversation with the model `config` picks, with the `system` prompt and `tools`. Bono
