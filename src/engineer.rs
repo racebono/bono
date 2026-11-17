@@ -284,9 +284,9 @@ struct SessionState {
     /// The simulator writing the database, e.g. `lmu`
     sim: &'static str,
     tool: EngineerTool,
-    /// The game session the conversation is about (track, session type and number), for
-    /// `auto_session`
-    game_session: Option<String>,
+    /// The weekend the conversation is about, for `auto_session`: the recording's oldest epoch,
+    /// which only a clear (a new weekend) replaces
+    weekend: Option<i64>,
 }
 
 impl Engineer {
@@ -1117,7 +1117,7 @@ impl Engineer {
                 tool,
                 pool,
                 sim,
-                game_session: None,
+                weekend: None,
             })),
         })
     }
@@ -1164,10 +1164,10 @@ fn system_prompt(skill: &str, corner_names: bool) -> Arc<str> {
 
 impl SessionState {
     /// Tells the conversation which game session it's about (Bono Cloud leases it). With
-    /// `auto_session`, a new one (another track, or the next practice, qualifying or race) starts
-    /// the conversation over.
+    /// `auto_session`, a new weekend (the recording cleared: another track or event) starts the
+    /// conversation over; the next practice, qualifying or race of the same one doesn't.
     async fn follow_game_session(&mut self, auto_session: bool) {
-        let current = match game_session(&self.pool, self.sim).await {
+        let (weekend, current) = match game_session(&self.pool, self.sim).await {
             Ok(Some(current)) => current,
             Ok(None) => return,
             Err(e) => {
@@ -1176,24 +1176,42 @@ impl SessionState {
             }
         };
 
-        if self.game_session.as_ref() != Some(&current.key) {
-            if auto_session && self.game_session.is_some() {
-                log::info!("New game session: the engineer starts over");
+        // A recording without epochs can't tell weekends apart: the conversation carries on
+        if let Some(weekend) = weekend {
+            if auto_session && self.weekend.is_some_and(|known| known != weekend) {
+                log::info!("New weekend: the engineer starts over");
                 self.conversation.reset();
             }
-            self.game_session = Some(current.key.clone());
+            self.weekend = Some(weekend);
         }
         self.conversation.set_game_session(&current);
     }
 }
 
-/// The game session in the database: its track, type and number, and how long it's scheduled
-/// to last.
-async fn game_session(pool: &Pool, sim: &'static str) -> anyhow::Result<Option<GameSession>> {
+/// The game session in the database (its track, type and number, and how long it's scheduled to
+/// last), with the weekend it's in: the oldest epoch's id, `None` for recordings without epochs.
+async fn game_session(
+    pool: &Pool,
+    sim: &'static str,
+) -> anyhow::Result<Option<(Option<i64>, GameSession)>> {
     let conn = pool.get().await?;
     Ok(conn
         .run(move |conn| {
             use rusqlite::OptionalExtension;
+            // The session and its weekend in one snapshot: a clear between them would pair the
+            // old weekend's session with the new one
+            let _snapshot = conn.unchecked_transaction()?;
+            let epochs = conn
+                .prepare_cached(
+                    "SELECT 1 FROM pragma_table_list WHERE name = 'epoch' AND type = 'table'",
+                )?
+                .exists([])?;
+            let weekend = match epochs {
+                true => conn
+                    .prepare_cached("SELECT min(id) FROM epoch")?
+                    .query_row([], |row| row.get::<_, Option<i64>>(0))?,
+                false => None,
+            };
             conn.query_row(
                 "SELECT track, session_type, session_number, session_end_time FROM session \
                  ORDER BY id DESC LIMIT 1",
@@ -1207,7 +1225,7 @@ async fn game_session(pool: &Pool, sim: &'static str) -> anyhow::Result<Option<G
                         row.get::<_, Option<i64>>(2)?.unwrap_or_default()
                     );
                     let scheduled = row.get::<_, Option<f64>>(3)?;
-                    Ok(GameSession::new(key, sim, &session_type, scheduled))
+                    Ok((weekend, GameSession::new(key, sim, &session_type, scheduled)))
                 },
             )
             .optional()
@@ -1935,7 +1953,7 @@ mod tests {
                     pool: original,
                     tool: first.clone(),
                     sim: "lmu",
-                    game_session: None,
+                    weekend: None,
                 })),
             });
             engineer.follow_recording(&rt, Some(&mut *sim));
@@ -1977,6 +1995,27 @@ mod tests {
     async fn follows_the_game_session() {
         use provider::bono_cloud::SessionType;
 
+        /// Asks until the conversation is told about `key`, in another weekend than `old`.
+        async fn follow_until(
+            state: &mut SessionState,
+            recorded: &std::sync::Mutex<Recorded>,
+            auto_session: bool,
+            key: &str,
+            old: Option<i64>,
+        ) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                state.follow_game_session(auto_session).await;
+                let told = recorded.lock().unwrap().games.last().map(|game| game.key.clone());
+                if told.as_deref() == Some(key) && state.weekend.is_some() && state.weekend != old
+                {
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "{key} not recorded");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+
         for auto_session in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let recorder = Recorder::new(dir.path(), None).unwrap();
@@ -1992,46 +2031,56 @@ mod tests {
                 tool: EngineerTool::new(pool.clone()),
                 pool,
                 sim: "lmu",
-                game_session: None,
+                weekend: None,
             };
 
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while state.game_session.is_none() {
-                assert!(std::time::Instant::now() < deadline, "no session recorded");
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                state.follow_game_session(auto_session).await;
-            }
-            assert_eq!(
-                state.game_session.as_deref(),
-                Some("Circuit de la Sarthe|practice|1")
-            );
+            let practice = "Circuit de la Sarthe|practice|1";
+            follow_until(&mut state, &recorded, auto_session, practice, None).await;
+            let weekend = state.weekend;
+            // Told every turn, so a lease ended meanwhile is started again
+            let told = recorded.lock().unwrap().games.len();
             state.follow_game_session(auto_session).await;
+            {
+                let recorded = recorded.lock().unwrap();
+                let games = &recorded.games;
+                assert_eq!(games.len(), told + 1);
+                assert_eq!(games[told - 1], games[told]);
+                assert_eq!(games[told].key, practice);
+                assert_eq!(games[told].sim, "lmu");
+                assert_eq!(games[told].session_type, SessionType::Practice);
+                // Not scheduled: the type's default
+                assert_eq!(games[told].expected_minutes, 60);
+            }
 
+            // The race of the same weekend: another game session, the same conversation
             let mut race = session("race", 1);
             race.session_end_time = Some(5400.0).into();
             recorder.push_scoring(race, Vec::new());
+            let race = "Circuit de la Sarthe|race|1";
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while recorded.lock().unwrap().games.last().unwrap().key != race {
+                assert!(std::time::Instant::now() < deadline, "race not recorded");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                state.follow_game_session(auto_session).await;
+            }
+            assert_eq!(state.weekend, weekend);
+            {
+                let recorded = recorded.lock().unwrap();
+                let game = recorded.games.last().unwrap();
+                assert_eq!(game.session_type, SessionType::Race);
+                assert_eq!(game.expected_minutes, 90);
+                assert_eq!(recorded.resets, 0);
+            }
+
+            // A new weekend clears the recording, even back at the same track and session
+            recorder.clear();
+            recorder.push_scoring(session("practice", 1), Vec::new());
+            follow_until(&mut state, &recorded, auto_session, practice, weekend).await;
             drop(recorder);
             state.follow_game_session(auto_session).await;
-            assert_eq!(
-                state.game_session.as_deref(),
-                Some("Circuit de la Sarthe|race|1")
-            );
 
-            let recorded = recorded.lock().unwrap();
-            // Told every turn, so a lease ended meanwhile is started again
-            let games = &recorded.games;
-            assert_eq!(games.len(), 3);
-            assert_eq!(games[0], games[1]);
-            assert_eq!(games[0].key, "Circuit de la Sarthe|practice|1");
-            assert_eq!(games[0].sim, "lmu");
-            assert_eq!(games[0].session_type, SessionType::Practice);
-            // Not scheduled: the type's default
-            assert_eq!(games[0].expected_minutes, 60);
-            assert_eq!(games[2].key, "Circuit de la Sarthe|race|1");
-            assert_eq!(games[2].session_type, SessionType::Race);
-            assert_eq!(games[2].expected_minutes, 90);
-            // Only auto sessions start the conversation over
-            assert_eq!(recorded.resets, usize::from(auto_session));
+            // Only auto sessions start the conversation over, once
+            assert_eq!(recorded.lock().unwrap().resets, usize::from(auto_session));
         }
     }
 }
