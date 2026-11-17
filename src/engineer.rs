@@ -8,7 +8,7 @@ use crate::{
     config::{ArrayStr, Config, ModelConfig, ModelProvider},
     language::{self, LanguageDetector},
     provider::{
-        self, Model, Reply, StopReason, Tools,
+        self, Model, Reply, Steer, StopReason, Tools,
         bono_cloud::{GameSession, Lease},
     },
     sim::Sim,
@@ -136,6 +136,9 @@ struct Turn {
     text: mpsc::UnboundedReceiver<String>,
     /// The chat entry it's written into, once it says something
     entry: Option<usize>,
+    /// The pilot's questions asked while it runs, for it to take at its next tool hand-back.
+    /// What it leaves there is asked next
+    steer: Steer,
 }
 
 /// An answer in the engineer's line: speech played as it's synthesized.
@@ -498,7 +501,7 @@ impl Engineer {
     }
 
     /// What the pilot said on the radio: a question is asked, and anything else is answered
-    /// with why it can't be, cutting off whatever was being said (the pilot talked over it).
+    /// with why it can't be, after whatever is being said: nothing heard stops the engineer.
     pub fn hear(
         &mut self,
         rt: &Handle,
@@ -518,7 +521,6 @@ impl Engineer {
             }
             Heard::TooShort => {}
             Heard::Unvoiced { text, lang } => {
-                self.stop();
                 let language = language::ui_name(lang);
                 self.notice(t!(
                     "engineer.no_voice_for",
@@ -528,7 +530,6 @@ impl Engineer {
                 self.say_again(rt, config, synth);
             }
             Heard::Nothing => {
-                self.stop();
                 self.misheard += 1;
                 match self.misheard >= MISHEARD_HINT {
                     true => {
@@ -540,13 +541,11 @@ impl Engineer {
                 self.say_again(rt, config, synth);
             }
             Heard::Failed(e) => {
-                self.stop();
                 self.notice(t!("engineer.error_hearing", error = format!("{e:#}")));
                 self.say_again(rt, config, synth);
             }
             // The voice may not be there either: the tone says it
             Heard::NotListening(why) => {
-                self.stop();
                 self.notice(match why {
                     NotListening::NoMicrophone => t!("engineer.no_microphone"),
                     NotListening::NoModel => t!("engineer.no_stt_model"),
@@ -555,7 +554,6 @@ impl Engineer {
                 self.no_beep();
             }
             Heard::NoVoice(lang) => {
-                self.stop();
                 self.notice(match lang {
                     Some(lang) => {
                         t!(
@@ -568,7 +566,6 @@ impl Engineer {
                 self.no_beep();
             }
             Heard::UnsupportedLanguage(lang) => {
-                self.stop();
                 self.notice(t!(
                     "engineer.stt_unsupported_language",
                     language = language::ui_name(lang)
@@ -685,8 +682,9 @@ impl Engineer {
     }
 
     /// The pilot asked something on the radio: it's sent to the model, with the running
-    /// simulator's telemetry, and the answer is spoken as the model writes it. An answer still on its way, or
-    /// being spoken, is dropped: the pilot talked over it.
+    /// simulator's telemetry, and the answer is spoken as the model writes it. Asked while a
+    /// question is being answered, it steers that turn instead (see [`Turn::steer`]); what's
+    /// being said carries on.
     ///
     /// `lang`: the language it was asked in; `None` if it isn't known. Unless a reply language
     /// is selected, the model is told to answer in this language, or goes by the question if
@@ -704,8 +702,6 @@ impl Engineer {
         lang: Option<ArrayStr<2>>,
         released: Option<Instant>,
     ) {
-        self.stop();
-        let timeline = Arc::new(Timeline::new(released, Instant::now()));
         // Whisper distinguishes Nynorsk (`nn`), but both Norwegian forms use the `no` voice.
         let lang = lang.map(language::voice_code);
         let spoken = config.get().engineer_reply_language();
@@ -718,7 +714,13 @@ impl Engineer {
             text: question.clone(),
             detail: None,
         });
+        // The turn hears it at its next tool hand-back, or answers it next
+        if let Some(turn) = &self.turn {
+            turn.steer.push(question);
+            return;
+        }
 
+        let timeline = Arc::new(Timeline::new(released, Instant::now()));
         let mut sim = sim;
         let database = sim
             .as_deref_mut()
@@ -774,7 +776,22 @@ impl Engineer {
             }
             self.new_session = false;
         }
+        self.start_turn(rt, config, synth, question, lang, known, timeline);
+    }
 
+    /// Starts a turn on the current session for `question`, answered in `lang` (`known`: told
+    /// to the model, see [`Self::ask`]).
+    #[allow(clippy::too_many_arguments)]
+    fn start_turn(
+        &mut self,
+        rt: &Handle,
+        config: &Config,
+        synth: &mut Synthesizer,
+        question: String,
+        lang: ArrayStr<2>,
+        known: bool,
+        timeline: Arc<Timeline>,
+    ) {
         let Some(session) = &self.session else {
             return;
         };
@@ -789,6 +806,8 @@ impl Engineer {
         // answer, the skill, the telemetry and often earlier answers are all in English
         let note: Option<Arc<str>> = known.then(|| language::reply_note(lang).into());
         let (chat, text) = mpsc::unbounded_channel();
+        let steer = Steer::default();
+        let slot = steer.clone();
         let task = Task::spawn(async move {
             let mut state = state.lock().await;
             state.follow_game_session(auto_session).await;
@@ -798,6 +817,7 @@ impl Engineer {
                 None => question,
             };
             state.conversation.set_tool_result_note(note);
+            state.conversation.set_steer(Some(slot));
             let mut on_text = |text: &str| {
                 timeline.first_text();
                 if let Some(speech) = &speech {
@@ -821,6 +841,7 @@ impl Engineer {
             lang,
             text,
             entry: None,
+            steer,
         });
     }
 
@@ -886,6 +907,14 @@ impl Engineer {
             if let Some(result) = turn.task.update(rt)
                 && let Some(turn) = self.turn.take()
             {
+                // Questions the turn missed (it was writing its final text) are asked next. A
+                // failed or refused turn was forgotten, and they go with it: they may build on
+                // its question
+                let missed = match &result {
+                    Ok(reply) if reply.stop != StopReason::Refusal => turn.steer.take(),
+                    Ok(_) | Err(_) => Vec::new(),
+                };
+                let lang = turn.lang;
                 match result {
                     Ok(reply) => self.answer(rt, config, synth, reply, turn),
                     Err(e) => {
@@ -900,6 +929,13 @@ impl Engineer {
                 // Its answer has all it will have
                 for playback in self.incoming.iter_mut().chain(&mut self.line) {
                     playback.writing = false;
+                }
+                // On the same session, so not once it's full (a new one is asked for): they'd
+                // end the same way, and the tone already said the answer was cut off
+                if !missed.is_empty() && !self.new_session {
+                    let timeline = Arc::new(Timeline::new(None, Instant::now()));
+                    let question = missed.join("\n");
+                    self.start_turn(rt, config, synth, question, lang, true, timeline);
                 }
             }
         }
@@ -1200,7 +1236,8 @@ impl Engineer {
             })
     }
 
-    /// Drops the answer on its way and the whole line, stopping the one being spoken.
+    /// Drops the answer on its way, with the questions steering it, and the whole line,
+    /// stopping the one being spoken.
     fn stop(&mut self) {
         if let Some(turn) = self.turn.take() {
             if let Some(entry) = turn.entry {
@@ -1847,6 +1884,7 @@ mod tests {
                     lang: arrstr!("en"),
                     text,
                     entry: None,
+                    steer: Steer::default(),
                 },
             );
             assert!(engineer.line.is_empty(), "spoken: {spoken}");
@@ -2033,6 +2071,7 @@ mod tests {
             lang: arrstr!("en"),
             text,
             entry: None,
+            steer: Steer::default(),
         });
         let deadline = Instant::now() + Duration::from_secs(10);
         while engineer.is_thinking() {
@@ -2095,6 +2134,7 @@ mod tests {
                     lang: arrstr!("en"),
                     text,
                     entry: None,
+                    steer: Steer::default(),
                 },
             );
             assert_eq!(engineer.line.len(), 1, "{stop:?}");
@@ -2150,6 +2190,7 @@ mod tests {
                 lang: arrstr!("en"),
                 text: receiver,
                 entry: None,
+                steer: Steer::default(),
             };
             engineer.answer(
                 rt,
@@ -2364,6 +2405,271 @@ mod tests {
             assert!(!engineer.tool.as_ref().unwrap().is_same(&first));
             engineer.quit(&rt).await.unwrap();
         }
+    }
+
+    /// How a [`ScriptedModel`]'s turn ends, once the test says.
+    enum Act {
+        /// It takes the questions steering it, then replies
+        Steered,
+        /// It replies without looking at them
+        Reply,
+        Refuse,
+        Fail,
+    }
+
+    /// What a [`ScriptedModel`] was asked.
+    #[derive(Default)]
+    struct Asked {
+        /// Each turn's question, in order
+        questions: Vec<String>,
+        /// What each [`Act::Steered`] took from its turn's steer
+        steered: Vec<Vec<String>>,
+    }
+
+    /// A conversation whose turns each wait for an [`Act`] from the test.
+    struct ScriptedModel {
+        asked: Arc<std::sync::Mutex<Asked>>,
+        acts: mpsc::UnboundedReceiver<Act>,
+        steer: Option<Steer>,
+    }
+
+    impl Model for ScriptedModel {
+        fn send_streaming<'a>(
+            &'a mut self,
+            text: String,
+            _: &'a mut (dyn FnMut(&str) + Send),
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<Reply>> {
+            self.asked.lock().unwrap().questions.push(text);
+            Box::pin(async move {
+                let stop = match self.acts.recv().await {
+                    Some(Act::Steered) => {
+                        let taken = self.steer.as_ref().map(Steer::take).unwrap_or_default();
+                        self.asked.lock().unwrap().steered.push(taken);
+                        StopReason::EndTurn
+                    }
+                    Some(Act::Reply) => StopReason::EndTurn,
+                    Some(Act::Refuse) => StopReason::Refusal,
+                    Some(Act::Fail) | None => anyhow::bail!("scripted failure"),
+                };
+                Ok(Reply {
+                    text: "Copy.".into(),
+                    stop,
+                    usage: Default::default(),
+                    model: "scripted".into(),
+                })
+            })
+        }
+
+        fn reset(&mut self) {}
+
+        fn usage(&self) -> &std::collections::BTreeMap<String, provider::Usage> {
+            unimplemented!()
+        }
+
+        fn set_steer(&mut self, steer: Option<Steer>) {
+            self.steer = steer;
+        }
+    }
+
+    /// An engineer whose conversation is a [`ScriptedModel`], on a running simulator's
+    /// recording, as the app drives it.
+    struct Scripted {
+        engineer: Engineer,
+        sim: Box<Sim>,
+        synth: Synthesizer,
+        config: Config,
+        asked: Arc<std::sync::Mutex<Asked>>,
+        acts: mpsc::UnboundedSender<Act>,
+        _dir: tempfile::TempDir,
+        runtime: tokio::runtime::Runtime,
+    }
+
+    impl Scripted {
+        fn new() -> Self {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let _entered = runtime.enter();
+            let rt = runtime.handle();
+            let dir = tempfile::tempdir().unwrap();
+            // No voices: nothing is synthesized, and tones stand in for "say again"
+            let config = rt
+                .block_on(Config::new(dir.path().join("config.json")))
+                .unwrap();
+            let synth = Synthesizer::new(rt, &config.get());
+            let one = NonZeroUsize::new(1).unwrap();
+            let pool = Pool::new(
+                Database::read_only(Arc::new(dir.path().join("a.db"))),
+                one,
+                one,
+            );
+            let sim = crate::sim::recording(pool.clone());
+            let asked = Arc::new(std::sync::Mutex::new(Asked::default()));
+            let (acts, script) = mpsc::unbounded_channel();
+            let mut engineer = Engineer::new(reqwest::Client::new(), None);
+            // As `ask` would start it, so it keeps it
+            engineer.session = Some(Session {
+                db: pool.database().path().to_owned(),
+                model: config.get().model.clone(),
+                corner_names: *config.get().corner_names(),
+                user: None,
+                lease: None,
+                state: Arc::new(Mutex::new(SessionState {
+                    conversation: Box::new(ScriptedModel {
+                        asked: asked.clone(),
+                        acts: script,
+                        steer: None,
+                    }),
+                    tool: EngineerTool::new(pool.clone()),
+                    pool,
+                    sim: "test",
+                    game_session: None,
+                })),
+            });
+            Self {
+                engineer,
+                sim,
+                synth,
+                config,
+                asked,
+                acts,
+                _dir: dir,
+                runtime,
+            }
+        }
+
+        fn ask(&mut self, question: &str) {
+            let _entered = self.runtime.enter();
+            let sim = Some(&mut *self.sim);
+            let (config, synth) = (&self.config, &mut self.synth);
+            (self.engineer).ask_text(self.runtime.handle(), sim, config, synth, question.into());
+        }
+
+        fn hear(&mut self, heard: Heard) {
+            let _entered = self.runtime.enter();
+            let sim = Some(&mut *self.sim);
+            let (config, synth) = (&self.config, &mut self.synth);
+            (self.engineer).hear(self.runtime.handle(), sim, config, synth, heard);
+        }
+
+        /// Runs the app's frames until `done`, failing if that takes too long.
+        fn until(&mut self, what: &str, done: impl Fn(&Self) -> bool) {
+            let _entered = self.runtime.enter();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done(self) {
+                assert!(Instant::now() < deadline, "never {what}");
+                std::thread::sleep(Duration::from_millis(1));
+                let (config, synth) = (&self.config, &mut self.synth);
+                (self.engineer).update(self.runtime.handle(), true, config, synth, None);
+            }
+        }
+
+        fn questions(&self) -> Vec<String> {
+            self.asked.lock().unwrap().questions.clone()
+        }
+
+        fn cancelled(&self) -> bool {
+            (self.engineer.chat.iter())
+                .any(|e| e.speaker == Speaker::Notice && e.text == t!("engineer.cancelled"))
+        }
+    }
+
+    impl Drop for Scripted {
+        fn drop(&mut self) {
+            let _entered = self.runtime.enter();
+            let quit = self.engineer.quit(self.runtime.handle());
+            let _ = self.runtime.block_on(quit);
+        }
+    }
+
+    #[test]
+    fn asking_during_a_turn_steers_it() {
+        let mut scripted = Scripted::new();
+        scripted.ask("How are the fronts?");
+        scripted.until("asked", |s| s.questions().len() == 1);
+
+        scripted.ask("And the rears?");
+        assert!(scripted.engineer.is_thinking());
+        assert!(!scripted.cancelled());
+        let last = scripted.engineer.chat.last().unwrap();
+        assert_eq!(last.speaker, Speaker::Pilot);
+        assert_eq!(last.text, "And the rears?");
+
+        // The running turn takes it: one reply covers both
+        scripted.acts.send(Act::Steered).unwrap();
+        scripted.until("answered", |s| !s.engineer.is_thinking());
+        let asked = scripted.asked.lock().unwrap();
+        assert_eq!(asked.steered, [vec!["And the rears?".to_owned()]]);
+        assert_eq!(asked.questions.len(), 1);
+    }
+
+    #[test]
+    fn left_over_steers_run_as_the_next_turn() {
+        let mut scripted = Scripted::new();
+        scripted.ask("How are the fronts?");
+        scripted.ask("And the rears?");
+        // The turn was writing its final text: it ends without taking the steer
+        scripted.acts.send(Act::Reply).unwrap();
+        scripted.until("asked again", |s| s.questions().len() == 2);
+        assert!(scripted.questions()[1].contains("And the rears?"));
+        assert!(scripted.engineer.is_thinking());
+        // The first reply was had
+        assert!((scripted.engineer.chat.iter()).any(|e| e.speaker == Speaker::Engineer));
+    }
+
+    #[test]
+    fn a_refused_turn_drops_its_left_over_steers() {
+        for act in [Act::Refuse, Act::Fail] {
+            let mut scripted = Scripted::new();
+            scripted.ask("How are the fronts?");
+            scripted.ask("No, I meant sector two.");
+            scripted.acts.send(act).unwrap();
+            // A turn for the steer would start in the frame the reply is handled
+            scripted.until("answered", |s| !s.engineer.is_thinking());
+            assert_eq!(scripted.questions().len(), 1);
+        }
+    }
+
+    #[test]
+    fn hearing_nothing_keeps_the_turn() {
+        let mut scripted = Scripted::new();
+        scripted.ask("How are the fronts?");
+
+        scripted.hear(Heard::Nothing);
+        assert!(scripted.engineer.is_thinking());
+        // "Say again", as the tone without a voice
+        assert_eq!(scripted.engineer.incoming.len(), 1);
+
+        scripted.hear(Heard::TooShort);
+        assert!(scripted.engineer.is_thinking());
+        assert_eq!(scripted.engineer.incoming.len(), 1);
+
+        scripted.hear(Heard::Failed(anyhow::anyhow!("no audio")));
+        assert!(scripted.engineer.is_thinking());
+        assert_eq!(scripted.engineer.incoming.len(), 2);
+        assert!(!scripted.cancelled());
+    }
+
+    #[test]
+    fn new_session_clears_the_turn_its_steers_and_the_line() {
+        let mut scripted = Scripted::new();
+        scripted.ask("How are the fronts?");
+        scripted.until("asked", |s| s.questions().len() == 1);
+        scripted.ask("And the rears?");
+        scripted.engineer.line.push_back(Playback::tone());
+        scripted.engineer.queue(Playback::tone());
+
+        scripted.engineer.new_session();
+        assert!(!scripted.engineer.is_thinking());
+        assert!(scripted.engineer.line.is_empty());
+        assert!(scripted.engineer.incoming.is_empty());
+
+        // The turn is gone: its reply, if it still came, would start no turn for the steer
+        scripted.acts.send(Act::Reply).unwrap();
+        let start = Instant::now();
+        scripted.until("idle a while", |_| {
+            start.elapsed() > Duration::from_millis(100)
+        });
+        assert_eq!(scripted.questions().len(), 1);
+        assert!(!scripted.engineer.is_thinking());
     }
 
     #[tokio::test(flavor = "multi_thread")]

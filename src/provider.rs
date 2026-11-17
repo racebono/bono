@@ -101,7 +101,6 @@ pub trait Model: Send {
     /// a turn ends is left there. `None`: no slot. Claude's conversations add it as a text block;
     /// OpenAI's and Ollama's to the last tool result's content, as their APIs document no user
     /// message after tool results.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn set_steer(&mut self, _steer: Option<Steer>) {}
 }
 
@@ -113,7 +112,6 @@ pub struct Steer(Arc<std::sync::Mutex<Vec<String>>>);
 
 impl Steer {
     /// Adds a question after the ones waiting.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn push(&self, question: String) {
         self.0
             .lock()
