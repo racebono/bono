@@ -32,6 +32,7 @@ use tokio::{
 };
 use tool::{Engineer as EngineerTool, SKILL, instructions};
 
+mod schedule;
 mod timeline;
 mod tool;
 
