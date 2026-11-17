@@ -337,6 +337,19 @@
     },
     {
       "id": 30,
+      "prompt": "What's my best lap so far, and how far off it was the last one?",
+      "expected_output": "Controlled synthetic fixture; lap times spoken in minutes and seconds",
+      "files": [],
+      "session": "race",
+      "assertions": [
+        "Gives the best lap time in minutes and seconds (like \"one minute thirty five point four\"), never as a number of seconds alone",
+        "Gives the last lap's difference to the best in seconds or tenths, not as a second lap time",
+        "Rounds to tenths and uses no colons or other symbols",
+        "Answers both parts in at most 30 words excluding acknowledgement"
+      ]
+    },
+    {
+      "id": 31,
       "prompt": "Give me my fuel at the end of every lap for the next five laps.",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
@@ -351,7 +364,7 @@
       ]
     },
     {
-      "id": 31,
+      "id": 32,
       "prompt": "Remind me in ten minutes to check my brake bias.",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
@@ -365,7 +378,7 @@
       ]
     },
     {
-      "id": 32,
+      "id": 33,
       "prompt": "At the start of the race, remind me the tyres will be cold.",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
@@ -378,7 +391,7 @@
       ]
     },
     {
-      "id": 33,
+      "id": 34,
       "prompt": "Tell me if the car behind gets within a second.",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
@@ -393,7 +406,7 @@
       ]
     },
     {
-      "id": 34,
+      "id": 35,
       "prompt": "Let me know when my front left drops below fifty percent.",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
@@ -406,7 +419,7 @@
       ]
     },
     {
-      "id": 35,
+      "id": 36,
       "prompt": "Give me the gap to Ruiz every lap until I pit.",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
@@ -420,7 +433,7 @@
       ]
     },
     {
-      "id": 36,
+      "id": 37,
       "prompt": "What have you got scheduled?",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
@@ -471,7 +484,7 @@
       ]
     },
     {
-      "id": 37,
+      "id": 38,
       "prompt": "Forget the fuel one.",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
@@ -519,7 +532,7 @@
       ]
     },
     {
-      "id": 38,
+      "id": 39,
       "prompt": "Make the fuel one every two laps instead.",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
@@ -569,7 +582,7 @@
       ]
     },
     {
-      "id": 39,
+      "id": 40,
       "prompt": "Start the fuel calls again from now, five more laps.",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
@@ -618,7 +631,7 @@
       ]
     },
     {
-      "id": 40,
+      "id": 41,
       "prompt": "",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
@@ -638,7 +651,7 @@
       ]
     },
     {
-      "id": 41,
+      "id": 42,
       "prompt": "",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
@@ -657,7 +670,7 @@
       ]
     },
     {
-      "id": 42,
+      "id": 43,
       "prompt": "",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
@@ -682,7 +695,7 @@
       ]
     },
     {
-      "id": 43,
+      "id": 44,
       "prompt": "",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
@@ -704,7 +717,7 @@
       ]
     },
     {
-      "id": 44,
+      "id": 45,
       "prompt": "",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
@@ -731,7 +744,7 @@
       ]
     },
     {
-      "id": 45,
+      "id": 46,
       "prompt": "",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],
@@ -753,7 +766,7 @@
       ]
     },
     {
-      "id": 46,
+      "id": 47,
       "prompt": "",
       "expected_output": "Controlled synthetic fixture; scheduled request",
       "files": [],

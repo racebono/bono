@@ -2,7 +2,7 @@
 
 Controlled manual/model scenarios, not executed results. They cover adding requests with the
 `schedule` tool, managing pending ones by talking, and the engineer's own scheduled turns,
-silent and spoken. They are evals 30 to 46 in `evals.json`, run against the synthetic race
+silent and spoken. They are evals 31 to 47 in `evals.json`, run against the synthetic race
 fixture (practice for the race-start reminder). The fixture records the player's standings gaps
 in its latest frame only, so there's a gap to the car one place behind but no gap history.
 

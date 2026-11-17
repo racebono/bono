@@ -2179,9 +2179,10 @@ pub(crate) fn scheduled_message(batch: &Batch) -> String {
     }
     message.push_str(&format!(
         "\n\nDon't acknowledge (no \"Copy\" or \"Checking\"): the pilot isn't waiting for you. \
-         Open with the subject (\"Fuel check: ...\", \"Lap four: 1:42.3\"), as the pilot didn't \
-         just ask. Answer each request briefly, leaving out any with nothing worth saying. If \
-         none of them has anything worth saying, reply with exactly {SILENCE}."
+         Open with the subject (\"Fuel check: ...\", \"Lap four: one minute forty two point \
+         three\"), as the pilot didn't just ask. Answer each request briefly, leaving out any \
+         with nothing worth saying. If none of them has anything worth saying, reply with \
+         exactly {SILENCE}."
     ));
     message
 }
@@ -4889,7 +4890,7 @@ mod tests {
         let (_send, mut playing) = being_written();
         playing.sentences.pieces.push_back(piece());
         engineer.line.push_back(playing);
-        let answer = scheduled_answer("Lap four: 1:42.3.");
+        let answer = scheduled_answer("Lap four: one minute forty two point three.");
         engineer.queue_scheduled(SpeechOutput::ready(piece()), answer, false);
         engineer.admit(1.0);
         assert_eq!(engineer.line.len(), 2);
@@ -4924,7 +4925,7 @@ mod tests {
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
         let (_send, thinking) = being_written();
         engineer.queue(thinking);
-        let answer = scheduled_answer("Lap four: 1:42.3.");
+        let answer = scheduled_answer("Lap four: one minute forty two point three.");
         engineer.queue_scheduled(SpeechOutput::ready(piece()), answer, false);
         engineer.play(&config, None);
         // It played (and found no speaker to play on), the pilot's answer still to come
@@ -5141,7 +5142,7 @@ mod tests {
             .block_on(Config::new(dir.path().join("config.json")))
             .unwrap();
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
-        let answer = scheduled_answer("Lap four: 1:42.3.");
+        let answer = scheduled_answer("Lap four: one minute forty two point three.");
         engineer.queue_scheduled(SpeechOutput::ready(piece()), answer, false);
         // Ready while the pilot talks: it waits at the front
         engineer.talk(true);
@@ -5243,7 +5244,7 @@ mod tests {
             .block_on(Config::new(dir.path().join("config.json")))
             .unwrap();
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
-        let answer = scheduled_answer("Lap four: 1:42.3, and");
+        let answer = scheduled_answer("Lap four: one minute forty two point three, and");
         engineer.queue_scheduled(SpeechOutput::ready(piece()), answer, true);
         engineer.admit(1.0);
         // As if it had played all it had

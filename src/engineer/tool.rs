@@ -3500,17 +3500,17 @@ mod evals {
         };
 
         // Three pending requests, in the question's pending list
-        let asked = eval(36);
-        let setup36 = setup(asked, &progress);
-        assert!(setup36.batch.is_none());
+        let asked = eval(37);
+        let setup37 = setup(asked, &progress);
+        assert!(setup37.batch.is_none());
         assert_eq!(
-            setup36.schedule.pending_ids(),
+            setup37.schedule.pending_ids(),
             [RequestId(1), RequestId(2), RequestId(3)]
         );
-        assert_eq!(setup36.schedule.next_id(), RequestId(4));
-        let pending = setup36.schedule.pending_text(&progress);
+        assert_eq!(setup37.schedule.next_id(), RequestId(4));
+        let pending = setup37.schedule.pending_text(&progress);
         let prompt = asked["prompt"].as_str().unwrap();
-        let (question, note) = brief(asked, &setup36, &progress, head(asked, &setup36));
+        let (question, note) = brief(asked, &setup37, &progress, head(asked, &setup37));
         assert!(note.is_none());
         assert_eq!(question, format!("{prompt}\n\n{pending}"));
         for entry in asked["pending"].as_array().unwrap() {
@@ -3524,20 +3524,20 @@ mod evals {
 
         // A scheduled turn: the app's message for the request that fired, then the pending list
         // (none) and which language to reply in
-        let fired = eval(40);
-        let setup40 = setup(fired, &progress);
-        let batch = setup40.batch.as_ref().unwrap();
+        let fired = eval(41);
+        let setup41 = setup(fired, &progress);
+        let batch = setup41.batch.as_ref().unwrap();
         assert_eq!(batch.fired.len(), 1);
         assert_eq!(batch.fired[0].id, RequestId(1));
-        assert!(setup40.schedule.pending_ids().is_empty());
-        let head40 = head(fired, &setup40);
-        assert_eq!(head40, scheduled_message(batch));
-        let (message, note) = brief(fired, &setup40, &progress, head40.clone());
+        assert!(setup41.schedule.pending_ids().is_empty());
+        let head41 = head(fired, &setup41);
+        assert_eq!(head41, scheduled_message(batch));
+        let (message, note) = brief(fired, &setup41, &progress, head41.clone());
         let reply_note = language::reply_note(arrstr!("en"));
         assert_eq!(note.as_deref(), Some(reply_note.as_str()));
         assert_eq!(
             message,
-            format!("{head40}\n\nScheduled requests: none.\n\n{reply_note}")
+            format!("{head41}\n\nScheduled requests: none.\n\n{reply_note}")
         );
         let entry = &fired["scheduled"][0];
         for part in [
