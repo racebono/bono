@@ -157,6 +157,9 @@ pub struct Playback {
     writing: bool,
     /// Paused: whether [`Self::set_held`]`(true)` is in effect
     held: bool,
+    /// Its stream was flushed since its last piece went on, so all of it plays out: a stream
+    /// that resamples holds some of its input back until then
+    flushed: bool,
 }
 
 /// How far behind where it was interrupted an answer resumes, in seconds.
@@ -271,6 +274,7 @@ impl Playback {
             complete,
             writing: false,
             held: false,
+            flushed: false,
         }
     }
 
@@ -301,6 +305,18 @@ impl Playback {
                 }
                 Poll::Ready(None)
             }
+        }
+    }
+
+    /// It's caught up with what its pilot turn has written so far: what's on its stream plays out
+    /// in full, once for each such stretch, so it can be seen to have played it all. Flushing
+    /// after every piece instead could leave gaps between them.
+    fn caught_up(&mut self) {
+        if let Some(stream) = &self.stream
+            && !std::mem::replace(&mut self.flushed, true)
+            && let Err(e) = stream.flush()
+        {
+            log::warn!("Error flushing the answer's audio: {e}");
         }
     }
 
@@ -906,6 +922,9 @@ impl Engineer {
             // The exchange was forgotten, and whatever was said with it: the pilot can ask again
             StopReason::Refusal => {
                 detail = format!("{detail} | {}", t!("engineer.detail_declined"));
+                // Its answer stops, unheard or not, as the chat only shows "say again"
+                self.incoming.retain(|playback| !playback.writing);
+                self.line.retain(|playback| !playback.writing);
                 let say_again = t!("engineer.say_again": &turn.lang);
                 self.say(rt, config, synth, say_again, turn.lang, None);
                 if self.voice(config, turn.lang).is_none() {
@@ -1065,14 +1084,18 @@ impl Engineer {
 
         // Submit at most one sentence per frame, including when replaying. Synthesis
         // stays on its worker and a long retained answer cannot monopolize the UI.
-        if !playback.done
-            && playback.sentences.pending().is_none()
-            && let Poll::Ready(Some(Err(e))) = playback.pull(gain)
-        {
-            self.line.pop_front();
-            self.notice(t!("engineer.error_synthesizing", error = format!("{e:#}")));
-            self.no_beep();
-            return;
+        if !playback.done && playback.sentences.pending().is_none() {
+            match playback.pull(gain) {
+                Poll::Ready(Some(Err(e))) => {
+                    self.line.pop_front();
+                    self.notice(t!("engineer.error_synthesizing", error = format!("{e:#}")));
+                    self.no_beep();
+                    return;
+                }
+                // Nothing more yet: what it said plays out while its turn works on the rest
+                Poll::Pending if playback.writing => playback.caught_up(),
+                Poll::Pending | Poll::Ready(_) => {}
+            }
         }
 
         if let Some(speech) = playback.sentences.pending() {
@@ -1098,6 +1121,7 @@ impl Engineer {
                 return;
             }
             playback.sentences.submitted();
+            playback.flushed = false;
             if let Some(timeline) = &playback.timeline {
                 timeline.first_audio();
             }
@@ -1715,6 +1739,106 @@ mod tests {
         assert!(!engineer.is_speaking());
         let line = timeline.to_string();
         assert!(!line.ends_with("played never"), "{line}");
+    }
+
+    #[test]
+    #[ignore = "run alone with SDL_AUDIO_DRIVER=dummy"]
+    fn an_answer_caught_up_with_its_turn_plays_out_and_opens_the_gap() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let sdl = sdl3::init().unwrap();
+        let audio = sdl.audio().unwrap();
+        // At another rate than the voice's: the stream resamples, holding some of its input back
+        // until it's flushed
+        let spec = sdl3::audio::AudioSpec {
+            freq: Some(48000),
+            channels: Some(1),
+            format: Some(sdl3::audio::AudioFormat::f32_sys()),
+        };
+        let device = audio.open_playback_device(&spec).unwrap();
+        let sentence = || Speech {
+            samples: vec![0.0; 2205],
+            sample_rate: 22050,
+        };
+
+        // It said its first sentence, and its turn is still working on the next
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        let (send, mut answer) = being_written();
+        answer.sentences.pieces.push_back(sentence());
+        engineer.line.push_back(answer);
+        let play_until = |engineer: &mut Engineer, done: fn(&Engineer) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(engineer) {
+                assert!(Instant::now() < deadline, "it never played out");
+                engineer.play(&config, Some(&device));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        play_until(&mut engineer, |e| e.line[0].waiting_on_its_turn());
+        assert!(engineer.line[0].flushed);
+
+        // Its next sentence starts another stretch
+        send.send(Ok(sentence())).unwrap();
+        engineer.play(&config, Some(&device));
+        assert!(!engineer.line[0].flushed);
+        assert!(!engineer.line[0].waiting_on_its_turn());
+
+        // Caught up again, it leaves the radio to a complete answer
+        engineer.line.push_back(Playback::tone());
+        play_until(&mut engineer, |engineer| engineer.line[0].complete);
+        assert!(engineer.line[1].writing);
+        assert!(engineer.line[1].flushed);
+    }
+
+    #[test]
+    fn a_refused_answer_is_replaced_by_say_again() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let rt = runtime.handle();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // The voice's path only stands in for an installed one: nothing is synthesized
+        std::fs::write(&path, r#"{"voices": {"en": "en.onnx"}}"#).unwrap();
+        let config = runtime.block_on(Config::new(&path)).unwrap();
+        let mut synth = Synthesizer::new(rt, &config.get());
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+
+        // Whether it has spoken yet or not
+        for spoken in [true, false] {
+            engineer.stop();
+            let (_send, answer) = being_written();
+            match spoken {
+                true => engineer.line.push_back(answer),
+                false => engineer.queue(answer),
+            }
+            let (_, text) = mpsc::unbounded_channel();
+            engineer.answer(
+                rt,
+                &config,
+                &mut synth,
+                Reply {
+                    text: "Partial".into(),
+                    stop: StopReason::Refusal,
+                    usage: Default::default(),
+                    model: "test".into(),
+                },
+                Turn {
+                    task: Task::spawn(std::future::pending()),
+                    lang: arrstr!("en"),
+                    text,
+                    entry: None,
+                },
+            );
+            assert!(engineer.line.is_empty(), "spoken: {spoken}");
+            assert_eq!(engineer.incoming.len(), 1, "spoken: {spoken}");
+            assert!(engineer.incoming[0].complete, "spoken: {spoken}");
+            let reply = engineer.chat.last().unwrap();
+            assert_eq!(reply.text, t!("engineer.say_again": "en"));
+        }
     }
 
     #[test]
