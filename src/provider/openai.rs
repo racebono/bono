@@ -183,8 +183,11 @@ impl Conversation {
                     bail!("The model stopped for tool calls, but made none")
                 }
                 Some("stop") => Some(StopReason::EndTurn),
-                Some("length") => Some(StopReason::MaxTokens),
+                // Mistral's `model_length`: the model's context is full
+                Some("length" | "model_length") => Some(StopReason::MaxTokens),
                 Some("content_filter") => Some(StopReason::Refusal),
+                // Mistral's: the server failed while writing
+                Some("error") => bail!("The model failed partway through its answer"),
                 other => bail!("Unexpected stop reason from the model: {other:?}"),
             };
 
@@ -405,8 +408,9 @@ impl Response {
         struct DeltaFunction {
             #[serde(default)]
             name: Option<String>,
+            /// JSON text (a piece of it), or (Mistral's may be) the JSON itself
             #[serde(default)]
-            arguments: Option<String>,
+            arguments: Option<serde_json::Value>,
         }
 
         #[derive(Deserialize)]
@@ -493,8 +497,12 @@ impl Response {
                         if let Some(name) = function.name {
                             call.name.push_str(&name);
                         }
-                        if let Some(arguments) = function.arguments {
-                            call.arguments.push_str(&arguments);
+                        match function.arguments {
+                            None => {}
+                            Some(serde_json::Value::String(arguments)) => {
+                                call.arguments.push_str(&arguments);
+                            }
+                            Some(arguments) => call.arguments.push_str(&arguments.to_string()),
                         }
                     }
                 }
@@ -693,9 +701,11 @@ impl ConversationBuilder {
 
         let (reasoning_effort, chat_template_kwargs) = match self.effort.trim() {
             "" => (None, None),
-            "none" if !is_openai(&base_url) => (
+            // OpenAI and Mistral reject fields they don't know, and turn thinking off by
+            // `reasoning_effort` alone
+            "none" if !is_openai(&base_url) && !is_mistral(&base_url) => (
                 Some("none".to_owned()),
-                (!is_openai(&base_url)).then(|| serde_json::json!({"enable_thinking": false})),
+                Some(serde_json::json!({"enable_thinking": false})),
             ),
             effort => (Some(effort.to_owned()), None),
         };
@@ -765,6 +775,11 @@ fn base_url_or_default(base_url: Option<&str>) -> String {
 /// `max_completion_tokens` and reject `max_tokens`, which compatible servers may only know.
 fn is_openai(base_url: &str) -> bool {
     reqwest::Url::parse(base_url).is_ok_and(|url| url.host_str() == Some("api.openai.com"))
+}
+
+/// Whether `base_url` is Mistral's own API, which rejects request fields it doesn't know.
+fn is_mistral(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url).is_ok_and(|url| url.host_str() == Some("api.mistral.ai"))
 }
 
 /// The bearer token: `api_key`, or else `OPENAI_API_KEY`, if set.
@@ -1009,6 +1024,25 @@ mod tests {
     }
 
     #[test]
+    fn reads_arguments_sent_as_json() {
+        let mut response = Response::default();
+        let mut on_text = |_: &str| {};
+        let mut sink = TextSink::new(&mut on_text);
+        let line = format!(
+            "data: {}",
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"id": "abc123XYZ", "index": 0, "function": {"name": "lookup", "arguments": {"what": "gap"}}}
+            ]}}]})
+        );
+        response.line(line.as_bytes(), &mut sink).unwrap();
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&response.tool_calls[0].arguments).unwrap(),
+            json!({"what": "gap"})
+        );
+    }
+
+    #[test]
     fn reads_content_sent_as_chunks_and_skips_thinking() {
         let mut response = Response::default();
         let mut pieces = Vec::new();
@@ -1115,17 +1149,16 @@ mod tests {
     }
 
     #[test]
-    fn omits_chat_template_kwargs_for_openai() {
-        let mut builder = ConversationBuilder::new();
-        builder
-            .base_url("https://api.openai.com/v1/")
-            .api_key("test")
-            .effort("none");
-        let conversation = builder.build(reqwest::Client::new()).unwrap();
-        let body = serde_json::to_value(&conversation.body).unwrap();
+    fn omits_chat_template_kwargs_for_openai_and_mistral() {
+        for url in ["https://api.openai.com/v1/", "https://api.mistral.ai/v1"] {
+            let mut builder = ConversationBuilder::new();
+            builder.base_url(url).api_key("test").effort("none");
+            let conversation = builder.build(reqwest::Client::new()).unwrap();
+            let body = serde_json::to_value(&conversation.body).unwrap();
 
-        assert_eq!(body["reasoning_effort"], "none");
-        assert!(body.get("chat_template_kwargs").is_none());
+            assert_eq!(body["reasoning_effort"], "none", "{url}");
+            assert!(body.get("chat_template_kwargs").is_none(), "{url}");
+        }
     }
 
     #[test]
@@ -1192,6 +1225,8 @@ mod tests {
         let (url, _) = mock(vec![
             stream(vec![text("Box, box"), finish("length")]),
             stream(vec![text("No."), finish("content_filter")]),
+            stream(vec![text("Stay"), finish("model_length")]),
+            stream(vec![text("Bo"), finish("error")]),
         ])
         .await;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1205,6 +1240,15 @@ mod tests {
         let (reply, _) = send_streaming(&mut conversation, "Pit?").await.unwrap();
         assert_eq!(reply.stop, StopReason::Refusal);
         assert_eq!(conversation.body.messages.len(), 3);
+
+        // Mistral's: a full context, and a failure
+        let (reply, _) = send_streaming(&mut conversation, "Pit?").await.unwrap();
+        assert_eq!(reply.stop, StopReason::MaxTokens);
+        assert_eq!(conversation.body.messages.len(), 5);
+
+        let error = send_streaming(&mut conversation, "Pit?").await.unwrap_err();
+        assert!(format!("{error:#}").contains("failed partway"), "{error:#}");
+        assert_eq!(conversation.body.messages.len(), 5);
     }
 
     #[tokio::test]
