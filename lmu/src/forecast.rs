@@ -24,12 +24,8 @@ const DIRECTIONS: [&str; 8] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
 
 /// The forecast as of `session_time`, or `None` if the web API doesn't answer (in time) with 200.
 pub fn fetch(session_time: f64) -> Option<Vec<bono_forecast_point>> {
-    // It's on this PC: anything slow means it isn't answering
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(1)))
-        .timeout_global(Some(Duration::from_secs(3)))
-        .build()
-        .into();
+    // About 3 s in all
+    let agent = crate::local_agent(Duration::from_millis(750));
 
     let body = agent
         .get(URL)

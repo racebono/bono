@@ -1,5 +1,15 @@
 # Agent instructions
 
+## Keep designs simple
+
+Every new feature and fix must use the simplest design that solves the
+problem. Code should be easy to read through, easy to reason about, and easy
+to maintain. Prefer a small, direct change over a clever or general one: avoid
+new abstractions, layers, options, or indirection unless the change needs them
+now. Reuse what already exists before adding something new, and keep related
+logic together so a reader can follow it without jumping around. When choosing
+between designs, choose the one a newcomer could understand and safely change.
+
 ## Keep the UI thread responsive
 
 Agents must avoid blocking the UI thread at all costs. Move blocking I/O,

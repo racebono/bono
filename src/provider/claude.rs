@@ -1,6 +1,9 @@
 //! Claude, through the Claude API.
 
-use super::{Model, ModelOption, Reply, StopReason, ToolHandler, Tools, Usage, text::TextSink};
+use super::{
+    Model, ModelOption, Reply, Steer, StopReason, ToolHandler, Tools, Usage, steer_text,
+    text::TextSink,
+};
 use crate::config::{ClaudeCacheTtl, ClaudeConfig};
 use anyhow::{Context, bail};
 use bono_i18n::t;
@@ -226,6 +229,8 @@ pub struct Conversation {
     usage: BTreeMap<String, Usage>,
     /// Added after every turn's tool results (see [`Model::set_tool_result_note`])
     result_note: Option<Arc<str>>,
+    /// Questions the pilot asks while a turn runs (see [`Model::set_steer`])
+    steer: Option<Steer>,
     /// Requests carry an `Idempotency-Key`, so a retry after a lost connection isn't billed twice
     request_ids: bool,
 }
@@ -330,6 +335,10 @@ impl Model for Conversation {
 
     fn set_tool_result_note(&mut self, note: Option<Arc<str>>) {
         self.result_note = note;
+    }
+
+    fn set_steer(&mut self, steer: Option<Steer>) {
+        self.steer = steer;
     }
 }
 
@@ -533,7 +542,14 @@ impl Conversation {
                 tools_started.elapsed()
             );
 
-            // Together, too: the request that carries them back must still fit
+            // What the pilot asked while the tools ran, taken once: it goes back with the results
+            let steer = self
+                .steer
+                .as_ref()
+                .map(Steer::take)
+                .filter(|questions| !questions.is_empty())
+                .map(|questions| steer_text(&questions));
+            // Together, too: the request that carries them back (steer included) must still fit
             let note = self.result_note.clone();
             if let Some(limits) = self.history_limits {
                 let mut contents = results
@@ -542,7 +558,7 @@ impl Conversation {
                     .collect::<Vec<_>>();
                 self.body.messages.push(RequestMessage {
                     role: "user",
-                    content: tool_results(&results, note.as_deref())?,
+                    content: tool_results(&results, steer.as_deref(), note.as_deref())?,
                 });
                 let size = self.request_size();
                 self.body.messages.pop();
@@ -554,7 +570,7 @@ impl Conversation {
 
             self.body.messages.push(RequestMessage {
                 role: "user",
-                content: tool_results(&results, note.as_deref())?,
+                content: tool_results(&results, steer.as_deref(), note.as_deref())?,
             });
         }
 
@@ -751,12 +767,18 @@ impl Conversation {
     }
 }
 
-/// The content of the message carrying `results` back, with `note` after them: the API takes text
-/// in that message once every tool result is in.
-fn tool_results(results: &[ResultBody], note: Option<&str>) -> anyhow::Result<serde_json::Value> {
+/// The content of the message carrying `results` back, with `steer` (the pilot's new questions)
+/// after them, then `note`: the API takes text in that message once every tool result is in.
+fn tool_results(
+    results: &[ResultBody],
+    steer: Option<&str>,
+    note: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
     let mut content = serde_json::to_value(results)?;
-    if let (Some(note), Some(blocks)) = (note, content.as_array_mut()) {
-        blocks.push(serde_json::json!({"type": "text", "text": note}));
+    if let Some(blocks) = content.as_array_mut() {
+        for text in [steer, note].into_iter().flatten() {
+            blocks.push(serde_json::json!({"type": "text", "text": text}));
+        }
     }
     Ok(content)
 }
@@ -1326,6 +1348,7 @@ impl ConversationBuilder {
             tools: self.tools,
             usage: BTreeMap::new(),
             result_note: None,
+            steer: None,
             request_ids: self.request_ids,
         });
     }
@@ -3130,6 +3153,168 @@ mod tests {
         let content = &requests[3]["messages"][6]["content"];
         assert_eq!(content[0]["tool_use_id"], "t3");
         assert_eq!(content.as_array().unwrap().len(), 1);
+    }
+
+    /// Pushes its question into the slot when it's called, as the pilot asking again while the
+    /// turn's tools run.
+    struct SteerOnCall(Steer, &'static str);
+
+    impl ToolHandler for SteerOnCall {
+        type Input = Value;
+
+        fn handle(
+            &self,
+            _: Value,
+        ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
+            self.0.push(self.1.into());
+            async { Ok("Fronts 80°C.".into()) }
+        }
+    }
+
+    /// A conversation with `lookup` and the `steer` tool, which asks `question` when called.
+    fn steered_conversation(url: &str, steer: &Steer, question: &'static str) -> Conversation {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(url, &calls);
+        conversation.tools.insert(
+            "steer",
+            None,
+            json!({"type": "object"}),
+            SteerOnCall(steer.clone(), question),
+        );
+        conversation.set_steer(Some(steer.clone()));
+        conversation
+    }
+
+    fn steer_call() -> (u16, &'static str, Value) {
+        message(
+            "tool_use",
+            json!([{"type": "tool_use", "id": "t1", "name": "steer", "input": {}}]),
+        )
+    }
+
+    #[tokio::test]
+    async fn steer_goes_after_tool_results_and_before_the_note() {
+        let (url, requests) = mock(vec![
+            steer_call(),
+            message(
+                "end_turn",
+                json!([{"type": "text", "text": "Fronts fine, rears too."}]),
+            ),
+        ])
+        .await;
+        let steer = Steer::default();
+        let mut conversation = steered_conversation(&url, &steer, "And the rears?");
+        let note = "[Reply in English, the pilot's language.]";
+        conversation.set_tool_result_note(Some(note.into()));
+
+        send(&mut conversation, "Tyre temps?").await.unwrap();
+        let expected = json!([
+            {"type": "tool_result", "tool_use_id": "t1", "content": "Fronts 80°C.", "is_error": false},
+            {"type": "text", "text": steer_text(&["And the rears?".into()])},
+            {"type": "text", "text": note}
+        ]);
+        assert_eq!(
+            requests.lock().unwrap()[1]["messages"][2]["content"],
+            expected
+        );
+        // Kept in the history, and taken from the slot
+        assert_eq!(conversation.body.messages[2].content, expected);
+        assert!(steer.take().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_steer_during_the_final_request_stays_in_the_slot() {
+        let (url, requests) = mock(vec![message(
+            "end_turn",
+            json!([{"type": "text", "text": "Gap 2.1."}]),
+        )])
+        .await;
+        let steer = Steer::default();
+        let mut conversation = steered_conversation(&url, &steer, "unused");
+
+        steer.push("Fuel?".into());
+        send(&mut conversation, "Gap?").await.unwrap();
+        // No tool hand-back took it: it's left for the next turn
+        assert_eq!(steer.take(), ["Fuel?"]);
+        let steered = steer_text(&["Fuel?".into()]);
+        for request in requests.lock().unwrap().iter() {
+            assert!(!request.to_string().contains(&steered));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_steered_turn_forgets_both_questions() {
+        let (url, _) = mock(vec![
+            steer_call(),
+            (
+                400,
+                "",
+                json!({"error": {"type": "invalid_request_error", "message": "bad"}}),
+            ),
+        ])
+        .await;
+        let steer = Steer::default();
+        let mut conversation = steered_conversation(&url, &steer, "And the rears?");
+
+        let before = conversation.body.messages.len();
+        send(&mut conversation, "Tyre temps?").await.unwrap_err();
+        assert_eq!(conversation.body.messages.len(), before);
+        assert!(steer.take().is_empty());
+    }
+
+    #[tokio::test]
+    async fn steered_results_still_fit_the_request() {
+        struct Big;
+
+        impl ToolHandler for Big {
+            type Input = Value;
+
+            fn handle(
+                &self,
+                _: Value,
+            ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
+                async { Ok("x".repeat(2_000)) }
+            }
+        }
+
+        let mut calls = (0..8)
+            .map(|i| json!({"type": "tool_use", "id": format!("call{i}"), "name": "big", "input": {}}))
+            .collect::<Vec<_>>();
+        calls.push(json!({"type": "tool_use", "id": "steer", "name": "steer", "input": {}}));
+        let (url, requests) = mock(vec![
+            message("tool_use", Value::Array(calls)),
+            message("end_turn", json!([{"type": "text", "text": "Answer"}])),
+        ])
+        .await;
+        let steer = Steer::default();
+        let mut builder = ConversationBuilder::new();
+        builder
+            .api_key("test")
+            .base_url(&url)
+            .system("You are a race engineer.")
+            .tool("big", None, json!({"type": "object"}), Big)
+            .tool(
+                "steer",
+                None,
+                json!({"type": "object"}),
+                SteerOnCall(steer.clone(), "And how far back is the car behind?"),
+            )
+            .history_limits(HistoryLimits {
+                max_bytes: 10_000,
+                max_messages: 100,
+                target: 0.5,
+            });
+        let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+        conversation.set_steer(Some(steer));
+        assert_eq!(
+            conversation.send("Gap?".into()).await.unwrap().text,
+            "Answer"
+        );
+        // The steer is part of the message the results are sized in
+        let requests = requests.lock().unwrap();
+        let steered = steer_text(&["And how far back is the car behind?".into()]);
+        assert_eq!(requests[1]["messages"][2]["content"][9]["text"], steered);
+        assert!(serde_json::to_vec(&requests[1]).unwrap().len() <= 10_000);
     }
 
     #[tokio::test]

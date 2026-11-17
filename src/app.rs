@@ -344,9 +344,11 @@ impl AppState {
                 heard,
             );
         }
+        // Its answer waits while the pilot holds the talk button
+        self.engineer.talk(self.gui.topbar.audio.recording());
         self.engineer.update(
             rt,
-            self.simulators.current().is_some(),
+            self.simulators.current_mut(),
             &self.config,
             &mut self.synth,
             self.gui.topbar.audio.speaker.get(),
