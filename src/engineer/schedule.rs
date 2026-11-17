@@ -273,6 +273,19 @@ impl Request {
             .flatten()
     }
 
+    /// The conditions the data thread checks for it: all of them while it's pending. Once it's
+    /// ended, only whether its answers still waiting are out of date matters
+    fn checked_slots(&self) -> impl Iterator<Item = &Slot> {
+        let pending = self.pending();
+        [
+            (&self.trigger_slot, pending),
+            (&self.until_slot, pending),
+            (&self.stale_slot, true),
+        ]
+        .into_iter()
+        .filter_map(|(slot, checked)| slot.as_ref().filter(|_| checked))
+    }
+
     fn slots_mut(&mut self) -> impl Iterator<Item = &mut Slot> {
         [
             &mut self.trigger_slot,
@@ -397,6 +410,19 @@ impl Schedule {
     /// A session trigger made before a session start that `advance` saw while the turn ran fires
     /// for that start on the next `advance` (if it's of the type asked for).
     pub fn apply(&mut self, changes: Vec<Change>, progress: &Progress) -> Applied {
+        self.apply_answering(changes, progress, &[])
+    }
+
+    /// Applies a finished turn's changes, as [`Self::apply`], for a scheduled turn that answered
+    /// `answered`. Its cancel of a request it answered ends the request, which never fires again,
+    /// but keeps it until those answers are resolved: it cancelled what came after them. Any other
+    /// cancel drops the request's answers on their way (see [`Self::is_stale`]).
+    pub fn apply_answering(
+        &mut self,
+        changes: Vec<Change>,
+        progress: &Progress,
+        answered: &[Fired],
+    ) -> Applied {
         self.follow_weekend(progress.weekend);
         let mut ids = Vec::new();
         let mut missing = Vec::new();
@@ -422,6 +448,16 @@ impl Schedule {
                 // A change to an add this turn made and that was dropped goes with it
                 Change::Cancel(id) | Change::Replace(id, _) if dropped.contains(&id) => {}
                 Change::Cancel(id) => {
+                    // Cancelled by the turn that answered it: ended, its answers kept
+                    let answering = (self.requests.iter_mut()).find(|r| {
+                        r.id == id
+                            && (r.waiting.iter())
+                                .any(|at| answered.iter().any(|f| f.id == id && same(&f.at, at)))
+                    });
+                    if let Some(request) = answering {
+                        request.end();
+                        continue;
+                    }
                     let before = self.requests.len();
                     self.requests.retain(|r| r.id != id);
                     if self.requests.len() == before {
@@ -727,7 +763,7 @@ impl Schedule {
     pub fn conditions(&self) -> Vec<(ConditionId, String)> {
         self.requests
             .iter()
-            .flat_map(Request::slots)
+            .flat_map(Request::checked_slots)
             .map(|slot| (slot.id, slot.query.clone()))
             .collect()
     }
@@ -2051,6 +2087,91 @@ mod tests {
         }
         assert!(run.schedule.requests.is_empty());
         assert!(run.schedule.is_stale(&fired, &run.last));
+    }
+
+    #[test]
+    fn a_cancel_from_the_answering_turn_keeps_its_answer() {
+        let lap = || request(Trigger::Laps { count: 1 }, every(), &laps(0));
+        let answered = |run: &mut Run| {
+            let id = run.add(lap());
+            run.tick(laps(1));
+            let batch = run.take();
+            run.schedule.answered(&batch.fired, &run.last);
+            (id, batch.fired)
+        };
+
+        // The scheduled turn that answered it cancels it: that answer is still worth hearing
+        let mut run = Run::new();
+        let (id, fired) = answered(&mut run);
+        let progress = run.last.clone();
+        let applied = run
+            .schedule
+            .apply_answering(vec![Change::Cancel(id)], &progress, &fired);
+        assert!(applied.missing.is_empty());
+        assert_eq!(run.schedule.len(), 0);
+        assert!(run.schedule.pending_ids().is_empty());
+        assert!(!run.schedule.is_stale(&fired, &run.last));
+        // It never fires again
+        run.tick(laps(2));
+        run.now += GATHER;
+        assert!(run.schedule.take_batch(run.now).is_none());
+        run.schedule.resolved(&fired);
+        assert!(run.schedule.requests.is_empty());
+
+        // Any other cancel: the pilot doesn't want it anymore, answer included
+        let mut run = Run::new();
+        let (id, fired) = answered(&mut run);
+        let progress = run.last.clone();
+        let applied = run
+            .schedule
+            .apply_answering(vec![Change::Cancel(id)], &progress, &[]);
+        assert!(applied.missing.is_empty());
+        assert!(run.schedule.requests.is_empty());
+        assert!(run.schedule.is_stale(&fired, &run.last));
+    }
+
+    #[test]
+    fn an_ended_request_keeps_only_its_stale_condition() {
+        let queries = |run: &Run| -> Vec<String> {
+            (run.schedule.conditions().into_iter())
+                .map(|(_, query)| query)
+                .collect()
+        };
+        let fire = |run: &mut Run| {
+            let trigger = run.condition_ids()[0];
+            run.tick(with(laps(0), trigger, ConditionState::False));
+            run.tick(with(laps(0), trigger, ConditionState::True));
+            let batch = run.take();
+            run.schedule.answered(&batch.fired, &run.last);
+            batch.fired
+        };
+
+        // A one-shot, answered for the last time
+        let mut run = Run::new();
+        let mut new = request(condition("SELECT 'trigger'"), Repeat::Once, &laps(0));
+        new.stale_after = Some(condition("SELECT 'stale'"));
+        run.add(new);
+        let fired = fire(&mut run);
+        assert_eq!(queries(&run), ["SELECT 'stale'"]);
+        run.schedule.resolved(&fired);
+        assert!(queries(&run).is_empty());
+
+        // A repeating one, cancelled by the turn that answered it
+        let mut run = Run::new();
+        let mut new = request(
+            condition("SELECT 'trigger'"),
+            Repeat::Every {
+                until: Some(condition("SELECT 'until'")),
+            },
+            &laps(0),
+        );
+        new.stale_after = Some(condition("SELECT 'stale'"));
+        let id = run.add(new);
+        let fired = fire(&mut run);
+        assert_eq!(queries(&run).len(), 3);
+        let progress = run.last.clone();
+        (run.schedule).apply_answering(vec![Change::Cancel(id)], &progress, &fired);
+        assert_eq!(queries(&run), ["SELECT 'stale'"]);
     }
 
     #[test]
