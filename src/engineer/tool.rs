@@ -257,6 +257,10 @@ macro_rules! say {
 }
 
 mod derived;
+mod progress;
+// The data thread and the schedule, which later tasks add, use these.
+#[allow(unused_imports)]
+pub use progress::*;
 
 // --------------------------------------------------------------------------- rows
 
