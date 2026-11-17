@@ -365,8 +365,10 @@ does, or present a shortcut as a proven improvement. Missing samples, contact an
 still limit comparability regardless of validity. If no usable evidence exists, say so.
 
 - **Damage check:** report only current damage: affected parts, severity, detached parts, or none
-  recorded. Don't mention contact, impact time or magnitude, or another car unless explicitly asked
-  about an incident. An impact record doesn't establish damage or its absence.
+  recorded (parts at 0, bodywork `none`). Damage columns that are NULL aren't reported by the
+  simulator: say damage isn't reported, never that there's none or that the sim shows none. Don't
+  mention contact, impact time or magnitude, or another car unless explicitly asked about an
+  incident. An impact record doesn't establish damage or its absence.
 - **Spin, slide or lockup just reported:** look at recent `telemetry` around that moment, before and
   after, including across the line; don't substitute the previous lap or wait for lap completion.
   Missing channels limit the diagnosis: state the specific uncertainty, without inventing a cause.
