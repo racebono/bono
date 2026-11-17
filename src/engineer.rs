@@ -120,7 +120,9 @@ pub struct Engineer {
     /// with their speech buffered. Only [`Self::fill_gap`] moves one ahead
     line: VecDeque<Playback>,
     /// The spotter is speaking: the front answer waits, and carries on from there after
-    held: bool,
+    spotter_held: bool,
+    /// The talk button is held: the front answer waits, as for the spotter
+    talking: bool,
     /// Times in a row nothing was understood on the radio
     misheard: u32,
 }
@@ -391,7 +393,8 @@ impl Engineer {
             turn: None,
             incoming: Vec::new(),
             line: VecDeque::new(),
-            held: false,
+            spotter_held: false,
+            talking: false,
             misheard: 0,
         }
     }
@@ -436,19 +439,32 @@ impl Engineer {
     /// spotter speaks; releasing it resumes `RESUME_BEHIND` before where it stopped, or from the
     /// sentence's start if that sentence began since then.
     pub fn hold(&mut self, held: bool) {
-        if std::mem::replace(&mut self.held, held) == held {
-            return;
-        }
+        self.spotter_held = held;
         self.hold_front();
     }
 
-    /// Holds the front of the line as [`Self::held`] says, whichever answer is there.
+    /// Pauses the answer at the front of the line (and holds one about to start) while the
+    /// talk button is held, as [`Self::hold`] does for the spotter, so it doesn't play over the
+    /// pilot. It stays paused until both let go.
+    pub fn talk(&mut self, talking: bool) {
+        self.talking = talking;
+        self.hold_front();
+    }
+
+    /// Whether the front of the line waits: the spotter is speaking or the pilot is talking.
+    fn held(&self) -> bool {
+        self.spotter_held || self.talking
+    }
+
+    /// Holds the front of the line as [`Self::held`] says, whichever answer is there. Nothing
+    /// is done when it's already so (see [`Playback::set_held`]).
     fn hold_front(&mut self) {
+        let held = self.held();
         let Some(playback) = self.line.front_mut() else {
             return;
         };
-        if let Err(e) = playback.set_held(self.held) {
-            log::warn!("Error holding the answer for the spotter: {e}");
+        if let Err(e) = playback.set_held(held) {
+            log::warn!("Error holding the answer: {e}");
             self.line.pop_front();
         }
     }
@@ -1068,9 +1084,9 @@ impl Engineer {
             config.master_volume() * config.engineer_volume()
         };
         self.admit(gain);
-        // Whichever answer is at the front waits while the spotter speaks
+        // Whichever answer is at the front waits while the spotter speaks or the pilot talks
         self.hold_front();
-        let held = self.held;
+        let held = self.held();
         let Some(playback) = self.line.front_mut() else {
             return;
         };
@@ -1952,6 +1968,48 @@ mod tests {
         let (_send, front) = being_written();
         let behind = Playback::new(SpeechOutput::ready(piece()), false);
         assert!(stays_ahead(front, behind));
+    }
+
+    #[test]
+    fn talking_and_the_spotter_hold_overlap() {
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.line.push_back(Playback::tone());
+        engineer.talk(true);
+        assert!(engineer.line[0].held);
+        engineer.hold(true);
+        // Letting go of the talk button while the spotter speaks keeps it paused
+        engineer.talk(false);
+        assert!(engineer.line[0].held);
+        engineer.hold(false);
+        assert!(!engineer.line[0].held);
+    }
+
+    #[test]
+    fn an_answer_ready_while_talking_waits_for_release() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let no_speaker = |engineer: &Engineer| {
+            (engineer.chat.iter())
+                .any(|e| e.speaker == Speaker::Notice && e.text == t!("engineer.no_speaker"))
+        };
+
+        // The answer is ready while the pilot talks: it doesn't start over them
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.talk(true);
+        engineer.queue(Playback::tone());
+        engineer.play(&config, None);
+        engineer.play(&config, None);
+        assert_eq!(engineer.line.len(), 1);
+        assert!(!no_speaker(&engineer));
+
+        // Released, it plays (and finds no speaker to play on)
+        engineer.talk(false);
+        engineer.play(&config, None);
+        assert!(no_speaker(&engineer));
     }
 
     #[test]
