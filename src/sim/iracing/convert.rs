@@ -186,8 +186,8 @@ struct Flag {
     /// Whether who won can't be known (see `convert`): none is taken, and nobody finishes but by
     /// the cool-down
     undecided: bool,
-    /// The update a winner was first taken at: it can change for a moment after that or after
-    /// its crossing, whichever is later (a count timed ahead of the line is timed at the line), as
+    /// The update a winner was first taken at: it can change for a moment after that, its
+    /// crossing or the update that saw it over the line, whichever is latest (a count timed ahead of the line is timed at the line), as
     /// counts come an update or so after their crossings: until the update after the moment's
     /// last (the next one, however long after: the recording can hold up)
     decided: Option<f64>,
@@ -461,10 +461,19 @@ impl Converter {
         {
             flag.finish = Some(at);
         }
+        // The update that saw the winner over the line (its count's, or its line's when the count
+        // came ahead of it): a car over first is seen by then, its count a moment after at most
+        let finish_seen = match &self.flag {
+            Some(Some(flag)) => flag.winner.and_then(|w| self.cars.get(&w)?.finish_seen),
+            _ => None,
+        };
         if let Some(Some(flag)) = &mut self.flag
             && !flag.undecided
             && flag.decided.is_none_or(|at| {
-                time - dt.unwrap_or(0.0) - at.max(flag.finish.unwrap_or(at)) <= COUNT_LAG
+                let from = at
+                    .max(flag.finish.unwrap_or(at))
+                    .max(finish_seen.unwrap_or(at));
+                time - dt.unwrap_or(0.0) - from <= COUNT_LAG
             })
         {
             // A race of so many laps: the first car over the line with them all done, whenever the
@@ -585,6 +594,7 @@ impl Converter {
                     && car.laps_completed == Some(laps)
                 {
                     track.finish_at = track.counted_at;
+                    track.finish_seen = Some(time);
                 }
             }
         }
@@ -1703,6 +1713,8 @@ struct CarTrack {
     laps_final: bool,
     /// Finished on the winner's lap: when it was over the line
     finish_at: Option<f64>,
+    /// The update `finish_at` was set or timed at its line in
+    finish_seen: Option<f64>,
     /// In races, its laps behind the leader and the car a place ahead (see `laps_behind`)
     laps_behind: Option<(Option<i64>, Option<i64>)>,
 }
@@ -1973,6 +1985,7 @@ impl CarTrack {
                         self.counted_at = Some(at);
                         if self.finish_at == Some(was) {
                             self.finish_at = Some(at);
+                            self.finish_seen = Some(time);
                         }
                     }
                 }
@@ -3581,6 +3594,37 @@ mod tests {
             got.is_some_and(|got| (got - (10.75 - 10.0 - 2.0 / 3.0)).abs() < 1e-6),
             "{got:?}"
         );
+        assert_eq!(behind(1), Some(0.0));
+    }
+
+    /// The winner taken at its count ahead of the line, a hold-up over both cars' crossings, and
+    /// the car over first counted an update after the one after the hold-up: it wins.
+    #[test]
+    fn a_count_an_update_after_a_hold_up_still_wins() {
+        // Car 0 counted at 10 s, car 1 over first; both over in the hold-up to 13 s, car 1
+        // counted at 13.25 s
+        let end = race_of(
+            &[
+                (9.75, STATE_RACING, [0.97, 0.975, 0.5], [2, 2, 1]),
+                (10.0, STATE_CHECKERED, [0.99, 0.995, 0.51], [3, 2, 1]),
+                (13.0, STATE_CHECKERED, [0.3, 0.32, 0.6], [3, 2, 1]),
+                (13.25, STATE_CHECKERED, [0.326, 0.347, 0.61], [3, 3, 1]),
+            ],
+            [0.0, 0.3, 50.0],
+            Some(3),
+        );
+        let (_, standings) = end.scoring.as_ref().unwrap();
+        let behind = |car: i64| {
+            standings
+                .iter()
+                .find(|s| s.vehicle_id.get() == Some(car))
+                .unwrap()
+                .time_behind_leader
+                .get()
+        };
+        let want = (10.0 + 0.01 / 0.31 * 3.0) - (10.0 + 0.005 / 0.325 * 3.0);
+        let got = behind(0);
+        assert!(got.is_some_and(|got| (got - want).abs() < 1e-6), "{got:?}");
         assert_eq!(behind(1), Some(0.0));
     }
 
