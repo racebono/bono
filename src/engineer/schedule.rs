@@ -361,7 +361,9 @@ fn reached(
     match trigger {
         Trigger::Time { seconds } => progress.clock_s >= base.clock_s + seconds - TOLERANCE_S,
         Trigger::Laps { count } => progress.laps >= base.laps.saturating_add(u64::from(*count)),
-        Trigger::Session { kind: None } => starts.any,
+        // A session that started after it was armed: one that started in the epoch it was armed in
+        // had already begun
+        Trigger::Session { kind: None } => starts.any && base.epoch != progress.epoch,
         // On the first snapshot that says what the session is, if it started after the request was
         // armed: one that started in the epoch it was armed in had already begun
         Trigger::Session { kind: Some(kind) } => {
@@ -424,6 +426,8 @@ impl Schedule {
                     self.requests.push(request);
                     ids.push(id);
                 }
+                // A change to an add this turn made and that was dropped goes with it
+                Change::Cancel(id) | Change::Replace(id, _) if dropped.contains(&id) => {}
                 Change::Cancel(id) => {
                     let before = self.requests.len();
                     self.requests.retain(|r| r.id != id);
@@ -2137,6 +2141,45 @@ mod tests {
             &later,
         );
         run.tick(new_epoch(laps(0), 2, &[]));
+        assert_eq!(run.due(), [id]);
+    }
+
+    #[test]
+    fn a_change_to_a_dropped_add_goes_with_it() {
+        let mut schedule = Schedule::new();
+        let made = laps(0);
+        let mut now = laps(0);
+        now.weekend = Some(WEEKEND + 1);
+        let id = schedule.next_id();
+        let applied = schedule.apply(
+            vec![
+                Change::Add(id, request(Trigger::Laps { count: 1 }, Repeat::Once, &made)),
+                Change::Replace(id, request(Trigger::Laps { count: 2 }, Repeat::Once, &made)),
+                Change::Cancel(id),
+            ],
+            &now,
+        );
+        assert_eq!(applied.dropped, [id]);
+        assert!(applied.missing.is_empty());
+        assert!(applied.ids.is_empty());
+    }
+
+    #[test]
+    fn session_trigger_skips_the_session_it_was_armed_in() {
+        let mut run = Run::new();
+        run.tick(laps(0));
+        // Armed from a snapshot of the new session, whose start a later snapshot reports again
+        let mut made = laps(0);
+        made.epoch = Some(2);
+        run.add(request(
+            Trigger::Session { kind: None },
+            Repeat::Once,
+            &made,
+        ));
+        run.tick(new_epoch(laps(0), 2, &["session"]));
+        assert!(run.due().is_empty());
+        let id = run.schedule.pending_ids()[0];
+        run.tick(new_epoch(laps(0), 3, &["session"]));
         assert_eq!(run.due(), [id]);
     }
 
