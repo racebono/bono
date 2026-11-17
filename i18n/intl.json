@@ -1181,6 +1181,16 @@
         "es": "conversación llena, empezando de nuevo",
         "ca": "conversa plena, tornant a començar"
     },
+    "engineer.detail_not_said_gone": {
+        "en": "not said: its request was cancelled or dropped",
+        "es": "no dicha: su petición se canceló o se descartó",
+        "ca": "no dita: la seva petició es va cancel·lar o descartar"
+    },
+    "engineer.detail_not_said_stale": {
+        "en": "not said: out of date",
+        "es": "no dicha: desactualizada",
+        "ca": "no dita: desactualitzada"
+    },
     "engineer.detail_tokens": {
         "en": "{model} | {input} in, {cached} cached, {output} out",
         "es": "{model} | {input} de entrada, {cached} en caché, {output} de salida",

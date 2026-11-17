@@ -142,8 +142,9 @@ pub struct Engineer {
     /// The conditions registered with the followed tool, as last pushed to it
     registered: Vec<(ConditionId, String)>,
     /// Notes for the model's next message, about what it doesn't know happened (e.g. a change it
-    /// confirmed that didn't apply). About the current conversation: they go when it ends
-    unheard: Vec<String>,
+    /// confirmed that didn't apply). They go when the conversation ends, and each is told only
+    /// to the conversation it's about
+    unheard: Vec<Note>,
     /// The scheduled turn running, answering requests that fired: at most one, and never while a
     /// pilot turn runs
     scheduled: Option<ScheduledTurn>,
@@ -174,7 +175,7 @@ struct Synthesis {
 /// message if the conversation doesn't keep the exchange.
 #[derive(Default)]
 struct Told {
-    notes: Vec<String>,
+    notes: Vec<Note>,
     /// Its conversation started over (`auto_session`) before its message was sent: the notes,
     /// about the conversation that's over, were left out and aren't told again
     started_over: Arc<AtomicBool>,
@@ -182,7 +183,7 @@ struct Told {
 
 impl Told {
     /// The notes to tell with the next message, its exchange forgotten.
-    fn untold(&mut self) -> Vec<String> {
+    fn untold(&mut self) -> Vec<Note> {
         match self.started_over.load(atomic::Ordering::Relaxed) {
             true => Vec::new(),
             false => std::mem::take(&mut self.notes),
@@ -199,8 +200,11 @@ struct Briefing {
     pending: Vec<RequestId>,
     next_id: RequestId,
     pending_text: String,
-    /// The [`Told`] notes, as the message has them
-    notes: String,
+    /// The [`Told`] notes: the message has those about its conversation as it is once the turn
+    /// has the lock on it (see [`Note::conversation`])
+    notes: Vec<Note>,
+    /// The conversation the turn runs on
+    state: Weak<Mutex<SessionState>>,
     /// Which language to reply in: told last, and after each tool result
     note: Option<Arc<str>>,
     /// The [`Told`] flag, set if the conversation starts over first
@@ -219,6 +223,16 @@ struct ScheduledTurn {
     told: Told,
 }
 
+/// A note for the model's next message (see [`Engineer::unheard`]).
+#[derive(Clone)]
+struct Note {
+    text: String,
+    /// The conversation it's about, the only one told it: checked by the turn telling it, once
+    /// it has the lock on the conversation, so one started over in that very turn isn't told.
+    /// `None`: no conversation has it
+    conversation: Option<Conversation>,
+}
+
 /// What a scheduled turn's answer in the line answers (see [`Playback::scheduled`]).
 struct ScheduledAnswer {
     /// What it says, for the note telling the model if the pilot doesn't hear it
@@ -228,10 +242,22 @@ struct ScheduledAnswer {
     fired: Vec<Fired>,
     /// The conversation that gave it, the only one told if the pilot doesn't hear it
     conversation: Option<Conversation>,
+    /// Its chat entry, which says so if it isn't said
+    entry: Option<usize>,
+}
+
+/// Why a scheduled answer wasn't said: dropped at the front of the line, before it started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unsaid {
+    /// Out of date by the time the radio was free
+    Stale,
+    /// One of its requests is gone: cancelled, or dropped as its condition kept failing
+    Gone,
 }
 
 /// A conversation, as it was when it said something: another one, or the same one started over
 /// (`auto_session`), doesn't have what it said.
+#[derive(Clone)]
 struct Conversation {
     state: Weak<Mutex<SessionState>>,
     starts: u32,
@@ -592,6 +618,12 @@ impl Engineer {
         Instant::now()
     }
 
+    /// Notes `text` for the model's next message, about the conversation as it is now.
+    fn note(&mut self, text: String) {
+        let conversation = self.session.as_ref().map(Conversation::of);
+        self.unheard.push(Note { text, conversation });
+    }
+
     /// The pilot's requests for later.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn schedule(&self) -> &Schedule {
@@ -626,32 +658,26 @@ impl Engineer {
         self.incoming.push(playback);
     }
 
-    /// Speaks a scheduled turn's answer, `text`, written in `lang` (the pilot's reply language
-    /// when the turn started, which it was told to answer in): synthesized in one piece, it joins
-    /// the back of the line once that's ready. Not streamed: the synthesizer streams one answer
-    /// at a time per language, so it would wait behind a pilot answer still being written.
-    /// Without any voice, its requests are resolved at once: the chat has it, and that's all.
-    #[allow(clippy::too_many_arguments)]
+    /// Speaks a scheduled turn's `answer`, written in `lang` (the pilot's reply language when the
+    /// turn started, which it was told to answer in): synthesized in one piece, it joins the back
+    /// of the line once that's ready. Not streamed: the synthesizer streams one answer at a time
+    /// per language, so it would wait behind a pilot answer still being written. Without any
+    /// voice, its requests are resolved at once: the chat has it, and that's all.
     fn speak_scheduled(
         &mut self,
         rt: &Handle,
         config: &Config,
         synth: &mut Synthesizer,
-        text: String,
+        answer: ScheduledAnswer,
         lang: ArrayStr<2>,
-        fired: Vec<Fired>,
         incomplete: bool,
     ) {
         let Some(lang) = self.voice(config, lang) else {
-            self.schedule.resolved(&fired);
+            self.schedule.resolved(&answer.fired);
             self.sync_conditions();
             return;
         };
-        let answer = ScheduledAnswer {
-            text: text.clone(),
-            fired,
-            conversation: self.session.as_ref().map(Conversation::of),
-        };
+        let text = answer.text.clone();
         #[cfg(test)]
         if let Some(synthesis) = &mut self.synthesis {
             let (send, speech) = SpeechOutput::channel();
@@ -704,12 +730,22 @@ impl Engineer {
         }
     }
 
-    /// Drops the scheduled answers that haven't started, in the line or waiting to join it: their
-    /// requests are being cleared. One that has started plays out.
+    /// The answers `which` picks [leave](Self::left) the line, and those waiting to join it;
+    /// the others keep their places.
+    fn drop_answers(&mut self, which: impl Fn(&Playback) -> bool) {
+        let (dropped, kept): (Vec<_>, Vec<_>) = self.incoming.drain(..).partition(&which);
+        self.incoming = kept;
+        let (in_line, line): (VecDeque<_>, VecDeque<_>) = self.line.drain(..).partition(&which);
+        self.line = line;
+        for playback in dropped.into_iter().chain(in_line) {
+            self.left(playback);
+        }
+    }
+
+    /// The scheduled answers that haven't started leave the line, and those waiting to join it:
+    /// their requests are being cleared. One that has started plays out.
     fn drop_waiting_answers(&mut self) {
-        let waiting = |playback: &Playback| playback.scheduled.is_some() && !playback.started;
-        self.incoming.retain(|playback| !waiting(playback));
-        self.line.retain(|playback| !waiting(playback));
+        self.drop_answers(|playback| playback.scheduled.is_some() && !playback.started);
     }
 
     /// Drops the scheduled answer at the front of the line if it's out of date, before it starts
@@ -739,15 +775,34 @@ impl Engineer {
             if !stale {
                 return;
             }
+            let why = match self.schedule.is_gone(&answer.fired) {
+                true => Unsaid::Gone,
+                false => Unsaid::Stale,
+            };
             let playback = self.line.pop_front().expect("just looked");
             let answer = playback.scheduled.as_ref().expect("just looked");
-            let told = (answer.conversation.as_ref())
+            // Told by its conversation's next turn (see `Note::conversation`); not even noted
+            // once that's over
+            let current = (answer.conversation.as_ref())
                 .zip(self.session.as_ref())
                 .is_some_and(|(conversation, session)| conversation.is(session));
-            if told {
-                self.unheard.push(unheard_note(&answer.text));
+            if current {
+                self.unheard.push(Note {
+                    text: unheard_note(&answer.text, why),
+                    conversation: answer.conversation.clone(),
+                });
             }
-            log::info!("Dropped a scheduled answer gone out of date: {}", answer.text);
+            if let Some(entry) = answer.entry.and_then(|entry| self.chat.get_mut(entry)) {
+                let not_said = match why {
+                    Unsaid::Stale => t!("engineer.detail_not_said_stale"),
+                    Unsaid::Gone => t!("engineer.detail_not_said_gone"),
+                };
+                entry.detail = Some(match &entry.detail {
+                    Some(detail) => format!("{detail} | {not_said}"),
+                    None => not_said.to_owned(),
+                });
+            }
+            log::info!("Dropped a scheduled answer ({why:?}): {}", answer.text);
             self.left(playback);
         }
     }
@@ -928,12 +983,12 @@ impl Engineer {
         let applied = self.schedule.apply_answering(changes, &progress, answered);
         for id in applied.missing {
             self.notice(t!("engineer.request_missing", id = id));
-            self.unheard.push(missing_note(id));
+            self.note(missing_note(id));
         }
         // The pilot heard them confirmed
         for id in applied.dropped {
             self.notice(t!("engineer.request_dropped", id = id));
-            self.unheard.push(dropped_note(id));
+            self.note(dropped_note(id));
         }
         self.sync_conditions();
     }
@@ -1280,16 +1335,14 @@ impl Engineer {
             started_over: Arc::default(),
         };
         let progress = self.progress.clone().unwrap_or_default();
+        let state = (self.session.as_ref()).map_or_else(Weak::new, |s| Arc::downgrade(&s.state));
         let briefing = Briefing {
             auto_session: *config.get().auto_session(),
             pending: self.schedule.pending_ids(),
             next_id: self.schedule.next_id(),
             pending_text: self.schedule.pending_text(&progress),
-            notes: told
-                .notes
-                .iter()
-                .map(|note| format!("\n\n{note}"))
-                .collect(),
+            notes: told.notes.clone(),
+            state,
             note,
             started_over: told.started_over.clone(),
         };
@@ -1452,7 +1505,9 @@ impl Engineer {
         // Cut off before it said anything: nothing was answered. Its requests stay due, tried
         // again after a pause rather than at once, so a turn that keeps ending this way (its
         // tokens spent on lookups, or a conversation filled within the turn) doesn't run back to
-        // back. A full context window starts the conversation over for it
+        // back. A full context window starts the conversation over for it. The conversation keeps
+        // the exchange all the same, with the changes it confirmed: they count, as a pilot
+        // turn's do, answering nothing
         let cut_off = matches!(
             reply.stop,
             StopReason::MaxTokens | StopReason::ContextWindowExceeded
@@ -1461,6 +1516,7 @@ impl Engineer {
             if reply.stop == StopReason::ContextWindowExceeded {
                 self.new_session = true;
             }
+            self.apply(changes, &[]);
             let now = self.now();
             self.schedule.batch_failed(now);
             return;
@@ -1511,7 +1567,13 @@ impl Engineer {
         };
         self.notice(t!("engineer.scheduled", what = what));
         self.reply(reply.text.clone(), Some(detail));
-        self.speak_scheduled(rt, config, synth, reply.text, lang, batch.fired, incomplete);
+        let answer = ScheduledAnswer {
+            text: reply.text,
+            fired: batch.fired,
+            conversation: self.session.as_ref().map(Conversation::of),
+            entry: Some(self.chat.len() - 1),
+        };
+        self.speak_scheduled(rt, config, synth, answer, lang, incomplete);
     }
 
     /// Called every frame: answers come in, are synthesized and played. `sim`: the running
@@ -1651,8 +1713,7 @@ impl Engineer {
             StopReason::Refusal => {
                 detail = format!("{detail} | {}", t!("engineer.detail_declined"));
                 // Its answer stops, unheard or not, as the chat only shows "say again"
-                self.incoming.retain(|playback| !playback.writing);
-                self.line.retain(|playback| !playback.writing);
+                self.drop_answers(|playback| playback.writing);
                 let say_again = t!("engineer.say_again": &turn.lang);
                 self.say(rt, config, synth, say_again, turn.lang, None);
                 if self.voice(config, turn.lang).is_none() {
@@ -1758,16 +1819,20 @@ impl Engineer {
                     let playback = self.incoming.remove(i);
                     self.line.push_back(playback);
                 }
+                // No tone for a scheduled answer: the pilot didn't ask
                 Poll::Ready(Some(Err(e))) => {
                     let playback = self.incoming.remove(i);
+                    let tone = playback.scheduled.is_none();
                     self.left(playback);
                     self.notice(t!("engineer.error_synthesizing", error = format!("{e:#}")));
-                    self.no_beep();
+                    if tone {
+                        self.no_beep();
+                    }
                 }
                 // It said nothing
                 Poll::Ready(None) => {
                     let playback = self.incoming.remove(i);
-                    let tone = playback.tone_after_drain;
+                    let tone = playback.tone_after_drain && playback.scheduled.is_none();
                     self.left(playback);
                     if tone {
                         self.no_beep();
@@ -1831,9 +1896,13 @@ impl Engineer {
         if !playback.done && playback.sentences.pending().is_none() {
             match playback.pull(gain) {
                 Poll::Ready(Some(Err(e))) => {
+                    // No tone for a scheduled answer: the pilot didn't ask
+                    let tone = playback.scheduled.is_none();
                     self.drop_front();
                     self.notice(t!("engineer.error_synthesizing", error = format!("{e:#}")));
-                    self.no_beep();
+                    if tone {
+                        self.no_beep();
+                    }
                     return;
                 }
                 // Nothing more yet: what it said plays out while its turn works on the rest
@@ -2075,15 +2144,20 @@ fn dropped_note(id: RequestId) -> String {
 const UNHEARD_QUOTE: usize = 80;
 
 /// What the model is told when its scheduled answer `text` was dropped before the pilot heard
-/// it: it was out of date by the time the radio was free.
-fn unheard_note(text: &str) -> String {
+/// it, and `why`.
+fn unheard_note(text: &str, why: Unsaid) -> String {
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let quote = match text.char_indices().nth(UNHEARD_QUOTE) {
         Some((end, _)) => format!("{}...", &text[..end]),
         None => text,
     };
+    let why = match why {
+        Unsaid::Stale => "it was out of date by the time the radio was free",
+        Unsaid::Gone => "its request was cancelled or dropped before the radio was free",
+    };
     format!(
-        "[The pilot didn't hear your scheduled answer \"{quote}\": it was out of date by the time          the radio was free, so it wasn't said. Don't refer to it as said.]"
+        "[The pilot didn't hear your scheduled answer \"{quote}\": {why}, so it wasn't said. \
+         Don't refer to it as said.]"
     )
 }
 
@@ -2158,14 +2232,22 @@ impl SessionState {
     /// turn: the `schedule` tool stages its changes from here.
     async fn brief(&mut self, message: String, briefing: Briefing) -> String {
         self.schedule_tool.begin(briefing.pending, briefing.next_id);
-        let notes = match self.follow_game_session(briefing.auto_session).await {
-            // About the conversation that's over
-            true => {
-                (briefing.started_over).store(true, atomic::Ordering::Relaxed);
-                ""
-            }
-            false => briefing.notes.as_str(),
-        };
+        if self.follow_game_session(briefing.auto_session).await {
+            // Its notes are about the conversation that's over
+            (briefing.started_over).store(true, atomic::Ordering::Relaxed);
+        }
+        // Only those about this conversation as it is now: one that's started over, here or
+        // since a note was made, never had what it's about
+        let starts = self.starts.load(atomic::Ordering::Relaxed);
+        let notes: String = (briefing.notes.iter())
+            .filter(|note| {
+                note.conversation.as_ref().is_some_and(|conversation| {
+                    Weak::ptr_eq(&conversation.state, &briefing.state)
+                        && conversation.starts == starts
+                })
+            })
+            .map(|note| format!("\n\n{}", note.text))
+            .collect();
         let message = self.tool.question_with_snapshot(message).await;
         let message = format!("{message}\n\n{}{notes}", briefing.pending_text);
         let message = match &briefing.note {
@@ -3734,6 +3816,13 @@ mod tests {
             self.tick();
         }
 
+        /// The notes for the model's next message, as it would be told them.
+        fn notes(&self) -> Vec<String> {
+            (self.engineer.unheard.iter())
+                .map(|note| note.text.clone())
+                .collect()
+        }
+
         /// How many chat entries are the engineer's answers.
         fn answers(&self) -> usize {
             (self.engineer.chat.iter())
@@ -3776,7 +3865,7 @@ mod tests {
             self.engineer.schedule.clear();
             self.finish(Act::Reply);
             let note = missing_note(RequestId(1));
-            assert_eq!(self.engineer.unheard, std::slice::from_ref(&note));
+            assert_eq!(self.notes(), std::slice::from_ref(&note));
             note
         }
     }
@@ -4107,11 +4196,7 @@ mod tests {
                 "failed" => scripted.finish(Act::Fail),
                 _ => scripted.engineer.stop(),
             }
-            assert_eq!(
-                scripted.engineer.unheard,
-                std::slice::from_ref(&note),
-                "{how}"
-            );
+            assert_eq!(scripted.notes(), std::slice::from_ref(&note), "{how}");
         }
     }
 
@@ -4302,7 +4387,7 @@ mod tests {
         let mut scripted = Scripted::recorded();
         scripted.falls_due();
         let note = "[Something the model doesn't know happened.]".to_owned();
-        scripted.engineer.unheard.push(note.clone());
+        scripted.engineer.note(note.clone());
         let turns = scripted.questions().len();
         scripted.wait(schedule::GATHER);
         let message = scripted.scheduled_asked(turns);
@@ -4673,6 +4758,7 @@ mod tests {
             text: text.into(),
             fired: Vec::new(),
             conversation: None,
+            entry: None,
         }
     }
 
@@ -4753,14 +4839,98 @@ mod tests {
         assert!(scripted.engineer.schedule().conditions().is_empty());
         let tool = scripted.engineer.tool.clone().unwrap();
         assert!(tool.conditions().is_empty());
+        // The chat says it wasn't said, and why
+        let answer = (scripted.engineer.chat.iter())
+            .rfind(|e| e.speaker == Speaker::Engineer)
+            .unwrap();
+        assert_eq!(answer.text, "Marker: it's set.");
+        let detail = answer.detail.as_deref().unwrap();
+        assert!(detail.ends_with(t!("engineer.detail_not_said_stale")), "{detail}");
 
         // The model is told the pilot didn't hear it
         let turns = scripted.questions().len();
         scripted.ask("How are the tyres?");
         scripted.until("asked", |s| s.questions().len() > turns);
         let question = &scripted.questions()[turns];
-        let note = unheard_note("Marker: it's set.");
+        let note = unheard_note("Marker: it's set.", Unsaid::Stale);
         assert!(question.contains(&note), "{question}");
+        assert!(note.contains("out of date") && !note.contains("  "), "{note}");
+    }
+
+    #[test]
+    fn a_cancelled_requests_answer_is_dropped_for_that_reason() {
+        let mut scripted = Scripted::recorded_with(VOICES);
+        let mut every = marker_set();
+        every["repeat"] = serde_json::json!("every");
+        scripted.answer_waiting_with(every, "Marker: it's set.");
+        // The pilot cancels the request while its answer waits
+        let turns = scripted.questions().len();
+        scripted.ask("Forget the marker.");
+        scripted.until("asked", |s| s.questions().len() > turns);
+        scripted.schedule(cancel(RequestId(1))).unwrap();
+        scripted.finish(Act::Reply);
+        assert!(scripted.pending().is_empty());
+        scripted.engineer.talk(false);
+        scripted.frame();
+        assert!(scripted.answers_waiting().is_empty());
+        let answer = (scripted.engineer.chat.iter())
+            .find(|e| e.speaker == Speaker::Engineer && e.text == "Marker: it's set.")
+            .unwrap();
+        let detail = answer.detail.as_deref().unwrap();
+        assert!(detail.ends_with(t!("engineer.detail_not_said_gone")), "{detail}");
+        // Not said to be out of date
+        let notes = scripted.notes();
+        assert_eq!(notes, [unheard_note("Marker: it's set.", Unsaid::Gone)]);
+        assert!(!notes[0].contains("out of date"), "{}", notes[0]);
+    }
+
+    #[test]
+    fn a_note_is_not_told_to_a_conversation_started_over_since() {
+        let mut scripted = Scripted::recorded_with(VOICES);
+        scripted.answer_waiting("Marker: it's set.");
+        scripted.new_game_session();
+        // The next turn starts the conversation over (`auto_session`), held up until the answer
+        // has been dropped, in the frame the turn started
+        let state = scripted.engineer.session.as_ref().unwrap().state.clone();
+        state.blocking_lock().game_session = Some("Elsewhere|practice|1".into());
+        let held = state.blocking_lock();
+        let turns = scripted.questions().len();
+        scripted.ask("How are the tyres?");
+        scripted.engineer.talk(false);
+        scripted.frame();
+        assert!(scripted.answers_waiting().is_empty());
+        drop(held);
+        scripted.until("asked", |s| s.questions().len() > turns);
+        scripted.finish(Act::Reply);
+
+        // The conversation started over never gave that answer
+        let note = unheard_note("Marker: it's set.", Unsaid::Stale);
+        let turns = scripted.questions().len();
+        scripted.ask("Anything else?");
+        scripted.until("asked", |s| s.questions().len() > turns);
+        for question in &scripted.questions()[turns - 1..] {
+            assert!(!question.contains(&note), "{question}");
+        }
+    }
+
+    #[test]
+    fn cut_off_turn_keeps_its_changes() {
+        for stop in [StopReason::MaxTokens, StopReason::ContextWindowExceeded] {
+            let mut scripted = Scripted::recorded();
+            let turns = scripted.scheduled_running();
+            // It confirmed an add, then ran out before it said anything: the conversation keeps
+            // the exchange, so the add counts
+            let added = scripted.schedule(fuel_every_lap()).unwrap();
+            assert!(added.contains("#2"), "{added}");
+            scripted.finish_scheduled(Act::End(stop, ""));
+            assert_eq!(scripted.pending(), [RequestId(1), RequestId(2)], "{stop:?}");
+            if stop == StopReason::MaxTokens {
+                // Nothing was answered: tried again after a pause
+                scripted.wait(schedule::RETRY_AFTER);
+                let message = scripted.scheduled_asked(turns + 1);
+                assert!(message.contains(MARKER), "{message}");
+            }
+        }
     }
 
     #[test]
@@ -4960,15 +5130,14 @@ mod tests {
         };
         assert_eq!(tone.samples, Speech::no_beep(1.0).samples);
 
-        // One whose synthesis gave nothing still ends with it
+        // One whose synthesis gave nothing has no tone: the pilot didn't ask
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
         let (send, speech) = SpeechOutput::channel();
         drop(send);
         engineer.queue_scheduled(speech, scheduled_answer("And"), true);
         engineer.admit(1.0);
-        assert!(engineer.incoming.is_empty());
-        assert_eq!(engineer.line.len(), 1);
-        assert!(engineer.line[0].complete && engineer.line[0].scheduled.is_none());
+        assert!(!engineer.is_speaking());
+        assert!(engineer.incoming.is_empty() && engineer.line.is_empty());
     }
 
     #[test]
@@ -4982,6 +5151,8 @@ mod tests {
         scripted.until("dropped", |s| s.answers_waiting().is_empty());
         let error = t!("engineer.error_synthesizing", error = "no voice loaded");
         assert!(scripted.noticed(&error));
+        // No tone: the pilot didn't ask
+        assert!(!scripted.engineer.is_speaking());
         assert!(scripted.pending().is_empty());
         assert_eq!(scripted.engineer.schedule().waiting(RequestId(1)), 0);
     }

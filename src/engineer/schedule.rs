@@ -750,6 +750,12 @@ impl Schedule {
         })
     }
 
+    /// Whether one of the requests an answer to `fired` answers is gone: cancelled, cleared, or
+    /// dropped because its condition kept failing (see [`Self::is_stale`]).
+    pub fn is_gone(&self, fired: &[Fired]) -> bool {
+        (fired.iter()).any(|f| self.requests.iter().all(|r| r.id != f.id))
+    }
+
     /// Drops every request, and the batch out with them
     pub fn clear(&mut self) {
         self.requests.clear();
