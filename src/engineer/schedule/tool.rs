@@ -484,7 +484,7 @@ impl ScheduleInput {
     }
 
     /// The request to add or replace with: its instruction, trigger, repeat and `stale_after`
-    fn request(self) -> anyhow::Result<(String, Trigger, Repeat, Option<Trigger>)> {
+    pub(crate) fn request(self) -> anyhow::Result<(String, Trigger, Repeat, Option<Trigger>)> {
         let instruction = self.instruction.as_deref().map(str::trim).unwrap_or("");
         if instruction.is_empty() {
             bail!("`instruction` is needed: what to do when it fires");

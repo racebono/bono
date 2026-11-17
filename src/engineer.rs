@@ -2184,6 +2184,21 @@ pub(crate) fn scheduled_message(batch: &Batch) -> String {
     message
 }
 
+/// A turn's `message`, its telemetry snapshot attached, with what follows it: the pending
+/// requests, the `notes` (each already led by a blank line) and the reply-language `note`, last.
+pub(crate) fn briefed(
+    message: String,
+    pending_text: &str,
+    notes: &str,
+    note: Option<&str>,
+) -> String {
+    let message = format!("{message}\n\n{pending_text}{notes}");
+    match note {
+        Some(note) => format!("{message}\n\n{note}"),
+        None => message,
+    }
+}
+
 /// How the chat names the requests that fired: each one's id and instruction.
 fn what_fired<'a>(requests: impl IntoIterator<Item = (RequestId, &'a str)>) -> String {
     (requests.into_iter())
@@ -2249,11 +2264,12 @@ impl SessionState {
             .map(|note| format!("\n\n{}", note.text))
             .collect();
         let message = self.tool.question_with_snapshot(message).await;
-        let message = format!("{message}\n\n{}{notes}", briefing.pending_text);
-        let message = match &briefing.note {
-            Some(note) => format!("{message}\n\n{note}"),
-            None => message,
-        };
+        let message = briefed(
+            message,
+            &briefing.pending_text,
+            &notes,
+            briefing.note.as_deref(),
+        );
         self.conversation.set_tool_result_note(briefing.note);
         message
     }
