@@ -19,8 +19,6 @@ pub enum ConditionState {
 }
 
 /// What the data thread has measured, published about once a second for the engineer's schedule
-// Read by the schedule, which a later task adds.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 pub struct Progress {
     /// Goes up with every snapshot, so a reader can tell a new one from one it has seen

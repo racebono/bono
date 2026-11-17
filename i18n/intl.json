@@ -1251,6 +1251,21 @@
         "es": "Cancelada: el piloto habló por encima",
         "ca": "Cancel·lada: el pilot hi ha parlat per sobre"
     },
+    "engineer.request_missing": {
+        "en": "Request {id} had already ended, so the change to it didn't apply",
+        "es": "La petición {id} ya había terminado, así que el cambio no se ha aplicado",
+        "ca": "La petició {id} ja s'havia acabat, així que el canvi no s'ha aplicat"
+    },
+    "engineer.requests_cleared": {
+        "en": "Scheduled requests cleared",
+        "es": "Peticiones programadas borradas",
+        "ca": "Peticions programades esborrades"
+    },
+    "engineer.condition_dropped": {
+        "en": "Request {id} dropped, as its condition kept failing: {instruction}",
+        "es": "Petición {id} descartada, porque su condición fallaba una y otra vez: {instruction}",
+        "ca": "Petició {id} descartada, perquè la seva condició fallava una vegada i una altra: {instruction}"
+    },
     "engineer.not_understood": {
         "en": "Nothing understood on the radio: say it again, a little louder or closer to the microphone",
         "es": "No se entendió nada por radio: repítelo, un poco más alto o más cerca del micrófono",

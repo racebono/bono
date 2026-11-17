@@ -34,8 +34,6 @@ const MIN_REPEAT_S: f64 = 10.0;
 const SESSION_TYPES: [&str; 5] = ["test", "practice", "qualifying", "warmup", "race"];
 
 /// The tool, for one conversation. Cheap to clone; clones stage into the same turn.
-// Inserted into the conversation's tools by the engineer, which a later task makes use it.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct ScheduleTool {
     engineer: tool::Engineer,
@@ -57,8 +55,6 @@ struct Staging {
     changes: Vec<Change>,
 }
 
-// Inserted into the conversation's tools by the engineer, which a later task makes use it.
-#[allow(dead_code)]
 impl ScheduleTool {
     pub const NAME: &'static str = "schedule";
 

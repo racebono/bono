@@ -168,8 +168,6 @@ impl Engineer {
     /// What the data thread last measured for the scheduled requests (see [`Progress`]), without
     /// waiting for it. `None` until its first snapshot, and while its tables are catching up with
     /// the recording.
-    // The schedule, which a later task adds, reads it.
-    #[allow(dead_code)]
     pub fn progress(&self) -> Option<Progress> {
         lock(&self.inner.shared.progress).clone()
     }
@@ -182,17 +180,19 @@ impl Engineer {
 
     /// Replaces the conditions the data thread checks with every progress snapshot, without
     /// waiting for it.
-    // The schedule, which a later task adds, registers them.
-    #[allow(dead_code)]
     pub fn set_conditions(&self, conditions: Vec<(ConditionId, String)>) {
         let replaced = std::mem::replace(&mut *lock(&self.inner.shared.conditions), conditions);
         drop(replaced);
     }
 
+    /// The conditions registered with [`Self::set_conditions`].
+    #[cfg(test)]
+    pub fn conditions(&self) -> Vec<(ConditionId, String)> {
+        lock(&self.inner.shared.conditions).clone()
+    }
+
     /// Checks a condition once now, as `sql` would run it and under a condition's time limit:
     /// whether it returns at least one row.
-    // The `schedule` tool, which a later task adds, checks a request's conditions with it.
-    #[allow(dead_code)]
     pub async fn check_condition(&self, query: String) -> anyhow::Result<bool> {
         self.ask(derived::Job::Condition { query })
             .await

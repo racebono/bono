@@ -23,8 +23,6 @@ pub const GATHER: Duration = Duration::from_secs(1);
 pub const CONDITION_FAILURES: u32 = 5;
 
 /// When an answer stops being worth saying, for a request made without its own
-// Used by the engineer's scheduled turns, which a later task adds.
-#[allow(dead_code)]
 pub const DEFAULT_STALE: Trigger = Trigger::Time { seconds: 30.0 };
 
 /// How long a failed scheduled turn waits before its requests are tried again
@@ -33,8 +31,6 @@ pub const DEFAULT_STALE: Trigger = Trigger::Time { seconds: 30.0 };
 pub const RETRY_AFTER: Duration = Duration::from_secs(10);
 
 /// The most requests that may be pending, a guard against a model stuck adding them
-// Used by the `schedule` tool, which a later task adds.
-#[allow(dead_code)]
 pub const MAX_REQUESTS: usize = 50;
 
 /// The game clock is a sum of float differences, so a time target counts as reached this close
@@ -46,8 +42,6 @@ const TOLERANCE_S: f64 = 1e-6;
 const BOUNDARIES: [&str; 3] = ["session", "clock_rollback", "replay"];
 
 /// What the model and the pilot call a request by, shown as `#3`
-// Used by the engineer's scheduled turns, which a later task adds.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RequestId(pub u32);
 
@@ -58,8 +52,6 @@ impl fmt::Display for RequestId {
 }
 
 /// When a request fires, ends or goes stale, counted from a baseline
-// Used by the engineer's scheduled turns, which a later task adds.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Trigger {
     /// Seconds of game clock
@@ -74,8 +66,6 @@ pub enum Trigger {
 }
 
 /// Whether a request is answered once or again and again
-// Used by the engineer's scheduled turns, which a later task adds.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Repeat {
     /// Answered, then removed
@@ -86,8 +76,6 @@ pub enum Repeat {
 }
 
 /// A request as the model asks for it
-// Used by the engineer's scheduled turns, which a later task adds.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct NewRequest {
     /// Self-contained: it makes sense to a conversation that never heard it asked
@@ -102,8 +90,6 @@ pub struct NewRequest {
 }
 
 /// A change a turn makes to the schedule, applied once the turn finishes
-// Used by the engineer's scheduled turns, which a later task adds.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum Change {
     /// With the id the tool gave it from [`Schedule::next_id`], which the model already confirmed
@@ -134,8 +120,6 @@ pub struct Batch {
 }
 
 /// What [`Schedule::apply`] did with a turn's changes
-// Used by the engineer's pilot turns, which a later task adds.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Applied {
     /// The requests added or replaced
@@ -146,8 +130,6 @@ pub struct Applied {
 }
 
 /// What a step of the schedule did that the engineer tells the pilot about
-// Used by the engineer's scheduled turns, which a later task adds.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Advance {
     /// A new weekend cleared the requests
@@ -159,8 +141,6 @@ pub struct Advance {
 }
 
 /// The pilot's requests, and every rule about when they fire, end and go stale
-// Owned by the engineer, which a later task makes use it.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Schedule {
     /// In the order they were made
@@ -781,8 +761,6 @@ impl Schedule {
 
     /// The id the next request added will have. The tool numbers a turn's adds from it, so the ids
     /// the model confirms are the ones applied: a dropped turn's ids are given out again
-    // Used by the schedule tool, which a later task adds.
-    #[allow(dead_code)]
     pub fn next_id(&self) -> RequestId {
         RequestId(self.next_id)
     }
@@ -793,8 +771,6 @@ impl Schedule {
     }
 
     /// The pending requests' ids, the ones [`len`](Self::len) counts, in the order they were made
-    // Used by the schedule tool, which a later task adds.
-    #[allow(dead_code)]
     pub fn pending_ids(&self) -> Vec<RequestId> {
         self.requests
             .iter()
