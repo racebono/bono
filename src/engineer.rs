@@ -1218,7 +1218,7 @@ async fn game_session(
             let session = conn
                 .query_row(
                     "SELECT track, session_type, session_number, session_end_time FROM session \
-                 ORDER BY id DESC LIMIT 1",
+                     ORDER BY id DESC LIMIT 1",
                     [],
                     |row| {
                         let session_type = row.get::<_, Option<String>>(1)?.unwrap_or_default();
