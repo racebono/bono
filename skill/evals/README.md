@@ -28,6 +28,11 @@ race, where another car's gap to its own neighbour is a plausible wrong answer, 
 cars and missing race-order times. These are controlled manual/model scenarios, not executed
 results.
 
+`steering.md` covers the pilot speaking again while a turn is working: a correction, an unrelated
+addition, a follow-up, two questions in one hand-back and a different language. It checks for one
+reply, no second acknowledgement and no answer to a corrected question. These are controlled
+manual/model scenarios, not executed results.
+
 These cases test the race engineer's answers, not the automatic spotter. Direct side/clear
 calls, immediate alerts and imminent-rain announcements are excluded. Rival pace, longer
 weather outlooks, strategy and driving advice remain in scope.

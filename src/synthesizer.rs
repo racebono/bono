@@ -86,6 +86,32 @@ impl Synthesizer {
         return recv;
     }
 
+    /// [`Self::synthesize`]s `text` in one piece, as a [`SpeechOutput`] that ends after it: the
+    /// worker takes it between a stream's sentences, so it never waits behind a reply still being
+    /// written. Dropping the output before it's synthesized skips the synthesis.
+    pub fn synthesize_output(
+        &mut self,
+        rt: &Handle,
+        lang: ArrayStr<2>,
+        text: String,
+        effects: Effects,
+    ) -> SpeechOutput {
+        let speech = self.synthesize(rt, lang, text, effects);
+        let (output, recv) = mpsc::unbounded_channel();
+        rt.spawn(async move {
+            tokio::select! {
+                // Nobody's listening: the worker sees its receiver dropped, and skips the synthesis
+                // if it hasn't started it
+                () = output.closed() => {}
+                // Without a sender, the worker stopped: the output ends with nothing
+                speech = speech => if let Ok(speech) = speech {
+                    let _ = output.send(speech);
+                },
+            }
+        });
+        return SpeechOutput(recv);
+    }
+
     /// Speaks text as it comes in, a sentence at a time: each one is synthesized as soon as
     /// it's complete, and comes out of the [`SpeechOutput`] while the next is still being
     /// written. The transmission ends when the [`SpeechInput`] is dropped, and stops early when
@@ -136,8 +162,8 @@ impl SpeechInput {
     }
 }
 
-/// The speech of a [`Synthesizer::stream`], a sentence or so at a time: dropping it stops the
-/// synthesis.
+/// The speech of a [`Synthesizer::stream`], a sentence or so at a time (or of a
+/// [`Synthesizer::synthesize_output`], in one piece): dropping it stops the synthesis.
 pub struct SpeechOutput(mpsc::UnboundedReceiver<anyhow::Result<Speech>>);
 
 impl SpeechOutput {
@@ -148,6 +174,13 @@ impl SpeechOutput {
         Self(recv)
     }
 
+    /// An output fed by hand, as a synthesizer would: it ends once the sender is dropped.
+    #[cfg(test)]
+    pub fn channel() -> (mpsc::UnboundedSender<anyhow::Result<Speech>>, Self) {
+        let (output, recv) = mpsc::unbounded_channel();
+        (output, Self(recv))
+    }
+
     /// The next piece of speech if it's ready, or `Ready(None)` once the transmission is over
     /// (an error ends it too).
     pub fn try_next(&mut self) -> Poll<Option<anyhow::Result<Speech>>> {
@@ -156,6 +189,12 @@ impl SpeechOutput {
             Err(TryRecvError::Empty) => Poll::Pending,
             Err(TryRecvError::Disconnected) => Poll::Ready(None),
         }
+    }
+
+    /// Whether nothing is ready to [take](Self::try_next): no piece of speech or error, though
+    /// the transmission may be over.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -885,19 +924,20 @@ impl Speech {
 
     /// Starts playing on `device`. Dropping the returned stream stops playback.
     pub fn play(&self, device: &sdl3::audio::AudioDevice) -> Result<AudioStreamOwner, sdl3::Error> {
-        let stream = self.start(device)?;
+        let stream = self.start(device, 0)?;
         stream.flush()?;
         return Ok(stream);
     }
 
-    /// Starts playing on `device`, with more to come: put it on the returned stream, and flush
-    /// it after the last. Dropping the stream stops playback.
+    /// Starts playing on `device` from the sample `skip`, with more to come: put it on the
+    /// returned stream, and flush it after the last. Dropping the stream stops playback.
     pub fn start(
         &self,
         device: &sdl3::audio::AudioDevice,
+        skip: usize,
     ) -> Result<AudioStreamOwner, sdl3::Error> {
         let stream = device.clone().open_device_stream(Some(&self.spec()))?;
-        stream.put_data_f32(&self.samples)?;
+        stream.put_data_f32(&self.samples[skip..])?;
         stream.resume()?;
         return Ok(stream);
     }
@@ -1212,6 +1252,26 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "timed out");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_piece_output_ends_after_its_speech() {
+        let rt = Handle::current();
+        let mut synth = Synthesizer {
+            inner: BTreeMap::new(),
+        };
+        let effects = Effects {
+            radio: 0.65,
+            beep_volume: 1.0,
+        };
+        // Without a voice, the one piece is the error saying so
+        let mut output =
+            synth.synthesize_output(&rt, crate::arrstr!("en"), "Copy.".into(), effects);
+        let Some(Err(error)) = next(&mut output).await else {
+            panic!("there's no voice to speak with");
+        };
+        assert_eq!(error.to_string(), no_model().to_string());
+        assert!(next(&mut output).await.is_none());
     }
 
     /// Needs a Piper voice: `BONO_VOICE` is the path to its `.onnx`.

@@ -8,7 +8,7 @@ use crate::{
     config::{ArrayStr, Config, ModelConfig, ModelProvider},
     language::{self, LanguageDetector},
     provider::{
-        self, Model, Reply, StopReason, Tools,
+        self, Model, Reply, Steer, StopReason, Tools,
         bono_cloud::{GameSession, Lease},
     },
     sim::Sim,
@@ -112,10 +112,17 @@ pub struct Engineer {
     new_session: bool,
     /// The question being answered
     turn: Option<Turn>,
-    /// The answer being spoken
-    playback: Option<Playback>,
-    /// The spotter is speaking: the answer waits, and carries on from there after
-    held: bool,
+    /// Answers waiting for their first piece of speech, in the order they were
+    /// [queued](Self::queue): each joins the back of `line` once it has one, so an answer still
+    /// being thought about never holds up one that's ready
+    incoming: Vec<Playback>,
+    /// The line of answers, in the order they're played: the front one plays, the others wait
+    /// with their speech buffered. Only [`Self::fill_gap`] moves one ahead
+    line: VecDeque<Playback>,
+    /// The spotter is speaking: the front answer waits, and carries on from there after
+    spotter_held: bool,
+    /// The talk button is held: the front answer waits, as for the spotter
+    talking: bool,
     /// Times in a row nothing was understood on the radio
     misheard: u32,
 }
@@ -129,10 +136,16 @@ struct Turn {
     text: mpsc::UnboundedReceiver<String>,
     /// The chat entry it's written into, once it says something
     entry: Option<usize>,
+    /// The pilot's questions asked while it runs, for it to take at its next tool hand-back.
+    /// What it leaves there is asked next
+    steer: Steer,
+    /// The latest of those questions' language and the first one's release, as given to
+    /// [`Engineer::ask`]: what it leaves is asked with them. `None` until one is asked
+    steered: Option<(Option<ArrayStr<2>>, Option<Instant>)>,
 }
 
-/// Speech played as it's synthesized.
-struct Playback {
+/// An answer in the engineer's line: speech played as it's synthesized.
+pub struct Playback {
     speech: SpeechOutput,
     /// Opened with the first piece of speech. Dropping it stops playback
     stream: Option<AudioStreamOwner>,
@@ -145,7 +158,25 @@ struct Playback {
     /// Play the incomplete-answer tone once this speech has drained.
     tone_after_drain: bool,
     sentences: SentenceQueue,
+    /// Made in one piece (a tone, "say again"): it may play in the gap of an answer
+    /// [waiting on its turn](Self::waiting_on_its_turn)
+    complete: bool,
+    /// Its pilot turn is still running: more of it may come
+    writing: bool,
+    /// Paused: whether [`Self::set_held`]`(true)` is in effect
+    held: bool,
+    /// Its stream was flushed since its last piece went on, so all of it plays out: a stream
+    /// that resamples holds some of its input back until then
+    flushed: bool,
+    /// Since when it's been [waiting on its turn](Self::waiting_on_its_turn), with nothing
+    /// submitted since: [`Engineer::fill_gap`] waits [`GAP_AFTER`]
+    waiting_since: Option<Instant>,
 }
+
+/// How long the answer at the front waits on its turn, with nothing to play, before another
+/// plays in its gap. The speaker may still be playing what SDL has taken from the stream (its
+/// queued bytes count only what SDL hasn't), and a short pause sounds natural on the radio.
+const GAP_AFTER: Duration = Duration::from_millis(300);
 
 /// How far behind where it was interrupted an answer resumes, in seconds.
 const RESUME_BEHIND: f32 = 0.4;
@@ -246,7 +277,94 @@ impl SentenceQueue {
 }
 
 impl Playback {
+    /// `speech`, to play once it's at the front of the line. `complete`: it's made in one piece.
+    pub fn new(speech: SpeechOutput, complete: bool) -> Self {
+        Self {
+            speech,
+            stream: None,
+            done: false,
+            drain: Drain::new(Instant::now()),
+            timeline: None,
+            tone_after_drain: false,
+            sentences: SentenceQueue::default(),
+            complete,
+            writing: false,
+            held: false,
+            flushed: false,
+            waiting_since: None,
+        }
+    }
+
+    /// The radio's low tone, as loud as the engineer: a request couldn't be answered.
+    pub fn tone() -> Self {
+        Self::new(SpeechOutput::ready(Speech::no_beep(1.0)), true)
+    }
+
+    /// Takes the next piece of speech, if it's ready, at `gain`: it's pending, to play. At the
+    /// end (`Ready(None)`), it's [`done`](Self::done), and SDL plays what's left.
+    fn pull(&mut self, gain: f32) -> Poll<Option<anyhow::Result<()>>> {
+        match self.speech.try_next() {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(mut speech))) => {
+                for sample in &mut speech.samples {
+                    *sample *= gain;
+                }
+                self.sentences.pieces.push_back(speech);
+                Poll::Ready(Some(Ok(())))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => {
+                self.done = true;
+                if let Some(stream) = &self.stream
+                    && let Err(e) = stream.flush()
+                {
+                    log::warn!("Error flushing the answer's audio: {e}");
+                }
+                Poll::Ready(None)
+            }
+        }
+    }
+
+    /// It's caught up with what its pilot turn has written so far: what's on its stream plays out
+    /// in full, once for each such stretch, so it can be seen to have played it all. Flushing
+    /// after every piece instead could leave gaps between them.
+    fn caught_up(&mut self) {
+        if let Some(stream) = &self.stream
+            && !std::mem::replace(&mut self.flushed, true)
+            && let Err(e) = stream.flush()
+        {
+            log::warn!("Error flushing the answer's audio: {e}");
+        }
+    }
+
+    /// Whether it's played all it has so far and waits on its pilot turn for more (e.g. "Copy,
+    /// checking." said, the lookups still running): nothing is playing meanwhile, and its next
+    /// piece isn't synthesized yet.
+    fn waiting_on_its_turn(&self) -> bool {
+        self.writing
+            && self.sentences.pending().is_none()
+            && self.speech.is_empty()
+            && (self.stream.as_ref()).is_none_or(|stream| matches!(stream.queued_bytes(), Ok(0)))
+    }
+
+    /// Lets go of its stream: what it hasn't played goes out again, on whichever speaker is
+    /// picked once it's next at the front. An answer [waiting on its
+    /// turn](Self::waiting_on_its_turn) needs none, and holds none behind another.
+    fn close_stream(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            self.sentences.rewind(stream.queued_bytes().ok());
+        }
+        self.flushed = false;
+        self.waiting_since = None;
+        self.drain = Drain::new(Instant::now());
+    }
+
+    /// Pauses it, ready to resume [`RESUME_BEHIND`] before where it stopped, or resumes it.
+    /// Recorded even without a stream to pause, and nothing is done if it's already so.
     fn set_held(&mut self, held: bool) -> Result<(), sdl3::Error> {
+        if std::mem::replace(&mut self.held, held) == held {
+            return Ok(());
+        }
         let Some(stream) = &self.stream else {
             return Ok(());
         };
@@ -302,8 +420,10 @@ impl Engineer {
             session: None,
             new_session: false,
             turn: None,
-            playback: None,
-            held: false,
+            incoming: Vec::new(),
+            line: VecDeque::new(),
+            spotter_held: false,
+            talking: false,
             misheard: 0,
         }
     }
@@ -320,10 +440,18 @@ impl Engineer {
         self.turn.is_some()
     }
 
-    /// Whether an answer is being spoken, or is about to be.
+    /// Whether an answer is being spoken, or is about to be: anything in the line, or waiting
+    /// to join it.
     #[inline]
     pub fn is_speaking(&self) -> bool {
-        self.playback.is_some()
+        !self.line.is_empty() || !self.incoming.is_empty()
+    }
+
+    /// Adds `playback` to the line: how any answer joins it, a pilot turn's or one made
+    /// elsewhere (e.g. scheduled). It waits in `incoming` until its first piece of speech is
+    /// ready, then joins the back of the line (see [`Self::admit`]).
+    pub fn queue(&mut self, playback: Playback) {
+        self.incoming.push(playback);
     }
 
     /// The configured input language, or the language the pilot last asked in.
@@ -336,20 +464,37 @@ impl Engineer {
             .unwrap_or(self.last_lang)
     }
 
-    /// Pauses the answer being spoken (and holds one about to start) while the spotter speaks;
-    /// releasing it resumes `RESUME_BEHIND` before where it stopped, or from the sentence's start
-    /// if that sentence began since then.
+    /// Pauses the answer at the front of the line (and holds one about to start) while the
+    /// spotter speaks; releasing it resumes `RESUME_BEHIND` before where it stopped, or from the
+    /// sentence's start if that sentence began since then.
     pub fn hold(&mut self, held: bool) {
-        if std::mem::replace(&mut self.held, held) == held {
-            return;
-        }
+        self.spotter_held = held;
+        self.hold_front();
+    }
 
-        if let Some(playback) = self.playback.as_mut() {
-            let result = playback.set_held(held);
-            if let Err(e) = result {
-                log::warn!("Error holding the answer for the spotter: {e}");
-                self.playback = None;
-            }
+    /// Pauses the answer at the front of the line (and holds one about to start) while the
+    /// talk button is held, as [`Self::hold`] does for the spotter, so it doesn't play over the
+    /// pilot. It stays paused until both let go.
+    pub fn talk(&mut self, talking: bool) {
+        self.talking = talking;
+        self.hold_front();
+    }
+
+    /// Whether the front of the line waits: the spotter is speaking or the pilot is talking.
+    fn held(&self) -> bool {
+        self.spotter_held || self.talking
+    }
+
+    /// Holds the front of the line as [`Self::held`] says, whichever answer is there. Nothing
+    /// is done when it's already so (see [`Playback::set_held`]).
+    fn hold_front(&mut self) {
+        let held = self.held();
+        let Some(playback) = self.line.front_mut() else {
+            return;
+        };
+        if let Err(e) = playback.set_held(held) {
+            log::warn!("Error holding the answer: {e}");
+            self.line.pop_front();
         }
     }
 
@@ -357,14 +502,21 @@ impl Engineer {
         self.notice(t!("engineer.microphone_removed"));
     }
 
-    /// The speaker `which` is gone (unplugged): the answer being spoken on it stops. `picked`:
-    /// whether it's the speaker picked, which the pilot is told about either way.
+    /// The speaker `which` is gone (unplugged): the answer being spoken on it stops. Only the
+    /// front of the line holds a stream (see [`Self::fill_gap`]), and one only waiting on its
+    /// turn there keeps its place: the rest of it plays on whichever speaker is picked, as the
+    /// others do. `picked`: whether it's the speaker picked, which the pilot is told about
+    /// either way.
     pub fn speaker_removed(&mut self, which: u32, picked: bool) {
-        let on_it = (self.playback.as_ref())
+        let on_it = (self.line.front())
             .and_then(|playback| playback.stream.as_ref())
             .is_some_and(|stream| plays_on(stream, which));
         if on_it {
-            self.playback = None;
+            if self.line[0].waiting_on_its_turn() {
+                self.line[0].close_stream();
+            } else {
+                self.line.pop_front();
+            }
         }
         if on_it || picked {
             self.notice(t!("engineer.speaker_removed"));
@@ -382,7 +534,7 @@ impl Engineer {
     }
 
     /// What the pilot said on the radio: a question is asked, and anything else is answered
-    /// with why it can't be, cutting off whatever was being said (the pilot talked over it).
+    /// with why it can't be, after whatever is being said: nothing heard stops the engineer.
     pub fn hear(
         &mut self,
         rt: &Handle,
@@ -402,7 +554,6 @@ impl Engineer {
             }
             Heard::TooShort => {}
             Heard::Unvoiced { text, lang } => {
-                self.stop();
                 let language = language::ui_name(lang);
                 self.notice(t!(
                     "engineer.no_voice_for",
@@ -412,7 +563,6 @@ impl Engineer {
                 self.say_again(rt, config, synth);
             }
             Heard::Nothing => {
-                self.stop();
                 self.misheard += 1;
                 match self.misheard >= MISHEARD_HINT {
                     true => {
@@ -424,13 +574,11 @@ impl Engineer {
                 self.say_again(rt, config, synth);
             }
             Heard::Failed(e) => {
-                self.stop();
                 self.notice(t!("engineer.error_hearing", error = format!("{e:#}")));
                 self.say_again(rt, config, synth);
             }
             // The voice may not be there either: the tone says it
             Heard::NotListening(why) => {
-                self.stop();
                 self.notice(match why {
                     NotListening::NoMicrophone => t!("engineer.no_microphone"),
                     NotListening::NoModel => t!("engineer.no_stt_model"),
@@ -439,7 +587,6 @@ impl Engineer {
                 self.no_beep();
             }
             Heard::NoVoice(lang) => {
-                self.stop();
                 self.notice(match lang {
                     Some(lang) => {
                         t!(
@@ -452,7 +599,6 @@ impl Engineer {
                 self.no_beep();
             }
             Heard::UnsupportedLanguage(lang) => {
-                self.stop();
                 self.notice(t!(
                     "engineer.stt_unsupported_language",
                     language = language::ui_name(lang)
@@ -468,27 +614,25 @@ impl Engineer {
         let spoken = config.get().engineer_reply_language();
         let lang = spoken.unwrap_or_else(|| self.language(config));
         match self.voice(config, lang) {
-            Some(lang) => self.say(rt, config, synth, t!("engineer.say_again": &lang), lang),
+            Some(lang) => {
+                let text = t!("engineer.say_again": &lang);
+                self.say(rt, config, synth, text, lang, None);
+            }
             None => self.no_beep(),
         }
     }
 
-    /// The radio's low tone, as loud as the engineer: the request couldn't be answered.
+    /// The radio's low tone, as loud as the engineer, at the back of the line: the request
+    /// couldn't be answered.
     fn no_beep(&mut self) {
-        self.playback = Some(Playback {
-            speech: SpeechOutput::ready(Speech::no_beep(1.0)),
-            stream: None,
-            done: false,
-            drain: Drain::new(Instant::now()),
-            timeline: None,
-            tone_after_drain: false,
-            sentences: SentenceQueue::default(),
-        });
+        self.queue(Playback::tone());
     }
 
-    /// Preserve the answer still being synthesized or played before sounding its failure tone.
+    /// Preserve the answer still being synthesized or played before sounding its failure tone:
+    /// it follows the answer of the pilot turn still running, if it has one.
     fn incomplete_beep(&mut self) {
-        match &mut self.playback {
+        let writing = (self.incoming.iter_mut().chain(&mut self.line)).find(|p| p.writing);
+        match writing {
             Some(playback) => playback.tone_after_drain = true,
             None => self.no_beep(),
         }
@@ -571,8 +715,9 @@ impl Engineer {
     }
 
     /// The pilot asked something on the radio: it's sent to the model, with the running
-    /// simulator's telemetry, and the answer is spoken as the model writes it. An answer still on its way, or
-    /// being spoken, is dropped: the pilot talked over it.
+    /// simulator's telemetry, and the answer is spoken as the model writes it. Asked while a
+    /// question is being answered, it steers that turn instead (see [`Turn::steer`]); what's
+    /// being said carries on.
     ///
     /// `lang`: the language it was asked in; `None` if it isn't known. Unless a reply language
     /// is selected, the model is told to answer in this language, or goes by the question if
@@ -590,21 +735,45 @@ impl Engineer {
         lang: Option<ArrayStr<2>>,
         released: Option<Instant>,
     ) {
-        self.stop();
-        let timeline = Arc::new(Timeline::new(released, Instant::now()));
-        // Whisper distinguishes Nynorsk (`nn`), but both Norwegian forms use the `no` voice.
-        let lang = lang.map(language::voice_code);
-        let spoken = config.get().engineer_reply_language();
-        let known = lang.is_some() || spoken.is_some();
-        let lang = lang.unwrap_or(self.last_lang);
-        self.last_lang = lang;
-        let lang = spoken.unwrap_or(lang);
+        if let Some(lang) = lang {
+            self.last_lang = language::voice_code(lang);
+        }
         self.chat.push(ChatEntry {
             speaker: Speaker::Pilot,
             text: question.clone(),
             detail: None,
         });
+        // The turn hears it at its next tool hand-back, or answers it next
+        if let Some(turn) = &mut self.turn {
+            turn.steer.push(question);
+            let first = turn.steered.map_or(released, |(_, first)| first);
+            turn.steered = Some((lang, first));
+            return;
+        }
+        self.send_question(rt, sim, config, synth, question, lang, released);
+    }
 
+    /// Sends `question` to the model on the running simulator's recording, starting the
+    /// conversation over first if it must be (a new session was asked for, the model settings
+    /// changed, another recording), or answers why it can't be. `lang` and `released`: as given
+    /// to [`Self::ask`], which has taken in `lang`.
+    #[allow(clippy::too_many_arguments)]
+    fn send_question(
+        &mut self,
+        rt: &Handle,
+        sim: Option<&mut Sim>,
+        config: &Config,
+        synth: &mut Synthesizer,
+        question: String,
+        lang: Option<ArrayStr<2>>,
+        released: Option<Instant>,
+    ) {
+        // Whisper distinguishes Nynorsk (`nn`), but both Norwegian forms use the `no` voice.
+        let lang = lang.map(language::voice_code);
+        let spoken = config.get().engineer_reply_language();
+        let known = lang.is_some() || spoken.is_some();
+        let lang = spoken.unwrap_or(lang.unwrap_or(self.last_lang));
+        let timeline = Arc::new(Timeline::new(released, Instant::now()));
         let mut sim = sim;
         let database = sim
             .as_deref_mut()
@@ -625,10 +794,7 @@ impl Engineer {
                 ),
             };
             self.reply(text.into(), Some(detail.into()));
-            self.say(rt, config, synth, text, lang);
-            if let Some(playback) = &mut self.playback {
-                playback.timeline = Some(timeline);
-            }
+            self.say(rt, config, synth, text, lang, Some(timeline));
             return;
         };
 
@@ -663,7 +829,22 @@ impl Engineer {
             }
             self.new_session = false;
         }
+        self.start_turn(rt, config, synth, question, lang, known, timeline);
+    }
 
+    /// Starts a turn on the current session for `question`, answered in `lang` (`known`: told
+    /// to the model, see [`Self::ask`]).
+    #[allow(clippy::too_many_arguments)]
+    fn start_turn(
+        &mut self,
+        rt: &Handle,
+        config: &Config,
+        synth: &mut Synthesizer,
+        question: String,
+        lang: ArrayStr<2>,
+        known: bool,
+        timeline: Arc<Timeline>,
+    ) {
         let Some(session) = &self.session else {
             return;
         };
@@ -671,16 +852,15 @@ impl Engineer {
         let auto_session = *config.get().auto_session();
 
         // What the model writes goes straight to the synthesizer, and to the chat
-        let speech = self.speak(rt, config, synth, lang);
-        if let (Some(_), Some(playback)) = (&speech, &mut self.playback) {
-            playback.timeline = Some(timeline.clone());
-        }
+        let speech = self.speak(rt, config, synth, lang, Some(timeline.clone()));
         let lang = speech.as_ref().map_or(lang, |(lang, _)| *lang);
         let speech = speech.map(|(_, speech)| speech);
         // Told last, after the question (and its snapshot) and after each tool result: by the
         // answer, the skill, the telemetry and often earlier answers are all in English
         let note: Option<Arc<str>> = known.then(|| language::reply_note(lang).into());
         let (chat, text) = mpsc::unbounded_channel();
+        let steer = Steer::default();
+        let slot = steer.clone();
         let task = Task::spawn(async move {
             let mut state = state.lock().await;
             state.follow_game_session(auto_session).await;
@@ -690,6 +870,7 @@ impl Engineer {
                 None => question,
             };
             state.conversation.set_tool_result_note(note);
+            state.conversation.set_steer(Some(slot));
             let mut on_text = |text: &str| {
                 timeline.first_text();
                 if let Some(speech) = &speech {
@@ -713,26 +894,31 @@ impl Engineer {
             lang,
             text,
             entry: None,
+            steer,
+            steered: None,
         });
     }
 
-    /// Called every frame: answers come in, are synthesized and played. `sim_running`: whether a
-    /// simulator is running at all.
+    /// Called every frame: answers come in, are synthesized and played. `sim`: the running
+    /// simulator, if any, for the questions a turn left over.
     pub fn update(
         &mut self,
         rt: &Handle,
-        sim_running: bool,
+        sim: Option<&mut Sim>,
         config: &Config,
         synth: &mut Synthesizer,
         speaker: Option<&AudioDevice>,
     ) {
         self.languages.update(rt, config.get().voices());
         // The game stopped: the conversation lets go of the database, so the plugin can delete it
-        if !sim_running && self.session.is_some() {
+        if sim.is_none() && self.session.is_some() {
             let interrupted = self.turn.take().is_some();
             self.drop_session(rt);
             self.notice(t!("engineer.sim_stopped"));
             if interrupted {
+                // What it was saying goes with the turn, which the conversation forgot
+                self.line.clear();
+                self.incoming.clear();
                 self.no_beep();
             }
         }
@@ -775,6 +961,14 @@ impl Engineer {
             if let Some(result) = turn.task.update(rt)
                 && let Some(turn) = self.turn.take()
             {
+                // Questions the turn missed (it was writing its final text) are asked next, as
+                // any question is. A failed or refused turn was forgotten, and they go with it:
+                // they may build on its question
+                let missed = match &result {
+                    Ok(reply) if reply.stop != StopReason::Refusal => turn.steer.take(),
+                    Ok(_) | Err(_) => Vec::new(),
+                };
+                let (lang, released) = turn.steered.unwrap_or_default();
                 match result {
                     Ok(reply) => self.answer(rt, config, synth, reply, turn),
                     Err(e) => {
@@ -782,8 +976,17 @@ impl Engineer {
                             self.chat[entry].detail = Some(t!("engineer.detail_cut_off").into());
                         }
                         self.notice(t!("engineer.error_asking", error = format!("{e:#}")));
-                        self.no_beep();
+                        // What it said before failing plays out first
+                        self.incomplete_beep();
                     }
+                }
+                // Its answer has all it will have
+                for playback in self.incoming.iter_mut().chain(&mut self.line) {
+                    playback.writing = false;
+                }
+                if !missed.is_empty() {
+                    let question = missed.join("\n");
+                    self.send_question(rt, sim, config, synth, question, lang, released);
                 }
             }
         }
@@ -822,8 +1025,11 @@ impl Engineer {
             // The exchange was forgotten, and whatever was said with it: the pilot can ask again
             StopReason::Refusal => {
                 detail = format!("{detail} | {}", t!("engineer.detail_declined"));
+                // Its answer stops, unheard or not, as the chat only shows "say again"
+                self.incoming.retain(|playback| !playback.writing);
+                self.line.retain(|playback| !playback.writing);
                 let say_again = t!("engineer.say_again": &turn.lang);
-                self.say(rt, config, synth, say_again, turn.lang);
+                self.say(rt, config, synth, say_again, turn.lang, None);
                 if self.voice(config, turn.lang).is_none() {
                     self.no_beep();
                 }
@@ -859,7 +1065,8 @@ impl Engineer {
         }
     }
 
-    /// Speaks `text` in `lang` (see [`Self::voice`]): nothing without any voice.
+    /// Speaks `text` in `lang` (see [`Self::voice`]), synthesized in one piece and added to the
+    /// line: nothing without any voice. `timeline`: the question it answers, if any.
     fn say(
         &mut self,
         rt: &Handle,
@@ -867,10 +1074,16 @@ impl Engineer {
         synth: &mut Synthesizer,
         text: &str,
         lang: ArrayStr<2>,
+        timeline: Option<Arc<Timeline>>,
     ) {
-        if let Some((_, speech)) = self.speak(rt, config, synth, lang) {
-            speech.push(text);
-        }
+        let Some(lang) = self.voice(config, lang) else {
+            return;
+        };
+        let effects = config.get().synth_effects();
+        let speech = synth.synthesize_output(rt, lang, text.to_owned(), effects);
+        let mut playback = Playback::new(speech, true);
+        playback.timeline = timeline;
+        self.queue(playback);
     }
 
     /// The language `lang` is spoken in: itself with a voice for it, or else the one the pilot
@@ -886,35 +1099,91 @@ impl Engineer {
             .or_else(|| voices.keys().next().copied())
     }
 
-    /// Starts speaking what's pushed on the returned input (in `lang`, see [`Self::voice`], as
-    /// returned), cutting off whatever was being said. `None` without any voice.
+    /// Starts an answer to speak what's pushed on the returned input (in `lang`, see
+    /// [`Self::voice`], as returned), written by the pilot turn starting: it joins the line once
+    /// its first sentence is synthesized. `timeline`: the question it answers. `None` without
+    /// any voice.
     fn speak(
         &mut self,
         rt: &Handle,
         config: &Config,
         synth: &mut Synthesizer,
         lang: ArrayStr<2>,
+        timeline: Option<Arc<Timeline>>,
     ) -> Option<(ArrayStr<2>, SpeechInput)> {
         let lang = self.voice(config, lang)?;
         let effects = config.get().synth_effects();
 
         let (input, speech) = synth.stream(rt, lang, effects);
-        self.playback = Some(Playback {
-            speech,
-            stream: None,
-            done: false,
-            drain: Drain::new(Instant::now()),
-            timeline: None,
-            tone_after_drain: false,
-            sentences: SentenceQueue::default(),
-        });
+        let mut playback = Playback::new(speech, false);
+        playback.writing = true;
+        playback.timeline = timeline;
+        self.queue(playback);
         Some((lang, input))
     }
 
-    /// Plays the speech synthesized so far.
+    /// Answers whose first piece of speech is ready join the back of the line, in the order
+    /// they were queued. One that ends without saying anything never joins it.
+    fn admit(&mut self, gain: f32) {
+        let mut i = 0;
+        while i < self.incoming.len() {
+            match self.incoming[i].pull(gain) {
+                Poll::Pending => i += 1,
+                Poll::Ready(Some(Ok(()))) => {
+                    let playback = self.incoming.remove(i);
+                    self.line.push_back(playback);
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    self.incoming.remove(i);
+                    self.notice(t!("engineer.error_synthesizing", error = format!("{e:#}")));
+                    self.no_beep();
+                }
+                // It said nothing
+                Poll::Ready(None) => {
+                    if self.incoming.remove(i).tone_after_drain {
+                        self.no_beep();
+                    }
+                }
+            }
+        }
+    }
+
+    /// The gap: once the answer at the front has played all it has and waited on its pilot turn
+    /// for more for [`GAP_AFTER`], the first complete answer behind it plays. The waiting one
+    /// stays next, giving up its stream, and carries on once that's played. This is the one
+    /// place an answer is moved ahead in the line, and only complete ones are, so a gap never
+    /// opens another, and only the front holds a stream.
+    fn fill_gap(&mut self, now: Instant) {
+        let Some(front) = self.line.front_mut() else {
+            return;
+        };
+        if !front.waiting_on_its_turn() {
+            front.waiting_since = None;
+            return;
+        }
+        if now.duration_since(*front.waiting_since.get_or_insert(now)) < GAP_AFTER {
+            return;
+        }
+        // An answer starts playing at the front, or here: a check that drops one gone stale
+        // before it starts (scheduled requests) goes in both places
+        if let Some(complete) = self.line.iter().position(|playback| playback.complete) {
+            self.line[0].close_stream();
+            let playback = self.line.remove(complete).expect("just found");
+            self.line.push_front(playback);
+        }
+    }
+
+    /// Plays the line: what the answer at its front has synthesized so far.
     fn play(&mut self, config: &Config, speaker: Option<&AudioDevice>) {
-        let held = self.held;
-        let Some(playback) = &mut self.playback else {
+        let gain = {
+            let config = config.get();
+            config.master_volume() * config.engineer_volume()
+        };
+        self.admit(gain);
+        // Whichever answer is at the front waits while the spotter speaks or the pilot talks
+        self.hold_front();
+        let held = self.held();
+        let Some(playback) = self.line.front_mut() else {
             return;
         };
 
@@ -928,62 +1197,43 @@ impl Engineer {
         // Submit at most one sentence per frame, including when replaying. Synthesis
         // stays on its worker and a long retained answer cannot monopolize the UI.
         if !playback.done && playback.sentences.pending().is_none() {
-            let speech = match playback.speech.try_next() {
-                Poll::Pending => None,
-                Poll::Ready(Some(Ok(speech))) => Some(speech),
+            match playback.pull(gain) {
                 Poll::Ready(Some(Err(e))) => {
-                    self.playback = None;
+                    self.line.pop_front();
                     self.notice(t!("engineer.error_synthesizing", error = format!("{e:#}")));
                     self.no_beep();
                     return;
                 }
-                // SDL plays what's left
-                Poll::Ready(None) => {
-                    playback.done = true;
-                    if let Some(stream) = &playback.stream
-                        && let Err(e) = stream.flush()
-                    {
-                        log::warn!("Error flushing the answer's audio: {e}");
-                    }
-                    None
-                }
-            };
-
-            if let Some(mut speech) = speech {
-                let gain = {
-                    let config = config.get();
-                    config.master_volume() * config.engineer_volume()
-                };
-                for sample in &mut speech.samples {
-                    *sample *= gain;
-                }
-                playback.sentences.pieces.push_back(speech);
+                // Nothing more yet: what it said plays out while its turn works on the rest
+                Poll::Pending if playback.writing => playback.caught_up(),
+                Poll::Pending | Poll::Ready(_) => {}
             }
         }
 
         if let Some(speech) = playback.sentences.pending() {
+            let skip = playback.sentences.skip();
             let played = match (&playback.stream, speaker) {
-                (Some(stream), _) => {
-                    stream.put_data_f32(&speech.samples[playback.sentences.skip()..])
-                }
-                // Nothing to skip: only a stream's position can be resumed from
-                (None, Some(speaker)) => speech.start(speaker).and_then(|stream| {
+                (Some(stream), _) => stream.put_data_f32(&speech.samples[skip..]),
+                // On whichever speaker is picked, from where it resumes
+                (None, Some(speaker)) => speech.start(speaker, skip).and_then(|stream| {
                     playback.stream = Some(stream);
                     Ok(())
                 }),
                 (None, None) => {
-                    self.playback = None;
+                    self.line.pop_front();
                     self.notice(t!("engineer.no_speaker"));
                     return;
                 }
             };
 
             if let Err(e) = played {
-                self.playback = None;
+                self.line.pop_front();
                 self.notice(t!("engineer.error_playing", error = e));
                 return;
             }
             playback.sentences.submitted();
+            playback.flushed = false;
+            playback.waiting_since = None;
             if let Some(timeline) = &playback.timeline {
                 timeline.first_audio();
             }
@@ -999,6 +1249,8 @@ impl Engineer {
         // Once SDL has played all of it, the stream can go. A speaker that stops taking audio
         // without SDL saying it was removed doesn't keep it forever, holding up the spotter's calls
         if !playback.done || playback.sentences.pending().is_some() {
+            // More to come: something else may play while it waits for it
+            self.fill_gap(Instant::now());
             return;
         }
         let drained = match &playback.stream {
@@ -1011,20 +1263,19 @@ impl Engineer {
         match drained {
             Drained::Playing => {}
             Drained::Done => {
-                // Without a stream, the speech said nothing
-                if playback.stream.is_some()
-                    && let Some(timeline) = &playback.timeline
-                {
+                // Not marked if none of it reached the speaker (see `Timeline::played`)
+                if let Some(timeline) = &playback.timeline {
                     timeline.played();
                 }
                 let tone = playback.tone_after_drain;
-                self.playback = None;
+                self.line.pop_front();
+                // Right after the answer it belongs to; the next one starts on a later frame
                 if tone {
-                    self.no_beep();
+                    self.line.push_front(Playback::tone());
                 }
             }
             Drained::Stalled => {
-                self.playback = None;
+                self.line.pop_front();
                 self.notice(t!("engineer.speaker_stalled"));
             }
         }
@@ -1043,7 +1294,8 @@ impl Engineer {
             })
     }
 
-    /// Drops the answer on its way and stops the one being spoken.
+    /// Drops the answer on its way, with the questions steering it, and the whole line,
+    /// stopping the one being spoken.
     fn stop(&mut self) {
         if let Some(turn) = self.turn.take() {
             if let Some(entry) = turn.entry {
@@ -1051,7 +1303,8 @@ impl Engineer {
             }
             self.notice(t!("engineer.cancelled"));
         }
-        self.playback = None;
+        self.incoming.clear();
+        self.line.clear();
     }
 
     fn reply(&mut self, text: String, detail: Option<String>) {
@@ -1531,37 +1784,28 @@ mod tests {
 
         let timeline = Arc::new(Timeline::new(None, Instant::now()));
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
-        engineer.playback = Some(Playback {
-            speech: SpeechOutput::ready(Speech::no_beep(1.0)),
-            stream: Some(stream),
-            done: true,
-            drain: Drain::new(Instant::now()),
-            timeline: Some(timeline.clone()),
-            tone_after_drain: false,
-            sentences,
-        });
+        let mut playback = Playback::new(SpeechOutput::ready(Speech::no_beep(1.0)), false);
+        playback.stream = Some(stream);
+        playback.done = true;
+        playback.timeline = Some(timeline.clone());
+        playback.sentences = sentences;
+        engineer.line.push_back(playback);
         engineer.hold(true);
         engineer.hold(true);
         engineer.play(&config, Some(&device));
-        let playback = engineer.playback.as_ref().unwrap();
+        let playback = engineer.line.front().unwrap();
+        assert!(playback.held);
         assert_eq!(playback.sentences.submitted, 0);
         let resume = 11025 - BEHIND;
         assert_eq!(playback.sentences.skip(), resume);
         assert_eq!(playback.stream.as_ref().unwrap().queued_bytes().unwrap(), 0);
 
         engineer.hold(false);
+        assert!(!engineer.line[0].held);
         // Keep the dummy device paused while submitting, so the exact input byte count is stable.
-        engineer
-            .playback
-            .as_ref()
-            .unwrap()
-            .stream
-            .as_ref()
-            .unwrap()
-            .pause()
-            .unwrap();
+        engineer.line[0].stream.as_ref().unwrap().pause().unwrap();
         engineer.play(&config, Some(&device));
-        let playback = engineer.playback.as_ref().unwrap();
+        let playback = engineer.line.front().unwrap();
         assert_eq!(playback.sentences.submitted, 1);
         assert_eq!(
             playback.stream.as_ref().unwrap().queued_bytes().unwrap() as usize,
@@ -1570,20 +1814,11 @@ mod tests {
         assert_eq!(playback.sentences.pieces[0].samples[0], 1.0);
         // A second interruption must retain the same unfinished sentence.
         engineer.hold(true);
-        assert_eq!(engineer.playback.as_ref().unwrap().sentences.skip(), resume);
-        assert_eq!(
-            engineer
-                .playback
-                .as_ref()
-                .unwrap()
-                .sentences
-                .pending()
-                .unwrap()
-                .samples[0],
-            1.0
-        );
+        assert_eq!(engineer.line[0].sentences.skip(), resume);
+        let pending = engineer.line[0].sentences.pending().unwrap();
+        assert_eq!(pending.samples[0], 1.0);
         engineer.stop();
-        assert!(engineer.playback.is_none());
+        assert!(!engineer.is_speaking());
         let line = timeline.to_string();
         assert!(!line.contains("first audio never"), "{line}");
         assert!(line.ends_with("played never"), "{line}");
@@ -1605,20 +1840,188 @@ mod tests {
         let stream = device.clone().open_device_stream(Some(&spec)).unwrap();
 
         let timeline = Arc::new(Timeline::new(None, Instant::now()));
+        // Its speech already reached the stream
+        timeline.first_audio();
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
-        engineer.playback = Some(Playback {
-            speech: SpeechOutput::ready(Speech::no_beep(1.0)),
-            stream: Some(stream),
-            done: true,
-            drain: Drain::new(Instant::now()),
-            timeline: Some(timeline.clone()),
-            tone_after_drain: false,
-            sentences: SentenceQueue::default(),
-        });
+        let mut playback = Playback::new(SpeechOutput::ready(Speech::no_beep(1.0)), false);
+        playback.stream = Some(stream);
+        playback.done = true;
+        playback.timeline = Some(timeline.clone());
+        engineer.line.push_back(playback);
         engineer.play(&config, Some(&device));
-        assert!(engineer.playback.is_none());
+        assert!(!engineer.is_speaking());
         let line = timeline.to_string();
         assert!(!line.ends_with("played never"), "{line}");
+    }
+
+    #[test]
+    #[ignore = "run alone with SDL_AUDIO_DRIVER=dummy"]
+    fn an_answer_caught_up_with_its_turn_plays_out_and_opens_the_gap() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let sdl = sdl3::init().unwrap();
+        let audio = sdl.audio().unwrap();
+        // At another rate than the voice's: the stream resamples, holding some of its input back
+        // until it's flushed
+        let spec = sdl3::audio::AudioSpec {
+            freq: Some(48000),
+            channels: Some(1),
+            format: Some(sdl3::audio::AudioFormat::f32_sys()),
+        };
+        let device = audio.open_playback_device(&spec).unwrap();
+        let sentence = || Speech {
+            samples: vec![0.0; 2205],
+            sample_rate: 22050,
+        };
+
+        // It said its first sentence, and its turn is still working on the next
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        let (send, mut answer) = being_written();
+        answer.sentences.pieces.push_back(sentence());
+        engineer.line.push_back(answer);
+        let play_until = |engineer: &mut Engineer, done: fn(&Engineer) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(engineer) {
+                assert!(Instant::now() < deadline, "it never played out");
+                engineer.play(&config, Some(&device));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        play_until(&mut engineer, |e| e.line[0].waiting_on_its_turn());
+        assert!(engineer.line[0].flushed);
+
+        // Its next sentence starts another stretch
+        send.send(Ok(sentence())).unwrap();
+        engineer.play(&config, Some(&device));
+        assert!(!engineer.line[0].flushed);
+        assert!(!engineer.line[0].waiting_on_its_turn());
+
+        // Caught up again, it leaves the radio to a complete answer, and its stream with it
+        engineer.line.push_back(Playback::tone());
+        play_until(&mut engineer, |engineer| engineer.line[0].complete);
+        assert!(engineer.line[1].writing);
+        assert!(engineer.line[1].stream.is_none());
+
+        // Back at the front, its next sentence opens another
+        play_until(&mut engineer, |engineer| engineer.line.len() == 1);
+        send.send(Ok(sentence())).unwrap();
+        engineer.play(&config, Some(&device));
+        assert!(engineer.line[0].stream.is_some());
+        assert_eq!(engineer.line[0].sentences.submitted, 1);
+    }
+
+    #[test]
+    #[ignore = "run alone with SDL_AUDIO_DRIVER=dummy"]
+    fn a_removed_speaker_stops_only_the_answer_playing_on_it() {
+        let sdl = sdl3::init().unwrap();
+        let audio = sdl.audio().unwrap();
+        let spec = piece().spec();
+        let device = audio.open_playback_device(&spec).unwrap();
+        let stream = || device.clone().open_device_stream(Some(&spec)).unwrap();
+        let on = |playback: &Playback| {
+            let stream = playback.stream.as_ref().unwrap();
+            stream.device_id().unwrap().id().0
+        };
+        let notices = |engineer: &Engineer| {
+            (engineer.chat.iter())
+                .filter(|e| {
+                    e.speaker == Speaker::Notice && e.text == t!("engineer.speaker_removed")
+                })
+                .count()
+        };
+        // An answer that said its first sentence and waits on its turn for more, with an answer
+        // ready behind it (on a stream of its own: SDL removes each logical device)
+        let line = || {
+            let (send, mut waiting) = being_written();
+            waiting.stream = Some(stream());
+            let mut behind = Playback::tone();
+            behind.stream = Some(stream());
+            let ids = (on(&waiting), on(&behind));
+            let mut engineer = Engineer::new(reqwest::Client::new(), None);
+            engineer.line.extend([waiting, behind]);
+            (send, engineer, ids)
+        };
+
+        // Nothing is playing on the speaker: the waiting answer keeps its place
+        let (_send, mut engineer, (waiting_on, _)) = line();
+        engineer.speaker_removed(waiting_on, false);
+        assert_eq!(engineer.line.len(), 2);
+        assert!(engineer.line[0].writing);
+        assert!(engineer.line[0].stream.is_none());
+        assert_eq!(notices(&engineer), 1);
+
+        // The answer behind plays in its gap: whichever goes first, only that one stops
+        for gap_first in [true, false] {
+            let (_send, mut engineer, (waiting_on, gap_on)) = line();
+            let now = Instant::now();
+            engineer.fill_gap(now);
+            engineer.fill_gap(now + GAP_AFTER);
+            assert!(engineer.line[0].complete);
+            assert!(engineer.line[1].stream.is_none());
+            let order = match gap_first {
+                true => [gap_on, waiting_on],
+                false => [waiting_on, gap_on],
+            };
+            for which in order {
+                engineer.speaker_removed(which, false);
+            }
+            assert_eq!(engineer.line.len(), 1, "gap first: {gap_first}");
+            assert!(engineer.line[0].writing, "gap first: {gap_first}");
+            assert_eq!(notices(&engineer), 1, "gap first: {gap_first}");
+        }
+    }
+
+    #[test]
+    fn a_refused_answer_is_replaced_by_say_again() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let rt = runtime.handle();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // The voice's path only stands in for an installed one: nothing is synthesized
+        std::fs::write(&path, r#"{"voices": {"en": "en.onnx"}}"#).unwrap();
+        let config = runtime.block_on(Config::new(&path)).unwrap();
+        let mut synth = Synthesizer::new(rt, &config.get());
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+
+        // Whether it has spoken yet or not
+        for spoken in [true, false] {
+            engineer.stop();
+            let (_send, answer) = being_written();
+            match spoken {
+                true => engineer.line.push_back(answer),
+                false => engineer.queue(answer),
+            }
+            let (_, text) = mpsc::unbounded_channel();
+            engineer.answer(
+                rt,
+                &config,
+                &mut synth,
+                Reply {
+                    text: "Partial".into(),
+                    stop: StopReason::Refusal,
+                    usage: Default::default(),
+                    model: "test".into(),
+                },
+                Turn {
+                    task: Task::spawn(std::future::pending()),
+                    lang: arrstr!("en"),
+                    text,
+                    entry: None,
+                    steer: Steer::default(),
+                    steered: None,
+                },
+            );
+            assert!(engineer.line.is_empty(), "spoken: {spoken}");
+            assert_eq!(engineer.incoming.len(), 1, "spoken: {spoken}");
+            assert!(engineer.incoming[0].complete, "spoken: {spoken}");
+            let reply = engineer.chat.last().unwrap();
+            assert_eq!(reply.text, t!("engineer.say_again": "en"));
+        }
     }
 
     #[test]
@@ -1630,21 +2033,242 @@ mod tests {
             .block_on(Config::new(dir.path().join("config.json")))
             .unwrap();
 
+        // At the front, with nothing left to play
         let timeline = Arc::new(Timeline::new(None, Instant::now()));
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
-        engineer.playback = Some(Playback {
-            speech: SpeechOutput::ready(Speech::no_beep(1.0)),
-            stream: None,
-            done: true,
-            drain: Drain::new(Instant::now()),
-            timeline: Some(timeline.clone()),
-            tone_after_drain: false,
-            sentences: SentenceQueue::default(),
-        });
+        let mut playback = Playback::new(SpeechOutput::ready(Speech::no_beep(1.0)), false);
+        playback.done = true;
+        playback.timeline = Some(timeline.clone());
+        engineer.line.push_back(playback);
         engineer.play(&config, None);
-        assert!(engineer.playback.is_none());
+        assert!(!engineer.is_speaking());
         let line = timeline.to_string();
         assert!(line.ends_with("played never"), "{line}");
+
+        // Ended before its first piece: it never joins the line
+        let timeline = Arc::new(Timeline::new(None, Instant::now()));
+        let (send, speech) = SpeechOutput::channel();
+        drop(send);
+        let mut playback = Playback::new(speech, false);
+        playback.timeline = Some(timeline.clone());
+        engineer.queue(playback);
+        engineer.play(&config, None);
+        assert!(!engineer.is_speaking());
+        let line = timeline.to_string();
+        assert!(line.ends_with("played never"), "{line}");
+    }
+
+    #[test]
+    fn an_answer_that_gave_up_its_stream_is_still_marked_played() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+
+        // It spoke, then closed its stream giving way in a gap, and ended with nothing more
+        let timeline = Arc::new(Timeline::new(None, Instant::now()));
+        timeline.first_audio();
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        let mut playback = Playback::new(SpeechOutput::ready(Speech::no_beep(1.0)), false);
+        playback.done = true;
+        playback.timeline = Some(timeline.clone());
+        engineer.line.push_back(playback);
+        engineer.play(&config, None);
+        assert!(!engineer.is_speaking());
+        let line = timeline.to_string();
+        assert!(!line.ends_with("played never"), "{line}");
+    }
+
+    /// A piece of speech, standing in for a synthesized sentence.
+    fn piece() -> Speech {
+        Speech {
+            samples: vec![0.25, -0.25],
+            sample_rate: 22050,
+        }
+    }
+
+    /// A pilot answer whose turn is still running and that has nothing to play yet: the sender
+    /// keeps its speech open.
+    fn being_written() -> (mpsc::UnboundedSender<anyhow::Result<Speech>>, Playback) {
+        let (send, speech) = SpeechOutput::channel();
+        let mut playback = Playback::new(speech, false);
+        playback.writing = true;
+        (send, playback)
+    }
+
+    /// Whether `front` is still at the front of the line `[front, behind]` once a gap is looked
+    /// for in a frame, and again `after` that.
+    fn stays_ahead(mut front: Playback, behind: Playback, after: Duration) -> bool {
+        let marker = Arc::new(Timeline::new(None, Instant::now()));
+        front.timeline = Some(marker.clone());
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.line.extend([front, behind]);
+        let now = Instant::now();
+        engineer.fill_gap(now);
+        engineer.fill_gap(now + after);
+        assert_eq!(engineer.line.len(), 2);
+        (engineer.line[0].timeline.as_ref()).is_some_and(|first| Arc::ptr_eq(first, &marker))
+    }
+
+    #[test]
+    fn answers_join_the_line_when_their_first_piece_is_ready() {
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        let (send, speech) = SpeechOutput::channel();
+        engineer.queue(Playback::new(speech, false));
+        engineer.queue(Playback::tone());
+        engineer.admit(1.0);
+        // The tone was ready: it doesn't wait behind an answer still being thought about
+        assert_eq!(engineer.line.len(), 1);
+        assert!(engineer.line[0].complete);
+        assert_eq!(engineer.incoming.len(), 1);
+        assert!(engineer.is_speaking());
+
+        send.send(Ok(piece())).unwrap();
+        engineer.admit(1.0);
+        assert!(engineer.incoming.is_empty());
+        assert_eq!(engineer.line.len(), 2);
+        let answer = &engineer.line[1];
+        assert!(!answer.complete);
+        // Its first piece is kept, to play
+        assert_eq!(answer.sentences.pending().unwrap().samples, piece().samples);
+    }
+
+    #[test]
+    fn a_complete_answer_plays_in_the_gap_of_an_answer_being_written() {
+        let (_send, front) = being_written();
+        assert!(!stays_ahead(front, Playback::tone(), GAP_AFTER));
+    }
+
+    #[test]
+    fn the_gap_opens_only_after_a_pause() {
+        let (_send, front) = being_written();
+        let almost = GAP_AFTER - Duration::from_millis(1);
+        assert!(stays_ahead(front, Playback::tone(), almost));
+    }
+
+    #[test]
+    fn nothing_jumps_ahead_of_an_answer_with_speech_to_play() {
+        let (_send, mut front) = being_written();
+        front.sentences.pieces.push_back(piece());
+        assert!(stays_ahead(front, Playback::tone(), GAP_AFTER));
+    }
+
+    #[test]
+    fn nothing_jumps_ahead_of_an_answer_with_its_next_piece_ready() {
+        // Synthesized, not yet taken from its speech
+        let (send, front) = being_written();
+        send.send(Ok(piece())).unwrap();
+        assert!(stays_ahead(front, Playback::tone(), GAP_AFTER));
+    }
+
+    #[test]
+    fn nothing_jumps_ahead_of_a_finished_turn() {
+        let (_send, mut front) = being_written();
+        front.writing = false;
+        assert!(stays_ahead(front, Playback::tone(), GAP_AFTER));
+    }
+
+    #[test]
+    fn only_complete_answers_use_the_gap() {
+        let (_send, front) = being_written();
+        let behind = Playback::new(SpeechOutput::ready(piece()), false);
+        assert!(stays_ahead(front, behind, GAP_AFTER));
+    }
+
+    #[test]
+    fn talking_and_the_spotter_hold_overlap() {
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.line.push_back(Playback::tone());
+        engineer.talk(true);
+        assert!(engineer.line[0].held);
+        engineer.hold(true);
+        // Letting go of the talk button while the spotter speaks keeps it paused
+        engineer.talk(false);
+        assert!(engineer.line[0].held);
+        engineer.hold(false);
+        assert!(!engineer.line[0].held);
+    }
+
+    #[test]
+    fn an_answer_ready_while_talking_waits_for_release() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let no_speaker = |engineer: &Engineer| {
+            (engineer.chat.iter())
+                .any(|e| e.speaker == Speaker::Notice && e.text == t!("engineer.no_speaker"))
+        };
+
+        // The answer is ready while the pilot talks: it doesn't start over them
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.talk(true);
+        engineer.queue(Playback::tone());
+        engineer.play(&config, None);
+        engineer.play(&config, None);
+        assert_eq!(engineer.line.len(), 1);
+        assert!(!no_speaker(&engineer));
+
+        // Released, it plays (and finds no speaker to play on)
+        engineer.talk(false);
+        engineer.play(&config, None);
+        assert!(no_speaker(&engineer));
+    }
+
+    #[test]
+    fn an_error_lets_the_answer_finish_before_the_tone() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let rt = runtime.handle();
+        let dir = tempfile::tempdir().unwrap();
+        let config = rt
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let mut synth = Synthesizer::new(rt, &config.get());
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+
+        // The turn has spoken, and fails before it's done
+        let (send, answer) = being_written();
+        engineer.line.push_back(answer);
+        let (_chat, text) = mpsc::unbounded_channel();
+        engineer.turn = Some(Turn {
+            task: Task::spawn(async { Err(anyhow::anyhow!("connection lost")) }),
+            lang: arrstr!("en"),
+            text,
+            entry: None,
+            steer: Steer::default(),
+            steered: None,
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engineer.is_thinking() {
+            assert!(Instant::now() < deadline, "the turn never ended");
+            std::thread::sleep(Duration::from_millis(1));
+            engineer.update(rt, None, &config, &mut synth, None);
+        }
+        assert_eq!(engineer.line.len(), 1);
+        assert!(!engineer.line[0].writing);
+        assert!(engineer.incoming.is_empty());
+        let notices = (engineer.chat.iter())
+            .filter(|e| e.speaker == Speaker::Notice)
+            .map(|e| e.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(notices.iter().any(|text| text.contains("connection lost")));
+        assert!(!notices.contains(&t!("engineer.cancelled")));
+
+        // What it said plays out, then the tone
+        drop(send);
+        engineer.play(&config, None);
+        assert_eq!(engineer.line.len(), 1);
+        let tone = &mut engineer.line[0];
+        assert!(tone.complete);
+        let Poll::Ready(Some(Ok(tone))) = tone.speech.try_next() else {
+            panic!("the tone must follow the answer");
+        };
+        assert_eq!(tone.samples, Speech::no_beep(1.0).samples);
     }
 
     #[test]
@@ -1661,18 +2285,9 @@ mod tests {
 
         for stop in [StopReason::MaxTokens, StopReason::ContextWindowExceeded] {
             // Stand in for synthesized speech without loading a voice or opening a device.
-            engineer.playback = Some(Playback {
-                speech: SpeechOutput::ready(Speech {
-                    samples: vec![0.25, -0.25],
-                    sample_rate: 22050,
-                }),
-                stream: None,
-                done: false,
-                drain: Drain::new(Instant::now()),
-                timeline: None,
-                tone_after_drain: false,
-                sentences: SentenceQueue::default(),
-            });
+            let mut answer = Playback::new(SpeechOutput::ready(piece()), false);
+            answer.writing = true;
+            engineer.line.push_back(answer);
             let (_, text) = mpsc::unbounded_channel();
             engineer.answer(
                 rt,
@@ -1689,9 +2304,13 @@ mod tests {
                     lang: arrstr!("en"),
                     text,
                     entry: None,
+                    steer: Steer::default(),
+                    steered: None,
                 },
             );
-            let playback = engineer.playback.as_mut().unwrap();
+            assert_eq!(engineer.line.len(), 1, "{stop:?}");
+            assert!(engineer.incoming.is_empty(), "{stop:?}");
+            let playback = &mut engineer.line[0];
             assert!(playback.tone_after_drain, "{stop:?}");
             assert!(!playback.done);
             let Poll::Ready(Some(Ok(speech))) = playback.speech.try_next() else {
@@ -1702,14 +2321,16 @@ mod tests {
 
             // With the speech consumed and no device queue left, playback has drained.
             engineer.play(&config, None);
-            let playback = engineer.playback.as_mut().expect("tone follows the answer");
+            assert_eq!(engineer.line.len(), 1, "tone follows the answer");
+            let playback = &mut engineer.line[0];
+            assert!(playback.complete);
             assert!(!playback.tone_after_drain);
             let Poll::Ready(Some(Ok(tone))) = playback.speech.try_next() else {
                 panic!("failure tone must be ready after the answer drains");
             };
             assert_eq!(tone.samples, Speech::no_beep(1.0).samples);
             engineer.play(&config, None);
-            assert!(engineer.playback.is_none(), "tone must only play once");
+            assert!(!engineer.is_speaking(), "tone must only play once");
         }
     }
 
@@ -1733,13 +2354,15 @@ mod tests {
             (StopReason::EndTurn, "Complete answer", false),
             (StopReason::StopSequence, "Complete answer", false),
         ] {
-            engineer.playback = None;
+            engineer.stop();
             let (_, receiver) = mpsc::unbounded_channel();
             let turn = Turn {
                 task: Task::spawn(std::future::pending()),
                 lang: arrstr!("en"),
                 text: receiver,
                 entry: None,
+                steer: Steer::default(),
+                steered: None,
             };
             engineer.answer(
                 rt,
@@ -1753,8 +2376,10 @@ mod tests {
                 },
                 turn,
             );
-            assert_eq!(engineer.playback.is_some(), tone, "{stop:?}");
-            if let Some(playback) = &mut engineer.playback {
+            assert!(engineer.line.is_empty(), "{stop:?}");
+            assert_eq!(engineer.incoming.len(), usize::from(tone), "{stop:?}");
+            if let Some(playback) = engineer.incoming.first_mut() {
+                assert!(playback.complete);
                 let Poll::Ready(Some(Ok(speech))) = playback.speech.try_next() else {
                     panic!("failure tone must be ready without speech synthesis");
                 };
@@ -1814,7 +2439,7 @@ mod tests {
                     start.elapsed() < std::time::Duration::from_secs(120),
                     "stuck on {question:?}"
                 );
-                engineer.update(rt, true, &config, &mut synth, None);
+                engineer.update(rt, Some(&mut *sim), &config, &mut synth, None);
                 std::thread::sleep(std::time::Duration::from_millis(16));
             }
             println!("{question:?} answered in {:.1?}", start.elapsed());
@@ -1952,6 +2577,320 @@ mod tests {
             assert!(!engineer.tool.as_ref().unwrap().is_same(&first));
             engineer.quit(&rt).await.unwrap();
         }
+    }
+
+    /// How a [`ScriptedModel`]'s turn ends, once the test says.
+    enum Act {
+        /// It takes the questions steering it, then replies
+        Steered,
+        /// It replies without looking at them
+        Reply,
+        Refuse,
+        /// It replies with the conversation full
+        Full,
+        Fail,
+    }
+
+    /// What a [`ScriptedModel`] was asked.
+    #[derive(Default)]
+    struct Asked {
+        /// Each turn's question, in order
+        questions: Vec<String>,
+        /// What each [`Act::Steered`] took from its turn's steer
+        steered: Vec<Vec<String>>,
+    }
+
+    /// A conversation whose turns each wait for an [`Act`] from the test.
+    struct ScriptedModel {
+        asked: Arc<std::sync::Mutex<Asked>>,
+        acts: mpsc::UnboundedReceiver<Act>,
+        steer: Option<Steer>,
+    }
+
+    impl Model for ScriptedModel {
+        fn send_streaming<'a>(
+            &'a mut self,
+            text: String,
+            _: &'a mut (dyn FnMut(&str) + Send),
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<Reply>> {
+            self.asked.lock().unwrap().questions.push(text);
+            Box::pin(async move {
+                let stop = match self.acts.recv().await {
+                    Some(Act::Steered) => {
+                        let taken = self.steer.as_ref().map(Steer::take).unwrap_or_default();
+                        self.asked.lock().unwrap().steered.push(taken);
+                        StopReason::EndTurn
+                    }
+                    Some(Act::Reply) => StopReason::EndTurn,
+                    Some(Act::Refuse) => StopReason::Refusal,
+                    Some(Act::Full) => StopReason::ContextWindowExceeded,
+                    Some(Act::Fail) | None => anyhow::bail!("scripted failure"),
+                };
+                Ok(Reply {
+                    text: "Copy.".into(),
+                    stop,
+                    usage: Default::default(),
+                    model: "scripted".into(),
+                })
+            })
+        }
+
+        fn reset(&mut self) {}
+
+        fn usage(&self) -> &std::collections::BTreeMap<String, provider::Usage> {
+            unimplemented!()
+        }
+
+        fn set_steer(&mut self, steer: Option<Steer>) {
+            self.steer = steer;
+        }
+    }
+
+    /// An engineer whose conversation is a [`ScriptedModel`], on a running simulator's
+    /// recording, as the app drives it.
+    struct Scripted {
+        engineer: Engineer,
+        sim: Box<Sim>,
+        synth: Synthesizer,
+        config: Config,
+        asked: Arc<std::sync::Mutex<Asked>>,
+        acts: mpsc::UnboundedSender<Act>,
+        _dir: tempfile::TempDir,
+        runtime: tokio::runtime::Runtime,
+    }
+
+    impl Scripted {
+        /// No voices: nothing is synthesized, and tones stand in for "say again".
+        fn new() -> Self {
+            Self::with_config("{}")
+        }
+
+        /// With the config `raw`.
+        fn with_config(raw: &str) -> Self {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let _entered = runtime.enter();
+            let rt = runtime.handle();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.json");
+            std::fs::write(&path, raw).unwrap();
+            let config = rt.block_on(Config::new(&path)).unwrap();
+            let synth = Synthesizer::new(rt, &config.get());
+            let one = NonZeroUsize::new(1).unwrap();
+            let pool = Pool::new(
+                Database::read_only(Arc::new(dir.path().join("a.db"))),
+                one,
+                one,
+            );
+            let sim = crate::sim::recording(pool.clone());
+            let asked = Arc::new(std::sync::Mutex::new(Asked::default()));
+            let (acts, script) = mpsc::unbounded_channel();
+            let mut engineer = Engineer::new(reqwest::Client::new(), None);
+            // As `ask` would start it, so it keeps it
+            engineer.session = Some(Session {
+                db: pool.database().path().to_owned(),
+                model: config.get().model.clone(),
+                corner_names: *config.get().corner_names(),
+                user: None,
+                lease: None,
+                state: Arc::new(Mutex::new(SessionState {
+                    conversation: Box::new(ScriptedModel {
+                        asked: asked.clone(),
+                        acts: script,
+                        steer: None,
+                    }),
+                    tool: EngineerTool::new(pool.clone()),
+                    pool,
+                    sim: "test",
+                    game_session: None,
+                })),
+            });
+            Self {
+                engineer,
+                sim,
+                synth,
+                config,
+                asked,
+                acts,
+                _dir: dir,
+                runtime,
+            }
+        }
+
+        fn ask(&mut self, question: &str) {
+            let _entered = self.runtime.enter();
+            let sim = Some(&mut *self.sim);
+            let (config, synth) = (&self.config, &mut self.synth);
+            (self.engineer).ask_text(self.runtime.handle(), sim, config, synth, question.into());
+        }
+
+        fn hear(&mut self, heard: Heard) {
+            let _entered = self.runtime.enter();
+            let sim = Some(&mut *self.sim);
+            let (config, synth) = (&self.config, &mut self.synth);
+            (self.engineer).hear(self.runtime.handle(), sim, config, synth, heard);
+        }
+
+        /// Runs the app's frames until `done`, failing if that takes too long.
+        fn until(&mut self, what: &str, done: impl Fn(&Self) -> bool) {
+            let _entered = self.runtime.enter();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done(self) {
+                assert!(Instant::now() < deadline, "never {what}");
+                std::thread::sleep(Duration::from_millis(1));
+                let (sim, config, synth) = (Some(&mut *self.sim), &self.config, &mut self.synth);
+                (self.engineer).update(self.runtime.handle(), sim, config, synth, None);
+            }
+        }
+
+        fn questions(&self) -> Vec<String> {
+            self.asked.lock().unwrap().questions.clone()
+        }
+
+        fn cancelled(&self) -> bool {
+            (self.engineer.chat.iter())
+                .any(|e| e.speaker == Speaker::Notice && e.text == t!("engineer.cancelled"))
+        }
+    }
+
+    impl Drop for Scripted {
+        fn drop(&mut self) {
+            let _entered = self.runtime.enter();
+            let quit = self.engineer.quit(self.runtime.handle());
+            let _ = self.runtime.block_on(quit);
+        }
+    }
+
+    #[test]
+    fn asking_during_a_turn_steers_it() {
+        let mut scripted = Scripted::new();
+        scripted.ask("How are the fronts?");
+        scripted.until("asked", |s| s.questions().len() == 1);
+
+        scripted.ask("And the rears?");
+        assert!(scripted.engineer.is_thinking());
+        assert!(!scripted.cancelled());
+        let last = scripted.engineer.chat.last().unwrap();
+        assert_eq!(last.speaker, Speaker::Pilot);
+        assert_eq!(last.text, "And the rears?");
+
+        // The running turn takes it: one reply covers both
+        scripted.acts.send(Act::Steered).unwrap();
+        scripted.until("answered", |s| !s.engineer.is_thinking());
+        let asked = scripted.asked.lock().unwrap();
+        assert_eq!(asked.steered, [vec!["And the rears?".to_owned()]]);
+        assert_eq!(asked.questions.len(), 1);
+    }
+
+    #[test]
+    fn left_over_steers_run_as_the_next_turn() {
+        let mut scripted = Scripted::new();
+        scripted.ask("How are the fronts?");
+        scripted.ask("And the rears?");
+        // The turn was writing its final text: it ends without taking the steer
+        scripted.acts.send(Act::Reply).unwrap();
+        scripted.until("asked again", |s| s.questions().len() == 2);
+        assert!(scripted.questions()[1].contains("And the rears?"));
+        assert!(scripted.engineer.is_thinking());
+        // The first reply was had
+        assert!((scripted.engineer.chat.iter()).any(|e| e.speaker == Speaker::Engineer));
+    }
+
+    #[test]
+    fn a_refused_turn_drops_its_left_over_steers() {
+        for act in [Act::Refuse, Act::Fail] {
+            let mut scripted = Scripted::new();
+            scripted.ask("How are the fronts?");
+            scripted.ask("No, I meant sector two.");
+            scripted.acts.send(act).unwrap();
+            // A turn for the steer would start in the frame the reply is handled
+            scripted.until("answered", |s| !s.engineer.is_thinking());
+            assert_eq!(scripted.questions().len(), 1);
+        }
+    }
+
+    #[test]
+    fn left_over_steers_start_over_once_the_conversation_is_full() {
+        let mut scripted = Scripted::new();
+        let full = scripted.engineer.session.as_ref().unwrap().state.clone();
+        scripted.ask("How are the fronts?");
+        scripted.ask("And the rears?");
+        scripted.acts.send(Act::Full).unwrap();
+        // Asked on a new conversation, or told why there isn't one (Bono Cloud, signed out)
+        let error = t!(
+            "engineer.error_starting",
+            error = t!("provider.bono_cloud_sign_in")
+        );
+        scripted.until("started over", |s| {
+            let restarted = (s.engineer.session.as_ref())
+                .is_some_and(|session| !Arc::ptr_eq(&session.state, &full));
+            let failed =
+                (s.engineer.chat.iter()).any(|e| e.speaker == Speaker::Notice && e.text == error);
+            restarted || failed
+        });
+        // Not on the full one
+        assert_eq!(scripted.questions().len(), 1);
+    }
+
+    #[test]
+    fn left_over_steers_are_answered_in_their_own_language() {
+        // Voice paths only stand in for installed choices: nothing is synthesized
+        let mut scripted =
+            Scripted::with_config(r#"{"voices": {"en": "en.onnx", "es": "es.onnx"}}"#);
+        let heard = |text: &str, lang| Heard::Question {
+            text: text.into(),
+            lang,
+            released: Instant::now(),
+        };
+        scripted.hear(heard("How are the fronts?", arrstr!("en")));
+        assert_eq!(scripted.engineer.turn.as_ref().unwrap().lang, arrstr!("en"));
+        scripted.hear(heard("¿Y las traseras?", arrstr!("es")));
+        scripted.acts.send(Act::Reply).unwrap();
+        scripted.until("asked again", |s| s.questions().len() == 2);
+        assert_eq!(scripted.engineer.turn.as_ref().unwrap().lang, arrstr!("es"));
+    }
+
+    #[test]
+    fn hearing_nothing_keeps_the_turn() {
+        let mut scripted = Scripted::new();
+        scripted.ask("How are the fronts?");
+
+        scripted.hear(Heard::Nothing);
+        assert!(scripted.engineer.is_thinking());
+        // "Say again", as the tone without a voice
+        assert_eq!(scripted.engineer.incoming.len(), 1);
+
+        scripted.hear(Heard::TooShort);
+        assert!(scripted.engineer.is_thinking());
+        assert_eq!(scripted.engineer.incoming.len(), 1);
+
+        scripted.hear(Heard::Failed(anyhow::anyhow!("no audio")));
+        assert!(scripted.engineer.is_thinking());
+        assert_eq!(scripted.engineer.incoming.len(), 2);
+        assert!(!scripted.cancelled());
+    }
+
+    #[test]
+    fn new_session_clears_the_turn_its_steers_and_the_line() {
+        let mut scripted = Scripted::new();
+        scripted.ask("How are the fronts?");
+        scripted.until("asked", |s| s.questions().len() == 1);
+        scripted.ask("And the rears?");
+        scripted.engineer.line.push_back(Playback::tone());
+        scripted.engineer.queue(Playback::tone());
+
+        scripted.engineer.new_session();
+        assert!(!scripted.engineer.is_thinking());
+        assert!(scripted.engineer.line.is_empty());
+        assert!(scripted.engineer.incoming.is_empty());
+
+        // The turn is gone: its reply, if it still came, would start no turn for the steer
+        scripted.acts.send(Act::Reply).unwrap();
+        let start = Instant::now();
+        scripted.until("idle a while", |_| {
+            start.elapsed() > Duration::from_millis(100)
+        });
+        assert_eq!(scripted.questions().len(), 1);
+        assert!(!scripted.engineer.is_thinking());
     }
 
     #[tokio::test(flavor = "multi_thread")]
