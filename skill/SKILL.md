@@ -78,7 +78,12 @@ run, not a race to the flag.
 
 ## The tool
 
-- `quick`: the snapshot again, if time has passed within the turn.
+- `quick`: the snapshot again, if time has passed within the turn. Its gaps ahead and behind are
+  to the places either side; "nobody" there means no car in that place (or no place yet), not an
+  empty track. On a simulator that leaves a side's gap to a place empty (outside races, before a
+  place, first or last) and gives gaps on track, that side gets `on track ahead …` or `behind …`:
+  the car next that way on track (named when the simulator says which), which may not be racing us
+  for position.
 - `track`: the circuit's description as JSON. Positions are fractions of the lap; multiply by
   `lap_length_m` for metres. They've been lined up with the laps when `calibration` is there; without
   it they can be off, and `borrowed` means they're another simulator's for the same layout, so say
@@ -130,7 +135,11 @@ simulators report them only for the player), `parts_detached`, `body_damage` (da
 zone around the car, e.g. `front 2, rear_left 1`: 1 some, 2 more, not a fraction; `none` when
 undamaged, NULL when not reported), `last_impact_ago_s`, `last_impact_magnitude`; `in_pit_lane`,
 `in_pits`, `in_garage`, `pit_state`, `pit_stops`, `scheduled_pit_stops`, `pit_services_selected`
-(intent, not work done; `none` when nothing is, NULL when not reported), `pit_services_active`, `pit_min_duration_left_s`; `flag` (blue: being
+(what the pit menu is set to do at the next stop, often by default: not work done, nor a stop
+planned unless `pit_state` is `requested`, `entering` or `stopped`, so don't suggest changing it
+unless the pilot asks about a stop or one is coming; `entering` can also be a drive-through or just
+the pit lane, and from `exiting` on the menu is the next stop's; `none` when nothing is, NULL when
+not reported), `pit_services_active`, `pit_min_duration_left_s`; `flag` (blue: being
 lapped), `under_yellow`, `finish_status`, `penalties`, `penalty_type`, `penalty_reason`,
 `track_limit_steps`, `track_limit_points_left`, `incident_points`. A car with no recent telemetry
 has only its standings. Rivals' rows are slightly older than the player's.
@@ -175,9 +184,13 @@ positions are changing: they're side by side.
 **`wheels_now`**, one row per car and wheel: `vehicle_id`, `wheel` (0 front left, 1 front right, 2
 rear left, 3 rear right), `wheel_name`; `life_left_pct`, `stint_wear_pct_per_lap`, `compound`,
 `flat`, `detached`; `surface_inner_c`, `surface_middle_c`, `surface_outer_c`, `core_c` (inner
-rubber, a better read of working temperature), `carcass_c`, `optimal_c`, `surface_vs_optimal_c`;
-`pressure_kpa`, `brake_c`, `brake_optimal_c`, `surface_type` (0 dry, 1 wet, 2 grass, 3 dirt, 4
-gravel, 5 kerb, 6 special; on RaceRoom 0 means paved, wetness unknown), `sliding_fraction`.
+rubber, a better read of working temperature), `carcass_c`, `reading_age_s` (how long the life
+left, core and carcass have been unchanged, at least, where they're a reading the simulator updates
+only now and then: counted from when they were first seen, so the reading can be older; NULL where
+they're live), `optimal_c`, `surface_vs_optimal_c`; `pressure_kpa`, `cold_pressure_kpa` (the
+cold pressure set in the garage, not the running pressure), `brake_c`, `brake_optimal_c`,
+`surface_type` (0 dry, 1 wet, 2 grass, 3 dirt, 4 gravel, 5 kerb, 6 special; on RaceRoom 0 means
+paved, wetness unknown), `sliding_fraction`.
 
 **`sectors_now`**, one row per car and timing sector, as the simulator last scored it: `vehicle_id`,
 `sector` (from 1), `last_lap_s` (on the last lap), `best_lap_s` (on the best lap), `best_s` (the
@@ -318,13 +331,17 @@ session_first_id`; the other tables number their rows separately (`telemetry_id`
   `throttle`, `brake`, `clutch` (0 to 1), `steering` (-1 left to 1 right), `throttle_filtered`,
   `brake_filtered`, `gear`, `engine_rpm`, `fuel`, `virtual_energy`, `battery_charge`,
   `traction_control_active`, `abs_active`, `front_ride_height`, `rear_ride_height`, `drag`,
-  `gap_to_car_ahead/behind`, `gap_to_place_ahead/behind`, `cars_left/right` (the player's row:
+  `gap_to_car_ahead/behind` (and `car_ahead_id`/`car_behind_id`, the `vehicle_id` each is to, where
+  known; RaceRoom has no gaps on track, only those ids, the cars either side round the lap),
+  `gap_to_place_ahead/behind`, `cars_left/right` (the player's row:
   cars alongside as the simulator reports them, 0 to 2; NULL on simulators that don't).
 - `telemetry_wheel`: four rows per `telemetry` row (`telemetry_id`, `wheel`): `suspension_deflection`,
   `ride_height`, `camber`, `toe` (rad), `brake_temperature`, `brake_pressure`, `rotation_speed`,
   `lateral_force`, `longitudinal_force`, `tire_load`, `sliding_fraction`, `surface_type`,
   `tire_pressure`, `tire_surface_temperature_left/center/right`,
-  `tire_inner_temperature_left/center/right`, `tire_carcass_temperature`, `tire_wear`, `tire_flat`.
+  `tire_inner_temperature_left/center/right`, `tire_carcass_temperature`, `tire_wear`,
+  `tire_reading_time` (session time the inner, carcass and wear values last changed, or were first
+  seen, where they're a reading rather than live), `tire_cold_pressure` (garage cold pressure), `tire_flat`.
 - `car_state`: settings, pit stops, track-limit steps, damage, impacts, written only when one
   changes; a car's value at row X is its latest row with `telemetry_id <= X` (indexed on
   `(vehicle_id, telemetry_id)`). A setting change is a new row: use it for when a setting changed.
@@ -339,7 +356,43 @@ is Kelvin; `*_left/center/right` are edges seen from behind the car (inside is r
 and left on right tyres), and `tire_inner_*` is a layer under the tread, not the inside edge;
 `rear_brake_bias` is the rear's share; `session_time` restarts each session; lap time isn't stored
 in `telemetry`; `lap_invalidated` is the current lap's state; `lap_distance` can jump back a little;
-`sector` is zero-based there and in `standings`; `delta_best` positive is slower.
+`sector` is zero-based there and in `standings`; `delta_best` positive is slower. On iRacing,
+rivals' speed, lap starts, sector times and pit stops are worked out from their progress around the
+lap, and no car has a world position: `position_x/y/z`, `ahead_of_player_m` and
+`right_of_player_m` are NULL (places in the standings are there). The player's `heading` and
+`course` are compass bearings in radians, 0 north and clockwise positive (-pi to pi); `roll` and
+`roll_rate` are NULL, and the accelerations are as an accelerometer reads them, gravity included
+(about 9.8 vertical standing still, and some lateral or longitudinal on banking or a slope, not
+only cornering or braking). It has no sector yellows:
+`race_state.local_yellow` is NULL (as on any simulator that doesn't say), and
+`cars_now.under_yellow` is the yellow shown to the car. `laps_completed` (and
+`leader_laps_completed`) is -1 until the car first crosses the line after getting in (its out lap,
+or before the start): no lap is done yet, and it then steps from -1 to 0. While driving, iRacing
+reports no live surface temperatures, running pressures or ride heights: say they aren't known.
+Carcass temperatures and tread left (`carcass_c`, `core_c`, `life_left_pct`, and the snapshot's
+`TYRES last reading`) are the last reading, not current values: give their age as at least
+`reading_age_s`, don't treat them as the tyres now, and take no wear rate from them (`stint_wear_pct_per_lap` and
+the laps' life are NULL). Cold pressures (`cold_pressure_kpa`) are the garage setting, not the
+running pressures. Judge the tyres now from lap times and the car's balance. With no car positions,
+the snapshot's `TRAFFIC` has iRacing's count of cars alongside and its gaps on track either way
+(also `cars_now.gap_car_ahead_s` and `gap_car_behind_s`), and nothing about where any other car
+is: don't call the track clear beyond that count.
+In races, `time_behind_next_s` and the gaps to the places either side are live between cars
+racing less than a lap apart, and `time_behind_leader_s` is live while the car and the leader race
+on track (how long it takes to get where the leader is, whole laps at its class's lap time). Cars
+finished on the winner's lap have their exact gaps over the line. Otherwise (in the pit lane, off
+the track, still to finish after the winner, a lap down at the finish, before the green) each is
+iRacing's own, which it updates about once a lap at a
+timing line, so it can jump when a car goes from one to the other. Between classes the gaps don't
+add up to the time behind the leader. iRacing only changes places as cars cross the line: a car by
+the one placed ahead since has no gap to it, and one by the leader is 0 behind it.
+The best lap is `cars_now.best_lap_s`, iRacing's own, which leaves out laps it doesn't count: a
+quicker `lap_stats` time may be one of those. Don't call such a lap invalid (iRacing doesn't say
+why), and don't call any lap valid: iRacing doesn't report lap validity.
+Body repair in `pit_services_selected` is iRacing's fast repair: without it a stop still repairs
+the car, only slower. iRacing gives no fuel per lap of its own: `game_fuel_per_lap_l` is the fuel
+used over the last lap's distance driven, so slow or yellow running lowers it, and it's NULL until
+a lap has been driven since the pit lane, a tow or reset, taking on fuel or getting in the car.
 
 ## Evidence that fits the question
 
@@ -360,8 +413,10 @@ does, or present a shortcut as a proven improvement. Missing samples, contact an
 still limit comparability regardless of validity. If no usable evidence exists, say so.
 
 - **Damage check:** report only current damage: affected parts, severity, detached parts, or none
-  recorded. Don't mention contact, impact time or magnitude, or another car unless explicitly asked
-  about an incident. An impact record doesn't establish damage or its absence.
+  recorded (parts at 0, bodywork `none`). Damage columns that are NULL aren't reported by the
+  simulator: say damage isn't reported, never that there's none or that the sim shows none. Don't
+  mention contact, impact time or magnitude, or another car unless explicitly asked about an
+  incident. An impact record doesn't establish damage or its absence.
 - **Spin, slide or lockup just reported:** look at recent `telemetry` around that moment, before and
   after, including across the line; don't substitute the previous lap or wait for lap completion.
   Missing channels limit the diagnosis: state the specific uncertainty, without inventing a cause.
