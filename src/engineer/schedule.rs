@@ -295,16 +295,16 @@ impl Request {
         !self.waiting.is_empty()
     }
 
-    /// Where counting starts again after its firing at `fired`, having counted from `since`, as
-    /// of `progress`. A timed one counts on from its target, so a firing noticed a little late
-    /// doesn't push the next one back; but from the firing if that target is already more than a
-    /// period behind (a pause, an outage), so it doesn't fire again in a burst. Laps are whole, so
-    /// they're never late.
-    fn rearm_from(&self, since: &Progress, fired: &Progress, progress: &Progress) -> Progress {
+    /// Where counting starts again after its firing at `fired`, having counted from `since`. A
+    /// timed one counts on from its target, so a firing noticed a little late (by up to a tick)
+    /// doesn't push the next one back; but from the firing if it was noticed more than half a
+    /// period late (an outage the clock jumped over), so the next one doesn't follow straight
+    /// after. Laps are whole, so they're never late.
+    fn rearm_from(&self, since: &Progress, fired: &Progress) -> Progress {
         let mut base = fired.clone();
         if let Trigger::Time { seconds } = self.trigger {
             let target = since.clock_s + seconds;
-            if progress.clock_s - target <= seconds {
+            if fired.clock_s - target <= seconds / 2.0 {
                 base.clock_s = target;
             }
         }
@@ -353,8 +353,11 @@ fn reached(
         Trigger::Laps { count } => progress.laps >= base.laps.saturating_add(u64::from(*count)),
         Trigger::Session { kind: None } => starts.any,
         // On the first snapshot that says what the session is
+        // On the first snapshot that says what the session is, if it started after the request was
+        // armed: one that started in the epoch it was armed in had already begun
         Trigger::Session { kind: Some(kind) } => {
             starts.typed
+                && base.epoch != progress.epoch
                 && progress
                     .session_type
                     .as_ref()
@@ -529,8 +532,13 @@ impl Schedule {
                     ended = true;
                     break;
                 }
-                let since = request.rearm_from(since, fired, progress);
+                // Fired on this very snapshot: checking again would fire it again, just as stale
+                let fired_now = fired.seq == progress.seq;
+                let since = request.rearm_from(since, fired);
                 request.state = State::Armed { since };
+                if fired_now {
+                    break;
+                }
             }
             if ended && !request.end() {
                 continue;
@@ -602,7 +610,7 @@ impl Schedule {
     /// The scheduled turn answered `fired`, at `progress`: repeating requests are armed again from
     /// their firing (a timed one from its target), so a slow turn doesn't push the next one back,
     /// and the others end. Either way each waits for its answer to be resolved.
-    pub fn answered(&mut self, fired: &[Fired], progress: &Progress) {
+    pub fn answered(&mut self, fired: &[Fired], _progress: &Progress) {
         for request in &mut self.requests {
             let State::InBatch {
                 since, fired: at, ..
@@ -618,7 +626,7 @@ impl Schedule {
                 State::Ended
             } else {
                 State::Armed {
-                    since: request.rearm_from(since, &at, progress),
+                    since: request.rearm_from(since, &at),
                 }
             };
             request.state = next;
@@ -1798,6 +1806,72 @@ mod tests {
         }
         assert!(run.schedule.requests.is_empty());
         assert!(run.schedule.is_stale(&fired, &run.last));
+    }
+
+    #[test]
+    fn a_firing_stale_at_once_counts_once() {
+        let mut run = Run::new();
+        let mut new = request(
+            Trigger::Condition {
+                query: "SELECT 1".into(),
+            },
+            every(),
+            &laps(0),
+        );
+        new.stale_after = Some(Trigger::Condition {
+            query: "SELECT 2".into(),
+        });
+        run.add(new);
+        let ids = run.condition_ids();
+        let (trigger, stale) = (ids[0], ids[1]);
+        let both = |a, b| with(with(laps(0), trigger, a), stale, b);
+        run.tick(both(ConditionState::False, ConditionState::True));
+        let advance = run.tick(both(ConditionState::True, ConditionState::True));
+        assert_eq!(advance.skipped_stale, 1);
+        assert!(run.due().is_empty());
+    }
+
+    #[test]
+    fn a_firing_noticed_late_counts_on_from_itself() {
+        let mut run = Run::new();
+        let id = run.add(request(
+            Trigger::Time { seconds: 60.0 },
+            every(),
+            &at(0.0, 0),
+        ));
+        run.tick(at(55.0, 0));
+        // An outage the clock jumped over: noticed 55 s late
+        run.tick(at(115.0, 0));
+        assert_eq!(run.due(), [id]);
+        run.tick(at(118.0, 0));
+        run.answer();
+        run.tick(at(120.0, 0));
+        assert!(run.due().is_empty());
+        run.tick(at(174.9, 0));
+        assert!(run.due().is_empty());
+        run.tick(at(175.0, 0));
+        assert_eq!(run.due(), [id]);
+    }
+
+    #[test]
+    fn typed_session_trigger_skips_a_session_that_started_first() {
+        let mut run = Run::new();
+        run.tick(laps(0));
+        // The race's epoch arrives before its type, and the pilot asks in between
+        run.tick(new_epoch(laps(0), 2, &["session"]));
+        let mut made = laps(0);
+        made.epoch = Some(2);
+        run.add(request(
+            Trigger::Session {
+                kind: Some("race".into()),
+            },
+            Repeat::Once,
+            &made,
+        ));
+        let mut typed = new_epoch(laps(0), 2, &[]);
+        typed.session_type = Some("race".into());
+        run.tick(typed);
+        assert!(run.due().is_empty());
     }
 
     #[test]
