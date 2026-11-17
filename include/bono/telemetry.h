@@ -35,9 +35,9 @@
     X(boolean, in_pit_lane)                                                                              \
     X(boolean, lap_invalidated)                                                                          \
     X(f64, delta_best)                      /* seconds against the best lap */                           \
-    X(f64, gap_to_car_ahead)                /* seconds, on track */                                      \
+    X(f64, gap_to_car_ahead)                /* seconds, on track (RaceRoom: none) */                     \
     X(f64, gap_to_car_behind)                                                                            \
-    X(i64, car_ahead_id)                    /* vehicle_id the gap ahead on track is to (or NULL) */      \
+    X(i64, car_ahead_id) /* vehicle_id the gap ahead on track is to (or NULL), for cars on track with another. RaceRoom: the next car round the lap by lap_distance, though it has no gap; LMU: NULL, its SDK doesn't say which car its gap is to */ \
     X(i64, car_behind_id)                                                                                \
     X(f64, gap_to_place_ahead)              /* seconds, in the standings */                              \
     X(f64, gap_to_place_behind)                                                                          \

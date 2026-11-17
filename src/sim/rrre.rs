@@ -11,7 +11,11 @@ use crate::{
     sqlite::pool::Pool,
 };
 use bono_sim::sys::{bono_session_info, bono_standing, bono_telemetry};
-use std::{collections::HashMap, path::PathBuf, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    time::Instant,
+};
 use sys::*;
 
 const STEAM_APP_ID: u32 = 211500;
@@ -283,6 +287,7 @@ impl Converter {
         let vehicle_info = shared.vehicle_info;
         let player_slot = vehicle_info.slot_id;
 
+        let neighbours = track_neighbours(drivers);
         let mut telemetry = Vec::with_capacity(drivers.len());
         for driver in drivers {
             let info = driver.driver_info;
@@ -306,6 +311,11 @@ impl Converter {
             out.lap_invalidated = invalid.into();
             out.gap_to_place_ahead = seconds(driver.time_delta_front).into();
             out.gap_to_place_behind = seconds(driver.time_delta_behind).into();
+            // The game gives no gaps on track: only which cars are either side
+            if let Some((ahead, behind)) = neighbours.get(&slot) {
+                out.car_ahead_id = Some(*ahead as i64).into();
+                out.car_behind_id = Some(*behind as i64).into();
+            }
 
             let position = driver.position;
             let (x, y, z) = (position.x as f64, position.y as f64, position.z as f64);
@@ -369,6 +379,52 @@ impl Converter {
             new_event,
         })
     }
+}
+
+/// The cars next ahead and behind each car on track, by slot, going round the lap by distance. On
+/// track is out of the pit lane, at a known distance, and still on track or finished by the game's
+/// finish status (not out of the race, nor still to start). Only with two or more cars on track,
+/// and none when a slot is there twice (a read mixing two orders of the cars): which row is where
+/// the car is isn't known.
+fn track_neighbours(drivers: &[r3e_driver_data]) -> HashMap<i32, (i32, i32)> {
+    let mut slots = HashSet::new();
+    if !drivers
+        .iter()
+        .all(|driver| slots.insert(driver.driver_info.slot_id))
+    {
+        return HashMap::new();
+    }
+    let mut on_track: Vec<_> = drivers
+        .iter()
+        .filter(|driver| flag(driver.in_pitlane) == Some(false))
+        .filter(|driver| {
+            matches!(
+                driver.finish_status,
+                R3E_FINISH_STATUS_NONE | R3E_FINISH_STATUS_FINISHED
+            )
+        })
+        .filter_map(|driver| {
+            Some((
+                non_negative(driver.lap_distance)?,
+                driver.driver_info.slot_id,
+            ))
+        })
+        .collect();
+    on_track.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let n = on_track.len();
+    if n < 2 {
+        return HashMap::new();
+    }
+    on_track
+        .iter()
+        .enumerate()
+        .map(|(k, (_, slot))| {
+            (
+                *slot,
+                (on_track[(k + 1) % n].1, on_track[(k + n - 1) % n].1),
+            )
+        })
+        .collect()
 }
 
 /// What only the player's car has: its physics, inputs, engine, tires and settings.
@@ -1846,6 +1902,84 @@ mod tests {
         let (session, _) = update.scoring.unwrap();
         assert_eq!(session.pit_speed_limit.get(), None);
         assert_eq!(session.max_incident_points.get(), None);
+    }
+
+    /// The player (7) and slot 3 with three more cars: slot 9 on track and finished, slot 11 in
+    /// the pit lane and slot 12 out of the race, both beside the player.
+    fn field(time: f64) -> Box<r3e_shared> {
+        let mut game = shared(time, 0.0);
+        game.all_drivers_data_1[0].lap_distance = 6900.0;
+        game.all_drivers_data_1[1].lap_distance = 100.0;
+        let mut finished = driver(9, "Mia Novak", 3, 0.0);
+        finished.lap_distance = 3000.0;
+        finished.finish_status = R3E_FINISH_STATUS_FINISHED;
+        let mut pitting = driver(11, "Jon Berg", 4, 0.0);
+        pitting.lap_distance = 90.0;
+        pitting.in_pitlane = 1;
+        let mut retired = driver(12, "Eva Lind", 5, 0.0);
+        retired.lap_distance = 110.0;
+        retired.finish_status = R3E_FINISH_STATUS_DNF;
+        game.all_drivers_data_1[2] = finished;
+        game.all_drivers_data_1[3] = pitting;
+        game.all_drivers_data_1[4] = retired;
+        game.num_cars = 5;
+        game
+    }
+
+    fn either_side(update: &Update, slot: i64) -> (Option<i64>, Option<i64>) {
+        let car = update
+            .telemetry
+            .iter()
+            .find(|t| t.vehicle_id.get() == Some(slot))
+            .unwrap();
+        // The game gives no gaps on track
+        assert_eq!(car.gap_to_car_ahead.get(), None);
+        assert_eq!(car.gap_to_car_behind.get(), None);
+        (car.car_ahead_id.get(), car.car_behind_id.get())
+    }
+
+    #[test]
+    fn names_the_cars_either_side_on_track() {
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        let update = converter.convert(&field(500.0), start).unwrap();
+        // Round the lap: 7 at 100 m, 9 at 3000 m, 3 at 6900 m, and 7 again over the line
+        assert_eq!(either_side(&update, 7), (Some(9), Some(3)));
+        assert_eq!(either_side(&update, 9), (Some(3), Some(7)));
+        assert_eq!(either_side(&update, 3), (Some(7), Some(9)));
+        // Not on track: neither has cars either side, nor is either side of another
+        assert_eq!(either_side(&update, 11), (None, None));
+        assert_eq!(either_side(&update, 12), (None, None));
+
+        // Two on track: the other car is either side
+        let mut game = field(500.02);
+        game.all_drivers_data_1[2].finish_status = R3E_FINISH_STATUS_DNS;
+        let update = converter
+            .convert(&game, start + Duration::from_millis(20))
+            .unwrap();
+        assert_eq!(either_side(&update, 7), (Some(3), Some(3)));
+        assert_eq!(either_side(&update, 9), (None, None));
+
+        // Not known to be out of the pit lane isn't on track: the player alone, nobody either side
+        let mut game = field(500.04);
+        game.all_drivers_data_1[0].in_pitlane = -1;
+        game.all_drivers_data_1[2].finish_status = R3E_FINISH_STATUS_DNS;
+        let update = converter
+            .convert(&game, start + Duration::from_millis(40))
+            .unwrap();
+        assert_eq!(either_side(&update, 7), (None, None));
+        assert_eq!(either_side(&update, 3), (None, None));
+
+        // A read with a slot twice (the cars reordered as it was read): nobody either side
+        let mut game = field(500.06);
+        let mut again = game.all_drivers_data_1[0];
+        again.lap_distance = 5000.0;
+        game.all_drivers_data_1[3] = again;
+        let update = converter
+            .convert(&game, start + Duration::from_millis(60))
+            .unwrap();
+        assert_eq!(either_side(&update, 7), (None, None));
+        assert_eq!(either_side(&update, 9), (None, None));
     }
 
     #[test]
