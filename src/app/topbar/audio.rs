@@ -13,7 +13,7 @@ use crate::{
     config::{ArrayStr, AudioDevice, Config, RawConfig},
     engineer::Heard,
     error,
-    synthesizer::{Speech, Synthesizer, plays_on},
+    synthesizer::{Speech, Synthesizer, VoiceLoad, plays_on},
     task::Task,
     updating,
 };
@@ -74,6 +74,10 @@ pub enum SetupState {
     Downloading(f64),
     /// The download stopped before it was done
     Failed,
+    /// On disk and picked, and being loaded
+    Loading,
+    /// On disk and picked, but it couldn't be loaded
+    LoadFailed,
     Ready,
 }
 
@@ -140,8 +144,8 @@ impl AudioTopbar {
     }
 
     /// Whether something here isn't set up yet: a device that won't open, no speech to text
-    /// model, or no voice.
-    pub fn needs_setup(&self, config: &Config) -> bool {
+    /// model, or no voice (or one that won't load).
+    pub fn needs_setup(&self, config: &Config, synth: &Synthesizer) -> bool {
         let config = config.get();
         self.microphone.missing()
             || self.speaker.missing()
@@ -152,6 +156,7 @@ impl AudioTopbar {
             || self.whisper.failed()
             || config.voices().is_empty()
             || config.voices().values().any(|path| !self.files.voice(path))
+            || (config.voices().keys()).any(|&lang| synth.load(lang) == Some(VoiceLoad::Failed))
     }
 
     /// Called every frame, open or not: loads the speech to text model picked, and sets up what
@@ -283,10 +288,15 @@ impl AudioTopbar {
     }
 
     /// What `setup` downloads, as the setup guide shows it: each with what it's for.
-    pub fn setup_items(&mut self, rt: &Handle, config: &Config) -> Vec<(&'static str, SetupItem)> {
+    pub fn setup_items(
+        &mut self,
+        rt: &Handle,
+        config: &Config,
+        synth: &Synthesizer,
+    ) -> Vec<(&'static str, SetupItem)> {
         let locale = config.get().locale().clone();
         let whisper = self.whisper.setup_item(rt, config);
-        let voice = self.voices.setup_item(rt, config, &locale);
+        let voice = self.voices.setup_item(rt, config, synth, &locale);
         [
             (t!("audio.speech_to_text"), whisper),
             (t!("audio.voice"), voice),

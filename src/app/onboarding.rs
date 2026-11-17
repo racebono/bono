@@ -168,9 +168,9 @@ impl Onboarding {
             egui::ScrollArea::vertical()
                 .max_height(max_height)
                 .show(ui, |ui| match step {
-                    Step::Welcome => welcome(rt, ui, config, &mut topbar.audio),
+                    Step::Welcome => welcome(rt, ui, config, &mut topbar.audio, synth),
                     Step::Simulator => {
-                        self.simulator(rt, ui, config, &mut topbar.audio, simulators)
+                        self.simulator(rt, ui, config, &mut topbar.audio, synth, simulators)
                     }
                     Step::Account => {
                         ui.heading(t!("onboarding.account_title"));
@@ -186,16 +186,16 @@ impl Onboarding {
                         }
                         ui.add_space(8.0);
                         ui.weak(t!("onboarding.account_optional"));
-                        still_downloading(rt, ui, config, &mut topbar.audio);
+                        still_downloading(rt, ui, config, &mut topbar.audio, synth);
                     }
                     Step::Provider => {
                         ui.heading(t!("onboarding.provider_title"));
                         ui.label(t!("onboarding.provider_body"));
                         ui.add_space(8.0);
                         topbar.provider.guide(rt, ui, config);
-                        still_downloading(rt, ui, config, &mut topbar.audio);
+                        still_downloading(rt, ui, config, &mut topbar.audio, synth);
                     }
-                    Step::Microphone => microphone(rt, ss, ui, config, &mut topbar.audio),
+                    Step::Microphone => microphone(rt, ss, ui, config, &mut topbar.audio, synth),
                     Step::Voice => voice(rt, ss, ui, config, &mut topbar.audio, synth),
                     Step::TalkButton => self.talk_button(rt, ss, ui, config),
                     Step::RadioCheck => {
@@ -253,6 +253,7 @@ impl Onboarding {
         ui: &mut egui::Ui,
         config: &Config,
         audio: &mut AudioTopbar,
+        synth: &Synthesizer,
         simulators: &mut ActiveSimulator,
     ) {
         ui.heading(t!("onboarding.simulator_title"));
@@ -267,7 +268,7 @@ impl Onboarding {
             ui.weak(t!("onboarding.no_simulator"));
         }
 
-        still_downloading(rt, ui, config, audio);
+        still_downloading(rt, ui, config, audio, synth);
     }
 
     fn talk_button(&mut self, rt: &Handle, ss: &Subsystems, ui: &mut egui::Ui, config: &Config) {
@@ -436,7 +437,13 @@ fn engineer_done(said: &[crate::engineer::ChatEntry]) -> bool {
     said.iter().any(|entry| entry.speaker == Speaker::Engineer)
 }
 
-fn welcome(rt: &Handle, ui: &mut egui::Ui, config: &mut Config, audio: &mut AudioTopbar) {
+fn welcome(
+    rt: &Handle,
+    ui: &mut egui::Ui,
+    config: &mut Config,
+    audio: &mut AudioTopbar,
+    synth: &Synthesizer,
+) {
     ui.heading(t!("onboarding.welcome_title"));
     ui.label(t!("onboarding.welcome_body"));
 
@@ -444,7 +451,7 @@ fn welcome(rt: &Handle, ui: &mut egui::Ui, config: &mut Config, audio: &mut Audi
     ui.strong(t!("language"));
     config.maybe_update(|raw| settings::languages(ui, raw));
 
-    let items = audio.setup_items(rt, config);
+    let items = audio.setup_items(rt, config, synth);
     if !items.is_empty() {
         ui.add_space(8.0);
         ui.strong(t!("onboarding.downloads_title"));
@@ -461,6 +468,7 @@ fn microphone(
     ui: &mut egui::Ui,
     config: &mut Config,
     audio: &mut AudioTopbar,
+    synth: &Synthesizer,
 ) {
     ui.heading(t!("onboarding.microphone_title"));
     ui.label(t!("onboarding.microphone_body"));
@@ -488,7 +496,7 @@ fn microphone(
         }
     });
 
-    still_downloading(rt, ui, config, audio);
+    still_downloading(rt, ui, config, audio, synth);
 }
 
 fn voice(
@@ -556,12 +564,18 @@ fn voice(
         }
     });
 
-    still_downloading(rt, ui, config, audio);
+    still_downloading(rt, ui, config, audio, synth);
 }
 
 /// The downloads started on the first step, while they're still going.
-fn still_downloading(rt: &Handle, ui: &mut egui::Ui, config: &Config, audio: &mut AudioTopbar) {
-    let items = audio.setup_items(rt, config);
+fn still_downloading(
+    rt: &Handle,
+    ui: &mut egui::Ui,
+    config: &Config,
+    audio: &mut AudioTopbar,
+    synth: &Synthesizer,
+) {
+    let items = audio.setup_items(rt, config, synth);
     if !items.is_empty() {
         ui.add_space(8.0);
         ui.strong(t!("onboarding.downloads_title"));
@@ -609,6 +623,18 @@ fn downloads(ui: &mut egui::Ui, items: &[(&str, SetupItem)]) -> bool {
                                     t!("onboarding.failed"),
                                 );
                             }
+                            SetupState::Loading => {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.weak(t!("onboarding.loading"));
+                                });
+                            }
+                            SetupState::LoadFailed => {
+                                ui.colored_label(
+                                    ui.visuals().warn_fg_color,
+                                    t!("onboarding.load_failed"),
+                                );
+                            }
                             SetupState::Ready => {
                                 ui.label(format!(
                                     "{} {}",
@@ -628,7 +654,7 @@ fn downloads(ui: &mut egui::Ui, items: &[(&str, SetupItem)]) -> bool {
             item,
             SetupItem::Unavailable
                 | SetupItem::Found {
-                    state: SetupState::Failed | SetupState::Missing,
+                    state: SetupState::Failed | SetupState::LoadFailed | SetupState::Missing,
                     ..
                 }
         )

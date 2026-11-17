@@ -29,7 +29,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     mem::ManuallyDrop,
     num::NonZeroUsize,
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
     task::Poll,
     time::{Duration, Instant},
 };
@@ -117,6 +117,11 @@ impl Synthesizer {
         }
     }
 
+    /// How the voice for `lang` loaded: `None` if none was set.
+    pub fn load(&self, lang: ArrayStr<2>) -> Option<VoiceLoad> {
+        self.inner.get(&lang)?.load()
+    }
+
     /// Whether `model`, the voice picked for `lang`, failed to load: picking it again retries.
     pub fn failed(&self, lang: ArrayStr<2>, model: &Utf8Path) -> bool {
         self.inner
@@ -198,13 +203,31 @@ struct Model {
     gpu: bool,
 }
 
+/// How the latest voice given to a [`SynthesizerInner`] loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceLoad {
+    Loading,
+    Loaded,
+    /// It couldn't be loaded: the voice before it (if any) is still the one speaking
+    Failed,
+}
+
+/// The voices given to a [`SynthesizerInner`], counted, and how the latest loaded.
+#[derive(Default)]
+struct LoadStatus {
+    requested: u64,
+    /// The latest voice given
+    model: Option<Utf8PathBuf>,
+    /// `None` until a voice is given
+    state: Option<VoiceLoad>,
+}
+
 pub struct SynthesizerInner {
     handle: ManuallyDrop<std::thread::JoinHandle<()>>,
-    model: ManuallyDrop<watch::Sender<Option<Model>>>,
+    /// The voice to load, with its number in [`LoadStatus::requested`]
+    model: ManuallyDrop<watch::Sender<Option<(u64, Model)>>>,
     jobs: ManuallyDrop<mpsc::UnboundedSender<Job>>,
-    /// The voice the worker failed to load, if it's still the one picked: cleared once another
-    /// is picked (or the same one again)
-    failed: Arc<Mutex<Option<Utf8PathBuf>>>,
+    load: Arc<Mutex<LoadStatus>>,
 }
 
 impl SynthesizerInner {
@@ -212,50 +235,74 @@ impl SynthesizerInner {
         let threads = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
         let (model_send, model_recv) = watch::channel(None);
         let (jobs_send, jobs_recv) = mpsc::unbounded_channel();
-        let failed = Arc::new(Mutex::new(None));
-        let handle = std::thread::spawn({
-            let failed = failed.clone();
-            move || Self::worker(rt, model_recv, jobs_recv, threads, failed)
-        });
+        let load = Arc::new(Mutex::new(LoadStatus::default()));
+        let handle = {
+            let load = load.clone();
+            std::thread::spawn(move || Self::worker(rt, model_recv, jobs_recv, load, threads))
+        };
 
         Self {
             handle: ManuallyDrop::new(handle),
             model: ManuallyDrop::new(model_send),
             jobs: ManuallyDrop::new(jobs_send),
-            failed,
+            load,
         }
+    }
+
+    /// Loads `model` (again, if it's the one already set), to run on the GPU if `gpu`, or with
+    /// `None`, stops.
+    pub fn set_model(&self, model: Option<Utf8PathBuf>, gpu: bool) {
+        // Sent while locked, so the latest request is the one the worker gets last
+        let mut load = lock(&self.load);
+        load.requested += 1;
+        let loading = model.is_some();
+        load.state = loading.then_some(VoiceLoad::Loading);
+        load.model = model.clone();
+        let sent = (self.model).send(model.map(|path| (load.requested, Model { path, gpu })));
+        // The worker stopped, so nothing will load it
+        if sent.is_err() && loading {
+            load.state = Some(VoiceLoad::Failed);
+        }
+    }
+
+    /// How the latest voice set loaded: `None` if none was.
+    pub fn load(&self) -> Option<VoiceLoad> {
+        lock(&self.load).state
     }
 
     /// Whether `model` is the voice that last failed to load. One still loading hasn't failed.
     pub fn failed(&self, model: &Utf8Path) -> bool {
-        // The lock only guards a path: whatever a panic left in it is still one
-        let failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
-        failed.as_deref() == Some(model)
+        let load = lock(&self.load);
+        load.state == Some(VoiceLoad::Failed) && load.model.as_deref() == Some(model)
     }
 
-    /// Loads `model`, to run on the GPU if `gpu`. `None` stops the voice.
-    pub fn set_model(&self, model: Option<Utf8PathBuf>, gpu: bool) {
-        // Under the lock the worker records failures in, so one of a load this replaces can't
-        // be recorded after it's cleared: a voice picked (again) is loading, not failed
-        let mut failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
-        *failed = None;
-        let _ = self.model.send(model.map(|path| Model { path, gpu }));
-    }
-
-    /// Reloads the voice, if there's one and it isn't already where `gpu` says.
+    /// Reloads the voice to run on the GPU if `gpu`, if there's one and it isn't already there.
+    /// The reload counts as the latest request, as one from [`Self::set_model`] does.
     fn set_gpu(&self, gpu: bool) {
-        // Reloaded, it's loading again, as when it's picked again (see `set_model`)
-        let mut failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+        // Sent while locked, as `set_model` does
+        let mut load = lock(&self.load);
+        let requested = load.requested + 1;
         let reloads = self.model.send_if_modified(|model| match model {
-            Some(model) if model.gpu != gpu => {
+            Some((number, model)) if model.gpu != gpu => {
+                *number = requested;
                 model.gpu = gpu;
                 true
             }
             _ => false,
         });
         if reloads {
-            *failed = None;
+            load.requested = requested;
+            // The worker stopped, so nothing will load it
+            load.state = Some(match self.model.is_closed() {
+                true => VoiceLoad::Failed,
+                false => VoiceLoad::Loading,
+            });
         }
+    }
+
+    /// Whether its worker stopped, so it can't load or speak anything.
+    pub fn stopped(&self) -> bool {
+        self.model.is_closed()
     }
 
     fn send(&self, job: Job) {
@@ -266,10 +313,10 @@ impl SynthesizerInner {
 
     fn worker(
         handle: Handle,
-        mut model: watch::Receiver<Option<Model>>,
+        model: watch::Receiver<Option<(u64, Model)>>,
         mut jobs: mpsc::UnboundedReceiver<Job>,
+        load: Arc<Mutex<LoadStatus>>,
         threads: NonZeroUsize,
-        failed: Arc<Mutex<Option<Utf8PathBuf>>>,
     ) {
         let mut voice = None::<Voice>;
         // The model `voice` was loaded from
@@ -277,6 +324,12 @@ impl SynthesizerInner {
         // The transmission being spoken: one at a time, the others wait their turn
         let mut stream = None::<Stream>;
         let mut waiting = VecDeque::<Job>::new();
+        // After the voice, so it's dropped first: requests stop before the voice is freed
+        let mut stopping = Stopping {
+            load: load.clone(),
+            model: Some(model),
+        };
+        let model = stopping.model.as_mut().expect("just set");
 
         enum Event {
             Model,
@@ -344,7 +397,7 @@ impl SynthesizerInner {
                 Some(Event::Model) => {
                     // Cloned so the load doesn't hold the read lock `set_model` waits on
                     let next = model.borrow_and_update().clone();
-                    let Some(Model { path, gpu }) = next else {
+                    let Some((requested, Model { path, gpu })) = next else {
                         return;
                     };
                     // Its speech so far was in the old voice. The same voice moving to or from
@@ -352,20 +405,21 @@ impl SynthesizerInner {
                     if loaded.as_ref() != Some(&path) {
                         stream = None;
                     }
-                    match Voice::load(&path, threads, gpu) {
+                    let state = match Voice::load(&path, threads, gpu) {
                         Ok(next_voice) => {
                             voice = Some(next_voice);
                             loaded = Some(path);
+                            VoiceLoad::Loaded
                         }
                         Err(e) => {
-                            let mut last_failed = failed.lock().unwrap_or_else(|e| e.into_inner());
-                            // Unless another voice was picked meanwhile, which is loaded next
-                            if !model.has_changed().unwrap_or(true) {
-                                *last_failed = Some(path);
-                            }
-                            drop(last_failed);
                             error(t!("error.tts_model"), e);
+                            VoiceLoad::Failed
                         }
+                    };
+                    // A voice set during the load is the one shown
+                    let mut load = lock(&load);
+                    if load.requested == requested {
+                        load.state = Some(state);
                     }
                 }
                 Some(Event::Job(Job::Speech {
@@ -395,6 +449,34 @@ impl SynthesizerInner {
             }
         }
     }
+}
+
+/// The worker's voice requests, closed when it stops (or panics): a voice it didn't load, or any
+/// after a panic, is marked failed, since nothing will load or speak it.
+struct Stopping {
+    load: Arc<Mutex<LoadStatus>>,
+    model: Option<watch::Receiver<Option<(u64, Model)>>>,
+}
+
+impl Drop for Stopping {
+    fn drop(&mut self) {
+        // Closed while locked, as `set_model` sends while locked: a request is either seen here
+        // or fails to send
+        let mut load = lock(&self.load);
+        drop(self.model.take());
+        let failed = match load.state {
+            Some(VoiceLoad::Loading) => true,
+            Some(VoiceLoad::Loaded) => std::thread::panicking(),
+            Some(VoiceLoad::Failed) | None => false,
+        };
+        if failed {
+            load.state = Some(VoiceLoad::Failed);
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn no_model() -> anyhow::Error {
@@ -1112,6 +1194,84 @@ mod tests {
         assert!(!synth.failed(&missing));
         assert!(wait_until(|| synth.failed(&other)));
         assert!(!synth.failed(&missing));
+    }
+
+    async fn loaded(inner: &SynthesizerInner) -> Option<VoiceLoad> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while inner.load() == Some(VoiceLoad::Loading) {
+            assert!(Instant::now() < deadline, "timed out");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        inner.load()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_voice_that_wont_load_is_failed() {
+        let inner = SynthesizerInner::new(Handle::current());
+        assert_eq!(inner.load(), None);
+
+        let missing = std::env::temp_dir().join("bono-missing-voice.onnx");
+        let missing = Utf8PathBuf::from_path_buf(missing).unwrap();
+        inner.set_model(Some(missing.clone()), false);
+        assert_eq!(loaded(&inner).await, Some(VoiceLoad::Failed));
+
+        // Setting it again tries again
+        inner.set_model(Some(missing.clone()), false);
+        assert_eq!(loaded(&inner).await, Some(VoiceLoad::Failed));
+
+        // Once the worker stops, nothing loads it
+        inner.set_model(None, false);
+        assert_eq!(inner.load(), None);
+        stopped(&inner).await;
+        inner.set_model(Some(missing), false);
+        assert_eq!(inner.load(), Some(VoiceLoad::Failed));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn moving_a_voice_to_the_gpu_loads_it_again() {
+        let inner = SynthesizerInner::new(Handle::current());
+        let missing = std::env::temp_dir().join("bono-missing-gpu-voice.onnx");
+        let missing = Utf8PathBuf::from_path_buf(missing).unwrap();
+        inner.set_model(Some(missing), false);
+        assert_eq!(loaded(&inner).await, Some(VoiceLoad::Failed));
+
+        // Already where it's asked to run: nothing to load
+        inner.set_gpu(false);
+        assert_eq!(lock(&inner.load).requested, 1);
+        assert_eq!(inner.load(), Some(VoiceLoad::Failed));
+
+        // Moved, it's the latest request, and loads (and fails) again
+        inner.set_gpu(true);
+        assert_eq!(lock(&inner.load).requested, 2);
+        assert_eq!(loaded(&inner).await, Some(VoiceLoad::Failed));
+    }
+
+    async fn stopped(inner: &SynthesizerInner) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !inner.stopped() {
+            assert!(Instant::now() < deadline, "timed out");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn setting_a_voice_starts_a_stopped_synthesizer_again() {
+        let rt = Handle::current();
+        let lang = crate::arrstr!("en");
+        let mut synth = Synthesizer {
+            inner: BTreeMap::new(),
+        };
+        let mut config = RawConfig::default();
+        let missing = std::env::temp_dir().join("bono-missing-voice.onnx");
+        let missing = Utf8PathBuf::from_path_buf(missing).unwrap();
+
+        config.set_voice(&rt, lang, None, &mut synth);
+        stopped(&synth.inner[&lang]).await;
+
+        config.set_voice(&rt, lang, Some(missing), &mut synth);
+        assert_eq!(loaded(&synth.inner[&lang]).await, Some(VoiceLoad::Failed));
+        // It was loaded (and failed) by a worker that's still there for the next
+        assert!(!synth.inner[&lang].stopped());
     }
 
     #[test]
