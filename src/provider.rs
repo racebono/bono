@@ -98,8 +98,9 @@ pub trait Model: Send {
 
     /// Questions the pilot asks while the next turns run, taken at each tool hand-back and added
     /// after the tool results, before the note (see [`steer_text`]). What's still in the slot when
-    /// a turn ends is left there. `None`: no slot. Claude's conversations take it; the others
-    /// don't yet.
+    /// a turn ends is left there. `None`: no slot. Claude's conversations add it as a text block;
+    /// OpenAI's and Ollama's to the last tool result's content, as their APIs document no user
+    /// message after tool results.
     #[cfg_attr(not(test), allow(dead_code))]
     fn set_steer(&mut self, _steer: Option<Steer>) {}
 }
