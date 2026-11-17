@@ -454,6 +454,13 @@ impl Converter {
             }));
         }
         let total = race_laps(frame);
+        // The winner's finish timed at the line since (see `CarTrack::update`): it competes at
+        // that, as does the moment it can change for
+        if let Some(Some(flag)) = &mut self.flag
+            && let Some(at) = flag.winner.and_then(|w| self.cars.get(&w)?.finish_at)
+        {
+            flag.finish = Some(at);
+        }
         if let Some(Some(flag)) = &mut self.flag
             && !flag.undecided
             && flag.decided.is_none_or(|at| {
@@ -3539,6 +3546,39 @@ mod tests {
         let got = behind(0);
         assert!(
             got.is_some_and(|got| (got - 0.0625).abs() < 1e-6),
+            "{got:?}"
+        );
+        assert_eq!(behind(1), Some(0.0));
+    }
+
+    /// The winner taken at its count ahead of the line, and the car over first counted after a
+    /// hold-up that also takes the winner's count to its line: the winner competes at its
+    /// crossing, and the first over wins.
+    #[test]
+    fn the_winner_taken_competes_at_its_crossing() {
+        // Car 0 counted at 10 s, over at 10.75 s; car 1 over at 10.667 s, counted at 13 s
+        let end = race_of(
+            &[
+                (9.75, STATE_RACING, [0.89, 0.86, 0.5], [2, 2, 1]),
+                (10.0, STATE_CHECKERED, [0.9, 0.9, 0.51], [3, 2, 1]),
+                (13.0, STATE_CHECKERED, [0.3, 0.35, 0.6], [3, 3, 1]),
+                (13.25, STATE_CHECKERED, [0.325, 0.3875, 0.61], [3, 3, 1]),
+            ],
+            [0.0, 0.3, 50.0],
+            Some(3),
+        );
+        let (_, standings) = end.scoring.as_ref().unwrap();
+        let behind = |car: i64| {
+            standings
+                .iter()
+                .find(|s| s.vehicle_id.get() == Some(car))
+                .unwrap()
+                .time_behind_leader
+                .get()
+        };
+        let got = behind(0);
+        assert!(
+            got.is_some_and(|got| (got - (10.75 - 10.0 - 2.0 / 3.0)).abs() < 1e-6),
             "{got:?}"
         );
         assert_eq!(behind(1), Some(0.0));
