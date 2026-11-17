@@ -334,6 +334,399 @@
         "Answers both action and reason in at most 35 words excluding acknowledgement",
         "No invented marker boards, guaranteed optimum, tyre diagnosis or unrelated corners"
       ]
+    },
+    {
+      "id": 30,
+      "prompt": "Give me my fuel at the end of every lap for the next five laps.",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "race",
+      "assertions": [
+        "Calls `schedule` with action add: a `laps` trigger of 1, repeat `every`, and `until` 5 laps",
+        "The instruction is self-contained: it says the pilot asked during the race for their fuel at the end of each lap for five laps, without referring back to the conversation",
+        "Sets `stale_after` so a lap's figure isn't said after the next lap ends (about one lap, or a shorter time)",
+        "Makes no `engineer` call and gives no fuel figure now",
+        "The reply is one short confirmation sentence that says what and when; no separate \"checking\" acknowledgement before the call"
+      ]
+    },
+    {
+      "id": 31,
+      "prompt": "Remind me in ten minutes to check my brake bias.",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "race",
+      "assertions": [
+        "Calls `schedule` with action add: a `time` trigger of 600 seconds, repeat once",
+        "Doesn't work out a target clock time or lap itself",
+        "The instruction is self-contained: who asked, when, and that it's a reminder to check the brake bias",
+        "The reply is one short confirmation sentence that says what and when; no separate \"checking\" acknowledgement before the call"
+      ]
+    },
+    {
+      "id": 32,
+      "prompt": "At the start of the race, remind me the tyres will be cold.",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "practice",
+      "assertions": [
+        "Calls `schedule` with action add: a `session` trigger with `session_type` race, not a time or lap trigger",
+        "The instruction says the pilot asked during practice and what to remind them of at the race start",
+        "The reply is one short confirmation sentence that says what and when; no separate \"checking\" acknowledgement before the call"
+      ]
+    },
+    {
+      "id": 33,
+      "prompt": "Tell me if the car behind gets within a second.",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "race",
+      "assertions": [
+        "Calls `schedule` with action add and a `condition` trigger whose query returns a row only while the gap to the car behind is under a second",
+        "The query finds the player with `is_player = 1` or `race_state.player_vehicle_id`, never a literal `vehicle_id` number",
+        "The instruction is self-contained: who asked, when, and what to tell them",
+        "The reply is one short confirmation sentence that says what and when; no separate \"checking\" acknowledgement before the call",
+        "If the tool reports the condition already true, the confirmation says so and that it'll call when the car drops back and closes again"
+      ]
+    },
+    {
+      "id": 34,
+      "prompt": "Let me know when my front left drops below fifty percent.",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "race",
+      "assertions": [
+        "Calls `schedule` with action add and a `condition` trigger over `wheels_now`, for the front left (wheel 0) with `life_left_pct` under 50",
+        "Since `wheels_now` has no `is_player`, the query finds the player's car through `race_state.player_vehicle_id` or a join with `cars_now` on `is_player = 1`, never a literal `vehicle_id` number",
+        "The reply is one short confirmation sentence that says what and when; no separate \"checking\" acknowledgement before the call"
+      ]
+    },
+    {
+      "id": 35,
+      "prompt": "Give me the gap to Ruiz every lap until I pit.",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "race",
+      "assertions": [
+        "Calls `schedule` with action add: a `laps` trigger of 1, repeat `every`, and an `until` condition that returns a row once the player is in the pit lane",
+        "The query finds the player with `is_player = 1` or `race_state.player_vehicle_id`, never a literal `vehicle_id` number, and names Ruiz in the instruction rather than by vehicle id",
+        "The instruction is self-contained: who asked, when, the gap to Ruiz each lap, until they pit",
+        "The reply is one short confirmation sentence that says what and when; no separate \"checking\" acknowledgement before the call"
+      ]
+    },
+    {
+      "id": 36,
+      "prompt": "What have you got scheduled?",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "race",
+      "pending": [
+        {
+          "id": "#1",
+          "instruction": "The pilot asked during the race for their fuel at the end of each lap, for five laps.",
+          "trigger": {
+            "kind": "laps",
+            "count": 1
+          },
+          "repeat": "every",
+          "until": {
+            "kind": "laps",
+            "count": 5
+          },
+          "stale_after": {
+            "kind": "laps",
+            "count": 1
+          }
+        },
+        {
+          "id": "#2",
+          "instruction": "The pilot asked during the race to be told if the car behind gets within a second of them.",
+          "trigger": {
+            "kind": "condition",
+            "query": "SELECT 1 FROM cars_now WHERE is_player = 1 AND gap_car_behind_s < 1"
+          },
+          "repeat": "once"
+        },
+        {
+          "id": "#3",
+          "instruction": "The pilot asked during the race to be reminded, ten minutes later, to check their brake bias.",
+          "trigger": {
+            "kind": "time",
+            "seconds": 600
+          },
+          "repeat": "once"
+        }
+      ],
+      "assertions": [
+        "Answers from the pending list with no tool call",
+        "Mentions all three: fuel each lap for five laps, a call if the car behind gets within a second, the brake bias reminder",
+        "Says what and when for each, not their ids, and no symbols such as \"#\"",
+        "At most 65 words; no fuel, gap or other figures nobody asked for"
+      ]
+    },
+    {
+      "id": 37,
+      "prompt": "Forget the fuel one.",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "race",
+      "pending": [
+        {
+          "id": "#1",
+          "instruction": "The pilot asked during the race for their fuel at the end of each lap, for five laps.",
+          "trigger": {
+            "kind": "laps",
+            "count": 1
+          },
+          "repeat": "every",
+          "until": {
+            "kind": "laps",
+            "count": 5
+          },
+          "stale_after": {
+            "kind": "laps",
+            "count": 1
+          }
+        },
+        {
+          "id": "#2",
+          "instruction": "The pilot asked during the race to be told if the car behind gets within a second of them.",
+          "trigger": {
+            "kind": "condition",
+            "query": "SELECT 1 FROM cars_now WHERE is_player = 1 AND gap_car_behind_s < 1"
+          },
+          "repeat": "once"
+        },
+        {
+          "id": "#3",
+          "instruction": "The pilot asked during the race to be reminded, ten minutes later, to check their brake bias.",
+          "trigger": {
+            "kind": "time",
+            "seconds": 600
+          },
+          "repeat": "once"
+        }
+      ],
+      "assertions": [
+        "Calls `schedule` with action cancel and id `#1`, and makes no other change",
+        "Confirms the cancel in one short sentence"
+      ]
+    },
+    {
+      "id": 38,
+      "prompt": "Make the fuel one every two laps instead.",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "race",
+      "pending": [
+        {
+          "id": "#1",
+          "instruction": "The pilot asked during the race for their fuel at the end of each lap, for five laps.",
+          "trigger": {
+            "kind": "laps",
+            "count": 1
+          },
+          "repeat": "every",
+          "until": {
+            "kind": "laps",
+            "count": 5
+          },
+          "stale_after": {
+            "kind": "laps",
+            "count": 1
+          }
+        },
+        {
+          "id": "#2",
+          "instruction": "The pilot asked during the race to be told if the car behind gets within a second of them.",
+          "trigger": {
+            "kind": "condition",
+            "query": "SELECT 1 FROM cars_now WHERE is_player = 1 AND gap_car_behind_s < 1"
+          },
+          "repeat": "once"
+        },
+        {
+          "id": "#3",
+          "instruction": "The pilot asked during the race to be reminded, ten minutes later, to check their brake bias.",
+          "trigger": {
+            "kind": "time",
+            "seconds": 600
+          },
+          "repeat": "once"
+        }
+      ],
+      "assertions": [
+        "Calls `schedule` with action replace and id `#1`, not a cancel and an add",
+        "The replacement has a `laps` trigger of 2, repeat `every`, keeps `until` 5 laps, and an instruction that says every two laps",
+        "Confirms the change in one short sentence that says what and when"
+      ]
+    },
+    {
+      "id": 39,
+      "prompt": "Start the fuel calls again from now, five more laps.",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "race",
+      "pending": [
+        {
+          "id": "#1",
+          "instruction": "The pilot asked during the race for their fuel at the end of each lap, for five laps.",
+          "trigger": {
+            "kind": "laps",
+            "count": 1
+          },
+          "repeat": "every",
+          "until": {
+            "kind": "laps",
+            "count": 5
+          },
+          "stale_after": {
+            "kind": "laps",
+            "count": 1
+          }
+        },
+        {
+          "id": "#2",
+          "instruction": "The pilot asked during the race to be told if the car behind gets within a second of them.",
+          "trigger": {
+            "kind": "condition",
+            "query": "SELECT 1 FROM cars_now WHERE is_player = 1 AND gap_car_behind_s < 1"
+          },
+          "repeat": "once"
+        },
+        {
+          "id": "#3",
+          "instruction": "The pilot asked during the race to be reminded, ten minutes later, to check their brake bias.",
+          "trigger": {
+            "kind": "time",
+            "seconds": 600
+          },
+          "repeat": "once"
+        }
+      ],
+      "assertions": [
+        "Cancels `#1` and adds a new request (a `laps` trigger of 1, repeat `every`, `until` 5 laps), instead of a replace, which would keep what was already counted",
+        "Leaves `#2` and `#3` alone",
+        "Confirms in one short sentence that says what and when"
+      ]
+    },
+    {
+      "id": 40,
+      "prompt": "",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "race",
+      "scheduled": [
+        {
+          "instruction": "The pilot asked during the race to be told at the end of each lap if any of the top three cars has made a pit stop; nothing otherwise.",
+          "why": "1 lap completed; it repeats"
+        }
+      ],
+      "assertions": [
+        "The reply is exactly `[SILENCE]`, with nothing before or after it",
+        "No acknowledgement such as \"Copy\" or \"Checking\"",
+        "Makes no `schedule` call"
+      ]
+    },
+    {
+      "id": 41,
+      "prompt": "",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "race",
+      "scheduled": [
+        {
+          "instruction": "The pilot asked during the race to be told at the end of each lap if it has started raining or the track is getting wet.",
+          "why": "1 lap completed; it repeats"
+        }
+      ],
+      "assertions": [
+        "The reply is exactly `[SILENCE]`, with nothing before or after it",
+        "Doesn't mention the forecast, which the request didn't ask about"
+      ]
+    },
+    {
+      "id": 42,
+      "prompt": "",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "race",
+      "scheduled": [
+        {
+          "instruction": "The pilot asked during the race to be told at the end of each lap if any of the top three cars has made a pit stop; nothing otherwise.",
+          "why": "1 lap completed; it repeats"
+        },
+        {
+          "instruction": "The pilot asked during the race to be told at the end of each lap if it has started raining or the track is getting wet.",
+          "why": "1 lap completed; it repeats"
+        }
+      ],
+      "assertions": [
+        "The reply is exactly `[SILENCE]`, with nothing before or after it: one for the whole turn, not one per request",
+        "No acknowledgement and no \"nothing to report\" for either request"
+      ]
+    },
+    {
+      "id": 43,
+      "prompt": "",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "race",
+      "scheduled": [
+        {
+          "instruction": "The pilot asked during the race for an energy check at the end of the lap: can they make the finish without another stop?",
+          "why": "1 lap completed"
+        }
+      ],
+      "assertions": [
+        "Opens with the subject, such as \"Energy check:\", before the verdict",
+        "Gives the verdict that the pilot can't make the finish without another stop",
+        "No acknowledgement such as \"Copy\" or \"Checking\", even before tool calls",
+        "At most 20 words; no stop timing, weather or tyres",
+        "Isn't `[SILENCE]`"
+      ]
+    },
+    {
+      "id": 44,
+      "prompt": "",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "race",
+      "scheduled": [
+        {
+          "instruction": "The pilot asked during the race for an energy check at the end of the lap: can they make the finish without another stop?",
+          "why": "1 lap completed"
+        },
+        {
+          "instruction": "The pilot asked during the race to be told at the end of each lap if any of the top three cars has made a pit stop; nothing otherwise.",
+          "why": "1 lap completed; it repeats"
+        }
+      ],
+      "assertions": [
+        "Opens with the energy check's subject and gives its verdict",
+        "Leaves the pit stop watch out: says nothing about rivals' stops",
+        "Contains no `[SILENCE]`",
+        "No acknowledgement such as \"Copy\" or \"Checking\""
+      ]
+    },
+    {
+      "id": 45,
+      "prompt": "",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "race",
+      "scheduled": [
+        {
+          "instruction": "The pilot asked during the race for the gap to the car behind at the end of each lap, for five laps.",
+          "why": "1 lap completed; it repeats"
+        }
+      ],
+      "assertions": [
+        "Opens with the subject, such as \"Gap behind:\", then the gap rounded to tenths",
+        "Names the car behind by surname (Ruiz)",
+        "No acknowledgement such as \"Copy\" or \"Checking\"",
+        "One sentence; no advice, pace comparison or other topics",
+        "Makes no `schedule` call"
+      ]
     }
   ]
 }

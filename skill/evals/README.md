@@ -23,6 +23,11 @@ with `EVAL_LANG`. These are controlled manual/model scenarios, not executed resu
 references, explicitly disclosed fallback, and missing or non-comparable evidence. These are
 controlled manual/model scenarios, not executed results.
 
+`scheduled.md` covers adding requests with the right trigger and a self-contained instruction,
+conditions without literal vehicle ids, managing pending requests, and scheduled turns that
+stay silent or open with their subject. Its cases use the `pending` and `scheduled` fields it
+describes. These are controlled manual/model scenarios, not executed results.
+
 These cases test the race engineer's answers, not the automatic spotter. Direct side/clear
 calls, immediate alerts and imminent-rain announcements are excluded. Rival pace, longer
 weather outlooks, strategy and driving advice remain in scope.
