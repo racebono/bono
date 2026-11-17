@@ -183,8 +183,9 @@ impl Conversation {
                     bail!("The model stopped for tool calls, but made none")
                 }
                 Some("stop") => Some(StopReason::EndTurn),
-                // Mistral's `model_length`: the model's context is full
-                Some("length" | "model_length") => Some(StopReason::MaxTokens),
+                Some("length") => Some(StopReason::MaxTokens),
+                // Mistral's: the model's context is full
+                Some("model_length") => Some(StopReason::ContextWindowExceeded),
                 Some("content_filter") => Some(StopReason::Refusal),
                 // Mistral's: the server failed while writing
                 Some("error") => bail!("The model failed partway through its answer"),
@@ -373,8 +374,9 @@ impl Response {
         struct Delta {
             #[serde(default)]
             content: Option<Content>,
+            /// Null for none, in Mistral's
             #[serde(default)]
-            tool_calls: Vec<DeltaCall>,
+            tool_calls: Option<Vec<DeltaCall>>,
         }
 
         /// Text, or (Mistral's, from its reasoning models) a list of typed chunks
@@ -470,7 +472,7 @@ impl Response {
                     sink.push(&text);
                     self.content.push_str(&text);
                 }
-                for piece in delta.tool_calls {
+                for piece in delta.tool_calls.into_iter().flatten() {
                     let index = piece.index.unwrap_or_else(|| {
                         let new_call = self.tool_calls.last().is_some_and(|call| {
                             piece
@@ -777,9 +779,13 @@ fn is_openai(base_url: &str) -> bool {
     reqwest::Url::parse(base_url).is_ok_and(|url| url.host_str() == Some("api.openai.com"))
 }
 
-/// Whether `base_url` is Mistral's own API, which rejects request fields it doesn't know.
+/// Whether `base_url` is Mistral's own API (`api.mistral.ai`, `codestral.mistral.ai`...), which
+/// rejects request fields it doesn't know.
 fn is_mistral(base_url: &str) -> bool {
-    reqwest::Url::parse(base_url).is_ok_and(|url| url.host_str() == Some("api.mistral.ai"))
+    reqwest::Url::parse(base_url).is_ok_and(|url| {
+        url.host_str()
+            .is_some_and(|host| host == "mistral.ai" || host.ends_with(".mistral.ai"))
+    })
 }
 
 /// The bearer token: `api_key`, or else `OPENAI_API_KEY`, if set.
@@ -1057,7 +1063,7 @@ mod tests {
         ] {
             let line = format!(
                 "data: {}",
-                json!({"model": "magistral-medium-latest", "choices": [{"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": null}]})
+                json!({"model": "magistral-medium-latest", "choices": [{"index": 0, "delta": {"role": "assistant", "content": content, "tool_calls": null}, "finish_reason": null}]})
             );
             response.line(line.as_bytes(), &mut sink).unwrap();
         }
@@ -1150,7 +1156,11 @@ mod tests {
 
     #[test]
     fn omits_chat_template_kwargs_for_openai_and_mistral() {
-        for url in ["https://api.openai.com/v1/", "https://api.mistral.ai/v1"] {
+        for url in [
+            "https://api.openai.com/v1/",
+            "https://api.mistral.ai/v1",
+            "https://codestral.mistral.ai/v1",
+        ] {
             let mut builder = ConversationBuilder::new();
             builder.base_url(url).api_key("test").effort("none");
             let conversation = builder.build(reqwest::Client::new()).unwrap();
@@ -1243,7 +1253,7 @@ mod tests {
 
         // Mistral's: a full context, and a failure
         let (reply, _) = send_streaming(&mut conversation, "Pit?").await.unwrap();
-        assert_eq!(reply.stop, StopReason::MaxTokens);
+        assert_eq!(reply.stop, StopReason::ContextWindowExceeded);
         assert_eq!(conversation.body.messages.len(), 5);
 
         let error = send_streaming(&mut conversation, "Pit?").await.unwrap_err();
