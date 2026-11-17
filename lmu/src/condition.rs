@@ -5,6 +5,7 @@
 use bono_sim::sys::bono_telemetry;
 use serde_json::Value;
 use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -53,20 +54,8 @@ pub struct VehicleCondition {
 impl VehicleCondition {
     /// Starts asking the web API. If its thread can't start, the damage stays unknown.
     pub fn start() -> Self {
-        // It's on this PC, and asked every second: anything slow means it isn't answering. Each step
-        // has its own timeout, about 1.5 s in all, and finding localhost none: ureq may look a host up
-        // on a thread of its own when that has a timeout, and such a thread could outlive the DLL.
-        // Windows answers for localhost itself. No proxy from the environment and no redirects, so
-        // nothing else is looked up or asked
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .proxy(None)
-            .max_redirects(0)
-            .timeout_connect(Some(Duration::from_millis(300)))
-            .timeout_send_request(Some(Duration::from_millis(200)))
-            .timeout_recv_response(Some(Duration::from_millis(500)))
-            .timeout_recv_body(Some(Duration::from_millis(500)))
-            .build()
-            .into();
+        // Asked every second: anything slow means it isn't answering. About 1.5 s in all
+        let agent = crate::local_agent(Duration::from_millis(400));
         Self::with(POLL, move || fetch(&agent))
     }
 
@@ -148,7 +137,8 @@ impl Drop for VehicleCondition {
     fn drop(&mut self) {
         self.stop();
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            // Caught, as in `Recorder`'s drop: joining a thread the system already ended can panic
+            let _ = catch_unwind(AssertUnwindSafe(|| thread.join()));
         }
     }
 }

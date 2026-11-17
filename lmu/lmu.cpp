@@ -17,6 +17,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -517,6 +518,7 @@ namespace {
             }
             // A database left from an earlier run (the game crashed) would look like a session to the app
             // until the next one starts.
+            std::shared_lock lock(_recorder_mutex);
             if (!_recorder) {
                 try {
                     const std::wstring dir = database_dir().native();
@@ -540,7 +542,10 @@ namespace {
         // A track loading is a new weekend (its sessions come and go without loading it again): the last
         // weekend's data goes, while the practice, qualifying and race of this one stay together.
         void Load() override {
-            if (_recorder) bono_lmu_clear(_recorder);
+            {
+                std::shared_lock lock(_recorder_mutex);
+                if (_recorder) bono_lmu_clear(_recorder);
+            }
             std::lock_guard lock(_contexts_mutex);
             _contexts.clear();
         }
@@ -557,6 +562,7 @@ namespace {
         // Called on the game's simulation thread for every car, so only the updates the recorder keeps are
         // converted.
         void UpdateTelemetry(const TelemInfoV01& info) override {
+            std::shared_lock lock(_recorder_mutex);
             if (!_recorder) return;
             const double speed = std::hypot(info.mLocalVel.x, info.mLocalVel.y, info.mLocalVel.z);
             if (!bono_lmu_wants_telemetry(_recorder, info.mID, info.mElapsedTime, speed)) return;
@@ -574,6 +580,7 @@ namespace {
 
         // About five times a second.
         void UpdateScoring(const ScoringInfoV01& info) override {
+            std::shared_lock lock(_recorder_mutex);
             if (!_recorder || !info.mVehicle) return;
             bono_session_info_s session = convert(info);
             {
@@ -609,8 +616,9 @@ namespace {
         }
 
         // A recorder that stopped on an error is replaced, so a failure costs a session rather than the rest of
-        // the run.
+        // the run. Updates wait meanwhile, which is at most a few file operations and starting the writer.
         void start_recording() {
+            std::unique_lock lock(_recorder_mutex);
             if (_recorder && bono_lmu_failed(_recorder)) bono_lmu_restart(_recorder);
             if (_recorder) return;
             try {
@@ -624,11 +632,21 @@ namespace {
         // Stops recording and deletes the database. A reader that still has it open (the app only lets go once
         // Steam reports the game closed, which is after this) keeps it from being deleted: the app deletes it
         // once it has let go, and failing that the next run empties it.
+        // Takes the recorder once running updates are done with it, and closes it outside the lock: closing waits
+        // for its threads, which updates shouldn't.
         void close() {
-            if (_recorder) bono_lmu_close(std::exchange(_recorder, nullptr));
+            bono_lmu_recorder* recorder;
+            {
+                std::unique_lock lock(_recorder_mutex);
+                recorder = std::exchange(_recorder, nullptr);
+            }
+            if (recorder) bono_lmu_close(recorder);
         }
 
         std::filesystem::path _user_data;
+        // The game may call the updates on other threads than the rest: they use the recorder under a shared
+        // lock, and it's only opened, restarted or closed under an exclusive one.
+        std::shared_mutex _recorder_mutex;
         bono_lmu_recorder* _recorder = nullptr;
         std::mutex _weather_mutex;
         std::optional<Weather> _weather;

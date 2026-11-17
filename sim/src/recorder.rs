@@ -294,7 +294,10 @@ impl Drop for Recorder {
         lock(&self.shared.queue).stop = true;
         self.shared.wake.notify_one();
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            // Joining a thread the system already ended (a game closing its plugins as it exits,
+            // after every other thread is gone) can panic. It's caught here: a panic leaving this
+            // drop could meet another one while unwinding, which aborts the game
+            let _ = catch_unwind(AssertUnwindSafe(|| thread.join()));
         }
     }
 }
