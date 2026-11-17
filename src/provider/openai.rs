@@ -369,9 +369,26 @@ impl Response {
         #[derive(Deserialize)]
         struct Delta {
             #[serde(default)]
-            content: Option<String>,
+            content: Option<Content>,
             #[serde(default)]
             tool_calls: Vec<DeltaCall>,
+        }
+
+        /// Text, or (Mistral's, from its reasoning models) a list of typed chunks
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Content {
+            Text(String),
+            Chunks(Vec<ContentChunk>),
+        }
+
+        /// Only `text` chunks are the answer: the others (`thinking`...) aren't said
+        #[derive(Deserialize)]
+        struct ContentChunk {
+            #[serde(rename = "type")]
+            kind: String,
+            #[serde(default)]
+            text: Option<String>,
         }
 
         #[derive(Deserialize)]
@@ -436,9 +453,18 @@ impl Response {
 
         for choice in chunk.choices {
             if let Some(delta) = choice.delta {
-                if let Some(content) = delta.content {
-                    sink.push(&content);
-                    self.content.push_str(&content);
+                let texts = match delta.content {
+                    None => Vec::new(),
+                    Some(Content::Text(text)) => vec![text],
+                    Some(Content::Chunks(chunks)) => chunks
+                        .into_iter()
+                        .filter(|chunk| chunk.kind == "text")
+                        .filter_map(|chunk| chunk.text)
+                        .collect(),
+                };
+                for text in texts {
+                    sink.push(&text);
+                    self.content.push_str(&text);
                 }
                 for piece in delta.tool_calls {
                     let index = piece.index.unwrap_or_else(|| {
@@ -980,6 +1006,30 @@ mod tests {
             );
             assert_eq!(response.tool_calls[1].arguments, "{\"b\":2}");
         }
+    }
+
+    #[test]
+    fn reads_content_sent_as_chunks_and_skips_thinking() {
+        let mut response = Response::default();
+        let mut pieces = Vec::new();
+        let mut on_text = |piece: &str| pieces.push(piece.to_owned());
+        let mut sink = TextSink::new(&mut on_text);
+        let thinking =
+            |text: &str| json!({"type": "thinking", "thinking": [{"type": "text", "text": text}]});
+        for content in [
+            json!([thinking("The gap is ")]),
+            json!([thinking("1.2s."), {"type": "text", "text": "Gap's "}]),
+            json!("1.2 seconds."),
+        ] {
+            let line = format!(
+                "data: {}",
+                json!({"model": "magistral-medium-latest", "choices": [{"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": null}]})
+            );
+            response.line(line.as_bytes(), &mut sink).unwrap();
+        }
+        drop(sink);
+        assert_eq!(response.content, "Gap's 1.2 seconds.");
+        assert_eq!(pieces.concat(), "Gap's 1.2 seconds.");
     }
 
     #[tokio::test]
