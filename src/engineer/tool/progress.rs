@@ -44,6 +44,12 @@ pub struct Progress {
     pub conditions: BTreeMap<ConditionId, ConditionState>,
 }
 
+/// The furthest the session clock can step back without the recorder starting a new epoch (see
+/// `went_back` in `bono_sim::recorder`), in seconds
+// Used by the data thread through `Counters`, which a later task adds.
+#[allow(dead_code)]
+const SMALL_REWIND_S: f64 = 1.0;
+
 /// The game clock and the laps the pilot completes, added up across sessions. Each observation
 /// adds how far the session clock and the lap count moved forward since the last one, only within
 /// one epoch: a new epoch, or a missing value, starts a new baseline instead of a jump, and a
@@ -68,11 +74,16 @@ impl Counters {
         session_time_s: Option<f64>,
         laps_completed: Option<i64>,
     ) {
+        let mut session_time_s = session_time_s;
         if epoch == self.epoch {
-            if let (Some(last), Some(now)) = (self.session_time_s, session_time_s)
-                && now > last
-            {
-                self.clock_s += now - last;
+            if let (Some(last), Some(now)) = (self.session_time_s, session_time_s) {
+                if now > last {
+                    self.clock_s += now - last;
+                } else if last - now <= SMALL_REWIND_S {
+                    // The recorder keeps a step back this small in the same epoch: counting on
+                    // from it would count the same stretch of clock twice
+                    session_time_s = Some(last);
+                }
             }
             if let (Some(last), Some(now)) = (self.laps_completed, laps_completed)
                 && now > last
@@ -125,6 +136,39 @@ mod tests {
         counters.observe(Some(2), Some(0.0), None);
         counters.observe(Some(2), Some(5.0), None);
         assert_eq!(counters.clock_s(), 15.0);
+    }
+
+    #[test]
+    fn new_epoch_starting_higher_adds_nothing() {
+        // The writer resuming: a new epoch that carries on from further along
+        let mut counters = Counters::default();
+        counters.observe(Some(1), Some(100.0), Some(3));
+        counters.observe(Some(2), Some(400.0), Some(5));
+        assert_eq!((counters.clock_s(), counters.laps()), (0.0, 0));
+        counters.observe(Some(2), Some(401.0), Some(6));
+        assert_eq!((counters.clock_s(), counters.laps()), (1.0, 1));
+    }
+
+    #[test]
+    fn epochless_recordings_keep_counting() {
+        let mut counters = Counters::default();
+        counters.observe(None, Some(10.0), Some(1));
+        counters.observe(None, Some(12.0), Some(2));
+        assert_eq!((counters.clock_s(), counters.laps()), (2.0, 1));
+    }
+
+    #[test]
+    fn small_rewind_is_not_counted_twice() {
+        let mut counters = Counters::default();
+        counters.observe(Some(1), Some(100.0), None);
+        counters.observe(Some(1), Some(99.2), None);
+        counters.observe(Some(1), Some(100.5), None);
+        assert!((counters.clock_s() - 0.5).abs() < 1e-9);
+
+        // Further back is a new baseline, as the recorder would start a new epoch there
+        counters.observe(Some(1), Some(50.0), None);
+        counters.observe(Some(1), Some(51.0), None);
+        assert!((counters.clock_s() - 1.5).abs() < 1e-9);
     }
 
     #[test]
