@@ -9,6 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod tool;
+
 /// How long a scheduled turn waits after the first request falls due, to take in requests that
 /// fire together but are noticed a few checks apart
 // Used by the engineer's scheduled turns, which a later task adds.
