@@ -48,8 +48,10 @@ block ending in a newline before the first tool call, followed by the answer aft
 the results. An acknowledgement prepended to the final answer fails even if its words
 are correct. Check that the acknowledgement reaches speech before tool work finishes.
 For a standalone radio check or facts present in the attached snapshot, expect a direct
-answer with zero tool calls and no acknowledgement preamble. Compare time to first text
-and first audible speech separately from total completion time, using the same model,
+answer with zero tool calls and no acknowledgement preamble. Scheduled turns never
+acknowledge, even before tool calls, and neither does a turn whose only call is `schedule`
+(`scheduled.md`). Compare time to first text and first audible speech separately from total
+completion time, using the same model,
 effort and fixture for baseline and candidate. Record measured times; a transcript alone
 cannot establish improved latency.
 
@@ -60,4 +62,5 @@ and `EVAL_RUN` values. The current model comparison uses Haiku 5.5 high and Sonn
 `scripts/generate_mock_telemetry.py` at the repository root creates controlled race and
 practice fixtures for these cases. They are synthetic and cannot establish real-recording
 parity. The fixtures provide the named T2/T3 losses, a hot/worn front left, slower Ruiz,
-an energy deficit, and separate practice/race weather outlooks used by the assertions.
+an energy deficit, the current standings gap to Ruiz behind (without gap history), and
+separate practice/race weather outlooks used by the assertions.

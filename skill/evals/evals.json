@@ -356,7 +356,7 @@
       "files": [],
       "session": "race",
       "assertions": [
-        "Calls `schedule` with action add: a `time` trigger of 600 seconds, repeat once",
+        "Calls `schedule` with action add: a `time` trigger of 600 seconds, with `repeat` once or left out (the default)",
         "Doesn't work out a target clock time or lap itself",
         "The instruction is self-contained: who asked, when, and that it's a reminder to check the brake bias",
         "The reply is one short confirmation sentence that says what and when; no separate \"checking\" acknowledgement before the call"
@@ -381,11 +381,11 @@
       "files": [],
       "session": "race",
       "assertions": [
-        "Calls `schedule` with action add and a `condition` trigger whose query returns a row only while the gap to the car behind is under a second",
+        "Calls `schedule` with action add and a `condition` trigger whose query returns a row only while the gap to the car one place behind in the standings (`gap_place_behind_s`, or the car `place_behind_vehicle_id` names) is under a second, not the nearest car on track (`gap_car_behind_s`)",
         "The query finds the player with `is_player = 1` or `race_state.player_vehicle_id`, never a literal `vehicle_id` number",
         "The instruction is self-contained: who asked, when, and what to tell them",
         "The reply is one short confirmation sentence that says what and when; no separate \"checking\" acknowledgement before the call",
-        "If the tool reports the condition already true, the confirmation says so and that it'll call when the car drops back and closes again"
+        "The tool reports the condition already true (the fixture's gap behind is about six tenths): the confirmation says so and that it'll call when the car drops back and closes again"
       ]
     },
     {
@@ -439,10 +439,10 @@
         },
         {
           "id": "#2",
-          "instruction": "The pilot asked during the race to be told if the car behind gets within a second of them.",
+          "instruction": "The pilot asked during the race to be told if the car one place behind them in the standings gets within a second of them.",
           "trigger": {
             "kind": "condition",
-            "query": "SELECT 1 FROM cars_now WHERE is_player = 1 AND gap_car_behind_s < 1"
+            "query": "SELECT 1 FROM cars_now WHERE is_player = 1 AND gap_place_behind_s < 1"
           },
           "repeat": "once"
         },
@@ -458,6 +458,7 @@
       ],
       "assertions": [
         "Answers from the pending list with no tool call",
+        "No acknowledgement such as \"Copy, checking.\" before the answer",
         "Mentions all three: fuel each lap for five laps, a call if the car behind gets within a second, the brake bias reminder",
         "Says what and when for each, not their ids, and no symbols such as \"#\"",
         "At most 65 words; no fuel, gap or other figures nobody asked for"
@@ -489,10 +490,10 @@
         },
         {
           "id": "#2",
-          "instruction": "The pilot asked during the race to be told if the car behind gets within a second of them.",
+          "instruction": "The pilot asked during the race to be told if the car one place behind them in the standings gets within a second of them.",
           "trigger": {
             "kind": "condition",
-            "query": "SELECT 1 FROM cars_now WHERE is_player = 1 AND gap_car_behind_s < 1"
+            "query": "SELECT 1 FROM cars_now WHERE is_player = 1 AND gap_place_behind_s < 1"
           },
           "repeat": "once"
         },
@@ -537,10 +538,10 @@
         },
         {
           "id": "#2",
-          "instruction": "The pilot asked during the race to be told if the car behind gets within a second of them.",
+          "instruction": "The pilot asked during the race to be told if the car one place behind them in the standings gets within a second of them.",
           "trigger": {
             "kind": "condition",
-            "query": "SELECT 1 FROM cars_now WHERE is_player = 1 AND gap_car_behind_s < 1"
+            "query": "SELECT 1 FROM cars_now WHERE is_player = 1 AND gap_place_behind_s < 1"
           },
           "repeat": "once"
         },
@@ -556,7 +557,8 @@
       ],
       "assertions": [
         "Calls `schedule` with action replace and id `#1`, not a cancel and an add",
-        "The replacement has a `laps` trigger of 2, repeat `every`, keeps `until` 5 laps, and an instruction that says every two laps",
+        "The replacement has a `laps` trigger of 2 and repeat `every`, with an instruction that says every two laps",
+        "The replacement restates what still applies from `#1`: `until` 5 laps and `stale_after` 1 lap (or a longer one suited to two laps), not left out to fall back on the defaults",
         "Confirms the change in one short sentence that says what and when"
       ]
     },
@@ -586,10 +588,10 @@
         },
         {
           "id": "#2",
-          "instruction": "The pilot asked during the race to be told if the car behind gets within a second of them.",
+          "instruction": "The pilot asked during the race to be told if the car one place behind them in the standings gets within a second of them.",
           "trigger": {
             "kind": "condition",
-            "query": "SELECT 1 FROM cars_now WHERE is_player = 1 AND gap_car_behind_s < 1"
+            "query": "SELECT 1 FROM cars_now WHERE is_player = 1 AND gap_place_behind_s < 1"
           },
           "repeat": "once"
         },
@@ -617,7 +619,9 @@
       "session": "race",
       "scheduled": [
         {
+          "id": "#1",
           "instruction": "The pilot asked during the race to be told at the end of each lap if any of the top three cars has made a pit stop; nothing otherwise.",
+          "made": "3 laps and 3:27 of game clock before it fired, during race",
           "why": "1 lap completed; it repeats"
         }
       ],
@@ -635,7 +639,9 @@
       "session": "race",
       "scheduled": [
         {
+          "id": "#1",
           "instruction": "The pilot asked during the race to be told at the end of each lap if it has started raining or the track is getting wet.",
+          "made": "3 laps and 3:27 of game clock before it fired, during race",
           "why": "1 lap completed; it repeats"
         }
       ],
@@ -652,11 +658,15 @@
       "session": "race",
       "scheduled": [
         {
+          "id": "#1",
           "instruction": "The pilot asked during the race to be told at the end of each lap if any of the top three cars has made a pit stop; nothing otherwise.",
+          "made": "3 laps and 3:27 of game clock before it fired, during race",
           "why": "1 lap completed; it repeats"
         },
         {
+          "id": "#2",
           "instruction": "The pilot asked during the race to be told at the end of each lap if it has started raining or the track is getting wet.",
+          "made": "3 laps and 3:27 of game clock before it fired, during race",
           "why": "1 lap completed; it repeats"
         }
       ],
@@ -673,7 +683,9 @@
       "session": "race",
       "scheduled": [
         {
+          "id": "#1",
           "instruction": "The pilot asked during the race for an energy check at the end of the lap: can they make the finish without another stop?",
+          "made": "1 lap and 1:09 of game clock before it fired, during race",
           "why": "1 lap completed"
         }
       ],
@@ -693,11 +705,15 @@
       "session": "race",
       "scheduled": [
         {
+          "id": "#1",
           "instruction": "The pilot asked during the race for an energy check at the end of the lap: can they make the finish without another stop?",
+          "made": "1 lap and 1:09 of game clock before it fired, during race",
           "why": "1 lap completed"
         },
         {
+          "id": "#2",
           "instruction": "The pilot asked during the race to be told at the end of each lap if any of the top three cars has made a pit stop; nothing otherwise.",
+          "made": "3 laps and 3:27 of game clock before it fired, during race",
           "why": "1 lap completed; it repeats"
         }
       ],
@@ -716,16 +732,40 @@
       "session": "race",
       "scheduled": [
         {
-          "instruction": "The pilot asked during the race for the gap to the car behind at the end of each lap, for five laps.",
+          "id": "#1",
+          "instruction": "The pilot asked during the race for the gap to the car one place behind them at the end of each lap, for five laps.",
+          "made": "3 laps and 3:27 of game clock before it fired, during race",
           "why": "1 lap completed; it repeats"
         }
       ],
       "assertions": [
-        "Opens with the subject, such as \"Gap behind:\", then the gap rounded to tenths",
-        "Names the car behind by surname (Ruiz)",
+        "Opens with the subject, such as \"Gap behind:\", then the gap to the car one place behind, about six tenths, rounded to tenths",
+        "Names that car by surname (Ruiz), not the lapped car nearest on track",
         "No acknowledgement such as \"Copy\" or \"Checking\"",
         "One sentence; no advice, pace comparison or other topics",
         "Makes no `schedule` call"
+      ]
+    },
+    {
+      "id": 46,
+      "prompt": "",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "session": "race",
+      "scheduled": [
+        {
+          "id": "#1",
+          "instruction": "The pilot asked during the race for a tyre check at the end of each lap: whether any tyre is running hot or wearing fast.",
+          "made": "3 laps and 3:27 of game clock before it fired, during race",
+          "why": "1 lap completed; it repeats"
+        }
+      ],
+      "assertions": [
+        "Opens with the subject, such as \"Tyres:\" or \"Tyre check:\", before the finding",
+        "Identifies the front left as hot and wearing fast, and the other three as fine",
+        "No acknowledgement such as \"Copy\" or \"Checking\", even before tool calls",
+        "At most 20 words; interprets rather than reading out temperatures, pressures or wear percentages",
+        "Isn't `[SILENCE]` and contains no `[SILENCE]`"
       ]
     }
   ]
