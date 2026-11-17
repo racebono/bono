@@ -124,10 +124,14 @@ const RECENT_LAPS: usize = 4;
 const COUNT_LAG: f64 = 1.0;
 /// How long (s) after a car is over the line the game's places may take to catch up with it.
 const PLACES_LAG: f64 = 3.0;
+/// How far (s) after the update that counted a lap the game's lap time may put its crossing: the
+/// game's timing and the updates' are a frame or so apart.
+const LAP_TIME_JITTER: f64 = 0.05;
 /// Under this (s), a car's time behind the leader on its first lap may be the game's placeholder.
 const PLACEHOLDER_MAX: f64 = 0.1;
-/// How long (s) before the first update with the flag the winner's lap count may have gone up
-/// for that to be its finish: the count and the session's state can land a moment apart. Only a
+/// How long (s) before the last update without the flag the winner's lap count may have gone up
+/// for that to be its finish, in a timed race: the count and the session's state can land a
+/// moment apart. Only a
 /// moment: iRacing has been seen to show the flag seconds before the leader is over the line, and
 /// a longer window would take a count a lap before (a timed race's flag just after the leader
 /// started its last lap) for the finish.
@@ -166,14 +170,15 @@ pub struct Converter {
     raced: bool,
 }
 
-/// A race's flag, for who has finished. The winner is the first car over the line with more laps
-/// than any car had when the flag came (iRacing shows it a few seconds before the leader is over;
+/// A race's flag, for who has finished. The winner is the first car over the line with all the
+/// race's laps done, in a race of so many laps; in a timed one, the first over with more laps than
+/// any car had when the flag came (iRacing shows it a few seconds before the leader is over;
 /// whoever is over first then, if the lead changes hands on the way). A car, the winner too, has
 /// finished once its count has gone up since the winner's did: over the line after it (a car a lap
 /// down too, its race done at the flag).
 struct Flag {
-    /// The first update with the flag, the most laps any car had then, and the cars furthest on
-    /// (see `ALONGSIDE`)
+    /// The last update before the flag (it came since), the most laps any car had at the first
+    /// with it, and the cars furthest on then (see `ALONGSIDE`)
     since: f64,
     most: Option<i64>,
     leading: Vec<i64>,
@@ -319,6 +324,9 @@ impl Converter {
                 let official_best = car
                     .f64("CarIdxBestLapTime", "LapBestLapTime")
                     .filter(|t| *t > 0.0);
+                let last_lap_time = car
+                    .f64("CarIdxLastLapTime", "LapLastLapTime")
+                    .filter(|t| *t > 0.0);
                 // The laps the recording counts by, which its lap starts go with too
                 let completed = car
                     .i32("CarIdxLapCompleted", "LapCompleted")
@@ -331,6 +339,7 @@ impl Converter {
                     on_pit_road,
                     surface,
                     official_best,
+                    last_lap_time,
                     length,
                     &info.sectors,
                 );
@@ -417,7 +426,7 @@ impl Converter {
                 .map(|c| c.idx)
                 .collect();
             self.flag = Some(Some(Flag {
-                since: time,
+                since: time - dt.unwrap_or(0.0),
                 most: cars.iter().filter_map(|c| c.laps_completed).max(),
                 leading,
                 finish: None,
@@ -425,13 +434,20 @@ impl Converter {
                 winner: None,
             }));
         }
+        let total = race_laps(frame);
         if let Some(Some(flag)) = &mut self.flag
             && flag.finish.is_none_or(|at| time - at <= COUNT_LAG)
         {
-            // The first car over the line since with more laps than anyone had at the flag. Until
-            // a moment after: a car over the line just before can have its count go up an update
-            // after the one that came first, and a count timed ahead of the line is timed at it
-            // once the car is over (see `CarTrack::update`)
+            // A race of so many laps: the first car over the line with them all done, whenever the
+            // flag came (a moment before or after). Until a moment after, as below
+            let done = cars
+                .iter()
+                .filter(|c| total.is_some() && c.laps_completed == total)
+                .filter_map(|c| Some((counted(c.idx)?, c.laps_completed, c.idx)));
+            // Else, the first car over the line since with more laps than anyone had at the flag.
+            // Until a moment after: a car over the line just before can have its count go up an
+            // update after the one that came first, and a count timed ahead of the line is timed
+            // at it once the car is over (see `CarTrack::update`)
             let first = cars
                 .iter()
                 .filter(|c| c.laps_completed > flag.most)
@@ -450,8 +466,9 @@ impl Converter {
             let taken = flag
                 .winner
                 .and_then(|idx| Some((counted(idx)?, flag.laps, idx)));
-            if let Some((at, laps, idx)) = first
-                .chain(leading)
+            let window = first.chain(leading).filter(|_| total.is_none());
+            if let Some((at, laps, idx)) = done
+                .chain(window)
                 .chain(taken)
                 .min_by(|a, b| a.0.total_cmp(&b.0))
             {
@@ -745,11 +762,7 @@ impl Converter {
             .map(full_course_yellow(frame))
             .map(str::to_owned)
             .into();
-        s.max_laps = frame
-            .i32("SessionLapsTotal")
-            .filter(|laps| *laps > 0 && *laps < UNLIMITED_LAPS)
-            .map(i64::from)
-            .into();
+        s.max_laps = race_laps(frame).into();
         s.event_start_time_of_day = info.start_time_of_day.into();
         s.vehicle_count = Some(cars.len() as i64).into();
         s.max_vehicles = info.starters.into();
@@ -1343,6 +1356,14 @@ fn car_flag(bits: u32) -> Option<&'static str> {
     })
 }
 
+/// How many laps the session is, when it's a number of laps.
+fn race_laps(frame: &Frame<'_>) -> Option<i64> {
+    frame
+        .i32("SessionLapsTotal")
+        .filter(|laps| *laps > 0 && *laps < UNLIMITED_LAPS)
+        .map(i64::from)
+}
+
 /// `irsdk_TrackWetness` (1 dry to 7 extremely wet) as the recording's 0-1.
 fn wetness(level: i32) -> Option<f64> {
     (1..=7).contains(&level).then(|| f64::from(level - 1) / 6.0)
@@ -1613,6 +1634,8 @@ struct CarTrack {
     f2_timed: bool,
     /// When its lap count last went up, driven (see `update`)
     counted_at: Option<f64>,
+    /// The game's last lap time at the update before
+    official_last: Option<f64>,
     /// In races after the flag, how far it had gone when it finished, and whether its laps down
     /// have been worked out since (see `laps_behind`)
     finish_progress: Option<f64>,
@@ -1669,9 +1692,13 @@ impl CarTrack {
         on_pit_road: Option<bool>,
         surface: Option<i32>,
         official_best: Option<f64>,
+        last_lap_time: Option<f64>,
         length: f64,
         sectors: &[f64],
     ) {
+        // The game's last lap time, when it's changed since the update before
+        let new_lap_time = last_lap_time.filter(|t| Some(*t) != self.official_last);
+        self.official_last = last_lap_time;
         let n = sectors.len();
         if self.current.len() != n {
             self.current = vec![None; n];
@@ -1796,6 +1823,28 @@ impl CarTrack {
         // Counted an update or so before the car got to the line: when it gets there, at the speed
         // it's going (cars over together go in their order)
         let mut due = None;
+        // Counted after a gap too long to tell driving from moving (the recording held up): the
+        // crossing, from the game's time for the lap it finished, new since before the gap.
+        // Only from a lap start at a crossing seen (as the game's are, but for its first lap,
+        // timed from the start), and only a crossing in the gap the car could have driven to and
+        // on from
+        let recovered = match (step, self.lap_start, new_lap_time) {
+            (Some((t0, p0, dt, _)), Some(start), Some(lap_time))
+                if rose && !skipped && dt > MAX_GAP && lap.is_some_and(|lap| lap >= 2) =>
+            {
+                let at = start + lap_time;
+                let reach = |from: f64, to: f64, laps: f64| {
+                    laps * length <= MAX_SPEED * (to - from).max(0.0) + MAX_JUMP
+                };
+                let at = at.min(time);
+                (at > t0
+                    && start + lap_time <= time + LAP_TIME_JITTER
+                    && reach(t0, at, 1.0 - p0)
+                    && reach(at, time, pct))
+                .then_some(at)
+            }
+            _ => None,
+        };
         if counted_back {
             // Another session
             self.lap_start = None;
@@ -1808,7 +1857,7 @@ impl CarTrack {
             self.line = None;
             self.counted = None;
             if rose {
-                self.lap_start = None;
+                self.lap_start = recovered;
             }
         } else if rose {
             let crossed = line.or(self.line.filter(near)).map(|(at, _)| at);
@@ -1843,14 +1892,19 @@ impl CarTrack {
             }
         }
         // When the count went up, driven: the crossing it's for, worked out between updates (so
-        // cars over the line together go in their order), when that was a moment before or is a
-        // moment after (`due`); or else now (the count can go up at a finish line elsewhere than the start). A count that came
-        // with a move (a reset, a reconnect) isn't a crossing
+        // cars over the line together go in their order), when that was since the update before
+        // (however long ago: the recording can hold up), a moment before or is a moment after
+        // (`due`); or else now (the count can go up at a finish line elsewhere than the start). A
+        // count that came with a move (a reset, a reconnect) isn't a crossing, but for one timed
+        // by the game's lap time after a long gap: none, not the lap before's
         if rose && continuous {
             self.counted_at = Some(
-                due.or(self.lap_start.filter(|at| time - at <= COUNT_LAG))
+                due.or(line.map(|(at, _)| at))
+                    .or(self.lap_start.filter(|at| time - at <= COUNT_LAG))
                     .unwrap_or(time),
             );
+        } else if rose {
+            self.counted_at = recovered;
         }
         if lap.is_some() {
             self.lap = lap;
@@ -2015,6 +2069,7 @@ mod tests {
                 Some(false),
                 Some(3),
                 None,
+                None,
                 LENGTH,
                 &SECTORS,
             );
@@ -2063,6 +2118,7 @@ mod tests {
             Some(false),
             Some(3),
             None,
+            None,
             LENGTH,
             &SECTORS,
         );
@@ -2082,6 +2138,7 @@ mod tests {
             Some(lap),
             Some(false),
             Some(3),
+            None,
             None,
             LENGTH,
             sectors,
@@ -2441,6 +2498,57 @@ mod tests {
         close(gaps(&cool, 1).0, (6.0 + 0.05 / 0.07) - (5.0 + 0.05 / 0.06));
     }
 
+    /// A count after a gap too long to tell driving from moving is timed at its crossing from the
+    /// game's lap time, when that's new, fits the gap and the car could have driven it, and the
+    /// lap it times isn't the first; otherwise it isn't a crossing (nor the one before).
+    #[test]
+    fn a_count_after_a_long_gap_is_timed_by_the_games_lap() {
+        // Driven at 50 m/s (a lap in 20 s), over the line at 10.4 s, then nothing from 28 s (at
+        // 0.88) to 36 s (at 0.28, its count up), over the line at 30.4 s by its speed
+        let run = |first: i32, before: f64, after: f64| {
+            let mut track = CarTrack::default();
+            let mut step = |time: f64, pct: f64, lap: i32, lap_time: f64| {
+                track.update(
+                    time,
+                    Some(pct),
+                    Some(lap),
+                    Some(false),
+                    Some(3),
+                    None,
+                    Some(lap_time),
+                    LENGTH,
+                    &SECTORS,
+                );
+            };
+            step(10.0, 0.98, first, before);
+            let mut t = 10.5;
+            while t <= 28.0 {
+                step(t, 0.005 + 0.05 * (t - 10.5), first + 1, before);
+                t += 0.5;
+            }
+            step(36.0, 0.28, first + 2, after);
+            track
+        };
+        let close = |got: Option<f64>, want: f64| {
+            assert!(got.is_some_and(|got| (got - want).abs() < 1e-6), "{got:?}");
+        };
+        let track = run(1, 21.0, 20.0);
+        close(track.counted_at, 30.4);
+        close(track.lap_start, 30.4);
+        // The game's time not new yet, its first lap (timed from the start), a crossing before
+        // the gap, and one too soon for the car to have got to the line
+        for (first, before, after) in [
+            (1, 20.0, 20.0),
+            (-1, 21.0, 20.0),
+            (1, 21.0, 12.0),
+            (1, 21.0, 17.7),
+        ] {
+            let track = run(first, before, after);
+            assert_eq!(track.counted_at, None);
+            assert_eq!(track.lap_start, None);
+        }
+    }
+
     /// Two cars over the line in one update are counted in the order they crossed: a car a lap
     /// down just ahead of the leader isn't over it after the leader's finish.
     #[test]
@@ -2453,6 +2561,7 @@ mod tests {
                 Some(pct),
                 Some(lap),
                 Some(false),
+                None,
                 None,
                 None,
                 1000.0,
@@ -2802,6 +2911,15 @@ mod tests {
     /// Updates of three cars in a race: time, session state, lap distance and laps completed each,
     /// with places 1 to 3 and the game's times behind the leader. The last update's.
     fn race_end(updates: &[(f64, i32, [f64; 3], [i32; 3])], f2: [f64; 3]) -> Update {
+        race_of(updates, f2, None)
+    }
+
+    /// As `race_end`, in a race of `laps` laps when there are so many.
+    fn race_of(
+        updates: &[(f64, i32, [f64; 3], [i32; 3])],
+        f2: [f64; 3],
+        laps: Option<i32>,
+    ) -> Update {
         use super::super::sdk::{Value, Vars};
         use super::super::session::{Driver, Session};
         let driver = Driver {
@@ -2824,8 +2942,9 @@ mod tests {
         let start = Instant::now();
         let mut converter = Converter::default();
         let mut last = None;
+        let total = laps;
         for (t, state, pct, laps) in updates {
-            let (vars, data) = Vars::of(&[
+            let mut values = vec![
                 ("SessionTime", Value::Double(*t)),
                 ("SessionNum", Value::Int(0)),
                 ("SessionState", Value::Int(*state)),
@@ -2847,7 +2966,11 @@ mod tests {
                     Value::Doubles(pct.iter().map(|p| p.max(0.0) * 90.0).collect()),
                 ),
                 ("CarIdxF2Time", Value::Doubles(f2.to_vec())),
-            ]);
+            ];
+            if let Some(total) = total {
+                values.push(("SessionLapsTotal", Value::Int(total)));
+            }
+            let (vars, data) = Vars::of(&values);
             last = converter.convert(
                 &Frame::new(&vars, &data),
                 &info,
@@ -3080,6 +3203,49 @@ mod tests {
             behind.is_some_and(|got| (got - want).abs() < 1e-6),
             "{behind:?}"
         );
+    }
+
+    /// In a race of so many laps, the winner is the first over the line with them all done
+    /// however long after the flag comes: not missed, nor the car over just behind it.
+    #[test]
+    fn a_lap_races_winner_is_the_first_with_every_lap_done() {
+        // Car 0 over at 4.15 s, car 1 at 4.95 s, the flag at 9 s
+        let updates = steady(0.1, 10.1, [2.585, 2.505, 1.6], 9.0);
+        let end = race_of(&updates, [0.0, 0.3, 50.0], Some(3));
+        let (_, standings) = end.scoring.as_ref().unwrap();
+        let behind = |car: i64| {
+            standings
+                .iter()
+                .find(|s| s.vehicle_id.get() == Some(car))
+                .unwrap()
+                .time_behind_leader
+                .get()
+        };
+        assert_eq!(behind(0), Some(0.0));
+        let got = behind(1);
+        assert!(got.is_some_and(|got| (got - 0.8).abs() < 1e-6), "{got:?}");
+    }
+
+    /// The recording held up across the flag (3 s without an update): each car over the line in
+    /// the gap is timed at its crossing, and the winner found among them. A car a lap down over
+    /// just before the winner is still racing its last lap, not finished.
+    #[test]
+    fn a_hold_up_across_the_flag_times_each_crossing() {
+        // Car 2 over at 3.7 s, car 0 at 4.15 s, car 1 at 4.95 s; no update from 3.6 s to 6.6 s
+        let gone = [2.585, 2.505, 1.63];
+        let mut updates = steady(0.1, 3.61, gone, 99.0);
+        updates.extend(steady(6.6, 8.1, gone, 6.6));
+        let end = race_end(&updates, [0.0, 0.3, 50.0]);
+        let (_, standings) = end.scoring.as_ref().unwrap();
+        let standing = |car: i64| {
+            standings
+                .iter()
+                .find(|s| s.vehicle_id.get() == Some(car))
+                .unwrap()
+        };
+        let got = standing(1).time_behind_leader.get();
+        assert!(got.is_some_and(|got| (got - 0.8).abs() < 1e-6), "{got:?}");
+        assert_eq!(standing(2).laps_behind_leader.get(), Some(0));
     }
 
     /// A car the cool-down finishes, its crossing not seen (the recording stalled over it), has
@@ -3554,6 +3720,7 @@ mod tests {
                 Some(pit),
                 Some(surface),
                 None,
+                None,
                 LENGTH,
                 &SECTORS,
             );
@@ -3593,6 +3760,7 @@ mod tests {
                 Some(1),
                 Some(pit),
                 Some(surface),
+                None,
                 None,
                 LENGTH,
                 &SECTORS,
