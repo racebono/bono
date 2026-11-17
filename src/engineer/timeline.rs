@@ -54,10 +54,13 @@ impl Timeline {
 
     /// All of the speech was played. Without this mark, the answer was cut off or never spoken.
     /// Changing the voice ends the speech early the same way it ends normally, so an answer cut
-    /// off by that still gets this mark.
+    /// off by that still gets this mark. Speech that never reached the speaker's stream (see
+    /// [`Self::first_audio`]) said nothing, and doesn't get it either.
     #[inline]
     pub fn played(&self) {
-        let _ = self.played.set(Instant::now());
+        if self.first_audio.get().is_some() {
+            let _ = self.played.set(Instant::now());
+        }
     }
 }
 

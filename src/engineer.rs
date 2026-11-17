@@ -1265,10 +1265,8 @@ impl Engineer {
         match drained {
             Drained::Playing => {}
             Drained::Done => {
-                // Without a stream, the speech said nothing
-                if playback.stream.is_some()
-                    && let Some(timeline) = &playback.timeline
-                {
+                // Not marked if none of it reached the speaker (see `Timeline::played`)
+                if let Some(timeline) = &playback.timeline {
                     timeline.played();
                 }
                 let tone = playback.tone_after_drain;
@@ -1844,6 +1842,8 @@ mod tests {
         let stream = device.clone().open_device_stream(Some(&spec)).unwrap();
 
         let timeline = Arc::new(Timeline::new(None, Instant::now()));
+        // Its speech already reached the stream
+        timeline.first_audio();
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
         let mut playback = Playback::new(SpeechOutput::ready(Speech::no_beep(1.0)), false);
         playback.stream = Some(stream);
@@ -2058,6 +2058,29 @@ mod tests {
         assert!(!engineer.is_speaking());
         let line = timeline.to_string();
         assert!(line.ends_with("played never"), "{line}");
+    }
+
+    #[test]
+    fn an_answer_that_gave_up_its_stream_is_still_marked_played() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+
+        // It spoke, then closed its stream giving way in a gap, and ended with nothing more
+        let timeline = Arc::new(Timeline::new(None, Instant::now()));
+        timeline.first_audio();
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        let mut playback = Playback::new(SpeechOutput::ready(Speech::no_beep(1.0)), false);
+        playback.done = true;
+        playback.timeline = Some(timeline.clone());
+        engineer.line.push_back(playback);
+        engineer.play(&config, None);
+        assert!(!engineer.is_speaking());
+        let line = timeline.to_string();
+        assert!(!line.ends_with("played never"), "{line}");
     }
 
     /// A piece of speech, standing in for a synthesized sentence.
