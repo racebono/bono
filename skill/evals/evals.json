@@ -334,6 +334,19 @@
         "Answers both action and reason in at most 35 words excluding acknowledgement",
         "No invented marker boards, guaranteed optimum, tyre diagnosis or unrelated corners"
       ]
+    },
+    {
+      "id": 30,
+      "prompt": "What's my best lap so far, and how far off it was the last one?",
+      "expected_output": "Controlled synthetic fixture; lap times spoken in minutes and seconds",
+      "files": [],
+      "session": "race",
+      "assertions": [
+        "Gives the best lap time in minutes and seconds (like \"one minute thirty five point four\"), never as a number of seconds alone",
+        "Gives the last lap's difference to the best in seconds or tenths, not as a second lap time",
+        "Rounds to tenths and uses no colons or other symbols",
+        "Answers both parts in at most 30 words excluding acknowledgement"
+      ]
     }
   ]
 }
