@@ -2,6 +2,7 @@
 //! completes, added up across sessions, and the latest result of every condition.
 
 use super::*;
+use std::collections::BTreeSet;
 
 /// A scheduled request's condition, as the data thread knows it
 pub type ConditionId = u64;
@@ -38,6 +39,9 @@ pub struct Progress {
     pub laps: u64,
     /// The latest check of every condition
     pub conditions: BTreeMap<ConditionId, ConditionState>,
+    /// The conditions checked for this snapshot: the others weren't reached within the tick's
+    /// budget, and their result in `conditions` is an older one
+    pub checked: BTreeSet<ConditionId>,
 }
 
 /// The furthest the session clock can step back without the recorder starting a new epoch (see

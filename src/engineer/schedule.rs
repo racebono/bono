@@ -104,7 +104,8 @@ pub struct NewRequest {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum Change {
-    Add(NewRequest),
+    /// With the id the tool gave it from [`Schedule::next_id`], which the model already confirmed
+    Add(RequestId, NewRequest),
     Cancel(RequestId),
     /// Keeps the old request's `made` and, while it's armed, its armed baseline
     Replace(RequestId, NewRequest),
@@ -221,8 +222,12 @@ impl Slot {
             self.last = None;
         }
         self.rose = false;
+        // Not checked for this snapshot (not yet, or not reached within the tick's budget): no change,
+        // and an older failure isn't counted again
+        if !progress.checked.contains(&self.id) {
+            return;
+        }
         match progress.conditions.get(&self.id) {
-            // Not checked yet: no change
             None => {}
             Some(ConditionState::Failed) => self.failures += 1,
             Some(state) => {
@@ -333,12 +338,13 @@ impl Schedule {
         let mut ids = Vec::new();
         for change in changes {
             match change {
-                Change::Add(new) => {
-                    if new.made.weekend != progress.weekend {
+                Change::Add(id, new) => {
+                    if new.made.weekend != progress.weekend
+                        || self.requests.iter().any(|r| r.id == id)
+                    {
                         continue;
                     }
-                    let id = RequestId(self.next_id);
-                    self.next_id += 1;
+                    self.next_id = self.next_id.max(id.0 + 1);
                     let since = new.made.clone();
                     let request = self.request(id, new, since);
                     self.requests.push(request);
@@ -596,6 +602,14 @@ impl Schedule {
         text
     }
 
+    /// The id the next request added will have. The tool numbers a turn's adds from it, so the ids
+    /// the model confirms are the ones applied: a dropped turn's ids are given out again
+    // Used by the schedule tool, which a later task adds.
+    #[allow(dead_code)]
+    pub fn next_id(&self) -> RequestId {
+        RequestId(self.next_id)
+    }
+
     /// Pending requests, for the cap
     pub fn len(&self) -> usize {
         self.requests.iter().filter(|r| r.pending()).count()
@@ -788,6 +802,7 @@ mod tests {
 
     fn with(mut progress: Progress, id: ConditionId, state: ConditionState) -> Progress {
         progress.conditions.insert(id, state);
+        progress.checked.insert(id);
         progress
     }
 
@@ -837,7 +852,8 @@ mod tests {
 
         fn add(&mut self, request: NewRequest) -> RequestId {
             let made = request.made.clone();
-            let ids = self.schedule.apply(vec![Change::Add(request)], &made);
+            let id = self.schedule.next_id();
+            let ids = self.schedule.apply(vec![Change::Add(id, request)], &made);
             assert_eq!(ids.len(), 1);
             ids[0]
         }
@@ -1109,15 +1125,76 @@ mod tests {
         let mut now = laps(0);
         now.weekend = Some(WEEKEND + 1);
         let ids = schedule.apply(
-            vec![Change::Add(request(
-                Trigger::Laps { count: 1 },
-                Repeat::Once,
-                &made,
-            ))],
+            vec![Change::Add(
+                schedule.next_id(),
+                request(Trigger::Laps { count: 1 }, Repeat::Once, &made),
+            )],
             &now,
         );
         assert!(ids.is_empty());
         assert_eq!(schedule.len(), 0);
+    }
+
+    #[test]
+    fn adds_keep_the_ids_the_tool_gave_them() {
+        let mut schedule = Schedule::new();
+        let made = laps(0);
+        let first = schedule.next_id();
+        // A dropped turn's adds were never applied: the next turn numbers from the same id
+        assert_eq!(schedule.next_id(), first);
+        let second = RequestId(first.0 + 1);
+        let ids = schedule.apply(
+            vec![
+                Change::Add(
+                    first,
+                    request(Trigger::Laps { count: 1 }, Repeat::Once, &made),
+                ),
+                Change::Add(
+                    second,
+                    request(Trigger::Laps { count: 2 }, Repeat::Once, &made),
+                ),
+            ],
+            &made,
+        );
+        assert_eq!(ids, [first, second]);
+        assert_eq!(schedule.next_id(), RequestId(second.0 + 1));
+        // An id already taken isn't added twice
+        let ids = schedule.apply(
+            vec![Change::Add(
+                first,
+                request(Trigger::Laps { count: 3 }, Repeat::Once, &made),
+            )],
+            &made,
+        );
+        assert!(ids.is_empty());
+        assert_eq!(schedule.len(), 2);
+    }
+
+    #[test]
+    fn unchecked_conditions_neither_change_nor_fail() {
+        let mut run = Run::new();
+        let made = laps(0);
+        run.add(request(
+            Trigger::Condition {
+                query: "SELECT 1".into(),
+            },
+            Repeat::Once,
+            &made,
+        ));
+        let cond = run.condition_ids()[0];
+        run.tick(with(laps(0), cond, ConditionState::False));
+        // A True left over from before, not checked for this snapshot: not a rise
+        let mut stale = laps(0);
+        stale.conditions.insert(cond, ConditionState::True);
+        run.tick(stale);
+        assert!(run.due().is_empty());
+        // One failure, carried over unchecked on later snapshots, counts once
+        run.tick(with(laps(0), cond, ConditionState::Failed));
+        for _ in 0..CONDITION_FAILURES {
+            let mut carried = laps(0);
+            carried.conditions.insert(cond, ConditionState::Failed);
+            assert!(run.tick(carried).dropped.is_empty());
+        }
     }
 
     #[test]

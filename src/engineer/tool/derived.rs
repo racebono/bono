@@ -646,6 +646,11 @@ impl Data {
         watch
             .results
             .retain(|id, (query, _)| conditions.get(id) == Some(&query.as_str()));
+        // Another session's results say nothing about this one's: none until checked again
+        if epoch != watch.last_epoch {
+            watch.results.clear();
+        }
+        let mut checked = std::collections::BTreeSet::new();
         guarded(conn, || {
             let started = Instant::now();
             let turn = conditions
@@ -664,6 +669,7 @@ impl Data {
                     }
                 };
                 watch.results.insert(id, (query.to_owned(), state));
+                checked.insert(id);
                 watch.next = id.wrapping_add(1);
             }
             Ok(())
@@ -688,6 +694,7 @@ impl Data {
                 .iter()
                 .map(|(id, (_, state))| (*id, *state))
                 .collect(),
+            checked,
         }))
     }
 }
