@@ -17,6 +17,9 @@ use crate::{
     task::Task,
 };
 use bono_i18n::t;
+use schedule::{
+    Batch, Change, Fired, NO_REQUESTS, RequestId, SILENCE, Schedule, tool::ScheduleTool,
+};
 use sdl3::audio::{AudioDevice, AudioStreamOwner};
 use std::{
     collections::VecDeque,
@@ -28,7 +31,6 @@ use std::{
     task::Poll,
     time::{Duration, Instant},
 };
-use schedule::{Batch, Change, Fired, RequestId, SILENCE, Schedule, tool::ScheduleTool};
 use timeline::Timeline;
 use tokio::{
     runtime::Handle,
@@ -569,9 +571,9 @@ struct SessionState {
     tool: EngineerTool,
     /// Stages the turn's changes to the requests, for the engineer to apply once it finishes
     schedule_tool: ScheduleTool,
-    /// The game session the conversation is about (track, session type and number), for
-    /// `auto_session`
-    game_session: Option<String>,
+    /// The weekend the conversation is about, for `auto_session`: the recording's oldest epoch,
+    /// which only a clear (a new weekend) replaces
+    weekend: Option<i64>,
     /// How many times `auto_session` started the conversation over: what it said before
     /// doesn't count
     starts: Arc<AtomicU32>,
@@ -2083,7 +2085,7 @@ impl Engineer {
                 schedule_tool,
                 pool,
                 sim,
-                game_session: None,
+                weekend: None,
                 starts: starts.clone(),
             })),
             starts,
@@ -2246,41 +2248,47 @@ impl SessionState {
     /// snapshot, then `briefing`'s pending requests, notes and reply-language note. Once per
     /// turn: the `schedule` tool stages its changes from here.
     async fn brief(&mut self, message: String, briefing: Briefing) -> String {
-        self.schedule_tool.begin(briefing.pending, briefing.next_id);
-        if self.follow_game_session(briefing.auto_session).await {
-            // Its notes are about the conversation that's over
-            (briefing.started_over).store(true, atomic::Ordering::Relaxed);
-        }
+        // Started over, it's a new weekend, which clears the requests: the briefing, taken before
+        // the engineer saw it, still has the last weekend's, and its notes are about the
+        // conversation that's over. The next progress clears the requests too.
+        let started_over = self.follow_game_session(briefing.auto_session).await;
+        let pending_text = match started_over {
+            true => {
+                (briefing.started_over).store(true, atomic::Ordering::Relaxed);
+                self.schedule_tool.begin(Vec::new(), briefing.next_id);
+                NO_REQUESTS.to_owned()
+            }
+            false => {
+                self.schedule_tool.begin(briefing.pending, briefing.next_id);
+                briefing.pending_text
+            }
+        };
         // Only those about this conversation as it is now: one that's started over, here or
         // since a note was made, never had what it's about
         let starts = self.starts.load(atomic::Ordering::Relaxed);
         let notes: String = (briefing.notes.iter())
             .filter(|note| {
-                note.conversation.as_ref().is_some_and(|conversation| {
-                    Weak::ptr_eq(&conversation.state, &briefing.state)
-                        && conversation.starts == starts
-                })
+                !started_over
+                    && note.conversation.as_ref().is_some_and(|conversation| {
+                        Weak::ptr_eq(&conversation.state, &briefing.state)
+                            && conversation.starts == starts
+                    })
             })
             .map(|note| format!("\n\n{}", note.text))
             .collect();
         let message = self.tool.question_with_snapshot(message).await;
-        let message = briefed(
-            message,
-            &briefing.pending_text,
-            &notes,
-            briefing.note.as_deref(),
-        );
+        let message = briefed(message, &pending_text, &notes, briefing.note.as_deref());
         self.conversation.set_tool_result_note(briefing.note);
         message
     }
 
     /// Tells the conversation which game session it's about (Bono Cloud leases it). With
-    /// `auto_session`, a new one (another track, or the next practice, qualifying or race) starts
-    /// the conversation over: returns whether it did.
+    /// `auto_session`, a new weekend (the recording cleared: another track or event) starts the
+    /// conversation over; the next practice, qualifying or race of the same one doesn't. Returns
+    /// whether it started over.
     async fn follow_game_session(&mut self, auto_session: bool) -> bool {
-        let current = match game_session(&self.pool, self.sim).await {
-            Ok(Some(current)) => current,
-            Ok(None) => return false,
+        let (weekend, current) = match game_session(&self.pool, self.sim).await {
+            Ok(current) => current,
             Err(e) => {
                 log::warn!("Error reading the game session: {e:#}");
                 return false;
@@ -2288,44 +2296,68 @@ impl SessionState {
         };
 
         let mut started_over = false;
-        if self.game_session.as_ref() != Some(&current.key) {
-            if auto_session && self.game_session.is_some() {
-                log::info!("New game session: the engineer starts over");
+        // A recording without epochs can't tell weekends apart: the conversation carries on. A
+        // clear counts even before the next session's scoring
+        if let Some(weekend) = weekend {
+            if auto_session && self.weekend.is_some_and(|known| known != weekend) {
+                log::info!("New weekend: the engineer starts over");
                 self.conversation.reset();
                 self.starts.fetch_add(1, atomic::Ordering::Relaxed);
                 started_over = true;
             }
-            self.game_session = Some(current.key.clone());
+            self.weekend = Some(weekend);
         }
-        self.conversation.set_game_session(&current);
+        if let Some(current) = current {
+            self.conversation.set_game_session(&current);
+        }
         started_over
     }
 }
 
-/// The game session in the database: its track, type and number, and how long it's scheduled
-/// to last.
-async fn game_session(pool: &Pool, sim: &'static str) -> anyhow::Result<Option<GameSession>> {
+/// The game session in the database (its track, type and number, and how long it's scheduled to
+/// last), if there's one yet, with the weekend it's in: the oldest epoch's id, `None` for
+/// recordings without epochs.
+async fn game_session(
+    pool: &Pool,
+    sim: &'static str,
+) -> anyhow::Result<(Option<i64>, Option<GameSession>)> {
     let conn = pool.get().await?;
     Ok(conn
         .run(move |conn| {
             use rusqlite::OptionalExtension;
-            conn.query_row(
-                "SELECT track, session_type, session_number, session_end_time FROM session \
-                 ORDER BY id DESC LIMIT 1",
-                [],
-                |row| {
-                    let session_type = row.get::<_, Option<String>>(1)?.unwrap_or_default();
-                    let key = format!(
-                        "{}|{}|{}",
-                        row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                        session_type,
-                        row.get::<_, Option<i64>>(2)?.unwrap_or_default()
-                    );
-                    let scheduled = row.get::<_, Option<f64>>(3)?;
-                    Ok(GameSession::new(key, sim, &session_type, scheduled))
-                },
-            )
-            .optional()
+            // The session and its weekend in one snapshot: a clear between them would pair the
+            // old weekend's session with the new one
+            let _snapshot = conn.unchecked_transaction()?;
+            let epochs = conn
+                .prepare_cached(
+                    "SELECT 1 FROM pragma_table_list WHERE name = 'epoch' AND type = 'table'",
+                )?
+                .exists([])?;
+            let weekend = match epochs {
+                true => conn
+                    .prepare_cached("SELECT min(id) FROM epoch")?
+                    .query_row([], |row| row.get::<_, Option<i64>>(0))?,
+                false => None,
+            };
+            let session = conn
+                .query_row(
+                    "SELECT track, session_type, session_number, session_end_time FROM session \
+                     ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| {
+                        let session_type = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+                        let key = format!(
+                            "{}|{}|{}",
+                            row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                            session_type,
+                            row.get::<_, Option<i64>>(2)?.unwrap_or_default()
+                        );
+                        let scheduled = row.get::<_, Option<f64>>(3)?;
+                        Ok(GameSession::new(key, sim, &session_type, scheduled))
+                    },
+                )
+                .optional()?;
+            Ok::<_, rusqlite::Error>((weekend, session))
         })
         .await?)
 }
@@ -3427,7 +3459,7 @@ mod tests {
                     tool: first.clone(),
                     schedule_tool: ScheduleTool::new(first.clone()),
                     sim: "lmu",
-                    game_session: None,
+                    weekend: None,
                     starts: Arc::default(),
                 })),
                 starts: Arc::default(),
@@ -3633,7 +3665,7 @@ mod tests {
                     schedule_tool,
                     pool,
                     sim: "test",
-                    game_session: None,
+                    weekend: None,
                     starts: starts.clone(),
                 })),
                 starts,
@@ -3832,6 +3864,17 @@ mod tests {
             self.tick();
         }
 
+        /// The recording is cleared for a new weekend, as the recorder clears it: emptied, and a
+        /// newer epoch begun. The engineer hasn't stepped through it yet.
+        fn new_weekend(&self) {
+            use bono_sim::sql::{EpochReason, begin_epoch, clear_tables};
+            let recording = self.recording();
+            let newest: i64 =
+                (recording.query_row("SELECT max(id) FROM epoch", [], |row| row.get(0))).unwrap();
+            clear_tables(&recording).unwrap();
+            begin_epoch(&recording, newest.saturating_add(1), EpochReason::Cleared).unwrap();
+        }
+
         /// The notes for the model's next message, as it would be told them.
         fn notes(&self) -> Vec<String> {
             (self.engineer.unheard.iter())
@@ -4005,7 +4048,11 @@ mod tests {
                 }
                 false => scripted.finish(Act::Fail),
             }
-            assert_eq!(scripted.pending(), [RequestId(1)], "signed out: {signed_out}");
+            assert_eq!(
+                scripted.pending(),
+                [RequestId(1)],
+                "signed out: {signed_out}"
+            );
             if signed_out {
                 continue;
             }
@@ -4060,7 +4107,15 @@ mod tests {
         assert_eq!(scripted.pending(), [RequestId(1)]);
         scripted.engineer.new_session();
         assert!(scripted.pending().is_empty());
-        assert!(scripted.engineer.tool.as_ref().unwrap().conditions().is_empty());
+        assert!(
+            scripted
+                .engineer
+                .tool
+                .as_ref()
+                .unwrap()
+                .conditions()
+                .is_empty()
+        );
         assert!(scripted.noticed(t!("engineer.requests_cleared")));
     }
 
@@ -4170,30 +4225,36 @@ mod tests {
     fn an_add_from_another_weekend_is_told() {
         use bono_sim::sql::{EpochReason, begin_epoch};
 
-        let mut scripted = Scripted::recorded();
-        scripted.ask("Fuel every lap, please.");
-        scripted.until("asked", |s| s.questions().len() == 1);
-        scripted.schedule(fuel_every_lap()).unwrap();
-        // The recording is cleared while the turn runs: the oldest epoch, the weekend, changes
-        begin_epoch(&scripted.recording(), 1, EpochReason::Cleared).unwrap();
-        scripted.tick();
-        assert_eq!(
-            scripted.engineer.progress.as_ref().unwrap().weekend,
-            Some(1)
-        );
-        scripted.finish(Act::Reply);
-        assert!(scripted.pending().is_empty());
-        let notice = t!("engineer.request_dropped", id = RequestId(1));
-        assert!(scripted.noticed(&notice));
-
-        // The model is told with the next question, once
-        let note = dropped_note(RequestId(1));
-        for (question, told) in [("Anything else?", true), ("And now?", false)] {
-            let turns = scripted.questions().len();
-            scripted.ask(question);
-            scripted.until("asked", |s| s.questions().len() > turns);
-            assert_eq!(scripted.questions()[turns].contains(&note), told);
+        for auto_session in [false, true] {
+            let raw = serde_json::json!({ "auto_session": auto_session }).to_string();
+            let mut scripted = Scripted::recorded_with(&raw);
+            scripted.ask("Fuel every lap, please.");
+            scripted.until("asked", |s| s.questions().len() == 1);
+            scripted.schedule(fuel_every_lap()).unwrap();
+            // The recording is cleared while the turn runs: the oldest epoch, the weekend, changes
+            begin_epoch(&scripted.recording(), 1, EpochReason::Cleared).unwrap();
+            scripted.tick();
+            assert_eq!(
+                scripted.engineer.progress.as_ref().unwrap().weekend,
+                Some(1)
+            );
             scripted.finish(Act::Reply);
+            assert!(scripted.pending().is_empty());
+            let notice = t!("engineer.request_dropped", id = RequestId(1));
+            assert!(scripted.noticed(&notice));
+
+            // The model is told with the next question, once. With `auto_session`, that question
+            // starts the conversation over at the new weekend: it never made the add
+            let note = dropped_note(RequestId(1));
+            for (question, told) in [("Anything else?", !auto_session), ("And now?", false)] {
+                let turns = scripted.questions().len();
+                scripted.ask(question);
+                scripted.until("asked", |s| s.questions().len() > turns);
+                let question = &scripted.questions()[turns];
+                assert_eq!(question.contains(&note), told, "{auto_session}: {question}");
+                scripted.finish(Act::Reply);
+            }
+            assert!(scripted.engineer.unheard.is_empty());
         }
     }
 
@@ -4226,11 +4287,12 @@ mod tests {
         assert!(scripted.engineer.session.is_none());
         assert!(scripted.engineer.unheard.is_empty());
 
-        // The game moves on to another session, and `auto_session` starts the conversation over
+        // The game moves on to another weekend, and `auto_session` starts the conversation over
+        // before the engineer has stepped through it (only the snapshots asked for from here on)
         let mut scripted = Scripted::recorded();
         let note = scripted.missed_change();
-        let state = scripted.engineer.session.as_ref().unwrap().state.clone();
-        state.blocking_lock().game_session = Some("Elsewhere|practice|1".into());
+        scripted.tick();
+        scripted.new_weekend();
         let turns = scripted.questions().len();
         scripted.ask("Anything else?");
         scripted.until("asked", |s| s.questions().len() > turns);
@@ -4238,6 +4300,34 @@ mod tests {
         // Not told to it again, either
         scripted.finish(Act::Fail);
         assert!(scripted.engineer.unheard.is_empty());
+    }
+
+    #[test]
+    fn a_new_weekends_conversation_is_not_told_the_last_ones_requests() {
+        let mut scripted = Scripted::recorded();
+        scripted.add("Fuel every lap, please.", fuel_every_lap());
+        // Only the snapshots asked for from here on: the turn starts before the engineer steps
+        // through the new weekend, and its briefing still has the request
+        scripted.tick();
+        assert_eq!(scripted.pending(), [RequestId(1)]);
+        scripted.new_weekend();
+        let turns = scripted.questions().len();
+        scripted.ask("How are the tyres?");
+        scripted.until("asked", |s| s.questions().len() > turns);
+        let question = &scripted.questions()[turns];
+        assert!(question.contains(NO_REQUESTS), "{question}");
+        assert!(
+            !question.contains("Tell the pilot the fuel left."),
+            "{question}"
+        );
+        // Nor can it change it
+        let error = scripted.schedule(cancel(RequestId(1))).unwrap_err();
+        assert!(error.contains("none are pending"), "{error}");
+        scripted.finish(Act::Reply);
+
+        // The next progress clears it
+        scripted.tick();
+        assert!(scripted.pending().is_empty());
     }
 
     #[test]
@@ -4560,7 +4650,10 @@ mod tests {
         assert_eq!(answer.fired[0].id, RequestId(1));
         let synthesis = scripted.engineer.synthesis.as_ref().unwrap();
         assert_eq!(synthesis.len(), 1);
-        assert_eq!((synthesis[0].lang, synthesis[0].text.as_str()), (arrstr!("en"), "Copy."));
+        assert_eq!(
+            (synthesis[0].lang, synthesis[0].text.as_str()),
+            (arrstr!("en"), "Copy.")
+        );
         // The notice naming what fired, then the answer
         let chat = &scripted.engineer.chat;
         let fired = t!("engineer.scheduled", what = marker_fired());
@@ -4625,7 +4718,10 @@ mod tests {
         scripted.finish_scheduled(Act::End(StopReason::MaxTokens, "Marker's set, and"));
         let ready = scripted.answers_waiting();
         assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].scheduled.as_ref().unwrap().text, "Marker's set, and");
+        assert_eq!(
+            ready[0].scheduled.as_ref().unwrap().text,
+            "Marker's set, and"
+        );
         // The incomplete tone follows it
         assert!(ready[0].tone_after_drain);
         assert!(scripted.noticed(&t!("engineer.scheduled", what = marker_fired())));
@@ -4861,7 +4957,10 @@ mod tests {
             .unwrap();
         assert_eq!(answer.text, "Marker: it's set.");
         let detail = answer.detail.as_deref().unwrap();
-        assert!(detail.ends_with(t!("engineer.detail_not_said_stale")), "{detail}");
+        assert!(
+            detail.ends_with(t!("engineer.detail_not_said_stale")),
+            "{detail}"
+        );
 
         // The model is told the pilot didn't hear it
         let turns = scripted.questions().len();
@@ -4870,7 +4969,10 @@ mod tests {
         let question = &scripted.questions()[turns];
         let note = unheard_note("Marker: it's set.", Unsaid::Stale);
         assert!(question.contains(&note), "{question}");
-        assert!(note.contains("out of date") && !note.contains("  "), "{note}");
+        assert!(
+            note.contains("out of date") && !note.contains("  "),
+            "{note}"
+        );
     }
 
     #[test]
@@ -4893,7 +4995,10 @@ mod tests {
             .find(|e| e.speaker == Speaker::Engineer && e.text == "Marker: it's set.")
             .unwrap();
         let detail = answer.detail.as_deref().unwrap();
-        assert!(detail.ends_with(t!("engineer.detail_not_said_gone")), "{detail}");
+        assert!(
+            detail.ends_with(t!("engineer.detail_not_said_gone")),
+            "{detail}"
+        );
         // Not said to be out of date
         let notes = scripted.notes();
         assert_eq!(notes, [unheard_note("Marker: it's set.", Unsaid::Gone)]);
@@ -4905,10 +5010,10 @@ mod tests {
         let mut scripted = Scripted::recorded_with(VOICES);
         scripted.answer_waiting("Marker: it's set.");
         scripted.new_game_session();
-        // The next turn starts the conversation over (`auto_session`), held up until the answer
-        // has been dropped, in the frame the turn started
+        // A new weekend: the next turn starts the conversation over (`auto_session`), held up
+        // until the answer has been dropped, in the frame the turn started
         let state = scripted.engineer.session.as_ref().unwrap().state.clone();
-        state.blocking_lock().game_session = Some("Elsewhere|practice|1".into());
+        scripted.new_weekend();
         let held = state.blocking_lock();
         let turns = scripted.questions().len();
         scripted.ask("How are the tyres?");
@@ -4963,7 +5068,7 @@ mod tests {
                 sim: state.sim,
                 tool: state.tool.clone(),
                 schedule_tool: state.schedule_tool.clone(),
-                game_session: None,
+                weekend: None,
                 starts: Arc::default(),
             }
         });
@@ -5097,7 +5202,10 @@ mod tests {
     fn played_answer_resolves_its_requests() {
         let mut scripted = Scripted::recorded_with(VOICES);
         // Out of date once there's a flag: a condition checked while its answer waits
-        scripted.recording().execute_batch("CREATE TABLE flag (x)").unwrap();
+        scripted
+            .recording()
+            .execute_batch("CREATE TABLE flag (x)")
+            .unwrap();
         let mut request = marker_set();
         let flag = "SELECT 1 FROM recording.flag";
         request["stale_after"] = serde_json::json!({"kind": "condition", "query": flag});
@@ -5110,7 +5218,11 @@ mod tests {
         let front = &mut scripted.engineer.line[0];
         front.sentences = SentenceQueue::default();
         front.started = true;
-        drop(scripted.engineer.synthesis.as_mut().unwrap()[0].speech.take());
+        drop(
+            scripted.engineer.synthesis.as_mut().unwrap()[0]
+                .speech
+                .take(),
+        );
         let played = no_speaker(&scripted.engineer);
         scripted.engineer.talk(false);
         scripted.frame();
@@ -5163,7 +5275,9 @@ mod tests {
         scripted.finish_scheduled(Act::Say("Marker: it's set.".into()));
         let synthesis = scripted.engineer.synthesis.as_mut().unwrap();
         let output = synthesis[0].speech.take().unwrap();
-        output.send(Err(anyhow::anyhow!("no voice loaded"))).unwrap();
+        output
+            .send(Err(anyhow::anyhow!("no voice loaded")))
+            .unwrap();
         scripted.until("dropped", |s| s.answers_waiting().is_empty());
         let error = t!("engineer.error_synthesizing", error = "no voice loaded");
         assert!(scripted.noticed(&error));
@@ -5198,11 +5312,15 @@ mod tests {
                 let rt = scripted.runtime.handle();
                 let (sim, config) = (Some(&mut *scripted.sim), &scripted.config);
                 let synth = &mut scripted.synth;
-                scripted.engineer.update(rt, sim, config, synth, Some(&device));
+                scripted
+                    .engineer
+                    .update(rt, sim, config, synth, Some(&device));
                 std::thread::sleep(Duration::from_millis(5));
             }
         };
-        let output = scripted.engineer.synthesis.as_mut().unwrap()[0].speech.take();
+        let output = scripted.engineer.synthesis.as_mut().unwrap()[0]
+            .speech
+            .take();
         output.unwrap().send(Ok(speech)).unwrap();
         play_until(&mut scripted, |s| {
             (s.engineer.line.front()).is_some_and(|playback| playback.started)
@@ -5387,6 +5505,31 @@ mod tests {
     async fn follows_the_game_session() {
         use provider::bono_cloud::SessionType;
 
+        /// Asks until the conversation is told about `key`, in another weekend than `old`.
+        async fn follow_until(
+            state: &mut SessionState,
+            recorded: &std::sync::Mutex<Recorded>,
+            auto_session: bool,
+            key: &str,
+            old: Option<i64>,
+        ) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                state.follow_game_session(auto_session).await;
+                let told = recorded
+                    .lock()
+                    .unwrap()
+                    .games
+                    .last()
+                    .map(|game| game.key.clone());
+                if told.as_deref() == Some(key) && state.weekend.is_some() && state.weekend != old {
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "{key} not recorded");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+
         for auto_session in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let recorder = Recorder::new(dir.path(), None).unwrap();
@@ -5404,47 +5547,67 @@ mod tests {
                 tool,
                 pool,
                 sim: "lmu",
-                game_session: None,
+                weekend: None,
                 starts: Arc::default(),
             };
 
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while state.game_session.is_none() {
-                assert!(std::time::Instant::now() < deadline, "no session recorded");
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                state.follow_game_session(auto_session).await;
-            }
-            assert_eq!(
-                state.game_session.as_deref(),
-                Some("Circuit de la Sarthe|practice|1")
-            );
+            let practice = "Circuit de la Sarthe|practice|1";
+            follow_until(&mut state, &recorded, auto_session, practice, None).await;
+            let weekend = state.weekend;
+            // Told every turn, so a lease ended meanwhile is started again
+            let told = recorded.lock().unwrap().games.len();
             state.follow_game_session(auto_session).await;
+            {
+                let recorded = recorded.lock().unwrap();
+                let games = &recorded.games;
+                assert_eq!(games.len(), told + 1);
+                assert_eq!(games[told - 1], games[told]);
+                assert_eq!(games[told].key, practice);
+                assert_eq!(games[told].sim, "lmu");
+                assert_eq!(games[told].session_type, SessionType::Practice);
+                // Not scheduled: the type's default
+                assert_eq!(games[told].expected_minutes, 60);
+            }
 
+            // The race of the same weekend: another game session, the same conversation
             let mut race = session("race", 1);
             race.session_end_time = Some(5400.0).into();
             recorder.push_scoring(race, Vec::new());
+            let race = "Circuit de la Sarthe|race|1";
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while recorded.lock().unwrap().games.last().unwrap().key != race {
+                assert!(std::time::Instant::now() < deadline, "race not recorded");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                state.follow_game_session(auto_session).await;
+            }
+            assert_eq!(state.weekend, weekend);
+            {
+                let recorded = recorded.lock().unwrap();
+                let game = recorded.games.last().unwrap();
+                assert_eq!(game.session_type, SessionType::Race);
+                assert_eq!(game.expected_minutes, 90);
+                assert_eq!(recorded.resets, 0);
+            }
+
+            // A new weekend clears the recording, even back at the same track and session
+            recorder.clear();
+            // Noticed before any scoring comes in (the game paused, say)
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while state.weekend == weekend {
+                assert!(std::time::Instant::now() < deadline, "clear not recorded");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                state.follow_game_session(auto_session).await;
+            }
+            assert_eq!(recorded.lock().unwrap().resets, usize::from(auto_session));
+            let cleared = state.weekend;
+            recorder.push_scoring(session("practice", 1), Vec::new());
+            follow_until(&mut state, &recorded, auto_session, practice, weekend).await;
+            assert_eq!(state.weekend, cleared);
             drop(recorder);
             state.follow_game_session(auto_session).await;
-            assert_eq!(
-                state.game_session.as_deref(),
-                Some("Circuit de la Sarthe|race|1")
-            );
 
-            let recorded = recorded.lock().unwrap();
-            // Told every turn, so a lease ended meanwhile is started again
-            let games = &recorded.games;
-            assert_eq!(games.len(), 3);
-            assert_eq!(games[0], games[1]);
-            assert_eq!(games[0].key, "Circuit de la Sarthe|practice|1");
-            assert_eq!(games[0].sim, "lmu");
-            assert_eq!(games[0].session_type, SessionType::Practice);
-            // Not scheduled: the type's default
-            assert_eq!(games[0].expected_minutes, 60);
-            assert_eq!(games[2].key, "Circuit de la Sarthe|race|1");
-            assert_eq!(games[2].session_type, SessionType::Race);
-            assert_eq!(games[2].expected_minutes, 90);
-            // Only auto sessions start the conversation over
-            assert_eq!(recorded.resets, usize::from(auto_session));
+            // Only auto sessions start the conversation over, once
+            assert_eq!(recorded.lock().unwrap().resets, usize::from(auto_session));
         }
     }
 }

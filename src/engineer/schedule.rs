@@ -30,6 +30,9 @@ pub const SILENCE: &str = "[SILENCE]";
 /// The most requests that may be pending, a guard against a model stuck adding them
 pub const MAX_REQUESTS: usize = 50;
 
+/// The pending list, for the model, when no request is pending
+pub const NO_REQUESTS: &str = "Scheduled requests: none.";
+
 /// The game clock is a sum of float differences, so a time target counts as reached this close
 /// to it
 const TOLERANCE_S: f64 = 1e-6;
@@ -779,7 +782,7 @@ impl Schedule {
     pub fn pending_text(&self, progress: &Progress) -> String {
         let pending: Vec<_> = self.requests.iter().filter(|r| r.pending()).collect();
         if pending.is_empty() {
-            return "Scheduled requests: none.".into();
+            return NO_REQUESTS.into();
         }
         let mut text = String::from("Scheduled requests:");
         for request in pending {
