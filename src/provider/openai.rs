@@ -193,7 +193,11 @@ impl Conversation {
                 }
                 Some("stop") => Some(StopReason::EndTurn),
                 Some("length") => Some(StopReason::MaxTokens),
+                // Mistral's: the model's context is full
+                Some("model_length") => Some(StopReason::ContextWindowExceeded),
                 Some("content_filter") => Some(StopReason::Refusal),
+                // Mistral's: the server failed while writing
+                Some("error") => bail!("The model failed partway through its answer"),
                 other => bail!("Unexpected stop reason from the model: {other:?}"),
             };
 
@@ -385,9 +389,27 @@ impl Response {
         #[derive(Deserialize)]
         struct Delta {
             #[serde(default)]
-            content: Option<String>,
+            content: Option<Content>,
+            /// Null for none, in Mistral's
             #[serde(default)]
-            tool_calls: Vec<DeltaCall>,
+            tool_calls: Option<Vec<DeltaCall>>,
+        }
+
+        /// Text, or (Mistral's, from its reasoning models) a list of typed chunks
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Content {
+            Text(String),
+            Chunks(Vec<ContentChunk>),
+        }
+
+        /// Only `text` chunks are the answer: the others (`thinking`...) aren't said
+        #[derive(Deserialize)]
+        struct ContentChunk {
+            #[serde(rename = "type")]
+            kind: String,
+            #[serde(default)]
+            text: Option<String>,
         }
 
         #[derive(Deserialize)]
@@ -404,8 +426,9 @@ impl Response {
         struct DeltaFunction {
             #[serde(default)]
             name: Option<String>,
+            /// JSON text (a piece of it), or (Mistral's may be) the JSON itself
             #[serde(default)]
-            arguments: Option<String>,
+            arguments: Option<serde_json::Value>,
         }
 
         #[derive(Deserialize)]
@@ -452,11 +475,20 @@ impl Response {
 
         for choice in chunk.choices {
             if let Some(delta) = choice.delta {
-                if let Some(content) = delta.content {
-                    sink.push(&content);
-                    self.content.push_str(&content);
+                let texts = match delta.content {
+                    None => Vec::new(),
+                    Some(Content::Text(text)) => vec![text],
+                    Some(Content::Chunks(chunks)) => chunks
+                        .into_iter()
+                        .filter(|chunk| chunk.kind == "text")
+                        .filter_map(|chunk| chunk.text)
+                        .collect(),
+                };
+                for text in texts {
+                    sink.push(&text);
+                    self.content.push_str(&text);
                 }
-                for piece in delta.tool_calls {
+                for piece in delta.tool_calls.into_iter().flatten() {
                     let index = piece.index.unwrap_or_else(|| {
                         let new_call = self.tool_calls.last().is_some_and(|call| {
                             piece
@@ -483,8 +515,12 @@ impl Response {
                         if let Some(name) = function.name {
                             call.name.push_str(&name);
                         }
-                        if let Some(arguments) = function.arguments {
-                            call.arguments.push_str(&arguments);
+                        match function.arguments {
+                            None => {}
+                            Some(serde_json::Value::String(arguments)) => {
+                                call.arguments.push_str(&arguments);
+                            }
+                            Some(arguments) => call.arguments.push_str(&arguments.to_string()),
                         }
                     }
                 }
@@ -683,9 +719,11 @@ impl ConversationBuilder {
 
         let (reasoning_effort, chat_template_kwargs) = match self.effort.trim() {
             "" => (None, None),
-            "none" if !is_openai(&base_url) => (
+            // OpenAI and Mistral reject fields they don't know, and turn thinking off by
+            // `reasoning_effort` alone
+            "none" if !is_openai(&base_url) && !is_mistral(&base_url) => (
                 Some("none".to_owned()),
-                (!is_openai(&base_url)).then(|| serde_json::json!({"enable_thinking": false})),
+                Some(serde_json::json!({"enable_thinking": false})),
             ),
             effort => (Some(effort.to_owned()), None),
         };
@@ -695,6 +733,11 @@ impl ConversationBuilder {
         } else {
             MaxTokens::MaxTokens(self.max_tokens)
         };
+
+        // Mistral's chunks may carry the tokens unasked, and it rejects fields it doesn't know
+        let stream_options = (!is_mistral(&base_url)).then_some(StreamOptions {
+            include_usage: true,
+        });
 
         let mut messages = Vec::new();
         if !self.system.trim().is_empty() {
@@ -727,9 +770,7 @@ impl ConversationBuilder {
                 messages,
                 tools,
                 stream: true,
-                stream_options: StreamOptions {
-                    include_usage: true,
-                },
+                stream_options,
                 max_tokens,
                 reasoning_effort,
                 chat_template_kwargs,
@@ -756,6 +797,15 @@ fn base_url_or_default(base_url: Option<&str>) -> String {
 /// `max_completion_tokens` and reject `max_tokens`, which compatible servers may only know.
 fn is_openai(base_url: &str) -> bool {
     reqwest::Url::parse(base_url).is_ok_and(|url| url.host_str() == Some("api.openai.com"))
+}
+
+/// Whether `base_url` is Mistral's own API (`api.mistral.ai`, `codestral.mistral.ai`...), which
+/// rejects request fields it doesn't know.
+fn is_mistral(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url).is_ok_and(|url| {
+        url.host_str()
+            .is_some_and(|host| host == "mistral.ai" || host.ends_with(".mistral.ai"))
+    })
 }
 
 /// The bearer token: `api_key`, or else `OPENAI_API_KEY`, if set.
@@ -791,7 +841,8 @@ struct RequestBody {
     /// Always: answers are spoken as they're written
     stream: bool,
     /// The tokens, in the stream's last event
-    stream_options: StreamOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
     #[serde(flatten)]
     max_tokens: MaxTokens,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -999,6 +1050,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reads_arguments_sent_as_json() {
+        let mut response = Response::default();
+        let mut on_text = |_: &str| {};
+        let mut sink = TextSink::new(&mut on_text);
+        let line = format!(
+            "data: {}",
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"id": "abc123XYZ", "index": 0, "function": {"name": "lookup", "arguments": {"what": "gap"}}}
+            ]}}]})
+        );
+        response.line(line.as_bytes(), &mut sink).unwrap();
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&response.tool_calls[0].arguments).unwrap(),
+            json!({"what": "gap"})
+        );
+    }
+
+    #[test]
+    fn reads_content_sent_as_chunks_and_skips_thinking() {
+        let mut response = Response::default();
+        let mut pieces = Vec::new();
+        let mut on_text = |piece: &str| pieces.push(piece.to_owned());
+        let mut sink = TextSink::new(&mut on_text);
+        let thinking =
+            |text: &str| json!({"type": "thinking", "thinking": [{"type": "text", "text": text}]});
+        for content in [
+            json!([thinking("The gap is ")]),
+            json!([thinking("1.2s."), {"type": "text", "text": "Gap's "}]),
+            json!("1.2 seconds."),
+        ] {
+            let line = format!(
+                "data: {}",
+                json!({"model": "magistral-medium-latest", "choices": [{"index": 0, "delta": {"role": "assistant", "content": content, "tool_calls": null}, "finish_reason": null}]})
+            );
+            response.line(line.as_bytes(), &mut sink).unwrap();
+        }
+        drop(sink);
+        assert_eq!(response.content, "Gap's 1.2 seconds.");
+        assert_eq!(pieces.concat(), "Gap's 1.2 seconds.");
+    }
+
     #[tokio::test]
     async fn runs_tool_calls_put_together_from_the_stream() {
         let call =
@@ -1167,17 +1261,26 @@ mod tests {
     }
 
     #[test]
-    fn omits_chat_template_kwargs_for_openai() {
-        let mut builder = ConversationBuilder::new();
-        builder
-            .base_url("https://api.openai.com/v1/")
-            .api_key("test")
-            .effort("none");
-        let conversation = builder.build(reqwest::Client::new()).unwrap();
-        let body = serde_json::to_value(&conversation.body).unwrap();
+    fn omits_chat_template_kwargs_for_openai_and_mistral() {
+        for url in [
+            "https://api.openai.com/v1/",
+            "https://api.mistral.ai/v1",
+            "https://codestral.mistral.ai/v1",
+        ] {
+            let mut builder = ConversationBuilder::new();
+            builder.base_url(url).api_key("test").effort("none");
+            let conversation = builder.build(reqwest::Client::new()).unwrap();
+            let body = serde_json::to_value(&conversation.body).unwrap();
 
-        assert_eq!(body["reasoning_effort"], "none");
-        assert!(body.get("chat_template_kwargs").is_none());
+            assert_eq!(body["reasoning_effort"], "none", "{url}");
+            assert!(body.get("chat_template_kwargs").is_none(), "{url}");
+            // Mistral's API doesn't take `stream_options`
+            assert_eq!(
+                body.get("stream_options").is_none(),
+                url.contains("mistral.ai"),
+                "{url}"
+            );
+        }
     }
 
     #[test]
@@ -1244,6 +1347,8 @@ mod tests {
         let (url, _) = mock(vec![
             stream(vec![text("Box, box"), finish("length")]),
             stream(vec![text("No."), finish("content_filter")]),
+            stream(vec![text("Stay"), finish("model_length")]),
+            stream(vec![text("Bo"), finish("error")]),
         ])
         .await;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1257,6 +1362,15 @@ mod tests {
         let (reply, _) = send_streaming(&mut conversation, "Pit?").await.unwrap();
         assert_eq!(reply.stop, StopReason::Refusal);
         assert_eq!(conversation.body.messages.len(), 3);
+
+        // Mistral's: a full context, and a failure
+        let (reply, _) = send_streaming(&mut conversation, "Pit?").await.unwrap();
+        assert_eq!(reply.stop, StopReason::ContextWindowExceeded);
+        assert_eq!(conversation.body.messages.len(), 5);
+
+        let error = send_streaming(&mut conversation, "Pit?").await.unwrap_err();
+        assert!(format!("{error:#}").contains("failed partway"), "{error:#}");
+        assert_eq!(conversation.body.messages.len(), 5);
     }
 
     #[tokio::test]
