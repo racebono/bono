@@ -188,7 +188,10 @@ impl Engineer {
     // The `schedule` tool, which a later task adds, checks a request's conditions with it.
     #[allow(dead_code)]
     pub async fn check_condition(&self, query: String) -> anyhow::Result<bool> {
-        self.ask(derived::Job::Condition { query }).await?.holds()
+        self.ask(derived::Job::Condition { query })
+            .await
+            .and_then(derived::Answer::holds)
+            .map_err(busy_retry)
     }
 
     async fn run(&self, input: EngineerInput) -> anyhow::Result<String> {
@@ -208,14 +211,7 @@ impl Engineer {
                     .and_then(derived::Answer::text)
             }
         }
-        .map_err(|e| match e.downcast_ref::<rusqlite::Error>() {
-            Some(rusqlite::Error::SqliteFailure(failure, _))
-                if failure.code == rusqlite::ErrorCode::DatabaseBusy =>
-            {
-                e.context("the logger is mid-write, just retry")
-            }
-            _ => e,
-        })
+        .map_err(busy_retry)
     }
 
     async fn quick(&self) -> anyhow::Result<String> {
@@ -246,6 +242,18 @@ impl Engineer {
     #[cfg(test)]
     async fn sync(&self) -> anyhow::Result<()> {
         self.ask(derived::Job::Sync).await.map(|_| ())
+    }
+}
+
+/// The recording being busy says so: it's the logger writing, and asking again is all it takes.
+fn busy_retry(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast_ref::<rusqlite::Error>() {
+        Some(rusqlite::Error::SqliteFailure(failure, _))
+            if failure.code == rusqlite::ErrorCode::DatabaseBusy =>
+        {
+            e.context("the logger is mid-write, just retry")
+        }
+        _ => e,
     }
 }
 
@@ -2971,6 +2979,40 @@ mod tests {
             .run(serde_json::from_value(input).unwrap())
             .await
             .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_busy_recording_says_to_retry() {
+        let (_dir, engineer) = race();
+        // A data thread that always finds the logger mid-write
+        let (data, requests) = mpsc::channel::<derived::Request>();
+        std::thread::spawn(move || {
+            for request in requests {
+                let busy = rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                );
+                let _ = request.reply.send(Err(busy.into()));
+            }
+        });
+        let busy = Engineer {
+            inner: Arc::new(Inner {
+                db: engineer.inner.db.clone(),
+                shared: engineer.inner.shared.clone(),
+                data,
+            }),
+        };
+
+        let error = busy.check_condition("SELECT 1".into()).await.unwrap_err();
+        assert!(format!("{error:#}").contains("just retry"), "{error:#}");
+        let error = busy
+            .run(
+                serde_json::from_value(serde_json::json!({"command": "sql", "query": "SELECT 1"}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("just retry"), "{error:#}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

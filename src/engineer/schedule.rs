@@ -164,6 +164,9 @@ pub struct Schedule {
     /// The epoch current when the last boundary was seen: whatever fired in an earlier one is out
     /// of date
     boundary: Option<i64>,
+    /// The epoch that started a session whose type no snapshot has given yet: an epoch can be
+    /// written before its session's first scoring row, so a typed session trigger waits for it
+    session_start: Option<i64>,
     /// A weekend change seen by `apply`, for the next `advance` to report
     cleared: bool,
     /// A batch was taken and hasn't been answered, dropped or failed
@@ -188,18 +191,38 @@ struct Request {
     state: State,
     /// Its `until` fired while it was due: it goes once this firing is answered
     ending: bool,
+    /// Where it fired, for each of its answers written that hasn't played or been dropped yet
+    waiting: Vec<Progress>,
 }
 
 #[derive(Debug)]
 enum State {
     /// Waiting for its trigger, counted from `since`
     Armed { since: Progress },
-    /// Fired, waiting for a scheduled turn
-    Due { fired: Progress, at: Instant },
+    /// Fired at `fired`, having counted from `since`, waiting for a scheduled turn
+    Due {
+        since: Progress,
+        fired: Progress,
+        at: Instant,
+    },
     /// Fired, in the scheduled turn that's out
-    InBatch { fired: Progress, at: Instant },
-    /// Its last answer was written and hasn't played or been dropped yet; then it goes
-    Answered { fired: Progress },
+    InBatch {
+        since: Progress,
+        fired: Progress,
+        at: Instant,
+    },
+    /// It won't fire again, and some of its answers are still waiting to play or be dropped: it
+    /// goes once they're resolved
+    Ended,
+}
+
+/// What a snapshot says about sessions starting, for session triggers
+#[derive(Clone, Copy, Debug, Default)]
+struct Starts {
+    /// A session started since the last snapshot
+    any: bool,
+    /// This snapshot is the first to give the type of the session that started in its epoch
+    typed: bool,
 }
 
 /// A condition the data thread checks for a request
@@ -263,7 +286,29 @@ impl Request {
     }
 
     fn pending(&self) -> bool {
-        !matches!(self.state, State::Answered { .. })
+        !matches!(self.state, State::Ended)
+    }
+
+    /// It won't fire again. Returns whether it stays, until its waiting answers are resolved.
+    fn end(&mut self) -> bool {
+        self.state = State::Ended;
+        !self.waiting.is_empty()
+    }
+
+    /// Where counting starts again after its firing at `fired`, having counted from `since`, as
+    /// of `progress`. A timed one counts on from its target, so a firing noticed a little late
+    /// doesn't push the next one back; but from the firing if that target is already more than a
+    /// period behind (a pause, an outage), so it doesn't fire again in a burst. Laps are whole, so
+    /// they're never late.
+    fn rearm_from(&self, since: &Progress, fired: &Progress, progress: &Progress) -> Progress {
+        let mut base = fired.clone();
+        if let Trigger::Time { seconds } = self.trigger {
+            let target = since.clock_s + seconds;
+            if progress.clock_s - target <= seconds {
+                base.clock_s = target;
+            }
+        }
+        base
     }
 
     fn until(&self) -> Option<&Trigger> {
@@ -283,7 +328,7 @@ impl Request {
         past_boundary
             || match &self.stale_after {
                 Trigger::Time { .. } | Trigger::Laps { .. } => {
-                    reached(&self.stale_after, None, fired, progress)
+                    reached(&self.stale_after, None, fired, progress, Starts::default())
                 }
                 // Any session starting is a boundary, so the rule above covers it
                 Trigger::Session { .. } => false,
@@ -296,18 +341,24 @@ impl Request {
 }
 
 /// Whether `trigger`, counted from `base`, fires at `progress`
-fn reached(trigger: &Trigger, slot: Option<&Slot>, base: &Progress, progress: &Progress) -> bool {
+fn reached(
+    trigger: &Trigger,
+    slot: Option<&Slot>,
+    base: &Progress,
+    progress: &Progress,
+    starts: Starts,
+) -> bool {
     match trigger {
         Trigger::Time { seconds } => progress.clock_s >= base.clock_s + seconds - TOLERANCE_S,
         Trigger::Laps { count } => progress.laps >= base.laps.saturating_add(u64::from(*count)),
-        Trigger::Session { kind } => {
-            progress.new_epochs.iter().any(|reason| reason == "session")
-                && kind.as_ref().is_none_or(|kind| {
-                    progress
-                        .session_type
-                        .as_ref()
-                        .is_some_and(|now| now.eq_ignore_ascii_case(kind))
-                })
+        Trigger::Session { kind: None } => starts.any,
+        // On the first snapshot that says what the session is
+        Trigger::Session { kind: Some(kind) } => {
+            starts.typed
+                && progress
+                    .session_type
+                    .as_ref()
+                    .is_some_and(|now| now.eq_ignore_ascii_case(kind))
         }
         Trigger::Condition { .. } => slot.is_some_and(|slot| slot.rose),
     }
@@ -324,6 +375,7 @@ impl Schedule {
             weekend: None,
             epoch: None,
             boundary: None,
+            session_start: None,
             cleared: false,
             batch_out: false,
             retry_at: None,
@@ -359,12 +411,16 @@ impl Schedule {
                     // Counting carries on from the last firing, if it has fired since it was armed
                     let since = match old.state {
                         State::Armed { since } => since,
-                        State::Due { fired, .. }
-                        | State::InBatch { fired, .. }
-                        | State::Answered { fired } => fired,
+                        State::Due { fired, .. } | State::InBatch { fired, .. } => fired,
+                        State::Ended => old
+                            .waiting
+                            .last()
+                            .cloned()
+                            .unwrap_or_else(|| old.made.clone()),
                     };
                     let mut request = self.request(id, new, since);
                     request.made = old.made;
+                    request.waiting = old.waiting;
                     self.requests.insert(index, request);
                     ids.push(id);
                 }
@@ -392,10 +448,25 @@ impl Schedule {
         {
             self.boundary = Some(epoch);
         }
+        let session = progress.new_epochs.iter().any(|reason| reason == "session");
+        if session {
+            self.session_start = progress.epoch;
+        } else if epoch_changed {
+            self.session_start = None;
+        }
+        let starts = Starts {
+            any: session,
+            typed: self.session_start.is_some()
+                && self.session_start == progress.epoch
+                && progress.session_type.is_some(),
+        };
+        if starts.typed {
+            self.session_start = None;
+        }
 
         let mut kept = Vec::with_capacity(self.requests.len());
         for mut request in std::mem::take(&mut self.requests) {
-            // An answer on its way: nothing more happens to it
+            // Its answers on their way: nothing more happens to it
             if !request.pending() {
                 kept.push(request);
                 continue;
@@ -412,37 +483,57 @@ impl Schedule {
             }
 
             let until = request.until().is_some_and(|until| {
-                reached(until, request.until_slot.as_ref(), &request.made, progress)
-            });
-            if let State::Armed { since } = &request.state {
-                if reached(
-                    &request.trigger,
-                    request.trigger_slot.as_ref(),
-                    since,
+                reached(
+                    until,
+                    request.until_slot.as_ref(),
+                    &request.made,
                     progress,
-                ) {
+                    starts,
+                )
+            });
+            if !matches!(request.state, State::Armed { .. }) {
+                request.ending |= until;
+            }
+            // A due request gone stale is armed again and checked once more on this snapshot, so
+            // a trigger that lasts one snapshot (a session starting) isn't lost
+            let mut ended = false;
+            for _ in 0..2 {
+                if let State::Armed { since } = &request.state {
+                    if !reached(
+                        &request.trigger,
+                        request.trigger_slot.as_ref(),
+                        since,
+                        progress,
+                        starts,
+                    ) {
+                        ended = until;
+                        break;
+                    }
                     // If it ends on the same step, this firing still counts
                     request.ending = until;
+                    let since = since.clone();
                     request.state = State::Due {
+                        since,
                         fired: progress.clone(),
                         at: now,
                     };
-                } else if until {
-                    continue;
                 }
-            } else {
-                request.ending |= until;
-            }
-
-            if let State::Due { fired, .. } = &request.state
-                && request.stale(fired, progress, self.boundary)
-            {
+                let State::Due { since, fired, .. } = &request.state else {
+                    break;
+                };
+                if !request.stale(fired, progress, self.boundary) {
+                    break;
+                }
                 advance.skipped_stale += 1;
                 if request.last_firing() {
-                    continue;
+                    ended = true;
+                    break;
                 }
-                let since = fired.clone();
+                let since = request.rearm_from(since, fired, progress);
                 request.state = State::Armed { since };
+            }
+            if ended && !request.end() {
+                continue;
             }
             kept.push(request);
         }
@@ -473,7 +564,7 @@ impl Schedule {
             fired: Vec::new(),
         };
         for request in &mut self.requests {
-            let State::Due { fired, at } = &request.state else {
+            let State::Due { since, fired, at } = &request.state else {
                 continue;
             };
             batch.requests.push((
@@ -487,6 +578,7 @@ impl Schedule {
                 at: fired.clone(),
             });
             request.state = State::InBatch {
+                since: since.clone(),
                 fired: fired.clone(),
                 at: *at,
             };
@@ -507,41 +599,55 @@ impl Schedule {
         self.retry_at = Some(now + RETRY_AFTER);
     }
 
-    /// The scheduled turn answered `fired`: repeating requests are armed again from their firing,
-    /// and the others wait for their answer to be resolved. `_progress` is when it was answered,
-    /// which counting doesn't use: it carries on from the firing, so a slow turn doesn't push
-    /// the next one back.
-    pub fn answered(&mut self, fired: &[Fired], _progress: &Progress) {
+    /// The scheduled turn answered `fired`, at `progress`: repeating requests are armed again from
+    /// their firing (a timed one from its target), so a slow turn doesn't push the next one back,
+    /// and the others end. Either way each waits for its answer to be resolved.
+    pub fn answered(&mut self, fired: &[Fired], progress: &Progress) {
         for request in &mut self.requests {
-            let State::InBatch { fired: at, .. } = &request.state else {
+            let State::InBatch {
+                since, fired: at, ..
+            } = &request.state
+            else {
                 continue;
             };
             if !fired.iter().any(|f| f.id == request.id && same(&f.at, at)) {
                 continue;
             }
             let at = at.clone();
-            request.state = if request.last_firing() {
-                State::Answered { fired: at }
+            let next = if request.last_firing() {
+                State::Ended
             } else {
-                State::Armed { since: at }
+                State::Armed {
+                    since: request.rearm_from(since, &at, progress),
+                }
             };
+            request.state = next;
+            request.waiting.push(at);
         }
         // Anything else in the batch wasn't answered after all
         self.return_batch();
     }
 
-    /// The answer to `fired` played or was dropped: the requests it was the last answer of go
+    /// The answer to `fired` played or was dropped: the requests that ended go once none of their
+    /// answers is waiting
     pub fn resolved(&mut self, fired: &[Fired]) {
-        self.requests.retain(|request| match &request.state {
-            State::Answered { fired: at } => {
-                !fired.iter().any(|f| f.id == request.id && same(&f.at, at))
-            }
-            _ => true,
-        });
+        for request in &mut self.requests {
+            let id = request.id;
+            request
+                .waiting
+                .retain(|at| !fired.iter().any(|f| f.id == id && same(&f.at, at)));
+        }
+        self.requests
+            .retain(|request| request.pending() || !request.waiting.is_empty());
     }
 
     /// Whether an answer to `fired` is out of date at `progress`: once the first of its requests
-    /// is, or once one of them is gone
+    /// is, or once one of them is gone.
+    ///
+    /// A request that ends (answered for the last time, or its `until` reached) stays until its
+    /// waiting answers are resolved, so ending doesn't make them stale. One that's cancelled,
+    /// cleared, or dropped because its condition kept failing is gone at once, and its waiting
+    /// answers are stale with it: the pilot asked for it to stop, or it can't be checked anymore.
     pub fn is_stale(&self, fired: &[Fired], progress: &Progress) -> bool {
         fired.iter().any(|f| {
             self.requests
@@ -615,6 +721,17 @@ impl Schedule {
         self.requests.iter().filter(|r| r.pending()).count()
     }
 
+    /// The pending requests' ids, the ones [`len`](Self::len) counts, in the order they were made
+    // Used by the schedule tool, which a later task adds.
+    #[allow(dead_code)]
+    pub fn pending_ids(&self) -> Vec<RequestId> {
+        self.requests
+            .iter()
+            .filter(|r| r.pending())
+            .map(|r| r.id)
+            .collect()
+    }
+
     fn request(&mut self, id: RequestId, new: NewRequest, since: Progress) -> Request {
         let stale_after = new.stale_after.unwrap_or(DEFAULT_STALE);
         let until = match &new.repeat {
@@ -633,6 +750,7 @@ impl Schedule {
             stale_after,
             state: State::Armed { since },
             ending: false,
+            waiting: Vec::new(),
         }
     }
 
@@ -669,8 +787,9 @@ impl Schedule {
     /// Puts the batch's requests back to due
     fn return_batch(&mut self) {
         for request in &mut self.requests {
-            if let State::InBatch { fired, at } = &request.state {
+            if let State::InBatch { since, fired, at } = &request.state {
                 request.state = State::Due {
+                    since: since.clone(),
                     fired: fired.clone(),
                     at: *at,
                 };
@@ -1534,6 +1653,211 @@ mod tests {
                     .is_empty()
             );
         }
+        assert_eq!(run.schedule.len(), 1);
+    }
+
+    #[test]
+    fn timed_repeat_rearms_from_its_target() {
+        // Every minute for five minutes, the snapshots 1.3 s of game clock apart: each firing is a
+        // little late, which mustn't push the next one back
+        let mut run = Run::new();
+        let id = run.add(request(
+            Trigger::Time { seconds: 60.0 },
+            Repeat::Every {
+                until: Some(Trigger::Time { seconds: 300.0 }),
+            },
+            &at(0.0, 0),
+        ));
+        let mut answers = 0;
+        for step in 1..=300 {
+            run.tick(at(f64::from(step) * 1.3, 0));
+            if !run.due().is_empty() {
+                assert_eq!(run.answer(), [id]);
+                answers += 1;
+            }
+            if run.schedule.requests.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(answers, 5);
+        assert!(run.schedule.requests.is_empty());
+
+        // More than a period late (a pause, an outage): counted from the firing, not in a burst
+        let mut run = Run::new();
+        let id = run.add(request(
+            Trigger::Time { seconds: 60.0 },
+            every(),
+            &at(0.0, 0),
+        ));
+        run.tick(at(10.0, 0));
+        run.tick(at(200.0, 0));
+        assert_eq!(run.answer(), [id]);
+        run.tick(at(201.0, 0));
+        assert!(run.due().is_empty());
+        run.tick(at(259.0, 0));
+        assert!(run.due().is_empty());
+        run.tick(at(260.0, 0));
+        assert_eq!(run.due(), [id]);
+    }
+
+    #[test]
+    fn stale_skip_checks_the_trigger_again() {
+        // Every session start, out of date once the next one starts
+        let mut run = Run::new();
+        let mut new = request(Trigger::Session { kind: None }, every(), &laps(0));
+        new.stale_after = Some(Trigger::Session { kind: None });
+        let id = run.add(new);
+        run.tick(laps(0));
+        run.tick(new_epoch(laps(0), 2, &["session"]));
+        assert_eq!(run.due(), [id]);
+
+        // Its scheduled turns keep failing until the next session loads
+        run.take();
+        run.schedule.batch_failed(run.now);
+        run.tick(new_epoch(laps(0), 2, &[]));
+        let advance = run.tick(new_epoch(laps(0), 3, &["session"]));
+        assert_eq!(advance.skipped_stale, 1);
+        assert_eq!(run.due(), [id]);
+        let batch = run
+            .schedule
+            .take_batch(run.now + RETRY_AFTER)
+            .expect("a batch");
+        assert_eq!(batch.fired.len(), 1);
+        assert_eq!(batch.fired[0].at.epoch, Some(3));
+        assert!(!run.schedule.is_stale(&batch.fired, &run.last));
+    }
+
+    #[test]
+    fn ended_repeat_waits_for_its_answer() {
+        // Every two laps for three laps: the answer at lap 2 still waits when lap 3 ends it
+        let mut run = Run::new();
+        let id = run.add(request(
+            Trigger::Laps { count: 2 },
+            Repeat::Every {
+                until: Some(Trigger::Laps { count: 3 }),
+            },
+            &laps(0),
+        ));
+        run.tick(laps(2));
+        let batch = run.take();
+        run.schedule.answered(&batch.fired, &run.last);
+        run.tick(laps(3));
+        assert_eq!(run.schedule.len(), 0);
+        assert!(run.schedule.pending_ids().is_empty());
+        assert!(run.schedule.pending_text(&run.last).contains("none"));
+        assert!(!run.schedule.is_stale(&batch.fired, &run.last));
+        // Nothing more happens to it
+        run.tick(laps(4));
+        assert!(run.due().is_empty());
+        assert!(!run.schedule.is_stale(&batch.fired, &run.last));
+
+        run.schedule.resolved(&batch.fired);
+        assert!(run.schedule.requests.is_empty());
+        assert!(run.schedule.is_stale(&batch.fired, &run.last));
+        assert_eq!(batch.fired[0].id, id);
+    }
+
+    #[test]
+    fn a_gone_request_makes_its_answer_stale() {
+        // An answer waiting in the line, of a request that repeats
+        let waiting = |run: &mut Run, made: NewRequest| {
+            let id = run.add(made);
+            run.tick(laps(1));
+            let batch = run.take();
+            run.schedule.answered(&batch.fired, &run.last);
+            assert!(!run.schedule.is_stale(&batch.fired, &run.last));
+            (id, batch.fired)
+        };
+        let lap = || request(Trigger::Laps { count: 1 }, every(), &laps(0));
+
+        // Cancelled
+        let mut run = Run::new();
+        let (id, fired) = waiting(&mut run, lap());
+        run.schedule
+            .apply(vec![Change::Cancel(id)], &run.last.clone());
+        assert!(run.schedule.is_stale(&fired, &run.last));
+
+        // Cleared
+        let mut run = Run::new();
+        let (_, fired) = waiting(&mut run, lap());
+        run.schedule.clear();
+        assert!(run.schedule.is_stale(&fired, &run.last));
+
+        // Dropped, its condition failing
+        let mut run = Run::new();
+        let mut failing = lap();
+        failing.repeat = Repeat::Every {
+            until: Some(condition("SELECT nope")),
+        };
+        let (_, fired) = waiting(&mut run, failing);
+        let [cond] = run.condition_ids()[..] else {
+            panic!("one condition")
+        };
+        for _ in 0..CONDITION_FAILURES {
+            run.tick(with(laps(1), cond, ConditionState::Failed));
+        }
+        assert!(run.schedule.requests.is_empty());
+        assert!(run.schedule.is_stale(&fired, &run.last));
+    }
+
+    #[test]
+    fn typed_session_trigger_waits_for_the_type() {
+        let race = || Trigger::Session {
+            kind: Some("race".into()),
+        };
+        let typed = |epoch: i64, reasons: &[&str], session_type: &str| {
+            let mut progress = new_epoch(laps(0), epoch, reasons);
+            progress.session_type = Some(session_type.into());
+            progress
+        };
+
+        // The epoch is written before the session's first scoring row
+        let mut run = Run::new();
+        let id = run.add(request(race(), every(), &laps(0)));
+        let any = run.add(request(
+            Trigger::Session { kind: None },
+            Repeat::Once,
+            &laps(0),
+        ));
+        run.tick(laps(0));
+        run.tick(new_epoch(laps(0), 2, &["session"]));
+        assert_eq!(run.due(), [any]);
+        run.answer();
+        run.tick(typed(2, &[], "race"));
+        assert_eq!(run.due(), [id]);
+        run.answer();
+        // Once a session
+        run.tick(typed(2, &[], "race"));
+        assert!(run.due().is_empty());
+
+        // Of another type
+        let mut run = Run::new();
+        run.add(request(race(), Repeat::Once, &laps(0)));
+        run.tick(new_epoch(laps(0), 2, &["session"]));
+        run.tick(typed(2, &[], "qualifying"));
+        run.tick(typed(2, &[], "race"));
+        assert!(run.due().is_empty());
+
+        // Forgotten at the next epoch change: a restart isn't a session starting
+        let mut run = Run::new();
+        run.add(request(race(), Repeat::Once, &laps(0)));
+        run.tick(new_epoch(laps(0), 2, &["session"]));
+        run.tick(typed(3, &["clock_rollback"], "race"));
+        run.tick(typed(3, &[], "race"));
+        assert!(run.due().is_empty());
+    }
+
+    #[test]
+    fn pending_ids_are_the_pending_requests() {
+        let mut run = Run::new();
+        let once = run.add(request(Trigger::Laps { count: 1 }, Repeat::Once, &laps(0)));
+        let lap = run.add(request(Trigger::Laps { count: 1 }, every(), &laps(0)));
+        assert_eq!(run.schedule.pending_ids(), [once, lap]);
+        run.tick(laps(1));
+        let batch = run.take();
+        run.schedule.answered(&batch.fired, &run.last);
+        // The one-shot's answer is on its way: it's no longer pending
+        assert_eq!(run.schedule.pending_ids(), [lap]);
         assert_eq!(run.schedule.len(), 1);
     }
 
