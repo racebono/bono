@@ -156,6 +156,8 @@ pub struct Converter {
     event: Option<Event>,
     /// The session being recorded: its number and id
     session: Option<(Option<i32>, Option<i32>)>,
+    /// Whether a replay was playing at the last update
+    replaying: Option<bool>,
     /// What's been worked out about each car, by car index
     cars: HashMap<i64, CarTrack>,
     /// When the session's clock runs out, as last recorded
@@ -270,8 +272,15 @@ impl Converter {
         let event = (info.event, info.track.clone());
         let new_event = self.event.as_ref().is_some_and(|last| *last != event);
         self.event = Some(event);
-        // Another session, or its clock went back (a restart, a replay rewound)
         let session = (frame.i32("SessionNum"), frame.i32("SessionUniqueID"));
+        // Scored right away, for the recorder to tell from the scoring before this update's
+        // telemetry: another session, or a replay starting or stopping
+        let replaying = info.replay || frame.bool("IsReplayPlaying") == Some(true);
+        let boundary = new_event
+            || self.session != Some(session)
+            || self.replaying.is_some_and(|last| last != replaying);
+        self.replaying = Some(replaying);
+        // Another session, or its clock went back (a restart, a replay rewound)
         if new_event || self.session != Some(session) || dt.is_none() {
             self.cars.clear();
             self.session_end = None;
@@ -689,7 +698,7 @@ impl Converter {
         }
 
         let scoring = match self.last_scoring {
-            Some(last) if now.duration_since(last) < SCORING_EVERY => None,
+            Some(last) if !boundary && now.duration_since(last) < SCORING_EVERY => None,
             _ => {
                 self.last_scoring = Some(now);
                 let remaining = frame

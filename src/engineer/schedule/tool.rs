@@ -5,7 +5,7 @@
 //! with the turn.
 
 use super::{
-    Change, DEFAULT_STALE, MAX_REQUESTS, NewRequest, Repeat, RequestId, Trigger, describe,
+    Change, Checked, DEFAULT_STALE, MAX_REQUESTS, NewRequest, Repeat, RequestId, Trigger, describe,
     describe_stale,
 };
 use crate::{
@@ -194,15 +194,16 @@ impl ScheduleTool {
             None => staging.room(),
         })?;
         let made = self.wait_for_progress().await?;
-        let new = NewRequest {
+        let mut new = NewRequest {
             instruction,
             trigger,
             repeat,
             stale_after,
             made,
+            checked: Checked::default(),
         };
         // Outside the lock: the data thread may take a while
-        let notes = self.check_conditions(&new).await?;
+        let notes = self.check_conditions(&mut new).await?;
         let summary = summary(&new);
         let kept = kept(&new);
         let id = self.stage(turn, |staging| match replacing {
@@ -253,27 +254,32 @@ impl ScheduleTool {
 
     /// Checks each of the request's conditions once now. Returns a note for the model about those
     /// already true.
-    async fn check_conditions(&self, new: &NewRequest) -> anyhow::Result<String> {
+    /// Notes each result in `new.checked`.
+    async fn check_conditions(&self, new: &mut NewRequest) -> anyhow::Result<String> {
         let until = match &new.repeat {
             Repeat::Every { until } => until.as_ref(),
             Repeat::Once => None,
         };
         let mut notes = String::new();
-        for (field, trigger, note) in [
+        let mut checked = Checked::default();
+        for (field, trigger, note, result) in [
             (
                 "trigger",
                 Some(&new.trigger),
                 "it fires only once that turns false and then true again",
+                &mut checked.trigger,
             ),
             (
                 "until",
                 until,
                 "it ends only once that turns false and then true again",
+                &mut checked.until,
             ),
             (
                 "stale_after",
                 new.stale_after.as_ref(),
                 "while it stays true, its answers are out of date and skipped",
+                &mut checked.stale_after,
             ),
         ] {
             let Some(Trigger::Condition { query }) = trigger else {
@@ -286,12 +292,14 @@ impl ScheduleTool {
                 .with_context(|| {
                     format!("the `{field}` condition failed, so nothing was changed")
                 })?;
+            *result = Some(holds);
             if holds {
                 notes.push_str(&format!(
                     " Its `{field}` condition is already true: {note}."
                 ));
             }
         }
+        new.checked = checked;
         Ok(notes)
     }
 }

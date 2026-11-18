@@ -439,13 +439,14 @@ impl SynthesizerInner {
                     let Some((requested, Model { path, gpu })) = next else {
                         return;
                     };
-                    // Its speech so far was in the old voice. The same voice moving to or from
-                    // the GPU carries on with it
-                    if loaded.as_ref() != Some(&path) {
-                        stream = None;
-                    }
                     let state = match Voice::load(&path, threads, gpu) {
                         Ok(next_voice) => {
+                            // Its speech so far was in the old voice. The same voice moving to or
+                            // from the GPU carries on with it, and so does the old voice when the
+                            // new one doesn't load
+                            if loaded.as_ref() != Some(&path) {
+                                stream = None;
+                            }
                             voice = Some(next_voice);
                             loaded = Some(path);
                             VoiceLoad::Loaded

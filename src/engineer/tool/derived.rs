@@ -1574,18 +1574,22 @@ impl LapBuild {
                 && rest.any(|d| d >= furthest * FIRST_DISTANCE)
         });
         // The length the lap's traces are built with: the layout's, or else the session's, as
-        // corners are found with; the lap's own furthest distance only without either
+        // corners are found with; the lap's own furthest distance only without either. The
+        // session's is the epoch's: until its first scoring, there's none
         let length = match self.length {
             Some(length) => Some(length),
-            None => scalar::<f64>(
-                conn,
-                "SELECT track_length FROM session ORDER BY id DESC LIMIT 1",
-                [],
-            )
-            .ok()
-            .flatten()
-            .filter(|length| *length > 0.0)
-            .or(self.furthest),
+            None => active_epoch(conn)
+                .and_then(|epoch| {
+                    scalar::<f64>(
+                        conn,
+                        "SELECT track_length FROM session WHERE id >= ?1 ORDER BY id DESC LIMIT 1",
+                        [epoch.session_from],
+                    )
+                })
+                .ok()
+                .flatten()
+                .filter(|length| *length > 0.0)
+                .or(self.furthest),
         };
         let extended = length.is_some_and(|length| {
             line_crossing_after_start(&self.samples, self.start, length).is_some()

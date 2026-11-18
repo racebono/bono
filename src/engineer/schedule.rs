@@ -93,6 +93,17 @@ pub struct NewRequest {
     pub stale_after: Option<Trigger>,
     /// The progress when it was asked for: the baseline of its trigger and its `until`
     pub made: Progress,
+    /// Its conditions as checked when it was asked for, in `made`'s epoch
+    pub checked: Checked,
+}
+
+/// What a request's conditions returned when it was asked for: the state a change is measured
+/// from, so one turning true before the data thread first checks it still counts
+#[derive(Clone, Debug, Default)]
+pub struct Checked {
+    pub trigger: Option<bool>,
+    pub until: Option<bool>,
+    pub stale_after: Option<bool>,
 }
 
 /// A change a turn makes to the schedule, applied once the turn finishes
@@ -207,6 +218,8 @@ struct Request {
     /// The epoch of a session start its session trigger missed: it was made before the start but
     /// applied after `advance` had seen it, so it's checked against that start on the next step
     missed_start: Option<i64>,
+    /// The same for its `until`, a session one: it ends for that start
+    until_missed_start: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -457,8 +470,10 @@ impl Schedule {
                     self.next_id = self.next_id.max(id.0 + 1);
                     let since = new.made.clone();
                     let missed = self.missed_start(&new.trigger, &new.made, &since);
-                    let mut request = self.request(id, new, since);
+                    let until_missed = self.until_missed_start(&new);
+                    let mut request = self.request(id, new, since, progress.epoch);
                     request.missed_start = missed;
+                    request.until_missed_start = until_missed;
                     self.requests.push(request);
                     ids.push(id);
                 }
@@ -488,9 +503,9 @@ impl Schedule {
                     };
                     let old = self.requests.remove(index);
                     // Counting carries on from the last firing, if it has fired since it was armed
-                    let since = match old.state {
-                        State::Armed { since } => since,
-                        State::Due { fired, .. } | State::InBatch { fired, .. } => fired,
+                    let since = match &old.state {
+                        State::Armed { since } => since.clone(),
+                        State::Due { fired, .. } | State::InBatch { fired, .. } => fired.clone(),
                         State::Ended => old
                             .waiting
                             .last()
@@ -505,10 +520,17 @@ impl Schedule {
                                 Trigger::Session { .. } => old.missed_start,
                                 _ => None,
                             });
-                    let mut request = self.request(id, new, since);
+                    let until_missed = self.until_missed_start(&new);
+                    let mut request = self.request(id, new, since, progress.epoch);
                     request.made = old.made;
                     request.waiting = old.waiting;
                     request.missed_start = missed;
+                    request.until_missed_start = until_missed;
+                    // Fired, and no scheduled turn has taken it yet: the next one answers it, as
+                    // it's asked for now
+                    if let State::Due { .. } = old.state {
+                        request.state = old.state;
+                    }
                     self.requests.insert(index, request);
                     ids.push(id);
                 }
@@ -593,11 +615,20 @@ impl Schedule {
                     starts,
                 )
             });
+            let until = match &request.repeat {
+                Repeat::Every {
+                    until: Some(trigger),
+                } => {
+                    self.missed_start_counts(trigger, &mut request.until_missed_start, progress)
+                        || until
+                }
+                _ => until,
+            };
             if !matches!(request.state, State::Armed { .. }) {
                 request.ending |= until;
             }
             let mut missed = matches!(request.state, State::Armed { .. })
-                && self.fires_for_missed_start(&mut request, progress);
+                && self.missed_start_counts(&request.trigger, &mut request.missed_start, progress);
             // A due request gone stale is armed again and checked once more on this snapshot, so
             // a trigger that lasts one snapshot (a session starting) isn't lost
             let mut ended = false;
@@ -789,6 +820,9 @@ impl Schedule {
         self.retry_at = None;
         self.cleared = false;
         self.last_start = None;
+        // Another recording's (the app following another simulator): its epochs aren't this one's
+        self.boundary = None;
+        self.session_start = None;
     }
 
     /// Every condition the data thread should check, by id
@@ -862,18 +896,30 @@ impl Schedule {
             .map_or(0, |r| r.waiting.len())
     }
 
-    fn request(&mut self, id: RequestId, new: NewRequest, since: Progress) -> Request {
+    /// At `epoch`, the current one: the conditions as checked when it was asked for are where
+    /// their changes are measured from, if that was in the same epoch
+    fn request(
+        &mut self,
+        id: RequestId,
+        new: NewRequest,
+        since: Progress,
+        epoch: Option<i64>,
+    ) -> Request {
+        let checked = match new.made.epoch == epoch {
+            true => new.checked,
+            false => Checked::default(),
+        };
         let stale_after = new.stale_after.unwrap_or(DEFAULT_STALE);
         let until = match &new.repeat {
-            Repeat::Every { until: Some(until) } => self.slot(until),
+            Repeat::Every { until: Some(until) } => self.slot(until, checked.until),
             _ => None,
         };
         Request {
             id,
             instruction: new.instruction,
-            trigger_slot: self.slot(&new.trigger),
+            trigger_slot: self.slot(&new.trigger, checked.trigger),
             until_slot: until,
-            stale_slot: self.slot(&stale_after),
+            stale_slot: self.slot(&stale_after, checked.stale_after),
             made: new.made,
             trigger: new.trigger,
             repeat: new.repeat,
@@ -882,6 +928,16 @@ impl Schedule {
             ending: false,
             waiting: Vec::new(),
             missed_start: None,
+            until_missed_start: None,
+        }
+    }
+
+    /// The session start a session `until` missed while the turn adding it ran (see
+    /// [`Self::missed_start`])
+    fn until_missed_start(&self, new: &NewRequest) -> Option<i64> {
+        match &new.repeat {
+            Repeat::Every { until: Some(until) } => self.missed_start(until, &new.made, &new.made),
+            _ => None,
         }
     }
 
@@ -896,10 +952,16 @@ impl Schedule {
         (before(made) && before(since)).then_some(start)
     }
 
-    /// Whether an armed request fires now for the session start it missed. A typed one waits for
-    /// that session's type while the session lasts; once it's settled either way, it's forgotten.
-    fn fires_for_missed_start(&self, request: &mut Request, progress: &Progress) -> bool {
-        let Some(epoch) = request.missed_start else {
+    /// Whether session `trigger` (a request's, or its `until`) is reached now by the start it
+    /// missed, `missed`. A typed one waits for that session's type while the session lasts; once
+    /// it's settled either way, `missed` is forgotten.
+    fn missed_start_counts(
+        &self,
+        trigger: &Trigger,
+        missed: &mut Option<i64>,
+        progress: &Progress,
+    ) -> bool {
+        let Some(epoch) = *missed else {
             return false;
         };
         // A later start is one `advance` sees in time
@@ -907,7 +969,7 @@ impl Schedule {
             .last_start
             .as_ref()
             .filter(|start| start.epoch == epoch);
-        let fires = match (&request.trigger, start) {
+        let fires = match (trigger, start) {
             (Trigger::Session { kind: None }, Some(_)) => true,
             (Trigger::Session { kind: Some(kind) }, Some(start)) => match &start.kind {
                 Some(now) => now.eq_ignore_ascii_case(kind),
@@ -916,11 +978,11 @@ impl Schedule {
             },
             _ => false,
         };
-        request.missed_start = None;
+        *missed = None;
         fires
     }
 
-    fn slot(&mut self, trigger: &Trigger) -> Option<Slot> {
+    fn slot(&mut self, trigger: &Trigger, last: Option<bool>) -> Option<Slot> {
         let Trigger::Condition { query } = trigger else {
             return None;
         };
@@ -929,7 +991,7 @@ impl Schedule {
         Some(Slot {
             id,
             query: query.clone(),
-            last: None,
+            last,
             failures: 0,
             rose: false,
         })
@@ -1111,6 +1173,7 @@ mod tests {
             repeat,
             stale_after: None,
             made: made.clone(),
+            checked: Checked::default(),
         }
     }
 
@@ -1291,6 +1354,35 @@ mod tests {
         assert!(run.due().is_empty());
         run.tick(with(laps(0), cond, ConditionState::True));
         assert_eq!(run.due(), [id]);
+    }
+
+    #[test]
+    fn condition_false_when_made_fires_on_its_first_true() {
+        let mut run = Run::new();
+        let mut new = request(condition("SELECT 1"), Repeat::Once, &laps(0));
+        new.checked.trigger = Some(false);
+        let id = run.add(new);
+        let [cond] = run.condition_ids()[..] else {
+            panic!("one condition")
+        };
+        // It turned true while the turn adding it ran
+        run.tick(with(laps(0), cond, ConditionState::True));
+        assert_eq!(run.due(), [id]);
+    }
+
+    #[test]
+    fn a_condition_checked_in_another_epoch_has_no_baseline() {
+        let mut run = Run::new();
+        let mut new = request(condition("SELECT 1"), Repeat::Once, &laps(0));
+        new.checked.trigger = Some(false);
+        let id = run.schedule.next_id();
+        let now = new_epoch(laps(0), 2, &["session"]);
+        run.schedule.apply(vec![Change::Add(id, new)], &now);
+        let [cond] = run.condition_ids()[..] else {
+            panic!("one condition")
+        };
+        run.tick(with(new_epoch(laps(0), 2, &[]), cond, ConditionState::True));
+        assert!(run.due().is_empty());
     }
 
     #[test]
@@ -2344,6 +2436,52 @@ mod tests {
             &later,
         );
         run.tick(new_epoch(laps(0), 2, &[]));
+        assert_eq!(run.due(), [id]);
+    }
+
+    #[test]
+    fn a_session_until_ends_for_a_start_it_missed() {
+        let mut run = Run::new();
+        run.tick(laps(0));
+        // Made before the race's start, applied after it
+        let made = laps(0);
+        run.tick(new_epoch(laps(0), 2, &["session"]));
+        let until = Some(Trigger::Session { kind: None });
+        run.add(request(
+            Trigger::Time { seconds: 10.0 },
+            Repeat::Every { until },
+            &made,
+        ));
+        run.tick(new_epoch(at(5.0, 0), 2, &[]));
+        assert_eq!(run.schedule.len(), 0);
+    }
+
+    #[test]
+    fn a_replace_keeps_a_firing_not_yet_answered() {
+        let mut run = Run::new();
+        let id = run.add(request(Trigger::Laps { count: 1 }, Repeat::Once, &laps(0)));
+        run.tick(laps(1));
+        assert_eq!(run.due(), [id]);
+        // The pilot's turn, running meanwhile, changes it
+        let made = laps(1);
+        let replacing = request(Trigger::Laps { count: 1 }, Repeat::Once, &made);
+        run.schedule
+            .apply(vec![Change::Replace(id, replacing)], &made);
+        assert_eq!(run.due(), [id]);
+    }
+
+    #[test]
+    fn a_clear_forgets_the_last_boundary() {
+        let mut run = Run::new();
+        run.tick(new_epoch(laps(0), 5, &["session"]));
+        run.schedule.clear();
+        // Another simulator's recording, whose epoch started before that one
+        let mut made = laps(0);
+        made.epoch = Some(2);
+        let id = run.add(request(Trigger::Laps { count: 1 }, Repeat::Once, &made));
+        let mut lap = laps(1);
+        lap.epoch = Some(2);
+        run.tick(lap);
         assert_eq!(run.due(), [id]);
     }
 

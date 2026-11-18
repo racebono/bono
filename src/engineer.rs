@@ -2400,11 +2400,14 @@ async fn game_session(
                     .query_row([], |row| row.get::<_, Option<i64>>(0))?,
                 false => None,
             };
+            // The active epoch's: a session just started has none until its first scoring, and
+            // the epoch before's isn't the one being driven
+            let epoch = bono_sim::sql::active_epoch(conn)?;
             let session = conn
                 .query_row(
                     "SELECT track, session_type, session_number, session_end_time FROM session \
-                     ORDER BY id DESC LIMIT 1",
-                    [],
+                     WHERE id >= ?1 ORDER BY id DESC LIMIT 1",
+                    [epoch.session_from],
                     |row| {
                         let session_type = row.get::<_, Option<String>>(1)?.unwrap_or_default();
                         let key = format!(

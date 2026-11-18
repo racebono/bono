@@ -3764,6 +3764,7 @@ mod evals {
                 repeat,
                 stale_after,
                 made: progress.clone(),
+                checked: Default::default(),
             };
             let applied = schedule.apply(vec![Change::Add(id, new)], progress);
             assert_eq!(
