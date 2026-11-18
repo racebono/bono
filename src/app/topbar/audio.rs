@@ -247,9 +247,7 @@ impl AudioTopbar {
                         let config = config.get();
                         config.master_volume() * config.engineer_volume()
                     };
-                    for sample in &mut speech.samples {
-                        *sample *= gain;
-                    }
+                    speech.amplify(gain);
                     if let Some(device) = self.speaker.get() {
                         match speech.play(device) {
                             Ok(stream) => self.test_playback = Some(stream),

@@ -605,10 +605,11 @@ impl Spotter {
             let config = config.get();
             *config.master_volume() * *config.spotter_volume()
         };
-        let speech = Speech {
-            samples: speech.samples.iter().map(|sample| sample * gain).collect(),
+        let mut speech = Speech {
+            samples: speech.samples.clone(),
             sample_rate: speech.sample_rate,
         };
+        speech.amplify(gain);
         match speech.play(speaker) {
             Ok(stream) => Some(Saying::Playing {
                 stream,
