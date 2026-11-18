@@ -262,6 +262,8 @@ impl ScheduleTool {
         };
         let mut notes = String::new();
         let mut checked = Checked::default();
+        // Snapshots after this one were measured after every check
+        let mut seq = 0;
         for (field, trigger, note, result) in [
             (
                 "trigger",
@@ -285,20 +287,22 @@ impl ScheduleTool {
             let Some(Trigger::Condition { query }) = trigger else {
                 continue;
             };
-            let holds = self
+            let (holds, at) = self
                 .engineer
-                .check_condition(query.clone())
+                .check_condition_at(query.clone())
                 .await
                 .with_context(|| {
                     format!("the `{field}` condition failed, so nothing was changed")
                 })?;
             *result = Some(holds);
+            seq = seq.max(at);
             if holds {
                 notes.push_str(&format!(
                     " Its `{field}` condition is already true: {note}."
                 ));
             }
         }
+        checked.seq = seq;
         new.checked = checked;
         Ok(notes)
     }

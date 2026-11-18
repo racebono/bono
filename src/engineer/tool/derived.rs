@@ -298,21 +298,29 @@ pub(super) enum Job {
 pub(super) enum Answer {
     /// A query's rows or the track's description, for the model
     Text(String),
-    /// Whether a condition returned a row
-    Holds(bool),
+    /// Whether a condition returned a row, and the last progress snapshot published by then: a
+    /// later one was measured after it
+    Holds(bool, u64),
 }
 
 impl Answer {
     pub fn text(self) -> anyhow::Result<String> {
         match self {
             Self::Text(text) => Ok(text),
-            Self::Holds(_) => bail!("the engineer's data thread answered another question"),
+            Self::Holds(..) => bail!("the engineer's data thread answered another question"),
         }
     }
 
     pub fn holds(self) -> anyhow::Result<bool> {
         match self {
-            Self::Holds(holds) => Ok(holds),
+            Self::Holds(holds, _) => Ok(holds),
+            Self::Text(_) => bail!("the engineer's data thread answered another question"),
+        }
+    }
+
+    pub fn holds_at(self) -> anyhow::Result<(bool, u64)> {
+        match self {
+            Self::Holds(holds, seq) => Ok((holds, seq)),
             Self::Text(_) => bail!("the engineer's data thread answered another question"),
         }
     }
@@ -394,7 +402,10 @@ fn thread(shared: &Shared, requests: &mpsc::Receiver<Request>) {
                     Job::Sql { query, limit } => {
                         (data.sql(shared, &query, limit, abandoned)).map(Answer::Text)
                     }
-                    Job::Condition { query } => data.condition(shared, &query).map(Answer::Holds),
+                    Job::Condition { query } => {
+                        let seq = data.watch.seq;
+                        (data.condition(shared, &query)).map(|holds| Answer::Holds(holds, seq))
+                    }
                     Job::Track => {
                         // Following the recording's newest epoch, for the session it's about
                         if let Err(e) = data.stream.tick(&data.conn, shared) {

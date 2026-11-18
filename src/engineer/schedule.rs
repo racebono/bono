@@ -104,6 +104,9 @@ pub struct Checked {
     pub trigger: Option<bool>,
     pub until: Option<bool>,
     pub stale_after: Option<bool>,
+    /// The last progress snapshot published when they were checked: a later one was measured
+    /// after them
+    pub seq: u64,
 }
 
 /// A change a turn makes to the schedule, applied once the turn finishes
@@ -522,8 +525,12 @@ impl Schedule {
                                 Repeat::Every { until } => until.as_ref(),
                                 Repeat::Once => None,
                             };
-                    if matches!(current.state, State::Ended)
-                        && (until_reached || !answered.iter().any(|f| f.id == id))
+                    // Its `until`, kept by the replace, reached while it waited due or its turn
+                    // ran: its firing waiting is its last, and it stays as it was, whatever the
+                    // replace changes
+                    if until_reached
+                        || (matches!(current.state, State::Ended)
+                            && !answered.iter().any(|f| f.id == id))
                     {
                         missing.push(id);
                         continue;
@@ -557,8 +564,7 @@ impl Schedule {
                     let until_missed = self
                         .until_missed_start(&new)
                         .or(old.until_missed_start.filter(|_| same_until));
-                    // Its conditions were checked once that snapshot was out
-                    let checked_after = new.made.seq;
+                    let checked_after = new.checked.seq;
                     let mut request = self.request(id, new, since, progress.epoch);
                     request.made = old.made;
                     request.waiting = old.waiting;
@@ -601,10 +607,6 @@ impl Schedule {
                             at,
                             step,
                         };
-                        // Its `until`, the same, reached while it waited: this is its last firing
-                        if request.until() == old_until.as_ref() {
-                            request.ending = old.ending;
-                        }
                     }
                     self.requests.insert(index, request);
                     ids.push(id);
@@ -763,12 +765,17 @@ impl Schedule {
                     break;
                 }
                 advance.skipped_stale += 1;
-                if matches!(request.repeat, Repeat::Once) || ending_before {
+                // Fired on this very snapshot: checking again would fire it again, just as stale
+                let fired_now = fired.seq == progress.seq;
+                // Its last firing gone stale: one waiting from before this step's `until`, or
+                // this step's own
+                if matches!(request.repeat, Repeat::Once)
+                    || ending_before
+                    || (fired_now && request.ending)
+                {
                     ended = true;
                     break;
                 }
-                // Fired on this very snapshot: checking again would fire it again, just as stale
-                let fired_now = fired.seq == progress.seq;
                 let since = request.rearm_from(since, fired);
                 request.state = State::Armed { since };
                 if fired_now {
@@ -2666,6 +2673,7 @@ mod tests {
         // Its turn rewords it, checking it false: no snapshot since
         let mut replacing = request(condition("SELECT 1"), every(), &run.last.clone());
         replacing.checked.trigger = Some(false);
+        replacing.checked.seq = run.last.seq;
         run.schedule.answered(&batch.fired);
         let now = run.last.clone();
         run.schedule
@@ -2811,6 +2819,54 @@ mod tests {
         assert_eq!(advance.skipped_stale, 1);
         assert_eq!(run.due(), [id]);
         run.answer();
+        assert_eq!(run.schedule.len(), 0);
+    }
+
+    #[test]
+    fn a_last_firing_stale_at_once_ends_it() {
+        let mut run = Run::new();
+        let mut new = request(
+            Trigger::Laps { count: 1 },
+            Repeat::Every {
+                until: Some(condition("SELECT 1")),
+            },
+            &laps(0),
+        );
+        new.stale_after = Some(condition("SELECT 2"));
+        run.add(new);
+        let [until, stale] = run.condition_ids()[..] else {
+            panic!("two conditions")
+        };
+        let both = |progress: Progress, state| with(with(progress, until, state), stale, state);
+        run.tick(both(laps(0), ConditionState::False));
+        // Its last lap, its `until` reached and its answer out of date at once
+        let advance = run.tick(both(laps(1), ConditionState::True));
+        assert_eq!(advance.skipped_stale, 1);
+        assert_eq!(run.schedule.len(), 0);
+    }
+
+    #[test]
+    fn a_replace_after_its_until_was_reached_while_due_leaves_it_as_it_was() {
+        let mut run = Run::new();
+        let repeat = || Repeat::Every {
+            until: Some(condition("SELECT 1")),
+        };
+        let id = run.add(request(Trigger::Laps { count: 1 }, repeat(), &laps(0)));
+        let [cond] = run.condition_ids()[..] else {
+            panic!("one condition")
+        };
+        run.tick(with(laps(0), cond, ConditionState::False));
+        run.tick(with(laps(1), cond, ConditionState::False));
+        assert_eq!(run.due(), [id]);
+        // Its `until` while the pilot's turn runs, which makes it every two laps
+        run.tick(with(laps(1), cond, ConditionState::True));
+        let replacing = request(Trigger::Laps { count: 2 }, repeat(), &laps(1));
+        let applied = run
+            .schedule
+            .apply(vec![Change::Replace(id, replacing)], &laps(1));
+        assert_eq!(applied.missing, [id]);
+        // Its last firing is answered, and it's done
+        assert_eq!(run.answer(), [id]);
         assert_eq!(run.schedule.len(), 0);
     }
 
