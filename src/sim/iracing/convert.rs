@@ -271,15 +271,16 @@ impl Converter {
             .last_time
             .map(|last| time - last)
             .filter(|dt| *dt > 0.0);
+        let went_back = self.last_time.is_some_and(|last| time < last);
         self.last_time = Some(time);
 
         let event = (info.event, info.track.clone());
         let new_event = self.event.as_ref().is_some_and(|last| *last != event);
         self.event = Some(event);
         let session = (frame.i32("SessionNum"), frame.i32("SessionUniqueID"));
-        // Another session is scored right away, for the recorder to tell from the scoring before
-        // this update's telemetry
-        let boundary = new_event || self.session != Some(session);
+        // Another session, or the clock going back, is scored right away, for the recorder to tell
+        // from the scoring before this update's telemetry (and before the clock moves on again)
+        let boundary = new_event || self.session != Some(session) || went_back;
         // Another session, or its clock went back (a restart, a replay rewound)
         if new_event || self.session != Some(session) || dt.is_none() {
             self.cars.clear();
@@ -4035,6 +4036,47 @@ mod tests {
         assert!(replayed.is_none());
         assert_eq!(converter.last_time, Some(500.0));
         assert!(converter.cars.contains_key(&0));
+    }
+
+    /// The clock going back is scored at once, however soon after the last scoring.
+    #[test]
+    fn a_clock_going_back_is_scored_at_once() {
+        use super::super::sdk::{Value, Vars};
+        use super::super::session::{Driver, Session};
+        let info = SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: HashMap::from([(0, Driver::default())]),
+            sessions: vec![Session {
+                num: 0,
+                kind: Some("race"),
+                number: 1,
+                results: HashMap::new(),
+            }],
+            ..Default::default()
+        };
+        let frame = |t: f64| {
+            Vars::of(&[
+                ("SessionTime", Value::Double(t)),
+                ("SessionNum", Value::Int(0)),
+                ("SessionState", Value::Int(STATE_RACING)),
+                ("PlayerCarIdx", Value::Int(0)),
+                ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
+                ("CarIdxLapCompleted", Value::Ints(vec![2])),
+            ])
+        };
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        let (vars, data) = frame(100.0);
+        let first = converter.convert(&Frame::new(&vars, &data), &info, start);
+        assert!(first.unwrap().scoring.is_some());
+        let soon = start + std::time::Duration::from_millis(20);
+        let (vars, data) = frame(100.1);
+        let on = converter.convert(&Frame::new(&vars, &data), &info, soon);
+        assert!(on.unwrap().scoring.is_none());
+        let (vars, data) = frame(98.9);
+        let back = converter.convert(&Frame::new(&vars, &data), &info, soon);
+        assert!(back.unwrap().scoring.is_some());
     }
 
     /// Fast repair alone in the pit menu is a service selected, not none; unticked, it's no word on

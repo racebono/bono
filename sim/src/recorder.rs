@@ -17,7 +17,7 @@ use crate::{
     sys::{bono_forecast_point, bono_session_info, bono_standing, bono_telemetry},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
@@ -246,6 +246,7 @@ impl Recorder {
         }
         tracking.advance(vehicle_id, session_time, speed);
         if self.is_player(vehicle_id) {
+            tracking.kept.insert(vehicle_id);
             return true;
         }
 
@@ -257,6 +258,9 @@ impl Recorder {
         let updates = tracking.opponent_updates.entry(vehicle_id).or_default();
         let keep = *updates % frequency == 0;
         *updates = updates.wrapping_add(1);
+        if keep {
+            tracking.kept.insert(vehicle_id);
+        }
         return keep;
     }
 
@@ -265,16 +269,13 @@ impl Recorder {
     pub fn push_telemetry(&self, telemetry: &bono_telemetry) {
         // Held until it's queued: an epoch started meanwhile (on another thread) would have it
         // tagged with the new epoch but filled in from the old one
-        let tracking = lock(&self.tracking);
-        // Checked again: the clock may have gone back since `wants_telemetry` kept it (scoring on
-        // another thread starting an epoch), and the update belongs to the timeline before
-        if tracking.replay
-            || telemetry
-                .session_time
-                .get()
-                .zip(tracking.scoring_time)
-                .is_some_and(|(time, scoring)| time < scoring - 1.0)
-        {
+        let mut tracking = lock(&self.tracking);
+        // Only what `wants_telemetry` kept in this epoch: one started since (on another thread) is
+        // another timeline's, which the update isn't part of
+        let kept = tracking
+            .kept
+            .remove(&telemetry.vehicle_id.get().unwrap_or(-1));
+        if tracking.replay || !kept {
             return;
         }
         let mut telemetry = *telemetry;
@@ -354,7 +355,7 @@ impl Recorder {
                 let mut queue = lock(&self.shared.queue);
                 self.start_epoch(&mut tracking, &mut queue, reason);
             }
-            tracking.scored_start = reason.is_some();
+            tracking.scored_start = reason;
             tracking.session_key = Some(key);
             if let Some(time) = session.session_time.get() {
                 tracking.scoring_time = Some(tracking.scoring_time.map_or(time, |t| t.max(time)));
@@ -407,10 +408,11 @@ impl Recorder {
     pub fn begin_epoch(&self, reason: EpochReason) {
         let mut tracking = lock(&self.tracking);
         let mut queue = lock(&self.shared.queue);
-        // The scoring told first, and nothing's been scored since: the adapter is telling the same
-        // start (a game that scores a session before saying it started). The scoring's reason
-        // stands: the writer may have written it already
-        if std::mem::take(&mut tracking.scored_start) {
+        // The scoring told first, for the same reason, and nothing's been scored since: the
+        // adapter is telling the same start (a game that scores a session before saying it
+        // started). For another reason (a restart's clock going back, then the game saying a
+        // session started) it's an epoch of its own, whichever came first
+        if tracking.scored_start.take() == Some(reason) {
             return;
         }
         self.start_epoch(&mut tracking, &mut queue, reason);
@@ -588,9 +590,12 @@ struct Tracking {
     scoring_time: Option<f64>,
     /// A replay is playing: nothing is recorded until the scoring is live again
     replay: bool,
-    /// The scoring started the epoch, and none has been queued since: an adapter starting one now
-    /// is telling the same start (see `begin_epoch`)
-    scored_start: bool,
+    /// Why the scoring started the epoch, if it did and none has been queued since: an adapter
+    /// starting one now for the same reason is telling the same start (see `begin_epoch`)
+    scored_start: Option<EpochReason>,
+    /// The cars `wants_telemetry` kept an update of, until `push_telemetry` queues it: an epoch
+    /// starting in between forgets them
+    kept: HashSet<i64>,
 }
 
 struct LapDistance {
@@ -992,7 +997,7 @@ mod tests {
         }
         recorder.restart(None).unwrap();
         // Still the player's car, before any scoring since
-        recorder.push_telemetry(&telemetry(1, 500.0));
+        record(&recorder, &telemetry(1, 500.0));
         // A restart of the race the writer failed in, with no adapter to say so
         recorder.push_scoring(session("Spa", "race", 3.0), vec![standing(1, true, 0.0)]);
         drop(recorder);
@@ -1012,6 +1017,15 @@ mod tests {
         session.session_number = Some(1).into();
         session.session_time = Some(time).into();
         session
+    }
+
+    /// What an adapter does with an update: pushes it if `wants_telemetry` keeps it.
+    fn record(recorder: &Recorder, telemetry: &bono_telemetry) {
+        let vehicle = telemetry.vehicle_id.get().unwrap_or(-1);
+        let time = telemetry.session_time.get().unwrap_or(0.0);
+        if recorder.wants_telemetry(vehicle, time, 0.0) {
+            recorder.push_telemetry(telemetry);
+        }
     }
 
     fn telemetry(vehicle: i64, time: f64) -> bono_telemetry {
@@ -1048,13 +1062,13 @@ mod tests {
             session("Spa", "practice", 100.0),
             vec![standing(1, true, 0.0)],
         );
-        recorder.push_telemetry(&telemetry(1, 100.0));
+        record(&recorder, &telemetry(1, 100.0));
         // Qualifying, later on the clock, spectating: nobody's car is the player's
         recorder.push_scoring(
             session("Spa", "qualifying", 200.0),
             vec![standing(1, false, 0.0)],
         );
-        recorder.push_telemetry(&telemetry(1, 200.0));
+        record(&recorder, &telemetry(1, 200.0));
         drop(recorder);
 
         let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
@@ -1111,6 +1125,22 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_kept_before_an_epoch_started_is_not_queued_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(session("Spa", "race", 500.0), vec![standing(1, true, 0.0)]);
+        assert!(recorder.wants_telemetry(1, 500.2, 10.0));
+        // A restart scored on another thread before the update is pushed
+        recorder.push_scoring(session("Spa", "race", 3.0), vec![standing(1, true, 0.0)]);
+        recorder.push_telemetry(&telemetry(1, 500.2));
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        assert_eq!(reasons(&conn), ["start", "clock_rollback"]);
+        assert!(telemetry_rows(&conn).is_empty());
+    }
+
+    #[test]
     fn a_session_the_scoring_tells_first_is_one_epoch() {
         let dir = tempfile::tempdir().unwrap();
         let recorder = Recorder::new(dir.path(), None).unwrap();
@@ -1129,6 +1159,20 @@ mod tests {
 
         let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
         assert_eq!(reasons(&conn), ["start", "session", "session"]);
+    }
+
+    #[test]
+    fn a_restart_the_scoring_tells_first_is_still_a_session_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(session("Spa", "race", 500.0), vec![standing(1, true, 0.0)]);
+        // The same session again, its clock back at the start, before the game says it started
+        recorder.push_scoring(session("Spa", "race", 0.0), vec![standing(1, true, 0.0)]);
+        recorder.begin_epoch(EpochReason::Session);
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        assert_eq!(reasons(&conn), ["start", "clock_rollback", "session"]);
     }
 
     #[test]
@@ -1152,12 +1196,12 @@ mod tests {
         let recorder = Recorder::new(dir.path(), None).unwrap();
         // Scoring and telemetry queued on both sides of a boundary, however the writer batches them
         recorder.push_scoring(session("Spa", "race", 10.0), vec![standing(1, true, 0.0)]);
-        recorder.push_telemetry(&telemetry(1, 10.0));
+        record(&recorder, &telemetry(1, 10.0));
         recorder.begin_epoch(EpochReason::Session);
         // The slot is reused by someone else, whose state must be written again
-        recorder.push_telemetry(&telemetry(1, 0.5));
+        record(&recorder, &telemetry(1, 0.5));
         recorder.push_scoring(session("Spa", "race", 1.0), vec![standing(1, true, 0.0)]);
-        recorder.push_telemetry(&telemetry(1, 1.0));
+        record(&recorder, &telemetry(1, 1.0));
         drop(recorder);
 
         let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
@@ -1242,6 +1286,8 @@ mod tests {
     #[test]
     fn forgets_the_player_when_cleared_or_spectating() {
         let dir = tempfile::tempdir().unwrap();
+        // Every opponent update kept: car 1 is one, once it's nobody's
+        fs::write(dir.path().join(SETTINGS), r#"{"opponent_frequency": 1}"#).unwrap();
         let recorder = Recorder::new(dir.path(), None).unwrap();
         let telemetry = |vehicle: i64| {
             let mut telemetry = bono_telemetry::default();
@@ -1250,17 +1296,17 @@ mod tests {
         };
 
         recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
-        recorder.push_telemetry(&telemetry(1));
+        record(&recorder, &telemetry(1));
         written(&recorder);
 
         // A new weekend: car 1 is someone else's until scoring says otherwise
         recorder.clear();
-        recorder.push_telemetry(&telemetry(1));
+        record(&recorder, &telemetry(1));
         written(&recorder);
 
         // Spectating: nobody is the player
         recorder.push_scoring(bono_session_info::default(), vec![standing(1, false, 0.0)]);
-        recorder.push_telemetry(&telemetry(1));
+        record(&recorder, &telemetry(1));
         drop(recorder);
 
         let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();

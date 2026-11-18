@@ -220,6 +220,9 @@ struct Request {
     missed_start: Option<i64>,
     /// The same for its `until`, a session one: it ends for that start
     until_missed_start: Option<i64>,
+    /// Its condition turned true again while its scheduled turn ran: it fires for that once it's
+    /// armed again
+    rose_in_batch: bool,
 }
 
 #[derive(Debug)]
@@ -375,9 +378,13 @@ impl Request {
                 }
                 // Any session starting is a boundary, so the rule above covers it
                 Trigger::Session { .. } => false,
-                // Stale while true; a failed or missing check isn't
+                // Stale while true; a failed or missing check isn't. Until the data thread has
+                // checked it, as it was checked when the request was asked for
                 Trigger::Condition { .. } => self.stale_slot.as_ref().is_some_and(|slot| {
-                    progress.conditions.get(&slot.id) == Some(&ConditionState::True)
+                    match progress.conditions.get(&slot.id) {
+                        Some(state) => *state == ConditionState::True,
+                        None => slot.last == Some(true),
+                    }
                 }),
             }
     }
@@ -529,7 +536,15 @@ impl Schedule {
                                 Trigger::Session { .. } => old.missed_start,
                                 _ => None,
                             });
-                    let until_missed = self.until_missed_start(&new);
+                    // The same `until` keeps a start it missed (the old one made before it)
+                    let same_until = old_until.as_ref()
+                        == match &new.repeat {
+                            Repeat::Every { until } => until.as_ref(),
+                            Repeat::Once => None,
+                        };
+                    let until_missed = self
+                        .until_missed_start(&new)
+                        .or(old.until_missed_start.filter(|_| same_until));
                     let mut request = self.request(id, new, since, progress.epoch);
                     request.made = old.made;
                     request.waiting = old.waiting;
@@ -668,8 +683,17 @@ impl Schedule {
             {
                 request.missed_start = Some(epoch);
             }
-            let mut missed = matches!(request.state, State::Armed { .. })
-                && self.missed_start_counts(&request.trigger, &mut request.missed_start, progress);
+            // The same for its condition turning true again
+            if matches!(request.state, State::InBatch { .. })
+                && request.trigger_slot.as_ref().is_some_and(|slot| slot.rose)
+            {
+                request.rose_in_batch = true;
+            }
+            let mut missed = matches!(request.state, State::Armed { .. }) && {
+                let start =
+                    self.missed_start_counts(&request.trigger, &mut request.missed_start, progress);
+                std::mem::take(&mut request.rose_in_batch) || start
+            };
             // A due request gone stale is armed again and checked once more on this snapshot, so
             // a trigger that lasts one snapshot (a session starting) isn't lost
             let mut ended = false;
@@ -970,6 +994,7 @@ impl Schedule {
             waiting: Vec::new(),
             missed_start: None,
             until_missed_start: None,
+            rose_in_batch: false,
         }
     }
 
@@ -1069,6 +1094,8 @@ impl Schedule {
                     at: *at,
                     step: *step,
                 };
+                // The turn that answers it now is after that rise: its answer covers it
+                request.rose_in_batch = false;
             }
         }
         self.batch_out = false;
@@ -2565,6 +2592,39 @@ mod tests {
             .apply(vec![Change::Replace(id, replacing)], &made);
         assert_eq!(applied.missing, [id]);
         assert_eq!(run.schedule.len(), 0);
+    }
+
+    #[test]
+    fn a_condition_rising_while_its_turn_runs_fires_it_again() {
+        let mut run = Run::new();
+        let id = run.add(request(condition("SELECT 1"), every(), &laps(0)));
+        let [cond] = run.condition_ids()[..] else {
+            panic!("one condition")
+        };
+        run.tick(with(laps(0), cond, ConditionState::False));
+        run.tick(with(laps(0), cond, ConditionState::True));
+        assert_eq!(run.due(), [id]);
+        let batch = run.take();
+        // False and true again while the turn answering it runs
+        run.tick(with(laps(0), cond, ConditionState::False));
+        run.tick(with(laps(0), cond, ConditionState::True));
+        run.schedule.answered(&batch.fired);
+        run.schedule.resolved(&batch.fired);
+        run.tick(with(laps(0), cond, ConditionState::True));
+        assert_eq!(run.due(), [id]);
+    }
+
+    #[test]
+    fn a_stale_condition_true_when_asked_counts_before_its_first_check() {
+        let mut run = Run::new();
+        let mut new = request(Trigger::Laps { count: 1 }, Repeat::Once, &laps(0));
+        new.stale_after = Some(condition("SELECT 1"));
+        new.checked.stale_after = Some(true);
+        run.add(new);
+        // Fired, its condition not checked yet: stale, and skipped
+        let advance = run.tick(laps(1));
+        assert_eq!(advance.skipped_stale, 1);
+        assert!(run.due().is_empty());
     }
 
     #[test]
