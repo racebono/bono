@@ -41,6 +41,8 @@ void bono_lmu_clear(bono_lmu_recorder* recorder);
 // A session started: what's recorded from now on is a new epoch of the recording, which readers keep apart
 // from the earlier sessions'.
 void bono_lmu_begin_session(bono_lmu_recorder* recorder);
+// Whether the game is in realtime, where the car can be driven: the player's damage is only asked for then.
+void bono_lmu_set_realtime(bono_lmu_recorder* recorder, bool realtime);
 // Whether recording stopped on an error: nothing more is recorded until it is restarted.
 bool bono_lmu_failed(bono_lmu_recorder* recorder);
 
