@@ -385,9 +385,10 @@ mod tests {
     fn only_asked_in_realtime() {
         let (asked_tx, asked) = mpsc::channel();
         let (answer, answer_rx) = mpsc::channel::<Condition>();
+        // Bounded, so a failing assertion can't leave dropping `condition` waiting on the question
         let condition = VehicleCondition::with(Duration::from_millis(1), move || {
             let _ = asked_tx.send(());
-            answer_rx.recv().ok()
+            answer_rx.recv_timeout(Duration::from_secs(5)).ok()
         });
         damage(&condition, true, Instant::now());
         assert!(asked.recv_timeout(Duration::from_millis(50)).is_err());
