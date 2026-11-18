@@ -231,7 +231,8 @@ pub struct Spotter {
     warm_failed: HashMap<CacheKey, Instant>,
 }
 
-type CacheKey = (ArrayStr<2>, PathBuf, u32, String);
+/// The language, the voice, the radio effect and speech speed (as bits), and the words
+type CacheKey = (ArrayStr<2>, PathBuf, u32, u32, String);
 
 struct Running {
     db: PathBuf,
@@ -432,6 +433,7 @@ impl Spotter {
             lang,
             voice.unwrap_or_default(),
             config.radio_effect().to_bits(),
+            config.speech_speed().to_bits(),
             words,
         )
     }
@@ -2127,7 +2129,7 @@ mod tests {
         let now = Instant::now();
         for closed in [false, true] {
             let mut spotter = Spotter::new();
-            let key = (arrstr!("en"), PathBuf::new(), 0, "car left".into());
+            let key = (arrstr!("en"), PathBuf::new(), 0, 0, "car left".into());
             let (send, recv) = oneshot::channel();
             spotter.warming.push((key.clone(), recv));
             if closed {
@@ -2140,9 +2142,10 @@ mod tests {
             assert!(spotter.cache.is_empty());
             assert!(spotter.warm_failed.contains_key(&key));
             for changed in [
-                (arrstr!("es"), key.1.clone(), key.2, key.3.clone()),
-                (key.0, PathBuf::from("voice.onnx"), key.2, key.3.clone()),
-                (key.0, key.1.clone(), 1.0_f32.to_bits(), key.3.clone()),
+                (arrstr!("es"), key.1.clone(), key.2, key.3, key.4.clone()),
+                (key.0, PathBuf::from("voice.onnx"), key.2, key.3, key.4.clone()),
+                (key.0, key.1.clone(), 1.0_f32.to_bits(), key.3, key.4.clone()),
+                (key.0, key.1.clone(), key.2, 1.5_f32.to_bits(), key.4.clone()),
             ] {
                 assert!(!spotter.warm_failed.contains_key(&changed));
             }
@@ -2154,9 +2157,26 @@ mod tests {
     }
 
     #[test]
+    fn a_new_speed_is_a_new_call_with_the_beep_still_off() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let lang = arrstr!("en");
+        let before = Spotter::key(&config, lang, "car left".into());
+
+        config.update(|raw| raw.speech_speed.set(1.5));
+        assert_ne!(Spotter::key(&config, lang, "car left".into()), before);
+        let effects = Spotter::effects(&config);
+        assert_eq!(effects.speed, 1.5);
+        assert_eq!(effects.beep_volume, 0.0);
+    }
+
+    #[test]
     fn warmups_keep_pending_jobs_and_cache_successes() {
         let mut spotter = Spotter::new();
-        let key = (arrstr!("en"), PathBuf::new(), 0, "car left".into());
+        let key = (arrstr!("en"), PathBuf::new(), 0, 0, "car left".into());
         let (send, recv) = oneshot::channel();
         spotter.warming.push((key.clone(), recv));
         spotter.finish_warming(Instant::now());
@@ -2326,7 +2346,7 @@ mod tests {
         let mut spotter = Spotter::new();
         let (send, recv) = oneshot::channel();
         spotter.saying = Some(Saying::Synthesizing {
-            key: (arrstr!("en"), PathBuf::new(), 0, text.into()),
+            key: (arrstr!("en"), PathBuf::new(), 0, 0, text.into()),
             recv,
             call: Raised {
                 text,
