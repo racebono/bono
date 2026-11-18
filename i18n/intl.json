@@ -1035,6 +1035,12 @@
         "ca": "bandera verda, bandera verda",
         "it": "bandiera verde, bandiera verde"
     },
+    "call.race_start": {
+        "en": "green, green, green",
+        "es": "verde, verde, verde",
+        "ca": "verd, verd, verd",
+        "it": "verde, verde, verde"
+    },
     "call.red_flag": {
         "en": "red flag",
         "es": "bandera roja",

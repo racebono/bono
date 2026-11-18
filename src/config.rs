@@ -608,6 +608,8 @@ settings! {
         /// The time of each of the pilot's laps in qualifying, said once it's over (not for laps
         /// invalidated, or through the pit lane)
         pub qualifying_lap_times: bool = false,
+        /// The race going green: at the start, and as it restarts after a red flag
+        pub race_starts: bool = true,
     }
 }
 
