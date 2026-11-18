@@ -271,6 +271,8 @@ struct Slot {
     failures: u32,
     /// It turned from false to true on the last step
     rose: bool,
+    /// The snapshot `last` is from
+    seen: u64,
 }
 
 impl Slot {
@@ -291,6 +293,7 @@ impl Slot {
                 let now = *state == ConditionState::True;
                 self.rose = self.last == Some(false) && now;
                 self.last = Some(now);
+                self.seen = progress.seq;
                 self.failures = 0;
             }
         }
@@ -554,21 +557,32 @@ impl Schedule {
                     let until_missed = self
                         .until_missed_start(&new)
                         .or(old.until_missed_start.filter(|_| same_until));
+                    // Its conditions were checked once that snapshot was out
+                    let checked_after = new.made.seq;
                     let mut request = self.request(id, new, since, progress.epoch);
                     request.made = old.made;
                     request.waiting = old.waiting;
                     request.missed_start = missed;
                     request.until_missed_start = until_missed;
-                    // The same trigger carries on from where the old one's condition is (newer
-                    // than the check when the replace was asked for), and a rise it saw while its
+                    // The same trigger carries on from where the old one's condition is, if a
+                    // snapshot since the replace's own check saw it, and a rise it saw while its
                     // turn ran still fires it, once
                     if request.trigger == old.trigger {
                         if let (Some(slot), Some(old_slot)) =
                             (&mut request.trigger_slot, &old.trigger_slot)
+                            && old_slot.seen > checked_after
                         {
                             slot.last = old_slot.last;
                         }
                         request.rose_in_batch = old.rose_in_batch;
+                    }
+                    // The same for the same `until`
+                    if same_until
+                        && let (Some(slot), Some(old_slot)) =
+                            (&mut request.until_slot, &old.until_slot)
+                        && old_slot.seen > checked_after
+                    {
+                        slot.last = old_slot.last;
                     }
                     // Fired, and no scheduled turn has taken it yet: the next one answers it, as
                     // it's asked for now. Only for the same trigger: another one didn't fire, and
@@ -687,6 +701,9 @@ impl Schedule {
                 }
                 _ => until,
             };
+            // Whether its firing waiting is its last, as of before this step: an `until` reached
+            // now still lets this step's own firing count, if the one waiting goes stale
+            let ending_before = request.ending;
             if !matches!(request.state, State::Armed { .. }) {
                 request.ending |= until;
             }
@@ -746,7 +763,7 @@ impl Schedule {
                     break;
                 }
                 advance.skipped_stale += 1;
-                if request.last_firing() {
+                if matches!(request.repeat, Repeat::Once) || ending_before {
                     ended = true;
                     break;
                 }
@@ -1082,6 +1099,7 @@ impl Schedule {
             last,
             failures: 0,
             rose: false,
+            seen: 0,
         })
     }
 
@@ -2636,6 +2654,32 @@ mod tests {
     }
 
     #[test]
+    fn a_replace_checked_after_the_last_snapshot_starts_from_its_check() {
+        let mut run = Run::new();
+        let id = run.add(request(condition("SELECT 1"), every(), &laps(0)));
+        let [cond] = run.condition_ids()[..] else {
+            panic!("one condition")
+        };
+        run.tick(with(laps(0), cond, ConditionState::False));
+        run.tick(with(laps(0), cond, ConditionState::True));
+        let batch = run.take();
+        // Its turn rewords it, checking it false: no snapshot since
+        let mut replacing = request(condition("SELECT 1"), every(), &run.last.clone());
+        replacing.checked.trigger = Some(false);
+        run.schedule.answered(&batch.fired);
+        let now = run.last.clone();
+        run.schedule
+            .apply_answering(vec![Change::Replace(id, replacing)], &now, &batch.fired);
+        run.schedule.resolved(&batch.fired);
+        let [cond] = run.condition_ids()[..] else {
+            panic!("one condition")
+        };
+        // True again: a rise from its check
+        run.tick(with(laps(0), cond, ConditionState::True));
+        assert_eq!(run.due(), [id]);
+    }
+
+    #[test]
     fn its_own_turn_replacing_it_keeps_a_rise_while_it_ran() {
         let mut run = Run::new();
         let id = run.add(request(condition("SELECT 1"), every(), &laps(0)));
@@ -2745,6 +2789,28 @@ mod tests {
             &batch.fired,
         );
         assert_eq!(applied.missing, [id]);
+        assert_eq!(run.schedule.len(), 0);
+    }
+
+    #[test]
+    fn a_stale_firing_on_the_step_its_until_is_reached_still_fires_the_last() {
+        let mut run = Run::new();
+        let mut new = request(
+            Trigger::Laps { count: 1 },
+            Repeat::Every {
+                until: Some(Trigger::Laps { count: 5 }),
+            },
+            &laps(0),
+        );
+        new.stale_after = Some(Trigger::Laps { count: 1 });
+        let id = run.add(new);
+        run.tick(laps(4));
+        assert_eq!(run.due(), [id]);
+        // No turn took it for a lap: stale, and its `until` reached on the same step
+        let advance = run.tick(laps(5));
+        assert_eq!(advance.skipped_stale, 1);
+        assert_eq!(run.due(), [id]);
+        run.answer();
         assert_eq!(run.schedule.len(), 0);
     }
 
