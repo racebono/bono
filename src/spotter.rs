@@ -227,7 +227,7 @@ pub struct Spotter {
     queue: VecDeque<(Raised, Instant)>,
     /// The call being said
     saying: Option<Saying>,
-    /// Calls already synthesized, by (language, voice, radio effect, words)
+    /// Calls already synthesized
     cache: HashMap<CacheKey, Arc<Speech>>,
     /// Calls being synthesized ahead
     warming: Vec<(CacheKey, oneshot::Receiver<anyhow::Result<Speech>>)>,
@@ -235,8 +235,18 @@ pub struct Spotter {
     warm_failed: HashMap<CacheKey, Instant>,
 }
 
-/// The language, the voice, the radio effect and speech speed (as bits), and the words
-type CacheKey = (ArrayStr<2>, PathBuf, u32, u32, String);
+/// What a call was synthesized with: the same words said another way are another call.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    lang: ArrayStr<2>,
+    /// The voice's model (empty without one)
+    voice: PathBuf,
+    /// The radio effect, as bits
+    radio: u32,
+    /// The speech speed, as bits
+    speed: u32,
+    words: String,
+}
 
 struct Running {
     db: PathBuf,
@@ -433,13 +443,13 @@ impl Spotter {
             .voices()
             .get(&lang)
             .map(|path| path.as_std_path().to_owned());
-        (
+        CacheKey {
             lang,
-            voice.unwrap_or_default(),
-            config.radio_effect().to_bits(),
-            config.speech_speed().to_bits(),
+            voice: voice.unwrap_or_default(),
+            radio: config.radio_effect().to_bits(),
+            speed: config.speech_speed().to_bits(),
             words,
-        )
+        }
     }
 
     fn effects(config: &Config) -> Effects {
@@ -456,9 +466,12 @@ impl Spotter {
 
         // Ones for other settings (a slider being dragged) would hold up the ones for these: the
         // voice skips those dropped before it gets to them
-        let (lang_now, voice, radio, speed, _) = Self::key(config, lang, String::new());
-        self.warming.retain(|((l, v, r, s, _), _)| {
-            (*l, v, *r, *s) == (lang_now, &voice, radio, speed)
+        let now = Self::key(config, lang, String::new());
+        self.warming.retain(|(key, _)| {
+            key.lang == now.lang
+                && key.voice == now.voice
+                && key.radio == now.radio
+                && key.speed == now.speed
         });
 
         for text in WARM {
@@ -2161,12 +2174,23 @@ mod tests {
         assert!(scoring(&conn, None).unwrap().unwrap().forecast.is_empty());
     }
 
+    /// `words` in English, with no voice and no effects.
+    fn english_key(words: &str) -> CacheKey {
+        CacheKey {
+            lang: arrstr!("en"),
+            voice: PathBuf::new(),
+            radio: 0,
+            speed: 0,
+            words: words.into(),
+        }
+    }
+
     #[test]
     fn failed_warmups_wait_for_backoff_for_the_same_key() {
         let now = Instant::now();
         for closed in [false, true] {
             let mut spotter = Spotter::new();
-            let key = (arrstr!("en"), PathBuf::new(), 0, 0, "car left".into());
+            let key = english_key("car left");
             let (send, recv) = oneshot::channel();
             spotter.warming.push((key.clone(), recv));
             if closed {
@@ -2179,10 +2203,22 @@ mod tests {
             assert!(spotter.cache.is_empty());
             assert!(spotter.warm_failed.contains_key(&key));
             for changed in [
-                (arrstr!("es"), key.1.clone(), key.2, key.3, key.4.clone()),
-                (key.0, PathBuf::from("voice.onnx"), key.2, key.3, key.4.clone()),
-                (key.0, key.1.clone(), 1.0_f32.to_bits(), key.3, key.4.clone()),
-                (key.0, key.1.clone(), key.2, 1.5_f32.to_bits(), key.4.clone()),
+                CacheKey {
+                    lang: arrstr!("es"),
+                    ..key.clone()
+                },
+                CacheKey {
+                    voice: PathBuf::from("voice.onnx"),
+                    ..key.clone()
+                },
+                CacheKey {
+                    radio: 1.0_f32.to_bits(),
+                    ..key.clone()
+                },
+                CacheKey {
+                    speed: 1.5_f32.to_bits(),
+                    ..key.clone()
+                },
             ] {
                 assert!(!spotter.warm_failed.contains_key(&changed));
             }
@@ -2233,14 +2269,14 @@ mod tests {
             spotter
                 .warming
                 .iter()
-                .all(|(key, _)| key.3 == 1.5_f32.to_bits())
+                .all(|(key, _)| key.speed == 1.5_f32.to_bits())
         );
     }
 
     #[test]
     fn warmups_keep_pending_jobs_and_cache_successes() {
         let mut spotter = Spotter::new();
-        let key = (arrstr!("en"), PathBuf::new(), 0, 0, "car left".into());
+        let key = english_key("car left");
         let (send, recv) = oneshot::channel();
         spotter.warming.push((key.clone(), recv));
         spotter.finish_warming(Instant::now());
@@ -2416,7 +2452,7 @@ mod tests {
         let mut spotter = Spotter::new();
         let (send, recv) = oneshot::channel();
         spotter.saying = Some(Saying::Synthesizing {
-            key: (arrstr!("en"), PathBuf::new(), 0, 0, text.into()),
+            key: english_key(text),
             recv,
             call: Raised {
                 text,
