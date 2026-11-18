@@ -58,13 +58,14 @@ const LAP_INVALID_GRACE: f64 = 1.0;
 /// A lap's time: its number is in milliseconds.
 const LAP_TIME: &str = "lap time {}";
 /// Calls synthesized ahead, so the first of each is said without waiting for the voice.
-const WARM: [&str; 6] = [
+const WARM: [&str; 7] = [
     "car left",
     "car right",
     "three wide",
     "clear left",
     "clear right",
     "clear all round",
+    "green, green, green",
 ];
 
 /// Something the spotter says. `text` is English (a `{}` in it takes `number`); [`Raised::words`]
@@ -154,7 +155,10 @@ impl Raised {
             | "clear left" | "clear right" | "clear all round" | "still there left"
             | "still there right" => WarningCategory::Traffic,
             "limiter, limiter" => WarningCategory::Limiter,
-            "full course yellow" | "green flag, green flag" | "red flag" => WarningCategory::Flag,
+            "full course yellow"
+            | "green flag, green flag"
+            | "red flag"
+            | "green, green, green" => WarningCategory::Flag,
             "car close behind" | "car within a second behind" => WarningCategory::GapBehind,
             text => WarningCategory::Other(text),
         }
@@ -184,8 +188,8 @@ impl Raised {
     }
 
     /// A traffic update replaces only the sides it describes; other updates replace the older
-    /// state in their category, as urgent as they are. Nothing but a red flag replaces a red
-    /// flag: the session's stopped until it restarts, which isn't called.
+    /// state in their category, as urgent as they are. Only a red flag, or the race going green
+    /// again, replaces a red flag: the session's stopped until it restarts.
     fn supersedes(&self, older: &Raised) -> bool {
         if self.urgent != older.urgent {
             return false;
@@ -195,7 +199,7 @@ impl Raised {
                 self.traffic_sides() & older.traffic_sides() != 0
             }
             (WarningCategory::Flag, WarningCategory::Flag) => {
-                older.text != "red flag" || self.text == "red flag"
+                older.text != "red flag" || matches!(self.text, "red flag" | "green, green, green")
             }
             (WarningCategory::Other(_), _) | (_, WarningCategory::Other(_)) => false,
             (new, old) => new == old,
@@ -444,7 +448,7 @@ impl Spotter {
         }
     }
 
-    /// Synthesizes the traffic calls ahead, so the first ones aren't late.
+    /// Synthesizes the traffic calls and the race start ahead, so the first ones aren't late.
     fn warm(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer, lang: ArrayStr<2>) {
         self.finish_warming(Instant::now());
 
@@ -1473,6 +1477,9 @@ struct Logic {
     /// The gap behind opened up since it was last called
     gap_armed: bool,
     prev_scoring: Option<Scoring>,
+    /// A caution was still shown as the race went green, which is still racing: the start call
+    /// said its end
+    start_caution: bool,
     /// The last bands called
     rain_band: Option<usize>,
     track_band: Option<usize>,
@@ -1509,6 +1516,7 @@ impl Default for Logic {
             prev_flat: [None; 4],
             gap_armed: true,
             prev_scoring: None,
+            start_caution: false,
             rain_band: None,
             track_band: None,
             last_rain_call: f64::NEG_INFINITY,
@@ -1634,7 +1642,7 @@ impl Logic {
         }
         if let Some(scoring) = scoring {
             self.lap_times(config, scoring, p.in_pit_lane, t, &mut calls);
-            self.flags(scoring, &mut calls);
+            self.flags(config, scoring, &mut calls);
             self.weather(config, scoring, wheels.wet, t, stopped, &mut calls);
         }
 
@@ -1853,21 +1861,41 @@ impl Logic {
         }
     }
 
-    /// Rising edges of flags and penalties.
-    fn flags(&mut self, now: &Scoring, calls: &mut Calls) {
+    /// Rising edges of flags and penalties, and the race going green: at the start, and as it
+    /// restarts after a red flag.
+    fn flags(&mut self, config: &SpotterConfig, now: &Scoring, calls: &mut Calls) {
         let Some(last) = self.prev_scoring.replace(now.clone()) else {
             return;
         };
         let caution = |fcy: &Option<String>| fcy.as_deref().is_some_and(|fcy| fcy != "none");
 
+        // A start is called once: a caution ending around it is said by the start call
+        let calls_starts = *config.race_starts() && now.session_type.as_deref() == Some("race");
+        if calls_starts
+            && now.phase.as_deref() == Some("green")
+            && matches!(
+                last.phase.as_deref(),
+                Some("formation_lap" | "countdown" | "stopped")
+            )
+        {
+            calls.raise("green, green, green", true);
+            self.start_caution = caution(&last.full_course_yellow);
+        }
+        // Until the race is held up again: a new caution or a red flag is called as it ends
+        self.start_caution &= now.phase.as_deref() == Some("green");
         if caution(&now.full_course_yellow) && !caution(&last.full_course_yellow) {
             calls.raise("full course yellow", true);
         } else if caution(&last.full_course_yellow)
             && now.full_course_yellow.as_deref() == Some("none")
-            // The caution ending as the session's stopped isn't a restart: it's still red
-            && now.phase.as_deref() != Some("stopped")
         {
-            calls.raise("green flag, green flag", true);
+            let started = std::mem::take(&mut self.start_caution);
+            // Ending before the race goes green: the start's still to say it
+            let said_by_the_start = calls_starts
+                && (started || matches!(now.phase.as_deref(), Some("formation_lap" | "countdown")));
+            // The caution ending as the session's stopped isn't a restart: it's still red
+            if !said_by_the_start && now.phase.as_deref() != Some("stopped") {
+                calls.raise("green flag, green flag", true);
+            }
         }
         if now.phase.as_deref() == Some("stopped") && last.phase.as_deref() != Some("stopped") {
             calls.raise("red flag", true);
@@ -2042,6 +2070,7 @@ pub fn translate(text: &'static str, lang: ArrayStr<2>) -> &'static str {
         "car within a second behind" => t!("call.car_within_a_second": lang),
         "full course yellow" => t!("call.full_course_yellow": lang),
         "green flag, green flag" => t!("call.green_flag": lang),
+        "green, green, green" => t!("call.race_start": lang),
         "red flag" => t!("call.red_flag": lang),
         "yellow flag on track" => t!("call.yellow_flag": lang),
         "blue flag" => t!("call.blue_flag": lang),
@@ -2237,7 +2266,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_red_flag_replaces_a_red_flag() {
+    fn only_a_red_flag_or_the_race_going_green_replaces_a_red_flag() {
         for newer in ["full course yellow", "green flag, green flag"] {
             let queue = queued(&[("red flag", true), (newer, true)]);
             assert_eq!(
@@ -2247,6 +2276,12 @@ mod tests {
         }
         let queue = queued(&[("red flag", true), ("red flag", true)]);
         assert_eq!(queue.len(), 1);
+        // The race going green again: the red flag's over
+        let queue = queued(&[("red flag", true), ("green, green, green", true)]);
+        assert_eq!(
+            queue.iter().map(|(call, _)| call.text).collect::<Vec<_>>(),
+            ["green, green, green"]
+        );
     }
 
     #[test]
@@ -3725,6 +3760,229 @@ mod tests {
         assert!(step(0.9, &scoring).is_empty());
     }
 
+    /// A race in `phase`, with the full course yellow in `fcy`.
+    fn race(phase: &str, fcy: &str) -> Scoring {
+        Scoring {
+            session_type: Some("race".into()),
+            phase: Some(phase.into()),
+            full_course_yellow: Some(fcy.into()),
+            ..Scoring::default()
+        }
+    }
+
+    /// The calls of each update in turn, a tenth of a second apart, from a spotter just started.
+    fn calls_of(config: &SpotterConfig, updates: &[Scoring]) -> Vec<Vec<(&'static str, bool)>> {
+        let mut logic = Logic::default();
+        updates
+            .iter()
+            .enumerate()
+            .map(|(i, scoring)| {
+                logic
+                    .update(
+                        config,
+                        &player(i as f64 * 0.1),
+                        &[],
+                        &Wheels::default(),
+                        Some(scoring),
+                    )
+                    .into_iter()
+                    .map(|call| (call.text, call.urgent))
+                    .collect()
+            })
+            .collect()
+    }
+
+    const START: (&str, bool) = ("green, green, green", true);
+    const CAUTION_OVER: (&str, bool) = ("green flag, green flag", true);
+
+    #[test]
+    fn calls_the_race_start_once() {
+        let config = SpotterConfig::default();
+        for from in ["formation_lap", "countdown", "stopped"] {
+            let green = race("green", "none");
+            assert_eq!(
+                calls_of(&config, &[race(from, "none"), green.clone(), green]),
+                [vec![], vec![START], vec![]],
+                "from {from}"
+            );
+        }
+
+        // Following a race already under way
+        let green = race("green", "none");
+        assert_eq!(calls_of(&config, &[green.clone(), green]), [vec![], vec![]]);
+        // A caution ending is its own call
+        assert_eq!(
+            calls_of(
+                &config,
+                &[race("full_course_yellow", "pending"), race("green", "none")]
+            ),
+            [vec![], vec![CAUTION_OVER]]
+        );
+        // A red flag restarting behind the safety car: green once the caution ends
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("stopped", "pending"),
+                    race("full_course_yellow", "pending"),
+                    race("green", "none"),
+                ]
+            ),
+            [vec![], vec![], vec![CAUTION_OVER]]
+        );
+    }
+
+    #[test]
+    fn no_race_start_call_outside_races() {
+        let mut config = SpotterConfig::default();
+        config.qualifying.set(true);
+        for kind in [Some("practice"), Some("qualifying"), Some("warmup"), None] {
+            let session = |phase: &str| Scoring {
+                session_type: kind.map(str::to_owned),
+                ..race(phase, "none")
+            };
+            assert_eq!(
+                calls_of(&config, &[session("formation_lap"), session("green")]),
+                [vec![], vec![]],
+                "in {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_call_for_a_start_as_a_caution_ends() {
+        let config = SpotterConfig::default();
+        // As it goes green
+        assert_eq!(
+            calls_of(
+                &config,
+                &[race("formation_lap", "last_lap"), race("green", "none")]
+            ),
+            [vec![], vec![START]]
+        );
+        // Just after
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "last_lap"),
+                    race("green", "resume"),
+                    race("green", "none"),
+                ]
+            ),
+            [vec![], vec![START], vec![]]
+        );
+        // Just before
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("countdown", "last_lap"),
+                    race("countdown", "none"),
+                    race("green", "none"),
+                ]
+            ),
+            [vec![], vec![], vec![START]]
+        );
+        // A red flag after the start: its restart behind the safety car is called
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "last_lap"),
+                    race("green", "resume"),
+                    race("stopped", "race_halt"),
+                    race("full_course_yellow", "pending"),
+                    race("green", "none"),
+                ]
+            ),
+            [
+                vec![],
+                vec![START],
+                vec![("red flag", true)],
+                vec![],
+                vec![CAUTION_OVER]
+            ]
+        );
+        // A caution out again before the start's has cleared: its end is called
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "last_lap"),
+                    race("green", "resume"),
+                    race("full_course_yellow", "pending"),
+                    race("green", "none"),
+                ]
+            ),
+            [vec![], vec![START], vec![], vec![CAUTION_OVER]]
+        );
+        // A caution coming out at the start is called, and so is its end
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "none"),
+                    race("green", "pending"),
+                    race("green", "none"),
+                ]
+            ),
+            [
+                vec![],
+                vec![START, ("full course yellow", true)],
+                vec![CAUTION_OVER]
+            ]
+        );
+    }
+
+    #[test]
+    fn race_start_call_can_be_turned_off() {
+        let mut config = SpotterConfig::default();
+        config.race_starts.set(false);
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "none"),
+                    race("green", "none"),
+                    race("full_course_yellow", "pending"),
+                    race("green", "none"),
+                ]
+            ),
+            [
+                vec![],
+                vec![],
+                vec![("full course yellow", true)],
+                vec![CAUTION_OVER]
+            ]
+        );
+        // A caution ending before the start is called as before
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "last_lap"),
+                    race("formation_lap", "none")
+                ]
+            ),
+            [vec![], vec![CAUTION_OVER]]
+        );
+
+        // Turned off after the start, before its caution ends
+        let mut logic = Logic::default();
+        let mut step = |config: &SpotterConfig, t: f64, scoring: Scoring| {
+            logic
+                .update(config, &player(t), &[], &Wheels::default(), Some(&scoring))
+                .into_iter()
+                .map(|call| (call.text, call.urgent))
+                .collect::<Vec<_>>()
+        };
+        let on = SpotterConfig::default();
+        assert!(step(&on, 0.0, race("formation_lap", "last_lap")).is_empty());
+        assert_eq!(step(&on, 0.1, race("green", "resume")), [START]);
+        assert_eq!(step(&config, 0.2, race("green", "none")), [CAUTION_OVER]);
+    }
+
     #[test]
     fn keeps_flags_and_penalties_outside_the_standing_window() {
         let conn = Connection::open_in_memory().unwrap();
@@ -4233,10 +4491,10 @@ mod tests {
         scoring.phase = Some("formation_lap".into());
         scoring.session_end_time = Some(83.0);
         assert!(at(30.0, &scoring).is_empty());
-        // Under way, the rain's 15 minutes off
+        // Under way, the rain's 15 minutes off: only the start's called
         scoring.phase = Some("green".into());
         scoring.session_end_time = Some(1883.0);
-        assert!(at(90.0, &scoring).is_empty());
+        assert_eq!(at(90.0, &scoring), ["green, green, green"]);
     }
 
     #[test]
@@ -4306,6 +4564,7 @@ mod tests {
             "libero a sinistra",
             "libero a destra",
             "tutto libero",
+            "verde, verde, verde",
         ]) {
             assert_eq!(translate(text, arrstr!("it")), expected);
         }
