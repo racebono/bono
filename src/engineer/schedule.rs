@@ -509,9 +509,17 @@ impl Schedule {
                         continue;
                     };
                     // Ended while the turn ran, kept for its answers on their way: gone, unless
-                    // this turn answered it (a follow-up to its last answer)
-                    if matches!(self.requests[index].state, State::Ended)
-                        && !answered.iter().any(|f| f.id == id)
+                    // this turn answered it (a follow-up to its last answer). Not when its
+                    // `until` ended it and the replace keeps that `until`: it's reached already
+                    let current = &self.requests[index];
+                    let until_reached = current.ending
+                        && current.until()
+                            == match &new.repeat {
+                                Repeat::Every { until } => until.as_ref(),
+                                Repeat::Once => None,
+                            };
+                    if matches!(current.state, State::Ended)
+                        && (until_reached || !answered.iter().any(|f| f.id == id))
                     {
                         missing.push(id);
                         continue;
@@ -550,6 +558,12 @@ impl Schedule {
                     request.waiting = old.waiting;
                     request.missed_start = missed;
                     request.until_missed_start = until_missed;
+                    // A rise of the same condition while its turn ran still fires it, if the new
+                    // one starts from true (from false, its own first true check is that rise)
+                    request.rose_in_batch = old.rose_in_batch
+                        && request.trigger == old.trigger
+                        && (request.trigger_slot.as_ref())
+                            .is_some_and(|slot| slot.last == Some(true));
                     // Fired, and no scheduled turn has taken it yet: the next one answers it, as
                     // it's asked for now
                     if let State::Due {
@@ -683,7 +697,11 @@ impl Schedule {
             {
                 request.missed_start = Some(epoch);
             }
-            // The same for its condition turning true again
+            // The same for its condition turning true again; another epoch's rise says nothing
+            // about this one, as its results don't
+            if epoch_changed {
+                request.rose_in_batch = false;
+            }
             if matches!(request.state, State::InBatch { .. })
                 && request.trigger_slot.as_ref().is_some_and(|slot| slot.rose)
             {
@@ -2615,6 +2633,27 @@ mod tests {
     }
 
     #[test]
+    fn a_rise_while_its_turn_runs_is_forgotten_in_another_session() {
+        let mut run = Run::new();
+        let id = run.add(request(condition("SELECT 1"), every(), &laps(0)));
+        let [cond] = run.condition_ids()[..] else {
+            panic!("one condition")
+        };
+        run.tick(with(laps(0), cond, ConditionState::False));
+        run.tick(with(laps(0), cond, ConditionState::True));
+        assert_eq!(run.due(), [id]);
+        let batch = run.take();
+        run.tick(with(laps(0), cond, ConditionState::False));
+        run.tick(with(laps(0), cond, ConditionState::True));
+        // Another session before the turn ends
+        run.tick(new_epoch(laps(0), 2, &["session"]));
+        run.schedule.answered(&batch.fired);
+        run.schedule.resolved(&batch.fired);
+        run.tick(with(new_epoch(laps(0), 2, &[]), cond, ConditionState::True));
+        assert!(run.due().is_empty());
+    }
+
+    #[test]
     fn a_stale_condition_true_when_asked_counts_before_its_first_check() {
         let mut run = Run::new();
         let mut new = request(Trigger::Laps { count: 1 }, Repeat::Once, &laps(0));
@@ -2625,6 +2664,33 @@ mod tests {
         let advance = run.tick(laps(1));
         assert_eq!(advance.skipped_stale, 1);
         assert!(run.due().is_empty());
+    }
+
+    #[test]
+    fn its_own_turn_replacing_it_after_its_until_doesnt_bring_it_back() {
+        let mut run = Run::new();
+        let repeat = || Repeat::Every {
+            until: Some(condition("SELECT 1")),
+        };
+        let id = run.add(request(Trigger::Laps { count: 1 }, repeat(), &laps(0)));
+        let [cond] = run.condition_ids()[..] else {
+            panic!("one condition")
+        };
+        run.tick(with(laps(0), cond, ConditionState::False));
+        run.tick(with(laps(1), cond, ConditionState::False));
+        assert_eq!(run.due(), [id]);
+        let batch = run.take();
+        // Its `until` while the turn answering it runs; the turn rewords it, the same `until`
+        run.tick(with(laps(1), cond, ConditionState::True));
+        run.schedule.answered(&batch.fired);
+        let replacing = request(Trigger::Laps { count: 1 }, repeat(), &laps(1));
+        let applied = run.schedule.apply_answering(
+            vec![Change::Replace(id, replacing)],
+            &laps(1),
+            &batch.fired,
+        );
+        assert_eq!(applied.missing, [id]);
+        assert_eq!(run.schedule.len(), 0);
     }
 
     #[test]
