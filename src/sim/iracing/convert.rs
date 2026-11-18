@@ -156,8 +156,6 @@ pub struct Converter {
     event: Option<Event>,
     /// The session being recorded: its number and id
     session: Option<(Option<i32>, Option<i32>)>,
-    /// Whether a replay was playing at the last update
-    replaying: Option<bool>,
     /// What's been worked out about each car, by car index
     cars: HashMap<i64, CarTrack>,
     /// When the session's clock runs out, as last recorded
@@ -260,6 +258,12 @@ impl Converter {
     ) -> Option<Update> {
         let time = frame.f64("SessionTime")?;
         let length = info.track_length?;
+        // A replay's frames aren't the live session's: they aren't recorded (the recorder skips
+        // replays), nor do they move on what's been worked out about it (laps, pit stops, the
+        // clock), which carries on once it's live again
+        if info.replay || frame.bool("IsReplayPlaying") == Some(true) {
+            return None;
+        }
         if self.last_time == Some(time) {
             return None;
         }
@@ -273,13 +277,9 @@ impl Converter {
         let new_event = self.event.as_ref().is_some_and(|last| *last != event);
         self.event = Some(event);
         let session = (frame.i32("SessionNum"), frame.i32("SessionUniqueID"));
-        // Scored right away, for the recorder to tell from the scoring before this update's
-        // telemetry: another session, or a replay starting or stopping
-        let replaying = info.replay || frame.bool("IsReplayPlaying") == Some(true);
-        let boundary = new_event
-            || self.session != Some(session)
-            || self.replaying.is_some_and(|last| last != replaying);
-        self.replaying = Some(replaying);
+        // Another session is scored right away, for the recorder to tell from the scoring before
+        // this update's telemetry
+        let boundary = new_event || self.session != Some(session);
         // Another session, or its clock went back (a restart, a replay rewound)
         if new_event || self.session != Some(session) || dt.is_none() {
             self.cars.clear();
@@ -626,11 +626,9 @@ impl Converter {
         if race {
             self.laps_behind(&cars, before_green, &finished, &over_line, time);
         }
-        // The player's own fuel: only while in the car and driving it live (iRacing gives the
-        // fuel level and pit road as the player's then), and only the player's car keeps a window
-        let in_car = frame.bool("IsOnTrack") == Some(true)
-            && !info.replay
-            && frame.bool("IsReplayPlaying") != Some(true);
+        // The player's own fuel: only while in the car (iRacing gives the fuel level and pit road
+        // as the player's then; a replay isn't converted), and only the player's car keeps a window
+        let in_car = frame.bool("IsOnTrack") == Some(true);
         for (idx, track) in &mut self.cars {
             if Some(*idx) != player {
                 track.fuel_window.clear();
@@ -945,7 +943,6 @@ impl Converter {
         out.estimated_lap_time = d.class_lap_time.into();
         out.in_pits = car.on_pit_road.into();
         let control = match () {
-            _ if info.replay || frame.bool("IsReplayPlaying") == Some(true) => "replay",
             _ if is_player => "player",
             _ if d.ai => "ai",
             _ => "remote",
@@ -3990,6 +3987,54 @@ mod tests {
         assert_eq!(track.fuel_per_lap(Some(59.8), on_track), None);
         assert!(track.fuel_window.is_empty());
         assert_eq!(track.fuel_per_lap(None, on_track), None);
+    }
+
+    /// A replay isn't converted: what's known of the live session carries on from where it was.
+    #[test]
+    fn a_replay_leaves_the_live_session_as_it_was() {
+        use super::super::sdk::{Value, Vars};
+        use super::super::session::{Driver, Session};
+        let info = SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: HashMap::from([(0, Driver::default())]),
+            sessions: vec![Session {
+                num: 0,
+                kind: Some("race"),
+                number: 1,
+                results: HashMap::new(),
+            }],
+            ..Default::default()
+        };
+        let frame = |t: f64, replay: bool| {
+            Vars::of(&[
+                ("SessionTime", Value::Double(t)),
+                ("SessionNum", Value::Int(0)),
+                ("SessionState", Value::Int(STATE_RACING)),
+                ("PlayerCarIdx", Value::Int(0)),
+                ("IsReplayPlaying", Value::Bool(replay)),
+                ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
+                ("CarIdxLapCompleted", Value::Ints(vec![2])),
+            ])
+        };
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        let (vars, data) = frame(500.0, false);
+        assert!(
+            converter
+                .convert(&Frame::new(&vars, &data), &info, start)
+                .is_some()
+        );
+        // Rewound
+        let (vars, data) = frame(100.0, true);
+        let replayed = converter.convert(
+            &Frame::new(&vars, &data),
+            &info,
+            start + std::time::Duration::from_secs(1),
+        );
+        assert!(replayed.is_none());
+        assert_eq!(converter.last_time, Some(500.0));
+        assert!(converter.cars.contains_key(&0));
     }
 
     /// Fast repair alone in the pit menu is a service selected, not none; unticked, it's no word on

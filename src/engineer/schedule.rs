@@ -501,7 +501,16 @@ impl Schedule {
                         missing.push(id);
                         continue;
                     };
+                    // Ended while the turn ran, kept for its answers on their way: gone, unless
+                    // this turn answered it (a follow-up to its last answer)
+                    if matches!(self.requests[index].state, State::Ended)
+                        && !answered.iter().any(|f| f.id == id)
+                    {
+                        missing.push(id);
+                        continue;
+                    }
                     let old = self.requests.remove(index);
+                    let old_until = old.until().cloned();
                     // Counting carries on from the last firing, if it has fired since it was armed
                     let since = match &old.state {
                         State::Armed { since } => since.clone(),
@@ -528,8 +537,31 @@ impl Schedule {
                     request.until_missed_start = until_missed;
                     // Fired, and no scheduled turn has taken it yet: the next one answers it, as
                     // it's asked for now
-                    if let State::Due { .. } = old.state {
-                        request.state = old.state;
+                    if let State::Due {
+                        mut since,
+                        fired,
+                        at,
+                        step,
+                    } = old.state
+                    {
+                        // Another period counts on from the firing: the old one's target isn't
+                        // the new one's
+                        if request.trigger != old.trigger
+                            && let Trigger::Time { seconds } = request.trigger
+                        {
+                            since = fired.clone();
+                            since.clock_s -= seconds;
+                        }
+                        request.state = State::Due {
+                            since,
+                            fired,
+                            at,
+                            step,
+                        };
+                        // Its `until`, the same, reached while it waited: this is its last firing
+                        if request.until() == old_until.as_ref() {
+                            request.ending = old.ending;
+                        }
                     }
                     self.requests.insert(index, request);
                     ids.push(id);
@@ -546,8 +578,10 @@ impl Schedule {
     /// Steps through a new progress snapshot: what fell due, what ended, what went stale, and
     /// whether a new weekend cleared everything
     pub fn advance(&mut self, progress: &Progress, now: Instant) -> Advance {
+        // Taken whether this step or `apply` saw the weekend change: reported once
+        let followed = self.follow_weekend(progress.weekend);
         let mut advance = Advance {
-            cleared: self.follow_weekend(progress.weekend) || std::mem::take(&mut self.cleared),
+            cleared: std::mem::take(&mut self.cleared) || followed,
             ..Default::default()
         };
         self.steps += 1;
@@ -626,6 +660,13 @@ impl Schedule {
             };
             if !matches!(request.state, State::Armed { .. }) {
                 request.ending |= until;
+            }
+            // A session starting while its turn runs is one it fires for once it's armed again:
+            // it's rearmed from the firing before
+            if let (State::InBatch { .. }, Trigger::Session { .. }, true, Some(epoch)) =
+                (&request.state, &request.trigger, starts.any, progress.epoch)
+            {
+                request.missed_start = Some(epoch);
             }
             let mut missed = matches!(request.state, State::Armed { .. })
                 && self.missed_start_counts(&request.trigger, &mut request.missed_start, progress);
@@ -1496,8 +1537,11 @@ mod tests {
 
         let mut progress = new_epoch(laps(0), 2, &["cleared"]);
         progress.weekend = Some(WEEKEND + 1);
-        let advance = run.tick(progress);
+        let advance = run.tick(progress.clone());
         assert!(advance.cleared);
+        // Told once
+        progress.new_epochs.clear();
+        assert!(!run.tick(progress).cleared);
         assert_eq!(run.schedule.len(), 0);
         assert!(run.schedule.conditions().is_empty());
         assert!(run.schedule.pending_text(&run.last).contains("none"));
@@ -2468,6 +2512,59 @@ mod tests {
         run.schedule
             .apply(vec![Change::Replace(id, replacing)], &made);
         assert_eq!(run.due(), [id]);
+    }
+
+    #[test]
+    fn a_replace_with_another_period_counts_from_the_firing() {
+        let mut run = Run::new();
+        let id = run.add(request(
+            Trigger::Time { seconds: 60.0 },
+            every(),
+            &at(0.0, 0),
+        ));
+        run.tick(at(60.0, 0));
+        assert_eq!(run.due(), [id]);
+        let made = at(60.0, 0);
+        let replacing = request(Trigger::Time { seconds: 120.0 }, every(), &made);
+        run.schedule
+            .apply(vec![Change::Replace(id, replacing)], &made);
+        run.answer();
+        run.tick(at(179.0, 0));
+        assert!(run.due().is_empty());
+        run.tick(at(180.0, 0));
+        assert_eq!(run.due(), [id]);
+    }
+
+    #[test]
+    fn a_session_starting_while_its_turn_runs_fires_it_again() {
+        let mut run = Run::new();
+        run.tick(laps(0));
+        let id = run.add(request(Trigger::Session { kind: None }, every(), &laps(0)));
+        run.tick(new_epoch(laps(0), 2, &["session"]));
+        assert_eq!(run.due(), [id]);
+        let batch = run.take();
+        // The next session starts while the turn answering the first runs
+        run.tick(new_epoch(laps(0), 3, &["session"]));
+        run.schedule.answered(&batch.fired);
+        run.tick(new_epoch(laps(0), 3, &[]));
+        assert_eq!(run.due(), [id]);
+    }
+
+    #[test]
+    fn a_replace_of_a_request_that_ended_meanwhile_is_missing() {
+        let mut run = Run::new();
+        let id = run.add(request(Trigger::Laps { count: 1 }, Repeat::Once, &laps(0)));
+        run.tick(laps(1));
+        let batch = run.take();
+        run.schedule.answered(&batch.fired);
+        // Its answer still on its way, a pilot turn replaces it
+        let made = laps(1);
+        let replacing = request(Trigger::Laps { count: 1 }, Repeat::Once, &made);
+        let applied = run
+            .schedule
+            .apply(vec![Change::Replace(id, replacing)], &made);
+        assert_eq!(applied.missing, [id]);
+        assert_eq!(run.schedule.len(), 0);
     }
 
     #[test]

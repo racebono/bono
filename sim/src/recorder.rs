@@ -93,7 +93,7 @@ impl Recorder {
         // would mix two runs. If it's still open, it's emptied instead, once the writer has it
         let left_over = try_remove_database(&dir).is_err();
 
-        Self::start(dir, forecast, left_over, None)
+        Self::start(dir, forecast, left_over, None, 0.0)
     }
 
     /// Restarts a stopped writer without deleting earlier sessions.
@@ -121,6 +121,8 @@ impl Recorder {
             forecast,
             self.shared.reset_pending.load(Ordering::Relaxed),
             Some(queue),
+            // Before its writer starts, which reads the forecast as of it
+            f64::from_bits(self.shared.session_time.load(Ordering::Relaxed)),
         )?;
         std::mem::swap(
             restarted
@@ -135,21 +137,18 @@ impl Recorder {
             self.shared.player_id.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
-        restarted.shared.session_time.store(
-            self.shared.session_time.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
         *self = restarted;
         Ok(())
     }
 
     /// Carries on from `queue` if given (its epoch, and what was waiting to be done), or starts an
-    /// epoch.
+    /// epoch. `session_time` is where the session is, as far as the scoring said.
     fn start(
         dir: PathBuf,
         forecast: Option<ForecastSource>,
         left_over: bool,
         queue: Option<Queue>,
+        session_time: f64,
     ) -> std::io::Result<Self> {
         let settings = Settings::read(&dir.join(SETTINGS));
         let queue = match queue {
@@ -168,7 +167,7 @@ impl Recorder {
             wake: Condvar::new(),
             opponent_frequency: AtomicU32::new(settings.opponent_frequency),
             player_id: AtomicI64::new(-1),
-            session_time: AtomicU64::new(0f64.to_bits()),
+            session_time: AtomicU64::new(session_time.to_bits()),
             failed: AtomicBool::new(false),
             reset_pending: AtomicBool::new(left_over),
             stop: AtomicBool::new(false),
@@ -409,18 +408,9 @@ impl Recorder {
         let mut tracking = lock(&self.tracking);
         let mut queue = lock(&self.shared.queue);
         // The scoring told first, and nothing's been scored since: the adapter is telling the same
-        // start (a game that scores a session before saying it started), which takes its reason
-        // if it's not written yet
+        // start (a game that scores a session before saying it started). The scoring's reason
+        // stands: the writer may have written it already
         if std::mem::take(&mut tracking.scored_start) {
-            let epoch = queue.epoch;
-            if let Some((_, pending)) = queue
-                .boundaries
-                .iter_mut()
-                .rev()
-                .find(|(start, _)| *start == epoch)
-            {
-                *pending = reason;
-            }
             return;
         }
         self.start_epoch(&mut tracking, &mut queue, reason);
@@ -731,7 +721,11 @@ impl Writer {
             }
 
             if clear {
-                if let Err(e) = sql::clear_tables(&conn) {
+                let cleared = boundaries
+                    .iter()
+                    .find(|(_, reason)| *reason == EpochReason::Cleared)
+                    .map(|(epoch, _)| *epoch);
+                if let Err(e) = sql::clear_tables(&conn, cleared) {
                     // Still to do, by a restarted writer, with the epoch that follows it
                     let mut queue = lock(&shared.queue);
                     queue.clear = true;

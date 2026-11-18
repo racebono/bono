@@ -252,7 +252,9 @@ pub fn recreate_tables(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Deletes every row of every table.
-pub fn clear_tables(conn: &Connection) -> rusqlite::Result<()> {
+/// Starts epoch `cleared` in the same breath, if given: a reader never sees the emptied
+/// recording without an epoch.
+pub fn clear_tables(conn: &Connection, cleared: Option<i64>) -> rusqlite::Result<()> {
     // Newest first: the tables referencing `telemetry` (`telemetry_wheel`, `car_state`) are made
     // after it, and each `*_sector` table after the one it belongs to, so they're emptied first. Foreign keys are on (rusqlite's bundled SQLite), and
     // each `telemetry` row deleted while `car_state` still has rows is looked up in it, which has
@@ -273,6 +275,9 @@ pub fn clear_tables(conn: &Connection) -> rusqlite::Result<()> {
             &format!("DELETE FROM \"{}\"", table.replace('"', "\"\"")),
             [],
         )?;
+    }
+    if let Some(id) = cleared {
+        begin_epoch(&tx, id, EpochReason::Cleared)?;
     }
     tx.commit()?;
 
@@ -747,7 +752,7 @@ mod tests {
         .unwrap();
 
         let start = Instant::now();
-        clear_tables(&conn).unwrap();
+        clear_tables(&conn, None).unwrap();
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "took {:?}",

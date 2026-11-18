@@ -1565,9 +1565,10 @@ impl Engineer {
             if reply.stop == StopReason::ContextWindowExceeded {
                 self.new_session = true;
             }
-            self.apply(changes, &[]);
+            // Due again first: a request it replaced stays due, as replaced
             let now = self.now();
             self.schedule.batch_failed(now);
+            self.apply(changes, &[]);
             return;
         }
         let what = what_fired(
@@ -3972,7 +3973,7 @@ mod tests {
             let recording = self.recording();
             let newest: i64 =
                 (recording.query_row("SELECT max(id) FROM epoch", [], |row| row.get(0))).unwrap();
-            clear_tables(&recording).unwrap();
+            clear_tables(&recording, None).unwrap();
             begin_epoch(&recording, newest.saturating_add(1), EpochReason::Cleared).unwrap();
         }
 
