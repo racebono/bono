@@ -541,12 +541,14 @@ fn voice(
             ui,
             *raw.engineer_volume(),
             &mut raw.engineer_volume,
+            0.0..=1.0,
             t!("volume.engineer"),
             t!("volume.engineer_hover"),
         ) | volume(
             ui,
             *raw.radio_effect(),
             &mut raw.radio_effect,
+            0.0..=1.0,
             t!("volume.radio_effect"),
             t!("volume.radio_effect_hover"),
         )
