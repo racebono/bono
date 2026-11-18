@@ -38,6 +38,8 @@ void bono_lmu_push_scoring(bono_lmu_recorder* recorder, bono_session_info_s* ses
                                bono_standing_s* standings, size_t count);
 // Deletes everything recorded so far, e.g. when a session ends, and forgets what's kept to fill those in.
 void bono_lmu_clear(bono_lmu_recorder* recorder);
+// Whether the game is in realtime, where the car can be driven: the player's damage is only asked for then.
+void bono_lmu_set_realtime(bono_lmu_recorder* recorder, bool realtime);
 // Whether recording stopped on an error: nothing more is recorded until it is restarted.
 bool bono_lmu_failed(bono_lmu_recorder* recorder);
 

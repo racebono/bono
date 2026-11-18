@@ -194,6 +194,14 @@ pub unsafe extern "C" fn bono_lmu_clear(recorder: *const LmuRecorder) {
 /// # Safety
 /// `recorder` must come from `bono_lmu_open`.
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn bono_lmu_set_realtime(recorder: *const LmuRecorder, realtime: bool) {
+    let condition = unsafe { &(*recorder).3 };
+    guard((), || condition.set_realtime(realtime))
+}
+
+/// # Safety
+/// `recorder` must come from `bono_lmu_open`.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn bono_lmu_failed(recorder: *const LmuRecorder) -> bool {
     let recorder = unsafe { &(*recorder).0 };
     recorder.failed()

@@ -1,6 +1,8 @@
 //! The player's aero and suspension damage, from LMU's own local web API (the one its UI uses): the
 //! plugin interface only has the car's dents. A thread of its own asks about once a second while the
 //! player drives, so the game's threads never wait on the web API: they only take the last answer.
+//! It's only asked in realtime: after realtime ends the game may unload the car, and asking about
+//! it then may crash the game.
 
 use bono_sim::sys::bono_telemetry;
 use serde_json::Value;
@@ -35,6 +37,8 @@ struct State {
     answer: Option<(Condition, Instant)>,
     /// When the player's telemetry last arrived
     driving: Option<Instant>,
+    /// Whether the game is in realtime (see `set_realtime`)
+    realtime: bool,
     /// The player's car the answer is for
     vehicle: Option<i64>,
     /// Bumped by `clear`, so an answer asked for before it is dropped
@@ -82,6 +86,12 @@ impl VehicleCondition {
         state.forget();
         state.driving = None;
         state.vehicle = None;
+    }
+
+    /// Whether the game is in realtime, where the car can be driven. Outside it, it isn't asked: a
+    /// request in flight when realtime ends finishes while the car is still loaded.
+    pub fn set_realtime(&self, realtime: bool) {
+        lock(&self.shared.state).realtime = realtime;
     }
 
     /// Takes the player's car from a scoring update (`None`: no car is theirs). Another car, or none,
@@ -168,7 +178,7 @@ impl Shared {
             if self.stop.load(Ordering::Relaxed) {
                 return;
             }
-            if !state.driving.is_some_and(|at| at.elapsed() < DRIVING) {
+            if !state.realtime || !state.driving.is_some_and(|at| at.elapsed() < DRIVING) {
                 continue;
             }
 
@@ -350,6 +360,7 @@ mod tests {
         };
 
         // Only asked once the player drives
+        condition.set_realtime(true);
         damage(&condition, true, Instant::now());
         asked.recv().unwrap();
         condition.clear();
@@ -367,5 +378,27 @@ mod tests {
         );
         // The thread's next question gets no answer, so dropping `condition` can join it
         drop(answer);
+    }
+
+    #[test]
+    fn only_asked_in_realtime() {
+        let (asked_tx, asked) = mpsc::channel();
+        let condition = VehicleCondition::with(Duration::from_millis(1), move || {
+            let _ = asked_tx.send(());
+            None
+        });
+        damage(&condition, true, Instant::now());
+        assert!(asked.recv_timeout(Duration::from_millis(50)).is_err());
+
+        condition.set_realtime(true);
+        damage(&condition, true, Instant::now());
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // Realtime ends: a question already being asked may still come, then none
+        condition.set_realtime(false);
+        damage(&condition, true, Instant::now());
+        std::thread::sleep(Duration::from_millis(20));
+        while asked.try_recv().is_ok() {}
+        assert!(asked.recv_timeout(Duration::from_millis(50)).is_err());
     }
 }

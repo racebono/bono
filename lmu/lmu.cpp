@@ -555,6 +555,17 @@ namespace {
         // In case the plugin missed the session starting.
         void EnterRealtime() override {
             start_recording();
+            set_realtime(true);
+        }
+
+        // The game may unload the player's car after this, so its damage stops being asked for. A session
+        // ending counts too, in case realtime's end was missed.
+        void ExitRealtime() override {
+            set_realtime(false);
+        }
+
+        void EndSession() override {
+            set_realtime(false);
         }
 
         void Shutdown() override {
@@ -645,6 +656,11 @@ namespace {
             const std::filesystem::path user_data =
                     _user_data.empty() ? std::filesystem::absolute("UserData") : _user_data;
             return user_data / "bono";
+        }
+
+        void set_realtime(bool realtime) {
+            std::shared_lock lock(_recorder_mutex);
+            if (_recorder) bono_lmu_set_realtime(_recorder, realtime);
         }
 
         // A recorder that stopped on an error is replaced, so a failure costs a session rather than the rest of
