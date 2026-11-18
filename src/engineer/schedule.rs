@@ -104,9 +104,10 @@ pub struct Checked {
     pub trigger: Option<bool>,
     pub until: Option<bool>,
     pub stale_after: Option<bool>,
-    /// The last progress snapshot published when they were checked: a later one was measured
-    /// after them
-    pub seq: u64,
+    /// The last progress snapshot published when the trigger's and the `until`'s were checked: a
+    /// later one was measured after that check
+    pub trigger_seq: u64,
+    pub until_seq: u64,
 }
 
 /// A change a turn makes to the schedule, applied once the turn finishes
@@ -564,7 +565,8 @@ impl Schedule {
                     let until_missed = self
                         .until_missed_start(&new)
                         .or(old.until_missed_start.filter(|_| same_until));
-                    let checked_after = new.checked.seq;
+                    let (trigger_checked, until_checked) =
+                        (new.checked.trigger_seq, new.checked.until_seq);
                     let mut request = self.request(id, new, since, progress.epoch);
                     request.made = old.made;
                     request.waiting = old.waiting;
@@ -576,7 +578,7 @@ impl Schedule {
                     if request.trigger == old.trigger {
                         if let (Some(slot), Some(old_slot)) =
                             (&mut request.trigger_slot, &old.trigger_slot)
-                            && old_slot.seen > checked_after
+                            && old_slot.seen > trigger_checked
                         {
                             slot.last = old_slot.last;
                         }
@@ -586,7 +588,7 @@ impl Schedule {
                     if same_until
                         && let (Some(slot), Some(old_slot)) =
                             (&mut request.until_slot, &old.until_slot)
-                        && old_slot.seen > checked_after
+                        && old_slot.seen > until_checked
                     {
                         slot.last = old_slot.last;
                     }
@@ -2673,7 +2675,7 @@ mod tests {
         // Its turn rewords it, checking it false: no snapshot since
         let mut replacing = request(condition("SELECT 1"), every(), &run.last.clone());
         replacing.checked.trigger = Some(false);
-        replacing.checked.seq = run.last.seq;
+        replacing.checked.trigger_seq = run.last.seq;
         run.schedule.answered(&batch.fired);
         let now = run.last.clone();
         run.schedule

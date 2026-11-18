@@ -311,6 +311,7 @@ impl Answer {
         }
     }
 
+    #[cfg(test)]
     pub fn holds(self) -> anyhow::Result<bool> {
         match self {
             Self::Holds(holds, _) => Ok(holds),

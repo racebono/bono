@@ -226,6 +226,7 @@ impl Engineer {
 
     /// Checks a condition once now, as `sql` would run it and under a condition's time limit:
     /// whether it returns at least one row.
+    #[cfg(test)]
     pub async fn check_condition(&self, query: String) -> anyhow::Result<bool> {
         self.ask(derived::Job::Condition { query })
             .await

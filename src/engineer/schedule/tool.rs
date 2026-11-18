@@ -262,8 +262,8 @@ impl ScheduleTool {
         };
         let mut notes = String::new();
         let mut checked = Checked::default();
-        // Snapshots after this one were measured after every check
-        let mut seq = 0;
+        // The snapshot when each was checked: one after it was measured after that check
+        let (mut trigger_seq, mut until_seq) = (0, 0);
         for (field, trigger, note, result) in [
             (
                 "trigger",
@@ -295,14 +295,18 @@ impl ScheduleTool {
                     format!("the `{field}` condition failed, so nothing was changed")
                 })?;
             *result = Some(holds);
-            seq = seq.max(at);
+            match field {
+                "trigger" => trigger_seq = at,
+                "until" => until_seq = at,
+                _ => {}
+            }
             if holds {
                 notes.push_str(&format!(
                     " Its `{field}` condition is already true: {note}."
                 ));
             }
         }
-        checked.seq = seq;
+        (checked.trigger_seq, checked.until_seq) = (trigger_seq, until_seq);
         new.checked = checked;
         Ok(notes)
     }
