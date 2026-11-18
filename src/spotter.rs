@@ -58,13 +58,14 @@ const LAP_INVALID_GRACE: f64 = 1.0;
 /// A lap's time: its number is in milliseconds.
 const LAP_TIME: &str = "lap time {}";
 /// Calls synthesized ahead, so the first of each is said without waiting for the voice.
-const WARM: [&str; 6] = [
+const WARM: [&str; 7] = [
     "car left",
     "car right",
     "three wide",
     "clear left",
     "clear right",
     "clear all round",
+    "green, green, green",
 ];
 
 /// Something the spotter says. `text` is English (a `{}` in it takes `number`); [`Raised::words`]
@@ -447,7 +448,7 @@ impl Spotter {
         }
     }
 
-    /// Synthesizes the traffic calls ahead, so the first ones aren't late.
+    /// Synthesizes the traffic calls and the race start ahead, so the first ones aren't late.
     fn warm(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer, lang: ArrayStr<2>) {
         self.finish_warming(Instant::now());
 
@@ -1476,6 +1477,8 @@ struct Logic {
     /// The gap behind opened up since it was last called
     gap_armed: bool,
     prev_scoring: Option<Scoring>,
+    /// A caution was still shown as the race went green: the start call said its end
+    start_caution: bool,
     /// The last bands called
     rain_band: Option<usize>,
     track_band: Option<usize>,
@@ -1512,6 +1515,7 @@ impl Default for Logic {
             prev_flat: [None; 4],
             gap_armed: true,
             prev_scoring: None,
+            start_caution: false,
             rain_band: None,
             track_band: None,
             last_rain_call: f64::NEG_INFINITY,
@@ -1864,26 +1868,31 @@ impl Logic {
         };
         let caution = |fcy: &Option<String>| fcy.as_deref().is_some_and(|fcy| fcy != "none");
 
-        let start = *config.race_starts()
-            && now.session_type.as_deref() == Some("race")
+        // A start is called once: a caution ending around it is said by the start call
+        let calls_starts = *config.race_starts() && now.session_type.as_deref() == Some("race");
+        if calls_starts
             && now.phase.as_deref() == Some("green")
             && matches!(
                 last.phase.as_deref(),
                 Some("formation_lap" | "countdown" | "stopped")
-            );
-        if start {
+            )
+        {
             calls.raise("green, green, green", true);
+            self.start_caution = caution(&last.full_course_yellow);
         }
         if caution(&now.full_course_yellow) && !caution(&last.full_course_yellow) {
             calls.raise("full course yellow", true);
         } else if caution(&last.full_course_yellow)
             && now.full_course_yellow.as_deref() == Some("none")
-            // The caution ending as the session's stopped isn't a restart: it's still red
-            && now.phase.as_deref() != Some("stopped")
-            // Nor is one ending as the race starts: that's called once, as the start
-            && !start
         {
-            calls.raise("green flag, green flag", true);
+            let said_by_the_start = std::mem::take(&mut self.start_caution)
+                // Ending before the race goes green: the start's still to say it
+                || calls_starts
+                    && matches!(now.phase.as_deref(), Some("formation_lap" | "countdown"));
+            // The caution ending as the session's stopped isn't a restart: it's still red
+            if !said_by_the_start && now.phase.as_deref() != Some("stopped") {
+                calls.raise("green flag, green flag", true);
+            }
         }
         if now.phase.as_deref() == Some("stopped") && last.phase.as_deref() != Some("stopped") {
             calls.raise("red flag", true);
@@ -2254,7 +2263,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_red_flag_replaces_a_red_flag() {
+    fn only_a_red_flag_or_the_race_going_green_replaces_a_red_flag() {
         for newer in ["full course yellow", "green flag, green flag"] {
             let queue = queued(&[("red flag", true), (newer, true)]);
             assert_eq!(
@@ -3840,12 +3849,53 @@ mod tests {
     #[test]
     fn one_call_for_a_start_as_a_caution_ends() {
         let config = SpotterConfig::default();
+        // As it goes green
         assert_eq!(
             calls_of(
                 &config,
                 &[race("formation_lap", "last_lap"), race("green", "none")]
             ),
             [vec![], vec![START]]
+        );
+        // Just after
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "last_lap"),
+                    race("green", "resume"),
+                    race("green", "none"),
+                ]
+            ),
+            [vec![], vec![START], vec![]]
+        );
+        // Just before
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("countdown", "last_lap"),
+                    race("countdown", "none"),
+                    race("green", "none"),
+                ]
+            ),
+            [vec![], vec![], vec![START]]
+        );
+        // A caution coming out at the start is called, and so is its end
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "none"),
+                    race("green", "pending"),
+                    race("green", "none"),
+                ]
+            ),
+            [
+                vec![],
+                vec![START, ("full course yellow", true)],
+                vec![CAUTION_OVER]
+            ]
         );
     }
 
@@ -3869,6 +3919,17 @@ mod tests {
                 vec![("full course yellow", true)],
                 vec![CAUTION_OVER]
             ]
+        );
+        // A caution ending before the start is called as before
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "last_lap"),
+                    race("formation_lap", "none")
+                ]
+            ),
+            [vec![], vec![CAUTION_OVER]]
         );
     }
 
@@ -4453,6 +4514,7 @@ mod tests {
             "libero a sinistra",
             "libero a destra",
             "tutto libero",
+            "verde, verde, verde",
         ]) {
             assert_eq!(translate(text, arrstr!("it")), expected);
         }
