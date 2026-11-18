@@ -1477,7 +1477,8 @@ struct Logic {
     /// The gap behind opened up since it was last called
     gap_armed: bool,
     prev_scoring: Option<Scoring>,
-    /// A caution was still shown as the race went green: the start call said its end
+    /// A caution was still shown as the race went green, which is still racing: the start call
+    /// said its end
     start_caution: bool,
     /// The last bands called
     rain_band: Option<usize>,
@@ -1880,6 +1881,8 @@ impl Logic {
             calls.raise("green, green, green", true);
             self.start_caution = caution(&last.full_course_yellow);
         }
+        // Until the race is held up again: a new caution or a red flag is called as it ends
+        self.start_caution &= now.phase.as_deref() == Some("green");
         if caution(&now.full_course_yellow) && !caution(&last.full_course_yellow) {
             calls.raise("full course yellow", true);
         } else if caution(&last.full_course_yellow)
@@ -1896,8 +1899,6 @@ impl Logic {
         }
         if now.phase.as_deref() == Some("stopped") && last.phase.as_deref() != Some("stopped") {
             calls.raise("red flag", true);
-            // Whatever caution follows is the restart's, not the start's
-            self.start_caution = false;
         }
         if now.yellow && !last.yellow {
             calls.raise("yellow flag on track", false);
@@ -3902,6 +3903,19 @@ mod tests {
                 vec![],
                 vec![CAUTION_OVER]
             ]
+        );
+        // A caution out again before the start's has cleared: its end is called
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "last_lap"),
+                    race("green", "resume"),
+                    race("full_course_yellow", "pending"),
+                    race("green", "none"),
+                ]
+            ),
+            [vec![], vec![START], vec![], vec![CAUTION_OVER]]
         );
         // A caution coming out at the start is called, and so is its end
         assert_eq!(
