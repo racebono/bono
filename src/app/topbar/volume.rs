@@ -18,7 +18,7 @@ impl VolumeTopbar {
                 ui,
                 *raw.master_volume(),
                 &mut raw.master_volume,
-                0.0..=1.0,
+                0.0..=MAX_VOLUME,
                 t!("volume.master"),
                 t!("volume.master_hover"),
             );
@@ -29,7 +29,7 @@ impl VolumeTopbar {
                 ui,
                 *raw.engineer_volume(),
                 &mut raw.engineer_volume,
-                0.0..=1.0,
+                0.0..=MAX_VOLUME,
                 t!("volume.engineer"),
                 t!("volume.engineer_hover"),
             );
@@ -37,7 +37,7 @@ impl VolumeTopbar {
                 ui,
                 *raw.spotter_volume(),
                 &mut raw.spotter_volume,
-                0.0..=1.0,
+                0.0..=MAX_VOLUME,
                 t!("volume.spotter"),
                 t!("volume.spotter_hover"),
             );
@@ -45,7 +45,7 @@ impl VolumeTopbar {
                 ui,
                 *raw.beep_volume(),
                 &mut raw.beep_volume,
-                0.0..=1.0,
+                0.0..=MAX_VOLUME,
                 t!("volume.beep"),
                 t!("volume.beep_hover"),
             );
@@ -71,8 +71,11 @@ impl VolumeTopbar {
     }
 }
 
-/// A percentage within `range` (0 to 1 for a volume or effect), `current` until it's set. Returns
-/// whether it changed.
+/// The loudest a volume goes: 150%, for voices too quiet over the simulator.
+pub const MAX_VOLUME: f32 = 1.5;
+
+/// A percentage within `range` (0 to 1 is 0 to 100%), `current` until it's set. Returns whether
+/// it changed.
 pub fn volume(
     ui: &mut egui::Ui,
     current: f32,

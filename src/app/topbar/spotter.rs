@@ -1,5 +1,5 @@
-//! The spotter: whether it calls at all (and in qualifying), in which language, and whether it
-//! says lap times in qualifying.
+//! The spotter: whether it calls at all (and in qualifying), in which language, whether it says
+//! lap times in qualifying, and whether it calls race starts.
 
 use crate::{app::topbar::pick, config::Config, language};
 use bono_i18n::t;
@@ -32,6 +32,13 @@ impl SpotterTopbar {
                     .edit(*spotter.qualifying(), |qualifying| {
                         ui.checkbox(qualifying, t!("spotter.qualifying"))
                             .on_hover_text(t!("spotter.qualifying_hover"))
+                            .changed()
+                    });
+                changed |= spotter
+                    .race_starts
+                    .edit(*spotter.race_starts(), |race_starts| {
+                        ui.checkbox(race_starts, t!("spotter.race_starts"))
+                            .on_hover_text(t!("spotter.race_starts_hover"))
                             .changed()
                     });
                 changed |= pick(

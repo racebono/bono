@@ -922,14 +922,19 @@ impl Speech {
 
     fn tone(tone: impl FnOnce(&Radio, f32) -> Vec<f32>, volume: f32) -> Self {
         const SAMPLE_RATE: u32 = 48000;
-        let mut samples = tone(&Radio::default(), SAMPLE_RATE as f32);
-        for sample in &mut samples {
-            *sample = (*sample * volume).clamp(-1.0, 1.0);
-        }
-        return Self {
-            samples,
+        let mut speech = Self {
+            samples: tone(&Radio::default(), SAMPLE_RATE as f32),
             sample_rate: SAMPLE_RATE,
         };
+        speech.amplify(volume);
+        return speech;
+    }
+
+    /// Scales it by `gain`, clipped to full scale: a volume over 100% pushes peaks past it.
+    pub fn amplify(&mut self, gain: f32) {
+        for sample in &mut self.samples {
+            *sample = (*sample * gain).clamp(-1.0, 1.0);
+        }
     }
 
     #[inline]
@@ -1189,6 +1194,16 @@ mod tests {
         assert_eq!(loaded(&synth.inner[&lang]).await, Some(VoiceLoad::Failed));
         // It was loaded (and failed) by a worker that's still there for the next
         assert!(!synth.inner[&lang].stopped());
+    }
+
+    #[test]
+    fn amplified_speech_clips_at_full_scale() {
+        let mut speech = Speech {
+            samples: vec![0.25, -0.25, 0.75, -0.75],
+            sample_rate: 48000,
+        };
+        speech.amplify(2.0);
+        assert_eq!(speech.samples, [0.5, -0.5, 1.0, -1.0]);
     }
 
     #[test]

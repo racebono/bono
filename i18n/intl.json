@@ -475,6 +475,16 @@
         "es": "El idioma de sus avisos: el del piloto es el último en el que preguntó al ingeniero. Los avisos se dicen en catalán, español, italiano o inglés; con las voces de otros idiomas, se dicen en inglés",
         "ca": "L'idioma dels seus avisos: el del pilot és l'últim en què va preguntar a l'enginyer. Els avisos es diuen en català, castellà, italià o anglès; amb les veus d'altres idiomes, es diuen en anglès"
     },
+    "spotter.race_starts": {
+        "en": "Race starts",
+        "es": "Salidas",
+        "ca": "Sortides"
+    },
+    "spotter.race_starts_hover": {
+        "en": "Says \"green, green, green\" as the race starts, and as it goes green again straight after a red flag",
+        "es": "Dice \"verde, verde, verde\" cuando empieza la carrera, y cuando vuelve a verde justo después de una bandera roja",
+        "ca": "Diu \"verd, verd, verd\" quan comença la cursa, i quan torna a verd just després d'una bandera vermella"
+    },
     "spotter.qualifying_lap_times": {
         "en": "Lap times in qualifying",
         "es": "Tiempos de vuelta en clasificación",
@@ -1044,6 +1054,12 @@
         "es": "bandera verde, bandera verde",
         "ca": "bandera verda, bandera verda",
         "it": "bandiera verde, bandiera verde"
+    },
+    "call.race_start": {
+        "en": "green, green, green",
+        "es": "verde, verde, verde",
+        "ca": "verd, verd, verd",
+        "it": "verde, verde, verde"
     },
     "call.red_flag": {
         "en": "red flag",

@@ -306,9 +306,7 @@ impl Playback {
         match self.speech.try_next() {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(Ok(mut speech))) => {
-                for sample in &mut speech.samples {
-                    *sample *= gain;
-                }
+                speech.amplify(gain);
                 self.sentences.pieces.push_back(speech);
                 Poll::Ready(Some(Ok(())))
             }
