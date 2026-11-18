@@ -88,8 +88,9 @@ impl VehicleCondition {
         state.vehicle = None;
     }
 
-    /// Whether the game is in realtime, where the car can be driven. Outside it, it isn't asked: a
-    /// request in flight when realtime ends finishes while the car is still loaded.
+    /// Whether the game is in realtime, where the car can be driven. Outside it, it isn't asked. A
+    /// request already in flight when realtime ends isn't waited for (that would hold the game's
+    /// thread): it normally takes milliseconds, well before the game unloads the car.
     pub fn set_realtime(&self, realtime: bool) {
         lock(&self.shared.state).realtime = realtime;
     }
@@ -383,9 +384,10 @@ mod tests {
     #[test]
     fn only_asked_in_realtime() {
         let (asked_tx, asked) = mpsc::channel();
+        let (answer, answer_rx) = mpsc::channel::<Condition>();
         let condition = VehicleCondition::with(Duration::from_millis(1), move || {
             let _ = asked_tx.send(());
-            None
+            answer_rx.recv().ok()
         });
         damage(&condition, true, Instant::now());
         assert!(asked.recv_timeout(Duration::from_millis(50)).is_err());
@@ -394,11 +396,11 @@ mod tests {
         damage(&condition, true, Instant::now());
         asked.recv_timeout(Duration::from_secs(5)).unwrap();
 
-        // Realtime ends: a question already being asked may still come, then none
+        // Realtime ends while a question is being asked: it's answered, and no other is asked
         condition.set_realtime(false);
         damage(&condition, true, Instant::now());
-        std::thread::sleep(Duration::from_millis(20));
-        while asked.try_recv().is_ok() {}
+        answer.send(Condition::default()).unwrap();
         assert!(asked.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(answer);
     }
 }
