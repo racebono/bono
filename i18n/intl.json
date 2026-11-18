@@ -471,9 +471,9 @@
         "ca": "Sortides"
     },
     "spotter.race_starts_hover": {
-        "en": "Says \"green, green, green\" as the race starts, and as it restarts after a red flag",
-        "es": "Dice \"verde, verde, verde\" cuando empieza la carrera, y cuando se reanuda tras una bandera roja",
-        "ca": "Diu \"verd, verd, verd\" quan comença la cursa, i quan es reprèn després d'una bandera vermella"
+        "en": "Says \"green, green, green\" as the race starts, and as it goes green again straight after a red flag",
+        "es": "Dice \"verde, verde, verde\" cuando empieza la carrera, y cuando vuelve a verde justo después de una bandera roja",
+        "ca": "Diu \"verd, verd, verd\" quan comença la cursa, i quan torna a verd just després d'una bandera vermella"
     },
     "spotter.qualifying_lap_times": {
         "en": "Lap times in qualifying",
