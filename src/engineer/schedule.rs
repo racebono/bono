@@ -220,8 +220,9 @@ struct Request {
     missed_start: Option<i64>,
     /// The same for its `until`, a session one: it ends for that start
     until_missed_start: Option<i64>,
-    /// Its condition turned true again while its scheduled turn ran: it fires for that once it's
-    /// armed again
+    /// Its condition turned true again since it fired, before a scheduled turn took it (while it
+    /// was due) or while its turn ran: it fires for that once it's armed again, unless a turn taking
+    /// it later covers it
     rose_in_batch: bool,
 }
 
@@ -558,29 +559,28 @@ impl Schedule {
                     request.waiting = old.waiting;
                     request.missed_start = missed;
                     request.until_missed_start = until_missed;
-                    // A rise of the same condition while its turn ran still fires it, if the new
-                    // one starts from true (from false, its own first true check is that rise)
-                    request.rose_in_batch = old.rose_in_batch
-                        && request.trigger == old.trigger
-                        && (request.trigger_slot.as_ref())
-                            .is_some_and(|slot| slot.last == Some(true));
-                    // Fired, and no scheduled turn has taken it yet: the next one answers it, as
-                    // it's asked for now
-                    if let State::Due {
-                        mut since,
-                        fired,
-                        at,
-                        step,
-                    } = old.state
-                    {
-                        // Another period counts on from the firing: the old one's target isn't
-                        // the new one's
-                        if request.trigger != old.trigger
-                            && let Trigger::Time { seconds } = request.trigger
+                    // The same trigger carries on from where the old one's condition is (newer
+                    // than the check when the replace was asked for), and a rise it saw while its
+                    // turn ran still fires it, once
+                    if request.trigger == old.trigger {
+                        if let (Some(slot), Some(old_slot)) =
+                            (&mut request.trigger_slot, &old.trigger_slot)
                         {
-                            since = fired.clone();
-                            since.clock_s -= seconds;
+                            slot.last = old_slot.last;
                         }
+                        request.rose_in_batch = old.rose_in_batch;
+                    }
+                    // Fired, and no scheduled turn has taken it yet: the next one answers it, as
+                    // it's asked for now. Only for the same trigger: another one didn't fire, and
+                    // counts on from the firing (armed from it, above)
+                    if request.trigger == old.trigger
+                        && let State::Due {
+                            since,
+                            fired,
+                            at,
+                            step,
+                        } = old.state
+                    {
                         request.state = State::Due {
                             since,
                             fired,
@@ -702,7 +702,7 @@ impl Schedule {
             if epoch_changed {
                 request.rose_in_batch = false;
             }
-            if matches!(request.state, State::InBatch { .. })
+            if matches!(request.state, State::Due { .. } | State::InBatch { .. })
                 && request.trigger_slot.as_ref().is_some_and(|slot| slot.rose)
             {
                 request.rose_in_batch = true;
@@ -757,6 +757,8 @@ impl Schedule {
                 if fired_now {
                     break;
                 }
+                // A rise since that firing, its answer skipped, is checked now
+                missed = std::mem::take(&mut request.rose_in_batch);
             }
             if ended && !request.end() {
                 continue;
@@ -815,6 +817,8 @@ impl Schedule {
                 at: *at,
                 step: *step,
             };
+            // The turn taking it is after any rise since its firing: its answer covers it
+            request.rose_in_batch = false;
         }
         self.batch_out = true;
         Some(batch)
@@ -1112,8 +1116,6 @@ impl Schedule {
                     at: *at,
                     step: *step,
                 };
-                // The turn that answers it now is after that rise: its answer covers it
-                request.rose_in_batch = false;
             }
         }
         self.batch_out = false;
@@ -2573,7 +2575,8 @@ mod tests {
         let replacing = request(Trigger::Time { seconds: 120.0 }, every(), &made);
         run.schedule
             .apply(vec![Change::Replace(id, replacing)], &made);
-        run.answer();
+        // Another trigger didn't fire: it counts on from the firing
+        assert!(run.due().is_empty());
         run.tick(at(179.0, 0));
         assert!(run.due().is_empty());
         run.tick(at(180.0, 0));
@@ -2629,6 +2632,58 @@ mod tests {
         run.schedule.answered(&batch.fired);
         run.schedule.resolved(&batch.fired);
         run.tick(with(laps(0), cond, ConditionState::True));
+        assert_eq!(run.due(), [id]);
+    }
+
+    #[test]
+    fn its_own_turn_replacing_it_keeps_a_rise_while_it_ran() {
+        let mut run = Run::new();
+        let id = run.add(request(condition("SELECT 1"), every(), &laps(0)));
+        let [cond] = run.condition_ids()[..] else {
+            panic!("one condition")
+        };
+        run.tick(with(laps(0), cond, ConditionState::False));
+        run.tick(with(laps(0), cond, ConditionState::True));
+        let batch = run.take();
+        run.tick(with(laps(0), cond, ConditionState::False));
+        // The turn rewords it, its condition checked false; then true and false again
+        let mut replacing = request(condition("SELECT 1"), every(), &laps(0));
+        replacing.checked.trigger = Some(false);
+        run.tick(with(laps(0), cond, ConditionState::True));
+        run.tick(with(laps(0), cond, ConditionState::False));
+        run.schedule.answered(&batch.fired);
+        run.schedule
+            .apply_answering(vec![Change::Replace(id, replacing)], &laps(0), &batch.fired);
+        run.schedule.resolved(&batch.fired);
+        let [cond] = run.condition_ids()[..] else {
+            panic!("one condition")
+        };
+        run.tick(with(laps(0), cond, ConditionState::False));
+        assert_eq!(run.due(), [id]);
+        run.answer();
+        // Once
+        run.tick(with(laps(0), cond, ConditionState::False));
+        assert!(run.due().is_empty());
+    }
+
+    #[test]
+    fn a_rise_while_due_fires_it_again_when_that_firing_goes_stale() {
+        let mut run = Run::new();
+        let mut new = request(condition("SELECT 1"), every(), &at(0.0, 0));
+        new.stale_after = Some(Trigger::Time { seconds: 10.0 });
+        let id = run.add(new);
+        let [trigger, ..] = run.condition_ids()[..] else {
+            panic!("its condition")
+        };
+        run.tick(with(at(99.0, 0), trigger, ConditionState::False));
+        run.tick(with(at(100.0, 0), trigger, ConditionState::True));
+        assert_eq!(run.due(), [id]);
+        // No turn takes it (the pilot's runs); it falls and rises again
+        run.tick(with(at(103.0, 0), trigger, ConditionState::False));
+        run.tick(with(at(105.0, 0), trigger, ConditionState::True));
+        // The first firing goes stale: the rise at 105 fires it
+        let advance = run.tick(with(at(110.0, 0), trigger, ConditionState::True));
+        assert_eq!(advance.skipped_stale, 1);
         assert_eq!(run.due(), [id]);
     }
 
