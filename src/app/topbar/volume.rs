@@ -59,8 +59,8 @@ impl VolumeTopbar {
     }
 }
 
-/// The loudest a volume goes: 200%, for voices too quiet over the simulator.
-pub const MAX_VOLUME: f32 = 2.0;
+/// The loudest a volume goes: 150%, for voices too quiet over the simulator.
+pub const MAX_VOLUME: f32 = 1.5;
 
 /// A volume (or effect) from 0 to `max` (1 is 100%), `current` until it's set. Returns whether
 /// it changed.
