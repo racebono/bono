@@ -450,6 +450,13 @@ impl Spotter {
     fn warm(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer, lang: ArrayStr<2>) {
         self.finish_warming(Instant::now());
 
+        // Ones for other settings (a slider being dragged) would hold up the ones for these: the
+        // voice skips those dropped before it gets to them
+        let (lang_now, voice, radio, speed, _) = Self::key(config, lang, String::new());
+        self.warming.retain(|((l, v, r, s, _), _)| {
+            (*l, v, *r, *s) == (lang_now, &voice, radio, speed)
+        });
+
         for text in WARM {
             let words = translate(text, lang).to_owned();
             let key = Self::key(config, lang, words.clone());
@@ -2171,6 +2178,33 @@ mod tests {
         let effects = Spotter::effects(&config);
         assert_eq!(effects.speed, 1.5);
         assert_eq!(effects.beep_volume, 0.0);
+    }
+
+    #[test]
+    fn warmups_for_old_settings_are_dropped() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let mut synth = Synthesizer::new(runtime.handle(), &config.get());
+        let lang = arrstr!("en");
+        let mut spotter = Spotter::new();
+        let old = Spotter::key(&config, lang, "car left".into());
+        let (_send, recv) = oneshot::channel();
+        spotter.warming.push((old.clone(), recv));
+
+        config.update(|raw| raw.speech_speed.set(1.5));
+        spotter.warm(runtime.handle(), &config, &mut synth, lang);
+        assert!(!spotter.warming.iter().any(|(key, _)| *key == old));
+        assert!(!spotter.warm_failed.contains_key(&old));
+        assert!(
+            spotter
+                .warming
+                .iter()
+                .all(|(key, _)| key.3 == 1.5_f32.to_bits())
+        );
     }
 
     #[test]
