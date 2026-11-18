@@ -154,9 +154,10 @@ impl Raised {
             | "clear left" | "clear right" | "clear all round" | "still there left"
             | "still there right" => WarningCategory::Traffic,
             "limiter, limiter" => WarningCategory::Limiter,
-            "full course yellow" | "green flag, green flag" | "red flag" | "green, green, green" => {
-                WarningCategory::Flag
-            }
+            "full course yellow"
+            | "green flag, green flag"
+            | "red flag"
+            | "green, green, green" => WarningCategory::Flag,
             "car close behind" | "car within a second behind" => WarningCategory::GapBehind,
             text => WarningCategory::Other(text),
         }
@@ -3796,10 +3797,7 @@ mod tests {
 
         // Following a race already under way
         let green = race("green", "none");
-        assert_eq!(
-            calls_of(&config, &[green.clone(), green]),
-            [vec![], vec![]]
-        );
+        assert_eq!(calls_of(&config, &[green.clone(), green]), [vec![], vec![]]);
         // A caution ending is its own call
         assert_eq!(
             calls_of(
