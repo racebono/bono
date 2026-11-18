@@ -16,6 +16,7 @@ impl VolumeTopbar {
                 &mut raw.master_volume,
                 t!("volume.master"),
                 t!("volume.master_hover"),
+                MAX_VOLUME,
             );
             ui.separator();
 
@@ -26,6 +27,7 @@ impl VolumeTopbar {
                 &mut raw.engineer_volume,
                 t!("volume.engineer"),
                 t!("volume.engineer_hover"),
+                MAX_VOLUME,
             );
             changed |= volume(
                 ui,
@@ -33,6 +35,7 @@ impl VolumeTopbar {
                 &mut raw.spotter_volume,
                 t!("volume.spotter"),
                 t!("volume.spotter_hover"),
+                MAX_VOLUME,
             );
             changed |= volume(
                 ui,
@@ -40,6 +43,7 @@ impl VolumeTopbar {
                 &mut raw.beep_volume,
                 t!("volume.beep"),
                 t!("volume.beep_hover"),
+                MAX_VOLUME,
             );
             ui.separator();
             changed |= volume(
@@ -48,23 +52,29 @@ impl VolumeTopbar {
                 &mut raw.radio_effect,
                 t!("volume.radio_effect"),
                 t!("volume.radio_effect_hover"),
+                1.0,
             );
             changed
         });
     }
 }
 
-/// A volume (or effect) from 0 to 100%, `current` until it's set. Returns whether it changed.
+/// The loudest a volume goes: 150%, for voices too quiet over the simulator.
+pub const MAX_VOLUME: f32 = 1.5;
+
+/// A volume (or effect) from 0 to `max` (1 is 100%), `current` until it's set. Returns whether
+/// it changed.
 pub fn volume(
     ui: &mut egui::Ui,
     current: f32,
     setting: &mut Setting<f32>,
     name: &str,
     hover: &str,
+    max: f32,
 ) -> bool {
     setting.edit(current, |value| {
         ui.add(
-            egui::Slider::new(value, 0.0..=1.0)
+            egui::Slider::new(value, 0.0..=max)
                 .text(name)
                 .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
                 .custom_parser(|text| {
