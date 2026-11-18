@@ -18,7 +18,11 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        mpsc,
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -87,6 +91,14 @@ struct Shared {
     path: PathBuf,
     /// How far the track description has been moved to line up with the laps
     calibration: Mutex<Option<AppliedCalibration>>,
+    /// The data thread's latest progress snapshot, none while its tables are catching up. Locked
+    /// only to copy it or put a new one in, so the UI thread never waits on it.
+    progress: Mutex<Option<Progress>>,
+    /// The `seq` of the last snapshot [read](Engineer::progress), 0 before the first: one
+    /// published over an unread one carries its `new_epochs` on. Set with `progress` locked.
+    read: AtomicU64,
+    /// The conditions the data thread checks with every snapshot. Locked only to copy or swap.
+    conditions: Mutex<Vec<(ConditionId, String)>>,
 }
 
 impl Engineer {
@@ -96,6 +108,9 @@ impl Engineer {
         let shared = Arc::new(Shared {
             path: db.database().path().to_owned(),
             calibration: Mutex::new(None),
+            progress: Mutex::new(None),
+            read: AtomicU64::new(0),
+            conditions: Mutex::new(Vec::new()),
         });
         let data = derived::spawn(shared.clone());
         Self {
@@ -158,26 +173,84 @@ impl Engineer {
         }
     }
 
+    /// What the data thread last measured for the scheduled requests (see [`Progress`]), without
+    /// waiting for it, read to step the schedule through: the next snapshot's `new_epochs` start
+    /// after it. `None` until its first snapshot, and while its tables are catching up with the
+    /// recording.
+    pub fn progress(&self) -> Option<Progress> {
+        let progress = lock(&self.inner.shared.progress);
+        let copy = progress.clone();
+        if let Some(copy) = &copy {
+            (self.inner.shared.read).fetch_max(copy.seq, AtomicOrdering::Relaxed);
+        }
+        drop(progress);
+        copy
+    }
+
+    /// The latest snapshot, as [`Self::progress`] has it, without reading it: one that isn't
+    /// read still has its `new_epochs` carried on to the next.
+    pub fn peek_progress(&self) -> Option<Progress> {
+        lock(&self.inner.shared.progress).clone()
+    }
+
+    /// The latest snapshot's `seq`, without copying it: whether there's a new one to read.
+    pub fn progress_seq(&self) -> Option<u64> {
+        lock(&self.inner.shared.progress).as_ref().map(|p| p.seq)
+    }
+
+    /// Has the data thread publish a snapshot now, its tables caught up first. It publishes none
+    /// of its own after this: a test's snapshots are the ones it asks for.
+    #[cfg(test)]
+    pub async fn publish_progress(&self) -> anyhow::Result<()> {
+        self.ask(derived::Job::Progress).await.map(|_| ())
+    }
+
+    /// Takes the progress away, as a tick that falls behind the recording does.
+    #[cfg(test)]
+    pub fn take_progress(&self) -> Option<Progress> {
+        lock(&self.inner.shared.progress).take()
+    }
+
+    /// Replaces the conditions the data thread checks with every progress snapshot, without
+    /// waiting for it.
+    pub fn set_conditions(&self, conditions: Vec<(ConditionId, String)>) {
+        let replaced = std::mem::replace(&mut *lock(&self.inner.shared.conditions), conditions);
+        drop(replaced);
+    }
+
+    /// The conditions registered with [`Self::set_conditions`].
+    #[cfg(test)]
+    pub fn conditions(&self) -> Vec<(ConditionId, String)> {
+        lock(&self.inner.shared.conditions).clone()
+    }
+
+    /// Checks a condition once now, as `sql` would run it and under a condition's time limit:
+    /// whether it returns at least one row.
+    pub async fn check_condition(&self, query: String) -> anyhow::Result<bool> {
+        self.ask(derived::Job::Condition { query })
+            .await
+            .and_then(derived::Answer::holds)
+            .map_err(busy_retry)
+    }
+
     async fn run(&self, input: EngineerInput) -> anyhow::Result<String> {
         match input.command {
             Command::Quick => self.quick().await,
-            Command::Track => self.ask(derived::Job::Track).await,
+            Command::Track => self
+                .ask(derived::Job::Track)
+                .await
+                .and_then(derived::Answer::text),
             Command::Sql => {
                 let Some(query) = input.query else {
                     bail!("sql needs a `query`");
                 };
                 let limit = input.limit;
-                self.ask(derived::Job::Sql { query, limit }).await
+                self.ask(derived::Job::Sql { query, limit })
+                    .await
+                    .and_then(derived::Answer::text)
             }
         }
-        .map_err(|e| match e.downcast_ref::<rusqlite::Error>() {
-            Some(rusqlite::Error::SqliteFailure(failure, _))
-                if failure.code == rusqlite::ErrorCode::DatabaseBusy =>
-            {
-                e.context("the logger is mid-write, just retry")
-            }
-            _ => e,
-        })
+        .map_err(busy_retry)
     }
 
     async fn quick(&self) -> anyhow::Result<String> {
@@ -194,7 +267,7 @@ impl Engineer {
         .await
     }
 
-    async fn ask(&self, job: derived::Job) -> anyhow::Result<String> {
+    async fn ask(&self, job: derived::Job) -> anyhow::Result<derived::Answer> {
         let (reply, answer) = tokio::sync::oneshot::channel();
         self.inner
             .data
@@ -208,6 +281,18 @@ impl Engineer {
     #[cfg(test)]
     async fn sync(&self) -> anyhow::Result<()> {
         self.ask(derived::Job::Sync).await.map(|_| ())
+    }
+}
+
+/// The recording being busy says so: it's the logger writing, and asking again is all it takes.
+fn busy_retry(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast_ref::<rusqlite::Error>() {
+        Some(rusqlite::Error::SqliteFailure(failure, _))
+            if failure.code == rusqlite::ErrorCode::DatabaseBusy =>
+        {
+            e.context("the logger is mid-write, just retry")
+        }
+        _ => e,
     }
 }
 
@@ -257,6 +342,8 @@ macro_rules! say {
 }
 
 mod derived;
+mod progress;
+pub use progress::*;
 
 // --------------------------------------------------------------------------- rows
 
@@ -3235,6 +3322,40 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_busy_recording_says_to_retry() {
+        let (_dir, engineer) = race();
+        // A data thread that always finds the logger mid-write
+        let (data, requests) = mpsc::channel::<derived::Request>();
+        std::thread::spawn(move || {
+            for request in requests {
+                let busy = rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                );
+                let _ = request.reply.send(Err(busy.into()));
+            }
+        });
+        let busy = Engineer {
+            inner: Arc::new(Inner {
+                db: engineer.inner.db.clone(),
+                shared: engineer.inner.shared.clone(),
+                data,
+            }),
+        };
+
+        let error = busy.check_condition("SELECT 1".into()).await.unwrap_err();
+        assert!(format!("{error:#}").contains("just retry"), "{error:#}");
+        let error = busy
+            .run(
+                serde_json::from_value(serde_json::json!({"command": "sql", "query": "SELECT 1"}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("just retry"), "{error:#}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn quick_is_about_the_newest_epoch_only() {
         let (dir, engineer) = race();
         let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
@@ -3533,32 +3654,52 @@ mod tests {
 /// - `EVAL_OUT`: where each eval's reply goes, as `eval-<id>/<EVAL_CONFIG>/<EVAL_RUN>/`
 /// - `EVAL_CONFIG` (default `with_skill`), `EVAL_RUN` (default `run-1`), `EVAL_MODEL`,
 ///   `EVAL_EFFORT`, `EVAL_IDS` (e.g. `1,5,9`)
+///
+/// The `schedule` tool is registered too. An eval's `pending` requests are added before its
+/// question, which then carries the pending list as the app's do; one with `scheduled` requests
+/// is sent as the scheduled-turn message the app sends for them instead of its `prompt` (see
+/// `skill/evals/scheduled.md`). Each eval's staged schedule changes go to `changes.json`.
 #[cfg(test)]
 mod evals {
     use super::*;
     use crate::{
+        arrstr,
+        engineer::{
+            briefed,
+            schedule::{
+                self, Batch, Change, Fired, NewRequest, Repeat, RequestId, Schedule, Trigger,
+                tool::{ScheduleInput, ScheduleTool},
+            },
+            scheduled_message,
+        },
+        language,
         provider::{Model, claude::ConversationBuilder},
         sqlite::Database,
     };
     use std::{num::NonZeroUsize, sync::Mutex as StdMutex, time::Instant};
 
-    /// The tool, recording every call and what it answered.
+    /// A tool, recording every call and what it answered.
     #[derive(Clone)]
-    struct Recording {
-        tool: Engineer,
+    struct Recording<H> {
+        tool: H,
+        /// The call's heading in the transcript
+        heading: &'static str,
         calls: Arc<StdMutex<Vec<String>>>,
         events: Arc<StdMutex<Vec<serde_json::Value>>>,
         start: Instant,
     }
 
-    impl ToolHandler for Recording {
+    impl<H: ToolHandler> ToolHandler for Recording<H> {
         type Input = serde_json::Value;
 
         fn handle(
             &self,
             input: serde_json::Value,
         ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
-            let tool = self.tool.clone();
+            // Handed to the tool now, when the call is made, as the conversation would
+            let run = serde_json::from_value::<H::Input>(input.clone())
+                .map(|parsed| self.tool.handle(parsed));
+            let heading = self.heading;
             let calls = self.calls.clone();
             let events = self.events.clone();
             let start = self.start;
@@ -3567,8 +3708,8 @@ mod evals {
                     "kind": "tool_start", "ms": start.elapsed().as_millis() as u64,
                     "input": input,
                 }));
-                let result = match EngineerInput::deserialize(&input) {
-                    Ok(parsed) => tool.run(parsed).await,
+                let result = match run {
+                    Ok(run) => run.await,
                     Err(e) => Err(e.into()),
                 };
                 events.lock().unwrap().push(serde_json::json!({
@@ -3581,9 +3722,226 @@ mod evals {
                 calls
                     .lock()
                     .unwrap()
-                    .push(format!("### Tool call: `{input}`\n\n```\n{answer}\n```\n"));
+                    .push(format!("### {heading}: `{input}`\n\n```\n{answer}\n```\n"));
                 result
             }
+        }
+    }
+
+    /// What an eval's turn starts from: the requests pending before it, and the batch of those
+    /// that fired for it, if it's a scheduled turn
+    struct Setup {
+        schedule: Schedule,
+        batch: Option<Batch>,
+    }
+
+    /// The schedule an eval's `pending` requests make, added at `progress` as the `schedule`
+    /// tool's adds (ids from #1, in order), and the batch its `scheduled` requests make, fired at
+    /// `progress`.
+    fn setup(eval: &serde_json::Value, progress: &Progress) -> Setup {
+        let eval_id = &eval["id"];
+        let mut schedule = Schedule::new();
+        for entry in eval["pending"].as_array().into_iter().flatten() {
+            let id = schedule.next_id();
+            let mut input = entry.clone();
+            let fields = (input.as_object_mut())
+                .unwrap_or_else(|| panic!("eval {eval_id}: pending {id} isn't an object"));
+            let given = fields.remove("id");
+            assert_eq!(
+                given.as_ref().and_then(|given| given.as_str()),
+                Some(id.to_string().as_str()),
+                "eval {eval_id}: pending ids number from #1 in order"
+            );
+            fields.insert("action".into(), "add".into());
+            let (instruction, trigger, repeat, stale_after) =
+                serde_json::from_value::<ScheduleInput>(input)
+                    .map_err(anyhow::Error::from)
+                    .and_then(ScheduleInput::request)
+                    .unwrap_or_else(|e| panic!("eval {eval_id}: pending {id}: {e:#}"));
+            let new = NewRequest {
+                instruction,
+                trigger,
+                repeat,
+                stale_after,
+                made: progress.clone(),
+            };
+            let applied = schedule.apply(vec![Change::Add(id, new)], progress);
+            assert_eq!(
+                applied.ids,
+                [id],
+                "eval {eval_id}: pending {id} wasn't added"
+            );
+        }
+        let batch = eval.get("scheduled").map(|scheduled| {
+            let requests = (scheduled.as_array())
+                .filter(|scheduled| !scheduled.is_empty())
+                .unwrap_or_else(|| panic!("eval {eval_id}: `scheduled` isn't a list of requests"))
+                .iter()
+                .map(|entry| {
+                    let text = |field: &str| {
+                        (entry[field].as_str())
+                            .unwrap_or_else(|| {
+                                panic!("eval {eval_id}: a scheduled request has no `{field}`")
+                            })
+                            .to_owned()
+                    };
+                    let id = text("id");
+                    let id = (id.strip_prefix('#'))
+                        .and_then(|number| number.parse().ok())
+                        .map(RequestId)
+                        .unwrap_or_else(|| panic!("eval {eval_id}: {id:?} isn't an id like #1"));
+                    (id, text("instruction"), text("made"), text("why"))
+                })
+                .collect::<Vec<_>>();
+            let fired = (requests.iter())
+                .map(|(id, ..)| Fired {
+                    id: *id,
+                    at: progress.clone(),
+                })
+                .collect();
+            Batch { requests, fired }
+        });
+        Setup { schedule, batch }
+    }
+
+    /// What an eval's turn says before its telemetry snapshot: the pilot's question, or the
+    /// scheduled-turn message for the requests that fired.
+    fn head(eval: &serde_json::Value, setup: &Setup) -> String {
+        match &setup.batch {
+            Some(batch) => scheduled_message(batch),
+            None => eval["prompt"].as_str().unwrap().to_owned(),
+        }
+    }
+
+    /// The message an eval's turn sends, from its `head` with the snapshot attached, and the
+    /// note told after its tool results, as the app has them: a scheduled turn ends with the
+    /// pending requests and which language to reply in, a typed question with the pending
+    /// requests. An eval with neither `pending` nor `scheduled` is sent as it always was.
+    fn brief(
+        eval: &serde_json::Value,
+        setup: &Setup,
+        progress: &Progress,
+        head: String,
+    ) -> (String, Option<Arc<str>>) {
+        let pending = setup.schedule.pending_text(progress);
+        if setup.batch.is_some() {
+            // The pilot's reply language when nobody has spoken: the app's default
+            let note: Arc<str> = language::reply_note(arrstr!("en")).into();
+            (briefed(head, &pending, "", Some(&note)), Some(note))
+        } else if eval.get("pending").is_some() {
+            (briefed(head, &pending, "", None), None)
+        } else {
+            (head, None)
+        }
+    }
+
+    /// A staged change as the `schedule` tool's input has it, for grading
+    fn change_json(change: &Change) -> serde_json::Value {
+        fn trigger(trigger: &Trigger) -> serde_json::Value {
+            match trigger {
+                Trigger::Time { seconds } => {
+                    serde_json::json!({"kind": "time", "seconds": seconds})
+                }
+                Trigger::Laps { count } => serde_json::json!({"kind": "laps", "count": count}),
+                Trigger::Session { kind } => {
+                    serde_json::json!({"kind": "session", "session_type": kind})
+                }
+                Trigger::Condition { query } => {
+                    serde_json::json!({"kind": "condition", "query": query})
+                }
+            }
+        }
+        let (action, id, new) = match change {
+            Change::Add(id, new) => ("add", id, Some(new)),
+            Change::Cancel(id) => ("cancel", id, None),
+            Change::Replace(id, new) => ("replace", id, Some(new)),
+        };
+        let mut json = serde_json::json!({"action": action, "id": id.to_string()});
+        if let Some(new) = new {
+            let (repeat, until) = match &new.repeat {
+                Repeat::Once => ("once", None),
+                Repeat::Every { until } => ("every", until.as_ref()),
+            };
+            json["instruction"] = new.instruction.clone().into();
+            json["trigger"] = trigger(&new.trigger);
+            json["repeat"] = repeat.into();
+            json["until"] = until.map_or(serde_json::Value::Null, trigger);
+            json["stale_after"] =
+                (new.stale_after.as_ref()).map_or(serde_json::Value::Null, trigger);
+        }
+        json
+    }
+
+    fn all_evals() -> Vec<serde_json::Value> {
+        let evals: serde_json::Value =
+            serde_json::from_str(include_str!("../../skill/evals/evals.json")).unwrap();
+        evals["evals"].as_array().unwrap().clone()
+    }
+
+    /// The `pending` and `scheduled` fields of the evals make the schedule and the messages the
+    /// harness sends, as the app would.
+    #[test]
+    fn pending_and_scheduled_evals_are_briefed() {
+        let progress = Progress::default();
+        let evals = all_evals();
+        for eval in &evals {
+            let setup = setup(eval, &progress);
+            brief(eval, &setup, &progress, head(eval, &setup));
+        }
+        let eval = |id: u64| {
+            (evals.iter())
+                .find(|eval| eval["id"].as_u64() == Some(id))
+                .unwrap()
+        };
+
+        // Three pending requests, in the question's pending list
+        let asked = eval(37);
+        let setup37 = setup(asked, &progress);
+        assert!(setup37.batch.is_none());
+        assert_eq!(
+            setup37.schedule.pending_ids(),
+            [RequestId(1), RequestId(2), RequestId(3)]
+        );
+        assert_eq!(setup37.schedule.next_id(), RequestId(4));
+        let pending = setup37.schedule.pending_text(&progress);
+        let prompt = asked["prompt"].as_str().unwrap();
+        let (question, note) = brief(asked, &setup37, &progress, head(asked, &setup37));
+        assert!(note.is_none());
+        assert_eq!(question, format!("{prompt}\n\n{pending}"));
+        for entry in asked["pending"].as_array().unwrap() {
+            let line = format!(
+                "- {}: {}",
+                entry["id"].as_str().unwrap(),
+                entry["instruction"].as_str().unwrap()
+            );
+            assert!(pending.contains(&line), "{line:?} in {pending}");
+        }
+
+        // A scheduled turn: the app's message for the request that fired, then the pending list
+        // (none) and which language to reply in
+        let fired = eval(41);
+        let setup41 = setup(fired, &progress);
+        let batch = setup41.batch.as_ref().unwrap();
+        assert_eq!(batch.fired.len(), 1);
+        assert_eq!(batch.fired[0].id, RequestId(1));
+        assert!(setup41.schedule.pending_ids().is_empty());
+        let head41 = head(fired, &setup41);
+        assert_eq!(head41, scheduled_message(batch));
+        let (message, note) = brief(fired, &setup41, &progress, head41.clone());
+        let reply_note = language::reply_note(arrstr!("en"));
+        assert_eq!(note.as_deref(), Some(reply_note.as_str()));
+        assert_eq!(
+            message,
+            format!("{head41}\n\nScheduled requests: none.\n\n{reply_note}")
+        );
+        let entry = &fired["scheduled"][0];
+        for part in [
+            format!("- #1: {}", entry["instruction"].as_str().unwrap()),
+            format!("Made {}.", entry["made"].as_str().unwrap()),
+            format!("Fired now: {}.", entry["why"].as_str().unwrap()),
+            schedule::SILENCE.to_owned(),
+        ] {
+            assert!(message.contains(&part), "{part:?} in {message}");
         }
     }
 
@@ -3666,17 +4024,12 @@ mod evals {
                 .collect::<Vec<_>>()
         });
 
-        let evals: serde_json::Value =
-            serde_json::from_str(include_str!("../../skill/evals/evals.json")).unwrap();
-        let evals = evals["evals"]
-            .as_array()
-            .unwrap()
-            .iter()
+        let evals = all_evals()
+            .into_iter()
             .filter(|eval| {
                 ids.as_ref()
                     .is_none_or(|ids| ids.contains(&eval["id"].as_u64().unwrap()))
             })
-            .cloned()
             .collect::<Vec<_>>();
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -3696,6 +4049,10 @@ mod evals {
             let pool = Pool::new(Database::read_only(Arc::new(db.clone())), four, four);
             let tool = Engineer::new(pool);
             tool.sync().await.unwrap();
+            // What the pending requests count from, and the `schedule` tool's adds: one snapshot,
+            // as the recording doesn't move
+            tool.publish_progress().await.unwrap();
+            let progress = tool.peek_progress().expect("no progress for the schedule");
 
             let runs = evals.iter().map(|eval| {
                 let (tool, system, model, effort) =
@@ -3704,25 +4061,47 @@ mod evals {
                     .join(format!("eval-{}", eval["id"]))
                     .join(&config)
                     .join(&run);
-                let prompt = eval["prompt"].as_str().unwrap().to_owned();
+                let progress = &progress;
                 async move {
-                    let question = tool.question_with_snapshot(prompt.clone()).await;
+                    let setup = setup(eval, progress);
+                    let head = tool.question_with_snapshot(head(eval, &setup)).await;
+                    let (question, note) = brief(eval, &setup, progress, head);
+                    let schedule_tool = ScheduleTool::new(tool.clone());
+                    schedule_tool.begin(setup.schedule.pending_ids(), setup.schedule.next_id());
                     let calls = Arc::new(StdMutex::new(Vec::new()));
                     let events = Arc::new(StdMutex::new(Vec::new()));
                     let start = Instant::now();
                     let mut builder = ConversationBuilder::new();
-                    builder.model(model).effort(effort).system(system).tool(
-                        Engineer::NAME,
-                        Some(Engineer::description()),
-                        Engineer::input_schema(),
-                        Recording {
-                            tool,
-                            calls: calls.clone(),
-                            events: events.clone(),
-                            start,
-                        },
-                    );
+                    builder
+                        .model(model)
+                        .effort(effort)
+                        .system(system)
+                        .tool(
+                            Engineer::NAME,
+                            Some(Engineer::description()),
+                            Engineer::input_schema(),
+                            Recording {
+                                tool,
+                                heading: "Tool call",
+                                calls: calls.clone(),
+                                events: events.clone(),
+                                start,
+                            },
+                        )
+                        .tool(
+                            ScheduleTool::NAME,
+                            Some(ScheduleTool::description()),
+                            ScheduleTool::input_schema(),
+                            Recording {
+                                tool: schedule_tool.clone(),
+                                heading: "Schedule call",
+                                calls: calls.clone(),
+                                events: events.clone(),
+                                start,
+                            },
+                        );
                     let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+                    conversation.set_tool_result_note(note);
 
                     let reply = conversation.send_streaming(question.clone(), &mut |text| {
                         events.lock().unwrap().push(serde_json::json!({
@@ -3731,9 +4110,15 @@ mod evals {
                         }));
                     }).await;
                     let elapsed = start.elapsed();
+                    // What the app would apply once the turn finishes
+                    let changes = (schedule_tool.take().iter())
+                        .map(change_json)
+                        .collect::<Vec<_>>();
 
                     let outputs = dir.join("outputs");
                     std::fs::create_dir_all(&outputs).unwrap();
+                    let changes_json = serde_json::to_string_pretty(&changes).unwrap();
+                    std::fs::write(dir.join("changes.json"), format!("{changes_json}\n")).unwrap();
                     std::fs::write(dir.join("events.json"),
                         serde_json::to_string_pretty(&*events.lock().unwrap()).unwrap()).unwrap();
                     let (text, usage) = match &reply {
@@ -3746,10 +4131,20 @@ mod evals {
                     std::fs::write(outputs.join("reply.md"), format!("{text}\n")).unwrap();
                     let tool_calls = calls.lock().unwrap().len();
                     let calls = calls.lock().unwrap().join("\n");
+                    let asker = match setup.batch {
+                        Some(_) => "Scheduled turn",
+                        None => "Pilot",
+                    };
+                    let changes = match changes.is_empty() {
+                        true => String::new(),
+                        false => {
+                            format!("\n## Schedule changes\n\n```json\n{changes_json}\n```\n")
+                        }
+                    };
                     std::fs::write(
                         dir.join("transcript.md"),
                         format!(
-                            "## Pilot\n\n{question}\n\n{calls}\n## Engineer\n\n{text}\n\n{usage}\n"
+                            "## {asker}\n\n{question}\n\n{calls}\n## Engineer\n\n{text}\n\n{usage}\n{changes}"
                         ),
                     )
                     .unwrap();

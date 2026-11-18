@@ -122,6 +122,10 @@ def generate(output):
             position_x=-3.0 if vehicle == 4 else 0.0,
             position_z=-803.0 if vehicle == 2 else -760.0 if vehicle == 3 else -797.0 if vehicle == 4 else -800.0,
             heading=0.0, speed=70.0, lap_start_time=now - 10.0)
+        if vehicle == 1:
+            # The standings gaps now, 3 m to Fischer ahead and 40 m to Ruiz behind at 70 m/s; only
+            # this frame has them, so there's still no gap history
+            latest.update(gap_to_place_ahead=0.04, gap_to_place_behind=0.6)
         traces.append(latest)
     traces.sort(key=lambda r: (r['session_time'], 1 if r['vehicle_id'] == 1 else 0, r['vehicle_id']))
     for row in traces:
