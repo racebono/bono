@@ -281,6 +281,8 @@ settings! {
         pub microphone: RawAudioDevice<true> = RawAudioDevice::default(),
         pub speaker: RawAudioDevice<false> = RawAudioDevice::default(),
         pub radio_effect: f32 = 0.65,
+        /// How fast the voices talk: 1 is each voice's own pace
+        pub speech_speed: f32 = 1.0,
         pub master_volume: f32 = 1.0,
         pub engineer_volume: f32 = 1.0,
         pub spotter_volume: f32 = 1.0,
@@ -334,6 +336,7 @@ impl RawConfig {
         Effects {
             radio: *self.radio_effect(),
             beep_volume: *self.beep_volume(),
+            speed: *self.speech_speed(),
         }
     }
 

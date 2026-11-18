@@ -54,6 +54,11 @@ const SENTENCE_SILENCE: f32 = 0.2;
 /// Silence between the end of the voice and the roger beep, in seconds
 const BEEP_GAP: f32 = 0.1;
 
+/// The slowest [`Effects::speed`]: slower, the voices drag
+pub const MIN_SPEED: f32 = 0.5;
+/// The fastest [`Effects::speed`]: faster, the voices slur
+pub const MAX_SPEED: f32 = 2.0;
+
 pub struct Synthesizer {
     pub(crate) inner: BTreeMap<ArrayStr<2>, SynthesizerInner>,
 }
@@ -629,6 +634,9 @@ pub struct Effects {
     pub radio: f32,
     /// Volume of the roger beep (0 for none)
     pub beep_volume: f32,
+    /// How fast it's said: 1 is the voice's own pace. Kept within [`MIN_SPEED`] and
+    /// [`MAX_SPEED`]
+    pub speed: f32,
 }
 
 /// A loaded Piper voice.
@@ -764,7 +772,7 @@ impl Voice {
             }
 
             let start = voice.len();
-            self.infer(ids, &mut voice)?;
+            self.infer(ids, transmission.effects.speed, &mut voice)?;
             normalize(&mut voice[start..]);
         }
 
@@ -836,12 +844,18 @@ impl Voice {
         return ids;
     }
 
-    fn infer(&mut self, ids: Vec<i64>, dest: &mut Vec<f32>) -> anyhow::Result<()> {
+    fn infer(&mut self, ids: Vec<i64>, speed: f32, dest: &mut Vec<f32>) -> anyhow::Result<()> {
         let len = ids.len();
+        let [noise_scale, voice_length_scale, noise_w] = self.scales;
+        let scales = vec![
+            noise_scale,
+            length_scale(voice_length_scale, speed),
+            noise_w,
+        ];
         let mut inputs = ort::inputs![
             "input" => Tensor::from_array(([1, len], ids))?,
             "input_lengths" => Tensor::from_array(([1], vec![len as i64]))?,
-            "scales" => Tensor::from_array(([3], self.scales.to_vec()))?,
+            "scales" => Tensor::from_array(([3], scales))?,
         ];
 
         if self.multi_speaker {
@@ -874,6 +888,11 @@ fn split_sentences(mut samples: Vec<f32>, voice_start: usize, splits: &[usize]) 
     pieces.push(samples);
     pieces.reverse();
     return pieces;
+}
+
+/// The voice's `length_scale` (how long it draws each sound out) at `speed`: faster is shorter.
+fn length_scale(voice: f32, speed: f32) -> f32 {
+    voice / speed.clamp(MIN_SPEED, MAX_SPEED)
 }
 
 /// The radio's hiss and the beep can push peaks past full scale.
@@ -1222,6 +1241,28 @@ mod tests {
     }
 
     #[test]
+    fn speed_divides_the_voices_own_pace() {
+        assert_eq!(length_scale(1.2, 1.0), 1.2);
+        assert_eq!(length_scale(1.0, 2.0), 0.5);
+        assert_eq!(length_scale(1.0, 0.5), 2.0);
+    }
+
+    #[test]
+    fn a_speed_outside_the_range_is_clamped() {
+        assert_eq!(length_scale(1.0, 10.0), 0.5);
+        assert_eq!(length_scale(1.0, 0.0), 2.0);
+        assert_eq!(length_scale(1.0, -1.0), 2.0);
+    }
+
+    #[test]
+    fn speech_is_at_the_voices_own_pace_by_default() {
+        assert_eq!(RawConfig::default().synth_effects().speed, 1.0);
+        let mut config = RawConfig::default();
+        config.speech_speed.set(1.5);
+        assert_eq!(config.synth_effects().speed, 1.5);
+    }
+
+    #[test]
     fn splits_a_piece_per_sentence() {
         let samples = vec![9.0, 9.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0];
         assert_eq!(
@@ -1263,6 +1304,7 @@ mod tests {
         let effects = Effects {
             radio: 0.65,
             beep_volume: 1.0,
+            speed: 1.0,
         };
         // Without a voice, the one piece is the error saying so
         let mut output =
@@ -1288,6 +1330,7 @@ mod tests {
         let effects = Effects {
             radio: 0.65,
             beep_volume: 1.0,
+            speed: 1.0,
         };
         let (input, mut output) = synth.stream(&rt, crate::arrstr!("en"), effects);
         input.push("Copy. ".repeat(32));
@@ -1331,6 +1374,7 @@ mod tests {
         let effects = Effects {
             radio: 0.65,
             beep_volume: 1.0,
+            speed: 1.0,
         };
         let (input, mut output) = synth.stream(&rt, crate::arrstr!("en"), effects);
 
