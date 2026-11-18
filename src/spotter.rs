@@ -1885,10 +1885,10 @@ impl Logic {
         } else if caution(&last.full_course_yellow)
             && now.full_course_yellow.as_deref() == Some("none")
         {
-            let said_by_the_start = std::mem::take(&mut self.start_caution)
-                // Ending before the race goes green: the start's still to say it
-                || calls_starts
-                    && matches!(now.phase.as_deref(), Some("formation_lap" | "countdown"));
+            let started = std::mem::take(&mut self.start_caution);
+            // Ending before the race goes green: the start's still to say it
+            let said_by_the_start = calls_starts
+                && (started || matches!(now.phase.as_deref(), Some("formation_lap" | "countdown")));
             // The caution ending as the session's stopped isn't a restart: it's still red
             if !said_by_the_start && now.phase.as_deref() != Some("stopped") {
                 calls.raise("green flag, green flag", true);
@@ -1896,6 +1896,8 @@ impl Logic {
         }
         if now.phase.as_deref() == Some("stopped") && last.phase.as_deref() != Some("stopped") {
             calls.raise("red flag", true);
+            // Whatever caution follows is the restart's, not the start's
+            self.start_caution = false;
         }
         if now.yellow && !last.yellow {
             calls.raise("yellow flag on track", false);
@@ -3881,6 +3883,26 @@ mod tests {
             ),
             [vec![], vec![], vec![START]]
         );
+        // A red flag after the start: its restart behind the safety car is called
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "last_lap"),
+                    race("green", "resume"),
+                    race("stopped", "race_halt"),
+                    race("full_course_yellow", "pending"),
+                    race("green", "none"),
+                ]
+            ),
+            [
+                vec![],
+                vec![START],
+                vec![("red flag", true)],
+                vec![],
+                vec![CAUTION_OVER]
+            ]
+        );
         // A caution coming out at the start is called, and so is its end
         assert_eq!(
             calls_of(
@@ -3931,6 +3953,20 @@ mod tests {
             ),
             [vec![], vec![CAUTION_OVER]]
         );
+
+        // Turned off after the start, before its caution ends
+        let mut logic = Logic::default();
+        let mut step = |config: &SpotterConfig, t: f64, scoring: Scoring| {
+            logic
+                .update(config, &player(t), &[], &Wheels::default(), Some(&scoring))
+                .into_iter()
+                .map(|call| (call.text, call.urgent))
+                .collect::<Vec<_>>()
+        };
+        let on = SpotterConfig::default();
+        assert!(step(&on, 0.0, race("formation_lap", "last_lap")).is_empty());
+        assert_eq!(step(&on, 0.1, race("green", "resume")), [START]);
+        assert_eq!(step(&config, 0.2, race("green", "none")), [CAUTION_OVER]);
     }
 
     #[test]
