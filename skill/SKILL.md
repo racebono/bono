@@ -442,9 +442,11 @@ happens rather than at the line. iRacing's own places change only as cars cross 
 of the world, back in it or towed since its last line, or yet to cross the line for the first time
 keeps its order in them (behind the cars iRacing had ahead of it) until it's driven over the line,
 and a car that has finished takes its own a few seconds after the line.
-Before the green, and after the flag when who won can't be told, the places are iRacing's (or the
-grid's). Where a car's place is iRacing's while it races, a car by the one placed ahead since the
-line has no gap to it, and one by the leader is 0 behind it.
+Before the green, and after the flag when who won or who has finished can't be told, the places are
+iRacing's (or the grid's). Two cars that have changed order on the road since the line, with one of
+them keeping iRacing's place or in the pit lane, may have no gap between them or iRacing's from
+before; a car by the leader can be 0 behind it; and a negative `race_gap_to_player_s` for the car
+ahead in class can be such a car rather than one side by side.
 The best lap is `cars_now.best_lap_s`, iRacing's own, which leaves out laps it doesn't count: a
 quicker `lap_stats` time may be one of those. Don't call such a lap invalid (iRacing doesn't say
 why), and don't call any lap valid: iRacing doesn't report lap validity.

@@ -196,9 +196,8 @@ struct Flag {
     /// Whether who won can't be known (see `convert`): none is taken, and nobody finishes but by
     /// the cool-down
     undecided: bool,
-    /// Whether a car's count has gone up untimed since the flag came (across a hold-up, or with a
-    /// move): who has finished, and when, can't be told for the places, which are the game's
-    /// from then
+    /// Whether a car's count has gone up untimed across a hold-up since the flag came: who has
+    /// finished, and when, can't be told for the places, which are the game's from then
     untimed: bool,
     /// The update a winner was first taken at: it can change for a moment after that, its
     /// crossing or the update that saw it over the line, whichever is latest (a count timed ahead of the line is timed at the line), as
@@ -645,7 +644,7 @@ impl Converter {
             })
             .collect();
         // The places as they are on track (see `live_places`): while the race runs, and after the
-        // flag only while who has finished can be known
+        // flag only once a winner is taken and while who has finished can be known
         if let Some(Some(flag)) = &mut self.flag {
             flag.untimed |= cars.iter().any(|c| {
                 let at = self.cars.get(&c.idx).and_then(|t| t.untimed_count);
@@ -654,24 +653,22 @@ impl Converter {
         }
         let live = match state {
             Some(STATE_RACING) => true,
-            Some(STATE_CHECKERED) => {
-                matches!(&self.flag, Some(Some(flag)) if !flag.undecided && !flag.untimed)
-            }
+            Some(STATE_CHECKERED) => matches!(
+                &self.flag,
+                Some(Some(flag)) if flag.finish.is_some() && !flag.undecided && !flag.untimed
+            ),
             _ => false,
         };
         if race && live {
             live_places(&mut cars, |car| {
-                if car.pct.is_none() || car.laps_completed.is_none_or(|laps| laps < 0) {
-                    return None;
-                }
                 let track = self.cars.get(&car.idx)?;
                 if racing(car) {
-                    // Moved since its line (towed, reset, back in the world): where it is now
-                    // isn't where it is in the race
-                    if track.moved {
+                    // Out of the world, before its first line, or moved since its line (towed,
+                    // reset, back in the world): where it is now isn't where it is in the race
+                    let laps = car.laps_completed.filter(|laps| *laps >= 0)?;
+                    if car.pct.is_none() || track.moved {
                         return None;
                     }
-                    let laps = car.laps_completed?;
                     // After the flag, a car still racing isn't past the line it's to finish at
                     // (over it with the count still to come, or with the count at a finish line
                     // further on): behind the cars finished there
@@ -684,9 +681,9 @@ impl Converter {
                 // Finished: at the line, in the order over it, until the game's places catch up.
                 // Only that line: not one round the cool-down lap after it (how far it had gone
                 // when it first had, see `laps_behind`, is that line's lap give or take its count
-                // coming a little either side of it)
+                // coming a little either side of it), wherever it is now (out of the world too)
                 let at = track.counted_at?;
-                let laps = car.laps_completed? as f64;
+                let laps = f64::from(track.counted_lap?);
                 let finishing = track
                     .finish_progress
                     .is_none_or(|gone| laps <= gone.round());
@@ -1901,8 +1898,8 @@ struct CarTrack {
     /// Whether it's been out of the world or moved (towed, reset) since its count last went up
     /// driven: where it is says nothing of where it is in the race (see `live_places`)
     moved: bool,
-    /// When its count last went up with no crossing to time it by (across a hold-up, or with a
-    /// move), nor the game's lap time
+    /// When its count last went up across a hold-up of the recording, with no crossing to time it
+    /// by nor the game's lap time
     untimed_count: Option<f64>,
     /// The player's fuel (litres) at its `distance`, over the last lap's distance driven: since
     /// it last left the pit lane, was moved or took on fuel
@@ -2224,7 +2221,9 @@ impl CarTrack {
         } else if rose {
             if recovered.is_some() {
                 self.counted_lap = lap;
-            } else {
+            } else if step.is_some_and(|(_, _, dt, _)| dt > MAX_GAP) {
+                // Across a hold-up, driven for all that's known (a count with a move is a moved
+                // car's, see `moved`)
                 self.untimed_count = Some(time);
             }
             self.counted_at =
@@ -3544,13 +3543,13 @@ mod tests {
     /// the cars over it are in the order they crossed. Once they've had time to, the game's.
     #[test]
     fn a_last_lap_pass_holds_over_the_line() {
-        // Car 1 by car 0 at 1 s and over the line first, at 1.83 s; car 0 at 2 s; car 2 a lap
-        // down. The game's places stay as they were
+        // Car 1 by car 0 at 1 s and over the line first, at 1.83 s, with the flag; car 0 at 2 s;
+        // car 2 a lap down. The game's places stay as they were
         let updates: Vec<_> = (0..25)
             .map(|k| {
                 let t = 0.1 + 0.25 * k as f64;
                 let gone = [2.8 + 0.1 * t, 2.78 + 0.12 * t, 1.9 + 0.1 * t];
-                let state = match t >= 0.5 {
+                let state = match t >= 1.8 {
                     true => STATE_CHECKERED,
                     false => STATE_RACING,
                 };
@@ -3562,7 +3561,7 @@ mod tests {
                 )
             })
             .collect();
-        let places = |at: f64| {
+        let places = |updates: &[(f64, i32, [f64; 3], [i32; 3])], at: f64| {
             let last = updates.iter().position(|u| u.0 >= at).unwrap();
             let end = race_of(&updates[..=last], [0.0, 0.3, 95.0], Some(3));
             let (_, standings) = end.scoring.as_ref().unwrap();
@@ -3573,11 +3572,38 @@ mod tests {
             (place(0), place(1), place(2))
         };
         // Passed, both still racing; car 1 over the line; both over
-        assert_eq!(places(1.5), (Some(2), Some(1), Some(3)));
-        assert_eq!(places(1.85), (Some(2), Some(1), Some(3)));
-        assert_eq!(places(2.35), (Some(2), Some(1), Some(3)));
+        assert_eq!(places(&updates, 1.5), (Some(2), Some(1), Some(3)));
+        assert_eq!(places(&updates, 1.85), (Some(2), Some(1), Some(3)));
+        assert_eq!(places(&updates, 2.35), (Some(2), Some(1), Some(3)));
         // Long enough over it for the game to have caught up
-        assert_eq!(places(6.0), (Some(1), Some(2), Some(3)));
+        assert_eq!(places(&updates, 6.0), (Some(1), Some(2), Some(3)));
+        // Car 1 out of the world a moment after its line: at the line all the same
+        let mut gone = updates.clone();
+        for update in gone.iter_mut().filter(|u| u.0 > 2.0) {
+            update.2[1] = -1.0;
+        }
+        assert_eq!(places(&gone, 2.35), (Some(2), Some(1), Some(3)));
+    }
+
+    /// A race of so many laps ended on time, before any car has them all: no winner is taken, so
+    /// who has finished isn't known, and the places after the flag are the game's.
+    #[test]
+    fn a_lap_race_ended_on_time_keeps_the_games_places() {
+        // Of 20 laps: car 0 over its 15th line and slowing, car 1 over after it and by it
+        let updates = [
+            (0.5, STATE_RACING, [0.95, 0.9, 0.5], [14, 14, 14]),
+            (1.0, STATE_CHECKERED, [0.99, 0.95, 0.55], [14, 14, 14]),
+            (1.5, STATE_CHECKERED, [0.01, 0.99, 0.6], [15, 14, 14]),
+            (2.0, STATE_CHECKERED, [0.015, 0.03, 0.65], [15, 15, 14]),
+            (2.5, STATE_CHECKERED, [0.02, 0.08, 0.7], [15, 15, 14]),
+        ];
+        let end = race_of(&updates, [0.0, 0.3, 95.0], Some(20));
+        let (_, standings) = end.scoring.as_ref().unwrap();
+        let place = |car: i64| {
+            let row = standings.iter().find(|s| s.vehicle_id.get() == Some(car));
+            row.and_then(|row| row.position.get())
+        };
+        assert_eq!((place(0), place(1), place(2)), (Some(1), Some(2), Some(3)));
     }
 
     /// A car over the line with its count still to come is at the line, behind those over it
