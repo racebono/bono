@@ -815,6 +815,11 @@ impl PendingSession {
             ) {
                 return Ok(problem);
             }
+            // Whisper makes words up for silence, so it never hears it
+            if !voiced(&samples) {
+                log::debug!("Only silence on the radio");
+                return Ok(Heard::Nothing);
+            }
             // With a fixed reply language, the input needs no voice of its own.
             let candidates = match spoken_language {
                 Some(_) => (0..=whisper_rs::get_lang_max_id())
@@ -943,6 +948,32 @@ impl WhisperSession {
 /// Less than this is too short to have said anything (0.3 s): the talk button was likely
 /// pressed by accident.
 const MIN_SAMPLES: usize = 16000 * 3 / 10;
+
+/// What loudness is measured over (20 ms).
+const FRAME: usize = 16000 / 50;
+
+/// How loud (RMS) a frame must be to be more than silence: -50 dBFS. Speech into a microphone is
+/// louder, while one unplugged, muted or blocked records zeros, and a quiet room little more.
+const SILENCE: f32 = 0.003_162;
+
+/// How long (0.1 s) a recording must be louder than [`SILENCE`] to be transcribed: a click of
+/// the talk button isn't speech.
+const MIN_VOICED: usize = 16000 / 10;
+
+/// Whether `samples` are loud enough, for long enough, to have anything said in them. Whisper
+/// can't tell: it makes words up for silence and says it's sure they're speech.
+fn voiced(samples: &[f32]) -> bool {
+    let len = FRAME as f32;
+    let loud = (samples.chunks_exact(FRAME))
+        .filter(|frame| {
+            // Around its mean: some inputs record silence offset from zero
+            let mean = frame.iter().sum::<f32>() / len;
+            let power = frame.iter().map(|s| (s - mean).powi(2)).sum::<f32>() / len;
+            power > SILENCE * SILENCE
+        })
+        .count();
+    loud * FRAME >= MIN_VOICED
+}
 
 /// Reject incompatible settings before inference or language detection starts.
 fn transcription_problem(
@@ -1769,6 +1800,30 @@ mod tests {
         );
         assert_eq!(choose(&[(es, 0.4), (pt, 0.3)], &[es]), Spoken::Voiced(es));
         assert_eq!(choose(&[(en, 0.2), (es, 0.05)], &[es]), Spoken::Unclear);
+    }
+
+    #[test]
+    fn silence_isnt_transcribed() {
+        // A tone `amplitude` loud, for `secs`, after a second of `floor`
+        let recording = |floor: f32, amplitude: f32, secs: f32| {
+            let tone = (0..(16000.0 * secs) as usize).map(|i| amplitude * (i as f32 * 0.1).sin());
+            let floor = (0..16000).map(|i| floor * (i as f32 * 0.37).sin());
+            floor.chain(tone).collect::<Vec<_>>()
+        };
+        // Unplugged, muted, or a quiet room (-63 dBFS)
+        assert!(!voiced(&[0.0; 3 * 16000]));
+        assert!(!voiced(&recording(0.001, 0.001, 2.0)));
+        // An input whose silence is offset from zero
+        let offset = recording(0.001, 0.001, 2.0)
+            .iter()
+            .map(|s| s + 0.05)
+            .collect::<Vec<_>>();
+        assert!(!voiced(&offset));
+        // A click of the button
+        assert!(!voiced(&recording(0.001, 0.5, 0.02)));
+        // Something said, even quietly (-43 dBFS), after a quiet room's noise
+        assert!(voiced(&recording(0.001, 0.01, 0.5)));
+        assert!(voiced(&recording(0.001, 0.2, 0.2)));
     }
 
     #[test]
