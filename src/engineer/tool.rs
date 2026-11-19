@@ -190,11 +190,7 @@ impl Engineer {
     async fn setup_names(&self) -> anyhow::Result<Vec<String>> {
         let conn = self.inner.db.get().await?;
         conn.run(|conn| {
-            let player = scalar::<i64>(
-                conn,
-                "SELECT vehicle_id FROM telemetry WHERE is_player = 1 ORDER BY id DESC LIMIT 1",
-                [],
-            )?;
+            let player = derived::setup_player(conn)?;
             Ok(derived::setup_history(conn, player)?
                 .map(|setup| setup.now.into_keys().collect())
                 .unwrap_or_default())
@@ -3437,7 +3433,10 @@ mod tests {
         let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
         let inserted = conn.execute(
             "INSERT INTO setup_set (telemetry_id, player_telemetry_id, vehicle_id, session_time, \
-             file_name, modified, source) SELECT id, id, ?1, session_time, ?3, ?4, ?5 FROM telemetry \
+             file_name, modified, source, session_type, session_number) \
+             SELECT id, id, ?1, session_time, ?3, ?4, ?5, \
+             (SELECT session_type FROM session ORDER BY id DESC LIMIT 1), \
+             (SELECT session_number FROM session ORDER BY id DESC LIMIT 1) FROM telemetry \
              WHERE is_player = 1 AND lap = ?2 ORDER BY id LIMIT 1",
             params![vehicle, lap, file_name, modified, source],
         )
