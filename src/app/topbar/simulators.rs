@@ -254,15 +254,11 @@ fn plugin_status(ui: &mut egui::Ui, plugin: &PluginStatus) {
     }
 }
 
-/// Install, update (the app's is newer or another build, or the installed one doesn't say), or
-/// reinstall.
+/// Install, update (the installed one is outdated, see `PluginStatus::outdated`), or reinstall.
 fn install_label(plugin: &PluginStatus) -> &'static str {
-    match (&plugin.installed, plugin.bundled_version()) {
-        (None, _) => t!("plugin.install"),
-        (Some(Some(installed)), Some(latest)) if !latest.replaces(installed) => {
-            t!("plugin.reinstall")
-        }
-        (Some(_), Some(_)) => t!("plugin.update"),
-        (Some(_), None) => t!("plugin.reinstall"),
+    match plugin.installed {
+        None => t!("plugin.install"),
+        Some(_) if plugin.outdated() => t!("plugin.update"),
+        Some(_) => t!("plugin.reinstall"),
     }
 }
