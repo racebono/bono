@@ -2504,9 +2504,11 @@ pub(super) struct Stream {
     /// The last tick failed: the tables may be behind, whatever `behind` says
     pub failed: bool,
     pub session_start: i64,
-    /// The player's last row before `session_start`, for the session it was looked up for (see
-    /// `SessionRows`): looked up once, as it can be far back
+    /// The player's last row before `session_start`, and the session time of their first in it,
+    /// for the session they were looked up for (see `SessionRows`): looked up once, as they can be
+    /// far from it
     earlier_player_row: Option<(i64, Option<i64>)>,
+    first_player_time: Option<(i64, f64)>,
     /// The last telemetry row read
     pub cursor: i64,
     /// (session_time, vehicle_id) of the row at `cursor`, to notice a recreated file
@@ -3233,9 +3235,24 @@ impl Stream {
                 row
             }
         };
+        let first_player_time = match self.first_player_time {
+            Some((start, time)) if start == first => Some(time),
+            // Kept once there's one: until the player drives, there's none yet
+            _ => {
+                let time = scalar::<f64>(
+                    conn,
+                    "SELECT session_time FROM telemetry WHERE id >= ? AND is_player = 1 \
+                     ORDER BY id LIMIT 1",
+                    [first],
+                )?;
+                self.first_player_time = time.map(|time| (first, time));
+                time
+            }
+        };
         Ok(SessionRows {
             first,
             earlier_player_row,
+            first_player_time,
         })
     }
 
@@ -4736,11 +4753,13 @@ pub(super) struct SetAt {
     pub player_time: Option<f64>,
 }
 
-/// Where this session's rows start, and the player's last row before them.
+/// Where this session's rows start, the player's last row before them, and the session time of
+/// the player's first row in it.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct SessionRows {
     pub first: i64,
     pub earlier_player_row: Option<i64>,
+    pub first_player_time: Option<f64>,
 }
 
 impl SetAt {
@@ -4752,14 +4771,19 @@ impl SetAt {
 
     /// Whether it was written in this session: among its rows, or in its garage before the player
     /// drove (on iRacing the player writes no rows there): their latest row then was the last
-    /// session's, and the clock had gone back since.
+    /// session's, the clock had gone back since, and it wasn't yet where it was when the player
+    /// first drove in this session (past it, it's a session in between's, which they didn't drive).
     fn in_session(self, session: SessionRows) -> bool {
         let in_its_garage = self.player_row.is_some()
             && self.player_row == session.earlier_player_row
             && self
                 .session_time
                 .zip(self.player_time)
-                .is_some_and(|(set, player)| set + 1.0 < player);
+                .is_some_and(|(set, player)| set + 1.0 < player)
+            && self
+                .session_time
+                .zip(session.first_player_time)
+                .is_none_or(|(set, first)| set <= first);
         self.telemetry_id.is_some_and(|id| id >= session.first) || in_its_garage
     }
 }
@@ -9259,6 +9283,56 @@ mod tests {
         )
         .await;
         assert_eq!(state, [["\"race.sto\"", "NULL"]]);
+    }
+
+    /// A setup changed in the garage of a session the player didn't drive in (qualifying, say) isn't
+    /// the next session's: that session's clock was past it when the player first drove.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_skipped_sessions_garage_setup_is_not_this_sessions() {
+        let (dir, engineer) = race();
+        write_setup_set(
+            &dir,
+            Some(1),
+            1,
+            (Some("a.sto"), Some(false), Some("garage")),
+            &[("A", Some("1"))],
+        );
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        let row = |vehicle: i64, t: f64| {
+            conn.execute(
+                "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_distance, speed) \
+                 VALUES (?1, ?1 = 1, ?2, 0, ?2 * 10, 10)",
+                params![vehicle, t],
+            )
+            .unwrap();
+        };
+        // Qualifying, driven by the others only, with a garage change late in it
+        for i in 0..200 {
+            row(2, i as f64 * 0.1);
+        }
+        conn.execute(
+            "INSERT INTO setup_set (telemetry_id, player_telemetry_id, vehicle_id, session_time, \
+             file_name, modified, source) VALUES ((SELECT max(id) FROM telemetry), \
+             (SELECT max(id) FROM telemetry WHERE is_player = 1), 1, 20.0, 'a.sto', 1, 'garage')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO setup (setup_set_id, name, value) VALUES (last_insert_rowid(), 'A', '2')",
+            [],
+        )
+        .unwrap();
+        // The race: its clock starts again, and the player drives from early on
+        for i in 0..200 {
+            row(2, i as f64 * 0.01);
+        }
+        for i in 0..20 {
+            row(1, 5.0 + i as f64 * 0.5);
+        }
+        drop(conn);
+
+        let changes = query(&engineer, "SELECT name, this_session FROM setup_changes").await;
+        assert_eq!(changes, [["\"A\"", "0"]]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
