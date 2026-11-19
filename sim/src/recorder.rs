@@ -6,7 +6,8 @@
 //! `settings.json` the app writes to ask things of the recorder.
 
 use crate::{
-    sql::{self, ForecastWriter, ScoringWriter, TelemetryWriter},
+    setup::Setup,
+    sql::{self, ForecastWriter, ScoringWriter, SetupWriter, TelemetryWriter},
     sys::{bono_forecast_point, bono_session_info, bono_standing, bono_telemetry},
 };
 use std::{
@@ -273,6 +274,16 @@ impl Recorder {
         self.shared.wake.notify_one();
     }
 
+    /// Queues the player's setup, written with the latest telemetry row once the writer gets to
+    /// it, and only if it changed (see `SetupWriter`). A newer one replaces one still waiting.
+    pub fn push_setup(&self, setup: Setup) {
+        if self.failed() {
+            return;
+        }
+        lock(&self.shared.queue).setup = Some(setup);
+        self.shared.wake.notify_one();
+    }
+
     /// How many scoring updates wait to be written. Past `MAX_QUEUED_SCORING`, new ones are
     /// dropped: something replaying a game faster than it runs can wait for room.
     pub fn queued_scoring(&self) -> usize {
@@ -289,6 +300,7 @@ impl Recorder {
         let mut queue = lock(&self.shared.queue);
         queue.telemetry.clear();
         queue.scoring.clear();
+        queue.setup = None;
         queue.clear = true;
         drop(queue);
         self.shared.wake.notify_one();
@@ -329,13 +341,15 @@ struct Shared {
 struct Queue {
     telemetry: Vec<bono_telemetry>,
     scoring: Vec<(bono_session_info, Vec<bono_standing>)>,
+    /// The player's setup, the latest pushed
+    setup: Option<Setup>,
     /// `clear` was called: the writer deletes what was recorded
     clear: bool,
 }
 
 impl Queue {
     fn is_empty(&self) -> bool {
-        self.telemetry.is_empty() && self.scoring.is_empty()
+        self.telemetry.is_empty() && self.scoring.is_empty() && self.setup.is_none()
     }
 }
 
@@ -430,12 +444,13 @@ impl Writer {
         let mut telemetry_writer = TelemetryWriter::new(&conn)?;
         let mut scoring_writer = ScoringWriter::new(&conn)?;
         let mut forecast_writer = ForecastWriter::new(&conn)?;
+        let mut setup_writer = SetupWriter::new(&conn)?;
         let mut next_forecast = Instant::now();
 
         let mut telemetry = Vec::new();
         let mut scoring = Vec::new();
         loop {
-            let mut clear = {
+            let (mut clear, mut setup) = {
                 let queue = lock(&shared.queue);
                 // Wakes now and then even with nothing to write, to look at settings.json
                 let (mut queue, _) = shared
@@ -452,13 +467,14 @@ impl Writer {
 
                 std::mem::swap(&mut telemetry, &mut queue.telemetry);
                 std::mem::swap(&mut scoring, &mut queue.scoring);
-                std::mem::take(&mut queue.clear)
+                (std::mem::take(&mut queue.clear), queue.setup.take())
             };
 
             // Asked by the app: what's waiting was recorded before it asked
             if self.check_settings(shared) {
                 telemetry.clear();
                 scoring.clear();
+                setup = None;
                 clear = true;
             }
 
@@ -467,10 +483,11 @@ impl Writer {
                 telemetry_writer.reset();
                 scoring_writer.reset();
                 forecast_writer.reset();
+                setup_writer.reset();
                 next_forecast = Instant::now();
             }
 
-            if !telemetry.is_empty() || !scoring.is_empty() {
+            if !telemetry.is_empty() || !scoring.is_empty() || setup.is_some() {
                 // Everything that arrived since the last write goes into one transaction
                 let tx = conn.unchecked_transaction()?;
                 for update in telemetry.drain(..) {
@@ -478,6 +495,15 @@ impl Writer {
                 }
                 for (session, standings) in scoring.drain(..) {
                     scoring_writer.write(session, standings)?;
+                }
+                // After the telemetry it arrived with: it's dated by the latest row
+                if let Some(setup) = setup.take() {
+                    let telemetry_id: Option<i64> =
+                        tx.query_row("SELECT max(id) FROM telemetry", [], |row| row.get(0))?;
+                    let vehicle =
+                        Some(shared.player_id.load(Ordering::Relaxed)).filter(|id| *id >= 0);
+                    let session_time = f64::from_bits(shared.session_time.load(Ordering::Relaxed));
+                    setup_writer.write(vehicle, telemetry_id, Some(session_time), setup)?;
                 }
                 tx.commit()?;
             }
@@ -805,5 +831,66 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         drop(recorder);
+    }
+
+    fn wing(value: &str) -> crate::setup::Setup {
+        crate::setup::Setup {
+            source: Some(crate::setup::SetupSource::Garage),
+            settings: vec![crate::setup::Setting {
+                name: "VM_REAR_WING".to_owned(),
+                value: value.to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn push_setup_is_recorded_with_the_latest_telemetry_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
+        let mut telemetry = bono_telemetry::default();
+        telemetry.vehicle_id = Some(1).into();
+        telemetry.session_time = Some(10.0).into();
+        assert!(recorder.wants_telemetry(1, 10.0, 0.0));
+        recorder.push_telemetry(&telemetry);
+        recorder.push_setup(wing("P5"));
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        let (telemetry_id, vehicle, source): (i64, i64, String) = conn
+            .query_row(
+                "SELECT telemetry_id, vehicle_id, source FROM setup_set",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let latest: i64 = conn
+            .query_row("SELECT max(id) FROM telemetry", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            (telemetry_id, vehicle, source.as_str()),
+            (latest, 1, "garage")
+        );
+        let value: String = conn
+            .query_row("SELECT value FROM setup", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, "P5");
+    }
+
+    #[test]
+    fn a_setup_pushed_before_a_clear_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_setup(wing("P5"));
+        recorder.clear();
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        let sets: i64 = conn
+            .query_row("SELECT count(*) FROM setup_set", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sets, 0);
     }
 }

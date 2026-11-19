@@ -3,9 +3,12 @@
 //! `session_sector`, `standings`, `standing_sector` and `forecast`. The columns come from the
 //! headers' column lists (see `build.rs`).
 
-use crate::sys::{
-    bono_car_state, bono_forecast_point, bono_session_info, bono_session_sector, bono_standing,
-    bono_standing_sector, bono_telemetry, bono_wheel_telemetry,
+use crate::{
+    setup::{Setting, Setup},
+    sys::{
+        bono_car_state, bono_forecast_point, bono_session_info, bono_session_sector, bono_standing,
+        bono_standing_sector, bono_telemetry, bono_wheel_telemetry,
+    },
 };
 use rusqlite::{Connection, PrepFlags, Statement};
 use std::collections::HashMap;
@@ -103,7 +106,20 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
             standing_id INTEGER NOT NULL REFERENCES standings(id), sector INTEGER NOT NULL{standing_sector},
             PRIMARY KEY (standing_id, sector)
         ) WITHOUT ROWID;
-        CREATE TABLE IF NOT EXISTS forecast (id INTEGER PRIMARY KEY, generation INTEGER{forecast});",
+        CREATE TABLE IF NOT EXISTS forecast (id INTEGER PRIMARY KEY, generation INTEGER{forecast});
+
+        -- The player's garage setup (see setup.rs): a set each time it changes, with only the
+        -- settings that differ from the car's last set (all of them in its first). value NULL: the
+        -- setting is gone. step to saved_value are LMU's only
+        CREATE TABLE IF NOT EXISTS setup_set (
+            id INTEGER PRIMARY KEY, telemetry_id INTEGER REFERENCES telemetry(id),
+            vehicle_id INTEGER, session_time REAL, file_name TEXT, modified INTEGER, source TEXT
+        );
+        CREATE TABLE IF NOT EXISTS setup (
+            setup_set_id INTEGER NOT NULL REFERENCES setup_set(id), name TEXT NOT NULL, value TEXT,
+            step INTEGER, min_step INTEGER, max_step INTEGER, saved_value TEXT,
+            PRIMARY KEY (setup_set_id, name)
+        ) WITHOUT ROWID;",
         telemetry = bono_telemetry::DEFINITIONS,
         wheel = bono_wheel_telemetry::DEFINITIONS,
         state = bono_car_state::DEFINITIONS,
@@ -418,6 +434,120 @@ impl<'conn> ForecastWriter<'conn> {
     }
 }
 
+/// Writes the player's setup when it changes: a `setup_set` row, and a `setup` row for each
+/// setting that differs from the last set written for the car. Called inside the recorder's
+/// transaction, so a set is written whole or not at all.
+pub struct SetupWriter<'conn> {
+    conn: &'conn Connection,
+    /// The car the last set was for, and its file name and modified flag
+    last_set: Option<(Option<i64>, Option<String>, Option<bool>)>,
+    /// The last set's settings, by name
+    last: HashMap<String, Setting>,
+}
+
+impl<'conn> SetupWriter<'conn> {
+    pub fn new(conn: &'conn Connection) -> rusqlite::Result<Self> {
+        Ok(Self {
+            conn,
+            last_set: None,
+            last: HashMap::new(),
+        })
+    }
+
+    /// The next set is written whole.
+    pub fn reset(&mut self) {
+        self.last_set = None;
+        self.last.clear();
+    }
+
+    /// Returns whether anything changed, and so was written.
+    pub fn write(
+        &mut self,
+        vehicle: Option<i64>,
+        telemetry_id: Option<i64>,
+        session_time: Option<f64>,
+        setup: Setup,
+    ) -> rusqlite::Result<bool> {
+        if setup.settings.is_empty() {
+            return Ok(false);
+        }
+        // Another car's setup is all new
+        if self
+            .last_set
+            .as_ref()
+            .is_some_and(|(car, ..)| *car != vehicle)
+        {
+            self.reset();
+        }
+
+        let changed = setup
+            .settings
+            .iter()
+            .filter(|s| self.last.get(&s.name) != Some(*s))
+            .collect::<Vec<_>>();
+        let gone = self
+            .last
+            .keys()
+            .filter(|name| !setup.settings.iter().any(|s| &s.name == *name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let set = (vehicle, setup.file_name.clone(), setup.modified);
+        if changed.is_empty() && gone.is_empty() && self.last_set.as_ref() == Some(&set) {
+            return Ok(false);
+        }
+
+        // In the recorder's transaction, with the telemetry it goes with
+        self.conn.execute(
+            "INSERT INTO setup_set (telemetry_id, vehicle_id, session_time, file_name, modified, source) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                telemetry_id,
+                vehicle,
+                session_time,
+                setup.file_name,
+                setup.modified,
+                setup.source.map(|s| s.as_str()),
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        let mut insert = self.conn.prepare_cached(
+            "INSERT INTO setup (setup_set_id, name, value, step, min_step, max_step, saved_value) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )?;
+        for s in &changed {
+            insert.execute(rusqlite::params![
+                id,
+                s.name,
+                s.value,
+                s.step,
+                s.min_step,
+                s.max_step,
+                s.saved_value
+            ])?;
+        }
+        for name in &gone {
+            insert.execute(rusqlite::params![
+                id,
+                name,
+                None::<String>,
+                None::<i64>,
+                None::<i64>,
+                None::<i64>,
+                None::<String>
+            ])?;
+        }
+        drop(insert);
+
+        self.last_set = Some(set);
+        self.last = setup
+            .settings
+            .into_iter()
+            .map(|s| (s.name.clone(), s))
+            .collect();
+        Ok(true)
+    }
+}
+
 /// The same forecast, whenever it was read.
 fn same_forecast(a: &[bono_forecast_point], b: &[bono_forecast_point]) -> bool {
     a.len() == b.len()
@@ -597,5 +727,143 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 0, "{table}");
         }
+    }
+
+    fn setting(name: &str, value: &str) -> Setting {
+        Setting {
+            name: name.to_owned(),
+            value: value.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn setup(settings: &[(&str, &str)]) -> Setup {
+        Setup {
+            settings: settings.iter().map(|(n, v)| setting(n, v)).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn setup_writer() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        conn
+    }
+
+    /// Each set's rows, as (set, name, value), in order.
+    fn setup_rows(conn: &Connection) -> Vec<(i64, String, Option<String>)> {
+        conn.prepare("SELECT setup_set_id, name, value FROM setup ORDER BY setup_set_id, name")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn sets(conn: &Connection) -> i64 {
+        conn.query_row("SELECT count(*) FROM setup_set", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn row(set: i64, name: &str, value: Option<&str>) -> (i64, String, Option<String>) {
+        (set, name.to_owned(), value.map(str::to_owned))
+    }
+
+    #[test]
+    fn a_setup_is_written_whole_then_only_its_changes() {
+        let conn = setup_writer();
+        let mut writer = SetupWriter::new(&conn).unwrap();
+        let first = setup(&[("A", "1"), ("B", "2")]);
+        assert!(writer.write(Some(7), None, Some(1.0), first).unwrap());
+        let second = setup(&[("A", "1"), ("B", "3")]);
+        assert!(writer.write(Some(7), None, Some(2.0), second).unwrap());
+
+        assert_eq!(sets(&conn), 2);
+        assert_eq!(
+            setup_rows(&conn),
+            vec![
+                row(1, "A", Some("1")),
+                row(1, "B", Some("2")),
+                row(2, "B", Some("3"))
+            ]
+        );
+    }
+
+    #[test]
+    fn the_same_setup_again_writes_nothing() {
+        let conn = setup_writer();
+        let mut writer = SetupWriter::new(&conn).unwrap();
+        let same = setup(&[("A", "1")]);
+        assert!(writer.write(Some(7), None, None, same.clone()).unwrap());
+        assert!(!writer.write(Some(7), None, None, same).unwrap());
+        assert_eq!(sets(&conn), 1);
+    }
+
+    #[test]
+    fn a_setting_that_disappears_is_written_as_null() {
+        let conn = setup_writer();
+        let mut writer = SetupWriter::new(&conn).unwrap();
+        writer
+            .write(Some(7), None, None, setup(&[("A", "1"), ("B", "2")]))
+            .unwrap();
+        writer
+            .write(Some(7), None, None, setup(&[("A", "1")]))
+            .unwrap();
+        assert_eq!(setup_rows(&conn)[2..], [row(2, "B", None)]);
+    }
+
+    #[test]
+    fn a_new_vehicle_or_a_reset_writes_the_whole_setup_again() {
+        let conn = setup_writer();
+        let mut writer = SetupWriter::new(&conn).unwrap();
+        writer
+            .write(Some(7), None, None, setup(&[("A", "1")]))
+            .unwrap();
+        writer
+            .write(Some(8), None, None, setup(&[("A", "1")]))
+            .unwrap();
+        writer.reset();
+        writer
+            .write(Some(8), None, None, setup(&[("A", "1")]))
+            .unwrap();
+        assert_eq!(
+            setup_rows(&conn),
+            vec![
+                row(1, "A", Some("1")),
+                row(2, "A", Some("1")),
+                row(3, "A", Some("1"))
+            ]
+        );
+    }
+
+    #[test]
+    fn file_name_and_modified_changes_write_a_set() {
+        let conn = setup_writer();
+        let mut writer = SetupWriter::new(&conn).unwrap();
+        let mut loaded = setup(&[("A", "1")]);
+        loaded.file_name = Some("race.sto".to_owned());
+        loaded.modified = Some(false);
+        writer.write(Some(7), None, None, loaded.clone()).unwrap();
+        loaded.modified = Some(true);
+        assert!(writer.write(Some(7), None, None, loaded).unwrap());
+
+        assert_eq!(sets(&conn), 2);
+        assert_eq!(setup_rows(&conn).len(), 1);
+        let (file, modified): (String, bool) = conn
+            .query_row(
+                "SELECT file_name, modified FROM setup_set ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((file.as_str(), modified), ("race.sto", true));
+    }
+
+    #[test]
+    fn an_empty_setup_writes_nothing() {
+        let conn = setup_writer();
+        let mut writer = SetupWriter::new(&conn).unwrap();
+        assert!(!writer.write(Some(7), None, None, Setup::default()).unwrap());
+        assert_eq!(sets(&conn), 0);
     }
 }
