@@ -2430,7 +2430,10 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     if let Some(line) = track_line(ctx, sc) {
         say!(out, "TRACK {line}");
     }
-    say!(out, "SETUP {}", setup_line(ctx.conn, ctx.vehicle)?);
+    // The standings' player, as the setup tables have it: their telemetry can still be another
+    // car's before they drive this one
+    let player = derived::setup_player(ctx.conn)?.unwrap_or(ctx.vehicle);
+    say!(out, "SETUP {}", setup_line(ctx.conn, player)?);
 
     let (mut left, mut right, mut others) = (Vec::new(), Vec::new(), Vec::new());
     for (vehicle, r) in &frame {
@@ -3083,6 +3086,35 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn the_setup_line_says_file_modified_and_changes() {
+        // The standings' player, as the setup tables have it, before their telemetry says so: the
+        // player is now in car 2, which hasn't driven yet
+        let (dir, engineer) = race();
+        write_setup_set(
+            &dir,
+            Some(1),
+            1,
+            (Some("one.sto"), Some(false), Some("garage")),
+            &[("A", Some("1"))],
+        );
+        write_setup_set(
+            &dir,
+            Some(2),
+            2,
+            (Some("two.sto"), Some(false), Some("garage")),
+            &[("A", Some("1"))],
+        );
+        Connection::open(dir.path().join(DATABASE))
+            .unwrap()
+            .execute(
+                "INSERT INTO standings (vehicle_id, is_player) VALUES (1, 0), (2, 1)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            setup_line_of(&engineer).await,
+            "SETUP \"two.sto\" as loaded | no changes since the first setup"
+        );
+
         let (dir, engineer) = race();
         write_setup_set(
             &dir,

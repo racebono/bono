@@ -4740,10 +4740,12 @@ pub(super) struct SessionRows {
 }
 
 impl SetAt {
-    /// The player's lap, if it's one of this session's.
+    /// The player's lap, if it's one of this session's: before the player drives in a session,
+    /// their rows are still the last one's.
     fn lap_in(&self, session: &SessionRows) -> Option<i64> {
-        self.lap
-            .filter(|_| self.player_row.is_some_and(|row| row >= session.first))
+        self.lap.filter(|_| {
+            self.in_session(session) && self.player_row.is_some_and(|row| row >= session.first)
+        })
     }
 
     /// Whether it was written in this session: the one scoring named then, which also holds for
@@ -9399,6 +9401,37 @@ mod tests {
             "{now:?}"
         );
         assert_eq!(engineer.setup_names().await.unwrap(), ["VM_REAR_WING"]);
+    }
+
+    /// In the next session's garage, before the player drives there, their rows are still the
+    /// last session's: a change from then has no lap or stint of this session's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_earlier_sessions_lap_is_not_this_sessions_before_the_player_drives() {
+        let (dir, engineer) = race();
+        let set = (Some("a.sto"), Some(false), Some("garage"));
+        write_setup_set(&dir, Some(1), 1, set, &[("A", Some("1"))]);
+        write_setup_set(&dir, Some(1), 2, set, &[("A", Some("2"))]);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute("UPDATE setup_set SET session_type = 'practice'", [])
+            .unwrap();
+        // Qualifying, as scoring names it; the player hasn't driven in it yet
+        conn.execute(
+            "INSERT INTO session (session_type, session_time) VALUES ('qualifying', 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let changes = query(
+            &engineer,
+            "SELECT lap, this_session, stint_id FROM setup_changes",
+        )
+        .await;
+        assert_eq!(changes, [["NULL", "0", "NULL"]]);
+        let now = query(&engineer, "SELECT changed_lap FROM setup_now").await;
+        assert_eq!(now, [["NULL"]]);
+        let state = query(&engineer, "SELECT setup_as_of_lap FROM race_state").await;
+        assert_eq!(state, [["NULL"]]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
