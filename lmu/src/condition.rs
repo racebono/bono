@@ -176,8 +176,10 @@ impl VehicleCondition {
             state.driving = Some(now);
             let in_pit_lane = telemetry.in_pit_lane.get();
             match (state.in_pit_lane, in_pit_lane) {
-                (Some(false), Some(true)) => state.came_in = true,
-                // Leaving the garage goes down the pit lane too, but isn't a stop
+                // In from the track, or starting in the pit lane: a driver taking over in the pit
+                // box is read as they start, perhaps with the crew still at work, so the way out is
+                // read again. After a plain garage exit, that read is the same and writes nothing
+                (Some(false) | None, Some(true)) => state.came_in = true,
                 (Some(true), Some(false)) if state.came_in => {
                     state.came_in = false;
                     // A garage read still wanted stays one
@@ -618,7 +620,14 @@ mod tests {
         assert_eq!(condition.take_setup(), None);
         assert!(not_asked(&asked));
 
-        // Out of the garage onto the track: not a stop
+        // Out of the pit lane it started in: asked once more, as it may have been a stop (a
+        // driver taking over in the pit box, the crew still at work). Unchanged, it writes nothing
+        drive(&condition, false);
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            taken(&condition).unwrap().source,
+            Some(SetupSource::PitStop)
+        );
         drive(&condition, false);
         assert!(not_asked(&asked));
         // In from the track and out again
@@ -639,6 +648,12 @@ mod tests {
         drive(&condition, true);
         asked.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(taken(&condition).unwrap().source, Some(SetupSource::Garage));
+        drive(&condition, false);
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            taken(&condition).unwrap().source,
+            Some(SetupSource::PitStop)
+        );
         drive(&condition, false);
         assert!(not_asked(&asked));
     }
