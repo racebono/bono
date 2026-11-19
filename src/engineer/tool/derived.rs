@@ -557,10 +557,11 @@ impl Data {
     /// Whether a condition holds now: checked as `sql` runs a query, against the tables as of now.
     fn condition(&mut self, shared: &Shared, query: &str) -> anyhow::Result<bool> {
         self.catch_up(shared);
-        // A condition on the recording's own tables can still be checked without them
-        if let Err(e) = self.stream.refresh_now(&self.conn, shared) {
-            log::debug!("The engineer's current-state tables didn't update: {e:#}");
-        }
+        // Not checked against tables that didn't update: left empty, they'd make a condition on them
+        // false whatever it is now (one that's partly right, a car missing, still counts)
+        self.stream
+            .refresh_now(&self.conn, shared)
+            .context("the engineer's current-state tables didn't update: just retry")?;
         let conn = &self.conn;
         let snapshot = conn.unchecked_transaction()?;
         if active_epoch(conn)?.id != self.stream.epoch.id {
