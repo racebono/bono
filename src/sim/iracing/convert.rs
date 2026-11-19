@@ -342,7 +342,7 @@ impl Converter {
         };
         let mut cars: Vec<_> = info.cars().collect();
         cars.sort_by_key(|(idx, _)| *idx);
-        let cars: Vec<Car<'_>> = cars
+        let mut cars: Vec<Car<'_>> = cars
             .into_iter()
             .map(|(idx, driver)| {
                 let car = PerCar::new(frame, idx, player);
@@ -431,11 +431,11 @@ impl Converter {
             })
             .collect();
 
+        let state = frame.i32("SessionState");
         let gaps = track_gaps(&cars);
         // Who's racing: everyone between the green and the flag; after the flag, the cars still
         // to finish (each over the line after the leader, see `Flag`), until the cool-down. Those
         // that have keep their finishing gaps and laps down, whatever the cool-down lap does
-        let state = frame.i32("SessionState");
         let flagged = race && matches!(state, Some(STATE_CHECKERED | STATE_COOL_DOWN));
         self.raced |= race && state == Some(STATE_RACING);
         let counted = |idx: i64| self.cars.get(&idx).and_then(|t| t.counted_at);
@@ -634,6 +634,9 @@ impl Converter {
                 Some((c.idx, (at - finish?).max(0.0)))
             })
             .collect();
+        if race {
+            live_places(&mut cars, &racing);
+        }
         let places = place_gaps(&cars, race, &racing, &finish_gaps);
         let behind = behind_leader(&cars, race, &racing, &finish_gaps);
         let before_green =
@@ -1593,6 +1596,50 @@ fn follow_gap(behind: &Car<'_>, ahead: &Car<'_>) -> Option<f64> {
     apart
 }
 
+/// The places of the cars `racing`, by how far each has gone: iRacing only changes its places as
+/// cars cross the line, so a pass mid-lap would wait for it. Those in the world with a lap started
+/// (not the -1 before their first line) are put in order among the places the game gives them,
+/// overall and in each class. The rest keep the game's: before the green, out of the world, and
+/// once finished, where how far a car has gone no longer orders it.
+fn live_places(cars: &mut [Car<'_>], racing: impl Fn(&Car<'_>) -> bool) {
+    let mut moving: Vec<usize> = (0..cars.len())
+        .filter(|&i| {
+            let car = &cars[i];
+            racing(car) && car.pct.is_some() && car.laps_completed.is_some_and(|l| l >= 0)
+        })
+        .collect();
+    // Furthest on first; level, in the game's order
+    let gone = |car: &Car<'_>| car.progress().unwrap_or(0.0);
+    moving.sort_by(|&a, &b| {
+        gone(&cars[b])
+            .total_cmp(&gone(&cars[a]))
+            .then(cars[a].position.cmp(&cars[b].position))
+    });
+    for (i, place) in reorder(&moving, |i| cars[i].position) {
+        cars[i].position = Some(place);
+    }
+    let classes: HashSet<Option<i64>> = moving.iter().map(|&i| cars[i].driver.class_id).collect();
+    for class in classes {
+        let in_class: Vec<usize> = moving
+            .iter()
+            .copied()
+            .filter(|&i| cars[i].driver.class_id == class)
+            .collect();
+        for (i, place) in reorder(&in_class, |i| cars[i].class_position) {
+            cars[i].class_position = Some(place);
+        }
+    }
+}
+
+/// The places the cars in `order` hold between them (those with one), given out again in that
+/// order, best first.
+fn reorder(order: &[usize], place: impl Fn(usize) -> Option<i64>) -> Vec<(usize, i64)> {
+    let order: Vec<usize> = order.iter().copied().filter(|&i| place(i).is_some()).collect();
+    let mut places: Vec<i64> = order.iter().filter_map(|&i| place(i)).collect();
+    places.sort_unstable();
+    order.into_iter().zip(places).collect()
+}
+
 /// In races, each car's gaps to the places ahead and behind, in seconds. Between cars `racing`
 /// on track less than a lap apart, it's how long the one behind takes to get where the other is
 /// (see `follow_gap`): the game's times behind the leader are only as of a timing line each car
@@ -2538,6 +2585,91 @@ mod tests {
         assert!(place_gaps(&cars, false, |_| true, &HashMap::new()).is_empty());
     }
 
+    /// A pass mid-lap changes the places at once, overall and in the class, though the game's
+    /// wait for the line; a car out of the world keeps the game's, as do all before the green.
+    #[test]
+    fn places_change_as_cars_pass() {
+        use super::super::sdk::{Value, Vars};
+        use super::super::session::{Driver, Session};
+        let class = |id: i64| Driver {
+            class_id: Some(id),
+            class_lap_time: Some(90.0),
+            ..Default::default()
+        };
+        // Cars 0 and 1 in one class, car 2 another, car 3 out of the world
+        let info = SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: [(0, class(1)), (1, class(1)), (2, class(2)), (3, class(1))]
+                .into_iter()
+                .collect(),
+            sessions: vec![Session {
+                num: 0,
+                kind: Some("race"),
+                number: 1,
+                results: HashMap::new(),
+            }],
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let mut converter = Converter::default();
+        // The game's places as of the line: car 2, car 0, car 3, car 1
+        let mut frame = |t: f64, state: i32, pct: [f64; 4]| {
+            let (vars, data) = Vars::of(&[
+                ("SessionTime", Value::Double(t)),
+                ("SessionNum", Value::Int(0)),
+                ("SessionState", Value::Int(state)),
+                ("PlayerCarIdx", Value::Int(0)),
+                ("CarIdxLapDistPct", Value::Doubles(pct.to_vec())),
+                ("CarIdxTrackSurface", Value::Ints(vec![3, 3, 3, -1])),
+                ("CarIdxLapCompleted", Value::Ints(vec![3, 3, 3, 2])),
+                ("CarIdxPosition", Value::Ints(vec![2, 4, 1, 3])),
+                ("CarIdxClassPosition", Value::Ints(vec![1, 3, 1, 2])),
+            ]);
+            converter
+                .convert(
+                    &Frame::new(&vars, &data),
+                    &info,
+                    start + std::time::Duration::from_secs_f64(t),
+                )
+                .unwrap()
+        };
+        let places = |update: &Update| {
+            let (_, standings) = update.scoring.as_ref().unwrap();
+            (0..4)
+                .map(|car| {
+                    let row = standings
+                        .iter()
+                        .find(|s| s.vehicle_id.get() == Some(car))
+                        .unwrap();
+                    (row.position.get(), row.class_position.get())
+                })
+                .collect::<Vec<_>>()
+        };
+        // Car 1 by car 0, and car 2, since the line
+        let passed = frame(1.0, STATE_RACING, [0.5, 0.6, 0.55, 0.0]);
+        assert_eq!(
+            places(&passed),
+            [
+                (Some(4), Some(3)),
+                (Some(1), Some(1)),
+                (Some(2), Some(1)),
+                (Some(3), Some(2)),
+            ]
+        );
+        // Before the green: the game's
+        let gridded = frame(2.0, STATE_PARADE_LAPS, [0.5, 0.6, 0.55, 0.0]);
+        assert_eq!(
+            places(&gridded),
+            [
+                (Some(2), Some(1)),
+                (Some(4), Some(3)),
+                (Some(1), Some(1)),
+                (Some(3), Some(2)),
+            ]
+        );
+    }
+
     /// Through a race's end: the first lap's placeholder isn't a time until the game changes it,
     /// gaps are live between cars still racing, and a car that has finished keeps its finishing
     /// gaps and laps down through the cool-down.
@@ -2885,7 +3017,8 @@ mod tests {
         // On a short lap, the placeholder past the next line isn't a time either
         let mut converter = Converter::default();
         let mut behind = |t: f64, laps: i32, f2: [f64; 3]| {
-            let pct = [0.5, 0.4, 0.6];
+            // Short of half a lap, where a count going up is for the line just crossed
+            let pct = [0.3, 0.2, 0.4];
             let (vars, data) = Vars::of(&[
                 ("SessionTime", Value::Double(t)),
                 ("SessionNum", Value::Int(0)),
@@ -3093,9 +3226,9 @@ mod tests {
         // racing, its gap to car 0 live (0.92 of a lap), not a finishing one
         let early = run(
             &[
-                (1.0, STATE_RACING, [0.9, 0.97, 0.5], [2, 1, 2]),
-                (1.5, STATE_RACING, [0.94, 0.02, 0.54], [2, 2, 2]),
-                (2.0, STATE_CHECKERED, [0.98, 0.06, 0.58], [2, 2, 2]),
+                (1.0, STATE_RACING, [0.9, 0.97, 0.5], [2, 1, 1]),
+                (1.5, STATE_RACING, [0.94, 0.02, 0.54], [2, 2, 1]),
+                (2.0, STATE_CHECKERED, [0.98, 0.06, 0.58], [2, 2, 1]),
             ],
             [0.0, 0.7, 5.0],
         );
@@ -3232,6 +3365,27 @@ mod tests {
             t += 0.25;
         }
         updates
+    }
+
+    /// Once finished, a car keeps the game's place: going further than the winner stopped past
+    /// the line doesn't take its place.
+    #[test]
+    fn a_finished_car_keeps_the_games_place() {
+        // Over the line, car 0 at 5.15 s and stopped just past it, car 2 (a lap down) at 6.15 s,
+        // car 1 at 13.15 s and on by car 0 since
+        let mut updates = steady(0.1, 14.85, [9.485, 8.685, 8.385], 4.1);
+        let stopped = updates.iter().position(|u| u.0 >= 5.35).unwrap();
+        let (pct, laps) = (updates[stopped].2[0], updates[stopped].3[0]);
+        for update in &mut updates[stopped..] {
+            (update.2[0], update.3[0]) = (pct, laps);
+        }
+        let end = race_end(&updates, [0.0, 72.0, 99.0]);
+        let (_, standings) = end.scoring.as_ref().unwrap();
+        let place = |car: i64| {
+            let row = standings.iter().find(|s| s.vehicle_id.get() == Some(car));
+            row.and_then(|row| row.position.get())
+        };
+        assert_eq!((place(0), place(1), place(2)), (Some(1), Some(2), Some(3)));
     }
 
     /// A car a lap down, finished, behind a car on the lead lap still racing to the line: a lap
