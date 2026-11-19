@@ -317,7 +317,11 @@ impl Recorder {
         if self.failed() {
             return;
         }
-        lock(&self.shared.queue).setup = Some((setup, pushed));
+        let mut queue = lock(&self.shared.queue);
+        // After the telemetry already waiting, before what comes after it
+        let after = queue.telemetry.len();
+        queue.setup = Some((setup, pushed, after));
+        drop(queue);
         self.shared.wake.notify_one();
     }
 
@@ -382,7 +386,7 @@ struct Queue {
     telemetry: Vec<bono_telemetry>,
     scoring: Vec<(bono_session_info, Vec<bono_standing>)>,
     /// The player's setup, the latest pushed
-    setup: Option<(Setup, Pushed)>,
+    setup: Option<(Setup, Pushed, usize)>,
     /// `clear` was called: the writer deletes what was recorded
     clear: bool,
 }
@@ -531,7 +535,8 @@ impl Writer {
             if self.check_settings(shared) {
                 telemetry.clear();
                 scoring.clear();
-                setup = setup.or_else(|| last_setup.clone());
+                setup =
+                    setup.or_else(|| last_setup.clone().map(|(setup, pushed)| (setup, pushed, 0)));
                 clear = true;
             }
 
@@ -547,15 +552,15 @@ impl Writer {
             if !telemetry.is_empty() || !scoring.is_empty() || setup.is_some() {
                 // Everything that arrived since the last write goes into one transaction
                 let tx = conn.unchecked_transaction()?;
-                for update in telemetry.drain(..) {
+                // The telemetry that came before the setup, then the setup, dated by the latest
+                // rows then (none before anything is driven): dated by later ones, it could read
+                // as coming after the clock it was pushed at
+                let mut rows = telemetry.drain(..);
+                let before = setup.as_ref().map_or(0, |(.., after)| *after);
+                for update in rows.by_ref().take(before) {
                     telemetry_writer.write(&update)?;
                 }
-                for (session, standings) in scoring.drain(..) {
-                    scoring_writer.write(session, standings)?;
-                }
-                // After the telemetry it arrived with: it's dated by the latest rows (none
-                // before anything is driven), and is the session's it was pushed in
-                if let Some((setup, pushed)) = setup.take() {
+                if let Some((setup, pushed, _)) = setup.take() {
                     last_setup = Some((setup.clone(), pushed.clone()));
                     let date = SetDate {
                         telemetry_id: tx
@@ -566,6 +571,12 @@ impl Writer {
                         session_number: pushed.session_number,
                     };
                     setup_writer.write(pushed.vehicle, date, setup)?;
+                }
+                for update in rows {
+                    telemetry_writer.write(&update)?;
+                }
+                for (session, standings) in scoring.drain(..) {
+                    scoring_writer.write(session, standings)?;
                 }
                 tx.commit()?;
             }
@@ -1053,6 +1064,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(set, (None, Some(1), "practice".to_owned()));
+    }
+
+    /// A setup is dated by the player's row when it was pushed, even if the writer gets to it after
+    /// later rows: dated by those, it could read as coming after the clock it was pushed at.
+    #[test]
+    fn a_setup_written_late_is_dated_by_the_rows_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // The writer asks for the forecast after its first write, and waits there until told to go
+        let (asked_tx, asked) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Mutex::new(wait);
+        let forecast: ForecastSource = Box::new(move |_| {
+            let _ = asked_tx.send(());
+            let _ = lock(&wait).recv();
+            None
+        });
+        let recorder = Recorder::new(dir.path(), Some(forecast)).unwrap();
+        recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
+        let push = |time: f64| {
+            let mut telemetry = bono_telemetry::default();
+            telemetry.vehicle_id = Some(1).into();
+            telemetry.session_time = Some(time).into();
+            assert!(recorder.wants_telemetry(1, time, 0.0));
+            recorder.push_telemetry(&telemetry);
+        };
+        push(10.0);
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The writer is held: the setup, then later rows, wait for it
+        recorder.push_setup(wing("P5"));
+        push(11.0);
+        push(12.0);
+        go.send(()).unwrap();
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        let (player_row, first): (i64, i64) = conn
+            .query_row(
+                "SELECT player_telemetry_id, (SELECT min(id) FROM telemetry) FROM setup_set",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(player_row, first);
     }
 
     /// A setup is the session's it was pushed in, whatever scoring says by the time it's written.
