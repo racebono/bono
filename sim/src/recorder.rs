@@ -547,7 +547,11 @@ impl Writer {
             }
 
             if clear {
-                sql::clear_tables(&conn)?;
+                // Still owed if it fails, for the restarted writer (see `restart`)
+                if let Err(e) = sql::clear_tables(&conn) {
+                    lock(&shared.queue).clear = true;
+                    return Err(e);
+                }
                 telemetry_writer.reset();
                 scoring_writer.reset();
                 forecast_writer.reset();
@@ -1222,10 +1226,45 @@ mod tests {
         recorder.restart(None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while rows_in(dir.path(), "setup_set") != 0 {
-            assert!(Instant::now() < deadline, "the restarted writer never cleared");
+            assert!(
+                Instant::now() < deadline,
+                "the restarted writer never cleared"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(rows_in(dir.path(), "standings"), 0);
+        drop(recorder);
+    }
+
+    /// A clear that fails (the database busy or full) is still owed: the restarted writer clears.
+    #[test]
+    fn a_clear_that_fails_happens_after_the_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
+        while rows_in(dir.path(), "standings") != 1 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Another connection holds the write lock past the writer's wait: its clear fails
+        let blocker = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        recorder.clear();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !recorder.failed() {
+            assert!(Instant::now() < deadline, "the clear didn't fail");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+
+        recorder.restart(None).unwrap();
+        while rows_in(dir.path(), "standings") != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the restarted writer never cleared"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         drop(recorder);
     }
 
