@@ -256,9 +256,9 @@
         "ca": "El plugin instal·lat no és el que ve amb bono"
     },
     "plugin.unexpected_code_hover": {
-        "en": "It says it's the same version, but its contents differ (a modified or damaged file, or another build). Reinstall it to be sure the recording works",
-        "es": "Dice ser la misma versión, pero su contenido es distinto (un archivo modificado o dañado, u otra compilación). Reinstálalo para asegurarte de que la grabación funciona",
-        "ca": "Diu que és la mateixa versió, però el contingut és diferent (un fitxer modificat o malmès, o una altra compilació). Reinstal·la'l per assegurar-te que la gravació funciona"
+        "en": "It says it's the same version, but its contents differ (a modified or damaged file, or another build). Update it so its sessions can start",
+        "es": "Dice ser la misma versión, pero su contenido es distinto (un archivo modificado o dañado, u otra compilación). Actualízalo para que sus sesiones puedan empezar",
+        "ca": "Diu que és la mateixa versió, però el contingut és diferent (un fitxer modificat o malmès, o una altra compilació). Actualitza'l perquè les seves sessions puguin començar"
     },
     "plugin.disabled": {
         "en": "Disabled in the game's plugin settings",

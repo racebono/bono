@@ -98,14 +98,20 @@ impl LeMansUltimate {
                 // Finished, so this doesn't wait
                 match check.and_then(|check| unconstrained(check).now_or_never()) {
                     // The game's plugin not found while the game runs, the app's copy's version not
-                    // read, or the plugin's no longer read once it was: the lookup failed, which says
-                    // nothing new about the plugin loaded
+                    // read, the plugin's no longer read once it was, or the same version as the
+                    // app's but not hashed (only the contents tell those apart): the lookup failed,
+                    // which says nothing new about the plugin loaded. The app's own contents tell
+                    // it's current, whatever else couldn't be read
                     Some(Ok(status))
-                        if status.installed.is_none()
-                            || status.bundled_version().is_none()
-                            || (self.plugin_version_read
-                                && matches!(status.installed, Some(None))) =>
+                        if status.same_as_bundled != Some(true)
+                            && (status.installed.is_none()
+                                || status.bundled_version().is_none()
+                                || (self.plugin_version_read
+                                    && matches!(status.installed, Some(None)))
+                                || (status.same_as_bundled.is_none()
+                                    && status.installed == status.bundled)) =>
                     {
+                        self.plugin_version_read |= matches!(status.installed, Some(Some(_)));
                         self.plugin_outdated.get_or_insert(false);
                     }
                     Some(Ok(status)) => {
@@ -423,28 +429,49 @@ mod tests {
                 build: None,
             }))
         };
-        let status = |installed, bundled| PluginStatus {
+        let hashed = |installed, bundled, same_as_bundled| PluginStatus {
             installed,
             enabled: true,
             bundled,
-            same_as_bundled: None,
+            same_as_bundled,
         };
+        let status = |installed, bundled| hashed(installed, bundled, None);
 
         let mut lmu = LeMansUltimate::new(Game::fake());
         assert!(!looked_at(&mut lmu, status(version(0), version(1))).await);
         assert!(lmu.plugin_outdated());
-        // The plugin not found, the app's copy's version not read, the plugin's no longer read
+        // The plugin not found, the app's copy's version not read, the plugin's no longer read, the
+        // app's version not hashed
         for failed in [
             status(None, version(1)),
             status(version(0), None),
             status(version(0), Some(None)),
             status(Some(None), version(1)),
+            status(version(1), version(1)),
         ] {
             assert!(!looked_at(&mut lmu, failed).await);
             assert!(lmu.plugin_outdated());
         }
-        // A look that tells
+        // The app's contents tell, even with the plugin's version no longer read
+        assert!(looked_at(&mut lmu, hashed(Some(None), version(1), Some(true))).await);
+        assert!(!lmu.plugin_outdated());
+        // As does a look that reads both
+        lmu.plugin_outdated = Some(true);
+        assert!(looked_at(&mut lmu, hashed(version(1), version(1), Some(true))).await);
+        assert!(!lmu.plugin_outdated());
+        // Not hashed, the last answer stands
         assert!(looked_at(&mut lmu, status(version(1), version(1))).await);
+        assert!(!lmu.plugin_outdated());
+
+        // The app's version with other code
+        let mut lmu = LeMansUltimate::new(Game::fake());
+        assert!(!looked_at(&mut lmu, hashed(version(1), version(1), Some(false))).await);
+        assert!(lmu.plugin_outdated());
+        // Without an answer yet, not hashed isn't outdated, but its version was read
+        let mut lmu = LeMansUltimate::new(Game::fake());
+        assert!(looked_at(&mut lmu, status(version(1), version(1))).await);
+        assert!(!lmu.plugin_outdated());
+        assert!(looked_at(&mut lmu, status(Some(None), version(1))).await);
         assert!(!lmu.plugin_outdated());
 
         // Without a version on the first look, the plugin's too old to say it
