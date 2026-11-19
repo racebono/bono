@@ -5,6 +5,12 @@ run:
     cargo build -p bono-phonemizer
     cargo run
 
+# Build the Le Mans Ultimate plugin, e.g. `just lmu --release`. A plain build puts bono_lmu.dll in
+# target/debug, next to the executable `just run` starts, which installs it from there.
+[windows]
+lmu *args:
+    cargo build -p bono-lmu {{args}}
+
 # On Windows, tests build in a reusable slot (scripts/slot.ps1): a new worktree only rebuilds
 # the workspace crates, not every dependency.
 
