@@ -235,11 +235,12 @@ impl Engineer {
     }
 
     /// The same, with the last progress snapshot's `seq` when it was checked (a snapshot after it
-    /// was measured after the check) and the epoch it was checked in.
+    /// was measured after the check) and the epoch it was checked in. `None` when the tables don't
+    /// show how things are now (the player's car not in the session yet), so it can't say.
     pub async fn check_condition_at(
         &self,
         query: String,
-    ) -> anyhow::Result<(bool, u64, Option<i64>)> {
+    ) -> anyhow::Result<(Option<bool>, u64, Option<i64>)> {
         self.ask(derived::Job::Condition { query })
             .await
             .and_then(derived::Answer::holds_at)
@@ -3055,6 +3056,30 @@ mod tests {
 
         let engineer = reopen(&dir);
         (dir, engineer)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_condition_without_the_players_car_yet_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        // Scored, but no telemetry yet: the tables of how things are now can't be written
+        let mut session = bono_session_info::default();
+        session.session_time = Some(10.0).into();
+        session.track = Some("Test Ring".to_owned()).into();
+        session.track_length = Some(1000.0).into();
+        session.session_type = Some("race".to_owned()).into();
+        let mut standing = bono_standing::default();
+        standing.vehicle_id = Some(1).into();
+        standing.is_player = Some(true).into();
+        recorder.push_scoring(session, vec![standing]);
+        drop(recorder);
+
+        let engineer = reopen(&dir);
+        let (holds, _, _) = engineer
+            .check_condition_at("SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM cars_now)".into())
+            .await
+            .unwrap();
+        assert_eq!(holds, None);
     }
 
     /// The tool, on the recording in `dir`.

@@ -300,7 +300,7 @@ pub(super) enum Answer {
     Text(String),
     /// Whether a condition returned a row, and the last progress snapshot published by then: a
     /// later one was measured after it
-    Holds(bool, u64, Option<i64>),
+    Holds(Option<bool>, u64, Option<i64>),
 }
 
 impl Answer {
@@ -314,12 +314,12 @@ impl Answer {
     #[cfg(test)]
     pub fn holds(self) -> anyhow::Result<bool> {
         match self {
-            Self::Holds(holds, ..) => Ok(holds),
+            Self::Holds(holds, ..) => holds.context("the tables don't show how things are now"),
             Self::Text(_) => bail!("the engineer's data thread answered another question"),
         }
     }
 
-    pub fn holds_at(self) -> anyhow::Result<(bool, u64, Option<i64>)> {
+    pub fn holds_at(self) -> anyhow::Result<(Option<bool>, u64, Option<i64>)> {
         match self {
             Self::Holds(holds, seq, epoch) => Ok((holds, seq, epoch)),
             Self::Text(_) => bail!("the engineer's data thread answered another question"),
@@ -557,7 +557,9 @@ impl Data {
     }
 
     /// Whether a condition holds now: checked as `sql` runs a query, against the tables as of now.
-    fn condition(&mut self, shared: &Shared, query: &str) -> anyhow::Result<bool> {
+    /// `None` while they don't show how things are now: still catching up with the recording, or
+    /// without the player's car in it yet.
+    fn condition(&mut self, shared: &Shared, query: &str) -> anyhow::Result<Option<bool>> {
         self.catch_up(shared);
         // Not checked against tables that didn't update: left empty, they'd make a condition on them
         // false whatever it is now (one that's partly right, a car missing, still counts)
@@ -569,9 +571,12 @@ impl Data {
         if active_epoch(conn)?.id != self.stream.epoch.id {
             bail!("the recording moved on to another session: just retry");
         }
+        if self.stream.behind || self.stream.failed || !self.stream.now_written {
+            return Ok(None);
+        }
         let holds = guarded(conn, || condition_holds(conn, query));
         drop(snapshot);
-        holds
+        holds.map(Some)
     }
 
     /// Publishes progress when it's due. Only once the tables have caught up with the recording,
@@ -697,7 +702,13 @@ impl Data {
             watch.results.clear();
         }
         let mut checked = std::collections::BTreeSet::new();
+        // Without the tables of how things are now, none is checked: they'd all read false, and a
+        // condition's first real result would count as a change
+        let now_written = stream.now_written;
         guarded(conn, || {
+            if !now_written {
+                return Ok(());
+            }
             let started = Instant::now();
             let turn = conditions
                 .range(watch.next..)
@@ -2874,6 +2885,9 @@ pub(super) struct Stream {
     pub behind: bool,
     /// The last tick failed: the tables may be behind, whatever `behind` says
     pub failed: bool,
+    /// The last refresh wrote the tables of how things are now: without a player's car in the epoch
+    /// yet (or failing to read it), they're empty, and a condition on them says nothing
+    pub now_written: bool,
     pub session_start: i64,
     /// The recording's epoch the tables are about: its rows are the session's, whatever the clock
     pub epoch: Epoch,
@@ -3641,8 +3655,11 @@ impl Stream {
         conn: &Connection,
         shared: &Shared,
     ) -> anyhow::Result<Option<String>> {
+        // Written once the refresh has written them, whatever else it couldn't
+        self.now_written = false;
         let refreshed = self.write_refresh(conn, shared);
         if refreshed.is_err() {
+            self.now_written = false;
             for table in NOW_TABLES {
                 if let Err(e) = conn.execute(&format!("DELETE FROM {table}"), []) {
                     log::debug!("{table} wasn't emptied after a failed refresh: {e}");
@@ -3674,8 +3691,9 @@ impl Stream {
             stints: self.stints(conn, &mut problems),
             ..Fresh::default()
         };
-        if let Err(e) = self.write_now(conn, shared, &mut fresh, &mut problems) {
-            problems.push(format!("{e:#}"));
+        match self.write_now(conn, shared, &mut fresh, &mut problems) {
+            Ok(()) => self.now_written = true,
+            Err(e) => problems.push(format!("{e:#}")),
         }
         // Without a player's car too: they're the recording's
         self.write_stints(conn, &fresh, &mut problems);

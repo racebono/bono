@@ -301,13 +301,14 @@ impl ScheduleTool {
                      checked, so nothing was changed: just retry"
                 );
             }
-            *result = Some(holds);
+            // Unknown (the tables don't show how things are now): its first check is its start
+            *result = holds;
             match field {
                 "trigger" => trigger_seq = at,
                 "until" => until_seq = at,
                 _ => stale_seq = at,
             }
-            if holds {
+            if holds == Some(true) {
                 notes.push_str(&format!(
                     " Its `{field}` condition is already true: {note}."
                 ));
