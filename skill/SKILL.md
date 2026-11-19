@@ -434,8 +434,8 @@ on track (how long it takes to get where the leader is, whole laps at its class'
 finished on the winner's lap have their exact gaps over the line. Otherwise (in the pit lane, off
 the track, still to finish after the winner, a lap down at the finish, before the green) each is
 iRacing's own, which it updates about once a lap at a
-timing line, so it can jump when a car goes from one to the other; the time behind the leader is
-then counted from the car placed first, and NULL for a car iRacing had ahead of it. Between classes
+timing line, so it can jump when a car goes from one to the other; that time behind the leader is
+NULL while the car placed first has passed iRacing's own leader since the line. Between classes
 the gaps don't add up to the time behind the leader. While the race runs, the places (`position`,
 `class_position`) are the order on track, by how far each car has gone, so a pass counts as it
 happens rather than at the line. iRacing's own places change only as cars cross the line: a car out
