@@ -377,6 +377,7 @@ impl Converter {
             telemetry,
             scoring,
             new_event,
+            setup: None,
         })
     }
 }

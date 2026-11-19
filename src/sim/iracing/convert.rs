@@ -38,10 +38,13 @@
 
 use super::{
     sdk::{Frame, UNLIMITED_LAPS, UNLIMITED_TIME},
-    session::SessionInfo,
+    session::{PlayerSetup, SessionInfo},
 };
 use crate::sim::memory::{SCORING_EVERY, Update};
-use bono_sim::sys::{bono_session_info, bono_standing, bono_telemetry};
+use bono_sim::{
+    setup::{Setting, Setup, SetupSource},
+    sys::{bono_session_info, bono_standing, bono_telemetry},
+};
 use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -168,6 +171,8 @@ pub struct Converter {
     flag: Option<Option<Flag>>,
     /// Whether this session's race was seen running before its flag
     raced: bool,
+    /// The player's setup as last sent to the recorder (see `setup`); `None` in a new event
+    last_setup: Option<PlayerSetup>,
 }
 
 /// A race's flag, for who has finished. The winner is the first car over the line with all the
@@ -270,6 +275,10 @@ impl Converter {
         let event = (info.event, info.track.clone());
         let new_event = self.event.as_ref().is_some_and(|last| *last != event);
         self.event = Some(event);
+        // The recording starts again (see `memory::record`)
+        if new_event {
+            self.last_setup = None;
+        }
         // Another session, or its clock went back (a restart, a replay rewound)
         let session = (frame.i32("SessionNum"), frame.i32("SessionUniqueID"));
         if new_event || self.session != Some(session) || dt.is_none() {
@@ -705,6 +714,39 @@ impl Converter {
             telemetry,
             scoring,
             new_event,
+            setup: self.setup(frame, info),
+        })
+    }
+
+    /// The player's setup for the recorder, when the session info's is new or has changed: the
+    /// game sends it again on leaving the garage and loading a setup, and maybe after a stop.
+    fn setup(&mut self, frame: &Frame<'_>, info: &SessionInfo) -> Option<Setup> {
+        if info.setup == self.last_setup {
+            return None;
+        }
+        let first = self.last_setup.is_none();
+        self.last_setup = info.setup.clone();
+        let setup = info.setup.as_ref()?;
+        let source = if first || frame.bool("IsInGarage") == Some(true) {
+            Some(SetupSource::Garage)
+        } else if frame.bool("OnPitRoad") == Some(true) {
+            Some(SetupSource::PitStop)
+        } else {
+            None
+        };
+        Some(Setup {
+            file_name: setup.file_name.clone(),
+            modified: setup.modified,
+            source,
+            settings: setup
+                .settings
+                .iter()
+                .map(|(name, value)| Setting {
+                    name: name.clone(),
+                    value: value.clone(),
+                    ..Default::default()
+                })
+                .collect(),
         })
     }
 
@@ -4039,6 +4081,90 @@ mod tests {
             .unwrap();
         assert_eq!(me.pit_service_body_repair_selected.get(), None);
         assert_eq!(me.pit_service_refuel_selected.get(), Some(true));
+    }
+
+    /// The setup goes to the recorder when it's first seen, when the session info's changes, and
+    /// again in a new event (the recording starts again), each time with where it was read.
+    #[test]
+    fn the_setup_is_sent_once_until_it_changes() {
+        use super::super::sdk::{Value, Vars};
+        use super::super::session::Driver;
+        let arb = |value: &str| PlayerSetup {
+            update_count: Some(1),
+            file_name: Some("race.sto".into()),
+            modified: Some(false),
+            settings: vec![("Chassis/Front/ArbSize".into(), value.into())],
+        };
+        let mut info = SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: HashMap::from([(0, Driver::default())]),
+            setup: Some(arb("Soft")),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let mut converter = Converter::default();
+        let mut time = 0.0;
+        let mut convert = |info: &SessionInfo, garage: bool, pit_road: bool| {
+            time += 1.0;
+            let (vars, data) = Vars::of(&[
+                ("SessionTime", Value::Double(time)),
+                ("SessionNum", Value::Int(0)),
+                ("PlayerCarIdx", Value::Int(0)),
+                ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
+                ("CarIdxLapCompleted", Value::Ints(vec![2])),
+                ("IsInGarage", Value::Bool(garage)),
+                ("OnPitRoad", Value::Bool(pit_road)),
+            ]);
+            converter
+                .convert(&Frame::new(&vars, &data), info, start)
+                .unwrap()
+                .setup
+        };
+        let setup = |value: &str, source: Option<SetupSource>| Setup {
+            file_name: Some("race.sto".into()),
+            modified: Some(false),
+            source,
+            settings: vec![Setting {
+                name: "Chassis/Front/ArbSize".into(),
+                value: value.into(),
+                ..Default::default()
+            }],
+        };
+
+        // The first is the garage's, wherever the car is
+        assert_eq!(
+            convert(&info, false, false),
+            Some(setup("Soft", Some(SetupSource::Garage)))
+        );
+        assert_eq!(convert(&info, false, false), None);
+
+        info.setup = Some(arb("Medium"));
+        assert_eq!(
+            convert(&info, false, true),
+            Some(setup("Medium", Some(SetupSource::PitStop)))
+        );
+        assert_eq!(convert(&info, false, true), None);
+        info.setup = Some(arb("Hard"));
+        assert_eq!(
+            convert(&info, true, false),
+            Some(setup("Hard", Some(SetupSource::Garage)))
+        );
+        // Out on track, where it was changed isn't known
+        info.setup = Some(arb("Soft"));
+        assert_eq!(convert(&info, false, false), Some(setup("Soft", None)));
+
+        // A new event clears the recording: the same setup goes again
+        info.event = (Some(1), None, None);
+        assert_eq!(
+            convert(&info, false, false),
+            Some(setup("Soft", Some(SetupSource::Garage)))
+        );
+        assert_eq!(convert(&info, false, false), None);
+
+        // Setup logging turned off: nothing to send
+        info.setup = None;
+        assert_eq!(convert(&info, false, false), None);
     }
 
     /// The out lap is the game's -1 laps done: the standings keep it, so the line that ends the out

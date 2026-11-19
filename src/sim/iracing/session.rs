@@ -33,6 +33,78 @@ pub struct SessionInfo {
     pub sectors: Vec<f64>,
     /// Each car's place in qualifying, from 1: the grid a race starts from
     pub qualifying: HashMap<i64, i64>,
+    /// The player's garage setup; `None` without a `CarSetup` section (the user can turn it off)
+    pub setup: Option<PlayerSetup>,
+}
+
+/// The player's garage setup, from `CarSetup`: each setting by its path through the section
+/// (`Chassis/LeftFront/Camber`), with the game's display text (`-2.9 deg`). The names differ from
+/// car to car. Settings changed from the cockpit aren't sent again, so those are as of when it was.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlayerSetup {
+    /// `CarSetup:UpdateCount`, which goes up each time the game sends the setup
+    pub update_count: Option<i64>,
+    /// The setup file it was loaded from (`DriverSetupName`)
+    pub file_name: Option<String>,
+    /// Whether it was changed since it was loaded (`DriverSetupIsModified`)
+    pub modified: Option<bool>,
+    /// Path and trimmed text, each path once, in the order the game writes them. Readouts (see
+    /// `READOUTS`) are left out
+    pub settings: Vec<(String, String)>,
+}
+
+/// Entries of `CarSetup` that are readings after a run, not settings: they move after every run,
+/// and the telemetry has them live. A key that is one of these, or starts with `LastTemps`.
+const READOUTS: [&str; 4] = [
+    "LastHotPressure",
+    "TreadRemaining",
+    "CornerWeight",
+    "AeroCalculator",
+];
+
+impl PlayerSetup {
+    fn new(doc: &Node) -> Option<Self> {
+        let section = doc.get("CarSetup")?;
+        let Node::Map(entries) = section else {
+            return None;
+        };
+        let drivers = doc.get("DriverInfo");
+        let mut setup = PlayerSetup {
+            update_count: section.int("UpdateCount"),
+            file_name: drivers
+                .and_then(|d| d.text("DriverSetupName"))
+                .map(str::to_owned),
+            modified: drivers
+                .and_then(|d| d.int("DriverSetupIsModified"))
+                .map(|v| v != 0),
+            settings: Vec::new(),
+        };
+        for (key, node) in entries.iter().filter(|(key, _)| key != "UpdateCount") {
+            setup.add(key.clone(), key, node);
+        }
+        Some(setup)
+    }
+
+    /// Adds the settings at `path`, whose last key is `key`.
+    fn add(&mut self, path: String, key: &str, node: &Node) {
+        if READOUTS.contains(&key) || key.starts_with("LastTemps") {
+            return;
+        }
+        match node {
+            Node::Scalar(value) => {
+                let value = value.trim();
+                if !value.is_empty() && !self.settings.iter().any(|(name, _)| *name == path) {
+                    self.settings.push((path, value.to_owned()));
+                }
+            }
+            Node::Map(entries) => {
+                for (key, node) in entries {
+                    self.add(format!("{path}/{key}"), key, node);
+                }
+            }
+            Node::List(_) => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -107,6 +179,7 @@ impl SessionInfo {
                 .filter(|n| *n > 0),
             start_time_of_day: o("TimeOfDay").and_then(time_of_day),
             replay: w("SimMode") == Some("replay"),
+            setup: PlayerSetup::new(doc),
             ..Default::default()
         };
 
@@ -516,5 +589,96 @@ DriverInfo:
             [(2, 1), (3, 2), (1, 1), (4, 2)]
         );
         assert!(!grid.contains_key(&5));
+    }
+
+    const CADILLAC: &str = include_str!("fixtures/cadillac_setup.yaml");
+    const IR04: &str = include_str!("fixtures/ir04_setup.yaml");
+
+    fn setup_of(text: &str) -> PlayerSetup {
+        SessionInfo::new(&parse(text)).setup.unwrap()
+    }
+
+    fn names(setup: &PlayerSetup) -> Vec<&str> {
+        setup
+            .settings
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn the_car_setup_is_flattened_into_paths() {
+        let setup = setup_of(&format!(
+            "DriverInfo:\n DriverCarIdx: 0\n DriverSetupName: test.sto\n DriverSetupIsModified: 1\n{CADILLAC}"
+        ));
+        assert_eq!(setup.file_name.as_deref(), Some("test.sto"));
+        assert_eq!(setup.modified, Some(true));
+        assert_eq!(setup.update_count, Some(3));
+        let value = |name: &str| {
+            setup
+                .settings
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(value("Chassis/LeftFront/Camber"), Some("-2.9 deg"));
+        assert_eq!(
+            value("BrakesDriveUnit/BrakeSpec/BrakePressureBias"),
+            Some("49.25%")
+        );
+        // Written with two spaces before it
+        assert_eq!(value("Chassis/Front/ArbSize"), Some("Soft"));
+        assert_eq!(value("Chassis/LeftFront/TorsionBarOD"), Some("14.76 mm"));
+        // In the order the game writes them
+        assert_eq!(names(&setup)[0], "TiresAero/TireType/TireType");
+    }
+
+    #[test]
+    fn readouts_are_left_out() {
+        for fixture in [CADILLAC, IR04] {
+            for name in names(&setup_of(fixture)) {
+                let last = name.rsplit('/').next().unwrap();
+                assert!(
+                    ![
+                        "LastHotPressure",
+                        "TreadRemaining",
+                        "CornerWeight",
+                        "UpdateCount"
+                    ]
+                    .contains(&last)
+                        && !last.starts_with("LastTemps")
+                        && !name.split('/').any(|segment| segment == "AeroCalculator"),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn both_fixtures_keep_their_own_names() {
+        let (cadillac, ir04) = (setup_of(CADILLAC), setup_of(IR04));
+        assert!(!ir04.settings.is_empty());
+        assert_ne!(names(&cadillac), names(&ir04));
+        assert!(names(&ir04).contains(&"TiresAero/LeftFront/ColdPressure"));
+        assert!(names(&cadillac).contains(&"TiresAero/LeftFront/StartingPressure"));
+        // Neither has a setup file name or modified flag without the driver info
+        assert_eq!((ir04.file_name, ir04.modified), (None, None));
+    }
+
+    /// The recording keeps each name once: a key the game writes twice keeps its first value.
+    #[test]
+    fn a_path_written_twice_keeps_its_first_value() {
+        let setup = setup_of("CarSetup:\n Chassis:\n  Front:\n   ToeIn: 1 mm\n   ToeIn: 2 mm\n");
+        assert_eq!(
+            setup.settings,
+            [("Chassis/Front/ToeIn".to_owned(), "1 mm".to_owned())]
+        );
+    }
+
+    #[test]
+    fn no_car_setup_section_is_no_setup() {
+        let doc =
+            parse("WeekendInfo:\n TrackName: roadatlanta full\nDriverInfo:\n DriverCarIdx: 3\n");
+        assert_eq!(SessionInfo::new(&doc).setup, None);
     }
 }

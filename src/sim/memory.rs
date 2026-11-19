@@ -12,6 +12,7 @@ use crate::{
 };
 use bono_sim::{
     recorder::{DATABASE, Recorder, SETTINGS, try_remove_database},
+    setup::Setup,
     sys::{bono_session_info, bono_standing, bono_telemetry},
 };
 use serde_json::{Map, Value};
@@ -65,6 +66,8 @@ pub(super) struct Update {
     pub scoring: Option<(bono_session_info, Vec<bono_standing>)>,
     /// Another event (track, layout) since the last update
     pub new_event: bool,
+    /// The player's garage setup, when it's new or changed (only iRacing reads one)
+    pub setup: Option<Setup>,
 }
 
 /// A game recorded from its shared memory, while it runs.
@@ -428,6 +431,10 @@ pub(super) fn record(recorder: &Recorder, update: Update) {
         if recorder.wants_telemetry(vehicle, time, speed) {
             recorder.push_telemetry(telemetry);
         }
+    }
+    // After the telemetry, which it's written with
+    if let Some(setup) = update.setup {
+        recorder.push_setup(setup);
     }
 }
 
