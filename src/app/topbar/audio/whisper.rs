@@ -1626,6 +1626,7 @@ mod tests {
         let effects = Effects {
             radio: 0.0,
             beep_volume: 0.0,
+            speed: 1.0,
         };
 
         let mut session = WhisperSession {

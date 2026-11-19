@@ -11,7 +11,7 @@ use crate::{
             settings::{self, ChangeButton, button_name},
             setup_label,
             simulators::SimulatorsTopbar,
-            volume::volume,
+            volume::{MAX_VOLUME, volume},
         },
     },
     config::{Config, RawConfig},
@@ -541,12 +541,14 @@ fn voice(
             ui,
             *raw.engineer_volume(),
             &mut raw.engineer_volume,
+            0.0..=MAX_VOLUME,
             t!("volume.engineer"),
             t!("volume.engineer_hover"),
         ) | volume(
             ui,
             *raw.radio_effect(),
             &mut raw.radio_effect,
+            0.0..=1.0,
             t!("volume.radio_effect"),
             t!("volume.radio_effect_hover"),
         )
