@@ -234,9 +234,12 @@ impl Engineer {
             .map_err(busy_retry)
     }
 
-    /// The same, with the last progress snapshot's `seq` when it was checked: a snapshot after it
-    /// was measured after the check.
-    pub async fn check_condition_at(&self, query: String) -> anyhow::Result<(bool, u64)> {
+    /// The same, with the last progress snapshot's `seq` when it was checked (a snapshot after it
+    /// was measured after the check) and the epoch it was checked in.
+    pub async fn check_condition_at(
+        &self,
+        query: String,
+    ) -> anyhow::Result<(bool, u64, Option<i64>)> {
         self.ask(derived::Job::Condition { query })
             .await
             .and_then(derived::Answer::holds_at)

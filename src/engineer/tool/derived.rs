@@ -300,7 +300,7 @@ pub(super) enum Answer {
     Text(String),
     /// Whether a condition returned a row, and the last progress snapshot published by then: a
     /// later one was measured after it
-    Holds(bool, u64),
+    Holds(bool, u64, Option<i64>),
 }
 
 impl Answer {
@@ -314,14 +314,14 @@ impl Answer {
     #[cfg(test)]
     pub fn holds(self) -> anyhow::Result<bool> {
         match self {
-            Self::Holds(holds, _) => Ok(holds),
+            Self::Holds(holds, ..) => Ok(holds),
             Self::Text(_) => bail!("the engineer's data thread answered another question"),
         }
     }
 
-    pub fn holds_at(self) -> anyhow::Result<(bool, u64)> {
+    pub fn holds_at(self) -> anyhow::Result<(bool, u64, Option<i64>)> {
         match self {
-            Self::Holds(holds, seq) => Ok((holds, seq)),
+            Self::Holds(holds, seq, epoch) => Ok((holds, seq, epoch)),
             Self::Text(_) => bail!("the engineer's data thread answered another question"),
         }
     }
@@ -405,7 +405,9 @@ fn thread(shared: &Shared, requests: &mpsc::Receiver<Request>) {
                     }
                     Job::Condition { query } => {
                         let seq = data.watch.seq;
-                        (data.condition(shared, &query)).map(|holds| Answer::Holds(holds, seq))
+                        // Checked in the epoch the tables are of: `condition` refuses any other
+                        let holds = data.condition(shared, &query);
+                        holds.map(|holds| Answer::Holds(holds, seq, data.stream.epoch.id))
                     }
                     Job::Track => {
                         // Following the recording's newest epoch, for the session it's about

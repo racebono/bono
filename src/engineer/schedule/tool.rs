@@ -287,13 +287,20 @@ impl ScheduleTool {
             let Some(Trigger::Condition { query }) = trigger else {
                 continue;
             };
-            let (holds, at) = self
+            let (holds, at, epoch) = self
                 .engineer
                 .check_condition_at(query.clone())
                 .await
                 .with_context(|| {
                     format!("the `{field}` condition failed, so nothing was changed")
                 })?;
+            // Its result is where changes are counted from in the request's epoch, not another's
+            if epoch != new.made.epoch {
+                bail!(
+                    "the recording moved on to another session while the `{field}` condition was \
+                     checked, so nothing was changed: just retry"
+                );
+            }
             *result = Some(holds);
             match field {
                 "trigger" => trigger_seq = at,
