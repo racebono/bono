@@ -1782,13 +1782,12 @@ fn setup_line(conn: &Connection, player: i64) -> rusqlite::Result<String> {
     }
     let changes = match setup.changes.last() {
         None => "no changes since the first setup".to_owned(),
-        Some(last) => format!(
-            "{} change{} since the first setup{}",
+        // No lap: this reads the recording, which doesn't say which session a lap was in
+        // (`setup_changes` does)
+        Some(_) => format!(
+            "{} change{} since the first setup",
             setup.changes.len(),
             if setup.changes.len() == 1 { "" } else { "s" },
-            last.lap
-                .map(|lap| format!(", last on lap {lap}"))
-                .unwrap_or_default()
         ),
     };
     Ok(format!("{} | {changes}", parts.join(" ")))
@@ -3087,7 +3086,7 @@ mod tests {
         );
         assert_eq!(
             setup_line_of(&engineer).await,
-            "SETUP \"algarve.sto\" modified | 1 change since the first setup, last on lap 2"
+            "SETUP \"algarve.sto\" modified | 1 change since the first setup"
         );
 
         let (dir, engineer) = race();

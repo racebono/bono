@@ -117,8 +117,8 @@ not reported), `start_light`, `air_c`, `track_c`, `rain_pct`,
 `pit_window_end_lap`, `pit_window_opens_in_s`, `pit_window_closes_in_s`, `pit_speed_limit_kmh`,
 `track_limit_steps_per_penalty`, `track_limit_steps_per_point`, `max_incident_points`;
 `setup_file` (the loaded setup's file name, where the game gives it), `setup_modified` (1 when
-the setup has been changed since it was loaded), `setup_as_of_lap` (the lap the game last sent the
-setup on). All three are NULL without a setup.
+the setup has been changed since it was loaded), `setup_as_of_lap` (this session's lap of the setup's
+latest change; NULL when that was in an earlier session). The first two are NULL without a setup.
 
 **`cars_now`**, one row per car: `vehicle_id`, `is_player`, `current_stint_id` (its stint now, in
 `stints`, whose `driver_id` is who's driving), `team`, `car_number`, `vehicle`, `vehicle_class`,
@@ -238,12 +238,13 @@ this lap.
 
 **`setup_now`**, one row per setting of the player's garage setup, as the game shows it: `name`,
 `value` (the game's display text, units and all); `step`, `min_step`, `max_step` (the top step) and
-`saved_value` (what the loaded setup file says), which only LMU gives; `changed_lap` (the lap of the
-setting's latest change). It covers the whole recording, not only this session, since the setup
-carries over.
+`saved_value` (what the loaded setup file says), which only LMU gives; `changed_lap` (this
+session's lap of the setting's latest change; NULL when it changed in an earlier session). It
+covers the whole recording, not only this session, since the setup carries over.
 
-**`setup_changes`**, one row per setting change after the first setup: `name`, `lap`, `stint_id`
-(in `stints`; NULL for a change in an earlier session), `old_value`, `new_value` (NULL: the
+**`setup_changes`**, one row per setting change after the first setup: `name`, `lap` (this
+session's; NULL for a change in an earlier session), `this_session` (1 when the change was in this
+session), `stint_id` (in `stints`; NULL for a change in an earlier session), `old_value`, `new_value` (NULL: the
 setting is gone), `source` (`garage`, `pit stop`, or NULL when not known), `session_time_s`.
 
 **The car setup.** The snapshot's `SETUP` line says whether the game reports the garage setup,
@@ -263,8 +264,10 @@ aren't in the conversation, `SELECT name FROM setup_now` lists them.
 - **Settings changed on track** (brake bias, migration, TC, ABS, engine map, anti-roll bars):
   the live `cars_now` columns are what the car is on now. The setup's value is only what it left
   the garage or a stop with.
-- **Age:** the values are as of `race_state.setup_as_of_lap`. If a stop came after it, say "as of
-  leaving the garage", as the crew may have changed something since. For tyre pressures, prefer
+- **Age:** a setting's value is as of its latest change, and a setup the game sends again unchanged
+  writes nothing. If a stop came after `race_state.setup_as_of_lap`, or it's NULL (the latest change
+  was in an earlier session), say "as of leaving the garage", as the crew may have changed
+  something since. For tyre pressures, prefer
   `wheels_now.cold_pressure_kpa` where it's given.
 - **Limits:** iRacing gives no ranges: never say a setting is at its limit or how far it can go.
 - **No setup** (the line says it isn't reported, or `setup_now` is empty): say the garage setup
