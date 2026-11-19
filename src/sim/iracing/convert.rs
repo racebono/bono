@@ -728,9 +728,12 @@ impl Converter {
     fn setup(&mut self, frame: &Frame<'_>, info: &SessionInfo) -> Option<Setup> {
         let in_garage = frame.bool("IsInGarage") == Some(true);
         let on_pit_road = frame.bool("OnPitRoad") == Some(true);
+        // Out on track: in the world, off pit road. A car not in the world (the player watching,
+        // on the way from the garage to the car) hasn't left the garage yet
+        let in_world = frame.i32("PlayerTrackSurface") != Some(NOT_IN_WORLD);
         if in_garage {
             self.from_garage = true;
-        } else if !on_pit_road {
+        } else if in_world && !on_pit_road {
             self.from_garage = false;
         }
         if info.setup == self.last_setup {
@@ -4117,7 +4120,7 @@ mod tests {
         let start = Instant::now();
         let mut converter = Converter::default();
         let mut time = 0.0;
-        let mut convert = |info: &SessionInfo, garage: bool, pit_road: bool| {
+        let mut convert = |info: &SessionInfo, garage: bool, pit_road: bool, in_world: bool| {
             time += 1.0;
             let (vars, data) = Vars::of(&[
                 ("SessionTime", Value::Double(time)),
@@ -4127,6 +4130,10 @@ mod tests {
                 ("CarIdxLapCompleted", Value::Ints(vec![2])),
                 ("IsInGarage", Value::Bool(garage)),
                 ("OnPitRoad", Value::Bool(pit_road)),
+                (
+                    "PlayerTrackSurface",
+                    Value::Int(if in_world { 3 } else { NOT_IN_WORLD }),
+                ),
             ]);
             converter
                 .convert(&Frame::new(&vars, &data), info, start)
@@ -4146,51 +4153,59 @@ mod tests {
 
         // The first is the garage's, wherever the car is
         assert_eq!(
-            convert(&info, false, false),
+            convert(&info, false, false, true),
             Some(setup("Soft", Some(SetupSource::Garage)))
         );
-        assert_eq!(convert(&info, false, false), None);
+        assert_eq!(convert(&info, false, false, true), None);
 
         info.setup = Some(arb("Medium"));
         assert_eq!(
-            convert(&info, false, true),
+            convert(&info, false, true, true),
             Some(setup("Medium", Some(SetupSource::PitStop)))
         );
-        assert_eq!(convert(&info, false, true), None);
+        assert_eq!(convert(&info, false, true, true), None);
         info.setup = Some(arb("Hard"));
         assert_eq!(
-            convert(&info, true, false),
+            convert(&info, true, false, true),
             Some(setup("Hard", Some(SetupSource::Garage)))
         );
+        // Watching between the garage and the car: not in the world, not out on track
+        assert_eq!(convert(&info, false, false, false), None);
         // Out of the garage the car is in its stall, on pit road: still the garage's
         info.setup = Some(arb("Medium"));
         assert_eq!(
-            convert(&info, false, true),
+            convert(&info, false, true, true),
             Some(setup("Medium", Some(SetupSource::Garage)))
         );
         // Out on track, where it was changed isn't known
         info.setup = Some(arb("Soft"));
-        assert_eq!(convert(&info, false, false), Some(setup("Soft", None)));
+        assert_eq!(
+            convert(&info, false, false, true),
+            Some(setup("Soft", None))
+        );
         // Back on pit road from the track: a stop
         info.setup = Some(arb("Hard"));
         assert_eq!(
-            convert(&info, false, true),
+            convert(&info, false, true, true),
             Some(setup("Hard", Some(SetupSource::PitStop)))
         );
         info.setup = Some(arb("Soft"));
-        assert_eq!(convert(&info, false, false), Some(setup("Soft", None)));
+        assert_eq!(
+            convert(&info, false, false, true),
+            Some(setup("Soft", None))
+        );
 
         // A new event clears the recording: the same setup goes again
         info.event = (Some(1), None, None);
         assert_eq!(
-            convert(&info, false, false),
+            convert(&info, false, false, true),
             Some(setup("Soft", Some(SetupSource::Garage)))
         );
-        assert_eq!(convert(&info, false, false), None);
+        assert_eq!(convert(&info, false, false, true), None);
 
         // Setup logging turned off: nothing to send
         info.setup = None;
-        assert_eq!(convert(&info, false, false), None);
+        assert_eq!(convert(&info, false, false, true), None);
     }
 
     /// A new event's first update has scoring, whenever the last one went: the recording is cleared
