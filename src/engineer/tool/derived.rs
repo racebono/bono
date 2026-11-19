@@ -571,12 +571,11 @@ impl Data {
         if active_epoch(conn)?.id != self.stream.epoch.id {
             bail!("the recording moved on to another session: just retry");
         }
-        if self.stream.behind || self.stream.failed || !self.stream.now_written {
-            return Ok(None);
-        }
-        let holds = guarded(conn, || condition_holds(conn, query));
+        // Run all the same, so a query that can't run is told now; only its result says nothing
+        let holds = guarded(conn, || condition_holds(conn, query))?;
         drop(snapshot);
-        holds.map(Some)
+        let known = !self.stream.behind && !self.stream.failed && self.stream.now_written;
+        Ok(known.then_some(holds))
     }
 
     /// Publishes progress when it's due. Only once the tables have caught up with the recording,
@@ -733,9 +732,13 @@ impl Data {
         })?;
         drop(snapshot);
 
-        watch
-            .counters
-            .observe(epoch, session_time_s, laps_completed);
+        // Nor are the clock and laps read from them: missing then isn't missing from the game, and
+        // would start their counting over
+        if now_written {
+            watch
+                .counters
+                .observe(epoch, session_time_s, laps_completed);
+        }
         watch.last_epoch = epoch;
         watch.seq += 1;
         Ok(Some(Progress {

@@ -587,12 +587,12 @@ impl Schedule {
                     request.missed_start = missed;
                     request.until_missed_start = until_missed;
                     // The same trigger carries on from where the old one's condition is, if a
-                    // snapshot since the replace's own check saw it, and a rise it saw while its
-                    // turn ran still fires it, once
+                    // snapshot since the replace's own check saw it, or that check couldn't tell;
+                    // and a rise it saw while its turn ran still fires it, once
                     if request.trigger == old.trigger {
                         if let (Some(slot), Some(old_slot)) =
                             (&mut request.trigger_slot, &old.trigger_slot)
-                            && old_slot.seen > trigger_checked
+                            && (old_slot.seen > trigger_checked || slot.last.is_none())
                         {
                             slot.last = old_slot.last;
                             slot.seen = old_slot.seen;
@@ -604,7 +604,7 @@ impl Schedule {
                     if same_until
                         && let (Some(slot), Some(old_slot)) =
                             (&mut request.until_slot, &old.until_slot)
-                        && old_slot.seen > until_checked
+                        && (old_slot.seen > until_checked || slot.last.is_none())
                     {
                         slot.last = old_slot.last;
                         slot.seen = old_slot.seen;
@@ -613,7 +613,7 @@ impl Schedule {
                     if same_stale
                         && let (Some(slot), Some(old_slot)) =
                             (&mut request.stale_slot, &old.stale_slot)
-                        && old_slot.seen > stale_checked
+                        && (old_slot.seen > stale_checked || slot.last.is_none())
                     {
                         slot.last = old_slot.last;
                         slot.seen = old_slot.seen;
@@ -2784,6 +2784,29 @@ mod tests {
             panic!("one condition")
         };
         // True again: a rise from the false the old one saw last
+        run.tick(with(laps(0), cond, ConditionState::True));
+        assert_eq!(run.due(), [id]);
+    }
+
+    #[test]
+    fn a_replace_whose_check_couldnt_tell_keeps_the_old_state() {
+        let mut run = Run::new();
+        let id = run.add(request(condition("SELECT 1"), every(), &laps(0)));
+        let [cond] = run.condition_ids()[..] else {
+            panic!("one condition")
+        };
+        run.tick(with(laps(0), cond, ConditionState::False));
+        // Reworded while its check can't tell (the tables catching up)
+        let checked = run.last.clone();
+        let mut replacing = request(condition("SELECT 1"), every(), &checked);
+        replacing.checked.trigger = None;
+        replacing.checked.trigger_seq = checked.seq;
+        run.schedule
+            .apply(vec![Change::Replace(id, replacing)], &checked);
+        let [cond] = run.condition_ids()[..] else {
+            panic!("one condition")
+        };
+        // True: a rise from the false the old one knew
         run.tick(with(laps(0), cond, ConditionState::True));
         assert_eq!(run.due(), [id]);
     }

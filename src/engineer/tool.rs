@@ -3080,6 +3080,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(holds, None);
+        // A query that can't run is still told, so it's fixed before it's confirmed
+        let error = engineer
+            .check_condition_at("SELECT 1 FROM cars_now WHERE no_such_column = 1".into())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("no_such_column"), "{error:#}");
     }
 
     /// The tool, on the recording in `dir`.
