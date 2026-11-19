@@ -163,10 +163,12 @@ impl VehicleCondition {
         }
         let answer = {
             let mut state = lock(&self.shared.state);
-            // Another car's answer isn't this one's
+            // Another car's answer isn't this one's, and its setup is read as `set_player` would
+            // (telemetry can name the new car before scoring does)
             let vehicle = telemetry.vehicle_id.get();
             if state.vehicle != vehicle {
                 state.forget();
+                state.leave_garage();
                 state.vehicle = vehicle;
             }
             state.driving = Some(now);
@@ -386,6 +388,22 @@ mod tests {
         state.vehicle = Some(1);
         drop(state);
         condition
+    }
+
+    /// Telemetry can name a new player's car before scoring does: that car's setup is still read.
+    #[test]
+    fn a_new_car_first_seen_in_telemetry_reads_its_setup() {
+        let condition = answered(parse(BODY).unwrap(), Instant::now());
+        lock(&condition.shared.state).setup_wanted = None;
+        let mut telemetry = bono_telemetry::default();
+        telemetry.vehicle_id = Some(2).into();
+        condition.fill_at(&mut telemetry, true, Instant::now());
+        let state = lock(&condition.shared.state);
+        assert_eq!(state.vehicle, Some(2));
+        assert_eq!(
+            state.setup_wanted,
+            Some((SetupSource::Garage, SETUP_ATTEMPTS))
+        );
     }
 
     #[test]
