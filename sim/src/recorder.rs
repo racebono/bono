@@ -7,7 +7,7 @@
 
 use crate::{
     setup::Setup,
-    sql::{self, ForecastWriter, ScoringWriter, SetupWriter, TelemetryWriter},
+    sql::{self, ForecastWriter, ScoringWriter, SetDate, SetupWriter, TelemetryWriter},
     sys::{bono_forecast_point, bono_session_info, bono_standing, bono_telemetry},
 };
 use std::{
@@ -104,6 +104,7 @@ impl Recorder {
         let setup = lock(&self.setup).clone();
         let player = self.shared.player_id.load(Ordering::Relaxed);
         let session_time = self.shared.session_time.load(Ordering::Relaxed);
+        let session = lock(&self.shared.session).clone();
         *self = Self::start(
             self.dir.clone(),
             forecast,
@@ -115,6 +116,7 @@ impl Recorder {
         self.shared
             .session_time
             .store(session_time, Ordering::Relaxed);
+        *lock(&self.shared.session) = session;
         if let Some(setup) = setup {
             self.push_setup(setup);
         }
@@ -133,6 +135,7 @@ impl Recorder {
             opponent_frequency: AtomicU32::new(settings.opponent_frequency),
             player_id: AtomicI64::new(-1),
             session_time: AtomicU64::new(0f64.to_bits()),
+            session: Mutex::new((None, None)),
             failed: AtomicBool::new(false),
             reset_pending: AtomicBool::new(left_over),
             stop: AtomicBool::new(false),
@@ -253,6 +256,10 @@ impl Recorder {
         self.shared
             .session_time
             .store(session_time.to_bits(), Ordering::Relaxed);
+        *lock(&self.shared.session) = (
+            session.session_type.as_deref().map(str::to_owned),
+            session.session_number.get(),
+        );
 
         {
             // Where each car is now, for the telemetry updates until the next scoring update
@@ -347,6 +354,8 @@ struct Shared {
     player_id: AtomicI64,
     /// The session time of the last scoring update (an `f64`), for when the forecast was read
     session_time: AtomicU64,
+    /// The last scoring update's session type and number, for when a setup was written
+    session: Mutex<(Option<String>, Option<i64>)>,
     failed: AtomicBool,
     reset_pending: AtomicBool,
     /// Set without the queue's lock, so stopping can't wait for a lock a thread the system ended
@@ -546,15 +555,17 @@ impl Writer {
                         Some(_) => {
                             let vehicle = Some(shared.player_id.load(Ordering::Relaxed))
                                 .filter(|id| *id >= 0);
-                            let session_time =
-                                f64::from_bits(shared.session_time.load(Ordering::Relaxed));
-                            setup_writer.write(
-                                vehicle,
+                            let (session_type, session_number) = lock(&shared.session).clone();
+                            let date = SetDate {
                                 telemetry_id,
-                                telemetry_writer.last_player_row(),
-                                Some(session_time),
-                                setup,
-                            )?;
+                                player_telemetry_id: telemetry_writer.last_player_row(),
+                                session_time: Some(f64::from_bits(
+                                    shared.session_time.load(Ordering::Relaxed),
+                                )),
+                                session_type,
+                                session_number,
+                            };
+                            setup_writer.write(vehicle, date, setup)?;
                         }
                     }
                 }
@@ -1057,6 +1068,8 @@ mod tests {
         let mut recorder = Recorder::new(dir.path(), None).unwrap();
         let mut session = bono_session_info::default();
         session.session_time = Some(10.0).into();
+        session.session_type = Some("race".to_owned()).into();
+        session.session_number = Some(2).into();
         recorder.push_scoring(session, vec![standing(1, true, 0.0)]);
         let mut telemetry = bono_telemetry::default();
         telemetry.vehicle_id = Some(1).into();
@@ -1078,10 +1091,13 @@ mod tests {
         drop(recorder);
 
         let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
-        // Still the player's car, and their last row, before the next scoring update says so
+        // Still the player's car, their last row and the session, before the next scoring update
+        // says so
         let sets = conn
             .prepare(
-                "SELECT r.value, s.vehicle_id, s.player_telemetry_id, s.session_time                  FROM setup r JOIN setup_set s ON s.id = r.setup_set_id ORDER BY s.id",
+                "SELECT r.value, s.vehicle_id, s.player_telemetry_id, s.session_time, \
+                 s.session_type, s.session_number \
+                 FROM setup r JOIN setup_set s ON s.id = r.setup_set_id ORDER BY s.id",
             )
             .unwrap()
             .query_map([], |r| {
@@ -1090,16 +1106,26 @@ mod tests {
                     r.get::<_, Option<i64>>(1)?,
                     r.get::<_, Option<i64>>(2)?,
                     r.get::<_, Option<f64>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
                 ))
             })
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
+        let race = Some("race".to_owned());
         assert_eq!(
             sets,
             [
-                ("P5".to_owned(), Some(1), Some(1), Some(10.0)),
-                ("P6".to_owned(), Some(1), Some(1), Some(10.0))
+                (
+                    "P5".to_owned(),
+                    Some(1),
+                    Some(1),
+                    Some(10.0),
+                    race.clone(),
+                    Some(2)
+                ),
+                ("P6".to_owned(), Some(1), Some(1), Some(10.0), race, Some(2))
             ]
         );
     }

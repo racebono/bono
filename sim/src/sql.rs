@@ -111,10 +111,13 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         -- The player's garage setup (see setup.rs): a set each time it changes, with only the
         -- settings that differ from the car's last set (all of them in its first). value NULL: the
         -- setting is gone. step to saved_value are LMU's only. telemetry_id is the latest row of
-        -- any car when it was written, player_telemetry_id the player's
+        -- any car when it was written, player_telemetry_id the player's, and session_time,
+        -- session_type and session_number the session's as the last scoring update gave it
         CREATE TABLE IF NOT EXISTS setup_set (
             id INTEGER PRIMARY KEY, telemetry_id INTEGER REFERENCES telemetry(id),
-            player_telemetry_id INTEGER REFERENCES telemetry(id), vehicle_id INTEGER, session_time REAL, file_name TEXT, modified INTEGER, source TEXT
+            player_telemetry_id INTEGER REFERENCES telemetry(id), vehicle_id INTEGER,
+            session_time REAL, file_name TEXT, modified INTEGER, source TEXT, session_type TEXT,
+            session_number INTEGER
         );
         CREATE TABLE IF NOT EXISTS setup (
             setup_set_id INTEGER NOT NULL REFERENCES setup_set(id), name TEXT NOT NULL, value TEXT,
@@ -452,6 +455,17 @@ impl<'conn> ForecastWriter<'conn> {
     }
 }
 
+/// When a set is written: the latest row of any car's and of the player's, and the session as the
+/// last scoring update gave it.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct SetDate {
+    pub telemetry_id: Option<i64>,
+    pub player_telemetry_id: Option<i64>,
+    pub session_time: Option<f64>,
+    pub session_type: Option<String>,
+    pub session_number: Option<i64>,
+}
+
 /// Writes the player's setup when it changes: a `setup_set` row, and a `setup` row for each
 /// setting that differs from the last set written for the car. Called inside the recorder's
 /// transaction, so a set is written whole or not at all.
@@ -482,9 +496,7 @@ impl<'conn> SetupWriter<'conn> {
     pub fn write(
         &mut self,
         vehicle: Option<i64>,
-        telemetry_id: Option<i64>,
-        player_telemetry_id: Option<i64>,
-        session_time: Option<f64>,
+        date: SetDate,
         setup: Setup,
     ) -> rusqlite::Result<bool> {
         if setup.settings.is_empty() {
@@ -518,15 +530,18 @@ impl<'conn> SetupWriter<'conn> {
         // In the recorder's transaction, with the telemetry it goes with
         self.conn.execute(
             "INSERT INTO setup_set (telemetry_id, player_telemetry_id, vehicle_id, session_time, \
-             file_name, modified, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
+             file_name, modified, source, session_type, session_number) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rusqlite::params![
-                telemetry_id,
-                player_telemetry_id,
+                date.telemetry_id,
+                date.player_telemetry_id,
                 vehicle,
-                session_time,
+                date.session_time,
                 setup.file_name,
                 setup.modified,
                 setup.source.map(|s| s.as_str()),
+                date.session_type,
+                date.session_number,
             ],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -794,11 +809,29 @@ mod tests {
         let conn = setup_writer();
         let mut writer = SetupWriter::new(&conn).unwrap();
         let first = setup(&[("A", "1"), ("B", "2")]);
-        assert!(writer.write(Some(7), None, None, Some(1.0), first).unwrap());
+        assert!(
+            writer
+                .write(
+                    Some(7),
+                    SetDate {
+                        session_time: Some(1.0),
+                        ..SetDate::default()
+                    },
+                    first
+                )
+                .unwrap()
+        );
         let second = setup(&[("A", "1"), ("B", "3")]);
         assert!(
             writer
-                .write(Some(7), None, None, Some(2.0), second)
+                .write(
+                    Some(7),
+                    SetDate {
+                        session_time: Some(2.0),
+                        ..SetDate::default()
+                    },
+                    second
+                )
                 .unwrap()
         );
 
@@ -820,10 +853,10 @@ mod tests {
         let same = setup(&[("A", "1")]);
         assert!(
             writer
-                .write(Some(7), None, None, None, same.clone())
+                .write(Some(7), SetDate::default(), same.clone())
                 .unwrap()
         );
-        assert!(!writer.write(Some(7), None, None, None, same).unwrap());
+        assert!(!writer.write(Some(7), SetDate::default(), same).unwrap());
         assert_eq!(sets(&conn), 1);
     }
 
@@ -832,10 +865,14 @@ mod tests {
         let conn = setup_writer();
         let mut writer = SetupWriter::new(&conn).unwrap();
         writer
-            .write(Some(7), None, None, None, setup(&[("A", "1"), ("B", "2")]))
+            .write(
+                Some(7),
+                SetDate::default(),
+                setup(&[("A", "1"), ("B", "2")]),
+            )
             .unwrap();
         writer
-            .write(Some(7), None, None, None, setup(&[("A", "1")]))
+            .write(Some(7), SetDate::default(), setup(&[("A", "1")]))
             .unwrap();
         assert_eq!(setup_rows(&conn)[2..], [row(2, "B", None)]);
     }
@@ -845,14 +882,14 @@ mod tests {
         let conn = setup_writer();
         let mut writer = SetupWriter::new(&conn).unwrap();
         writer
-            .write(Some(7), None, None, None, setup(&[("A", "1")]))
+            .write(Some(7), SetDate::default(), setup(&[("A", "1")]))
             .unwrap();
         writer
-            .write(Some(8), None, None, None, setup(&[("A", "1")]))
+            .write(Some(8), SetDate::default(), setup(&[("A", "1")]))
             .unwrap();
         writer.reset();
         writer
-            .write(Some(8), None, None, None, setup(&[("A", "1")]))
+            .write(Some(8), SetDate::default(), setup(&[("A", "1")]))
             .unwrap();
         assert_eq!(
             setup_rows(&conn),
@@ -872,10 +909,10 @@ mod tests {
         loaded.file_name = Some("race.sto".to_owned());
         loaded.modified = Some(false);
         writer
-            .write(Some(7), None, None, None, loaded.clone())
+            .write(Some(7), SetDate::default(), loaded.clone())
             .unwrap();
         loaded.modified = Some(true);
-        assert!(writer.write(Some(7), None, None, None, loaded).unwrap());
+        assert!(writer.write(Some(7), SetDate::default(), loaded).unwrap());
 
         assert_eq!(sets(&conn), 2);
         assert_eq!(setup_rows(&conn).len(), 1);
@@ -895,7 +932,7 @@ mod tests {
         let mut writer = SetupWriter::new(&conn).unwrap();
         assert!(
             !writer
-                .write(Some(7), None, None, None, Setup::default())
+                .write(Some(7), SetDate::default(), Setup::default())
                 .unwrap()
         );
         assert_eq!(sets(&conn), 0);
