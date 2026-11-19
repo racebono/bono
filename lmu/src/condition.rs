@@ -60,8 +60,12 @@ struct State {
     setup: Option<Setup>,
     /// Whether the player's car was in the pit lane in its last telemetry
     in_pit_lane: Option<bool>,
-    /// Whether it came into the pit lane from the track, so leaving it is after a stop
+    /// Whether it came into the pit lane from the track, or started in it, so leaving it may be
+    /// after a stop
     came_in: bool,
+    /// Whether a setup has been read since the car left the garage: until one has, a read on the
+    /// way out of the pit lane is the garage's, with no earlier setup for a stop to have changed
+    read_since_garage: bool,
 }
 
 #[derive(Default)]
@@ -184,7 +188,11 @@ impl VehicleCondition {
                     state.came_in = false;
                     // A garage read still wanted stays one
                     if state.setup_wanted.is_none() {
-                        state.setup_wanted = Some((SetupSource::PitStop, SETUP_ATTEMPTS));
+                        let source = match state.read_since_garage {
+                            true => SetupSource::PitStop,
+                            false => SetupSource::Garage,
+                        };
+                        state.setup_wanted = Some((source, SETUP_ATTEMPTS));
                     }
                 }
                 _ => {}
@@ -239,6 +247,7 @@ impl State {
         self.setup = None;
         self.in_pit_lane = None;
         self.came_in = false;
+        self.read_since_garage = false;
     }
 }
 
@@ -299,6 +308,7 @@ impl Shared {
                         source: Some(source),
                         ..setup
                     });
+                    state.read_since_garage = true;
                     None
                 }
                 None => attempts
@@ -656,6 +666,32 @@ mod tests {
         );
         drive(&condition, false);
         assert!(not_asked(&asked));
+    }
+
+    /// Every garage read failing, the first read that works is still the garage's: there's no
+    /// earlier setup for a stop to have changed.
+    #[test]
+    fn the_first_read_after_failed_garage_reads_is_the_garages() {
+        let (asked_tx, asked) = mpsc::channel();
+        let answers = std::sync::atomic::AtomicUsize::new(0);
+        let condition = VehicleCondition::with(
+            Duration::from_millis(1),
+            || None,
+            move || {
+                let _ = asked_tx.send(());
+                // The garage's three attempts fail, the next works
+                (answers.fetch_add(1, Ordering::Relaxed) >= SETUP_ATTEMPTS as usize).then(wing)
+            },
+        );
+        condition.set_realtime(true);
+        drive(&condition, true);
+        for _ in 0..SETUP_ATTEMPTS {
+            asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert!(not_asked(&asked));
+        drive(&condition, false);
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(taken(&condition).unwrap().source, Some(SetupSource::Garage));
     }
 
     #[test]
