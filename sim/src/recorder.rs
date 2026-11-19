@@ -100,12 +100,21 @@ impl Recorder {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        let setup = lock(&self.setup).take();
+        // Kept if the writer can't start, for the next restart
+        let setup = lock(&self.setup).clone();
+        let player = self.shared.player_id.load(Ordering::Relaxed);
+        let session_time = self.shared.session_time.load(Ordering::Relaxed);
         *self = Self::start(
             self.dir.clone(),
             forecast,
             self.shared.reset_pending.load(Ordering::Relaxed),
         )?;
+        // What the last scoring update said holds until the next one: the setup is written for
+        // the player's car before it comes
+        self.shared.player_id.store(player, Ordering::Relaxed);
+        self.shared
+            .session_time
+            .store(session_time, Ordering::Relaxed);
         if let Some(setup) = setup {
             self.push_setup(setup);
         }
@@ -539,7 +548,13 @@ impl Writer {
                                 .filter(|id| *id >= 0);
                             let session_time =
                                 f64::from_bits(shared.session_time.load(Ordering::Relaxed));
-                            setup_writer.write(vehicle, telemetry_id, Some(session_time), setup)?;
+                            setup_writer.write(
+                                vehicle,
+                                telemetry_id,
+                                telemetry_writer.last_player_row(),
+                                Some(session_time),
+                                setup,
+                            )?;
                         }
                     }
                 }
@@ -893,23 +908,32 @@ mod tests {
         telemetry.session_time = Some(10.0).into();
         assert!(recorder.wants_telemetry(1, 10.0, 0.0));
         recorder.push_telemetry(&telemetry);
+        // Another car's row after the player's
+        telemetry.vehicle_id = Some(2).into();
+        assert!(recorder.wants_telemetry(2, 10.0, 0.0));
+        recorder.push_telemetry(&telemetry);
         recorder.push_setup(wing("P5"));
         drop(recorder);
 
         let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
-        let (telemetry_id, vehicle, source): (i64, i64, String) = conn
+        let (telemetry_id, player_row, vehicle, source): (i64, i64, i64, String) = conn
             .query_row(
-                "SELECT telemetry_id, vehicle_id, source FROM setup_set",
+                "SELECT telemetry_id, player_telemetry_id, vehicle_id, source FROM setup_set",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        let latest: i64 = conn
-            .query_row("SELECT max(id) FROM telemetry", [], |r| r.get(0))
+        let (latest, players): (i64, i64) = conn
+            .query_row(
+                "SELECT max(id), (SELECT max(id) FROM telemetry WHERE vehicle_id = 1) FROM telemetry",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
+        assert_ne!(latest, players);
         assert_eq!(
-            (telemetry_id, vehicle, source.as_str()),
-            (latest, 1, "garage")
+            (telemetry_id, player_row, vehicle, source.as_str()),
+            (latest, players, 1, "garage")
         );
         let value: String = conn
             .query_row("SELECT value FROM setup", [], |r| r.get(0))
@@ -1031,7 +1055,9 @@ mod tests {
     fn a_restarted_writer_gets_the_last_setup() {
         let dir = tempfile::tempdir().unwrap();
         let mut recorder = Recorder::new(dir.path(), None).unwrap();
-        recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
+        let mut session = bono_session_info::default();
+        session.session_time = Some(10.0).into();
+        recorder.push_scoring(session, vec![standing(1, true, 0.0)]);
         let mut telemetry = bono_telemetry::default();
         telemetry.vehicle_id = Some(1).into();
         telemetry.session_time = Some(10.0).into();
@@ -1052,14 +1078,30 @@ mod tests {
         drop(recorder);
 
         let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
-        let values = conn
-            .prepare("SELECT value FROM setup ORDER BY setup_set_id")
+        // Still the player's car, and their last row, before the next scoring update says so
+        let sets = conn
+            .prepare(
+                "SELECT r.value, s.vehicle_id, s.player_telemetry_id, s.session_time                  FROM setup r JOIN setup_set s ON s.id = r.setup_set_id ORDER BY s.id",
+            )
             .unwrap()
-            .query_map([], |r| r.get::<_, String>(0))
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<f64>>(3)?,
+                ))
+            })
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(values, ["P5", "P6"]);
+        assert_eq!(
+            sets,
+            [
+                ("P5".to_owned(), Some(1), Some(1), Some(10.0)),
+                ("P6".to_owned(), Some(1), Some(1), Some(10.0))
+            ]
+        );
     }
 
     #[test]
