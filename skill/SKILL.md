@@ -443,8 +443,8 @@ of the world, back in it or towed since its last line, or yet to cross the line 
 keeps its order in them (behind the cars iRacing had ahead of it) until it's driven over the line,
 and a car that has finished takes its own a few seconds after the line.
 Before the green, and after the flag when who won can't be told, the places are iRacing's (or the
-grid's): then a car by the one placed ahead since the line has no gap to it, and one by the leader
-is 0 behind it.
+grid's). Where a car's place is iRacing's while it races, a car by the one placed ahead since the
+line has no gap to it, and one by the leader is 0 behind it.
 The best lap is `cars_now.best_lap_s`, iRacing's own, which leaves out laps it doesn't count: a
 quicker `lap_stats` time may be one of those. Don't call such a lap invalid (iRacing doesn't say
 why), and don't call any lap valid: iRacing doesn't report lap validity.
