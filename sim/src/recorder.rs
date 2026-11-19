@@ -13,7 +13,10 @@
 //! A writer restarted after an error carries on in the same epoch.
 
 use crate::{
-    sql::{self, EpochReason, ForecastWriter, ScoringWriter, TelemetryWriter},
+    setup::Setup,
+    sql::{
+        self, EpochReason, ForecastWriter, ScoringWriter, SetDate, SetupWriter, TelemetryWriter,
+    },
     sys::{bono_forecast_point, bono_session_info, bono_standing, bono_telemetry},
 };
 use std::{
@@ -82,6 +85,8 @@ pub struct Recorder {
     shared: Arc<Shared>,
     tracking: Mutex<Tracking>,
     thread: Option<JoinHandle<()>>,
+    /// The last setup pushed, for a restarted writer: no game sends it again until it changes
+    setup: Mutex<Option<(Setup, Pushed)>>,
 }
 
 impl Recorder {
@@ -104,6 +109,10 @@ impl Recorder {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        // Kept if the writer can't start, for the next restart: no game sends its setup again
+        // until it changes
+        let setup = lock(&self.setup).clone();
+        let session = lock(&self.shared.session).clone();
         // The same session carries on: only the writer failed. What's known of it stays (the
         // player, where the timeline is, a replay playing), and so does what was waiting to be
         // done (a clear, the epochs started)
@@ -138,6 +147,11 @@ impl Recorder {
             Ordering::Relaxed,
         );
         *self = restarted;
+        // The setup is the scoring's session's until the next scoring update says otherwise
+        *lock(&self.shared.session) = session;
+        if let Some((setup, pushed)) = setup {
+            self.queue_setup(setup, pushed);
+        }
         Ok(())
     }
 
@@ -168,6 +182,7 @@ impl Recorder {
             opponent_frequency: AtomicU32::new(settings.opponent_frequency),
             player_id: AtomicI64::new(-1),
             session_time: AtomicU64::new(session_time.to_bits()),
+            session: Mutex::new((None, None)),
             failed: AtomicBool::new(false),
             reset_pending: AtomicBool::new(left_over),
             stop: AtomicBool::new(false),
@@ -199,6 +214,7 @@ impl Recorder {
             shared,
             tracking: Mutex::new(Tracking::default()),
             thread: Some(thread),
+            setup: Mutex::new(None),
         })
     }
 
@@ -378,6 +394,10 @@ impl Recorder {
         self.shared
             .session_time
             .store(session_time.to_bits(), Ordering::Relaxed);
+        *lock(&self.shared.session) = (
+            session.session_type.as_deref().map(str::to_owned),
+            session.session_number.get(),
+        );
 
         // No car is the player's (spectating, a replay): no telemetry is flagged as theirs, rather
         // than the car that has the player's last id
@@ -398,6 +418,34 @@ impl Recorder {
         queue.scoring.push((epoch, session, standings));
         drop(queue);
         drop(tracking);
+        self.shared.wake.notify_one();
+    }
+
+    /// Queues the player's setup, for the player and session the last scoring update named, and
+    /// written only if it changed (see `SetupWriter`). A newer one replaces one still waiting.
+    pub fn push_setup(&self, setup: Setup) {
+        let player = self.shared.player_id.load(Ordering::Relaxed);
+        let (session_type, session_number) = lock(&self.shared.session).clone();
+        let pushed = Pushed {
+            vehicle: Some(player).filter(|id| *id >= 0),
+            session_time: f64::from_bits(self.shared.session_time.load(Ordering::Relaxed)),
+            session_type,
+            session_number,
+        };
+        self.queue_setup(setup, pushed);
+    }
+
+    /// Kept for a restarted writer too, as no game sends its setup again until it changes. Queued
+    /// in the epoch it's pushed in, after the telemetry already waiting.
+    fn queue_setup(&self, setup: Setup, pushed: Pushed) {
+        *lock(&self.setup) = Some((setup.clone(), pushed.clone()));
+        if self.failed() {
+            return;
+        }
+        let mut queue = lock(&self.shared.queue);
+        let after = queue.telemetry.len();
+        queue.setup = Some((queue.epoch, setup, pushed, after));
+        drop(queue);
         self.shared.wake.notify_one();
     }
 
@@ -452,11 +500,13 @@ impl Recorder {
     ///
     /// Starts an epoch too, so readers following the last one notice.
     pub fn clear(&self) {
+        *lock(&self.setup) = None;
         let mut tracking = lock(&self.tracking);
         let mut queue = lock(&self.shared.queue);
         queue.telemetry.clear();
         queue.scoring.clear();
         queue.boundaries.clear();
+        queue.setup = None;
         queue.clear = true;
         // In the same breath as the clear: the writer never clears without the epoch that follows
         self.start_epoch(&mut tracking, &mut queue, EpochReason::Cleared);
@@ -488,6 +538,8 @@ struct Shared {
     player_id: AtomicI64,
     /// The session time of the last scoring update (an `f64`), for when the forecast was read
     session_time: AtomicU64,
+    /// The last scoring update's session type and number, for when a setup was written
+    session: Mutex<(Option<String>, Option<i64>)>,
     failed: AtomicBool,
     reset_pending: AtomicBool,
     /// Set without the queue's lock, so stopping can't wait for a lock a thread the system ended
@@ -505,14 +557,28 @@ struct Queue {
     boundaries: Vec<(i64, EpochReason)>,
     telemetry: Vec<(i64, bono_telemetry)>,
     scoring: Vec<(i64, bono_session_info, Vec<bono_standing>)>,
+    /// The player's setup, the latest pushed: its epoch, and how much telemetry was waiting before it
+    setup: Option<(i64, Setup, Pushed, usize)>,
     /// `clear` was called: the writer deletes what was recorded
     clear: bool,
 }
 
 impl Queue {
     fn is_empty(&self) -> bool {
-        self.telemetry.is_empty() && self.scoring.is_empty() && self.boundaries.is_empty()
+        self.telemetry.is_empty()
+            && self.scoring.is_empty()
+            && self.boundaries.is_empty()
+            && self.setup.is_none()
     }
+}
+
+/// The player and session a setup was pushed for, as the last scoring update named them.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Pushed {
+    vehicle: Option<i64>,
+    session_time: f64,
+    session_type: Option<String>,
+    session_number: Option<i64>,
 }
 
 /// The epoch after `previous`. From the clock, so a recording made again (the game restarted) is
@@ -678,6 +744,7 @@ impl Writer {
         let mut telemetry_writer = TelemetryWriter::new(&conn)?;
         let mut scoring_writer = ScoringWriter::new(&conn)?;
         let mut forecast_writer = ForecastWriter::new(&conn)?;
+        let mut setup_writer = SetupWriter::new(&conn)?;
         let mut next_forecast = Instant::now();
 
         let mut telemetry = Vec::new();
@@ -685,8 +752,11 @@ impl Writer {
         let mut boundaries = Vec::new();
         // The epoch the rows are being written in, whose row is written: `None` until the first
         let mut written = None::<i64>;
+        // The last setup, to write again after the app clears the data: no game sends its setup
+        // again until it changes
+        let mut last_setup: Option<(Setup, Pushed)> = None;
         loop {
-            let mut clear = {
+            let (mut clear, mut setup) = {
                 let queue = lock(&shared.queue);
                 // Wakes now and then even with nothing to write, to look at settings.json
                 let (mut queue, _) = shared
@@ -704,8 +774,16 @@ impl Writer {
                 std::mem::swap(&mut telemetry, &mut queue.telemetry);
                 std::mem::swap(&mut scoring, &mut queue.scoring);
                 std::mem::swap(&mut boundaries, &mut queue.boundaries);
-                std::mem::take(&mut queue.clear)
+                (std::mem::take(&mut queue.clear), queue.setup.take())
             };
+
+            // Another event: the setup is the new one's, when it comes
+            if clear {
+                last_setup = None;
+            }
+            if let Some((_, setup, pushed, _)) = &setup {
+                last_setup = Some((setup.clone(), pushed.clone()));
+            }
 
             // Asked by the app: what's waiting was recorded before it asked. Readers following the
             // last epoch are told by a new one
@@ -722,6 +800,11 @@ impl Writer {
                 queue.clear = false;
                 queue.epoch = next_epoch(queue.epoch);
                 boundaries.push((queue.epoch, EpochReason::Cleared));
+                // The car's setup is still the car's: written again, in the epoch after the clear
+                setup = setup
+                    .map(|(_, setup, pushed, _)| (setup, pushed))
+                    .or_else(|| last_setup.clone())
+                    .map(|(setup, pushed)| (queue.epoch, setup, pushed, 0));
                 clear = true;
             }
 
@@ -737,14 +820,19 @@ impl Writer {
                     queue.boundaries.splice(0..0, boundaries.drain(..));
                     return Err(e);
                 }
-                telemetry_writer.reset();
+                telemetry_writer.cleared();
                 scoring_writer.reset();
                 forecast_writer.reset();
+                setup_writer.reset();
                 next_forecast = Instant::now();
                 written = None;
             }
 
-            if !telemetry.is_empty() || !scoring.is_empty() || !boundaries.is_empty() {
+            if !telemetry.is_empty()
+                || !scoring.is_empty()
+                || !boundaries.is_empty()
+                || setup.is_some()
+            {
                 // Everything that arrived since the last write goes into one transaction, epoch by
                 // epoch, each starting before its rows
                 let result = (|| {
@@ -754,6 +842,7 @@ impl Writer {
                         .map(|(epoch, _)| *epoch)
                         .chain(telemetry.iter().map(|(epoch, _)| *epoch))
                         .chain(scoring.iter().map(|(epoch, ..)| *epoch))
+                        .chain(setup.iter().map(|(epoch, ..)| *epoch))
                         .collect::<Vec<_>>();
                     epochs.sort_unstable();
                     epochs.dedup();
@@ -773,8 +862,24 @@ impl Writer {
                             scoring_writer.reset();
                             written = Some(epoch);
                         }
-                        for (_, update) in telemetry.iter().filter(|(of, _)| *of == epoch) {
+                        // The setup after the telemetry queued before it: dated by later rows, it
+                        // could read as coming after the clock it was pushed at
+                        for (i, (_, update)) in
+                            (telemetry.iter().enumerate()).filter(|(_, (of, _))| *of == epoch)
+                        {
+                            if (setup.as_ref())
+                                .is_some_and(|(of, .., after)| *of == epoch && i >= *after)
+                            {
+                                let (_, setup, pushed, _) = setup.take().unwrap();
+                                let player_row = telemetry_writer.last_player_row();
+                                write_setup(&tx, &mut setup_writer, player_row, setup, pushed)?;
+                            }
                             telemetry_writer.write(epoch, update)?;
+                        }
+                        if (setup.as_ref()).is_some_and(|(of, ..)| *of == epoch) {
+                            let (_, setup, pushed, _) = setup.take().unwrap();
+                            let player_row = telemetry_writer.last_player_row();
+                            write_setup(&tx, &mut setup_writer, player_row, setup, pushed)?;
                         }
                         for (_, session, standings) in
                             scoring.iter_mut().filter(|(of, ..)| *of == epoch)
@@ -785,6 +890,11 @@ impl Writer {
                                 std::mem::take(standings),
                             )?;
                         }
+                    }
+                    // Of an epoch already written: still the car's, written after it
+                    if let Some((_, setup, pushed, _)) = setup.take() {
+                        let player_row = telemetry_writer.last_player_row();
+                        write_setup(&tx, &mut setup_writer, player_row, setup, pushed)?;
                     }
                     tx.commit()
                 })();
@@ -839,6 +949,25 @@ impl Writer {
             .store(settings.opponent_frequency, Ordering::Relaxed);
         return std::mem::replace(&mut self.clear_requests, settings.clear) != settings.clear;
     }
+}
+
+/// Writes a setup, dated by the rows written so far: the latest of any car's, and the player's.
+fn write_setup(
+    conn: &rusqlite::Connection,
+    setup_writer: &mut SetupWriter<'_>,
+    player_row: Option<i64>,
+    setup: Setup,
+    pushed: Pushed,
+) -> rusqlite::Result<()> {
+    let date = SetDate {
+        telemetry_id: conn.query_row("SELECT max(id) FROM telemetry", [], |row| row.get(0))?,
+        player_telemetry_id: player_row,
+        session_time: Some(pushed.session_time),
+        session_type: pushed.session_type,
+        session_number: pushed.session_number,
+    };
+    setup_writer.write(pushed.vehicle, date, setup)?;
+    Ok(())
 }
 
 /// A panic on another thread mustn't stop recording: the data behind these locks stays valid.
@@ -1437,5 +1566,372 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         drop(recorder);
+    }
+
+    fn wing(value: &str) -> crate::setup::Setup {
+        crate::setup::Setup {
+            source: Some(crate::setup::SetupSource::Garage),
+            settings: vec![crate::setup::Setting {
+                name: "VM_REAR_WING".to_owned(),
+                value: value.to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn push_setup_is_recorded_with_the_latest_telemetry_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
+        let mut telemetry = bono_telemetry::default();
+        telemetry.vehicle_id = Some(1).into();
+        telemetry.session_time = Some(10.0).into();
+        assert!(recorder.wants_telemetry(1, 10.0, 0.0));
+        recorder.push_telemetry(&telemetry);
+        // Another car's row after the player's
+        telemetry.vehicle_id = Some(2).into();
+        assert!(recorder.wants_telemetry(2, 10.0, 0.0));
+        recorder.push_telemetry(&telemetry);
+        recorder.push_setup(wing("P5"));
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        let (telemetry_id, player_row, vehicle, source): (i64, i64, i64, String) = conn
+            .query_row(
+                "SELECT telemetry_id, player_telemetry_id, vehicle_id, source FROM setup_set",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        let (latest, players): (i64, i64) = conn
+            .query_row(
+                "SELECT max(id), (SELECT max(id) FROM telemetry WHERE vehicle_id = 1) FROM telemetry",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(latest, players);
+        assert_eq!(
+            (telemetry_id, player_row, vehicle, source.as_str()),
+            (latest, players, 1, "garage")
+        );
+        let value: String = conn
+            .query_row("SELECT value FROM setup", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, "P5");
+    }
+
+    /// The app clearing the data doesn't clear the car: no game sends its setup again until it
+    /// changes, so the last one is written again, with the first telemetry after the clear.
+    #[test]
+    fn the_setup_is_written_again_after_the_app_clears_the_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
+        let push = |time: f64| {
+            let mut telemetry = bono_telemetry::default();
+            telemetry.vehicle_id = Some(1).into();
+            telemetry.session_time = Some(time).into();
+            assert!(recorder.wants_telemetry(1, time, 0.0));
+            recorder.push_telemetry(&telemetry);
+        };
+        push(10.0);
+        recorder.push_setup(wing("P5"));
+
+        let path = dir.path().join(DATABASE);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let count = |table: &str| -> i64 {
+            loop {
+                if let Ok(conn) = rusqlite::Connection::open_with_flags(
+                    &path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                ) && let Ok(n) =
+                    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                {
+                    return n;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let wait = |table: &str, n: i64| {
+            while count(table) != n {
+                assert!(Instant::now() < deadline, "{table} never had {n} rows");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait("setup_set", 1);
+
+        // As the app asks
+        fs::write(dir.path().join(SETTINGS), r#"{"clear": 1}"#).unwrap();
+        wait("telemetry", 0);
+        // Written again at once, with nothing driven since
+        wait("setup_set", 1);
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (telemetry_id, value): (Option<i64>, String) = conn
+            .query_row(
+                "SELECT telemetry_id, (SELECT value FROM setup) FROM setup_set",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((telemetry_id, value.as_str()), (None, "P5"));
+    }
+
+    /// Rows of `table` in the recording in `dir`, once the writer has made it.
+    fn rows_in(dir: &Path, table: &str) -> i64 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(conn) = rusqlite::Connection::open_with_flags(
+                dir.join(DATABASE),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ) && let Ok(n) =
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            {
+                return n;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A setup with no telemetry yet (the car in the garage, nothing driven: a test session alone)
+    /// is written at once, with the session scoring named: the engineer doesn't need a row to place
+    /// it, and has it while the car is set up.
+    #[test]
+    fn a_setup_before_any_telemetry_is_written_with_its_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        let mut session = bono_session_info::default();
+        session.session_type = Some("practice".to_owned()).into();
+        recorder.push_scoring(session, vec![standing(1, true, 0.0)]);
+        recorder.push_setup(wing("P5"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rows_in(dir.path(), "setup_set") != 1 {
+            assert!(Instant::now() < deadline, "the setup was never written");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        let set: (Option<i64>, Option<i64>, String) = conn
+            .query_row(
+                "SELECT telemetry_id, vehicle_id, session_type FROM setup_set",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(set, (None, Some(1), "practice".to_owned()));
+    }
+
+    /// A setup is dated by the player's row when it was pushed, even if the writer gets to it after
+    /// later rows: dated by those, it could read as coming after the clock it was pushed at.
+    #[test]
+    fn a_setup_written_late_is_dated_by_the_rows_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // The writer asks for the forecast after its first write, and waits there until told to go
+        let (asked_tx, asked) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Mutex::new(wait);
+        let forecast: ForecastSource = Box::new(move |_| {
+            let _ = asked_tx.send(());
+            let _ = lock(&wait).recv();
+            None
+        });
+        let recorder = Recorder::new(dir.path(), Some(forecast)).unwrap();
+        recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
+        let push = |time: f64| {
+            let mut telemetry = bono_telemetry::default();
+            telemetry.vehicle_id = Some(1).into();
+            telemetry.session_time = Some(time).into();
+            assert!(recorder.wants_telemetry(1, time, 0.0));
+            recorder.push_telemetry(&telemetry);
+        };
+        push(10.0);
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The writer is held: the setup, then later rows, wait for it
+        recorder.push_setup(wing("P5"));
+        push(11.0);
+        push(12.0);
+        go.send(()).unwrap();
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        let (player_row, first): (i64, i64) = conn
+            .query_row(
+                "SELECT player_telemetry_id, (SELECT min(id) FROM telemetry) FROM setup_set",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(player_row, first);
+    }
+
+    /// A setup is the session's it was pushed in, whatever scoring says by the time it's written.
+    #[test]
+    fn a_setup_keeps_the_session_it_was_pushed_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        let named = |kind: &str| {
+            let mut session = bono_session_info::default();
+            session.session_type = Some(kind.to_owned()).into();
+            session
+        };
+        recorder.push_scoring(named("practice"), vec![standing(1, true, 0.0)]);
+        recorder.push_setup(wing("P5"));
+        recorder.push_scoring(named("qualifying"), vec![standing(1, true, 0.0)]);
+        let (_, pushed) = lock(&recorder.setup).clone().unwrap();
+        assert_eq!(pushed.session_type.as_deref(), Some("practice"));
+        assert_eq!(pushed.vehicle, Some(1));
+    }
+
+    /// A restarted writer knows nothing of the setup, and no game sends it again until it changes:
+    /// the recorder gives it the last one, the push that came while it was stopped too.
+    #[test]
+    fn a_restarted_writer_gets_the_last_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = Recorder::new(dir.path(), None).unwrap();
+        let mut session = bono_session_info::default();
+        session.session_time = Some(10.0).into();
+        session.session_type = Some("race".to_owned()).into();
+        session.session_number = Some(2).into();
+        recorder.push_scoring(session, vec![standing(1, true, 0.0)]);
+        let mut telemetry = bono_telemetry::default();
+        telemetry.vehicle_id = Some(1).into();
+        telemetry.session_time = Some(10.0).into();
+        assert!(recorder.wants_telemetry(1, 10.0, 0.0));
+        recorder.push_telemetry(&telemetry);
+        recorder.push_setup(wing("P5"));
+        while rows_in(dir.path(), "setup_set") != 1 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // As if the writer had failed: stopped, then a push it doesn't take
+        recorder.shared.stop.store(true, Ordering::Relaxed);
+        recorder.shared.wake.notify_one();
+        recorder.thread.take().unwrap().join().unwrap();
+        recorder.shared.failed.store(true, Ordering::Relaxed);
+        recorder.push_setup(wing("P6"));
+        recorder.restart(None).unwrap();
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        // Still the player's car, their last row and the session, before the next scoring update
+        // says so
+        let sets = conn
+            .prepare(
+                "SELECT r.value, s.vehicle_id, s.player_telemetry_id, s.session_time, \
+                 s.session_type, s.session_number \
+                 FROM setup r JOIN setup_set s ON s.id = r.setup_set_id ORDER BY s.id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<f64>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let race = Some("race".to_owned());
+        assert_eq!(
+            sets,
+            [
+                (
+                    "P5".to_owned(),
+                    Some(1),
+                    Some(1),
+                    Some(10.0),
+                    race.clone(),
+                    Some(2)
+                ),
+                ("P6".to_owned(), Some(1), Some(1), Some(10.0), race, Some(2))
+            ]
+        );
+    }
+
+    /// A clear asked for while the writer is down (another track loaded) still happens once it's
+    /// restarted: the old recording isn't the new event's.
+    #[test]
+    fn a_clear_while_the_writer_is_down_happens_after_its_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
+        recorder.push_setup(wing("P5"));
+        while rows_in(dir.path(), "setup_set") != 1 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        recorder.shared.stop.store(true, Ordering::Relaxed);
+        recorder.shared.wake.notify_one();
+        recorder.thread.take().unwrap().join().unwrap();
+        recorder.shared.failed.store(true, Ordering::Relaxed);
+        recorder.clear();
+        recorder.restart(None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rows_in(dir.path(), "setup_set") != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the restarted writer never cleared"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(rows_in(dir.path(), "standings"), 0);
+        drop(recorder);
+    }
+
+    /// A clear that fails (the database busy or full) is still owed: the restarted writer clears.
+    #[test]
+    fn a_clear_that_fails_happens_after_the_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
+        while rows_in(dir.path(), "standings") != 1 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Another connection holds the write lock past the writer's wait: its clear fails
+        let blocker = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        recorder.clear();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !recorder.failed() {
+            assert!(Instant::now() < deadline, "the clear didn't fail");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+
+        recorder.restart(None).unwrap();
+        while rows_in(dir.path(), "standings") != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the restarted writer never cleared"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(recorder);
+    }
+
+    #[test]
+    fn a_setup_pushed_before_a_clear_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_setup(wing("P5"));
+        recorder.clear();
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        let sets: i64 = conn
+            .query_row("SELECT count(*) FROM setup_set", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sets, 0);
     }
 }

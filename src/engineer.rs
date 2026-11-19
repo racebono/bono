@@ -590,6 +590,14 @@ struct SessionState {
     /// How many times `auto_session` started the conversation over: what it said before
     /// doesn't count
     starts: Arc<AtomicU32>,
+    /// A hash of the setup's setting names this conversation was last shown (see
+    /// [`EngineerTool::question_with_snapshot`]): None until it's shown them
+    setup_outline: Option<u64>,
+    /// The names the turn being answered offers, kept as shown once the turn is (see
+    /// [`SessionState::keep_outline`])
+    outline_offered: Option<u64>,
+    /// The conversation's [`Model::forgotten`] as last seen
+    forgotten: u64,
 }
 
 impl Engineer {
@@ -1444,6 +1452,7 @@ impl Engineer {
             if reply.is_ok() {
                 timeline.answered();
             }
+            state.keep_outline(&reply);
             let changes = state.schedule_tool.take();
             reply.map(|reply| (reply, changes))
             // The speech's text ends here, with the turn
@@ -1507,6 +1516,7 @@ impl Engineer {
             // Not the pilot's turn: a question asked meanwhile drops it rather than steering it
             state.conversation.set_steer(None);
             let reply = state.conversation.send(message).await;
+            state.keep_outline(&reply);
             let changes = state.schedule_tool.take();
             reply.map(|reply| (reply, changes))
         });
@@ -2153,6 +2163,9 @@ impl Engineer {
                 sim,
                 weekend: None,
                 starts: starts.clone(),
+                setup_outline: None,
+                forgotten: 0,
+                outline_offered: None,
             })),
             starts,
         })
@@ -2343,10 +2356,35 @@ impl SessionState {
             })
             .map(|note| format!("\n\n{}", note.text))
             .collect();
-        let message = self.tool.question_with_snapshot(message).await;
+        // The setup's names, unless this conversation still has them
+        self.notice_forgotten();
+        let mut shown = self.setup_outline;
+        let message = self.tool.question_with_snapshot(message, &mut shown).await;
+        self.outline_offered = shown;
         let message = briefed(message, &pending_text, &notes, briefing.note.as_deref());
         self.conversation.set_tool_result_note(briefing.note);
         message
+    }
+
+    /// The setup's names were shown in messages the conversation may have forgotten on its own
+    /// since (see [`Model::forgotten`]): they're shown again.
+    fn notice_forgotten(&mut self) {
+        let forgotten = self.conversation.forgotten();
+        if forgotten != self.forgotten {
+            self.forgotten = forgotten;
+            self.setup_outline = None;
+        }
+    }
+
+    /// The names the turn offered are in the conversation once it keeps the turn: one that failed
+    /// or was refused shows them again next time (a stopped one never gets here).
+    fn keep_outline(&mut self, reply: &anyhow::Result<Reply>) {
+        if reply
+            .as_ref()
+            .is_ok_and(|reply| reply.stop != StopReason::Refusal)
+        {
+            self.setup_outline = self.outline_offered;
+        }
     }
 
     /// Tells the conversation which game session it's about (Bono Cloud leases it). With
@@ -2369,6 +2407,7 @@ impl SessionState {
             if auto_session && self.weekend.is_some_and(|known| known != weekend) {
                 log::info!("New weekend: the engineer starts over");
                 self.conversation.reset();
+                self.setup_outline = None;
                 self.starts.fetch_add(1, atomic::Ordering::Relaxed);
                 started_over = true;
             }
@@ -3431,6 +3470,7 @@ mod tests {
     struct Recorded {
         games: Vec<GameSession>,
         resets: usize,
+        forgotten: u64,
     }
 
     struct RecordingModel(Arc<std::sync::Mutex<Recorded>>);
@@ -3446,6 +3486,10 @@ mod tests {
 
         fn reset(&mut self) {
             self.0.lock().unwrap().resets += 1;
+        }
+
+        fn forgotten(&self) -> u64 {
+            self.0.lock().unwrap().forgotten
         }
 
         fn usage(&self) -> &std::collections::BTreeMap<String, provider::Usage> {
@@ -3531,6 +3575,9 @@ mod tests {
                     sim: "lmu",
                     weekend: None,
                     starts: Arc::default(),
+                    setup_outline: None,
+                    forgotten: 0,
+                    outline_offered: None,
                 })),
                 starts: Arc::default(),
             });
@@ -3737,6 +3784,9 @@ mod tests {
                     sim: "test",
                     weekend: None,
                     starts: starts.clone(),
+                    setup_outline: None,
+                    forgotten: 0,
+                    outline_offered: None,
                 })),
                 starts,
             });
@@ -5278,6 +5328,9 @@ mod tests {
                 schedule_tool: state.schedule_tool.clone(),
                 weekend: None,
                 starts: Arc::default(),
+                setup_outline: None,
+                forgotten: 0,
+                outline_offered: None,
             }
         });
         scripted.engineer.session.as_mut().unwrap().state = Arc::new(Mutex::new(other));
@@ -5757,11 +5810,27 @@ mod tests {
                 sim: "lmu",
                 weekend: None,
                 starts: Arc::default(),
+                setup_outline: None,
+                forgotten: 0,
+                outline_offered: None,
             };
 
             let practice = "Circuit de la Sarthe|practice|1";
             follow_until(&mut state, &recorded, auto_session, practice, None).await;
             let weekend = state.weekend;
+            // Names already shown in this conversation stay shown
+            state.setup_outline = Some(7);
+            state.follow_game_session(auto_session).await;
+            assert_eq!(state.setup_outline, Some(7));
+            state.notice_forgotten();
+            assert_eq!(state.setup_outline, Some(7));
+            // The conversation forgot earlier messages on its own (trimmed to fit): shown again
+            recorded.lock().unwrap().forgotten += 1;
+            state.notice_forgotten();
+            assert_eq!(state.setup_outline, None);
+            state.setup_outline = Some(7);
+            state.notice_forgotten();
+            assert_eq!(state.setup_outline, Some(7));
             // Told every turn, so a lease ended meanwhile is started again
             let told = recorded.lock().unwrap().games.len();
             state.follow_game_session(auto_session).await;
@@ -5807,6 +5876,8 @@ mod tests {
                 state.follow_game_session(auto_session).await;
             }
             assert_eq!(recorded.lock().unwrap().resets, usize::from(auto_session));
+            // A conversation started over shows the names again
+            assert_eq!(state.setup_outline.is_none(), auto_session);
             let cleared = state.weekend;
             recorder.push_scoring(session("practice", 1), Vec::new());
             follow_until(&mut state, &recorded, auto_session, practice, weekend).await;
