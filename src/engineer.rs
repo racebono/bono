@@ -406,6 +406,8 @@ struct SessionState {
     /// A hash of the setup's setting names this conversation was last shown (see
     /// [`EngineerTool::question_with_snapshot`]): None until it's shown them
     setup_outline: Option<u64>,
+    /// The conversation's [`Model::forgotten`] as last seen
+    forgotten: u64,
 }
 
 impl Engineer {
@@ -865,6 +867,7 @@ impl Engineer {
         let task = Task::spawn(async move {
             let mut state = state.lock().await;
             state.follow_game_session(auto_session).await;
+            state.notice_forgotten();
             let mut outline_shown = state.setup_outline;
             let question = state
                 .tool
@@ -1385,6 +1388,7 @@ impl Engineer {
                 sim,
                 game_session: None,
                 setup_outline: None,
+                forgotten: 0,
             })),
         })
     }
@@ -1433,6 +1437,16 @@ impl SessionState {
     /// Tells the conversation which game session it's about (Bono Cloud leases it). With
     /// `auto_session`, a new one (another track, or the next practice, qualifying or race) starts
     /// the conversation over.
+    /// The setup's names were shown in messages the conversation may have forgotten on its own
+    /// since (see [`Model::forgotten`]): they're shown again.
+    fn notice_forgotten(&mut self) {
+        let forgotten = self.conversation.forgotten();
+        if forgotten != self.forgotten {
+            self.forgotten = forgotten;
+            self.setup_outline = None;
+        }
+    }
+
     async fn follow_game_session(&mut self, auto_session: bool) {
         let current = match game_session(&self.pool, self.sim).await {
             Ok(Some(current)) => current,
@@ -2478,6 +2492,7 @@ mod tests {
     struct Recorded {
         games: Vec<GameSession>,
         resets: usize,
+        forgotten: u64,
     }
 
     struct RecordingModel(Arc<std::sync::Mutex<Recorded>>);
@@ -2493,6 +2508,10 @@ mod tests {
 
         fn reset(&mut self) {
             self.0.lock().unwrap().resets += 1;
+        }
+
+        fn forgotten(&self) -> u64 {
+            self.0.lock().unwrap().forgotten
         }
 
         fn usage(&self) -> &std::collections::BTreeMap<String, provider::Usage> {
@@ -2577,6 +2596,7 @@ mod tests {
                     sim: "lmu",
                     game_session: None,
                     setup_outline: None,
+                    forgotten: 0,
                 })),
             });
             engineer.follow_recording(&rt, Some(&mut *sim));
@@ -2719,6 +2739,7 @@ mod tests {
                     sim: "test",
                     game_session: None,
                     setup_outline: None,
+                    forgotten: 0,
                 })),
             });
             Self {
@@ -2950,6 +2971,7 @@ mod tests {
                 sim: "lmu",
                 game_session: None,
                 setup_outline: None,
+                forgotten: 0,
             };
 
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2965,6 +2987,15 @@ mod tests {
             // Names already shown in this conversation, still known in the same game session
             state.setup_outline = Some(7);
             state.follow_game_session(auto_session).await;
+            assert_eq!(state.setup_outline, Some(7));
+            state.notice_forgotten();
+            assert_eq!(state.setup_outline, Some(7));
+            // The conversation forgot earlier messages on its own (trimmed to fit): shown again
+            recorded.lock().unwrap().forgotten += 1;
+            state.notice_forgotten();
+            assert_eq!(state.setup_outline, None);
+            state.setup_outline = Some(7);
+            state.notice_forgotten();
             assert_eq!(state.setup_outline, Some(7));
 
             let mut race = session("race", 1);

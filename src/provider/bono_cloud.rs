@@ -662,6 +662,10 @@ impl Model for Conversation {
         self.inner.usage()
     }
 
+    fn forgotten(&self) -> u64 {
+        self.inner.forgotten()
+    }
+
     fn set_game_session(&mut self, game: &GameSession) {
         self.lease.set_game(game.clone());
         if self.keep_warm.is_none()

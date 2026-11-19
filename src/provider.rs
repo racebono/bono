@@ -78,6 +78,12 @@ pub trait Model: Send {
     /// and tools stay.
     fn reset(&mut self);
 
+    /// Goes up whenever the conversation forgets earlier messages or parts of them on its own
+    /// (trimmed to fit a limit, compacted, started over): what they said may be gone.
+    fn forgotten(&self) -> u64 {
+        0
+    }
+
     /// Every turn's tokens so far (resets included), by the model that answered it.
     #[allow(dead_code)]
     fn usage(&self) -> &BTreeMap<String, Usage>;

@@ -233,6 +233,8 @@ pub struct Conversation {
     steer: Option<Steer>,
     /// Requests carry an `Idempotency-Key`, so a retry after a lost connection isn't billed twice
     request_ids: bool,
+    /// See [`Model::forgotten`]
+    forgotten: u64,
 }
 
 /// Tokens billed, by kind, as the API counts them.
@@ -322,6 +324,7 @@ impl Model for Conversation {
 
     /// Also forgets the code execution container.
     fn reset(&mut self) {
+        self.forgotten += 1;
         self.body.messages.clear();
         if let Some(container) = &mut self.body.container {
             container.id = None;
@@ -331,6 +334,10 @@ impl Model for Conversation {
     #[inline]
     fn usage(&self) -> &BTreeMap<String, Usage> {
         &self.usage
+    }
+
+    fn forgotten(&self) -> u64 {
+        self.forgotten
     }
 
     fn set_tool_result_note(&mut self, note: Option<Arc<str>>) {
@@ -400,6 +407,7 @@ impl Conversation {
         }
         if let Some(index) = first_edit {
             clear_thinking(&mut self.body.messages, index);
+            self.forgotten += 1;
         }
         while size(self)? > (limits.max_bytes as f64 * target) as usize
             || self.body.messages.len() + 1 > (limits.max_messages as f64 * target) as usize
@@ -414,6 +422,7 @@ impl Conversation {
                 .map(|(index, _)| index);
             let Some(next) = next else { break };
             self.body.messages.drain(0..next);
+            self.forgotten += 1;
             clear_thinking(&mut self.body.messages, 0);
         }
         log::info!(
@@ -445,6 +454,14 @@ impl Conversation {
             *self.usage.entry(model.clone()).or_default() += usage;
 
             drop_declined(&mut response.content);
+            // The server summed up the earlier messages: what they said in full is gone
+            if response
+                .content
+                .iter()
+                .any(|block| block["type"] == "compaction")
+            {
+                self.forgotten += 1;
+            }
 
             // Client tool calls, which this side answers (server tools like code execution run on
             // Anthropic's side)
@@ -1350,6 +1367,7 @@ impl ConversationBuilder {
             result_note: None,
             steer: None,
             request_ids: self.request_ids,
+            forgotten: 0,
         });
     }
 }
@@ -2087,8 +2105,11 @@ mod tests {
             serde_json::to_value(&conversation.body.messages).unwrap(),
             original
         );
+        assert_eq!(conversation.forgotten(), 0);
         // Force preparation without forcing whole-turn removal.
         conversation.prepare_history("Next?", 0.25).unwrap();
+        // A snapshot taken out: what it said is gone
+        assert_eq!(conversation.forgotten(), 1);
         let messages = serde_json::to_value(&conversation.body.messages).unwrap();
         assert_eq!(
             &messages.as_array().unwrap()[..2],
