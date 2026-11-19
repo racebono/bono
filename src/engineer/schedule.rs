@@ -273,8 +273,10 @@ struct Slot {
     id: ConditionId,
     query: String,
     /// The last result, the starting state a change is measured against: none yet after it was
-    /// registered or after an epoch change
+    /// registered, or once a snapshot is of another epoch than it
     last: Option<bool>,
+    /// The epoch `last` is from
+    epoch: Option<i64>,
     /// Failed checks in a row
     failures: u32,
     /// It turned from false to true on the last step
@@ -284,9 +286,12 @@ struct Slot {
 }
 
 impl Slot {
-    fn observe(&mut self, progress: &Progress, epoch_changed: bool) {
-        if epoch_changed {
+    fn observe(&mut self, progress: &Progress) {
+        // Another epoch's result says nothing about this one; one of this epoch stays, even when
+        // this is the first snapshot of it stepped through (a check made in it when asked)
+        if self.epoch != progress.epoch {
             self.last = None;
+            self.epoch = progress.epoch;
         }
         self.rose = false;
         // Not checked for this snapshot (not yet, or not reached within the tick's budget): no change,
@@ -591,6 +596,7 @@ impl Schedule {
                         {
                             slot.last = old_slot.last;
                             slot.seen = old_slot.seen;
+                            slot.epoch = old_slot.epoch;
                         }
                         request.rose_in_batch = old.rose_in_batch;
                     }
@@ -602,6 +608,7 @@ impl Schedule {
                     {
                         slot.last = old_slot.last;
                         slot.seen = old_slot.seen;
+                        slot.epoch = old_slot.epoch;
                     }
                     if same_stale
                         && let (Some(slot), Some(old_slot)) =
@@ -610,6 +617,7 @@ impl Schedule {
                     {
                         slot.last = old_slot.last;
                         slot.seen = old_slot.seen;
+                        slot.epoch = old_slot.epoch;
                     }
                     // Fired, and no scheduled turn has taken it yet: the next one answers it, as
                     // it's asked for now. Only for the same trigger: another one didn't fire, and
@@ -694,7 +702,7 @@ impl Schedule {
             // condition for it that keeps failing still drops it
             if !request.pending() {
                 if let Some(slot) = &mut request.stale_slot {
-                    slot.observe(progress, epoch_changed);
+                    slot.observe(progress);
                     if slot.failures >= CONDITION_FAILURES {
                         advance.dropped.push((request.id, request.instruction));
                         continue;
@@ -704,7 +712,7 @@ impl Schedule {
                 continue;
             }
             for slot in request.slots_mut() {
-                slot.observe(progress, epoch_changed);
+                slot.observe(progress);
             }
             if request
                 .slots()
@@ -1050,6 +1058,7 @@ impl Schedule {
         since: Progress,
         epoch: Option<i64>,
     ) -> Request {
+        let made_epoch = new.made.epoch;
         let checked = match new.made.epoch == epoch {
             true => new.checked,
             false => Checked::default(),
@@ -1057,16 +1066,26 @@ impl Schedule {
         let stale_after = new.stale_after.unwrap_or(DEFAULT_STALE);
         let until = match &new.repeat {
             Repeat::Every { until: Some(until) } => {
-                self.slot(until, checked.until, checked.until_seq)
+                self.slot(until, checked.until, checked.until_seq, made_epoch)
             }
             _ => None,
         };
         Request {
             id,
             instruction: new.instruction,
-            trigger_slot: self.slot(&new.trigger, checked.trigger, checked.trigger_seq),
+            trigger_slot: self.slot(
+                &new.trigger,
+                checked.trigger,
+                checked.trigger_seq,
+                made_epoch,
+            ),
             until_slot: until,
-            stale_slot: self.slot(&stale_after, checked.stale_after, checked.stale_seq),
+            stale_slot: self.slot(
+                &stale_after,
+                checked.stale_after,
+                checked.stale_seq,
+                made_epoch,
+            ),
             made: new.made,
             trigger: new.trigger,
             repeat: new.repeat,
@@ -1131,8 +1150,14 @@ impl Schedule {
         fires
     }
 
-    /// Starting from `last`, as of snapshot `seen`
-    fn slot(&mut self, trigger: &Trigger, last: Option<bool>, seen: u64) -> Option<Slot> {
+    /// Starting from `last`, as of snapshot `seen` in `epoch`
+    fn slot(
+        &mut self,
+        trigger: &Trigger,
+        last: Option<bool>,
+        seen: u64,
+        epoch: Option<i64>,
+    ) -> Option<Slot> {
         let Trigger::Condition { query } = trigger else {
             return None;
         };
@@ -1142,6 +1167,7 @@ impl Schedule {
             id,
             query: query.clone(),
             last,
+            epoch,
             failures: 0,
             rose: false,
             seen,
@@ -3012,6 +3038,28 @@ mod tests {
         // Its firing before the new condition's first check: out of date, as the old one saw
         let advance = run.tick(laps(1));
         assert_eq!(advance.skipped_stale, 1);
+    }
+
+    #[test]
+    fn a_check_in_an_epoch_not_yet_stepped_through_is_its_baseline() {
+        let mut run = Run::new();
+        run.tick(laps(0));
+        // Asked for in epoch 2 before any snapshot of it is stepped through, checked false
+        let made = new_epoch(laps(0), 2, &[]);
+        let mut new = request(condition("SELECT 1"), Repeat::Once, &made);
+        new.checked.trigger = Some(false);
+        let id = run.schedule.next_id();
+        run.schedule.apply(vec![Change::Add(id, new)], &made);
+        let [cond] = run.condition_ids()[..] else {
+            panic!("one condition")
+        };
+        // The first snapshot of epoch 2 stepped through, the condition true: a rise
+        run.tick(with(
+            new_epoch(laps(0), 2, &["session"]),
+            cond,
+            ConditionState::True,
+        ));
+        assert_eq!(run.due(), [id]);
     }
 
     #[test]
