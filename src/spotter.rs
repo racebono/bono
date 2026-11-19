@@ -18,6 +18,7 @@ use crate::{
     synthesizer::{Drain, Drained, Effects, Speech, Synthesizer, plays_on},
 };
 use bono_i18n::t;
+use bono_sim::sql::{Epoch, active_epoch};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
 use sdl3::audio::{AudioDevice, AudioStreamOwner};
 use std::{
@@ -260,6 +261,8 @@ enum Heard {
     Call(Raised),
     /// It's gone quiet (qualifying, with the spotter off for it): nothing from before is said
     Muted,
+    /// The recording moved on to another epoch: the calls before are about another session's cars
+    Epoch,
 }
 
 impl Drop for Running {
@@ -353,7 +356,7 @@ impl Spotter {
         match heard {
             Heard::Call(call) => self.hear(call, at),
             // The calls waiting, and the one being said
-            Heard::Muted => {
+            Heard::Muted | Heard::Epoch => {
                 self.queue.clear();
                 self.saying = None;
             }
@@ -693,20 +696,27 @@ fn follow(
     let mut logic = Logic::default();
     let mut sizes = Sizes::default();
     let mut last_id = None;
+    let mut epoch = None;
     let mut failing = false;
     let mut muted = false;
     while !stop.load(Ordering::Relaxed) {
         let start = Instant::now();
         let (config, frequency) = settings.borrow().clone();
 
-        match poll(
+        let followed = epoch;
+        let polled = poll(
             &conn,
             &mut logic,
             &mut sizes,
             &config,
             frequency,
             &mut last_id,
-        ) {
+            &mut epoch,
+        );
+        if epoch != followed && calls.send(Heard::Epoch).is_err() {
+            return;
+        }
+        match polled {
             Ok(raised) => {
                 failing = false;
                 for heard in outgoing(raised, logic.muted, &mut muted) {
@@ -748,7 +758,10 @@ fn open(db: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// The calls for the player's newest row, if it's new.
+/// The calls for the player's newest row, if it's new. Only the newest epoch's rows count (see
+/// `bono_sim::sql`): in another session, what was called before starts over, and until the player
+/// has a row in it (spectating, or a replay, which isn't recorded) there's nothing to call. The
+/// epoch and its rows are read in one transaction, so they're as of the same write.
 fn poll(
     conn: &Connection,
     logic: &mut Logic,
@@ -756,8 +769,19 @@ fn poll(
     config: &SpotterConfig,
     frequency: u32,
     last_id: &mut Option<i64>,
+    seen_epoch: &mut Option<i64>,
 ) -> rusqlite::Result<Vec<Raised>> {
-    let Some(mut car) = latest(conn)? else {
+    let _snapshot = conn.unchecked_transaction()?;
+    let epoch = active_epoch(conn)?;
+    if epoch.id != *seen_epoch {
+        *seen_epoch = epoch.id;
+        *logic = Logic::default();
+        // Its cars' sizes are read again from its own standings
+        *sizes = Sizes::default();
+        // A cleared recording numbers its rows from 1 again
+        *last_id = None;
+    }
+    let Some(mut car) = latest(conn, &epoch)? else {
         return Ok(Vec::new());
     };
     if Some(car.id) == *last_id {
@@ -768,13 +792,13 @@ fn poll(
 
     // Only once it's all read: a row that failed is tried again, rather than left unfollowed
     let id = car.id;
-    sizes.update(conn, None)?;
+    sizes.update(conn, None, &epoch)?;
     sizes.apply(&mut car);
     let player = player(conn, car)?;
-    let mut others = frame(conn, &player.car, frequency)?;
+    let mut others = frame(conn, &player.car, frequency, &epoch)?;
     others.iter_mut().for_each(|other| sizes.apply(other));
     let wheels = wheels(conn, player.car.id)?;
-    let scoring = scoring(conn, None)?;
+    let scoring = scoring(conn, None, &epoch)?;
     *last_id = Some(id);
     Ok(logic.update(config, &player, &others, &wheels, scoring.as_ref()))
 }
@@ -796,13 +820,13 @@ pub fn replay(db: &Path, config: &SpotterConfig) -> rusqlite::Result<Vec<Raised>
     let mut calls = Vec::new();
     for mut car in cars.into_iter().filter(|car| car.time.is_some()) {
         let time = car.time;
-        sizes.update(&conn, time)?;
+        sizes.update(&conn, time, &Epoch::ALL)?;
         sizes.apply(&mut car);
         let player = player(&conn, car)?;
-        let mut others = frame(&conn, &player.car, 5)?;
+        let mut others = frame(&conn, &player.car, 5, &Epoch::ALL)?;
         others.iter_mut().for_each(|other| sizes.apply(other));
         let wheels = wheels(&conn, player.car.id)?;
-        let scoring = scoring(&conn, time)?;
+        let scoring = scoring(&conn, time, &Epoch::ALL)?;
         calls.extend(logic.update(config, &player, &others, &wheels, scoring.as_ref()));
     }
     Ok(calls)
@@ -878,10 +902,15 @@ fn session_of((sessions, latest): (u32, Option<f64>), clock: f64) -> u32 {
 }
 
 impl Sizes {
-    /// Reads the standings written since the last call (only up to the player's session time
+    /// Reads `epoch`'s standings written since the last call (only up to the player's session time
     /// `upto`, in the same session, when replaying). A recording cleared since (its rows deleted,
     /// their ids reused) is read again from the start.
-    fn update(&mut self, conn: &Connection, upto: Option<f64>) -> rusqlite::Result<()> {
+    fn update(
+        &mut self,
+        conn: &Connection,
+        upto: Option<f64>,
+        epoch: &Epoch,
+    ) -> rusqlite::Result<()> {
         if let Some(upto) = upto {
             self.replay[PLAYER] = (session_of(self.replay[PLAYER], upto), Some(upto));
         }
@@ -911,9 +940,10 @@ impl Sizes {
         }
         let mut statement = conn.prepare_cached(
             "SELECT id, vehicle_id, session_time, vehicle_width, vehicle_length FROM standings \
-             WHERE id > ?1 ORDER BY id",
+             WHERE id > ?1 AND id >= ?2 ORDER BY id",
         )?;
-        let mut rows = statement.query([self.last.map_or(0, |(id, ..)| id)])?;
+        let mut rows =
+            statement.query([self.last.map_or(0, |(id, ..)| id), epoch.standings_from])?;
         while let Some(row) = rows.next()? {
             let vehicle = row.get::<_, Option<i64>>(1)?;
             let time = row.get::<_, Option<f64>>(2)?;
@@ -1007,12 +1037,13 @@ struct Scoring {
     forecast: Vec<(f64, f64)>,
 }
 
-/// The player's newest row.
-fn latest(conn: &Connection) -> rusqlite::Result<Option<Car>> {
+/// The player's newest row in `epoch`.
+fn latest(conn: &Connection, epoch: &Epoch) -> rusqlite::Result<Option<Car>> {
     conn.prepare_cached(&format!(
-        "SELECT {CAR_COLUMNS} FROM telemetry WHERE is_player = 1 ORDER BY id DESC LIMIT 1"
+        "SELECT {CAR_COLUMNS} FROM telemetry WHERE is_player = 1 AND id >= ?1 \
+         ORDER BY id DESC LIMIT 1"
     ))?
-    .query_row([], car)
+    .query_row([epoch.telemetry_from], car)
     .optional()
 }
 
@@ -1102,8 +1133,13 @@ fn wheels(conn: &Connection, telemetry_id: i64) -> rusqlite::Result<Wheels> {
     Ok(wheels)
 }
 
-/// Every other car near the player's row, moved to the player's time.
-fn frame(conn: &Connection, player: &Car, frequency: u32) -> rusqlite::Result<Vec<Car>> {
+/// Every other car near the player's row in `epoch`, moved to the player's time.
+fn frame(
+    conn: &Connection,
+    player: &Car,
+    frequency: u32,
+    epoch: &Epoch,
+) -> rusqlite::Result<Vec<Car>> {
     let Some(time) = player.time else {
         return Ok(Vec::new());
     };
@@ -1114,9 +1150,11 @@ fn frame(conn: &Connection, player: &Car, frequency: u32) -> rusqlite::Result<Ve
         let previous = conn
             .prepare_cached(
                 "SELECT session_time FROM telemetry WHERE is_player = 1 AND id < ?1 \
-                 ORDER BY id DESC LIMIT 1",
+                 AND id >= ?2 ORDER BY id DESC LIMIT 1",
             )?
-            .query_row([player.id], |row| row.get::<_, Option<f64>>(0))
+            .query_row([player.id, epoch.telemetry_from], |row| {
+                row.get::<_, Option<f64>>(0)
+            })
             .optional()?
             .flatten();
         let interval = previous.map_or(0.0, |previous| (time - previous).max(0.0));
@@ -1130,7 +1168,13 @@ fn frame(conn: &Connection, player: &Car, frequency: u32) -> rusqlite::Result<Ve
     let mut statement = conn.prepare_cached(&format!(
         "SELECT {CAR_COLUMNS} FROM telemetry WHERE id BETWEEN ?1 AND ?2"
     ))?;
-    let rows = statement.query_map([player.id - window, player.id + window], car)?;
+    let rows = statement.query_map(
+        [
+            (player.id - window).max(epoch.telemetry_from),
+            player.id + window,
+        ],
+        car,
+    )?;
 
     // Per car, the row closest in time (then in id) to the player's
     let mut best = HashMap::<i64, ((f64, i64), Car)>::new();
@@ -1158,8 +1202,12 @@ fn frame(conn: &Connection, player: &Car, frequency: u32) -> rusqlite::Result<Ve
 }
 
 /// The newest session row, the player's newest standing and the session's newest forecast (at or
-/// before `upto`, when replaying).
-fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scoring>> {
+/// before `upto`, when replaying), in `epoch`.
+fn scoring(
+    conn: &Connection,
+    upto: Option<f64>,
+    epoch: &Epoch,
+) -> rusqlite::Result<Option<Scoring>> {
     let session = conn
         .prepare_cached(
             "SELECT full_course_yellow, phase, \
@@ -1167,9 +1215,10 @@ fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scor
              rain, track_wetness_average, session_type, session_end_time, \
              EXISTS (SELECT 1 FROM session_sector WHERE session_id = session.id \
                  AND local_yellow IS NOT NULL) \
-             FROM session WHERE ?1 IS NULL OR session_time <= ?1 ORDER BY id DESC LIMIT 1",
+             FROM session WHERE (?1 IS NULL OR session_time <= ?1) AND id >= ?2 \
+             ORDER BY id DESC LIMIT 1",
         )?
-        .query_row([upto], |row| {
+        .query_row(rusqlite::params![upto, epoch.session_from], |row| {
             Ok((
                 Scoring {
                     full_course_yellow: row.get(0)?,
@@ -1201,25 +1250,26 @@ fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scor
         None => conn
             .prepare_cached(&format!(
                 "SELECT {columns} FROM standings WHERE is_player = 1 \
-                 AND id > (SELECT coalesce(max(id), 0) - 5000 FROM standings) \
+                 AND id > (SELECT coalesce(max(id), 0) - 5000 FROM standings) AND id >= ?1 \
                  ORDER BY id DESC LIMIT 1"
             ))?
-            .query_row([], standing)
+            .query_row([epoch.standings_from], standing)
             .optional()?
             .map(|standing| Ok(Some(standing)))
             .unwrap_or_else(|| {
                 conn.prepare_cached(&format!(
-                    "SELECT {columns} FROM standings WHERE is_player = 1 ORDER BY id DESC LIMIT 1"
+                    "SELECT {columns} FROM standings WHERE is_player = 1 AND id >= ?1 \
+                     ORDER BY id DESC LIMIT 1"
                 ))?
-                .query_row([], standing)
+                .query_row([epoch.standings_from], standing)
                 .optional()
             })?,
         Some(upto) => conn
             .prepare_cached(&format!(
                 "SELECT {columns} FROM standings WHERE is_player = 1 AND session_time <= ?1 \
-                 ORDER BY id DESC LIMIT 1"
+                 AND id >= ?2 ORDER BY id DESC LIMIT 1"
             ))?
-            .query_row([upto], standing)
+            .query_row(rusqlite::params![upto, epoch.standings_from], standing)
             .optional()?,
     };
     if let Some((flag, penalties, laps_completed, last_lap_time, under_yellow)) = standing {
@@ -2159,19 +2209,28 @@ mod tests {
                 .unwrap();
             for upto in [None, Some(time)] {
                 assert_eq!(
-                    scoring(&conn, upto).unwrap().unwrap().forecast,
+                    scoring(&conn, upto, &Epoch::ALL).unwrap().unwrap().forecast,
                     vec![(0.0, 0.0), (1.0, 0.1)]
                 );
             }
         }
         assert_eq!(
-            scoring(&conn, Some(0.0)).unwrap().unwrap().forecast,
+            scoring(&conn, Some(0.0), &Epoch::ALL)
+                .unwrap()
+                .unwrap()
+                .forecast,
             vec![(0.0, 0.0), (1.0, 0.1)]
         );
         writer
             .write(vec![point(30.0, "qualifying", 0.0, 0.6)])
             .unwrap();
-        assert!(scoring(&conn, None).unwrap().unwrap().forecast.is_empty());
+        assert!(
+            scoring(&conn, None, &Epoch::ALL)
+                .unwrap()
+                .unwrap()
+                .forecast
+                .is_empty()
+        );
     }
 
     /// `words` in English, with no voice and no effects.
@@ -3029,10 +3088,10 @@ mod tests {
             let mut p = player(t);
             p.car.id = conn.last_insert_rowid();
             p.car.z = Some(-50.0 * t);
-            let others = frame(&conn, &p.car, 60).unwrap();
+            let others = frame(&conn, &p.car, 60, &Epoch::ALL).unwrap();
             assert_eq!(others.len(), 60);
             if tick == 59 {
-                default_expired = frame(&conn, &p.car, 5).unwrap().is_empty();
+                default_expired = frame(&conn, &p.car, 5, &Epoch::ALL).unwrap().is_empty();
             }
             calls.extend(texts(logic.update(
                 &SpotterConfig::default(),
@@ -3245,7 +3304,7 @@ mod tests {
         )
         .unwrap();
         let mut sizes = Sizes::default();
-        sizes.update(&conn, None).unwrap();
+        sizes.update(&conn, None, &Epoch::ALL).unwrap();
         assert!(sizes.sizes.is_empty());
 
         let size_of = |sizes: &Sizes, vehicle| {
@@ -3262,7 +3321,7 @@ mod tests {
              INSERT INTO standings VALUES (2, 2, 2.0, 1.8, 4.5), (3, 3, 2.0, 2.0, 5.0);",
         )
         .unwrap();
-        sizes.update(&conn, None).unwrap();
+        sizes.update(&conn, None, &Epoch::ALL).unwrap();
         assert_eq!(size_of(&sizes, 2), size(1.8, 4.5));
         assert_eq!(size_of(&sizes, 3), size(2.0, 5.0));
         assert_eq!(size_of(&sizes, 4), None);
@@ -3270,22 +3329,22 @@ mod tests {
         // Slot 2 taken by a car without a size, then by another car; slot 3 by an implausible one
         conn.execute("INSERT INTO standings VALUES (4, 2, 3.0, NULL, NULL)", [])
             .unwrap();
-        sizes.update(&conn, None).unwrap();
+        sizes.update(&conn, None, &Epoch::ALL).unwrap();
         assert_eq!(size_of(&sizes, 2), None);
         conn.execute_batch(
             "INSERT INTO standings VALUES (5, 2, 4.0, 1.9, 4.7), (6, 3, 4.0, 190, 470);",
         )
         .unwrap();
-        sizes.update(&conn, None).unwrap();
+        sizes.update(&conn, None, &Epoch::ALL).unwrap();
         assert_eq!(size_of(&sizes, 2), size(1.9, 4.7));
         assert_eq!(size_of(&sizes, 3), None);
 
         // Replaying, standings after the player's time aren't read yet
         let mut replaying = Sizes::default();
-        replaying.update(&conn, Some(3.5)).unwrap();
+        replaying.update(&conn, Some(3.5), &Epoch::ALL).unwrap();
         assert_eq!(size_of(&replaying, 2), None);
         assert_eq!(size_of(&replaying, 3), size(2.0, 5.0));
-        replaying.update(&conn, Some(4.0)).unwrap();
+        replaying.update(&conn, Some(4.0), &Epoch::ALL).unwrap();
         assert_eq!(size_of(&replaying, 2), size(1.9, 4.7));
         assert_eq!(size_of(&replaying, 3), None);
 
@@ -3294,30 +3353,30 @@ mod tests {
             "INSERT INTO standings VALUES (7, 2, 0.5, 2.0, 5.5), (8, 2, 2.5, 1.8, 4.2);",
         )
         .unwrap();
-        replaying.update(&conn, Some(5.0)).unwrap();
+        replaying.update(&conn, Some(5.0), &Epoch::ALL).unwrap();
         assert_eq!(size_of(&replaying, 2), size(1.9, 4.7));
-        replaying.update(&conn, Some(1.0)).unwrap();
+        replaying.update(&conn, Some(1.0), &Epoch::ALL).unwrap();
         assert_eq!(size_of(&replaying, 2), size(2.0, 5.5));
-        replaying.update(&conn, Some(3.0)).unwrap();
+        replaying.update(&conn, Some(3.0), &Epoch::ALL).unwrap();
         assert_eq!(size_of(&replaying, 2), size(1.8, 4.2));
         // A third session, which the player's rows join at a later clock than its last standing
         conn.execute("INSERT INTO standings VALUES (9, 5, 0.3, 2.0, 4.6)", [])
             .unwrap();
-        replaying.update(&conn, Some(100.0)).unwrap();
+        replaying.update(&conn, Some(100.0), &Epoch::ALL).unwrap();
         assert_eq!(size_of(&replaying, 5), None);
-        replaying.update(&conn, Some(20.0)).unwrap();
+        replaying.update(&conn, Some(20.0), &Epoch::ALL).unwrap();
         assert_eq!(size_of(&replaying, 5), size(2.0, 4.6));
 
         // The recording cleared, its ids used again: read from the start (slot 3 has no standing
         // yet, so no size)
-        sizes.update(&conn, None).unwrap();
+        sizes.update(&conn, None, &Epoch::ALL).unwrap();
         assert_eq!(size_of(&sizes, 2), size(1.8, 4.2));
         conn.execute_batch(
             "DELETE FROM standings;
              INSERT INTO standings VALUES (1, 2, 9.0, 2.0, 4.9), (2, 4, 9.0, 1.9, 4.6);",
         )
         .unwrap();
-        sizes.update(&conn, None).unwrap();
+        sizes.update(&conn, None, &Epoch::ALL).unwrap();
         assert_eq!(size_of(&sizes, 2), size(2.0, 4.9));
         assert_eq!(size_of(&sizes, 3), None);
         assert_eq!(size_of(&sizes, 4), size(1.9, 4.6));
@@ -3328,7 +3387,7 @@ mod tests {
                  (3, 4, 12.0, 2.1, 5.1);",
         )
         .unwrap();
-        sizes.update(&conn, None).unwrap();
+        sizes.update(&conn, None, &Epoch::ALL).unwrap();
         assert_eq!(size_of(&sizes, 2), size(1.8, 4.3));
         assert_eq!(size_of(&sizes, 4), size(2.1, 5.1));
     }
@@ -3352,7 +3411,8 @@ mod tests {
             .unwrap();
         }
 
-        let (mut logic, mut sizes, mut last_id) = (Logic::default(), Sizes::default(), None);
+        let (mut logic, mut sizes, mut last_id, mut epoch) =
+            (Logic::default(), Sizes::default(), None, None);
         let mut calls = Vec::new();
         for tick in 0..30 {
             let t = f64::from(tick) / 30.0;
@@ -3372,6 +3432,7 @@ mod tests {
                 &SpotterConfig::default(),
                 5,
                 &mut last_id,
+                &mut epoch,
             )
             .unwrap();
             calls.extend(texts(raised));
@@ -3534,10 +3595,21 @@ mod tests {
         let mut config = SpotterConfig::default();
         config.qualifying.set(true);
         let mut logic = Logic::default();
-        let mut last_id = None;
+        let (mut last_id, mut epoch) = (None, None);
         let mut sizes = Sizes::default();
 
-        assert!(poll(&conn, &mut logic, &mut sizes, &config, 5, &mut last_id).is_err());
+        assert!(
+            poll(
+                &conn,
+                &mut logic,
+                &mut sizes,
+                &config,
+                5,
+                &mut last_id,
+                &mut epoch
+            )
+            .is_err()
+        );
         assert_eq!(last_id, None);
 
         // The same row (the game paused) is read once it can be, so switching qualifying off
@@ -3545,16 +3617,32 @@ mod tests {
         conn.execute_batch("ALTER TABLE broken RENAME TO session;")
             .unwrap();
         assert!(
-            poll(&conn, &mut logic, &mut sizes, &config, 5, &mut last_id)
-                .unwrap()
-                .is_empty()
+            poll(
+                &conn,
+                &mut logic,
+                &mut sizes,
+                &config,
+                5,
+                &mut last_id,
+                &mut epoch
+            )
+            .unwrap()
+            .is_empty()
         );
         assert!(last_id.is_some());
         config.qualifying.set(false);
         assert!(
-            poll(&conn, &mut logic, &mut sizes, &config, 5, &mut last_id)
-                .unwrap()
-                .is_empty()
+            poll(
+                &conn,
+                &mut logic,
+                &mut sizes,
+                &config,
+                5,
+                &mut last_id,
+                &mut epoch
+            )
+            .unwrap()
+            .is_empty()
         );
         assert!(logic.muted);
     }
@@ -3573,6 +3661,7 @@ mod tests {
                 .map(|heard| match heard {
                     Heard::Call(call) => call.text,
                     Heard::Muted => "muted",
+                    Heard::Epoch => "epoch",
                 })
                 .collect::<Vec<_>>()
         };
@@ -3612,6 +3701,28 @@ mod tests {
         // What comes after it's back on is said
         spotter.heard(Heard::Call(call("rain starting")), at);
         assert_eq!(spotter.queue.len(), 1);
+    }
+
+    #[test]
+    fn another_epoch_drops_the_calls_waiting_and_being_said() {
+        let at = Instant::now();
+        let (mut spotter, send) = pending_call("car right", true, at);
+        spotter.heard(
+            Heard::Call(Raised {
+                text: "blue flag",
+                urgent: false,
+                number: None,
+                session_time: 0.0,
+            }),
+            at,
+        );
+        assert_eq!(spotter.queue.len(), 1);
+
+        // They're about the last session's cars
+        spotter.heard(Heard::Epoch, at);
+        assert!(spotter.queue.is_empty());
+        assert!(spotter.saying.is_none());
+        assert!(send.is_closed());
     }
 
     /// Runs the logic at 30 Hz from `from` to `to` with the simulator reporting the cars
@@ -4092,7 +4203,7 @@ mod tests {
         let config = SpotterConfig::default();
         let mut logic = Logic::default();
         let mut step = |t| {
-            let scoring = scoring(&conn, None).unwrap().unwrap();
+            let scoring = scoring(&conn, None, &Epoch::ALL).unwrap().unwrap();
             assert_eq!(scoring.flag.as_deref(), Some("blue"));
             assert_eq!(scoring.penalties, Some(1));
             texts(logic.update(&config, &player(t), &[], &Wheels::default(), Some(&scoring)))
@@ -4110,7 +4221,7 @@ mod tests {
         // The recorder clears the tables for a new session.
         conn.execute_batch("DELETE FROM standings; DELETE FROM session; INSERT INTO session (session_time) VALUES (0);")
             .unwrap();
-        let latest = scoring(&conn, None).unwrap().unwrap();
+        let latest = scoring(&conn, None, &Epoch::ALL).unwrap().unwrap();
         assert_eq!(latest.flag, None);
         assert_eq!(latest.penalties, None);
         assert!(!latest.yellow);
@@ -4120,7 +4231,75 @@ mod tests {
              INSERT INTO session_sector SELECT MAX(id), 4, 1 FROM session;",
         )
         .unwrap();
-        assert!(scoring(&conn, None).unwrap().unwrap().yellow);
+        assert!(scoring(&conn, None, &Epoch::ALL).unwrap().unwrap().yellow);
+    }
+
+    #[test]
+    fn follows_the_newest_epoch_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        bono_sim::sql::begin_epoch(&conn, 1, bono_sim::sql::EpochReason::Start).unwrap();
+        conn.execute_batch(
+            "INSERT INTO telemetry (vehicle_id, is_player, session_time, speed) VALUES (1, 1, 100, 50);
+             INSERT INTO session (session_time, session_type) VALUES (100, 'practice');
+             INSERT INTO standings (vehicle_id, is_player, session_time, flag, vehicle_width, \
+                 vehicle_length) VALUES (1, 1, 100, 'blue', 1.9, 4.7);",
+        )
+        .unwrap();
+        let config = SpotterConfig::default();
+        let mut logic = Logic::default();
+        let mut sizes = Sizes::default();
+        let (mut last_id, mut epoch) = (None, None);
+        poll(
+            &conn,
+            &mut logic,
+            &mut sizes,
+            &config,
+            5,
+            &mut last_id,
+            &mut epoch,
+        )
+        .unwrap();
+        assert_eq!((last_id, epoch), (Some(1), Some(1)));
+        assert!(logic.prev.is_some());
+        assert!(sizes.sizes.contains_key(&1));
+
+        // Another session, spectating: its rows say nothing of the player, and the last session's
+        // aren't taken for now
+        bono_sim::sql::begin_epoch(&conn, 2, bono_sim::sql::EpochReason::Session).unwrap();
+        conn.execute_batch(
+            "INSERT INTO telemetry (vehicle_id, is_player, session_time, speed) VALUES (1, 0, 200, 50);
+             INSERT INTO session (session_time, session_type) VALUES (200, 'qualifying');",
+        )
+        .unwrap();
+        assert!(
+            poll(
+                &conn,
+                &mut logic,
+                &mut sizes,
+                &config,
+                5,
+                &mut last_id,
+                &mut epoch
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(epoch, Some(2));
+        assert!(logic.prev.is_none(), "the calls start over");
+        assert!(
+            sizes.sizes.is_empty(),
+            "the last session's sizes aren't this one's"
+        );
+        assert_eq!(
+            last_id, None,
+            "a cleared recording numbers its rows from 1 again"
+        );
+        let current = active_epoch(&conn).unwrap();
+        assert!(latest(&conn, &current).unwrap().is_none());
+        let scoring = scoring(&conn, None, &current).unwrap().unwrap();
+        assert_eq!(scoring.session_type.as_deref(), Some("qualifying"));
+        assert_eq!(scoring.flag, None);
     }
 
     /// Simulators that don't say which sectors are yellow (iRacing) give the yellow shown to the
@@ -4142,10 +4321,10 @@ mod tests {
              INSERT INTO standings VALUES (1, 1, 0, 'green', 0, 1, NULL, NULL);",
         )
         .unwrap();
-        assert!(scoring(&conn, None).unwrap().unwrap().yellow);
+        assert!(scoring(&conn, None, &Epoch::ALL).unwrap().unwrap().yellow);
         conn.execute_batch("INSERT INTO standings VALUES (2, 1, 1, 'green', 0, 0, NULL, NULL);")
             .unwrap();
-        assert!(!scoring(&conn, None).unwrap().unwrap().yellow);
+        assert!(!scoring(&conn, None, &Epoch::ALL).unwrap().unwrap().yellow);
 
         // Sectors that say they're clear outweigh the player's flag
         conn.execute_batch(
@@ -4153,7 +4332,7 @@ mod tests {
              INSERT INTO standings VALUES (3, 1, 2, 'green', 0, 1, NULL, NULL);",
         )
         .unwrap();
-        assert!(!scoring(&conn, None).unwrap().unwrap().yellow);
+        assert!(!scoring(&conn, None, &Epoch::ALL).unwrap().unwrap().yellow);
     }
 
     #[test]

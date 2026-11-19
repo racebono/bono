@@ -13,6 +13,7 @@ use crate::{
 use bono_sim::{
     recorder::{DATABASE, Recorder, SETTINGS, try_remove_database},
     setup::Setup,
+    sql::EpochReason,
     sys::{bono_session_info, bono_standing, bono_telemetry},
 };
 use serde_json::{Map, Value};
@@ -68,6 +69,11 @@ pub(super) struct Update {
     pub new_event: bool,
     /// The player's garage setup, when it's new or changed (only iRacing reads one)
     pub setup: Option<Setup>,
+    /// The timeline broke since the last update, within the same event, in a way the scoring
+    /// may not show: another session, the clock going back (a restart), or a replay that didn't
+    /// end where the live session left off. Not set with `new_event`, which starts afresh anyway.
+    /// The recorder also starts epochs itself, from the scoring
+    pub new_epoch: Option<EpochReason>,
 }
 
 /// A game recorded from its shared memory, while it runs.
@@ -431,6 +437,8 @@ pub(super) fn record(recorder: &Recorder, update: Update) {
     // Another event (track, layout): what was recorded is about something else
     if update.new_event {
         recorder.clear();
+    } else if let Some(reason) = update.new_epoch {
+        recorder.begin_epoch(reason);
     }
     // Scoring first: it says which car is the player's, which the telemetry needs
     if let Some((session, standings)) = update.scoring {
@@ -612,6 +620,7 @@ mod tests {
                 scoring: Some((session, vec![standing])),
                 new_event: false,
                 setup,
+                new_epoch: None,
             })
         }
     }

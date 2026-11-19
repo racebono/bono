@@ -69,7 +69,6 @@ pub trait Model: Send {
     ) -> BoxFuture<'a, anyhow::Result<Reply>>;
 
     /// Like [`Self::send_streaming`], without the text as it comes.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn send(&mut self, text: String) -> BoxFuture<'_, anyhow::Result<Reply>> {
         Box::pin(async move { self.send_streaming(text, &mut |_: &str| {}).await })
     }

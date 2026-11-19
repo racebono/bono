@@ -4,14 +4,23 @@
 //!
 //! The database lives in a folder the app and the race-engineer skill's scripts know, next to a
 //! `settings.json` the app writes to ask things of the recorder.
+//!
+//! Recording is split into epochs (see `sql`). Adapters start one where they know the timeline
+//! breaks (`begin_epoch`), and the recorder starts one itself where the scoring shows it: the
+//! session's identity changing, its clock going back, or a replay ending somewhere the live
+//! timeline doesn't carry on from. Every update is tagged with the epoch when it's queued, and
+//! the writer writes the epochs in order, so an update can't land on the wrong side of a boundary.
+//! A writer restarted after an error carries on in the same epoch.
 
 use crate::{
     setup::Setup,
-    sql::{self, ForecastWriter, ScoringWriter, SetDate, SetupWriter, TelemetryWriter},
+    sql::{
+        self, EpochReason, ForecastWriter, ScoringWriter, SetDate, SetupWriter, TelemetryWriter,
+    },
     sys::{bono_forecast_point, bono_session_info, bono_standing, bono_telemetry},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
@@ -20,7 +29,7 @@ use std::{
         atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
     },
     thread::JoinHandle,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub const DATABASE: &str = "telemetry.db";
@@ -89,7 +98,7 @@ impl Recorder {
         // would mix two runs. If it's still open, it's emptied instead, once the writer has it
         let left_over = try_remove_database(&dir).is_err();
 
-        Self::start(dir, forecast, left_over)
+        Self::start(dir, forecast, left_over, None, 0.0)
     }
 
     /// Restarts a stopped writer without deleting earlier sessions.
@@ -100,47 +109,79 @@ impl Recorder {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        // Kept if the writer can't start, for the next restart
+        // Kept if the writer can't start, for the next restart: no game sends its setup again
+        // until it changes
         let setup = lock(&self.setup).clone();
-        let player = self.shared.player_id.load(Ordering::Relaxed);
-        let session_time = self.shared.session_time.load(Ordering::Relaxed);
         let session = lock(&self.shared.session).clone();
-        // A clear asked for while it was down is still owed (another track was loaded)
-        let clear = lock(&self.shared.queue).clear;
-        *self = Self::start(
+        // The same session carries on: only the writer failed. What's known of it stays (the
+        // player, where the timeline is, a replay playing), and so does what was waiting to be
+        // done (a clear, the epochs started)
+        let queue = {
+            let old = lock(&self.shared.queue);
+            Queue {
+                epoch: old.epoch,
+                boundaries: old.boundaries.clone(),
+                clear: old.clear,
+                ..Queue::default()
+            }
+        };
+        let mut restarted = Self::start(
             self.dir.clone(),
             forecast,
             self.shared.reset_pending.load(Ordering::Relaxed),
+            Some(queue),
+            // Before its writer starts, which reads the forecast as of it
+            f64::from_bits(self.shared.session_time.load(Ordering::Relaxed)),
         )?;
-        // What the last scoring update said holds until the next one: the setup is written for
-        // the player's car before it comes
-        self.shared.player_id.store(player, Ordering::Relaxed);
-        self.shared
-            .session_time
-            .store(session_time, Ordering::Relaxed);
+        std::mem::swap(
+            restarted
+                .tracking
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner),
+            self.tracking
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        restarted.shared.player_id.store(
+            self.shared.player_id.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        *self = restarted;
+        // The setup is the scoring's session's until the next scoring update says otherwise
         *lock(&self.shared.session) = session;
-        if clear {
-            lock(&self.shared.queue).clear = true;
-            self.shared.wake.notify_one();
-        }
         if let Some((setup, pushed)) = setup {
             self.queue_setup(setup, pushed);
         }
         Ok(())
     }
 
+    /// Carries on from `queue` if given (its epoch, and what was waiting to be done), or starts an
+    /// epoch. `session_time` is where the session is, as far as the scoring said.
     fn start(
         dir: PathBuf,
         forecast: Option<ForecastSource>,
         left_over: bool,
+        queue: Option<Queue>,
+        session_time: f64,
     ) -> std::io::Result<Self> {
         let settings = Settings::read(&dir.join(SETTINGS));
+        let queue = match queue {
+            Some(queue) => queue,
+            None => {
+                let epoch = next_epoch(0);
+                Queue {
+                    epoch,
+                    boundaries: vec![(epoch, EpochReason::Start)],
+                    ..Queue::default()
+                }
+            }
+        };
         let shared = Arc::new(Shared {
-            queue: Mutex::new(Queue::default()),
+            queue: Mutex::new(queue),
             wake: Condvar::new(),
             opponent_frequency: AtomicU32::new(settings.opponent_frequency),
             player_id: AtomicI64::new(-1),
-            session_time: AtomicU64::new(0f64.to_bits()),
+            session_time: AtomicU64::new(session_time.to_bits()),
             session: Mutex::new((None, None)),
             failed: AtomicBool::new(false),
             reset_pending: AtomicBool::new(left_over),
@@ -209,8 +250,19 @@ impl Recorder {
         }
 
         let mut tracking = lock(&self.tracking);
+        // A replay isn't recorded: see `push_scoring`. Nor is telemetry from well before the
+        // scoring: a replay's before its scoring says so, or a restart's before its scoring starts
+        // the epoch it belongs in
+        if tracking.replay
+            || tracking
+                .scoring_time
+                .is_some_and(|scoring| session_time < scoring - 1.0)
+        {
+            return false;
+        }
         tracking.advance(vehicle_id, session_time, speed);
         if self.is_player(vehicle_id) {
+            tracking.kept.insert(vehicle_id);
             return true;
         }
 
@@ -222,12 +274,26 @@ impl Recorder {
         let updates = tracking.opponent_updates.entry(vehicle_id).or_default();
         let keep = *updates % frequency == 0;
         *updates = updates.wrapping_add(1);
+        if keep {
+            tracking.kept.insert(vehicle_id);
+        }
         return keep;
     }
 
     /// Queues a telemetry update `wants_telemetry` kept. Fills in `is_player`, and `lap_distance`
     /// when the simulator doesn't give it, estimated from the scoring updates.
     pub fn push_telemetry(&self, telemetry: &bono_telemetry) {
+        // Held until it's queued: an epoch started meanwhile (on another thread) would have it
+        // tagged with the new epoch but filled in from the old one
+        let mut tracking = lock(&self.tracking);
+        // Only what `wants_telemetry` kept in this epoch: one started since (on another thread) is
+        // another timeline's, which the update isn't part of
+        let kept = tracking
+            .kept
+            .remove(&telemetry.vehicle_id.get().unwrap_or(-1));
+        if tracking.replay || !kept {
+            return;
+        }
         let mut telemetry = *telemetry;
         let vehicle = telemetry.vehicle_id.get();
         let player = self.shared.player_id.load(Ordering::Relaxed);
@@ -235,7 +301,6 @@ impl Recorder {
         if telemetry.lap_distance.get().is_none()
             && let Some(vehicle) = vehicle
         {
-            let tracking = lock(&self.tracking);
             telemetry.lap_distance = tracking
                 .lap_distances
                 .get(&vehicle)
@@ -247,29 +312,72 @@ impl Recorder {
         if queue.telemetry.len() >= MAX_QUEUED_TELEMETRY {
             return;
         }
-        queue.telemetry.push(telemetry);
+        let epoch = queue.epoch;
+        queue.telemetry.push((epoch, telemetry));
         drop(queue);
+        drop(tracking);
         self.shared.wake.notify_one();
     }
 
     /// Queues a scoring update: the session and every car's standing.
+    ///
+    /// Starts an epoch when the session's identity (track, type and number) changes, or its clock
+    /// goes back more than a second. A replay (a car under replay control) isn't recorded; once it
+    /// ends, recording carries on in the same epoch only if the session is the same and its clock
+    /// hasn't gone back, and starts another otherwise.
     pub fn push_scoring(&self, session: bono_session_info, standings: Vec<bono_standing>) {
         if self.failed() {
             return;
         }
 
         let session_time = session.session_time.get().unwrap_or(0.0);
-        self.shared
-            .session_time
-            .store(session_time.to_bits(), Ordering::Relaxed);
-        *lock(&self.shared.session) = (
-            session.session_type.as_deref().map(str::to_owned),
-            session.session_number.get(),
-        );
+        let replay = standings
+            .iter()
+            .any(|standing| standing.control.as_deref() == Some("replay"));
 
+        // Held until it's queued: an epoch started meanwhile (on another thread) would have this
+        // session's scoring open it, and its player taken for the new session's
+        let mut tracking = lock(&self.tracking);
         {
+            if replay {
+                tracking.replay = true;
+                return;
+            }
+            let mut key = SessionKey::of(&session);
+            let other_session = tracking
+                .session_key
+                .as_ref()
+                .is_some_and(|last| last.differs(&key));
+            let went_back = session
+                .session_time
+                .get()
+                .zip(tracking.scoring_time)
+                .is_some_and(|(time, last)| time < last - 1.0);
+            // A field an update leaves out is still what it was, for telling the next one apart
+            if !other_session && let Some(last) = &tracking.session_key {
+                key.fill_from(last);
+            }
+            let after_replay = std::mem::take(&mut tracking.replay);
+            let reason = if other_session {
+                Some(EpochReason::Session)
+            } else if went_back && after_replay {
+                Some(EpochReason::Replay)
+            } else if went_back {
+                Some(EpochReason::ClockRollback)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                let mut queue = lock(&self.shared.queue);
+                self.start_epoch(&mut tracking, &mut queue, reason);
+            }
+            tracking.scored_start = reason;
+            tracking.session_key = Some(key);
+            if let Some(time) = session.session_time.get() {
+                tracking.scoring_time = Some(tracking.scoring_time.map_or(time, |t| t.max(time)));
+            }
+
             // Where each car is now, for the telemetry updates until the next scoring update
-            let mut tracking = lock(&self.tracking);
             tracking.track_length = session.track_length.get().unwrap_or(0.0);
             for standing in &standings {
                 if let (Some(vehicle), Some(distance)) =
@@ -282,6 +390,14 @@ impl Recorder {
                 }
             }
         }
+
+        self.shared
+            .session_time
+            .store(session_time.to_bits(), Ordering::Relaxed);
+        *lock(&self.shared.session) = (
+            session.session_type.as_deref().map(str::to_owned),
+            session.session_number.get(),
+        );
 
         // No car is the player's (spectating, a replay): no telemetry is flagged as theirs, rather
         // than the car that has the player's last id
@@ -298,8 +414,10 @@ impl Recorder {
         if queue.scoring.len() >= MAX_QUEUED_SCORING {
             return;
         }
-        queue.scoring.push((session, standings));
+        let epoch = queue.epoch;
+        queue.scoring.push((epoch, session, standings));
         drop(queue);
+        drop(tracking);
         self.shared.wake.notify_one();
     }
 
@@ -317,18 +435,57 @@ impl Recorder {
         self.queue_setup(setup, pushed);
     }
 
-    /// Kept for a restarted writer too, as no game sends its setup again until it changes.
+    /// Kept for a restarted writer too, as no game sends its setup again until it changes. Queued
+    /// in the epoch it's pushed in, after the telemetry already waiting.
     fn queue_setup(&self, setup: Setup, pushed: Pushed) {
         *lock(&self.setup) = Some((setup.clone(), pushed.clone()));
         if self.failed() {
             return;
         }
         let mut queue = lock(&self.shared.queue);
-        // After the telemetry already waiting, before what comes after it
         let after = queue.telemetry.len();
-        queue.setup = Some((setup, pushed, after));
+        queue.setup = Some((queue.epoch, setup, pushed, after));
         drop(queue);
         self.shared.wake.notify_one();
+    }
+
+    /// Starts an epoch: the updates queued from now on are another session's, or another part of
+    /// the timeline. For adapters that know (a session starting, the clock jumping); the recorder
+    /// also starts one itself from the scoring, see `push_scoring`. What's known about the cars
+    /// goes, as the new session's cars aren't the old one's until scoring says so.
+    pub fn begin_epoch(&self, reason: EpochReason) {
+        let mut tracking = lock(&self.tracking);
+        let mut queue = lock(&self.shared.queue);
+        // The scoring told first, for the same reason, and nothing's been scored since: the
+        // adapter is telling the same start (a game that scores a session before saying it
+        // started). For another reason (a restart's clock going back, then the game saying a
+        // session started) it's an epoch of its own, whichever came first
+        if tracking.scored_start.take() == Some(reason) {
+            return;
+        }
+        self.start_epoch(&mut tracking, &mut queue, reason);
+        drop(queue);
+        drop(tracking);
+        self.shared.wake.notify_one();
+    }
+
+    /// The epoch updates are queued in now.
+    pub fn epoch(&self) -> i64 {
+        lock(&self.shared.queue).epoch
+    }
+
+    /// With both locks held (tracking's, then the queue's), so nothing is queued half in the old
+    /// epoch and half in the new. The caller wakes the writer once they're released.
+    fn start_epoch(&self, tracking: &mut Tracking, queue: &mut Queue, reason: EpochReason) {
+        // A replay still playing still isn't recorded, whatever starts
+        *tracking = Tracking {
+            replay: tracking.replay,
+            ..Tracking::default()
+        };
+        self.shared.player_id.store(-1, Ordering::Relaxed);
+        queue.epoch = next_epoch(queue.epoch);
+        let epoch = queue.epoch;
+        queue.boundaries.push((epoch, reason));
     }
 
     /// How many scoring updates wait to be written. Past `MAX_QUEUED_SCORING`, new ones are
@@ -340,17 +497,21 @@ impl Recorder {
     /// Deletes everything recorded so far (on the writer thread, soon after), e.g. when a session
     /// ends. What's known about the cars goes too: until the next scoring update, the new
     /// session's cars aren't taken for the old one's (the player's id, where each car was).
+    ///
+    /// Starts an epoch too, so readers following the last one notice.
     pub fn clear(&self) {
-        *lock(&self.tracking) = Tracking::default();
-        self.shared.player_id.store(-1, Ordering::Relaxed);
         *lock(&self.setup) = None;
-
+        let mut tracking = lock(&self.tracking);
         let mut queue = lock(&self.shared.queue);
         queue.telemetry.clear();
         queue.scoring.clear();
+        queue.boundaries.clear();
         queue.setup = None;
         queue.clear = true;
+        // In the same breath as the clear: the writer never clears without the epoch that follows
+        self.start_epoch(&mut tracking, &mut queue, EpochReason::Cleared);
         drop(queue);
+        drop(tracking);
         self.shared.wake.notify_one();
     }
 }
@@ -387,19 +548,27 @@ struct Shared {
     stop: AtomicBool,
 }
 
+/// What's waiting to be written, each update with the epoch it was queued in.
 #[derive(Default)]
 struct Queue {
-    telemetry: Vec<bono_telemetry>,
-    scoring: Vec<(bono_session_info, Vec<bono_standing>)>,
-    /// The player's setup, the latest pushed
-    setup: Option<(Setup, Pushed, usize)>,
+    /// The epoch updates are queued in now
+    epoch: i64,
+    /// Epochs started since the last write, and why
+    boundaries: Vec<(i64, EpochReason)>,
+    telemetry: Vec<(i64, bono_telemetry)>,
+    scoring: Vec<(i64, bono_session_info, Vec<bono_standing>)>,
+    /// The player's setup, the latest pushed: its epoch, and how much telemetry was waiting before it
+    setup: Option<(i64, Setup, Pushed, usize)>,
     /// `clear` was called: the writer deletes what was recorded
     clear: bool,
 }
 
 impl Queue {
     fn is_empty(&self) -> bool {
-        self.telemetry.is_empty() && self.scoring.is_empty() && self.setup.is_none()
+        self.telemetry.is_empty()
+            && self.scoring.is_empty()
+            && self.boundaries.is_empty()
+            && self.setup.is_none()
     }
 }
 
@@ -412,6 +581,66 @@ struct Pushed {
     session_number: Option<i64>,
 }
 
+/// The epoch after `previous`. From the clock, so a recording made again (the game restarted) is
+/// unlikely to reuse a reader's last epoch, and never going back within a recording.
+fn next_epoch(previous: i64) -> i64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_micros()).unwrap_or(i64::MAX - 1)
+        });
+    now.max(previous.saturating_add(1))
+}
+
+/// What identifies a session in its scoring. Fields a simulator leaves out (or doesn't fill yet)
+/// don't count as a change.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct SessionKey {
+    track: Option<String>,
+    session_type: Option<String>,
+    session_number: Option<i64>,
+}
+
+impl SessionKey {
+    fn of(session: &bono_session_info) -> Self {
+        Self {
+            // Empty is as good as left out (a session still loading)
+            track: session
+                .track
+                .as_deref()
+                .filter(|track| !track.is_empty())
+                .map(str::to_owned),
+            session_type: session
+                .session_type
+                .as_deref()
+                .filter(|kind| !kind.is_empty())
+                .map(str::to_owned),
+            session_number: session.session_number.get(),
+        }
+    }
+
+    /// Takes what this leaves out from `last`.
+    fn fill_from(&mut self, last: &Self) {
+        self.track = self.track.take().or_else(|| last.track.clone());
+        self.session_type = self
+            .session_type
+            .take()
+            .or_else(|| last.session_type.clone());
+        self.session_number = self.session_number.or(last.session_number);
+    }
+
+    fn differs(&self, other: &Self) -> bool {
+        fn differ<T: PartialEq>(a: &Option<T>, b: &Option<T>) -> bool {
+            matches!((a, b), (Some(a), Some(b)) if a != b)
+        }
+        differ(&self.track, &other.track)
+            || differ(&self.session_type, &other.session_type)
+            || differ(&self.session_number, &other.session_number)
+    }
+}
+
+/// What the recorder follows of the epoch being recorded.
+///
 /// Telemetry may have no distance around the lap (LMU's doesn't), scoring (five times a second)
 /// does. A telemetry update's is then the car's last scoring distance plus speed x time for every
 /// telemetry update since.
@@ -421,6 +650,18 @@ struct Tracking {
     lap_distances: HashMap<i64, LapDistance>,
     /// Updates seen per opponent, for keeping every Nth
     opponent_updates: HashMap<i64, u32>,
+    /// The session the epoch's scoring is about
+    session_key: Option<SessionKey>,
+    /// The latest session time the epoch's scoring has reached
+    scoring_time: Option<f64>,
+    /// A replay is playing: nothing is recorded until the scoring is live again
+    replay: bool,
+    /// Why the scoring started the epoch, if it did and none has been queued since: an adapter
+    /// starting one now for the same reason is telling the same start (see `begin_epoch`)
+    scored_start: Option<EpochReason>,
+    /// The cars `wants_telemetry` kept an update of, until `push_telemetry` queues it: an epoch
+    /// starting in between forgets them
+    kept: HashSet<i64>,
 }
 
 struct LapDistance {
@@ -508,6 +749,9 @@ impl Writer {
 
         let mut telemetry = Vec::new();
         let mut scoring = Vec::new();
+        let mut boundaries = Vec::new();
+        // The epoch the rows are being written in, whose row is written: `None` until the first
+        let mut written = None::<i64>;
         // The last setup, to write again after the app clears the data: no game sends its setup
         // again until it changes
         let mut last_setup: Option<(Setup, Pushed)> = None;
@@ -529,6 +773,7 @@ impl Writer {
 
                 std::mem::swap(&mut telemetry, &mut queue.telemetry);
                 std::mem::swap(&mut scoring, &mut queue.scoring);
+                std::mem::swap(&mut boundaries, &mut queue.boundaries);
                 (std::mem::take(&mut queue.clear), queue.setup.take())
             };
 
@@ -536,59 +781,133 @@ impl Writer {
             if clear {
                 last_setup = None;
             }
-            // Asked by the app: what's waiting was recorded before it asked. The car's setup is
-            // still the car's, written again
+            if let Some((_, setup, pushed, _)) = &setup {
+                last_setup = Some((setup.clone(), pushed.clone()));
+            }
+
+            // Asked by the app: what's waiting was recorded before it asked. Readers following the
+            // last epoch are told by a new one
             if self.check_settings(shared) {
                 telemetry.clear();
                 scoring.clear();
-                setup =
-                    setup.or_else(|| last_setup.clone().map(|(setup, pushed)| (setup, pushed, 0)));
+                boundaries.clear();
+                let mut queue = lock(&shared.queue);
+                // Including what was queued since the batch was taken, and a clear asked for
+                // meanwhile: this clear is the newer, and its epoch the active one
+                queue.telemetry.clear();
+                queue.scoring.clear();
+                queue.boundaries.clear();
+                queue.clear = false;
+                queue.epoch = next_epoch(queue.epoch);
+                boundaries.push((queue.epoch, EpochReason::Cleared));
+                // The car's setup is still the car's: written again, in the epoch after the clear
+                setup = setup
+                    .map(|(_, setup, pushed, _)| (setup, pushed))
+                    .or_else(|| last_setup.clone())
+                    .map(|(setup, pushed)| (queue.epoch, setup, pushed, 0));
                 clear = true;
             }
 
             if clear {
-                // Still owed if it fails, for the restarted writer (see `restart`)
-                if let Err(e) = sql::clear_tables(&conn) {
-                    lock(&shared.queue).clear = true;
+                let cleared = boundaries
+                    .iter()
+                    .find(|(_, reason)| *reason == EpochReason::Cleared)
+                    .map(|(epoch, _)| *epoch);
+                if let Err(e) = sql::clear_tables(&conn, cleared) {
+                    // Still to do, by a restarted writer, with the epoch that follows it
+                    let mut queue = lock(&shared.queue);
+                    queue.clear = true;
+                    queue.boundaries.splice(0..0, boundaries.drain(..));
                     return Err(e);
                 }
-                telemetry_writer.reset();
+                telemetry_writer.cleared();
                 scoring_writer.reset();
                 forecast_writer.reset();
                 setup_writer.reset();
                 next_forecast = Instant::now();
+                written = None;
             }
 
-            if !telemetry.is_empty() || !scoring.is_empty() || setup.is_some() {
-                // Everything that arrived since the last write goes into one transaction
-                let tx = conn.unchecked_transaction()?;
-                // The telemetry that came before the setup, then the setup, dated by the latest
-                // rows then (none before anything is driven): dated by later ones, it could read
-                // as coming after the clock it was pushed at
-                let mut rows = telemetry.drain(..);
-                let before = setup.as_ref().map_or(0, |(.., after)| *after);
-                for update in rows.by_ref().take(before) {
-                    telemetry_writer.write(&update)?;
+            if !telemetry.is_empty()
+                || !scoring.is_empty()
+                || !boundaries.is_empty()
+                || setup.is_some()
+            {
+                // Everything that arrived since the last write goes into one transaction, epoch by
+                // epoch, each starting before its rows
+                let result = (|| {
+                    let tx = conn.unchecked_transaction()?;
+                    let mut epochs = boundaries
+                        .iter()
+                        .map(|(epoch, _)| *epoch)
+                        .chain(telemetry.iter().map(|(epoch, _)| *epoch))
+                        .chain(scoring.iter().map(|(epoch, ..)| *epoch))
+                        .chain(setup.iter().map(|(epoch, ..)| *epoch))
+                        .collect::<Vec<_>>();
+                    epochs.sort_unstable();
+                    epochs.dedup();
+                    for epoch in epochs {
+                        // Queued before an epoch already written: it would land in that one
+                        if written.is_some_and(|written| epoch < written) {
+                            continue;
+                        }
+                        if written != Some(epoch) {
+                            let reason = boundaries
+                                .iter()
+                                .find(|(start, _)| *start == epoch)
+                                .map_or(EpochReason::Resumed, |(_, reason)| *reason);
+                            sql::begin_epoch(&conn, epoch, reason)?;
+                            // Each epoch has every car's state and standing of its own
+                            telemetry_writer.reset();
+                            scoring_writer.reset();
+                            written = Some(epoch);
+                        }
+                        // The setup after the telemetry queued before it: dated by later rows, it
+                        // could read as coming after the clock it was pushed at
+                        for (i, (_, update)) in
+                            (telemetry.iter().enumerate()).filter(|(_, (of, _))| *of == epoch)
+                        {
+                            if (setup.as_ref())
+                                .is_some_and(|(of, .., after)| *of == epoch && i >= *after)
+                            {
+                                let (_, setup, pushed, _) = setup.take().unwrap();
+                                let player_row = telemetry_writer.last_player_row();
+                                write_setup(&tx, &mut setup_writer, player_row, setup, pushed)?;
+                            }
+                            telemetry_writer.write(epoch, update)?;
+                        }
+                        if (setup.as_ref()).is_some_and(|(of, ..)| *of == epoch) {
+                            let (_, setup, pushed, _) = setup.take().unwrap();
+                            let player_row = telemetry_writer.last_player_row();
+                            write_setup(&tx, &mut setup_writer, player_row, setup, pushed)?;
+                        }
+                        for (_, session, standings) in
+                            scoring.iter_mut().filter(|(of, ..)| *of == epoch)
+                        {
+                            scoring_writer.write(
+                                epoch,
+                                std::mem::take(session),
+                                std::mem::take(standings),
+                            )?;
+                        }
+                    }
+                    // Of an epoch already written: still the car's, written after it
+                    if let Some((_, setup, pushed, _)) = setup.take() {
+                        let player_row = telemetry_writer.last_player_row();
+                        write_setup(&tx, &mut setup_writer, player_row, setup, pushed)?;
+                    }
+                    tx.commit()
+                })();
+                if let Err(e) = result {
+                    // The epochs it started are still to start, by a restarted writer: their
+                    // reasons go back in front of what was queued since
+                    let mut queue = lock(&shared.queue);
+                    queue.boundaries.splice(0..0, boundaries.drain(..));
+                    return Err(e);
                 }
-                if let Some((setup, pushed, _)) = setup.take() {
-                    last_setup = Some((setup.clone(), pushed.clone()));
-                    let date = SetDate {
-                        telemetry_id: tx
-                            .query_row("SELECT max(id) FROM telemetry", [], |row| row.get(0))?,
-                        player_telemetry_id: telemetry_writer.last_player_row(),
-                        session_time: Some(pushed.session_time),
-                        session_type: pushed.session_type,
-                        session_number: pushed.session_number,
-                    };
-                    setup_writer.write(pushed.vehicle, date, setup)?;
-                }
-                for update in rows {
-                    telemetry_writer.write(&update)?;
-                }
-                for (session, standings) in scoring.drain(..) {
-                    scoring_writer.write(session, standings)?;
-                }
-                tx.commit()?;
+                telemetry.clear();
+                scoring.clear();
+                boundaries.clear();
             }
 
             // The forecast, now and then, after what's waiting has been written. A source that doesn't
@@ -630,6 +949,25 @@ impl Writer {
             .store(settings.opponent_frequency, Ordering::Relaxed);
         return std::mem::replace(&mut self.clear_requests, settings.clear) != settings.clear;
     }
+}
+
+/// Writes a setup, dated by the rows written so far: the latest of any car's, and the player's.
+fn write_setup(
+    conn: &rusqlite::Connection,
+    setup_writer: &mut SetupWriter<'_>,
+    player_row: Option<i64>,
+    setup: Setup,
+    pushed: Pushed,
+) -> rusqlite::Result<()> {
+    let date = SetDate {
+        telemetry_id: conn.query_row("SELECT max(id) FROM telemetry", [], |row| row.get(0))?,
+        player_telemetry_id: player_row,
+        session_time: Some(pushed.session_time),
+        session_type: pushed.session_type,
+        session_number: pushed.session_number,
+    };
+    setup_writer.write(pushed.vehicle, date, setup)?;
+    Ok(())
 }
 
 /// A panic on another thread mustn't stop recording: the data behind these locks stays valid.
@@ -760,11 +1098,325 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(vehicles, [1, 2]);
+        // Only the writer failed: the session carries on in the same epoch
+        let epochs = conn
+            .prepare("SELECT DISTINCT epoch FROM standings")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .count();
+        assert_eq!(epochs, 1);
+        assert_eq!(
+            reasons(&conn),
+            ["start"],
+            "the restarted writer found its epoch already there"
+        );
+    }
+
+    #[test]
+    fn a_restarted_writer_carries_on_from_what_was_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder =
+            Recorder::new(dir.path(), Some(Box::new(|_| panic!("forecast failed")))).unwrap();
+        recorder.push_scoring(session("Spa", "race", 500.0), vec![standing(1, true, 0.0)]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !recorder.failed() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        recorder.restart(None).unwrap();
+        // Still the player's car, before any scoring since
+        record(&recorder, &telemetry(1, 500.0));
+        // A restart of the race the writer failed in, with no adapter to say so
+        recorder.push_scoring(session("Spa", "race", 3.0), vec![standing(1, true, 0.0)]);
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        assert_eq!(reasons(&conn), ["start", "clock_rollback"]);
+        let first = conn
+            .query_row("SELECT min(id) FROM epoch", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(telemetry_rows(&conn), [(first, 1, true)]);
+    }
+
+    fn session(track: &str, kind: &str, time: f64) -> bono_session_info {
+        let mut session = bono_session_info::default();
+        session.track = Some(track.to_owned()).into();
+        session.session_type = Some(kind.to_owned()).into();
+        session.session_number = Some(1).into();
+        session.session_time = Some(time).into();
+        session
+    }
+
+    /// What an adapter does with an update: pushes it if `wants_telemetry` keeps it.
+    fn record(recorder: &Recorder, telemetry: &bono_telemetry) {
+        let vehicle = telemetry.vehicle_id.get().unwrap_or(-1);
+        let time = telemetry.session_time.get().unwrap_or(0.0);
+        if recorder.wants_telemetry(vehicle, time, 0.0) {
+            recorder.push_telemetry(telemetry);
+        }
+    }
+
+    fn telemetry(vehicle: i64, time: f64) -> bono_telemetry {
+        let mut telemetry = bono_telemetry::default();
+        telemetry.vehicle_id = Some(vehicle).into();
+        telemetry.session_time = Some(time).into();
+        telemetry
+    }
+
+    fn reasons(conn: &rusqlite::Connection) -> Vec<String> {
+        conn.prepare("SELECT reason FROM epoch ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// (epoch, vehicle_id, is_player) of every telemetry row, in order.
+    fn telemetry_rows(conn: &rusqlite::Connection) -> Vec<(i64, i64, bool)> {
+        conn.prepare("SELECT epoch, vehicle_id, is_player FROM telemetry ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_new_session_starts_an_epoch_without_a_player_row_or_the_clock_going_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(
+            session("Spa", "practice", 100.0),
+            vec![standing(1, true, 0.0)],
+        );
+        record(&recorder, &telemetry(1, 100.0));
+        // Qualifying, later on the clock, spectating: nobody's car is the player's
+        recorder.push_scoring(
+            session("Spa", "qualifying", 200.0),
+            vec![standing(1, false, 0.0)],
+        );
+        record(&recorder, &telemetry(1, 200.0));
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        assert_eq!(reasons(&conn), ["start", "session"]);
+        let epoch = sql::active_epoch(&conn).unwrap();
+        let rows = telemetry_rows(&conn);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].0 < rows[1].0);
+        // The new epoch's rows are the last one's, and car 1 isn't the player's in it
+        assert_eq!(rows[1], (epoch.id.unwrap(), 1, false));
+        assert_eq!(epoch.telemetry_from, 2);
+        assert_eq!(epoch.standings_from, 2);
+        assert_eq!(epoch.session_from, 2);
+    }
+
+    #[test]
+    fn a_session_change_is_seen_through_an_update_that_leaves_the_track_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(session("Spa", "race", 10.0), vec![standing(1, true, 0.0)]);
+        let mut unknown = session("Spa", "race", 11.0);
+        unknown.track = None::<String>.into();
+        recorder.push_scoring(unknown, vec![standing(1, true, 0.0)]);
+        recorder.push_scoring(session("Monza", "race", 12.0), vec![standing(1, true, 0.0)]);
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        assert_eq!(reasons(&conn), ["start", "session"]);
+    }
+
+    #[test]
+    fn telemetry_from_well_before_the_scoring_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(session("Spa", "race", 500.0), vec![standing(1, true, 0.0)]);
+        assert!(recorder.wants_telemetry(1, 499.5, 10.0));
+        // A replay's, or a restart's, before its scoring says so
+        assert!(!recorder.wants_telemetry(1, 20.0, 10.0));
+    }
+
+    #[test]
+    fn a_replay_playing_through_an_epoch_still_is_not_recorded() {
+        let mut replaying = standing(1, true, 0.0);
+        replaying.control = Some("replay".to_owned()).into();
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(session("Spa", "race", 100.0), vec![standing(1, true, 0.0)]);
+        recorder.push_scoring(session("Spa", "race", 5.0), vec![replaying]);
+        recorder.clear();
+        recorder.begin_epoch(EpochReason::Session);
+        assert!(!recorder.wants_telemetry(1, 5.0, 10.0));
+        recorder.push_scoring(session("Spa", "race", 6.0), vec![standing(1, true, 0.0)]);
+        assert!(recorder.wants_telemetry(1, 6.0, 10.0));
+    }
+
+    #[test]
+    fn telemetry_kept_before_an_epoch_started_is_not_queued_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(session("Spa", "race", 500.0), vec![standing(1, true, 0.0)]);
+        assert!(recorder.wants_telemetry(1, 500.2, 10.0));
+        // A restart scored on another thread before the update is pushed
+        recorder.push_scoring(session("Spa", "race", 3.0), vec![standing(1, true, 0.0)]);
+        recorder.push_telemetry(&telemetry(1, 500.2));
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        assert_eq!(reasons(&conn), ["start", "clock_rollback"]);
+        assert!(telemetry_rows(&conn).is_empty());
+    }
+
+    #[test]
+    fn a_session_the_scoring_tells_first_is_one_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(
+            session("Spa", "practice", 500.0),
+            vec![standing(1, true, 0.0)],
+        );
+        // The next session scored before the adapter says it started
+        recorder.push_scoring(session("Spa", "race", 0.0), vec![standing(1, true, 0.0)]);
+        recorder.begin_epoch(EpochReason::Session);
+        assert!(recorder.is_player(1));
+        // Once more of it is scored, the adapter starting one is another
+        recorder.push_scoring(session("Spa", "race", 1.0), vec![standing(1, true, 0.0)]);
+        recorder.begin_epoch(EpochReason::Session);
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        assert_eq!(reasons(&conn), ["start", "session", "session"]);
+    }
+
+    #[test]
+    fn a_restart_the_scoring_tells_first_is_still_a_session_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(session("Spa", "race", 500.0), vec![standing(1, true, 0.0)]);
+        // The same session again, its clock back at the start, before the game says it started
+        recorder.push_scoring(session("Spa", "race", 0.0), vec![standing(1, true, 0.0)]);
+        recorder.begin_epoch(EpochReason::Session);
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        assert_eq!(reasons(&conn), ["start", "clock_rollback", "session"]);
+    }
+
+    #[test]
+    fn a_clock_going_back_starts_an_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(session("Spa", "race", 500.0), vec![standing(1, true, 0.0)]);
+        // Less than a second back is the same session
+        recorder.push_scoring(session("Spa", "race", 499.5), vec![standing(1, true, 0.0)]);
+        // A restart
+        recorder.push_scoring(session("Spa", "race", 3.0), vec![standing(1, true, 0.0)]);
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        assert_eq!(reasons(&conn), ["start", "clock_rollback"]);
+    }
+
+    #[test]
+    fn updates_stay_in_the_epoch_they_were_queued_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        // Scoring and telemetry queued on both sides of a boundary, however the writer batches them
+        recorder.push_scoring(session("Spa", "race", 10.0), vec![standing(1, true, 0.0)]);
+        record(&recorder, &telemetry(1, 10.0));
+        recorder.begin_epoch(EpochReason::Session);
+        // The slot is reused by someone else, whose state must be written again
+        record(&recorder, &telemetry(1, 0.5));
+        recorder.push_scoring(session("Spa", "race", 1.0), vec![standing(1, true, 0.0)]);
+        record(&recorder, &telemetry(1, 1.0));
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        let epoch = sql::active_epoch(&conn).unwrap();
+        let rows = telemetry_rows(&conn);
+        let first = rows[0].0;
+        let second = epoch.id.unwrap();
+        // Before the new session's scoring, car 1 is nobody's
+        assert_eq!(
+            rows,
+            [(first, 1, true), (second, 1, false), (second, 1, true)]
+        );
+        assert_eq!(epoch.telemetry_from, 2);
+        let states = conn
+            .query_row("SELECT count(*) FROM car_state", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(states, 2, "each epoch has the car's state of its own");
+        let standings_epochs = conn
+            .prepare("SELECT epoch FROM standings ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(standings_epochs, [first, second]);
+    }
+
+    #[test]
+    fn a_replay_is_not_recorded() {
+        let replaying = |vehicle: i64| {
+            let mut standing = standing(vehicle, true, 0.0);
+            standing.control = Some("replay".to_owned()).into();
+            standing
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(session("Spa", "race", 100.0), vec![standing(1, true, 0.0)]);
+
+        // Watching the replay from the start
+        recorder.push_scoring(session("Spa", "race", 5.0), vec![replaying(1)]);
+        assert!(!recorder.wants_telemetry(1, 5.0, 10.0));
+        // Live again where it left off: the same epoch
+        recorder.push_scoring(session("Spa", "race", 101.0), vec![standing(1, true, 0.0)]);
+        assert!(recorder.wants_telemetry(1, 101.0, 10.0));
+
+        // Another replay, and back live with the clock earlier than before it: a new epoch
+        recorder.push_scoring(session("Spa", "race", 50.0), vec![replaying(1)]);
+        recorder.push_scoring(session("Spa", "race", 60.0), vec![standing(1, true, 0.0)]);
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        assert_eq!(reasons(&conn), ["start", "replay"]);
+        let times = conn
+            .prepare("SELECT session_time FROM session ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, f64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(times, [100.0, 60.0]);
+    }
+
+    #[test]
+    fn clearing_starts_an_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(session("Spa", "race", 10.0), vec![standing(1, true, 0.0)]);
+        written(&recorder);
+        let before = recorder.epoch();
+        recorder.clear();
+        let after = recorder.epoch();
+        assert!(after > before);
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        assert_eq!(reasons(&conn), ["cleared"]);
+        assert_eq!(sql::active_epoch(&conn).unwrap().id, Some(after));
     }
 
     #[test]
     fn forgets_the_player_when_cleared_or_spectating() {
         let dir = tempfile::tempdir().unwrap();
+        // Every opponent update kept: car 1 is one, once it's nobody's
+        fs::write(dir.path().join(SETTINGS), r#"{"opponent_frequency": 1}"#).unwrap();
         let recorder = Recorder::new(dir.path(), None).unwrap();
         let telemetry = |vehicle: i64| {
             let mut telemetry = bono_telemetry::default();
@@ -773,17 +1425,17 @@ mod tests {
         };
 
         recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
-        recorder.push_telemetry(&telemetry(1));
+        record(&recorder, &telemetry(1));
         written(&recorder);
 
         // A new weekend: car 1 is someone else's until scoring says otherwise
         recorder.clear();
-        recorder.push_telemetry(&telemetry(1));
+        record(&recorder, &telemetry(1));
         written(&recorder);
 
         // Spectating: nobody is the player
         recorder.push_scoring(bono_session_info::default(), vec![standing(1, false, 0.0)]);
-        recorder.push_telemetry(&telemetry(1));
+        record(&recorder, &telemetry(1));
         drop(recorder);
 
         let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();

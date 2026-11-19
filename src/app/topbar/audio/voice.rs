@@ -253,6 +253,7 @@ impl Voices {
                     t!("audio.text_to_speech"),
                 ),
                 |ui| {
+                    gpu_checkbox(ui, config, synth);
                     if ui
                         .add_enabled(failed, egui::Button::new(t!("onboarding.retry")))
                         .clicked()
@@ -292,6 +293,8 @@ impl Voices {
                 let Some(catalog) = catalog else {
                     return;
                 };
+
+                gpu_checkbox(ui, config, synth);
 
                 // Copied out so the poller isn't blocked while the menu is drawn
                 let on_disk = catalog.on_disk.borrow().clone();
@@ -346,6 +349,27 @@ fn find<'a>(languages: &'a mut [Language], lang: ArrayStr<2>, name: &str) -> Opt
         .voices
         .iter_mut()
         .find(|voice| voice.model_file.ends_with(&file))
+}
+
+/// Whether voices run on the GPU, whether or not the catalog could be fetched. DirectML is Windows
+/// only: elsewhere, voices run on the processor and there's nothing to choose.
+fn gpu_checkbox(ui: &mut egui::Ui, config: &mut Config, synth: &Synthesizer) {
+    if !cfg!(windows) {
+        return;
+    }
+
+    config.maybe_update(|raw| {
+        let changed = raw.voice_gpu.edit(*raw.voice_gpu(), |gpu| {
+            ui.checkbox(gpu, t!("audio.voice_gpu"))
+                .on_hover_text(t!("audio.voice_gpu_hover"))
+                .changed()
+        });
+        if changed {
+            synth.set_gpu(*raw.voice_gpu());
+        }
+        changed
+    });
+    ui.separator();
 }
 
 struct Catalog {

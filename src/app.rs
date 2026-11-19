@@ -334,6 +334,9 @@ impl AppState {
         self.engineer
             .follow_recording(rt, self.simulators.current_mut());
 
+        // Its answer waits while the pilot holds the talk button. Told before what was heard: a
+        // release is seen no later than what was said before it
+        self.engineer.talk(self.gui.topbar.audio.recording());
         // What the pilot says on the radio goes to the engineer, and its answers come back
         if let Some(heard) = self.gui.topbar.audio.transcription(rt) {
             self.engineer.hear(
@@ -344,8 +347,6 @@ impl AppState {
                 heard,
             );
         }
-        // Its answer waits while the pilot holds the talk button
-        self.engineer.talk(self.gui.topbar.audio.recording());
         self.engineer.update(
             rt,
             self.simulators.current_mut(),

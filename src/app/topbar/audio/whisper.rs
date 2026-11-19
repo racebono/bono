@@ -1645,7 +1645,7 @@ mod tests {
                 "How much fuel do I have left, and when do I need to pit?",
             ),
         ] {
-            let mut voice = Voice::load(&voices[&lang], threads).unwrap();
+            let mut voice = Voice::load(&voices[&lang], threads, false).unwrap();
             let speech = voice.synthesize(text, effects).unwrap();
             // Whisper hears at 16 kHz
             let ratio = speech.sample_rate as f64 / 16000.0;

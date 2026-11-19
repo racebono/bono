@@ -16,6 +16,12 @@ rustflags = ["-C", "target-feature=+sse4.2,+avx,+avx2,+bmi2,+fma,+f16c"]
 # get built in parallel (CMP0147), so the build step runs before configure has finished.
 # Requires `ninja` on PATH.
 CMAKE_GENERATOR_x86_64_pc_windows_msvc = "Ninja"
+# espeak-ng's compat headers test `#if __has_include_next(<unistd.h>)` (and endian.h, getopt.h),
+# which newer MSVC refuses as an undefined function-like macro (C7780). /D can't define one, but an
+# object-like `0&&__has_include` makes each test `0 && __has_include(<...>)`: false, as there's no
+# system header to include next on Windows. The cmake and cc crates pass these flags to every C
+# compile for this target.
+CFLAGS_x86_64_pc_windows_msvc = "/D__has_include_next=0&&__has_include"
 # ggml uses sccache whenever it's on PATH, and MSVC's shared .pdb debug info then fails with
 # C1041. Embed debug info in each object instead (/Z7), which sccache can also cache.
 # whisper-rs-sys passes these to CMake; the policy enables the setting despite ggml's old minimum.

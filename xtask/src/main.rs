@@ -109,21 +109,29 @@ async fn dist() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The most recently built `espeak-rs-sys-*/out/share/espeak-ng-data` in `build_dir`.
+/// The most recently built espeak-rs-sys `out/share/espeak-ng-data` in `build_dir`: in
+/// `espeak-rs-sys-{hash}/out`, or `espeak-rs-sys/{hash}/out` where Cargo nests build outputs by
+/// package.
 async fn newest_espeak_data(build_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
     let mut newest = None::<(std::time::SystemTime, PathBuf)>;
+    let mut builds = Vec::new();
     let mut it = tokio::fs::read_dir(build_dir).await?;
 
     while let Some(entry) = it.next_entry().await? {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("espeak-rs-sys-")
-        {
-            continue;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "espeak-rs-sys" {
+            let mut nested = tokio::fs::read_dir(entry.path()).await?;
+            while let Some(build) = nested.next_entry().await? {
+                builds.push(build.path());
+            }
+        } else if name.starts_with("espeak-rs-sys-") {
+            builds.push(entry.path());
         }
+    }
 
-        let data = entry.path().join("out/share/espeak-ng-data");
+    for build in builds {
+        let data = build.join("out/share/espeak-ng-data");
         let Ok(metadata) = tokio::fs::metadata(data.join("phondata")).await else {
             continue;
         };
@@ -195,5 +203,21 @@ target-dir = "custom-target"
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("custom-target"));
         assert_eq!(release, project.path().join(target).join("release"));
+    }
+
+    #[tokio::test]
+    async fn finds_espeak_data_in_either_build_layout() {
+        for build in ["espeak-rs-sys-0123abcd", "espeak-rs-sys/0123abcd"] {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join(build).join("out/share/espeak-ng-data");
+            std::fs::create_dir_all(&data).unwrap();
+            std::fs::write(data.join("phondata"), "").unwrap();
+            // Another package's output, and a build without the data
+            std::fs::create_dir_all(dir.path().join("espeak-rs-sys-ffff/out")).unwrap();
+            std::fs::create_dir_all(dir.path().join("other-sys/0123abcd/out/share")).unwrap();
+
+            let found = newest_espeak_data(dir.path()).await.unwrap();
+            assert_eq!(found, Some(data), "{build}");
+        }
     }
 }

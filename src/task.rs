@@ -50,6 +50,12 @@ impl<T> Task<T> {
 
         return None;
     }
+
+    /// Whether it's done, its result waiting for [`Self::update`] to take it.
+    #[cfg(test)]
+    pub fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_some_and(JoinHandle::is_finished)
+    }
 }
 
 pub struct LocalTask<T> {
