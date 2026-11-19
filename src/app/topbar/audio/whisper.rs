@@ -963,9 +963,9 @@ const MIN_VOICED: usize = 16000 / 10;
 /// Whether `samples` are loud enough, for long enough, to have anything said in them. Whisper
 /// can't tell: it makes words up for silence and says it's sure they're speech.
 fn voiced(samples: &[f32]) -> bool {
-    let loud = (samples.chunks(FRAME))
+    let len = FRAME as f32;
+    let loud = (samples.chunks_exact(FRAME))
         .filter(|frame| {
-            let len = frame.len() as f32;
             // Around its mean: some inputs record silence offset from zero
             let mean = frame.iter().sum::<f32>() / len;
             let power = frame.iter().map(|s| (s - mean).powi(2)).sum::<f32>() / len;
@@ -1821,7 +1821,7 @@ mod tests {
         assert!(!voiced(&offset));
         // A click of the button
         assert!(!voiced(&recording(0.001, 0.5, 0.02)));
-        // Something said, even quietly (-43 dBFS), over a room's noise
+        // Something said, even quietly (-43 dBFS), after a quiet room's noise
         assert!(voiced(&recording(0.001, 0.01, 0.5)));
         assert!(voiced(&recording(0.001, 0.2, 0.2)));
     }
