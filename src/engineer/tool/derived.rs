@@ -871,14 +871,20 @@ fn run_query(
         .ok()
         .flatten()
         .unwrap_or(stream.cursor);
+    // The session's first standings and session rows are known only from its epoch: a recording
+    // made before epochs doesn't say where they start
+    let firsts = match stream.epoch.id {
+        Some(_) => format!(
+            ", standings_first_id={}, session_row_first_id={}",
+            stream.epoch.standings_from, stream.epoch.session_from
+        ),
+        None => String::new(),
+    };
     say!(
         out,
-        "-- player vehicle_id={}, session_first_id={}, latest_telemetry_id={latest}, \
-         standings_first_id={}, session_row_first_id={}",
+        "-- player vehicle_id={}, session_first_id={}, latest_telemetry_id={latest}{firsts}",
         int(stream.player),
         stream.session_start,
-        stream.epoch.standings_from,
-        stream.epoch.session_from,
     );
     if stream.behind || stream.failed {
         say!(
