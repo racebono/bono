@@ -287,6 +287,9 @@ impl Converter {
         // Another session, or its clock went back (a restart, a replay rewound)
         let session = (frame.i32("SessionNum"), frame.i32("SessionUniqueID"));
         if new_event || self.session != Some(session) || dt.is_none() {
+            // Scoring in this update too: it names the session before a setup sent with it is
+            // written
+            self.last_scoring = None;
             self.cars.clear();
             self.session_end = None;
             self.wind = None;
@@ -4282,10 +4285,10 @@ mod tests {
         };
         let start = Instant::now();
         let mut converter = Converter::default();
-        let mut convert = |info: &SessionInfo, time: f64| {
+        let mut convert = |info: &SessionInfo, time: f64, num: i32| {
             let (vars, data) = Vars::of(&[
                 ("SessionTime", Value::Double(time)),
-                ("SessionNum", Value::Int(0)),
+                ("SessionNum", Value::Int(num)),
                 ("PlayerCarIdx", Value::Int(0)),
                 ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
                 ("CarIdxLapCompleted", Value::Ints(vec![2])),
@@ -4294,12 +4297,18 @@ mod tests {
                 .convert(&Frame::new(&vars, &data), info, start)
                 .unwrap()
         };
-        assert!(convert(&info, 1.0).scoring.is_some());
+        assert!(convert(&info, 1.0, 0).scoring.is_some());
         // The same instant: no scoring yet
-        assert!(convert(&info, 2.0).scoring.is_none());
+        assert!(convert(&info, 2.0, 0).scoring.is_none());
         info.event = (Some(1), None, None);
-        let update = convert(&info, 3.0);
+        let update = convert(&info, 3.0, 0);
         assert!(update.new_event);
+        assert!(update.scoring.is_some());
+        // Another session of the event: its scoring names it before a setup sent with it is
+        // written
+        assert!(convert(&info, 4.0, 0).scoring.is_none());
+        let update = convert(&info, 5.0, 1);
+        assert!(!update.new_event);
         assert!(update.scoring.is_some());
     }
 
