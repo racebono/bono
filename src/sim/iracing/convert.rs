@@ -176,6 +176,8 @@ pub struct Converter {
     /// Whether the car has been in the garage since it was last on track: leaving it, the car is in
     /// its stall, on pit road, and a setup sent then is still the garage's
     from_garage: bool,
+    /// Whether the car was out on track (in the world, off pit road) in the last frame
+    on_track: bool,
 }
 
 /// A race's flag, for who has finished. The winner is the first car over the line with all the
@@ -738,11 +740,14 @@ impl Converter {
         let before_green = frame
             .i32("SessionState")
             .is_some_and(|state| state < STATE_RACING);
+        let on_track = in_world && !on_pit_road && !in_garage;
         if in_garage {
             self.from_garage = true;
-        } else if in_world && !on_pit_road && !before_green {
+        } else if (on_track && !before_green) || (on_pit_road && self.on_track) {
+            // Out racing, or into the pit lane from the track (a stop, before the green too)
             self.from_garage = false;
         }
+        self.on_track = on_track;
         if info.setup == self.last_setup {
             return None;
         }
@@ -4235,7 +4240,7 @@ mod tests {
         let start = Instant::now();
         let mut converter = Converter::default();
         let mut time = 0.0;
-        let mut source = |info: &SessionInfo, garage: bool, state: i32| {
+        let mut source = |info: &SessionInfo, garage: bool, pit_road: bool, state: i32| {
             time += 1.0;
             let (vars, data) = Vars::of(&[
                 ("SessionTime", Value::Double(time)),
@@ -4245,7 +4250,7 @@ mod tests {
                 ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
                 ("CarIdxLapCompleted", Value::Ints(vec![0])),
                 ("IsInGarage", Value::Bool(garage)),
-                ("OnPitRoad", Value::Bool(false)),
+                ("OnPitRoad", Value::Bool(pit_road)),
                 ("PlayerTrackSurface", Value::Int(3)),
             ]);
             converter
@@ -4255,20 +4260,26 @@ mod tests {
                 .map(|setup| setup.source)
         };
         assert_eq!(
-            source(&info, true, STATE_GET_IN_CAR),
+            source(&info, true, false, STATE_GET_IN_CAR),
             Some(Some(SetupSource::Garage))
         );
         // On the grid, before the green
-        assert_eq!(source(&info, false, STATE_GET_IN_CAR), None);
+        assert_eq!(source(&info, false, false, STATE_GET_IN_CAR), None);
         info.setup = Some(arb("Medium"));
         assert_eq!(
-            source(&info, false, STATE_PARADE_LAPS),
+            source(&info, false, false, STATE_PARADE_LAPS),
             Some(Some(SetupSource::Garage))
         );
+        // Into the pit lane from the pace laps: a stop, even before the green
+        info.setup = Some(arb("Soft"));
+        assert_eq!(
+            source(&info, false, true, STATE_PARADE_LAPS),
+            Some(Some(SetupSource::PitStop))
+        );
         // Racing: out on track, where it was changed isn't known
-        assert_eq!(source(&info, false, STATE_RACING), None);
+        assert_eq!(source(&info, false, false, STATE_RACING), None);
         info.setup = Some(arb("Hard"));
-        assert_eq!(source(&info, false, STATE_RACING), Some(None));
+        assert_eq!(source(&info, false, false, STATE_RACING), Some(None));
     }
 
     /// A new event's first update has scoring, whenever the last one went: the recording is cleared
