@@ -105,6 +105,8 @@ impl Recorder {
         let player = self.shared.player_id.load(Ordering::Relaxed);
         let session_time = self.shared.session_time.load(Ordering::Relaxed);
         let session = lock(&self.shared.session).clone();
+        // A clear asked for while it was down is still owed (another track was loaded)
+        let clear = lock(&self.shared.queue).clear;
         *self = Self::start(
             self.dir.clone(),
             forecast,
@@ -117,6 +119,10 @@ impl Recorder {
             .session_time
             .store(session_time, Ordering::Relaxed);
         *lock(&self.shared.session) = session;
+        if clear {
+            lock(&self.shared.queue).clear = true;
+            self.shared.wake.notify_one();
+        }
         if let Some((setup, pushed)) = setup {
             self.queue_setup(setup, pushed);
         }
@@ -1195,6 +1201,32 @@ mod tests {
                 ("P6".to_owned(), Some(1), Some(1), Some(10.0), race, Some(2))
             ]
         );
+    }
+
+    /// A clear asked for while the writer is down (another track loaded) still happens once it's
+    /// restarted: the old recording isn't the new event's.
+    #[test]
+    fn a_clear_while_the_writer_is_down_happens_after_its_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
+        recorder.push_setup(wing("P5"));
+        while rows_in(dir.path(), "setup_set") != 1 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        recorder.shared.stop.store(true, Ordering::Relaxed);
+        recorder.shared.wake.notify_one();
+        recorder.thread.take().unwrap().join().unwrap();
+        recorder.shared.failed.store(true, Ordering::Relaxed);
+        recorder.clear();
+        recorder.restart(None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rows_in(dir.path(), "setup_set") != 0 {
+            assert!(Instant::now() < deadline, "the restarted writer never cleared");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(rows_in(dir.path(), "standings"), 0);
+        drop(recorder);
     }
 
     #[test]
