@@ -344,10 +344,10 @@ impl PluginStatus {
 
     /// Whether the installed copy says it's the same version as the one that comes with the app,
     /// but its code isn't (a local build, or a damaged or modified file). Other versions are
-    /// expected to differ.
+    /// expected to differ, and without the app's version there's nothing to tell it by.
     pub fn unexpected_code(&self) -> bool {
         self.same_as_bundled == Some(false)
-            && self.installed.is_some()
+            && self.bundled_version().is_some()
             && self.installed == self.bundled
     }
 }
@@ -919,6 +919,8 @@ mod tests {
         // Another version is expected to be other code
         assert!(!status(version(0), version(1), Some(false)).unexpected_code());
         assert!(!status(None, version(0), None).unexpected_code());
+        // Neither says its version
+        assert!(!status(Some(None), Some(None), Some(false)).unexpected_code());
     }
 
     #[test]
