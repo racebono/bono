@@ -129,6 +129,8 @@ impl VehicleCondition {
         if realtime && !state.realtime {
             state.forget();
             state.leave_garage();
+            // The player drives again once their telemetry says so, not on what came before
+            state.driving = None;
         }
         state.realtime = realtime;
     }
@@ -391,6 +393,16 @@ mod tests {
     }
 
     /// Telemetry can name a new player's car before scoring does: that car's setup is still read.
+    /// Telemetry from before realtime ended isn't the player driving now: nothing is asked until
+    /// the next telemetry comes.
+    #[test]
+    fn realtime_starting_waits_for_fresh_telemetry() {
+        let condition = answered(parse(BODY).unwrap(), Instant::now());
+        lock(&condition.shared.state).driving = Some(Instant::now());
+        condition.set_realtime(true);
+        assert_eq!(lock(&condition.shared.state).driving, None);
+    }
+
     #[test]
     fn a_new_car_first_seen_in_telemetry_reads_its_setup() {
         let condition = answered(parse(BODY).unwrap(), Instant::now());
