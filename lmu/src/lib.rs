@@ -20,6 +20,7 @@ mod car_numbers;
 mod class_positions;
 mod condition;
 mod forecast;
+mod garage;
 mod track_limits;
 
 use car_numbers::CarNumbers;
@@ -143,7 +144,11 @@ pub unsafe extern "C" fn bono_lmu_push_telemetry(
             .get()
             .is_some_and(|vehicle| recorder.is_player(vehicle));
         condition.fill_telemetry(&mut telemetry, is_player);
-        recorder.push_telemetry(&telemetry)
+        recorder.push_telemetry(&telemetry);
+        // After the telemetry, so the setup is recorded with this update's row
+        if is_player && let Some(setup) = condition.take_setup() {
+            recorder.push_setup(setup);
+        }
     })
 }
 
