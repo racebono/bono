@@ -3436,8 +3436,8 @@ mod tests {
     ) {
         let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
         let inserted = conn.execute(
-            "INSERT INTO setup_set (telemetry_id, vehicle_id, session_time, file_name, modified, source) \
-             SELECT id, ?1, session_time, ?3, ?4, ?5 FROM telemetry \
+            "INSERT INTO setup_set (telemetry_id, player_telemetry_id, vehicle_id, session_time, \
+             file_name, modified, source) SELECT id, id, ?1, session_time, ?3, ?4, ?5 FROM telemetry \
              WHERE is_player = 1 AND lap = ?2 ORDER BY id LIMIT 1",
             params![vehicle, lap, file_name, modified, source],
         )

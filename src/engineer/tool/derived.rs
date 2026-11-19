@@ -2504,6 +2504,9 @@ pub(super) struct Stream {
     /// The last tick failed: the tables may be behind, whatever `behind` says
     pub failed: bool,
     pub session_start: i64,
+    /// The player's last row before `session_start`, for the session it was looked up for (see
+    /// `SessionRows`): looked up once, as it can be far back
+    earlier_player_row: Option<(i64, Option<i64>)>,
     /// The last telemetry row read
     pub cursor: i64,
     /// (session_time, vehicle_id) of the row at `cursor`, to notice a recreated file
@@ -3215,6 +3218,27 @@ impl Stream {
         Ok(())
     }
 
+    /// Where this session's rows start, and the player's last row before them.
+    fn session_rows(&mut self, conn: &Connection) -> rusqlite::Result<SessionRows> {
+        let first = self.session_start;
+        let earlier_player_row = match self.earlier_player_row {
+            Some((start, row)) if start == first => row,
+            _ => {
+                let row = scalar::<i64>(
+                    conn,
+                    "SELECT max(id) FROM telemetry WHERE is_player = 1 AND id < ?",
+                    [first],
+                )?;
+                self.earlier_player_row = Some((first, row));
+                row
+            }
+        };
+        Ok(SessionRows {
+            first,
+            earlier_player_row,
+        })
+    }
+
     /// Writes the tables of how things are now, and says what it couldn't: one car's trouble isn't
     /// the others', and a query is better off told than given an empty field.
     pub fn refresh_now(
@@ -3240,7 +3264,9 @@ impl Stream {
             .player
             .and_then(|player| fresh.stints.get(&player))
             .map_or(&[][..], Vec::as_slice);
-        if let Err(e) = write_setup(conn, self.player, self.session_start, stints) {
+        let session = self.session_rows(conn);
+        if let Err(e) = session.and_then(|session| write_setup(conn, self.player, session, stints))
+        {
             problems.push(format!("setup_now: {e}"));
         }
         if let Err(e) = self.write_drivers(conn) {
@@ -4693,31 +4719,48 @@ pub(super) struct SetupValue {
 #[derive(Debug, PartialEq)]
 pub(super) struct SetupChange {
     pub name: String,
-    pub telemetry_id: Option<i64>,
-    pub lap: Option<i64>,
+    pub at: SetAt,
     pub old_value: Option<String>,
     pub new_value: Option<String>,
     pub source: Option<String>,
-    pub session_time: Option<f64>,
 }
 
-/// When a set was written: the player's lap then, in the session it was in, and the telemetry row
-/// it's dated by, which tells that session from this one.
+/// When a set was written: the row it's dated by (the latest of any car's) and the session time
+/// then, and the player's latest row then, with its lap and session time.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub(super) struct SetAt {
-    pub lap: Option<i64>,
     pub telemetry_id: Option<i64>,
+    pub session_time: Option<f64>,
+    pub player_row: Option<i64>,
+    pub lap: Option<i64>,
+    pub player_time: Option<f64>,
+}
+
+/// Where this session's rows start, and the player's last row before them.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct SessionRows {
+    pub first: i64,
+    pub earlier_player_row: Option<i64>,
 }
 
 impl SetAt {
-    /// The lap, if the set is from the session starting at `session_start`: an earlier session's
-    /// lap isn't one of this session's.
-    fn lap_in(self, session_start: i64) -> Option<i64> {
-        self.lap.filter(|_| self.in_session(session_start))
+    /// The player's lap, if it's one of this session's.
+    fn lap_in(self, session: SessionRows) -> Option<i64> {
+        self.lap
+            .filter(|_| self.player_row.is_some_and(|row| row >= session.first))
     }
 
-    fn in_session(self, session_start: i64) -> bool {
-        self.telemetry_id.is_some_and(|id| id >= session_start)
+    /// Whether it was written in this session: among its rows, or in its garage before the player
+    /// drove (on iRacing the player writes no rows there): their latest row then was the last
+    /// session's, and the clock had gone back since.
+    fn in_session(self, session: SessionRows) -> bool {
+        let in_its_garage = self.player_row.is_some()
+            && self.player_row == session.earlier_player_row
+            && self
+                .session_time
+                .zip(self.player_time)
+                .is_some_and(|(set, player)| set + 1.0 < player);
+        self.telemetry_id.is_some_and(|id| id >= session.first) || in_its_garage
     }
 }
 
@@ -4748,17 +4791,21 @@ pub(super) fn setup_history(
     {
         return Ok(None);
     }
-    // A set is dated by the latest telemetry row of any car: the lap is the player's at that row.
-    // Looked up once a set, apart from its settings: the player's last row can be far back (on
-    // iRacing it writes none while the car is in the garage, as the others go on)
-    let laps = conn
+    // The player's row a set was written with, by its id: a set's settings are many rows
+    let player_rows = conn
         .prepare_cached(
-            "SELECT s.id, (SELECT t.lap FROM telemetry t WHERE t.id <= s.telemetry_id
-                           AND t.is_player = 1 ORDER BY t.id DESC LIMIT 1)
-             FROM setup_set s",
+            "SELECT s.id, s.player_telemetry_id, t.lap, t.session_time
+             FROM setup_set s LEFT JOIN telemetry t ON t.id = s.player_telemetry_id",
         )?
         .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                (
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<f64>>(3)?,
+                ),
+            ))
         })?
         .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
     let mut stmt = conn.prepare_cached(
@@ -4772,7 +4819,7 @@ pub(super) fn setup_history(
     // The set being read, the car of the one before it, and whether it's the player's whole one
     let (mut set, mut car, mut players, mut whole) =
         (None::<i64>, None::<Option<i64>>, false, false);
-    let (mut telemetry_id, mut session_time, mut lap, mut source) = (None, None, None, None);
+    let (mut at, mut source) = (SetAt::default(), None);
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
         if set != Some(id) {
@@ -4787,14 +4834,19 @@ pub(super) fn setup_history(
             if whole {
                 history = Some(SetupHistory::default());
             }
-            telemetry_id = row.get(2)?;
-            session_time = row.get(3)?;
-            lap = laps.get(&id).copied().flatten();
+            let (player_row, lap, player_time) = player_rows.get(&id).copied().unwrap_or_default();
+            at = SetAt {
+                telemetry_id: row.get(2)?,
+                session_time: row.get(3)?,
+                player_row,
+                lap,
+                player_time,
+            };
             source = row.get(6)?;
             let h = history.get_or_insert_default();
             h.file_name = row.get(4)?;
             h.modified = row.get(5)?;
-            h.as_of = SetAt { lap, telemetry_id };
+            h.as_of = at;
         }
         if !players {
             continue;
@@ -4819,19 +4871,17 @@ pub(super) fn setup_history(
         if changed && !whole {
             h.changes.push(SetupChange {
                 name: name.clone(),
-                telemetry_id,
-                lap,
+                at,
                 old_value,
                 new_value: new.value.clone(),
                 source: source.clone(),
-                session_time,
             });
         }
         // A NULL value: the setting is gone
         if new.value.is_some() {
             let changed_at = match old {
                 Some((_, at)) if !changed => at,
-                _ => SetAt { lap, telemetry_id },
+                _ => at,
             };
             h.now.insert(name, (new, changed_at));
         }
@@ -4845,7 +4895,7 @@ pub(super) fn setup_history(
 fn write_setup(
     conn: &Connection,
     player: Option<i64>,
-    session_start: i64,
+    session: SessionRows,
     stints: &[Segment],
 ) -> rusqlite::Result<()> {
     let Some(history) = setup_history(conn, player)? else {
@@ -4862,29 +4912,26 @@ fn write_setup(
                 ("min_step", integer(setting.min_step)),
                 ("max_step", integer(setting.max_step)),
                 ("saved_value", text_or_null(setting.saved_value.as_deref())),
-                ("changed_lap", integer(changed_at.lap_in(session_start))),
+                ("changed_lap", integer(changed_at.lap_in(session))),
             ],
         )?;
     }
     for change in &history.changes {
-        let at = SetAt {
-            lap: change.lap,
-            telemetry_id: change.telemetry_id,
-        };
+        let at = change.at;
         // `stints` are this session's: a change in an earlier one has none
-        let stint = setup_stint(stints, at.lap_in(session_start), change.session_time);
+        let stint = setup_stint(stints, at.lap_in(session), at.session_time);
         insert(
             conn,
             "setup_changes",
             vec![
                 ("name", Value::Text(change.name.clone())),
-                ("lap", integer(at.lap_in(session_start))),
-                ("this_session", flag(at.in_session(session_start))),
+                ("lap", integer(at.lap_in(session))),
+                ("this_session", flag(at.in_session(session))),
                 ("stint_id", integer(stint)),
                 ("old_value", text_or_null(change.old_value.as_deref())),
                 ("new_value", text_or_null(change.new_value.as_deref())),
                 ("source", text_or_null(change.source.as_deref())),
-                ("session_time_s", real(change.session_time)),
+                ("session_time_s", real(at.session_time)),
             ],
         )?;
     }
@@ -4893,7 +4940,7 @@ fn write_setup(
         rusqlite::params![
             history.file_name,
             history.modified,
-            history.as_of.lap_in(session_start)
+            history.as_of.lap_in(session)
         ],
     )?;
     Ok(())
@@ -9153,6 +9200,65 @@ mod tests {
         )
         .await;
         assert_eq!(changes, [["\"A\"", "NULL", "0", "NULL"]]);
+    }
+
+    /// A setup loaded in this session's garage before the player drives is this session's, with no
+    /// lap yet: iRacing writes no rows for the player there, as the others go on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_garage_setup_before_the_players_first_row_is_this_sessions() {
+        let (dir, engineer) = race();
+        write_setup_set(
+            &dir,
+            Some(1),
+            1,
+            (Some("a.sto"), Some(false), Some("garage")),
+            &[("A", Some("1"))],
+        );
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        // The next session: the others drive while the player is in the garage
+        let row = |vehicle: i64, t: f64| {
+            conn.execute(
+                "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_distance, speed) \
+                 VALUES (?1, ?1 = 1, ?2, 0, ?2 * 10, 10)",
+                params![vehicle, t],
+            )
+            .unwrap();
+        };
+        for i in 0..200 {
+            row(2, i as f64 * 0.1);
+        }
+        // The race's setup, dated by their latest row: the player's latest is still the last session's
+        conn.execute(
+            "INSERT INTO setup_set (telemetry_id, player_telemetry_id, vehicle_id, session_time, \
+             file_name, modified, source) VALUES ((SELECT max(id) FROM telemetry), \
+             (SELECT max(id) FROM telemetry WHERE is_player = 1), 1, 20.0, 'race.sto', 0, 'garage')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO setup (setup_set_id, name, value) VALUES (last_insert_rowid(), 'A', '2')",
+            [],
+        )
+        .unwrap();
+        for i in 0..20 {
+            row(1, 21.0 + i as f64 * 0.5);
+        }
+        drop(conn);
+
+        let changes = query(
+            &engineer,
+            "SELECT name, new_value, lap, this_session FROM setup_changes",
+        )
+        .await;
+        assert_eq!(changes, [["\"A\"", "\"2\"", "NULL", "1"]]);
+        let now = query(&engineer, "SELECT value, changed_lap FROM setup_now").await;
+        assert_eq!(now, [["\"2\"", "NULL"]]);
+        let state = query(
+            &engineer,
+            "SELECT setup_file, setup_as_of_lap FROM race_state",
+        )
+        .await;
+        assert_eq!(state, [["\"race.sto\"", "NULL"]]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
