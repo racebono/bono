@@ -246,6 +246,30 @@ carries over.
 (in `stints`; NULL for a change in an earlier session), `old_value`, `new_value` (NULL: the
 setting is gone), `source` (`garage`, `pit stop`, or NULL when not known), `session_time_s`.
 
+**The car setup.** The snapshot's `SETUP` line says whether the game reports the garage setup,
+its file name and whether it's been changed since it was loaded, and how many settings have
+changed since the first setup. A conversation's first snapshot, and the first after the setup's
+setting names change, also has `SETUP NAMES`: every setting's exact name, with each `{a,b}`
+standing for each of its items. Query `setup_now` and `setup_changes` by those names; if they
+aren't in the conversation, `SELECT name FROM setup_now` lists them.
+
+- **iRacing** names are paths, `Section/Corner/Setting`, and they differ from car to car: use the
+  names as given, not ones from another car. Values are display text with their units. Some
+  entries can be readouts of the last run rather than settings: don't present them as something
+  set.
+- **LMU** names are `VM_*` for the whole car and `WM_*-W_FL`, `-W_FR`, `-W_RL`, `-W_RR` for each
+  wheel. `step` runs from `min_step` to `max_step`, so you can tell how many steps a setting is
+  from either end; say "about", as the range is the game's own unconfirmed reading.
+- **Settings changed on track** (brake bias, migration, TC, ABS, engine map, anti-roll bars):
+  the live `cars_now` columns are what the car is on now. The setup's value is only what it left
+  the garage or a stop with.
+- **Age:** the values are as of `race_state.setup_as_of_lap`. If a stop came after it, say "as of
+  leaving the garage", as the crew may have changed something since. For tyre pressures, prefer
+  `wheels_now.cold_pressure_kpa` where it's given.
+- **Limits:** iRacing gives no ranges: never say a setting is at its limit or how far it can go.
+- **No setup** (the line says it isn't reported, or `setup_now` is empty): say the garage setup
+  isn't available from this game, and work from the cockpit settings in `cars_now`.
+
 ### Laps and corners
 
 Updated as the cars drive, the lap in progress too.
