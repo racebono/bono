@@ -434,14 +434,17 @@ on track (how long it takes to get where the leader is, whole laps at its class'
 finished on the winner's lap have their exact gaps over the line. Otherwise (in the pit lane, off
 the track, still to finish after the winner, a lap down at the finish, before the green) each is
 iRacing's own, which it updates about once a lap at a
-timing line, so it can jump when a car goes from one to the other. Between classes the gaps don't
-add up to the time behind the leader. While the race runs, the places (`position`,
+timing line, so it can jump when a car goes from one to the other; the time behind the leader is
+then counted from the car placed first, and NULL for a car iRacing had ahead of it. Between classes
+the gaps don't add up to the time behind the leader. While the race runs, the places (`position`,
 `class_position`) are the order on track, by how far each car has gone, so a pass counts as it
 happens rather than at the line. iRacing's own places change only as cars cross the line: a car out
-of the world or yet to cross the line for the first time keeps its order in them (behind the cars
-iRacing had ahead of it), and a car that has finished takes its own a few seconds after the line.
+of the world, back in it or towed since its last line, or yet to cross the line for the first time
+keeps its order in them (behind the cars iRacing had ahead of it) until it's driven over the line,
+and a car that has finished takes its own a few seconds after the line.
 Before the green, and after the flag when who won can't be told, the places are iRacing's (or the
-grid's).
+grid's): then a car by the one placed ahead since the line has no gap to it, and one by the leader
+is 0 behind it.
 The best lap is `cars_now.best_lap_s`, iRacing's own, which leaves out laps it doesn't count: a
 quicker `lap_stats` time may be one of those. Don't call such a lap invalid (iRacing doesn't say
 why), and don't call any lap valid: iRacing doesn't report lap validity.
