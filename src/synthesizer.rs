@@ -18,14 +18,18 @@ use crate::{
 use anyhow::{Context, bail};
 use bono_i18n::t;
 use camino::{Utf8Path, Utf8PathBuf};
-use ort::{session::Session, value::Tensor};
+use ort::{
+    environment::Environment,
+    session::{Session, builder::AutoDevicePolicy},
+    value::Tensor,
+};
 use sdl3::audio::{AudioFormat, AudioSpec, AudioStream, AudioStreamOwner};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     mem::ManuallyDrop,
     num::NonZeroUsize,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
     task::Poll,
     time::{Duration, Instant},
 };
@@ -68,7 +72,7 @@ impl Synthesizer {
         let mut inner = BTreeMap::new();
         for (&k, v) in config.voices() {
             let synth = SynthesizerInner::new(rt.clone());
-            synth.set_model(Some(v.clone()));
+            synth.set_model(Some(v.clone()), *config.voice_gpu());
             inner.insert(k, synth);
         }
 
@@ -135,6 +139,13 @@ impl Synthesizer {
             output,
         });
         return (SpeechInput(input), SpeechOutput(recv));
+    }
+
+    /// Reloads every voice to run on the GPU if `gpu`, or on the processor.
+    pub fn set_gpu(&self, gpu: bool) {
+        for inner in self.inner.values() {
+            inner.set_gpu(gpu);
+        }
     }
 
     /// How the voice for `lang` loaded: `None` if none was set.
@@ -229,6 +240,13 @@ impl Job {
     }
 }
 
+/// A voice's model, and whether it runs on the GPU.
+#[derive(Clone)]
+struct Model {
+    path: Utf8PathBuf,
+    gpu: bool,
+}
+
 /// How the latest voice given to a [`SynthesizerInner`] loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoiceLoad {
@@ -251,7 +269,7 @@ struct LoadStatus {
 pub struct SynthesizerInner {
     handle: ManuallyDrop<std::thread::JoinHandle<()>>,
     /// The voice to load, with its number in [`LoadStatus::requested`]
-    model: ManuallyDrop<watch::Sender<Option<(u64, Utf8PathBuf)>>>,
+    model: ManuallyDrop<watch::Sender<Option<(u64, Model)>>>,
     jobs: ManuallyDrop<mpsc::UnboundedSender<Job>>,
     load: Arc<Mutex<LoadStatus>>,
 }
@@ -275,15 +293,16 @@ impl SynthesizerInner {
         }
     }
 
-    /// Loads `model` (again, if it's the one already set), or with `None`, stops.
-    pub fn set_model(&self, model: Option<Utf8PathBuf>) {
+    /// Loads `model` (again, if it's the one already set), to run on the GPU if `gpu`, or with
+    /// `None`, stops.
+    pub fn set_model(&self, model: Option<Utf8PathBuf>, gpu: bool) {
         // Sent while locked, so the latest request is the one the worker gets last
         let mut load = lock(&self.load);
         load.requested += 1;
         let loading = model.is_some();
         load.state = loading.then_some(VoiceLoad::Loading);
         load.model = model.clone();
-        let sent = self.model.send(model.map(|model| (load.requested, model)));
+        let sent = (self.model).send(model.map(|path| (load.requested, Model { path, gpu })));
         // The worker stopped, so nothing will load it
         if sent.is_err() && loading {
             load.state = Some(VoiceLoad::Failed);
@@ -301,6 +320,30 @@ impl SynthesizerInner {
         load.state == Some(VoiceLoad::Failed) && load.model.as_deref() == Some(model)
     }
 
+    /// Reloads the voice to run on the GPU if `gpu`, if there's one and it isn't already there.
+    /// The reload counts as the latest request, as one from [`Self::set_model`] does.
+    fn set_gpu(&self, gpu: bool) {
+        // Sent while locked, as `set_model` does
+        let mut load = lock(&self.load);
+        let requested = load.requested + 1;
+        let reloads = self.model.send_if_modified(|model| match model {
+            Some((number, model)) if model.gpu != gpu => {
+                *number = requested;
+                model.gpu = gpu;
+                true
+            }
+            _ => false,
+        });
+        if reloads {
+            load.requested = requested;
+            // The worker stopped, so nothing will load it
+            load.state = Some(match self.model.is_closed() {
+                true => VoiceLoad::Failed,
+                false => VoiceLoad::Loading,
+            });
+        }
+    }
+
     /// Whether its worker stopped, so it can't load or speak anything.
     pub fn stopped(&self) -> bool {
         self.model.is_closed()
@@ -314,12 +357,14 @@ impl SynthesizerInner {
 
     fn worker(
         handle: Handle,
-        model: watch::Receiver<Option<(u64, Utf8PathBuf)>>,
+        model: watch::Receiver<Option<(u64, Model)>>,
         mut jobs: mpsc::UnboundedReceiver<Job>,
         load: Arc<Mutex<LoadStatus>>,
         threads: NonZeroUsize,
     ) {
         let mut voice = None::<Voice>;
+        // The model `voice` was loaded from
+        let mut loaded = None::<Utf8PathBuf>;
         // The transmission being spoken: one at a time, the others wait their turn
         let mut stream = None::<Stream>;
         let mut waiting = VecDeque::<Job>::new();
@@ -394,16 +439,21 @@ impl SynthesizerInner {
 
             match event {
                 Some(Event::Model) => {
-                    // Its speech so far was in the old voice
-                    stream = None;
                     // Cloned so the load doesn't hold the read lock `set_model` waits on
-                    let path = model.borrow_and_update().clone();
-                    let Some((requested, path)) = path else {
+                    let next = model.borrow_and_update().clone();
+                    let Some((requested, Model { path, gpu })) = next else {
                         return;
                     };
-                    let state = match Voice::load(&path, threads) {
+                    let state = match Voice::load(&path, threads, gpu) {
                         Ok(next_voice) => {
+                            // Its speech so far was in the old voice. The same voice moving to or
+                            // from the GPU carries on with it, and so does the old voice when the
+                            // new one doesn't load
+                            if loaded.as_ref() != Some(&path) {
+                                stream = None;
+                            }
                             voice = Some(next_voice);
+                            loaded = Some(path);
                             VoiceLoad::Loaded
                         }
                         Err(e) => {
@@ -450,7 +500,7 @@ impl SynthesizerInner {
 /// after a panic, is marked failed, since nothing will load or speak it.
 struct Stopping {
     load: Arc<Mutex<LoadStatus>>,
-    model: Option<watch::Receiver<Option<(u64, Utf8PathBuf)>>>,
+    model: Option<watch::Receiver<Option<(u64, Model)>>>,
 }
 
 impl Drop for Stopping {
@@ -642,6 +692,9 @@ pub struct Effects {
 /// A loaded Piper voice.
 pub struct Voice {
     session: Session,
+    /// While it runs on the GPU: its model and threads, to move it to the processor if the GPU
+    /// stops working
+    gpu: Option<(Utf8PathBuf, NonZeroUsize)>,
     sample_rate: u32,
     espeak_voice: String,
     phoneme_ids: BTreeMap<char, Vec<i64>>,
@@ -652,11 +705,31 @@ pub struct Voice {
     beep: Vec<f32>,
 }
 
+/// The ONNX Runtime environment every voice's session is created in.
+///
+/// ONNX Runtime allows one environment per process, and `ort` refuses to build another even after the first is
+/// dropped, so it's built once and kept. A failed build is retried by the next voice.
+fn environment() -> ort::Result<&'static Environment> {
+    static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
+    static BUILDING: Mutex<()> = Mutex::new(());
+
+    if let Some(environment) = ENVIRONMENT.get() {
+        return Ok(environment);
+    }
+    let _building = BUILDING.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(environment) = ENVIRONMENT.get() {
+        return Ok(environment);
+    }
+    let environment = ort::init().build()?;
+    Ok(ENVIRONMENT.get_or_init(|| environment))
+}
+
 impl Voice {
     /// Loads the model at `model` and its config at `{model}.json`, using at most 8 intra-op threads.
+    /// With `gpu`, it runs on the GPU with DirectML on Windows, or on the processor if that fails.
     ///
     /// This blocks while the model is read and compiled.
-    pub fn load(model: &Utf8Path, threads: NonZeroUsize) -> anyhow::Result<Self> {
+    pub fn load(model: &Utf8Path, threads: NonZeroUsize, gpu: bool) -> anyhow::Result<Self> {
         let config_path = model.with_added_extension("json");
         let config = std::fs::read(&config_path)
             .with_context(|| format!("Error reading voice config '{config_path}'"))?;
@@ -690,13 +763,19 @@ impl Voice {
         // Starts the phonemizer, if it isn't yet, and checks it knows the voice
         phonemize("", &config.espeak.voice)?;
 
-        let session = (|| {
-            Session::builder()?
-                .with_intra_threads(threads.get().min(8))?
-                .commit_from_file(model)
-        })()
-        .with_context(|| format!("Error loading voice model '{model}'"))?;
+        let context = || format!("Error loading voice model '{model}'");
+        let gpu = gpu && cfg!(windows);
+        let (session, gpu) = match Self::session(model, threads, gpu) {
+            Ok(session) => (session, gpu),
+            Err(e) if gpu => {
+                log::warn!("Couldn't run voice model '{model}' on the GPU, so it runs on the processor: {e}");
+                let session = Self::session(model, threads, false).with_context(context)?;
+                (session, false)
+            }
+            Err(e) => return Err(e).with_context(context),
+        };
 
+        log::info!("Loaded voice model '{model}' (GPU: {gpu})");
         let multi_speaker = session.inputs().iter().any(|input| input.name() == "sid");
         let inference = config.inference;
 
@@ -705,6 +784,7 @@ impl Voice {
 
         return Ok(Self {
             session,
+            gpu: gpu.then(|| (model.to_owned(), threads)),
             sample_rate: config.audio.sample_rate,
             espeak_voice: config.espeak.voice,
             phoneme_ids,
@@ -821,6 +901,31 @@ impl Voice {
         return samples;
     }
 
+    /// The ONNX Runtime session of the model at `model`, on the GPU with DirectML if `gpu` (only
+    /// on Windows, the only platform `ort` is built with DirectML for), or else on the processor.
+    fn session(model: &Utf8Path, threads: NonZeroUsize, gpu: bool) -> ort::Result<Session> {
+        // `ort` lets ONNX Runtime pick an accelerator by default (CoreML, on macOS). Preferring the
+        // processor never picks one, and DirectML registered below takes precedence over it
+        let builder = Session::builder(environment()?)?
+            .with_auto_device(AutoDevicePolicy::PreferCPU)?
+            .with_intra_threads(threads.get().min(8))?;
+        #[cfg(windows)]
+        let mut builder = match gpu {
+            // DirectML doesn't support memory patterns, nor parallel execution (off by default).
+            // Registering fails, rather than falling back, so the caller knows it isn't used
+            true => builder.with_memory_pattern(false)?.with_execution_providers([
+                ort::ep::DirectML::default().build().error_on_failure(),
+            ])?,
+            false => builder,
+        };
+        #[cfg(not(windows))]
+        let mut builder = {
+            let _ = gpu;
+            builder
+        };
+        builder.commit_from_file(model)
+    }
+
     /// Converts phonemes to IDs the way piper-phonemize does: BOS, then every phoneme followed
     /// by PAD, then EOS.
     fn phoneme_ids(&self, phonemes: &str) -> Vec<i64> {
@@ -845,6 +950,25 @@ impl Voice {
     }
 
     fn infer(&mut self, ids: Vec<i64>, speed: f32, dest: &mut Vec<f32>) -> anyhow::Result<()> {
+        let e = match self.run(ids.clone(), speed, dest) {
+            Err(e) if self.gpu.is_some() => e,
+            res => return res,
+        };
+
+        // The GPU can stop working once loaded (a driver reset removes its device), and every
+        // sentence would fail: the voice moves to the processor for good instead. It stays on the
+        // GPU if the move fails, so the next sentence tries again
+        let Some((model, threads)) = &self.gpu else {
+            unreachable!("only GPU failures get here");
+        };
+        log::warn!("Voice model '{model}' failed on the GPU, so it moves to the processor: {e:#}");
+        self.session = Self::session(model, *threads, false)
+            .with_context(|| format!("Error loading voice model '{model}'"))?;
+        self.gpu = None;
+        return self.run(ids, speed, dest);
+    }
+
+    fn run(&mut self, ids: Vec<i64>, speed: f32, dest: &mut Vec<f32>) -> anyhow::Result<()> {
         let len = ids.len();
         let [noise_scale, voice_length_scale, noise_w] = self.scales;
         let scales = vec![
@@ -1122,16 +1246,16 @@ mod tests {
 
         let synth = SynthesizerInner::new(rt.handle().clone());
         assert!(!synth.failed(&missing));
-        synth.set_model(Some(missing.clone()));
+        synth.set_model(Some(missing.clone()), false);
         assert!(wait_until(|| synth.failed(&missing)));
 
         // Picked again, it fails again. Whether it shows as loading in between isn't checked:
         // a missing voice fails before a check right after picking it is sure to run
-        synth.set_model(Some(missing.clone()));
+        synth.set_model(Some(missing.clone()), false);
         assert!(wait_until(|| synth.failed(&missing)));
 
         // Picking another one clears the failure of the one before
-        synth.set_model(Some(other.clone()));
+        synth.set_model(Some(other.clone()), false);
         assert!(!synth.failed(&missing));
         assert!(wait_until(|| synth.failed(&other)));
         assert!(!synth.failed(&missing));
@@ -1153,19 +1277,38 @@ mod tests {
 
         let missing = std::env::temp_dir().join("bono-missing-voice.onnx");
         let missing = Utf8PathBuf::from_path_buf(missing).unwrap();
-        inner.set_model(Some(missing.clone()));
+        inner.set_model(Some(missing.clone()), false);
         assert_eq!(loaded(&inner).await, Some(VoiceLoad::Failed));
 
         // Setting it again tries again
-        inner.set_model(Some(missing.clone()));
+        inner.set_model(Some(missing.clone()), false);
         assert_eq!(loaded(&inner).await, Some(VoiceLoad::Failed));
 
         // Once the worker stops, nothing loads it
-        inner.set_model(None);
+        inner.set_model(None, false);
         assert_eq!(inner.load(), None);
         stopped(&inner).await;
-        inner.set_model(Some(missing));
+        inner.set_model(Some(missing), false);
         assert_eq!(inner.load(), Some(VoiceLoad::Failed));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn moving_a_voice_to_the_gpu_loads_it_again() {
+        let inner = SynthesizerInner::new(Handle::current());
+        let missing = std::env::temp_dir().join("bono-missing-gpu-voice.onnx");
+        let missing = Utf8PathBuf::from_path_buf(missing).unwrap();
+        inner.set_model(Some(missing), false);
+        assert_eq!(loaded(&inner).await, Some(VoiceLoad::Failed));
+
+        // Already where it's asked to run: nothing to load
+        inner.set_gpu(false);
+        assert_eq!(lock(&inner.load).requested, 1);
+        assert_eq!(inner.load(), Some(VoiceLoad::Failed));
+
+        // Moved, it's the latest request, and loads (and fails) again
+        inner.set_gpu(true);
+        assert_eq!(lock(&inner.load).requested, 2);
+        assert_eq!(loaded(&inner).await, Some(VoiceLoad::Failed));
     }
 
     async fn stopped(inner: &SynthesizerInner) {
@@ -1338,7 +1481,7 @@ mod tests {
         let model = std::env::var("BONO_VOICE").expect("BONO_VOICE isn't set");
         let rt = Handle::current();
         let inner = SynthesizerInner::new(rt.clone());
-        inner.set_model(Some(model.into()));
+        inner.set_model(Some(model.into()), false);
         let mut synth = Synthesizer {
             inner: BTreeMap::from([(crate::arrstr!("en"), inner)]),
         };
@@ -1374,6 +1517,31 @@ mod tests {
         assert!(ready < 32, "the one-shot waited for the entire stream");
     }
 
+    /// Needs a Piper voice (`BONO_VOICE` is the path to its `.onnx`) and a DirectX 12 GPU.
+    #[test]
+    #[ignore]
+    #[cfg(windows)]
+    fn speaks_on_the_gpu() {
+        let model = std::env::var("BONO_VOICE").expect("BONO_VOICE isn't set");
+        let model = Utf8Path::new(&model);
+        let threads = NonZeroUsize::new(4).unwrap();
+        // Errs, rather than falling back to the processor, if DirectML can't be registered (ONNX
+        // Runtime may still run operators DirectML doesn't support on the processor)
+        Voice::session(model, threads, true).unwrap();
+
+        let mut voice = Voice::load(model, threads, true).unwrap();
+        assert!(voice.gpu.is_some(), "the voice fell back to the processor");
+        let effects = Effects {
+            radio: 0.65,
+            beep_volume: 1.0,
+            speed: 1.0,
+        };
+        let speech = voice.synthesize("Copy. Box this lap.", effects).unwrap();
+        assert!(!speech.samples.is_empty());
+        assert!(speech.samples.iter().all(|sample| sample.abs() <= 1.0));
+        assert!(voice.gpu.is_some(), "the GPU failed while speaking");
+    }
+
     /// Needs a Piper voice: `BONO_VOICE` is the path to its `.onnx`.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
@@ -1381,7 +1549,7 @@ mod tests {
         let model = std::env::var("BONO_VOICE").expect("BONO_VOICE isn't set");
         let rt = Handle::current();
         let inner = SynthesizerInner::new(rt.clone());
-        inner.set_model(Some(model.into()));
+        inner.set_model(Some(model.into()), false);
         let mut synth = Synthesizer {
             inner: BTreeMap::from([(crate::arrstr!("en"), inner)]),
         };
