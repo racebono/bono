@@ -449,6 +449,10 @@ impl Writer {
 
         let mut telemetry = Vec::new();
         let mut scoring = Vec::new();
+        // The last setup written, and whether it's to be written again: after the app clears the
+        // data, as no game sends its setup again until it changes
+        let mut last_setup: Option<Setup> = None;
+        let mut rewrite = false;
         loop {
             let (mut clear, mut setup) = {
                 let queue = lock(&shared.queue);
@@ -470,12 +474,27 @@ impl Writer {
                 (std::mem::take(&mut queue.clear), queue.setup.take())
             };
 
-            // Asked by the app: what's waiting was recorded before it asked
+            // Another event: the setup is the new one's, when it comes
+            if clear {
+                last_setup = None;
+                rewrite = false;
+            }
+            // Asked by the app: what's waiting was recorded before it asked. The car's setup is
+            // still the car's, written again with the next telemetry so it has a row to go with
             if self.check_settings(shared) {
                 telemetry.clear();
                 scoring.clear();
-                setup = None;
+                if let Some(setup) = setup.take() {
+                    last_setup = Some(setup);
+                }
+                rewrite = last_setup.is_some();
                 clear = true;
+            }
+            if setup.is_some() {
+                rewrite = false;
+            } else if rewrite && !telemetry.is_empty() {
+                setup = last_setup.clone();
+                rewrite = false;
             }
 
             if clear {
@@ -498,6 +517,7 @@ impl Writer {
                 }
                 // After the telemetry it arrived with: it's dated by the latest row
                 if let Some(setup) = setup.take() {
+                    last_setup = Some(setup.clone());
                     let telemetry_id: Option<i64> =
                         tx.query_row("SELECT max(id) FROM telemetry", [], |row| row.get(0))?;
                     let vehicle =
@@ -877,6 +897,67 @@ mod tests {
             .query_row("SELECT value FROM setup", [], |r| r.get(0))
             .unwrap();
         assert_eq!(value, "P5");
+    }
+
+    /// The app clearing the data doesn't clear the car: no game sends its setup again until it
+    /// changes, so the last one is written again, with the first telemetry after the clear.
+    #[test]
+    fn the_setup_is_written_again_after_the_app_clears_the_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
+        let push = |time: f64| {
+            let mut telemetry = bono_telemetry::default();
+            telemetry.vehicle_id = Some(1).into();
+            telemetry.session_time = Some(time).into();
+            assert!(recorder.wants_telemetry(1, time, 0.0));
+            recorder.push_telemetry(&telemetry);
+        };
+        push(10.0);
+        recorder.push_setup(wing("P5"));
+
+        let path = dir.path().join(DATABASE);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let count = |table: &str| -> i64 {
+            loop {
+                if let Ok(conn) = rusqlite::Connection::open_with_flags(
+                    &path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                ) && let Ok(n) =
+                    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                {
+                    return n;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let wait = |table: &str, n: i64| {
+            while count(table) != n {
+                assert!(Instant::now() < deadline, "{table} never had {n} rows");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait("setup_set", 1);
+
+        // As the app asks
+        fs::write(dir.path().join(SETTINGS), r#"{"clear": 1}"#).unwrap();
+        wait("telemetry", 0);
+        assert_eq!(count("setup_set"), 0);
+        push(11.0);
+        wait("setup_set", 1);
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (telemetry_id, latest, value): (i64, i64, String) = conn
+            .query_row(
+                "SELECT telemetry_id, (SELECT max(id) FROM telemetry), \
+                 (SELECT value FROM setup) FROM setup_set",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((telemetry_id, value.as_str()), (latest, "P5"));
     }
 
     #[test]
