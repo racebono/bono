@@ -176,7 +176,7 @@ $env:LMU_DIR = 'D:\SteamLibrary\steamapps\common\Le Mans Ultimate'
 cargo build -p bono-lmu
 ```
 
-The resulting `target/debug/bono_lmu.dll` sits alongside the development executable, where Bono can find it for installation. The plugin writes its telemetry database under the game's `UserData/bono/` directory.
+With Just installed, `just lmu` runs the same build. The resulting `target/debug/bono_lmu.dll` sits alongside the development executable, where Bono can find it for installation. The plugin writes its telemetry database under the game's `UserData/bono/` directory.
 
 ### Speech-recognition backends
 
