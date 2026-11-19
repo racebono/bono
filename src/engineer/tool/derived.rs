@@ -121,7 +121,7 @@ CREATE TABLE race_state (
     pit_window_status TEXT, pit_window_start_lap REAL, pit_window_end_lap REAL,
     pit_window_opens_in_s REAL, pit_window_closes_in_s REAL, pit_speed_limit_kmh REAL,
     track_limit_steps_per_penalty INTEGER, track_limit_steps_per_point INTEGER,
-    max_incident_points REAL
+    max_incident_points REAL, setup_file TEXT, setup_modified INTEGER, setup_as_of_lap INTEGER
 );
 CREATE TABLE cars_now (
     vehicle_id INTEGER PRIMARY KEY, is_player INTEGER, current_stint_id INTEGER, team TEXT,
@@ -186,6 +186,14 @@ CREATE TABLE forecast_now (
     part_of_session TEXT, sky TEXT, sky_text TEXT, rain_chance_pct REAL, air_c REAL,
     humidity_pct REAL, wind_speed_kmh REAL, wind_direction TEXT
 );
+CREATE TABLE setup_now (
+    name TEXT PRIMARY KEY, value TEXT, step INTEGER, min_step INTEGER, max_step INTEGER,
+    saved_value TEXT, changed_lap INTEGER
+);
+CREATE TABLE setup_changes (
+    name TEXT NOT NULL, lap INTEGER, stint_id INTEGER, old_value TEXT, new_value TEXT,
+    source TEXT, session_time_s REAL
+);
 ";
 
 const STREAM_TABLES: [&str; 5] = [
@@ -195,7 +203,7 @@ const STREAM_TABLES: [&str; 5] = [
     "corner_passes",
     "corner_pass_wheels",
 ];
-const NOW_TABLES: [&str; 7] = [
+const NOW_TABLES: [&str; 9] = [
     "race_state",
     "cars_now",
     "drivers_now",
@@ -203,6 +211,8 @@ const NOW_TABLES: [&str; 7] = [
     "wheels_now",
     "sectors_now",
     "forecast_now",
+    "setup_now",
+    "setup_changes",
 ];
 
 type Columns = Vec<(&'static str, Value)>;
@@ -3225,6 +3235,9 @@ impl Stream {
         }
         // Without a player's car too: they're the recording's
         self.write_stints(conn, &fresh, &mut problems);
+        if let Err(e) = write_setup(conn, self.player, self.session_start) {
+            problems.push(format!("setup_now: {e}"));
+        }
         if let Err(e) = self.write_drivers(conn) {
             problems.push(format!("drivers_now: {e}"));
         }
@@ -4656,6 +4669,196 @@ fn write_forecast(conn: &Connection, sc: &Scoring, now: Option<f64>) -> rusqlite
             )?;
         }
     }
+    Ok(())
+}
+
+// --------------------------------------------------------------------------- the car setup
+
+/// One setting of the player's setup, as a `setup` row of the recording gives it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct SetupValue {
+    pub value: Option<String>,
+    pub step: Option<i64>,
+    pub min_step: Option<i64>,
+    pub max_step: Option<i64>,
+    pub saved_value: Option<String>,
+}
+
+/// A setting's value changing after the first setup.
+#[derive(Debug, PartialEq)]
+pub(super) struct SetupChange {
+    pub name: String,
+    pub telemetry_id: Option<i64>,
+    pub lap: Option<i64>,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    pub source: Option<String>,
+    pub session_time: Option<f64>,
+}
+
+/// The player's setup, as the recording's sets have built it up.
+#[derive(Debug, Default)]
+pub(super) struct SetupHistory {
+    /// Each setting now, with the lap of its latest change
+    pub now: BTreeMap<String, (SetupValue, Option<i64>)>,
+    pub changes: Vec<SetupChange>,
+    /// The latest set's
+    pub file_name: Option<String>,
+    pub modified: Option<bool>,
+    pub as_of_lap: Option<i64>,
+}
+
+/// The player's setup from the recording's `setup_set` and `setup` tables. None without one: the
+/// game doesn't report it, or the recording is from before setups were recorded.
+///
+/// The recorder writes a car's first set whole and after it only what changed, so the sets are
+/// walked in order. A set for another car than the set before it is whole again, so it starts
+/// the setup over. Only values are compared: a set repeating them (after a restart) is no change.
+pub(super) fn setup_history(
+    conn: &Connection,
+    player: Option<i64>,
+) -> rusqlite::Result<Option<SetupHistory>> {
+    if !conn.table_exists(None::<&str>, "setup_set")?
+        || !conn.table_exists(None::<&str>, "setup")?
+    {
+        return Ok(None);
+    }
+    // A set is dated by the latest telemetry row of any car: the lap is the player's at that row
+    let mut stmt = conn.prepare_cached(
+        "SELECT s.id, s.vehicle_id, s.telemetry_id, s.session_time, s.file_name, s.modified,
+                s.source,
+                (SELECT t.lap FROM telemetry t WHERE t.id <= s.telemetry_id AND t.is_player = 1
+                 ORDER BY t.id DESC LIMIT 1),
+                r.name, r.value, r.step, r.min_step, r.max_step, r.saved_value
+         FROM setup_set s LEFT JOIN setup r ON r.setup_set_id = s.id
+         ORDER BY s.id, r.name",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut history = None::<SetupHistory>;
+    // The set being read, the car of the one before it, and whether it's the player's whole one
+    let (mut set, mut car, mut players, mut whole) =
+        (None::<i64>, None::<Option<i64>>, false, false);
+    let (mut telemetry_id, mut session_time, mut lap, mut source) = (None, None, None, None);
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        if set != Some(id) {
+            set = Some(id);
+            let vehicle: Option<i64> = row.get(1)?;
+            whole = car != Some(vehicle);
+            car = Some(vehicle);
+            players = vehicle.is_none() || vehicle == player;
+            if !players {
+                continue;
+            }
+            if whole {
+                history = Some(SetupHistory::default());
+            }
+            telemetry_id = row.get(2)?;
+            session_time = row.get(3)?;
+            lap = row.get(7)?;
+            source = row.get(6)?;
+            let h = history.get_or_insert_default();
+            h.file_name = row.get(4)?;
+            h.modified = row.get(5)?;
+            h.as_of_lap = lap;
+        }
+        if !players {
+            continue;
+        }
+        let Some(h) = &mut history else {
+            continue;
+        };
+        // A set with no settings of its own (its file name or modified flag changed)
+        let Some(name) = row.get::<_, Option<String>>(8)? else {
+            continue;
+        };
+        let new = SetupValue {
+            value: row.get(9)?,
+            step: row.get(10)?,
+            min_step: row.get(11)?,
+            max_step: row.get(12)?,
+            saved_value: row.get(13)?,
+        };
+        let old = h.now.remove(&name);
+        let old_value = old.as_ref().and_then(|(old, _)| old.value.clone());
+        let changed = old_value != new.value;
+        if changed && !whole {
+            h.changes.push(SetupChange {
+                name: name.clone(),
+                telemetry_id,
+                lap,
+                old_value,
+                new_value: new.value.clone(),
+                source: source.clone(),
+                session_time,
+            });
+        }
+        // A NULL value: the setting is gone
+        if new.value.is_some() {
+            let changed_lap = match old {
+                Some((_, changed_lap)) if !changed => changed_lap,
+                _ => lap,
+            };
+            h.now.insert(name, (new, changed_lap));
+        }
+    }
+    Ok(history)
+}
+
+/// `setup_now`, `setup_changes` and `race_state`'s setup columns. They cover the whole recording,
+/// not only this session: the setup carries over from one to the next.
+fn write_setup(conn: &Connection, player: Option<i64>, session_start: i64) -> rusqlite::Result<()> {
+    let Some(history) = setup_history(conn, player)? else {
+        return Ok(());
+    };
+    for (name, (setting, changed_lap)) in &history.now {
+        insert(
+            conn,
+            "setup_now",
+            vec![
+                ("name", Value::Text(name.clone())),
+                ("value", text_or_null(setting.value.as_deref())),
+                ("step", integer(setting.step)),
+                ("min_step", integer(setting.min_step)),
+                ("max_step", integer(setting.max_step)),
+                ("saved_value", text_or_null(setting.saved_value.as_deref())),
+                ("changed_lap", integer(*changed_lap)),
+            ],
+        )?;
+    }
+    for change in &history.changes {
+        // `stints` are this session's: a change in an earlier one has none
+        let stint = match (player, change.lap) {
+            (Some(vehicle), Some(lap))
+                if change.telemetry_id.is_some_and(|id| id >= session_start) =>
+            {
+                scalar::<i64>(
+                    conn,
+                    "SELECT stint_id FROM stints WHERE vehicle_id = ? AND start_lap <= ? \
+                     ORDER BY start_lap DESC LIMIT 1",
+                    [vehicle, lap],
+                )?
+            }
+            _ => None,
+        };
+        insert(
+            conn,
+            "setup_changes",
+            vec![
+                ("name", Value::Text(change.name.clone())),
+                ("lap", integer(change.lap)),
+                ("stint_id", integer(stint)),
+                ("old_value", text_or_null(change.old_value.as_deref())),
+                ("new_value", text_or_null(change.new_value.as_deref())),
+                ("source", text_or_null(change.source.as_deref())),
+                ("session_time_s", real(change.session_time)),
+            ],
+        )?;
+    }
+    conn.execute(
+        "UPDATE race_state SET setup_file = ?, setup_modified = ?, setup_as_of_lap = ?",
+        rusqlite::params![history.file_name, history.modified, history.as_of_lap],
+    )?;
     Ok(())
 }
 
@@ -8770,6 +8973,162 @@ mod tests {
         .await;
         assert_eq!(wheels[0], ["\"FL\"", "85", "170"]);
         assert_eq!(wheels.len(), 4);
+    }
+
+    /// The player's setup: {A 1, B 2} on lap 1, B to 3 on lap 2, A gone on lap 3 after a stop.
+    fn changing_setup(dir: &tempfile::TempDir) {
+        write_setup_set(
+            dir,
+            Some(1),
+            1,
+            (Some("a.sto"), Some(false), Some("garage")),
+            &[("A", Some("1")), ("B", Some("2"))],
+        );
+        write_setup_set(
+            dir,
+            Some(1),
+            2,
+            (Some("a.sto"), Some(true), None),
+            &[("B", Some("3"))],
+        );
+        write_setup_set(
+            dir,
+            Some(1),
+            3,
+            (Some("a.sto"), Some(true), Some("pit stop")),
+            &[("A", None)],
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn setup_now_is_the_latest_value_of_each_setting() {
+        let (dir, engineer) = race();
+        changing_setup(&dir);
+        let now = query(
+            &engineer,
+            "SELECT name, value, step, saved_value, changed_lap FROM setup_now ORDER BY name",
+        )
+        .await;
+        assert_eq!(now, [["\"B\"", "\"3\"", "NULL", "NULL", "2"]]);
+        let state = query(
+            &engineer,
+            "SELECT setup_file, setup_modified, setup_as_of_lap FROM race_state",
+        )
+        .await;
+        assert_eq!(state, [["\"a.sto\"", "1", "3"]]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn setup_changes_list_each_change_after_the_first_setup() {
+        let (dir, engineer) = race();
+        changing_setup(&dir);
+        let changes = query(
+            &engineer,
+            "SELECT name, lap, old_value, new_value, source, \
+             stint_id = (SELECT stint_id FROM stints WHERE vehicle_id = 1), \
+             session_time_s BETWEEN 100 AND 400 \
+             FROM setup_changes ORDER BY lap",
+        )
+        .await;
+        assert_eq!(
+            changes,
+            [
+                ["\"B\"", "2", "\"2\"", "\"3\"", "NULL", "1", "1"],
+                ["\"A\"", "3", "\"1\"", "NULL", "\"pit stop\"", "1", "1"],
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repeated_value_is_not_a_change() {
+        let (dir, engineer) = race();
+        let none = (None, None, None);
+        write_setup_set(
+            &dir,
+            Some(1),
+            1,
+            none,
+            &[("A", Some("1")), ("B", Some("2"))],
+        );
+        // The whole setup again, as after a recorder restart
+        write_setup_set(
+            &dir,
+            Some(1),
+            2,
+            none,
+            &[("A", Some("1")), ("B", Some("2"))],
+        );
+        assert_eq!(
+            number(&engineer, "SELECT COUNT(*) FROM setup_changes").await,
+            0.0
+        );
+        assert_eq!(
+            query(
+                &engineer,
+                "SELECT name, changed_lap FROM setup_now ORDER BY name"
+            )
+            .await,
+            [["\"A\"", "1"], ["\"B\"", "1"]]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn another_cars_setup_is_not_the_players() {
+        let (dir, engineer) = race();
+        let none = (None, None, None);
+        write_setup_set(&dir, Some(2), 1, none, &[("X", Some("9"))]);
+        write_setup_set(&dir, None, 2, none, &[("A", Some("1"))]);
+        assert_eq!(
+            query(&engineer, "SELECT name FROM setup_now").await,
+            [["\"A\""]]
+        );
+
+        // The player in another car and back: that set is the whole setup, with nothing left over
+        let (dir, engineer) = race();
+        write_setup_set(
+            &dir,
+            Some(1),
+            1,
+            none,
+            &[("A", Some("1")), ("B", Some("2"))],
+        );
+        write_setup_set(&dir, Some(2), 2, none, &[("C", Some("5"))]);
+        write_setup_set(
+            &dir,
+            Some(1),
+            3,
+            none,
+            &[("A", Some("1")), ("D", Some("4"))],
+        );
+        assert_eq!(
+            query(
+                &engineer,
+                "SELECT name, changed_lap FROM setup_now ORDER BY name"
+            )
+            .await,
+            [["\"A\"", "3"], ["\"D\"", "3"]]
+        );
+        assert_eq!(
+            number(&engineer, "SELECT COUNT(*) FROM setup_changes").await,
+            0.0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recordings_without_setup_tables_have_no_setup() {
+        let (dir, engineer) = race();
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute_batch("DROP TABLE setup; DROP TABLE setup_set;")
+            .unwrap();
+        let out = run(
+            &engineer,
+            serde_json::json!({"command": "sql", "query":
+                "SELECT (SELECT COUNT(*) FROM setup_now) + (SELECT COUNT(*) FROM setup_changes) AS n, \
+                 setup_file, setup_modified, setup_as_of_lap FROM race_state"}),
+        )
+        .await;
+        assert!(!out.contains("incomplete"), "{out}");
+        assert!(out.contains("\n0 | NULL | NULL | NULL"), "{out}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

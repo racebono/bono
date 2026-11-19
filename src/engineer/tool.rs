@@ -2949,6 +2949,37 @@ mod tests {
         Engineer::new(pool)
     }
 
+    /// One setting's row in the recording's `setup` table: its name and value (None: gone).
+    pub(super) type SetupRow<'a> = (&'a str, Option<&'a str>);
+
+    /// Writes a setup set into the recording in `dir` for `vehicle`, at the player's first
+    /// telemetry row on `lap`, as the recorder does: only the rows given.
+    pub(super) fn write_setup_set(
+        dir: &tempfile::TempDir,
+        vehicle: Option<i64>,
+        lap: i64,
+        (file_name, modified, source): (Option<&str>, Option<bool>, Option<&str>),
+        rows: &[SetupRow<'_>],
+    ) {
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        let inserted = conn.execute(
+            "INSERT INTO setup_set (telemetry_id, vehicle_id, session_time, file_name, modified, source) \
+             SELECT id, ?1, session_time, ?3, ?4, ?5 FROM telemetry \
+             WHERE is_player = 1 AND lap = ?2 ORDER BY id LIMIT 1",
+            params![vehicle, lap, file_name, modified, source],
+        )
+        .unwrap();
+        assert_eq!(inserted, 1, "no player row on lap {lap}");
+        let set = conn.last_insert_rowid();
+        for (name, value) in rows {
+            conn.execute(
+                "INSERT INTO setup (setup_set_id, name, value) VALUES (?, ?, ?)",
+                params![set, name, value],
+            )
+            .unwrap();
+        }
+    }
+
     /// A lap of a 2000 m track with five corners (braking hard into each, slowest at the apex),
     /// driven three times, and a description of it putting every turn 150 m late.
     pub(super) fn shifted_ring() -> (tempfile::TempDir, Engineer) {
