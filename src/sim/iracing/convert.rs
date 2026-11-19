@@ -173,6 +173,9 @@ pub struct Converter {
     raced: bool,
     /// The player's setup as last sent to the recorder (see `setup`); `None` in a new event
     last_setup: Option<PlayerSetup>,
+    /// Whether the car has been in the garage since it was last on track: leaving it, the car is in
+    /// its stall, on pit road, and a setup sent then is still the garage's
+    from_garage: bool,
 }
 
 /// A race's flag, for who has finished. The winner is the first car over the line with all the
@@ -275,9 +278,11 @@ impl Converter {
         let event = (info.event, info.track.clone());
         let new_event = self.event.as_ref().is_some_and(|last| *last != event);
         self.event = Some(event);
-        // The recording starts again (see `memory::record`)
+        // The recording starts again (see `memory::record`), with scoring in this update: it says
+        // which car is the player's before the setup is written
         if new_event {
             self.last_setup = None;
+            self.last_scoring = None;
         }
         // Another session, or its clock went back (a restart, a replay rewound)
         let session = (frame.i32("SessionNum"), frame.i32("SessionUniqueID"));
@@ -721,15 +726,22 @@ impl Converter {
     /// The player's setup for the recorder, when the session info's is new or has changed: the
     /// game sends it again on leaving the garage and loading a setup, and maybe after a stop.
     fn setup(&mut self, frame: &Frame<'_>, info: &SessionInfo) -> Option<Setup> {
+        let in_garage = frame.bool("IsInGarage") == Some(true);
+        let on_pit_road = frame.bool("OnPitRoad") == Some(true);
+        if in_garage {
+            self.from_garage = true;
+        } else if !on_pit_road {
+            self.from_garage = false;
+        }
         if info.setup == self.last_setup {
             return None;
         }
         let first = self.last_setup.is_none();
         self.last_setup = info.setup.clone();
         let setup = info.setup.as_ref()?;
-        let source = if first || frame.bool("IsInGarage") == Some(true) {
+        let source = if first || self.from_garage {
             Some(SetupSource::Garage)
-        } else if frame.bool("OnPitRoad") == Some(true) {
+        } else if on_pit_road {
             Some(SetupSource::PitStop)
         } else {
             None
@@ -4150,7 +4162,21 @@ mod tests {
             convert(&info, true, false),
             Some(setup("Hard", Some(SetupSource::Garage)))
         );
+        // Out of the garage the car is in its stall, on pit road: still the garage's
+        info.setup = Some(arb("Medium"));
+        assert_eq!(
+            convert(&info, false, true),
+            Some(setup("Medium", Some(SetupSource::Garage)))
+        );
         // Out on track, where it was changed isn't known
+        info.setup = Some(arb("Soft"));
+        assert_eq!(convert(&info, false, false), Some(setup("Soft", None)));
+        // Back on pit road from the track: a stop
+        info.setup = Some(arb("Hard"));
+        assert_eq!(
+            convert(&info, false, true),
+            Some(setup("Hard", Some(SetupSource::PitStop)))
+        );
         info.setup = Some(arb("Soft"));
         assert_eq!(convert(&info, false, false), Some(setup("Soft", None)));
 
@@ -4165,6 +4191,41 @@ mod tests {
         // Setup logging turned off: nothing to send
         info.setup = None;
         assert_eq!(convert(&info, false, false), None);
+    }
+
+    /// A new event's first update has scoring, whenever the last one went: the recording is cleared
+    /// with it, and the scoring says which car is the player's before the setup is written.
+    #[test]
+    fn a_new_event_starts_with_scoring() {
+        use super::super::sdk::{Value, Vars};
+        use super::super::session::Driver;
+        let mut info = SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: HashMap::from([(0, Driver::default())]),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let mut converter = Converter::default();
+        let mut convert = |info: &SessionInfo, time: f64| {
+            let (vars, data) = Vars::of(&[
+                ("SessionTime", Value::Double(time)),
+                ("SessionNum", Value::Int(0)),
+                ("PlayerCarIdx", Value::Int(0)),
+                ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
+                ("CarIdxLapCompleted", Value::Ints(vec![2])),
+            ]);
+            converter
+                .convert(&Frame::new(&vars, &data), info, start)
+                .unwrap()
+        };
+        assert!(convert(&info, 1.0).scoring.is_some());
+        // The same instant: no scoring yet
+        assert!(convert(&info, 2.0).scoring.is_none());
+        info.event = (Some(1), None, None);
+        let update = convert(&info, 3.0);
+        assert!(update.new_event);
+        assert!(update.scoring.is_some());
     }
 
     /// The out lap is the game's -1 laps done: the standings keep it, so the line that ends the out
