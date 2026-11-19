@@ -355,6 +355,9 @@ fn read(name: &str, dir: &Path, stop: &AtomicBool, mut source: Box<dyn Source>) 
     let mut retry_delay = RETRY;
     let mut warned_recorder = false;
     let mut healthy_since = None::<Instant>;
+    // The setup of an update the recorder couldn't start for: the game doesn't send it again until
+    // it changes
+    let mut pending_setup = None::<Setup>;
 
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
@@ -382,6 +385,14 @@ fn read(name: &str, dir: &Path, stop: &AtomicBool, mut source: Box<dyn Source>) 
             }
             Read::Update(update) => update,
         };
+        let mut update = update;
+        // A newer setup, or another event's, replaces it
+        if update.setup.is_some() || update.new_event {
+            pending_setup = None;
+        }
+        if update.setup.is_none() {
+            update.setup = pending_setup.take();
+        }
 
         // Only once there's something to record, so menus leave no empty database.
         // A failed writer resumes the same recording, preserving earlier sessions.
@@ -391,6 +402,7 @@ fn read(name: &str, dir: &Path, stop: &AtomicBool, mut source: Box<dyn Source>) 
                 None => Recorder::new(dir, None).map(|new| recorder = Some(new)),
             };
             if let Err(e) = result {
+                pending_setup = update.setup.take();
                 if !warned_recorder {
                     log::error!("Error starting to record {name}: {e}");
                     warned_recorder = true;
@@ -564,6 +576,81 @@ mod tests {
         assert!(sim.stopped.is_none());
         assert!(!dir.path().join(DATABASE).exists());
         sim.database(false);
+    }
+
+    /// A game whose first update has its setup, and the ones after it none (it's sent once until
+    /// it changes). Its second read unblocks the recording's folder.
+    struct SetupOnce {
+        reads: usize,
+        blocker: PathBuf,
+    }
+
+    impl Source for SetupOnce {
+        fn read(&mut self, _: Instant) -> Read {
+            self.reads += 1;
+            if self.reads == 2 {
+                std::fs::remove_file(&self.blocker).unwrap();
+            }
+            let mut session = bono_session_info::default();
+            session.session_time = Some(self.reads as f64).into();
+            let mut standing = bono_standing::default();
+            standing.vehicle_id = Some(1).into();
+            standing.is_player = Some(true).into();
+            let mut telemetry = bono_telemetry::default();
+            telemetry.vehicle_id = Some(1).into();
+            telemetry.session_time = Some(self.reads as f64).into();
+            let setup = (self.reads == 1).then(|| Setup {
+                settings: vec![bono_sim::setup::Setting {
+                    name: "VM_REAR_WING".into(),
+                    value: "P5".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            Read::Update(Update {
+                telemetry: vec![telemetry],
+                scoring: Some((session, vec![standing])),
+                new_event: false,
+                setup,
+            })
+        }
+    }
+
+    /// The recorder couldn't start for the update with the setup: no game sends it again until it
+    /// changes, so it's recorded once the recorder does start.
+    #[test]
+    fn a_setup_waits_for_the_recorder_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("recording");
+        // A file where the folder goes: the recorder can't start until it's gone
+        std::fs::write(&folder, b"").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = std::thread::spawn({
+            let (folder, stop) = (folder.clone(), stop.clone());
+            move || {
+                let source = SetupOnce {
+                    reads: 0,
+                    blocker: folder.clone(),
+                };
+                read("Test", &folder, &stop, Box::new(source));
+            }
+        });
+
+        let deadline = Instant::now() + RETRY * 10;
+        let sets = || -> i64 {
+            rusqlite::Connection::open_with_flags(
+                folder.join(DATABASE),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .and_then(|conn| conn.query_row("SELECT count(*) FROM setup_set", [], |r| r.get(0)))
+            .unwrap_or(0)
+        };
+        while sets() == 0 {
+            assert!(Instant::now() < deadline, "the setup was never recorded");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::Relaxed);
+        thread.join().unwrap();
     }
 
     #[test]
