@@ -731,9 +731,13 @@ impl Converter {
         // Out on track: in the world, off pit road. A car not in the world (the player watching,
         // on the way from the garage to the car) hasn't left the garage yet
         let in_world = frame.i32("PlayerTrackSurface") != Some(NOT_IN_WORLD);
+        // Nor has a car on the grid, which leaving the garage for a race goes straight to
+        let before_green = frame
+            .i32("SessionState")
+            .is_some_and(|state| state < STATE_RACING);
         if in_garage {
             self.from_garage = true;
-        } else if in_world && !on_pit_road {
+        } else if in_world && !on_pit_road && !before_green {
             self.from_garage = false;
         }
         if info.setup == self.last_setup {
@@ -4206,6 +4210,62 @@ mod tests {
         // Setup logging turned off: nothing to send
         info.setup = None;
         assert_eq!(convert(&info, false, false, true), None);
+    }
+
+    /// Leaving the garage for the grid, the car is in the world and off pit road at once: the setup
+    /// sent then is still the garage's, until the race goes green.
+    #[test]
+    fn leaving_the_garage_for_the_grid_is_the_garages() {
+        use super::super::sdk::{Value, Vars};
+        use super::super::session::Driver;
+        let arb = |value: &str| PlayerSetup {
+            settings: vec![("Chassis/Front/ArbSize".into(), value.into())],
+            ..Default::default()
+        };
+        let mut info = SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: HashMap::from([(0, Driver::default())]),
+            setup: Some(arb("Soft")),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let mut converter = Converter::default();
+        let mut time = 0.0;
+        let mut source = |info: &SessionInfo, garage: bool, state: i32| {
+            time += 1.0;
+            let (vars, data) = Vars::of(&[
+                ("SessionTime", Value::Double(time)),
+                ("SessionNum", Value::Int(0)),
+                ("SessionState", Value::Int(state)),
+                ("PlayerCarIdx", Value::Int(0)),
+                ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
+                ("CarIdxLapCompleted", Value::Ints(vec![0])),
+                ("IsInGarage", Value::Bool(garage)),
+                ("OnPitRoad", Value::Bool(false)),
+                ("PlayerTrackSurface", Value::Int(3)),
+            ]);
+            converter
+                .convert(&Frame::new(&vars, &data), info, start)
+                .unwrap()
+                .setup
+                .map(|setup| setup.source)
+        };
+        assert_eq!(
+            source(&info, true, STATE_GET_IN_CAR),
+            Some(Some(SetupSource::Garage))
+        );
+        // On the grid, before the green
+        assert_eq!(source(&info, false, STATE_GET_IN_CAR), None);
+        info.setup = Some(arb("Medium"));
+        assert_eq!(
+            source(&info, false, STATE_PARADE_LAPS),
+            Some(Some(SetupSource::Garage))
+        );
+        // Racing: out on track, where it was changed isn't known
+        assert_eq!(source(&info, false, STATE_RACING), None);
+        info.setup = Some(arb("Hard"));
+        assert_eq!(source(&info, false, STATE_RACING), Some(None));
     }
 
     /// A new event's first update has scoring, whenever the last one went: the recording is cleared
