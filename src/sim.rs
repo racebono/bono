@@ -325,15 +325,18 @@ impl PluginStatus {
     }
 
     /// Whether the installed copy is older than the one that comes with the app, another build of
-    /// its version, or too old to say its version: what it records may not be what the app reads.
-    /// Without the app's copy, or its version, there's nothing to tell it by, and a copy with the
-    /// same contents is the app's, whatever its version reads as.
+    /// its version, its version with other code (see `unexpected_code`), or too old to say its
+    /// version: what it records may not be what the app reads. Without the app's copy, or its
+    /// version, there's nothing to tell it by, and a copy with the same contents is the app's,
+    /// whatever its version reads as.
     pub fn outdated(&self) -> bool {
         if self.same_as_bundled == Some(true) {
             return false;
         }
         match (&self.installed, self.bundled_version()) {
-            (Some(Some(installed)), Some(latest)) => latest.replaces(installed),
+            (Some(Some(installed)), Some(latest)) => {
+                latest.replaces(installed) || self.unexpected_code()
+            }
             (Some(None), Some(_)) => true,
             _ => false,
         }
@@ -938,6 +941,18 @@ mod tests {
         assert!(status(version(0), version(1)).outdated());
         assert!(!status(version(1), version(1)).outdated());
         assert!(!status(version(2), version(1)).outdated());
+        // Its version, but other code
+        let other_code = PluginStatus {
+            same_as_bundled: Some(false),
+            ..status(version(1), version(1))
+        };
+        assert!(other_code.outdated());
+        // Another version is expected to be other code: only the version tells
+        let newer = PluginStatus {
+            same_as_bundled: Some(false),
+            ..status(version(2), version(1))
+        };
+        assert!(!newer.outdated());
         // Too old to say its version
         assert!(status(Some(None), version(1)).outdated());
         // The app's own copy, whatever its version reads as

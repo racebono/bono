@@ -233,7 +233,7 @@ fn plugin_status(ui: &mut egui::Ui, plugin: &PluginStatus) {
                     t!("plugin.outdated", version = version, latest = latest),
                 );
             }
-            Some(latest) if latest == version => {
+            Some(latest) if latest == version && !plugin.unexpected_code() => {
                 ui.label(t!("plugin.up_to_date", version = version));
             }
             _ => {
