@@ -965,7 +965,10 @@ const MIN_VOICED: usize = 16000 / 10;
 fn voiced(samples: &[f32]) -> bool {
     let loud = (samples.chunks(FRAME))
         .filter(|frame| {
-            let power = frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32;
+            let len = frame.len() as f32;
+            // Around its mean: some inputs record silence offset from zero
+            let mean = frame.iter().sum::<f32>() / len;
+            let power = frame.iter().map(|s| (s - mean).powi(2)).sum::<f32>() / len;
             power > SILENCE * SILENCE
         })
         .count();
@@ -1803,14 +1806,19 @@ mod tests {
     fn silence_isnt_transcribed() {
         // A tone `amplitude` loud, for `secs`, after a second of `floor`
         let recording = |floor: f32, amplitude: f32, secs: f32| {
-            let tone = (0..(16000.0 * secs) as usize)
-                .map(|i| amplitude * (i as f32 * 0.1).sin());
+            let tone = (0..(16000.0 * secs) as usize).map(|i| amplitude * (i as f32 * 0.1).sin());
             let floor = (0..16000).map(|i| floor * (i as f32 * 0.37).sin());
             floor.chain(tone).collect::<Vec<_>>()
         };
         // Unplugged, muted, or a quiet room (-63 dBFS)
         assert!(!voiced(&[0.0; 3 * 16000]));
         assert!(!voiced(&recording(0.001, 0.001, 2.0)));
+        // An input whose silence is offset from zero
+        let offset = recording(0.001, 0.001, 2.0)
+            .iter()
+            .map(|s| s + 0.05)
+            .collect::<Vec<_>>();
+        assert!(!voiced(&offset));
         // A click of the button
         assert!(!voiced(&recording(0.001, 0.5, 0.02)));
         // Something said, even quietly (-43 dBFS), over a room's noise
