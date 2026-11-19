@@ -4748,13 +4748,22 @@ pub(super) fn setup_history(
     {
         return Ok(None);
     }
-    // A set is dated by the latest telemetry row of any car: the lap is the player's at that row
+    // A set is dated by the latest telemetry row of any car: the lap is the player's at that row.
+    // Looked up once a set, apart from its settings: the player's last row can be far back (on
+    // iRacing it writes none while the car is in the garage, as the others go on)
+    let laps = conn
+        .prepare_cached(
+            "SELECT s.id, (SELECT t.lap FROM telemetry t WHERE t.id <= s.telemetry_id
+                           AND t.is_player = 1 ORDER BY t.id DESC LIMIT 1)
+             FROM setup_set s",
+        )?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?
+        .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
     let mut stmt = conn.prepare_cached(
         "SELECT s.id, s.vehicle_id, s.telemetry_id, s.session_time, s.file_name, s.modified,
-                s.source,
-                (SELECT t.lap FROM telemetry t WHERE t.id <= s.telemetry_id AND t.is_player = 1
-                 ORDER BY t.id DESC LIMIT 1),
-                r.name, r.value, r.step, r.min_step, r.max_step, r.saved_value
+                s.source, r.name, r.value, r.step, r.min_step, r.max_step, r.saved_value
          FROM setup_set s LEFT JOIN setup r ON r.setup_set_id = s.id
          ORDER BY s.id, r.name",
     )?;
@@ -4780,7 +4789,7 @@ pub(super) fn setup_history(
             }
             telemetry_id = row.get(2)?;
             session_time = row.get(3)?;
-            lap = row.get(7)?;
+            lap = laps.get(&id).copied().flatten();
             source = row.get(6)?;
             let h = history.get_or_insert_default();
             h.file_name = row.get(4)?;
@@ -4794,15 +4803,15 @@ pub(super) fn setup_history(
             continue;
         };
         // A set with no settings of its own (its file name or modified flag changed)
-        let Some(name) = row.get::<_, Option<String>>(8)? else {
+        let Some(name) = row.get::<_, Option<String>>(7)? else {
             continue;
         };
         let new = SetupValue {
-            value: row.get(9)?,
-            step: row.get(10)?,
-            min_step: row.get(11)?,
-            max_step: row.get(12)?,
-            saved_value: row.get(13)?,
+            value: row.get(8)?,
+            step: row.get(9)?,
+            min_step: row.get(10)?,
+            max_step: row.get(11)?,
+            saved_value: row.get(12)?,
         };
         let old = h.now.remove(&name);
         let old_value = old.as_ref().and_then(|(old, _)| old.value.clone());

@@ -239,7 +239,8 @@ this lap.
 **`setup_now`**, one row per setting of the player's garage setup, as the game shows it: `name`,
 `value` (the game's display text, units and all); `step`, `min_step`, `max_step` (the top step) and
 `saved_value` (what the loaded setup file says), which only LMU gives; `changed_lap` (this
-session's lap of the setting's latest change; NULL when it changed in an earlier session). It
+session's lap of the setting's latest change, or of when the setup was first recorded if it hasn't
+changed since; NULL when that was in an earlier session). It
 covers the whole recording, not only this session, since the setup carries over.
 
 **`setup_changes`**, one row per setting change after the first setup: `name`, `lap` (this
@@ -248,10 +249,11 @@ session), `stint_id` (in `stints`; NULL for a change in an earlier session), `ol
 setting is gone), `source` (`garage`, `pit stop`, or NULL when not known), `session_time_s`.
 
 **The car setup.** The snapshot's `SETUP` line says whether the game reports the garage setup,
-its file name and whether it's been changed since it was loaded, and how many settings have
-changed since the first setup. A conversation's first snapshot, and the first after the setup's
-setting names change, also has `SETUP NAMES`: every setting's exact name, with each `{a,b}`
-standing for each of its items. Query `setup_now` and `setup_changes` by those names; if they
+its file name and whether it's been changed since it was loaded, and how many changes
+there have been since the first setup (one setting changed twice counts twice; `setup_changes` says
+which). A conversation's first snapshot, and the first after the setup's setting names change or
+earlier messages are dropped, also has `SETUP NAMES`: every setting's exact name, with each `{a,b}`
+standing for each of its items, and `parent: a, b` for `parent/a` and `parent/b`. Query `setup_now` and `setup_changes` by those names; if they
 aren't in the conversation, `SELECT name FROM setup_now` lists them.
 
 - **iRacing** names are paths, `Section/Corner/Setting`, and they differ from car to car: use the
