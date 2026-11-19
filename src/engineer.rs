@@ -403,6 +403,9 @@ struct SessionState {
     /// The game session the conversation is about (track, session type and number), for
     /// `auto_session`
     game_session: Option<String>,
+    /// A hash of the setup's setting names this conversation was last shown (see
+    /// [`EngineerTool::question_with_snapshot`]): None until it's shown them
+    setup_outline: Option<u64>,
 }
 
 impl Engineer {
@@ -862,7 +865,11 @@ impl Engineer {
         let task = Task::spawn(async move {
             let mut state = state.lock().await;
             state.follow_game_session(auto_session).await;
-            let question = state.tool.question_with_snapshot(question).await;
+            let mut outline_shown = state.setup_outline;
+            let question = state
+                .tool
+                .question_with_snapshot(question, &mut outline_shown)
+                .await;
             let question = match &note {
                 Some(note) => format!("{question}\n\n{note}"),
                 None => question,
@@ -882,6 +889,14 @@ impl Engineer {
                 .await;
             if reply.is_ok() {
                 timeline.answered();
+            }
+            // The names are in the conversation only once the turn is kept in it: a turn that
+            // failed, was refused or was stopped shows them again next time
+            if reply
+                .as_ref()
+                .is_ok_and(|reply| reply.stop != StopReason::Refusal)
+            {
+                state.setup_outline = outline_shown;
             }
             reply
             // The speech's text ends here, with the turn
@@ -1369,6 +1384,7 @@ impl Engineer {
                 pool,
                 sim,
                 game_session: None,
+                setup_outline: None,
             })),
         })
     }
@@ -1431,6 +1447,7 @@ impl SessionState {
             if auto_session && self.game_session.is_some() {
                 log::info!("New game session: the engineer starts over");
                 self.conversation.reset();
+                self.setup_outline = None;
             }
             self.game_session = Some(current.key.clone());
         }
@@ -2559,6 +2576,7 @@ mod tests {
                     tool: first.clone(),
                     sim: "lmu",
                     game_session: None,
+                    setup_outline: None,
                 })),
             });
             engineer.follow_recording(&rt, Some(&mut *sim));
@@ -2700,6 +2718,7 @@ mod tests {
                     pool,
                     sim: "test",
                     game_session: None,
+                    setup_outline: None,
                 })),
             });
             Self {
@@ -2930,6 +2949,7 @@ mod tests {
                 pool,
                 sim: "lmu",
                 game_session: None,
+                setup_outline: None,
             };
 
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2942,7 +2962,10 @@ mod tests {
                 state.game_session.as_deref(),
                 Some("Circuit de la Sarthe|practice|1")
             );
+            // Names already shown in this conversation, still known in the same game session
+            state.setup_outline = Some(7);
             state.follow_game_session(auto_session).await;
+            assert_eq!(state.setup_outline, Some(7));
 
             let mut race = session("race", 1);
             race.session_end_time = Some(5400.0).into();
@@ -2953,6 +2976,9 @@ mod tests {
                 state.game_session.as_deref(),
                 Some("Circuit de la Sarthe|race|1")
             );
+            // A conversation started over shows them again
+            let shown_again = state.setup_outline.is_none();
+            assert_eq!(shown_again, auto_session);
 
             let recorded = recorded.lock().unwrap();
             // Told every turn, so a lease ended meanwhile is started again
