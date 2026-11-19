@@ -104,10 +104,11 @@ pub struct Checked {
     pub trigger: Option<bool>,
     pub until: Option<bool>,
     pub stale_after: Option<bool>,
-    /// The last progress snapshot published when the trigger's and the `until`'s were checked: a
-    /// later one was measured after that check
+    /// The last progress snapshot published when the trigger's, the `until`'s and the
+    /// `stale_after`'s were checked: a later one was measured after that check
     pub trigger_seq: u64,
     pub until_seq: u64,
+    pub stale_seq: u64,
 }
 
 /// A change a turn makes to the schedule, applied once the turn finishes
@@ -568,8 +569,13 @@ impl Schedule {
                     let until_missed = self
                         .until_missed_start(&new)
                         .or(old.until_missed_start.filter(|_| same_until));
-                    let (trigger_checked, until_checked) =
-                        (new.checked.trigger_seq, new.checked.until_seq);
+                    let (trigger_checked, until_checked, stale_checked) = (
+                        new.checked.trigger_seq,
+                        new.checked.until_seq,
+                        new.checked.stale_seq,
+                    );
+                    let same_stale =
+                        *new.stale_after.as_ref().unwrap_or(&DEFAULT_STALE) == old.stale_after;
                     let mut request = self.request(id, new, since, progress.epoch);
                     request.made = old.made;
                     request.waiting = old.waiting;
@@ -588,11 +594,19 @@ impl Schedule {
                         }
                         request.rose_in_batch = old.rose_in_batch;
                     }
-                    // The same for the same `until`
+                    // The same for the same `until`, and the same `stale_after`
                     if same_until
                         && let (Some(slot), Some(old_slot)) =
                             (&mut request.until_slot, &old.until_slot)
                         && old_slot.seen > until_checked
+                    {
+                        slot.last = old_slot.last;
+                        slot.seen = old_slot.seen;
+                    }
+                    if same_stale
+                        && let (Some(slot), Some(old_slot)) =
+                            (&mut request.stale_slot, &old.stale_slot)
+                        && old_slot.seen > stale_checked
                     {
                         slot.last = old_slot.last;
                         slot.seen = old_slot.seen;
@@ -676,8 +690,16 @@ impl Schedule {
 
         let mut kept = Vec::with_capacity(self.requests.len());
         for mut request in std::mem::take(&mut self.requests) {
-            // Its answers on their way: nothing more happens to it
+            // Its answers on their way: only whether they're out of date is still checked, and a
+            // condition for it that keeps failing still drops it
             if !request.pending() {
+                if let Some(slot) = &mut request.stale_slot {
+                    slot.observe(progress, epoch_changed);
+                    if slot.failures >= CONDITION_FAILURES {
+                        advance.dropped.push((request.id, request.instruction));
+                        continue;
+                    }
+                }
                 kept.push(request);
                 continue;
             }
@@ -1044,7 +1066,7 @@ impl Schedule {
             instruction: new.instruction,
             trigger_slot: self.slot(&new.trigger, checked.trigger, checked.trigger_seq),
             until_slot: until,
-            stale_slot: self.slot(&stale_after, checked.stale_after, 0),
+            stale_slot: self.slot(&stale_after, checked.stale_after, checked.stale_seq),
             made: new.made,
             trigger: new.trigger,
             repeat: new.repeat,
@@ -2942,6 +2964,54 @@ mod tests {
         // Its last firing is answered, and it's done
         assert_eq!(run.answer(), [id]);
         assert_eq!(run.schedule.len(), 0);
+    }
+
+    #[test]
+    fn an_answered_request_whose_stale_condition_keeps_failing_is_dropped() {
+        let mut run = Run::new();
+        let mut new = request(Trigger::Laps { count: 1 }, Repeat::Once, &laps(0));
+        new.stale_after = Some(condition("SELECT 1"));
+        let id = run.add(new);
+        let [stale] = run.condition_ids()[..] else {
+            panic!("one condition")
+        };
+        run.tick(with(laps(1), stale, ConditionState::False));
+        let batch = run.take();
+        // Answered, its answer waiting to play
+        run.schedule.answered(&batch.fired);
+        let mut dropped = Vec::new();
+        for _ in 0..CONDITION_FAILURES {
+            let advance = run.tick(with(laps(1), stale, ConditionState::Failed));
+            dropped.extend(advance.dropped.into_iter().map(|(id, _)| id));
+        }
+        assert_eq!(dropped, [id]);
+        assert!(run.schedule.is_gone(&batch.fired));
+    }
+
+    #[test]
+    fn a_replace_keeps_the_newer_state_of_the_same_stale_condition() {
+        let mut run = Run::new();
+        let stale = || Some(condition("SELECT 2"));
+        let mut new = request(Trigger::Laps { count: 1 }, every(), &laps(0));
+        new.stale_after = stale();
+        let id = run.add(new);
+        let [cond] = run.condition_ids()[..] else {
+            panic!("one condition")
+        };
+        run.tick(with(laps(0), cond, ConditionState::False));
+        // A pilot turn rewords it, its stale condition checked false; then a snapshot sees it true
+        let checked = run.last.clone();
+        let mut replacing = request(Trigger::Laps { count: 1 }, every(), &checked);
+        replacing.stale_after = stale();
+        replacing.checked.stale_after = Some(false);
+        replacing.checked.stale_seq = checked.seq;
+        run.tick(with(laps(0), cond, ConditionState::True));
+        let now = run.last.clone();
+        run.schedule
+            .apply(vec![Change::Replace(id, replacing)], &now);
+        // Its firing before the new condition's first check: out of date, as the old one saw
+        let advance = run.tick(laps(1));
+        assert_eq!(advance.skipped_stale, 1);
     }
 
     #[test]

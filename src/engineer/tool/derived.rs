@@ -3631,8 +3631,25 @@ impl Stream {
     }
 
     /// Writes the tables of how things are now, and says what it couldn't: one car's trouble isn't
-    /// the others', and a query is better off told than given an empty field.
+    /// the others', and a query is better off told than given an empty field. If it fails, they're
+    /// left empty: rolled back, they'd be the last refresh's, maybe of another epoch.
     pub fn refresh_now(
+        &mut self,
+        conn: &Connection,
+        shared: &Shared,
+    ) -> anyhow::Result<Option<String>> {
+        let refreshed = self.write_refresh(conn, shared);
+        if refreshed.is_err() {
+            for table in NOW_TABLES {
+                if let Err(e) = conn.execute(&format!("DELETE FROM {table}"), []) {
+                    log::debug!("{table} wasn't emptied after a failed refresh: {e}");
+                }
+            }
+        }
+        refreshed
+    }
+
+    fn write_refresh(
         &mut self,
         conn: &Connection,
         shared: &Shared,

@@ -263,7 +263,7 @@ impl ScheduleTool {
         let mut notes = String::new();
         let mut checked = Checked::default();
         // The snapshot when each was checked: one after it was measured after that check
-        let (mut trigger_seq, mut until_seq) = (0, 0);
+        let (mut trigger_seq, mut until_seq, mut stale_seq) = (0, 0, 0);
         for (field, trigger, note, result) in [
             (
                 "trigger",
@@ -298,7 +298,7 @@ impl ScheduleTool {
             match field {
                 "trigger" => trigger_seq = at,
                 "until" => until_seq = at,
-                _ => {}
+                _ => stale_seq = at,
             }
             if holds {
                 notes.push_str(&format!(
@@ -306,7 +306,8 @@ impl ScheduleTool {
                 ));
             }
         }
-        (checked.trigger_seq, checked.until_seq) = (trigger_seq, until_seq);
+        (checked.trigger_seq, checked.until_seq, checked.stale_seq) =
+            (trigger_seq, until_seq, stale_seq);
         new.checked = checked;
         Ok(notes)
     }

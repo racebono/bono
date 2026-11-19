@@ -1006,7 +1006,14 @@ impl Engineer {
                 Change::Cancel(_) => None,
             })
             .max_by_key(|made| made.seq);
-        let Some(progress) = self.progress.as_ref().or(made).cloned() else {
+        // The newer of the two: one the turn used may be newer than any stepped through (published
+        // and taken away unread while the tables caught up), and applying at an older one could
+        // take its weekend for the one before
+        let newest = match (self.progress.as_ref(), made) {
+            (Some(stepped), Some(made)) if made.seq > stepped.seq => Some(made),
+            (stepped, made) => stepped.or(made),
+        };
+        let Some(progress) = newest.cloned() else {
             log::warn!("No progress to apply the turn's changes to the requests at");
             return;
         };
