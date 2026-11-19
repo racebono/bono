@@ -4729,6 +4729,7 @@ pub(super) struct SetAt {
     pub session_number: Option<i64>,
     pub player_row: Option<i64>,
     pub lap: Option<i64>,
+    pub player_time: Option<f64>,
 }
 
 /// This session: where its rows start, and its type and number.
@@ -4743,8 +4744,16 @@ impl SetAt {
     /// The player's lap, if it's one of this session's: before the player drives in a session,
     /// their rows are still the last one's.
     fn lap_in(&self, session: &SessionRows) -> Option<i64> {
+        // Until they drive in it, their latest row is ahead of its clock (which started again):
+        // the last session's
+        let not_ahead = self
+            .player_time
+            .zip(self.session_time)
+            .is_none_or(|(player, set)| player <= set + 1.0);
         self.lap.filter(|_| {
-            self.in_session(session) && self.player_row.is_some_and(|row| row >= session.first)
+            self.in_session(session)
+                && not_ahead
+                && self.player_row.is_some_and(|row| row >= session.first)
         })
     }
 
@@ -4811,13 +4820,17 @@ pub(super) fn setup_history(
     // many rows
     let player_rows = conn
         .prepare_cached(
-            "SELECT s.id, s.player_telemetry_id, t.lap
+            "SELECT s.id, s.player_telemetry_id, t.lap, t.session_time
              FROM setup_set s LEFT JOIN telemetry t ON t.id = s.player_telemetry_id",
         )?
         .query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                (row.get::<_, Option<i64>>(1)?, row.get::<_, Option<i64>>(2)?),
+                (
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<f64>>(3)?,
+                ),
             ))
         })?
         .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
@@ -4848,7 +4861,7 @@ pub(super) fn setup_history(
             if whole {
                 history = Some(SetupHistory::default());
             }
-            let (player_row, lap) = player_rows.get(&id).copied().unwrap_or_default();
+            let (player_row, lap, player_time) = player_rows.get(&id).copied().unwrap_or_default();
             at = SetAt {
                 telemetry_id: row.get(2)?,
                 session_time: row.get(3)?,
@@ -4856,6 +4869,7 @@ pub(super) fn setup_history(
                 session_number: row.get(14)?,
                 player_row,
                 lap,
+                player_time,
             };
             source = row.get(6)?;
             let h = history.get_or_insert_default();
@@ -9428,6 +9442,43 @@ mod tests {
         )
         .await;
         assert_eq!(changes, [["NULL", "0", "NULL"]]);
+        let now = query(&engineer, "SELECT changed_lap FROM setup_now").await;
+        assert_eq!(now, [["NULL"]]);
+        let state = query(&engineer, "SELECT setup_as_of_lap FROM race_state").await;
+        assert_eq!(state, [["NULL"]]);
+    }
+
+    /// A change in the next session's garage, before the player drives there, is this session's,
+    /// but the player's row it was written with is still the last session's: no lap or stint.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_garage_change_before_the_player_drives_has_no_lap() {
+        let (dir, engineer) = race();
+        let set = (Some("a.sto"), Some(false), Some("garage"));
+        write_setup_set(&dir, Some(1), 1, set, &[("A", Some("1"))]);
+        write_setup_set(&dir, Some(1), 2, set, &[("A", Some("2"))]);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute("UPDATE setup_set SET session_type = 'practice'", [])
+            .unwrap();
+        // Qualifying, as scoring names it, its clock a few seconds in
+        conn.execute(
+            "INSERT INTO session (session_type, session_time) VALUES ('qualifying', 5)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE setup_set SET session_type = 'qualifying', session_time = 5 \
+             WHERE id = (SELECT max(id) FROM setup_set)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let changes = query(
+            &engineer,
+            "SELECT lap, this_session, stint_id FROM setup_changes",
+        )
+        .await;
+        assert_eq!(changes, [["NULL", "1", "NULL"]]);
         let now = query(&engineer, "SELECT changed_lap FROM setup_now").await;
         assert_eq!(now, [["NULL"]]);
         let state = query(&engineer, "SELECT setup_as_of_lap FROM race_state").await;
