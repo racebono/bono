@@ -1855,13 +1855,13 @@ fn setup_outline(names: &[String]) -> String {
     // The one part two parents with the same settings differ in
     let differ = |(a, a_settings): &(Vec<Vec<&str>>, Vec<&str>),
                   (b, b_settings): &(Vec<Vec<&str>>, Vec<&str>)| {
+        // Paths of other lengths are never compared part by part
+        if a_settings != b_settings || a.len() != b.len() {
+            return None;
+        }
         let mut parts = (0..a.len()).filter(|&i| a[i] != b[i]);
-        match (
-            a_settings == b_settings && a.len() == b.len(),
-            parts.next(),
-            parts.next(),
-        ) {
-            (true, Some(i), None) => Some(i),
+        match (parts.next(), parts.next()) {
+            (Some(i), None) => Some(i),
             _ => None,
         }
     };
@@ -3007,6 +3007,24 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(expand(&outline), sorted);
+    }
+
+    /// Paths of different depths, with the same settings or not, each keep their own.
+    #[test]
+    fn paths_of_different_depths_are_outlined() {
+        let mut names = [
+            "Chassis/Front/ArbSize",
+            "Chassis/ArbSize",
+            "Chassis/Rear/Diff/Preload",
+            "Tires/ArbSize",
+            "Brakes/Front/ArbSize",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let mut outlined = expand(&setup_outline(&names));
+        outlined.sort();
+        names.sort();
+        assert_eq!(outlined, names);
     }
 
     #[test]

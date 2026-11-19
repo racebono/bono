@@ -3236,7 +3236,11 @@ impl Stream {
         }
         // Without a player's car too: they're the recording's
         self.write_stints(conn, &fresh, &mut problems);
-        if let Err(e) = write_setup(conn, self.player, self.session_start) {
+        let stints = self
+            .player
+            .and_then(|player| fresh.stints.get(&player))
+            .map_or(&[][..], Vec::as_slice);
+        if let Err(e) = write_setup(conn, self.player, self.session_start, stints) {
             problems.push(format!("setup_now: {e}"));
         }
         if let Err(e) = self.write_drivers(conn) {
@@ -4829,7 +4833,12 @@ pub(super) fn setup_history(
 /// `setup_now`, `setup_changes` and `race_state`'s setup columns. They cover the whole recording,
 /// not only this session: the setup carries over from one to the next. Their laps are this
 /// session's only: a lap number from an earlier session would read as one of this session's.
-fn write_setup(conn: &Connection, player: Option<i64>, session_start: i64) -> rusqlite::Result<()> {
+fn write_setup(
+    conn: &Connection,
+    player: Option<i64>,
+    session_start: i64,
+    stints: &[Segment],
+) -> rusqlite::Result<()> {
     let Some(history) = setup_history(conn, player)? else {
         return Ok(());
     };
@@ -4854,15 +4863,7 @@ fn write_setup(conn: &Connection, player: Option<i64>, session_start: i64) -> ru
             telemetry_id: change.telemetry_id,
         };
         // `stints` are this session's: a change in an earlier one has none
-        let stint = match (player, at.lap_in(session_start)) {
-            (Some(vehicle), Some(lap)) => scalar::<i64>(
-                conn,
-                "SELECT stint_id FROM stints WHERE vehicle_id = ? AND start_lap <= ? \
-                     ORDER BY start_lap DESC LIMIT 1",
-                [vehicle, lap],
-            )?,
-            _ => None,
-        };
+        let stint = setup_stint(stints, at.lap_in(session_start), change.session_time);
         insert(
             conn,
             "setup_changes",
@@ -4887,6 +4888,15 @@ fn write_setup(conn: &Connection, player: Option<i64>, session_start: i64) -> ru
         ],
     )?;
     Ok(())
+}
+
+/// The stint a setup change came in, by its lap and when: none while drivers hand over, or when
+/// that isn't known.
+fn setup_stint(stints: &[Segment], lap: Option<i64>, time: Option<f64>) -> Option<i64> {
+    match place(stints, lap?, time, time) {
+        Place::Stint(i) => Some(stints[i].id),
+        Place::Across | Place::Unknown => None,
+    }
 }
 
 /// Where the newest session starts: the player's clock last went back, on a scan of the whole
@@ -8151,6 +8161,28 @@ mod tests {
         assert_eq!(place(&stints, 2, Some(250.0), Some(260.0)), Place::Stint(0));
         // When it was driven isn't known
         assert_eq!(place(&stints, 4, None, None), Place::Unknown);
+    }
+
+    /// A setup change is its stint's by when it came, not by the first lap wholly in a stint: the
+    /// lap of a driver change belongs to neither.
+    #[test]
+    fn a_setup_change_on_a_driver_change_lap_is_the_new_stints() {
+        let no = (false, false);
+        let spans = spans_of(&[no, no, no]);
+        let stints = stints_of(&spans, &[spell(1, 0.0, 150.0), spell(2, 160.0, 290.0)]);
+        // Lap 1 is the handover's, from 150 s to 160 s
+        assert_eq!(
+            setup_stint(&stints, Some(1), Some(200.0)),
+            Some(stints[1].id)
+        );
+        assert_eq!(
+            setup_stint(&stints, Some(1), Some(120.0)),
+            Some(stints[0].id)
+        );
+        // During the handover, or not known when
+        assert_eq!(setup_stint(&stints, Some(1), Some(155.0)), None);
+        assert_eq!(setup_stint(&stints, None, Some(200.0)), None);
+        assert_eq!(setup_stint(&[], Some(1), Some(200.0)), None);
     }
 
     #[test]
