@@ -452,8 +452,9 @@ that iRacing leaves it NULL for every car.
   (those three LMU only). Each control's highest step, LMU only and NULL where it lacks the control
   or doesn't know an AI car's: `traction_control_max`, `traction_control_slip_max`,
   `traction_control_cut_max`, `abs_max`, `engine_map_max`, `brake_migration_max`,
-  `front_anti_roll_bar_max`, `rear_anti_roll_bar_max`. The car: `steering_wheel_range` (RaceRoom
-  and iRacing: degrees, lock to lock; LMU: unit not documented), `engine_max_rpm` (the rev limit,
+  `front_anti_roll_bar_max`, `rear_anti_roll_bar_max`. The car: `steering_wheel_range` (degrees,
+  lock to lock; iRacing's span and LMU's unit and span aren't documented, and LMU often reports
+  none, so the player's may come from the setup's wheel range and other cars' are often NULL), `engine_max_rpm` (the rev limit,
   not the shift point), `max_gears` (forward gears). DRS: `drs_equipped`, `drs_available` (an
   activation left, not that it can be used here), `drs_activations_left` (this lap; NULL when
   unlimited), `drs_activations_unlimited`, `drs_activations_total` (RaceRoom only), and LMU's
