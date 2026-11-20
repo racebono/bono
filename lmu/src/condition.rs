@@ -203,7 +203,7 @@ impl VehicleCondition {
             }
             state.in_pit_lane = in_pit_lane;
             // LMU often reports 0, which `lmu.cpp` leaves NULL; one it reports is kept. Only in
-            // realtime: in the garage, the setup may be changing
+            // realtime, like the damage: outside it the car may be in the garage, its setup changing
             if state.realtime && telemetry.state.steering_wheel_range.get().is_none() {
                 telemetry.state.steering_wheel_range = state.wheel_range.into();
             }
