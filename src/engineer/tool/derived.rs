@@ -3215,10 +3215,14 @@ impl Stream {
                 if self.judged.remove(&vehicle) {
                     self.awaiting.insert(vehicle, ended);
                 }
-                // The lap starting now, judged by how it starts
+                // The lap starting now, judged by how it starts: with the session green, whatever
+                // flag the car itself is shown
                 if !race
                     && r.i("lap_time_counts").is_some()
-                    && r.text("phase") == Some("green")
+                    && matches!(
+                        r.text("phase"),
+                        Some("green" | "under_yellow" | "under_blue")
+                    )
                     && r.text("finish_status")
                         .is_none_or(|status| status == "none")
                 {
@@ -8051,6 +8055,30 @@ mod tests {
         )
         .await;
         assert_eq!(passes, [["0", "0"], ["1", "1"], ["2", "0"]]);
+    }
+
+    /// A car's own phase is the session's, or a flag shown to it while the session is green
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lap_started_under_a_blue_or_local_yellow_is_line_checked() {
+        for phase in ["under_blue", "under_yellow"] {
+            let (dir, original) = race();
+            drop(original);
+            let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+            conn.execute_batch(&format!(
+                "UPDATE session SET session_type = 'practice';
+                 UPDATE standings SET lap_time_counts = 1, phase = '{phase}', finish_status = 'none';
+                 UPDATE standings SET last_lap_time = NULL WHERE vehicle_id = 1 AND laps_completed = 2;",
+            ))
+            .unwrap();
+            drop(conn);
+            let engineer = reopen(&dir);
+            let laps = query(
+                &engineer,
+                "SELECT lap, invalid FROM lap_stats WHERE vehicle_id = 1 AND complete = 1 ORDER BY lap",
+            )
+            .await;
+            assert_eq!(laps, [["0", "0"], ["1", "1"], ["2", "0"]], "{phase}");
+        }
     }
 
     /// Car 1's lap 1 (from 100 s, 100 s long) and a corner pass of it, once the standings have
