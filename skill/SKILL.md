@@ -441,8 +441,8 @@ the gaps don't add up to the time behind the leader. While the race runs, the pl
 happens rather than at the line. iRacing's own places change only as cars cross the line: a car out
 of the world, back in it, towed or gone back over the line since it last crossed it, or yet to
 cross the line for the first time keeps its order in them (behind the cars iRacing had ahead of it,
-and any with more laps done) until it's driven over the line, and a car that has finished takes its
-own a few seconds after the line.
+and any with more laps done) until it's next driven to the end of a lap, and a car that has finished
+takes its own a few seconds after the line.
 Before the green, and after the flag when who won or who has finished can't be told, the places are
 iRacing's (or the grid's). Two cars that have changed order on the road since the line, with one of
 them keeping iRacing's place or in the pit lane, may have no gap between them or iRacing's from
