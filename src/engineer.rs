@@ -4114,7 +4114,8 @@ mod tests {
             let telemetry = bono_telemetry {
                 vehicle_id: Some(1).into(),
                 session_time: Some(t).into(),
-                lap: Some(laps).into(),
+                // On the lap after those done, as the game counts from lap 1
+                lap: Some(laps + 1).into(),
                 lap_distance: Some(t * 10.0).into(),
                 speed: Some(10.0).into(),
                 ..Default::default()
