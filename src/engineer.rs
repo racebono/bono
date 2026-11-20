@@ -38,6 +38,7 @@ use tokio::{
 };
 use tool::{ConditionId, Engineer as EngineerTool, Progress, SKILL, instructions};
 
+mod pit;
 mod schedule;
 mod timeline;
 mod tool;
