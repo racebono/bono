@@ -180,11 +180,9 @@ impl PitTool {
         let when = match timing(before.position, before.iracing_tyres) {
             Timing::ThisStop => "this stop",
             Timing::NextStop => "the next stop",
-            Timing::ThisStopOrLost => {
-                "this stop if the crew hasn't done it yet; otherwise it's lost, as iRacing clears                  the pit menu when the stop ends (set it again once back on track)"
-            }
             Timing::Lost => {
-                "not kept: iRacing ticks every service again as the car leaves the pits (set it                  again once back on track)"
+                "not kept: iRacing ticks every service again as the car leaves the pits (set it \
+                 again once back on track)"
             }
             Timing::Unknown => "unknown (say you're not sure which stop)",
         };
@@ -287,7 +285,8 @@ pub fn options_text(menu: &PitMenu) -> String {
         if menu.iracing_tyres {
             line(
                 "iRacing",
-                "one compound for every tyre fitted; a pressure only for a tyre being changed;                  every service is ticked again as the car leaves the pits"
+                "one compound for every tyre fitted; a pressure only for a tyre being changed; \
+                 every service is ticked again as the car leaves the pits"
                     .into(),
             );
         }
@@ -442,9 +441,9 @@ mod tests {
         assert!(text.contains("FL \"Wet\" new"), "{text}");
         assert!(!text.contains("Not taken"), "{text}");
 
-        // iRacing: too late or lost while stopped, lost leaving the pits
+        // iRacing: this stop while stopped, lost once serviced or leaving the pits
         for (position, says) in [
-            (Position::Stopped, "this stop if the crew hasn't done it yet"),
+            (Position::Stopped, "Applied for: this stop"),
             (Position::Exiting, "not kept"),
         ] {
             let mut menu = crate::sim::pit::tests::iracing_menu();
@@ -455,6 +454,10 @@ mod tests {
                 .unwrap();
             assert!(text.contains(says), "{text}");
             assert!(!text.contains("next stop"), "{text}");
+            // A broken line continuation leaves runs of spaces in what the model reads
+            assert!(!text.contains("  "), "{text}");
+            let options = options_text(&crate::sim::pit::tests::iracing_menu());
+            assert!(!options.contains("  "), "{options}");
         }
     }
 

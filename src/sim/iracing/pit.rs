@@ -124,15 +124,17 @@ fn parse(frame: &Frame, tires: &HashMap<i64, String>, fuel_capacity: Option<f64>
     }
 }
 
-/// Where the car is: in the pit lane, its service tells stopping from leaving.
+/// Where the car is: in the pit lane, its service tells stopping from leaving. A car whose
+/// service is complete counts as leaving, even still in its box: iRacing has cleared what was
+/// ticked, and ticks every service again as it drives off.
 fn position(frame: &Frame) -> Position {
     if frame.bool("OnPitRoad") != Some(true) {
         return Position::OnTrack;
     }
     match frame.i32("PlayerCarPitSvStatus") {
         Some(PIT_SV_IN_PROGRESS) => Position::Stopped,
-        _ if frame.bool("PlayerCarInPitStall") == Some(true) => Position::Stopped,
         Some(PIT_SV_COMPLETE) => Position::Exiting,
+        _ if frame.bool("PlayerCarInPitStall") == Some(true) => Position::Stopped,
         _ => Position::Entering,
     }
 }
@@ -272,6 +274,8 @@ mod tests {
         assert_eq!(at(0, true), Position::Stopped);
         assert_eq!(at(PIT_SV_IN_PROGRESS, true), Position::Stopped);
         assert_eq!(at(PIT_SV_COMPLETE, false), Position::Exiting);
+        // Serviced, still in the box: what's set now is cleared, as when it drives off
+        assert_eq!(at(PIT_SV_COMPLETE, true), Position::Exiting);
     }
 
     #[test]

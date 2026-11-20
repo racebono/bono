@@ -48,21 +48,21 @@ pub enum Position {
 pub enum Timing {
     ThisStop,
     NextStop,
-    /// Set mid-service (iRacing): this stop if the crew hasn't done that part yet, else lost
-    ThisStopOrLost,
-    /// iRacing ticks every service again as the car leaves the pits
+    /// iRacing clears what's ticked when the service ends, and ticks every service again as the
+    /// car leaves the pits
     Lost,
     Unknown,
 }
 
 /// Which stop a change made while the car is at `position` counts for. Seen in both games: a
 /// change made entering the pit lane is still set when the service starts. Once stopped, LMU
-/// keeps it for the next stop; iRacing clears everything when the service ends and ticks every
+/// keeps it for the next stop, while iRacing's crew still does it at this one (what's ticked
+/// mid-service is serviced); iRacing then clears everything when the service ends and ticks every
 /// service again as the car leaves the pits.
 pub fn timing(position: Position, iracing: bool) -> Timing {
     match position {
         Position::OnTrack | Position::StopRequested | Position::Entering => Timing::ThisStop,
-        Position::Stopped if iracing => Timing::ThisStopOrLost,
+        Position::Stopped if iracing => Timing::ThisStop,
         Position::Exiting if iracing => Timing::Lost,
         Position::Stopped | Position::Exiting => Timing::NextStop,
         Position::Unknown => Timing::Unknown,
@@ -688,8 +688,9 @@ pub mod tests {
         // LMU keeps what's set once stopped for the next stop
         assert_eq!(timing(Position::Stopped, false), Timing::NextStop);
         assert_eq!(timing(Position::Exiting, false), Timing::NextStop);
-        // iRacing clears it all when the service ends, and ticks every service leaving the pits
-        assert_eq!(timing(Position::Stopped, true), Timing::ThisStopOrLost);
+        // iRacing's crew still does what's ticked during the service, then clears it all and
+        // ticks every service leaving the pits
+        assert_eq!(timing(Position::Stopped, true), Timing::ThisStop);
         assert_eq!(timing(Position::Exiting, true), Timing::Lost);
     }
 
