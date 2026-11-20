@@ -3335,9 +3335,6 @@ impl Stream {
         Ok(behind)
     }
 
-    /// The laps `awaiting` an official time that would have come by `now`, the standings' time:
-    /// without one they didn't count, so they're invalid, and so are their corner passes. Not a
-    /// lap through the pit lane, which has no time for that.
     /// The car's newest lap may yet be lost at the line: its verdict is to come, or, a lap the
     /// line is checked for, its count isn't in the standings yet. Not to be taken for clean
     /// evidence until then.
@@ -3374,6 +3371,9 @@ impl Stream {
         }
     }
 
+    /// The laps `awaiting` an official time that would have come by `now`, the standings' time:
+    /// without one they didn't count, so they're invalid, and so are their corner passes. Not a
+    /// lap through the pit lane, which has no time for that.
     fn settle_untimed(&mut self, conn: &Connection, now: f64) -> rusqlite::Result<()> {
         let due = self
             .awaiting
@@ -8185,12 +8185,19 @@ mod tests {
             [],
         )
         .unwrap();
+        // Each row with its lap's start: when the count last changed, as LMU has it
+        let mut lap_start = None;
+        let mut laps_before = None;
         for &(t, laps, last, counts) in rows {
+            if laps_before != Some(laps) {
+                lap_start = Some(t);
+                laps_before = Some(laps);
+            }
             conn.execute(
                 "INSERT INTO standings (epoch, session_time, vehicle_id, is_player, \
-                 laps_completed, last_lap_time, lap_time_counts, phase, finish_status) \
-                 VALUES (1, ?, 1, 1, ?, ?, ?, 'green', 'none')",
-                params![t, laps, last, counts],
+                 laps_completed, last_lap_time, lap_time_counts, phase, finish_status, \
+                 lap_start_time) VALUES (1, ?, 1, 1, ?, ?, ?, 'green', 'none', ?)",
+                params![t, laps, last, counts, lap_start],
             )
             .unwrap();
         }
