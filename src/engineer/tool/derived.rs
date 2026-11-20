@@ -3212,7 +3212,9 @@ impl Stream {
             };
             self.laps_completed.insert(vehicle, (laps, ended));
             if new_lap {
-                if self.judged.remove(&vehicle) {
+                // A lap ended, not another car in the slot (fewer laps)
+                let ended_lap = before.is_some_and(|(before, _)| laps > before);
+                if self.judged.remove(&vehicle) && ended_lap {
                     self.awaiting.insert(vehicle, ended);
                 }
                 // The lap starting now, judged by how it starts: with the session green, whatever
@@ -8163,6 +8165,18 @@ mod tests {
     #[test]
     fn no_line_check_without_lap_time_counts() {
         assert_eq!(line_checked("practice", false, &untimed(None)), (0, 0));
+    }
+
+    #[test]
+    fn another_car_in_the_slot_is_no_lap_end() {
+        // Lap 1 (100 to 200 s) driven from its start, then someone else takes the slot over
+        let rows = [
+            (50.0, 0, None, Some(true)),
+            (100.0, 1, Some(99.0), Some(true)),
+            (200.0, 0, None, Some(true)),
+            (204.0, 0, None, Some(true)),
+        ];
+        assert_eq!(line_checked("practice", false, &rows), (0, 0));
     }
 
     #[test]

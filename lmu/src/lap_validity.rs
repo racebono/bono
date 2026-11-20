@@ -74,7 +74,11 @@ impl LapValidity {
         let car = cars.entry(vehicle).or_default();
         let lap = telemetry.lap.get();
         if car.lap != lap {
-            car.seen_start = car.lap.is_some();
+            // Only straight on from the lap before: after laps unseen, this one's begun unseen too
+            car.seen_start = car
+                .lap
+                .zip(lap)
+                .is_some_and(|(before, now)| now == before + 1);
             car.lap = lap;
             car.began_in_pit_lane = telemetry.in_pit_lane.get().unwrap_or(false);
             car.start_judged = false;
@@ -89,8 +93,10 @@ impl LapValidity {
                 not_counting && car.seen_start && !car.began_in_pit_lane && !car.in_pits;
         }
         let steps = telemetry.state.track_limits_steps.get();
+        // Not on a lap begun in the pits, which never counts: points scored there are the in lap's
         if let (Some(before), Some(now)) = (car.steps, steps) {
-            car.invalidated |= not_counting && now > before;
+            car.invalidated |=
+                not_counting && now > before && !car.began_in_pit_lane && !car.in_pits;
         }
         if steps.is_some() {
             car.steps = steps;
@@ -209,6 +215,27 @@ mod tests {
         assert_eq!(telemetry(&validity, 1, 5, true, 0), Some(false));
         scoring(&validity, 1, 5, Some(false), false);
         assert_eq!(telemetry(&validity, 1, 5, false, 0), Some(false));
+    }
+
+    #[test]
+    fn in_laps_points_scored_on_the_out_lap_do_not_invalidate_it() {
+        let validity = LapValidity::default();
+        scoring(&validity, 1, 4, Some(false), false);
+        telemetry(&validity, 1, 4, false, 0);
+        // Cut before the pit entry, scored once the out lap's begun in the pits
+        scoring(&validity, 1, 5, Some(false), true);
+        assert_eq!(telemetry(&validity, 1, 5, true, 0), Some(false));
+        assert_eq!(telemetry(&validity, 1, 5, true, 4), Some(false));
+    }
+
+    #[test]
+    fn a_lap_after_laps_unseen_is_not_carried_over() {
+        let validity = LapValidity::default();
+        scoring(&validity, 1, 5, Some(true), false);
+        telemetry(&validity, 1, 5, false, 0);
+        // No telemetry for lap 6: lap 7 is seen from its middle, off track
+        scoring(&validity, 1, 7, Some(false), false);
+        assert_eq!(telemetry(&validity, 1, 7, false, 0), Some(false));
     }
 
     #[test]

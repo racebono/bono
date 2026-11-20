@@ -1777,12 +1777,13 @@ impl Logic {
         self.follow_lap(player, t);
         // Back from quiet (its standings are kept for the laps): the flags start afresh
         let afresh = self.prev.is_none();
-        if let Some(prev) = self.prev.take() {
+        let prev = self.prev.take();
+        if let Some(prev) = &prev {
             let race = scoring.is_some_and(|s| s.session_type.as_deref() == Some("race"));
             self.alerts(
                 config,
                 player,
-                &prev,
+                prev,
                 wheels,
                 t,
                 race && !formation_lap,
@@ -1797,6 +1798,17 @@ impl Logic {
             }
             self.flags(config, scoring, &mut calls);
             self.weather(config, scoring, wheels.wet, t, stopped, &mut calls);
+        }
+        // After the line's check is opened (the lap count and the flag can come in one update):
+        // just past a line the lap's verdict is waiting on, the lap just begun is said with it
+        if prev
+            .as_ref()
+            .is_some_and(|prev| player.lap_invalidated && !prev.lap_invalidated)
+            && self.line_check.is_none()
+            && !self.lap_called
+        {
+            calls.raise("lap invalidated", false);
+            self.lap_called = true;
         }
 
         self.prev_flat = wheels.flat;
@@ -1943,11 +1955,6 @@ impl Logic {
         {
             calls.raise("limiter, limiter", true);
         }
-        // Just past a line the lap's verdict is waiting on, the lap just begun is said with it
-        if rose(p.lap_invalidated, prev.lap_invalidated) && self.line_check.is_none() {
-            calls.raise("lap invalidated", false);
-            self.lap_called = true;
-        }
 
         // A car closing to within a second, called again only once it's dropped back. Not on the
         // formation lap, where the field runs nose to tail. Standings gaps outside races
@@ -2008,10 +2015,15 @@ impl Logic {
             // A lap LMU doesn't count gets no time: whether it did is known once it's had its
             // chance to come (it may already have, a row before the count). Not in races, which
             // give points instead, nor once the session or the player's over
-            let judged = last.lap_time_counts.is_some()
+            // Nor a lap begun before the spotter was following (its pit lane unseen)
+            let judged = self.lap_started.is_some()
+                && last.lap_time_counts.is_some()
                 && last.session_type.as_deref() != Some("race")
                 && last.phase.as_deref() == Some("green")
-                && last.finish_status.as_deref().is_none_or(|status| status == "none");
+                && last
+                    .finish_status
+                    .as_deref()
+                    .is_none_or(|status| status == "none");
             self.line_check = judged.then(|| LineCheck {
                 at: t,
                 called: self.lap_called,
@@ -4722,8 +4734,62 @@ mod tests {
         calls
     }
 
+    /// The calls of `rows`, with the lap before them seen from its start: the spotter only judges
+    /// laps it saw begin.
     fn line_calls(rows: &[(f64, i64, Option<f64>, bool, bool, Option<bool>)]) -> Vec<String> {
-        line_calls_with("none", rows)
+        let (t, laps, _, _, _, counts) = rows[0];
+        let mut seen = vec![(t - 100.0, laps - 1, None, false, false, counts)];
+        seen.extend_from_slice(rows);
+        line_calls_with("none", &seen)
+    }
+
+    #[test]
+    fn first_lap_end_after_a_reset_is_not_line_checked() {
+        // Joined on a lap begun unseen (an out lap, maybe), then a lap of its own
+        assert_eq!(
+            line_calls_with(
+                "none",
+                &[
+                    (50.0, 4, None, false, false, Some(false)),
+                    (110.0, 5, None, false, false, Some(true)),
+                    (115.0, 5, None, false, false, Some(true)),
+                    (200.0, 5, None, false, false, Some(false)),
+                    (210.0, 6, None, false, false, Some(true)),
+                    (215.0, 6, None, false, false, Some(true)),
+                ]
+            ),
+            ["lap invalidated"]
+        );
+    }
+
+    #[test]
+    fn count_and_rise_together_say_one_call() {
+        assert_eq!(
+            line_calls(&[
+                (10.0, 4, None, false, false, Some(true)),
+                (100.0, 4, None, false, false, Some(false)),
+                (110.0, 5, None, false, true, Some(false)),
+                (113.5, 5, None, false, true, Some(false)),
+                (150.0, 5, None, false, true, Some(false)),
+            ]),
+            ["lap invalidated, next lap too"]
+        );
+    }
+
+    #[test]
+    fn called_lap_carried_over_after_the_flag_resets_says_next_lap_once() {
+        // The plugin starts the lap afresh as the telemetry's lap ticks over, before its scoring
+        assert_eq!(
+            line_calls(&[
+                (10.0, 4, None, false, false, Some(true)),
+                (50.0, 4, None, false, true, Some(false)),
+                (109.9, 4, None, false, false, Some(false)),
+                (110.0, 5, None, false, true, Some(false)),
+                (113.5, 5, None, false, true, Some(false)),
+                (150.0, 5, None, false, true, Some(false)),
+            ]),
+            ["lap invalidated", "next lap invalidated"]
+        );
     }
 
     #[test]
