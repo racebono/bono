@@ -6,6 +6,7 @@
 //! alone, and its folder isn't looked for (nothing needs it).
 
 mod convert;
+mod pit;
 mod sdk;
 mod session;
 mod yaml;
@@ -20,7 +21,9 @@ use crate::{
 use convert::Converter;
 use sdk::{Frame, HEADER_LEN, Header, MEMORY_NAME, VERSION, Vars};
 use session::SessionInfo;
-use std::{path::PathBuf, time::Instant};
+use crate::sim::pit::PitService;
+use pit::IracingPit;
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 /// How often the session info is read again while its update count stays the same.
 const INFO_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
@@ -59,6 +62,10 @@ impl Simulator for IRacing {
 
     fn clear(&mut self) {
         self.0.clear();
+    }
+
+    fn pit(&self) -> Option<Arc<dyn PitService>> {
+        Some(Arc::new(IracingPit))
     }
 }
 
@@ -252,6 +259,39 @@ impl Source for Game {
             None => Read::Idle,
         }
     }
+}
+
+/// One look at the shared memory, for the engineer's pit menu: the variables, the latest update in
+/// them and the session info. `None` while the game isn't in a session, or if it wrote over what
+/// was copied meanwhile (the header changed, or the update's buffer was written again).
+pub(super) fn read_once() -> Option<(Vars, Vec<u8>, Vec<u8>)> {
+    let memory = SharedMemory::open()?;
+    let header = memory.header()?;
+    if !header.connected() || header.version != VERSION {
+        return None;
+    }
+    let fits = |range: Option<std::ops::Range<usize>>| range.filter(|r| r.end <= memory.len);
+    let headers = memory.copy(fits(header.var_headers())?)?;
+    let info = memory.copy(fits(header.session_info())?)?;
+    let (tick, offset) = header.latest()?;
+    let len = header.buf_len()?;
+    let buffer = memory.copy(fits(Some(offset..offset.checked_add(len)?))?)?;
+    let layout = |h: &Header| {
+        (
+            h.var_count,
+            h.var_header_offset,
+            h.buf_count,
+            h.buf_len,
+            h.session_info_offset,
+            h.session_info_len,
+            h.session_info_update,
+        )
+    };
+    let again = memory.header()?;
+    if !again.connected() || layout(&again) != layout(&header) || !again.holds(tick, offset) {
+        return None;
+    }
+    Some((Vars::from_headers(&headers, len), buffer, info))
 }
 
 /// The game's shared memory, mapped read-only.

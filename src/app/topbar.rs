@@ -8,7 +8,7 @@ use crate::{
         },
     },
     config::{Config, RawConfig, Setting},
-    sim::{ActiveSimulator, Sim},
+    sim::{ActiveSimulator, PitKeyStatus, Sim, key_name},
     synthesizer::Synthesizer,
 };
 use bono_i18n::t;
@@ -183,6 +183,26 @@ impl Topbar {
                     if simulator.is_some_and(|simulator| simulator.plugin_outdated()) {
                         ui.colored_label(ui.visuals().warn_fg_color, t!("topbar.plugin_outdated"))
                             .on_hover_text(t!("topbar.plugin_outdated_hover"));
+                    }
+                    let warn = ui.visuals().warn_fg_color;
+                    match simulator.and_then(|simulator| simulator.pit_key()) {
+                        Some(PitKeyStatus::Key(key)) => {
+                            ui.label(t!("topbar.pit_key", key = key_name(key)))
+                                .on_hover_text(t!("topbar.pit_key_hover"));
+                        }
+                        Some(PitKeyStatus::Unbound) => {
+                            ui.colored_label(warn, t!("topbar.pit_key_none"))
+                                .on_hover_text(t!("topbar.pit_key_unbound_hover"));
+                        }
+                        Some(PitKeyStatus::F11Taken) => {
+                            ui.colored_label(warn, t!("topbar.pit_key_none"))
+                                .on_hover_text(t!("topbar.pit_key_taken_hover"));
+                        }
+                        Some(PitKeyStatus::Unreadable) => {
+                            ui.colored_label(warn, t!("topbar.pit_key_none"))
+                                .on_hover_text(t!("topbar.pit_key_unreadable_hover"));
+                        }
+                        Some(PitKeyStatus::Off) | None => {}
                     }
                 });
             });

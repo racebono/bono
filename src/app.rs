@@ -142,7 +142,7 @@ impl App {
                 gui,
                 synth,
                 simulators,
-                applied_opponent_frequency: None,
+                applied_settings: None,
                 tracks,
                 account,
                 engineer,
@@ -305,7 +305,7 @@ pub struct AppState {
     synth: Synthesizer,
     simulators: ActiveSimulator,
     /// The recording settings last passed to the simulators
-    applied_opponent_frequency: Option<NonZeroU32>,
+    applied_settings: Option<(NonZeroU32, bool)>,
     /// Keeps the running simulator's track description next to its database
     tracks: TrackSync,
     // FIXME: Do we want this to be `MaybeDone`?
@@ -389,15 +389,19 @@ impl AppState {
     /// to a simulator again when it starts running, and follows which simulator is running.
     fn update_simulators(&mut self) {
         let opponent_frequency = *self.config.get().opponent_frequency();
-        let settings = SimulatorSettings { opponent_frequency };
-        let changed = self.applied_opponent_frequency != Some(opponent_frequency);
+        let pit_requests = *self.config.get().pit_requests();
+        let settings = SimulatorSettings {
+            opponent_frequency,
+            pit_requests,
+        };
+        let changed = self.applied_settings != Some((opponent_frequency, pit_requests));
         for simulator in self.simulators.simulators() {
             // Reapply on process starts too: Steam's running flag can lag behind a restart.
             if simulator.started() || changed {
                 simulator.apply(&settings);
             }
         }
-        self.applied_opponent_frequency = Some(opponent_frequency);
+        self.applied_settings = Some((opponent_frequency, pit_requests));
 
         // Only looks: a change waiting is taken, otherwise it's looked for again next frame
         if let Some(current) = self.simulators.changed().now_or_never() {

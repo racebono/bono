@@ -105,6 +105,15 @@ impl SettingsTopbar {
         });
 
         ui.separator();
+        config.maybe_update(|raw| {
+            raw.pit_requests.edit(*raw.pit_requests(), |on| {
+                ui.checkbox(on, t!("settings.pit_requests"))
+                    .on_hover_text(t!("settings.pit_requests_hover"))
+                    .changed()
+            })
+        });
+
+        ui.separator();
         let guide = ui.button(t!("settings.setup_guide")).clicked();
         if guide {
             ui.close();

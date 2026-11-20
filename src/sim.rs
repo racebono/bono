@@ -25,6 +25,7 @@ mod iracing;
 mod lmu;
 #[cfg(windows)]
 mod memory;
+pub mod pit;
 #[cfg(any(windows, test))]
 mod probe;
 #[cfg(windows)]
@@ -275,6 +276,16 @@ impl Game {
             install_dir: None,
         }))
     }
+
+    /// A game installed where `BONO_TEST_GAME_DIR` says, for tests against a running game.
+    #[cfg(test)]
+    pub(crate) fn from_test_env() -> Self {
+        Self(Arc::new(GameInner {
+            app_id: None,
+            process: watch::channel(Program::default()).1,
+            install_dir: Some(|| std::env::var_os("BONO_TEST_GAME_DIR").map(PathBuf::from)),
+        }))
+    }
 }
 
 pub trait Simulator: Send {
@@ -300,6 +311,17 @@ pub trait Simulator: Send {
     /// aren't followed: `database` has none until the plugin is updated.
     fn plugin_outdated(&self) -> bool {
         false
+    }
+
+    /// The game's pit menu, for games the engineer can change it in: `None` for the others.
+    fn pit(&self) -> Option<Arc<dyn pit::PitService>> {
+        None
+    }
+
+    /// The key the engineer requests stops with, as last looked at, for games it presses one in:
+    /// `None` for the others, and before it's been looked at.
+    fn pit_key(&self) -> Option<PitKeyStatus> {
+        None
     }
 }
 
@@ -388,6 +410,33 @@ impl fmt::Display for Version {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SimulatorSettings {
     pub opponent_frequency: NonZeroU32,
+    /// Whether the engineer may request pit stops (in LMU, by pressing the pilot's Pit Request key)
+    pub pit_requests: bool,
+}
+
+/// The key the engineer presses to request a stop, in games it presses one in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PitKeyStatus {
+    /// Bound to this key (a DirectInput scan code)
+    Key(u16),
+    /// No key yet: one is bound once the game is closed
+    Unbound,
+    /// No key, and F11 (the one Bono binds) is another control's
+    F11Taken,
+    /// The game's bindings couldn't be read
+    Unreadable,
+    /// The pilot doesn't let the engineer request stops
+    Off,
+}
+
+/// A key, by its DirectInput scan code, as the pilot reads it.
+pub fn key_name(scan: u16) -> String {
+    match scan {
+        0x3B..=0x44 => format!("F{}", scan - 0x3B + 1),
+        0x57 => "F11".into(),
+        0x58 => "F12".into(),
+        _ => format!("key 0x{scan:02X}"),
+    }
 }
 
 /// Follows which simulator is running. The first one found running stays current for as long as

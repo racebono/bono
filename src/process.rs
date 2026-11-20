@@ -279,7 +279,7 @@ impl Executables {
 }
 
 #[cfg(windows)]
-mod win32 {
+pub(crate) mod win32 {
     use std::{
         ffi::OsString,
         os::windows::{

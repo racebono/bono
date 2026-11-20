@@ -33,6 +33,13 @@ race, where another car's gap to its own neighbour is a plausible wrong answer, 
 cars and missing race-order times. These are controlled manual/model scenarios, not executed
 results.
 
+`pit-service.md` covers changing the car's next stop with the `pit` tool: what the pilot asks for
+applied directly, the engineer's own ideas proposed first, saying which stop a change counts for,
+fields the car doesn't have, standing orders that stay silent when nothing needs changing, and stop
+requests. Its cases use the `pit` and `history` fields it describes, and `scheduled` as
+`scheduled.md` does. These are controlled
+manual/model scenarios, not executed results.
+
 `steering.md` covers the pilot speaking again while a turn is working: a correction, an unrelated
 addition, a follow-up, two questions in one hand-back and a different language. It checks for one
 reply, no second acknowledgement and no answer to a corrected question. These are controlled
@@ -60,7 +67,7 @@ are correct. Check that the acknowledgement reaches speech before tool work fini
 For a standalone radio check or facts present in the attached snapshot, expect a direct
 answer with zero tool calls and no acknowledgement preamble. Scheduled turns never
 acknowledge, even before tool calls, and neither does a turn whose only call is `schedule`
-(`scheduled.md`). Compare time to first text and first audible speech separately from total
+(`scheduled.md`) or `pit` (`pit-service.md`). Compare time to first text and first audible speech separately from total
 completion time, using the same model,
 effort and fixture for baseline and candidate. Record measured times; a transcript alone
 cannot establish improved latency.
