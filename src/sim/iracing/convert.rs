@@ -1691,8 +1691,9 @@ fn follow_gap(behind: &Car<'_>, ahead: &Car<'_>) -> Option<f64> {
 /// in laps, and when it crossed the line for those level with it, or `None` to keep it where the
 /// game has it: out of the world, before its first line, finished a while (where how far it has
 /// gone no longer orders it), and before the green. Those cars keep the game's order, each just
-/// behind the last car the game had ahead of it; between them all, the cars take the places the
-/// game gave them, and each class's cars, in the same order, the class's.
+/// behind the last car the game had ahead of it or with a lap more done than its count; between
+/// them all, the cars take the places the game gave them, and each class's cars, in the same
+/// order, the class's.
 fn live_places(cars: &mut [Car<'_>], gone: impl Fn(&Car<'_>) -> Option<(f64, f64)>) {
     let order = live_order(cars, gone);
     let mut places: Vec<i64> = order.iter().filter_map(|&i| cars[i].position).collect();
@@ -1741,12 +1742,16 @@ fn live_order(cars: &[Car<'_>], gone: impl Fn(&Car<'_>) -> Option<(f64, f64)>) -
             .then(past(b.0).total_cmp(&past(a.0)))
             .then(a.1.cmp(&b.1))
     });
-    // A car kept where the game has it goes once no car still to come was ahead of it there
+    // A car kept where the game has it goes once no car still to come was ahead of it there, nor
+    // has a lap more done than it (the game's places can be behind with that too)
     let mut order = Vec::with_capacity(placed.len());
     let mut kept = kept.into_iter().peekable();
     for k in 0..moving.len() {
         while let Some(&(i, p)) = kept.peek()
-            && moving[k..].iter().all(|m| m.1 > p)
+            && moving[k..].iter().all(|m| {
+                let laps = cars[i].laps_completed.filter(|laps| *laps >= 0);
+                m.1 > p && laps.is_none_or(|laps| m.2.0 < (laps + 1) as f64)
+            })
         {
             order.push(i);
             kept.next();
@@ -3649,8 +3654,9 @@ mod tests {
         // Each car counted at its line a lap before; car 0 wins at 14.9 s; car 2 by car 1 at
         // 17.1 s, over the line at 17.9 s, car 1 at 18.2 s. The cool-down from 18.75 s; or from
         // 18.5 s, car 1's count late, at 18.75 s; or from the update that sees car 1 over, its
-        // count the next
-        for (cool_down, counted) in [(18.75, 18.25), (18.5, 18.75), (18.25, 18.5)] {
+        // count the next; or from the one that sees car 2 over, before car 1 is
+        let cases = [(18.75, 18.25), (18.5, 18.75), (18.25, 18.5), (18.0, 18.25)];
+        for (cool_down, counted) in cases {
             let updates: Vec<_> = (0..=82)
                 .map(|k| {
                     let t = 0.25 * k as f64;
@@ -3667,7 +3673,7 @@ mod tests {
                     (t, state, gone.map(f64::fract), laps)
                 })
                 .collect();
-            for at in [18.25, 18.5, 18.75, 19.0, 20.5] {
+            for at in [18.0, 18.25, 18.5, 18.75, 19.0, 20.5] {
                 let last = updates.iter().position(|u| u.0 >= at).unwrap();
                 let end = race_end(&updates[..=last], [0.0, 0.3, 95.0]);
                 let (_, standings) = end.scoring.as_ref().unwrap();
