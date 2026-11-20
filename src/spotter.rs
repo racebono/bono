@@ -1681,6 +1681,8 @@ struct LineCheck {
     pit: bool,
     /// Its time came
     timed: bool,
+    /// Its own verdict is said (see `Logic::lap_judged`)
+    judged: bool,
 }
 
 /// The calls of one update.
@@ -2031,12 +2033,13 @@ impl Logic {
             // chance to come (it may already have, a row before the count). Judged by how it
             // began: not in races, which give points instead, nor once the session or the
             // player's over, nor a lap begun before the spotter was following (pit lane unseen)
-            // A lap already called isn't judged again, but what follows it is still said
-            self.line_check = (self.lap_judged || self.lap_called).then(|| LineCheck {
+            // Whatever its own verdict, the lap begun is still said if already lost
+            self.line_check = now.lap_time_counts.is_some().then(|| LineCheck {
                 at: t,
                 called: self.lap_called,
                 pit: self.lap_in_pit_lane,
                 timed: self.lap_timed.is_some_and(|(at, _)| t - at <= LAP_MATCH),
+                judged: self.lap_judged,
             });
             self.lap_called = false;
             self.lap_judged = now.lap_time_counts.is_some()
@@ -2085,11 +2088,13 @@ impl Logic {
         if t - check.at > LAP_MATCH + OTHER_FOR.as_secs_f64() {
             return;
         }
-        let lost = !check.timed && !check.pit && !check.called;
+        let lost = check.judged && !check.timed && !check.pit && !check.called;
         match (lost, invalidated) {
             (true, true) => calls.raise("lap invalidated, next lap too", false),
             (true, false) => calls.raise("lap invalidated", false),
-            (false, true) => calls.raise("next lap invalidated", false),
+            // "Next" only after the lap before was called: otherwise this is the first said of it
+            (false, true) if check.called => calls.raise("next lap invalidated", false),
+            (false, true) => calls.raise("lap invalidated", false),
             (false, false) => {}
         }
         self.lap_called |= invalidated;
@@ -5098,6 +5103,23 @@ mod tests {
                 ]
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_lap_lost_before_it_begins_is_called_after_joining_on_a_lost_lap() {
+        // Joined on a lap already invalidated, never called, that carries over to the next
+        assert_eq!(
+            line_calls_with(
+                "none",
+                &[
+                    (50.0, 4, None, false, true, Some(false)),
+                    (110.0, 5, None, false, true, Some(false)),
+                    (113.5, 5, None, false, true, Some(false)),
+                    (150.0, 5, None, false, true, Some(false)),
+                ]
+            ),
+            ["lap invalidated"]
         );
     }
 
