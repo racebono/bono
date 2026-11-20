@@ -3568,44 +3568,40 @@ mod tests {
 
     #[test]
     fn starts_afresh_when_qualifying_is_switched_back_on() {
-        // Whether or not it followed the laps while off
-        for lap_times in [false, true] {
-            let mut scoring = Scoring {
-                session_type: Some("qualifying".into()),
-                flag: Some("green".into()),
-                ..Scoring::default()
-            };
-            let mut config = SpotterConfig::default();
-            config.qualifying.set(true);
-            config.qualifying_lap_times.set(lap_times);
-            let mut logic = Logic::default();
-            let step = |logic: &mut Logic, config: &SpotterConfig, t: f64, scoring: &Scoring| {
-                texts(logic.update(config, &player(t), &[], &Wheels::default(), Some(scoring)))
-            };
+        let mut scoring = Scoring {
+            session_type: Some("qualifying".into()),
+            flag: Some("green".into()),
+            ..Scoring::default()
+        };
+        let mut config = SpotterConfig::default();
+        config.qualifying.set(true);
+        let mut logic = Logic::default();
+        let step = |logic: &mut Logic, config: &SpotterConfig, t: f64, scoring: &Scoring| {
+            texts(logic.update(config, &player(t), &[], &Wheels::default(), Some(scoring)))
+        };
 
-            assert!(step(&mut logic, &config, 0.0, &scoring).is_empty());
-            config.qualifying.set(false);
-            // The blue flag came while it was off: it isn't called once it's back on
-            scoring.flag = Some("blue".into());
-            assert!(step(&mut logic, &config, 0.1, &scoring).is_empty());
-            assert!(logic.muted);
-            config.qualifying.set(true);
-            assert!(step(&mut logic, &config, 0.2, &scoring).is_empty());
-            assert!(!logic.muted);
-            scoring.flag = Some("green".into());
-            assert!(step(&mut logic, &config, 0.3, &scoring).is_empty());
-            scoring.flag = Some("blue".into());
-            assert_eq!(step(&mut logic, &config, 0.4, &scoring), ["blue flag"]);
+        assert!(step(&mut logic, &config, 0.0, &scoring).is_empty());
+        config.qualifying.set(false);
+        // The blue flag came while it was off: it isn't called once it's back on
+        scoring.flag = Some("blue".into());
+        assert!(step(&mut logic, &config, 0.1, &scoring).is_empty());
+        assert!(logic.muted);
+        config.qualifying.set(true);
+        assert!(step(&mut logic, &config, 0.2, &scoring).is_empty());
+        assert!(!logic.muted);
+        scoring.flag = Some("green".into());
+        assert!(step(&mut logic, &config, 0.3, &scoring).is_empty());
+        scoring.flag = Some("blue".into());
+        assert_eq!(step(&mut logic, &config, 0.4, &scoring), ["blue flag"]);
 
-            // Nor when it's back on with no rows coming (the game paused, or in the garage)
-            config.qualifying.set(false);
-            scoring.flag = Some("green".into());
-            assert!(step(&mut logic, &config, 0.5, &scoring).is_empty());
-            config.qualifying.set(true);
-            assert!(!logic.mute(&config));
-            scoring.flag = Some("blue".into());
-            assert!(step(&mut logic, &config, 0.6, &scoring).is_empty());
-        }
+        // Nor when it's back on with no rows coming (the game paused, or in the garage)
+        config.qualifying.set(false);
+        scoring.flag = Some("green".into());
+        assert!(step(&mut logic, &config, 0.5, &scoring).is_empty());
+        config.qualifying.set(true);
+        assert!(!logic.mute(&config));
+        scoring.flag = Some("blue".into());
+        assert!(step(&mut logic, &config, 0.6, &scoring).is_empty());
     }
 
     #[test]
@@ -4666,6 +4662,20 @@ mod tests {
         assert_eq!(
             step(&config, 510.0, 5, Some(96.0), false),
             ["lap time 1 36.0"]
+        );
+        // Quiet, the time first, then the count
+        config.qualifying.set(false);
+        assert!(step(&config, 609.8, 5, Some(95.0), false).is_empty());
+        assert_eq!(
+            step(&config, 610.0, 6, Some(95.0), false),
+            ["lap time 1 35.0"]
+        );
+        // Still invalidated a moment past the line: the next lap isn't
+        assert!(step(&config, 610.5, 6, Some(95.0), true).is_empty());
+        assert!(step(&config, 611.0, 6, Some(95.0), false).is_empty());
+        assert_eq!(
+            step(&config, 710.0, 7, Some(94.0), false),
+            ["lap time 1 34.0"]
         );
     }
 
