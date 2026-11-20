@@ -306,6 +306,15 @@ impl Converter {
         if info.replay || behind_live(frame, self.behind_live_frames.0) {
             return None;
         }
+        // Watching, the clock going back in the same session is the replay rewound by less than
+        // that: time already recorded, which doesn't reset what's known either
+        let session = (frame.i32("SessionNum"), frame.i32("SessionUniqueID"));
+        if frame.bool("IsReplayPlaying") == Some(true)
+            && self.session == Some(session)
+            && self.last_time.is_some_and(|last| time < last)
+        {
+            return None;
+        }
         if self.last_time == Some(time) {
             return None;
         }
@@ -323,7 +332,6 @@ impl Converter {
         if new_event {
             self.last_setup = None;
         }
-        let session = (frame.i32("SessionNum"), frame.i32("SessionUniqueID"));
         // Another session, or the clock going back, is scored right away, for the recorder to tell
         // from the scoring before this update's telemetry (and before the clock moves on again)
         let boundary = new_event || self.session != Some(session) || went_back;
@@ -673,10 +681,12 @@ impl Converter {
         if race {
             self.laps_behind(&cars, before_green, &finished, &over_line, time);
         }
-        // The player's own fuel: only while in the car (iRacing gives the fuel level and pit road
-        // as the player's then; a view behind live isn't converted, and watching live from outside
-        // the car isn't in it), and only the player's car keeps a window
-        let in_car = frame.bool("IsOnTrack") == Some(true);
+        // Watching live (a teammate driving, spectating), the game's own-car variables aren't the
+        // player's car's: it's read like any other car. The player's own fuel: only while in the
+        // car and not watching (iRacing gives the fuel level and pit road as the player's then),
+        // and only the player's car keeps a window
+        let own_car = frame.bool("IsReplayPlaying") != Some(true);
+        let in_car = own_car && frame.bool("IsOnTrack") == Some(true);
         for (idx, track) in &mut self.cars {
             if Some(*idx) != player {
                 track.fuel_window.clear();
@@ -733,7 +743,7 @@ impl Converter {
                 .filter(|count| race && *count >= 0 && track.push_to_pass_seen)
                 .map(i64::from)
                 .into();
-            if Some(car.idx) == player {
+            if Some(car.idx) == player && own_car {
                 player_telemetry(frame, info, &mut out);
                 for (wheel, reading) in out.wheels.iter_mut().zip(readings) {
                     wheel.tire_reading_time = reading.into();
@@ -4186,6 +4196,83 @@ mod tests {
             start + std::time::Duration::from_secs(1),
         );
         assert!(update.is_some());
+    }
+
+    /// Watching live (a teammate driving the player's car, spectating), the game's own-car
+    /// variables aren't that car's: its telemetry is read like any other car's.
+    #[test]
+    fn watching_live_doesnt_take_the_own_car_values() {
+        use super::super::sdk::{Value, Vars};
+        let info = one_car_race();
+        let fuel = |replay: bool| {
+            let frame = |t: f64| {
+                Vars::of(&[
+                    ("SessionTime", Value::Double(t)),
+                    ("SessionNum", Value::Int(0)),
+                    ("SessionState", Value::Int(STATE_RACING)),
+                    ("PlayerCarIdx", Value::Int(0)),
+                    ("IsReplayPlaying", Value::Bool(replay)),
+                    ("ReplayFrameNumEnd", Value::Int(0)),
+                    ("IsOnTrack", Value::Bool(!replay)),
+                    ("FuelLevel", Value::Double(50.0)),
+                    ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
+                    ("CarIdxLapCompleted", Value::Ints(vec![2])),
+                ])
+            };
+            let mut converter = Converter::default();
+            let start = Instant::now();
+            let (vars, data) = frame(500.0);
+            converter.convert(&Frame::new(&vars, &data), &info, start);
+            let (vars, data) = frame(501.0);
+            let update = converter
+                .convert(
+                    &Frame::new(&vars, &data),
+                    &info,
+                    start + std::time::Duration::from_secs(1),
+                )
+                .unwrap();
+            update.telemetry[0].fuel.get()
+        };
+        assert_eq!(fuel(false), Some(50.0));
+        assert_eq!(fuel(true), None);
+    }
+
+    /// A replay rewound by less than the threshold is still a replay of time already recorded:
+    /// it isn't converted, nor does it reset what's known. Another session is, from its start.
+    #[test]
+    fn a_small_rewind_while_watching_leaves_the_session_as_it_was() {
+        use super::super::sdk::{Value, Vars};
+        let info = one_car_race();
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        let later = |s: u64| start + std::time::Duration::from_secs(s);
+        let (vars, data) = watched(500.0, true, Some(0));
+        converter.convert(&Frame::new(&vars, &data), &info, start);
+        // Half a second back, still under the threshold
+        let (vars, data) = watched(499.5, true, Some(30));
+        assert!(
+            converter
+                .convert(&Frame::new(&vars, &data), &info, later(1))
+                .is_none()
+        );
+        assert_eq!(converter.last_time, Some(500.0));
+        assert!(converter.cars.contains_key(&0));
+        // The next session, watched from its start
+        let (vars, data) = Vars::of(&[
+            ("SessionTime", Value::Double(1.0)),
+            ("SessionNum", Value::Int(1)),
+            ("SessionState", Value::Int(STATE_RACING)),
+            ("PlayerCarIdx", Value::Int(0)),
+            ("IsReplayPlaying", Value::Bool(true)),
+            ("ReplayFrameNumEnd", Value::Int(0)),
+            ("CarIdxLapDistPct", Value::Doubles(vec![0.1])),
+            ("CarIdxLapCompleted", Value::Ints(vec![0])),
+        ]);
+        assert!(
+            converter
+                .convert(&Frame::new(&vars, &data), &info, later(2))
+                .is_some()
+        );
     }
 
     #[test]
