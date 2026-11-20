@@ -2,7 +2,7 @@
 
 Bono is a desktop AI race engineer and spotter for sim racing. Ask questions by voice or text and get spoken answers grounded in live telemetry: fuel range, tyre condition, lap times, nearby cars, and race standings.
 
-Built in Rust with SDL3 and egui, Bono uses local Whisper speech recognition and Piper text-to-speech. The engineer supports Bono Cloud, Claude, Ollama, and OpenAI-compatible APIs. An automatic spotter reads telemetry directly to call traffic, flags, car alerts, and weather changes. It keeps quiet in qualifying sessions unless **In qualifying** is turned on in its menu, and with **Lap times in qualifying** on too, it calls the time of each qualifying lap.
+Built in Rust with SDL3 and egui, Bono uses local Whisper speech recognition and Piper text-to-speech. The engineer supports Bono Cloud, Claude, Ollama, and OpenAI-compatible APIs. An automatic spotter reads telemetry directly to call traffic, flags, car alerts, and weather changes. It keeps quiet in qualifying sessions unless **In qualifying** is turned on in its menu, and with **Lap times in qualifying** on too, it calls the time of each qualifying lap. It calls the start of a race, and its restart after a red flag, unless **Race starts** is turned off.
 
 ## Simulator support
 
@@ -176,7 +176,7 @@ $env:LMU_DIR = 'D:\SteamLibrary\steamapps\common\Le Mans Ultimate'
 cargo build -p bono-lmu
 ```
 
-The resulting `target/debug/bono_lmu.dll` sits alongside the development executable, where Bono can find it for installation. The plugin writes its telemetry database under the game's `UserData/bono/` directory.
+With Just installed, `just lmu` runs the same build. The resulting `target/debug/bono_lmu.dll` sits alongside the development executable, where Bono can find it for installation. The plugin writes its telemetry database under the game's `UserData/bono/` directory.
 
 ### Speech-recognition backends
 

@@ -281,6 +281,8 @@ settings! {
         pub microphone: RawAudioDevice<true> = RawAudioDevice::default(),
         pub speaker: RawAudioDevice<false> = RawAudioDevice::default(),
         pub radio_effect: f32 = 0.65,
+        /// How fast the voices talk: 1 is each voice's own pace
+        pub speech_speed: f32 = 1.0,
         pub master_volume: f32 = 1.0,
         pub engineer_volume: f32 = 1.0,
         pub spotter_volume: f32 = 1.0,
@@ -300,6 +302,9 @@ settings! {
         /// Whether speech to text runs on the GPU, when Bono was built with a GPU backend. Off, it
         /// stays off the GPU the simulator renders on
         pub whisper_gpu: bool = true,
+        /// Whether voices run on the GPU, with DirectML (Windows only). Off by default: voices are
+        /// quick on the processor, and the GPU is the simulator's
+        pub voice_gpu: bool = false,
         pub text_scale: f32 = 1.3,
         pub min_confidence: f32 = 0.1,
         /// The setup guide's version the pilot last finished (or skipped): an older one shows it
@@ -334,6 +339,7 @@ impl RawConfig {
         Effects {
             radio: *self.radio_effect(),
             beep_volume: *self.beep_volume(),
+            speed: *self.speech_speed(),
         }
     }
 
@@ -365,7 +371,7 @@ impl RawConfig {
             // Dropping it joins its thread
             rt.spawn_blocking(move || drop(stopped));
         }
-        inner.set_model(model);
+        inner.set_model(model, *self.voice_gpu());
     }
 }
 
@@ -608,6 +614,8 @@ settings! {
         /// The time of each of the pilot's laps in qualifying, said once it's over (not for laps
         /// invalidated, or through the pit lane)
         pub qualifying_lap_times: bool = false,
+        /// The race going green: at the start, and as it restarts after a red flag
+        pub race_starts: bool = true,
     }
 }
 

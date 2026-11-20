@@ -38,10 +38,13 @@
 
 use super::{
     sdk::{Frame, UNLIMITED_LAPS, UNLIMITED_TIME},
-    session::SessionInfo,
+    session::{PlayerSetup, SessionInfo},
 };
 use crate::sim::memory::{SCORING_EVERY, Update};
-use bono_sim::sys::{bono_session_info, bono_standing, bono_telemetry};
+use bono_sim::{
+    setup::{Setting, Setup, SetupSource},
+    sys::{bono_session_info, bono_standing, bono_telemetry},
+};
 use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -168,6 +171,13 @@ pub struct Converter {
     flag: Option<Option<Flag>>,
     /// Whether this session's race was seen running before its flag
     raced: bool,
+    /// The player's setup as last sent to the recorder (see `setup`); `None` in a new event
+    last_setup: Option<PlayerSetup>,
+    /// Whether the car has been in the garage since it was last on track: leaving it, the car is in
+    /// its stall, on pit road, and a setup sent then is still the garage's
+    from_garage: bool,
+    /// Whether the car was out on track (in the world, off pit road) in the last frame
+    on_track: bool,
 }
 
 /// A race's flag, for who has finished. The winner is the first car over the line with all the
@@ -258,6 +268,12 @@ impl Converter {
     ) -> Option<Update> {
         let time = frame.f64("SessionTime")?;
         let length = info.track_length?;
+        // A replay's frames aren't the live session's: they aren't recorded (the recorder skips
+        // replays), nor do they move on what's been worked out about it (laps, pit stops, the
+        // clock), which carries on once it's live again
+        if info.replay || frame.bool("IsReplayPlaying") == Some(true) {
+            return None;
+        }
         if self.last_time == Some(time) {
             return None;
         }
@@ -265,13 +281,21 @@ impl Converter {
             .last_time
             .map(|last| time - last)
             .filter(|dt| *dt > 0.0);
+        let went_back = self.last_time.is_some_and(|last| time < last);
         self.last_time = Some(time);
 
         let event = (info.event, info.track.clone());
         let new_event = self.event.as_ref().is_some_and(|last| *last != event);
         self.event = Some(event);
-        // Another session, or its clock went back (a restart, a replay rewound)
+        // The recording starts again (see `memory::record`): the setup is sent again
+        if new_event {
+            self.last_setup = None;
+        }
         let session = (frame.i32("SessionNum"), frame.i32("SessionUniqueID"));
+        // Another session, or the clock going back, is scored right away, for the recorder to tell
+        // from the scoring before this update's telemetry (and before the clock moves on again)
+        let boundary = new_event || self.session != Some(session) || went_back;
+        // Another session, or its clock went back (a restart, a replay rewound)
         if new_event || self.session != Some(session) || dt.is_none() {
             self.cars.clear();
             self.session_end = None;
@@ -617,11 +641,9 @@ impl Converter {
         if race {
             self.laps_behind(&cars, before_green, &finished, &over_line, time);
         }
-        // The player's own fuel: only while in the car and driving it live (iRacing gives the
-        // fuel level and pit road as the player's then), and only the player's car keeps a window
-        let in_car = frame.bool("IsOnTrack") == Some(true)
-            && !info.replay
-            && frame.bool("IsReplayPlaying") != Some(true);
+        // The player's own fuel: only while in the car (iRacing gives the fuel level and pit road
+        // as the player's then; a replay isn't converted), and only the player's car keeps a window
+        let in_car = frame.bool("IsOnTrack") == Some(true);
         for (idx, track) in &mut self.cars {
             if Some(*idx) != player {
                 track.fuel_window.clear();
@@ -689,7 +711,7 @@ impl Converter {
         }
 
         let scoring = match self.last_scoring {
-            Some(last) if now.duration_since(last) < SCORING_EVERY => None,
+            Some(last) if !boundary && now.duration_since(last) < SCORING_EVERY => None,
             _ => {
                 self.last_scoring = Some(now);
                 let remaining = frame
@@ -705,6 +727,59 @@ impl Converter {
             telemetry,
             scoring,
             new_event,
+            setup: self.setup(frame, info),
+            // The recorder tells another session, the clock going back and replays from the
+            // scoring
+            new_epoch: None,
+        })
+    }
+
+    /// The player's setup for the recorder, when the session info's is new or has changed: the
+    /// game sends it again on leaving the garage and loading a setup, and maybe after a stop.
+    fn setup(&mut self, frame: &Frame<'_>, info: &SessionInfo) -> Option<Setup> {
+        let in_garage = frame.bool("IsInGarage") == Some(true);
+        let on_pit_road = frame.bool("OnPitRoad") == Some(true);
+        // Out on track: in the world, off pit road. A car not in the world (the player watching,
+        // on the way from the garage to the car) hasn't left the garage yet
+        let in_world = frame.i32("PlayerTrackSurface") != Some(NOT_IN_WORLD);
+        // Nor has a car on the grid, which leaving the garage for a race goes straight to
+        let before_green = frame
+            .i32("SessionState")
+            .is_some_and(|state| state < STATE_RACING);
+        let on_track = in_world && !on_pit_road && !in_garage;
+        if in_garage {
+            self.from_garage = true;
+        } else if (on_track && !before_green) || (on_pit_road && self.on_track) {
+            // Out racing, or into the pit lane from the track (a stop, before the green too)
+            self.from_garage = false;
+        }
+        self.on_track = on_track;
+        if info.setup == self.last_setup {
+            return None;
+        }
+        let first = self.last_setup.is_none();
+        self.last_setup = info.setup.clone();
+        let setup = info.setup.as_ref()?;
+        let source = if first || self.from_garage {
+            Some(SetupSource::Garage)
+        } else if on_pit_road {
+            Some(SetupSource::PitStop)
+        } else {
+            None
+        };
+        Some(Setup {
+            file_name: setup.file_name.clone(),
+            modified: setup.modified,
+            source,
+            settings: setup
+                .settings
+                .iter()
+                .map(|(name, value)| Setting {
+                    name: name.clone(),
+                    value: value.clone(),
+                    ..Default::default()
+                })
+                .collect(),
         })
     }
 
@@ -933,7 +1008,6 @@ impl Converter {
         out.estimated_lap_time = d.class_lap_time.into();
         out.in_pits = car.on_pit_road.into();
         let control = match () {
-            _ if info.replay || frame.bool("IsReplayPlaying") == Some(true) => "replay",
             _ if is_player => "player",
             _ if d.ai => "ai",
             _ => "remote",
@@ -3980,6 +4054,95 @@ mod tests {
         assert_eq!(track.fuel_per_lap(None, on_track), None);
     }
 
+    /// A replay isn't converted: what's known of the live session carries on from where it was.
+    #[test]
+    fn a_replay_leaves_the_live_session_as_it_was() {
+        use super::super::sdk::{Value, Vars};
+        use super::super::session::{Driver, Session};
+        let info = SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: HashMap::from([(0, Driver::default())]),
+            sessions: vec![Session {
+                num: 0,
+                kind: Some("race"),
+                number: 1,
+                results: HashMap::new(),
+            }],
+            ..Default::default()
+        };
+        let frame = |t: f64, replay: bool| {
+            Vars::of(&[
+                ("SessionTime", Value::Double(t)),
+                ("SessionNum", Value::Int(0)),
+                ("SessionState", Value::Int(STATE_RACING)),
+                ("PlayerCarIdx", Value::Int(0)),
+                ("IsReplayPlaying", Value::Bool(replay)),
+                ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
+                ("CarIdxLapCompleted", Value::Ints(vec![2])),
+            ])
+        };
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        let (vars, data) = frame(500.0, false);
+        assert!(
+            converter
+                .convert(&Frame::new(&vars, &data), &info, start)
+                .is_some()
+        );
+        // Rewound
+        let (vars, data) = frame(100.0, true);
+        let replayed = converter.convert(
+            &Frame::new(&vars, &data),
+            &info,
+            start + std::time::Duration::from_secs(1),
+        );
+        assert!(replayed.is_none());
+        assert_eq!(converter.last_time, Some(500.0));
+        assert!(converter.cars.contains_key(&0));
+    }
+
+    /// The clock going back is scored at once, however soon after the last scoring.
+    #[test]
+    fn a_clock_going_back_is_scored_at_once() {
+        use super::super::sdk::{Value, Vars};
+        use super::super::session::{Driver, Session};
+        let info = SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: HashMap::from([(0, Driver::default())]),
+            sessions: vec![Session {
+                num: 0,
+                kind: Some("race"),
+                number: 1,
+                results: HashMap::new(),
+            }],
+            ..Default::default()
+        };
+        let frame = |t: f64| {
+            Vars::of(&[
+                ("SessionTime", Value::Double(t)),
+                ("SessionNum", Value::Int(0)),
+                ("SessionState", Value::Int(STATE_RACING)),
+                ("PlayerCarIdx", Value::Int(0)),
+                ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
+                ("CarIdxLapCompleted", Value::Ints(vec![2])),
+            ])
+        };
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        let (vars, data) = frame(100.0);
+        let first = converter.convert(&Frame::new(&vars, &data), &info, start);
+        assert!(first.unwrap().scoring.is_some());
+        let soon = start + std::time::Duration::from_millis(20);
+        let (vars, data) = frame(100.1);
+        let on = converter.convert(&Frame::new(&vars, &data), &info, soon);
+        assert!(on.unwrap().scoring.is_none());
+        let (vars, data) = frame(98.9);
+        let back = converter.convert(&Frame::new(&vars, &data), &info, soon);
+        assert!(back.unwrap().scoring.is_some());
+    }
+
     /// Fast repair alone in the pit menu is a service selected, not none; unticked, it's no word on
     /// repairs.
     #[test]
@@ -4039,6 +4202,219 @@ mod tests {
             .unwrap();
         assert_eq!(me.pit_service_body_repair_selected.get(), None);
         assert_eq!(me.pit_service_refuel_selected.get(), Some(true));
+    }
+
+    /// The setup goes to the recorder when it's first seen, when the session info's changes, and
+    /// again in a new event (the recording starts again), each time with where it was read.
+    #[test]
+    fn the_setup_is_sent_once_until_it_changes() {
+        use super::super::sdk::{Value, Vars};
+        use super::super::session::Driver;
+        let arb = |value: &str| PlayerSetup {
+            update_count: Some(1),
+            file_name: Some("race.sto".into()),
+            modified: Some(false),
+            settings: vec![("Chassis/Front/ArbSize".into(), value.into())],
+        };
+        let mut info = SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: HashMap::from([(0, Driver::default())]),
+            setup: Some(arb("Soft")),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let mut converter = Converter::default();
+        let mut time = 0.0;
+        let mut convert = |info: &SessionInfo, garage: bool, pit_road: bool, in_world: bool| {
+            time += 1.0;
+            let (vars, data) = Vars::of(&[
+                ("SessionTime", Value::Double(time)),
+                ("SessionNum", Value::Int(0)),
+                ("PlayerCarIdx", Value::Int(0)),
+                ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
+                ("CarIdxLapCompleted", Value::Ints(vec![2])),
+                ("IsInGarage", Value::Bool(garage)),
+                ("OnPitRoad", Value::Bool(pit_road)),
+                (
+                    "PlayerTrackSurface",
+                    Value::Int(if in_world { 3 } else { NOT_IN_WORLD }),
+                ),
+            ]);
+            converter
+                .convert(&Frame::new(&vars, &data), info, start)
+                .unwrap()
+                .setup
+        };
+        let setup = |value: &str, source: Option<SetupSource>| Setup {
+            file_name: Some("race.sto".into()),
+            modified: Some(false),
+            source,
+            settings: vec![Setting {
+                name: "Chassis/Front/ArbSize".into(),
+                value: value.into(),
+                ..Default::default()
+            }],
+        };
+
+        // The first is the garage's, wherever the car is
+        assert_eq!(
+            convert(&info, false, false, true),
+            Some(setup("Soft", Some(SetupSource::Garage)))
+        );
+        assert_eq!(convert(&info, false, false, true), None);
+
+        info.setup = Some(arb("Medium"));
+        assert_eq!(
+            convert(&info, false, true, true),
+            Some(setup("Medium", Some(SetupSource::PitStop)))
+        );
+        assert_eq!(convert(&info, false, true, true), None);
+        info.setup = Some(arb("Hard"));
+        assert_eq!(
+            convert(&info, true, false, true),
+            Some(setup("Hard", Some(SetupSource::Garage)))
+        );
+        // Watching between the garage and the car: not in the world, not out on track
+        assert_eq!(convert(&info, false, false, false), None);
+        // Out of the garage the car is in its stall, on pit road: still the garage's
+        info.setup = Some(arb("Medium"));
+        assert_eq!(
+            convert(&info, false, true, true),
+            Some(setup("Medium", Some(SetupSource::Garage)))
+        );
+        // Out on track, where it was changed isn't known
+        info.setup = Some(arb("Soft"));
+        assert_eq!(
+            convert(&info, false, false, true),
+            Some(setup("Soft", None))
+        );
+        // Back on pit road from the track: a stop
+        info.setup = Some(arb("Hard"));
+        assert_eq!(
+            convert(&info, false, true, true),
+            Some(setup("Hard", Some(SetupSource::PitStop)))
+        );
+        info.setup = Some(arb("Soft"));
+        assert_eq!(
+            convert(&info, false, false, true),
+            Some(setup("Soft", None))
+        );
+
+        // A new event clears the recording: the same setup goes again
+        info.event = (Some(1), None, None);
+        assert_eq!(
+            convert(&info, false, false, true),
+            Some(setup("Soft", Some(SetupSource::Garage)))
+        );
+        assert_eq!(convert(&info, false, false, true), None);
+
+        // Setup logging turned off: nothing to send
+        info.setup = None;
+        assert_eq!(convert(&info, false, false, true), None);
+    }
+
+    /// Leaving the garage for the grid, the car is in the world and off pit road at once: the setup
+    /// sent then is still the garage's, until the race goes green.
+    #[test]
+    fn leaving_the_garage_for_the_grid_is_the_garages() {
+        use super::super::sdk::{Value, Vars};
+        use super::super::session::Driver;
+        let arb = |value: &str| PlayerSetup {
+            settings: vec![("Chassis/Front/ArbSize".into(), value.into())],
+            ..Default::default()
+        };
+        let mut info = SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: HashMap::from([(0, Driver::default())]),
+            setup: Some(arb("Soft")),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let mut converter = Converter::default();
+        let mut time = 0.0;
+        let mut source = |info: &SessionInfo, garage: bool, pit_road: bool, state: i32| {
+            time += 1.0;
+            let (vars, data) = Vars::of(&[
+                ("SessionTime", Value::Double(time)),
+                ("SessionNum", Value::Int(0)),
+                ("SessionState", Value::Int(state)),
+                ("PlayerCarIdx", Value::Int(0)),
+                ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
+                ("CarIdxLapCompleted", Value::Ints(vec![0])),
+                ("IsInGarage", Value::Bool(garage)),
+                ("OnPitRoad", Value::Bool(pit_road)),
+                ("PlayerTrackSurface", Value::Int(3)),
+            ]);
+            converter
+                .convert(&Frame::new(&vars, &data), info, start)
+                .unwrap()
+                .setup
+                .map(|setup| setup.source)
+        };
+        assert_eq!(
+            source(&info, true, false, STATE_GET_IN_CAR),
+            Some(Some(SetupSource::Garage))
+        );
+        // On the grid, before the green
+        assert_eq!(source(&info, false, false, STATE_GET_IN_CAR), None);
+        info.setup = Some(arb("Medium"));
+        assert_eq!(
+            source(&info, false, false, STATE_PARADE_LAPS),
+            Some(Some(SetupSource::Garage))
+        );
+        // Into the pit lane from the pace laps: a stop, even before the green
+        info.setup = Some(arb("Soft"));
+        assert_eq!(
+            source(&info, false, true, STATE_PARADE_LAPS),
+            Some(Some(SetupSource::PitStop))
+        );
+        // Racing: out on track, where it was changed isn't known
+        assert_eq!(source(&info, false, false, STATE_RACING), None);
+        info.setup = Some(arb("Hard"));
+        assert_eq!(source(&info, false, false, STATE_RACING), Some(None));
+    }
+
+    /// A new event's first update has scoring, whenever the last one went: the recording is cleared
+    /// with it, and the scoring says which car is the player's before the setup is written.
+    #[test]
+    fn a_new_event_starts_with_scoring() {
+        use super::super::sdk::{Value, Vars};
+        use super::super::session::Driver;
+        let mut info = SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: HashMap::from([(0, Driver::default())]),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let mut converter = Converter::default();
+        let mut convert = |info: &SessionInfo, time: f64, num: i32| {
+            let (vars, data) = Vars::of(&[
+                ("SessionTime", Value::Double(time)),
+                ("SessionNum", Value::Int(num)),
+                ("PlayerCarIdx", Value::Int(0)),
+                ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
+                ("CarIdxLapCompleted", Value::Ints(vec![2])),
+            ]);
+            converter
+                .convert(&Frame::new(&vars, &data), info, start)
+                .unwrap()
+        };
+        assert!(convert(&info, 1.0, 0).scoring.is_some());
+        // The same instant: no scoring yet
+        assert!(convert(&info, 2.0, 0).scoring.is_none());
+        info.event = (Some(1), None, None);
+        let update = convert(&info, 3.0, 0);
+        assert!(update.new_event);
+        assert!(update.scoring.is_some());
+        // Another session of the event: its scoring names it before a setup sent with it is
+        // written
+        assert!(convert(&info, 4.0, 0).scoring.is_none());
+        let update = convert(&info, 5.0, 1);
+        assert!(!update.new_event);
+        assert!(update.scoring.is_some());
     }
 
     /// The out lap is the game's -1 laps done: the standings keep it, so the line that ends the out

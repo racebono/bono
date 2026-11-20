@@ -256,9 +256,9 @@
         "ca": "El plugin instal·lat no és el que ve amb bono"
     },
     "plugin.unexpected_code_hover": {
-        "en": "It says it's the same version, but its contents differ (a modified or damaged file, or another build). Reinstall it to be sure the recording works",
-        "es": "Dice ser la misma versión, pero su contenido es distinto (un archivo modificado o dañado, u otra compilación). Reinstálalo para asegurarte de que la grabación funciona",
-        "ca": "Diu que és la mateixa versió, però el contingut és diferent (un fitxer modificat o malmès, o una altra compilació). Reinstal·la'l per assegurar-te que la gravació funciona"
+        "en": "It says it's the same version, but its contents differ (a modified or damaged file, or another build). Update it so its sessions can start",
+        "es": "Dice ser la misma versión, pero su contenido es distinto (un archivo modificado o dañado, u otra compilación). Actualízalo para que sus sesiones puedan empezar",
+        "ca": "Diu que és la mateixa versió, però el contingut és diferent (un fitxer modificat o malmès, o una altra compilació). Actualitza'l perquè les seves sessions puguin començar"
     },
     "plugin.disabled": {
         "en": "Disabled in the game's plugin settings",
@@ -430,6 +430,16 @@
         "es": "Cuánto suenan las voces a radio: 0% es una voz limpia, sin el ruido de apertura. A partir de la siguiente transmisión",
         "ca": "Com sonen de ràdio les veus: 0% és una veu neta, sense el soroll d'obertura. A partir de la següent transmissió"
     },
+    "volume.speech_speed": {
+        "en": "Speech speed",
+        "es": "Velocidad de habla",
+        "ca": "Velocitat de parla"
+    },
+    "volume.speech_speed_hover": {
+        "en": "How fast the voices talk, the engineer's and the spotter's: 100% is each voice's own pace. From the next transmission on",
+        "es": "Lo rápido que hablan las voces, la del ingeniero y la del spotter: 100% es el ritmo propio de cada voz. A partir de la siguiente transmisión",
+        "ca": "Com de ràpid parlen les veus, la de l'enginyer i la de l'spotter: 100% és el ritme propi de cada veu. A partir de la següent transmissió"
+    },
     "spotter.enabled": {
         "en": "Enabled",
         "es": "Activado",
@@ -464,6 +474,16 @@
         "en": "The language of its calls: the pilot's is the last one they asked the engineer in. Calls are said in Catalan, Spanish, Italian or English; other languages' voices say them in English",
         "es": "El idioma de sus avisos: el del piloto es el último en el que preguntó al ingeniero. Los avisos se dicen en catalán, español, italiano o inglés; con las voces de otros idiomas, se dicen en inglés",
         "ca": "L'idioma dels seus avisos: el del pilot és l'últim en què va preguntar a l'enginyer. Els avisos es diuen en català, castellà, italià o anglès; amb les veus d'altres idiomes, es diuen en anglès"
+    },
+    "spotter.race_starts": {
+        "en": "Race starts",
+        "es": "Salidas",
+        "ca": "Sortides"
+    },
+    "spotter.race_starts_hover": {
+        "en": "Says \"green, green, green\" as the race starts, and as it goes green again straight after a red flag",
+        "es": "Dice \"verde, verde, verde\" cuando empieza la carrera, y cuando vuelve a verde justo después de una bandera roja",
+        "ca": "Diu \"verd, verd, verd\" quan comença la cursa, i quan torna a verd just després d'una bandera vermella"
     },
     "spotter.qualifying_lap_times": {
         "en": "Lap times in qualifying",
@@ -760,6 +780,16 @@
         "es": "La voz a texto se ejecuta en la tarjeta gráfica, que es más rápida salvo que el simulador la tenga ocupada. Desactivado, se ejecuta en el procesador",
         "ca": "La veu a text s'executa a la targeta gràfica, que és més ràpida tret que el simulador la tingui ocupada. Desactivat, s'executa al processador"
     },
+    "audio.voice_gpu": {
+        "en": "Use the GPU",
+        "es": "Usar la GPU",
+        "ca": "Fer servir la GPU"
+    },
+    "audio.voice_gpu_hover": {
+        "en": "Voices run on the graphics card, which can be slower while the simulator keeps it busy. If it can't, or when this is off, they run on the processor",
+        "es": "Las voces se ejecutan en la tarjeta gráfica, que puede ser más lenta mientras el simulador la tiene ocupada. Si no puede, o cuando esto está desactivado, se ejecutan en el procesador",
+        "ca": "Les veus s'executen a la targeta gràfica, que pot ser més lenta mentre el simulador la té ocupada. Si no pot, o quan això està desactivat, s'executen al processador"
+    },
     "audio.model": {
         "en": "Model",
         "es": "Modelo",
@@ -1035,6 +1065,12 @@
         "ca": "bandera verda, bandera verda",
         "it": "bandiera verde, bandiera verde"
     },
+    "call.race_start": {
+        "en": "green, green, green",
+        "es": "verde, verde, verde",
+        "ca": "verd, verd, verd",
+        "it": "verde, verde, verde"
+    },
     "call.red_flag": {
         "en": "red flag",
         "es": "bandera roja",
@@ -1171,6 +1207,16 @@
         "es": "conversación llena, empezando de nuevo",
         "ca": "conversa plena, tornant a començar"
     },
+    "engineer.detail_not_said_gone": {
+        "en": "not said: its request was cancelled or dropped",
+        "es": "no dicha: su petición se canceló o se descartó",
+        "ca": "no dita: la seva petició es va cancel·lar o descartar"
+    },
+    "engineer.detail_not_said_stale": {
+        "en": "not said: out of date",
+        "es": "no dicha: desactualizada",
+        "ca": "no dita: desactualitzada"
+    },
     "engineer.detail_tokens": {
         "en": "{model} | {input} in, {cached} cached, {output} out",
         "es": "{model} | {input} de entrada, {cached} en caché, {output} de salida",
@@ -1240,6 +1286,41 @@
         "en": "Cancelled: the pilot talked over it",
         "es": "Cancelada: el piloto habló por encima",
         "ca": "Cancel·lada: el pilot hi ha parlat per sobre"
+    },
+    "engineer.request_missing": {
+        "en": "Request {id} had already ended, so the change to it didn't apply",
+        "es": "La petición {id} ya había terminado, así que el cambio no se ha aplicado",
+        "ca": "La petició {id} ja s'havia acabat, així que el canvi no s'ha aplicat"
+    },
+    "engineer.request_dropped": {
+        "en": "Request {id} wasn't kept: a new weekend started while it was being made",
+        "es": "La petición {id} no se ha guardado: empezó un nuevo fin de semana mientras se hacía",
+        "ca": "La petició {id} no s'ha desat: va començar un nou cap de setmana mentre es feia"
+    },
+    "engineer.requests_cleared": {
+        "en": "Scheduled requests cleared",
+        "es": "Peticiones programadas borradas",
+        "ca": "Peticions programades esborrades"
+    },
+    "engineer.condition_dropped": {
+        "en": "Request {id} dropped, as its condition kept failing: {instruction}",
+        "es": "Petición {id} descartada, porque su condición fallaba una y otra vez: {instruction}",
+        "ca": "Petició {id} descartada, perquè la seva condició fallava una vegada i una altra: {instruction}"
+    },
+    "engineer.scheduled": {
+        "en": "Scheduled: {what}",
+        "es": "Programada: {what}",
+        "ca": "Programada: {what}"
+    },
+    "engineer.nothing_to_report": {
+        "en": "Nothing to report: {what}",
+        "es": "Nada que comunicar: {what}",
+        "ca": "Res a comunicar: {what}"
+    },
+    "engineer.scheduled_failed": {
+        "en": "Scheduled requests couldn't be answered, trying again shortly: {error}",
+        "es": "No se han podido responder las peticiones programadas, se reintentará en breve: {error}",
+        "ca": "No s'han pogut respondre les peticions programades, es tornarà a provar aviat: {error}"
     },
     "engineer.not_understood": {
         "en": "Nothing understood on the radio: say it again, a little louder or closer to the microphone",

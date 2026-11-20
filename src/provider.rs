@@ -69,7 +69,6 @@ pub trait Model: Send {
     ) -> BoxFuture<'a, anyhow::Result<Reply>>;
 
     /// Like [`Self::send_streaming`], without the text as it comes.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn send(&mut self, text: String) -> BoxFuture<'_, anyhow::Result<Reply>> {
         Box::pin(async move { self.send_streaming(text, &mut |_: &str| {}).await })
     }
@@ -77,6 +76,12 @@ pub trait Model: Send {
     /// Starts the conversation over, e.g. for a new session: forgets every message. The settings
     /// and tools stay.
     fn reset(&mut self);
+
+    /// Goes up whenever the conversation forgets earlier messages or parts of them on its own
+    /// (trimmed to fit a limit, compacted, started over): what they said may be gone.
+    fn forgotten(&self) -> u64 {
+        0
+    }
 
     /// Every turn's tokens so far (resets included), by the model that answered it.
     #[allow(dead_code)]

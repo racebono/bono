@@ -1,8 +1,12 @@
 //! The volumes: of everything the app plays, and of each voice on the radio. And how much it
-//! sounds like a radio.
+//! sounds like a radio, and how fast the voices talk.
 
-use crate::config::{Config, Setting};
+use crate::{
+    config::{Config, Setting},
+    synthesizer::{MAX_SPEED, MIN_SPEED},
+};
 use bono_i18n::t;
+use std::ops::RangeInclusive;
 
 #[derive(Default)]
 pub struct VolumeTopbar;
@@ -14,9 +18,9 @@ impl VolumeTopbar {
                 ui,
                 *raw.master_volume(),
                 &mut raw.master_volume,
+                0.0..=MAX_VOLUME,
                 t!("volume.master"),
                 t!("volume.master_hover"),
-                MAX_VOLUME,
             );
             ui.separator();
 
@@ -25,34 +29,42 @@ impl VolumeTopbar {
                 ui,
                 *raw.engineer_volume(),
                 &mut raw.engineer_volume,
+                0.0..=MAX_VOLUME,
                 t!("volume.engineer"),
                 t!("volume.engineer_hover"),
-                MAX_VOLUME,
             );
             changed |= volume(
                 ui,
                 *raw.spotter_volume(),
                 &mut raw.spotter_volume,
+                0.0..=MAX_VOLUME,
                 t!("volume.spotter"),
                 t!("volume.spotter_hover"),
-                MAX_VOLUME,
             );
             changed |= volume(
                 ui,
                 *raw.beep_volume(),
                 &mut raw.beep_volume,
+                0.0..=MAX_VOLUME,
                 t!("volume.beep"),
                 t!("volume.beep_hover"),
-                MAX_VOLUME,
             );
             ui.separator();
             changed |= volume(
                 ui,
                 *raw.radio_effect(),
                 &mut raw.radio_effect,
+                0.0..=1.0,
                 t!("volume.radio_effect"),
                 t!("volume.radio_effect_hover"),
-                1.0,
+            );
+            changed |= volume(
+                ui,
+                *raw.speech_speed(),
+                &mut raw.speech_speed,
+                MIN_SPEED..=MAX_SPEED,
+                t!("volume.speech_speed"),
+                t!("volume.speech_speed_hover"),
             );
             changed
         });
@@ -62,19 +74,19 @@ impl VolumeTopbar {
 /// The loudest a volume goes: 150%, for voices too quiet over the simulator.
 pub const MAX_VOLUME: f32 = 1.5;
 
-/// A volume (or effect) from 0 to `max` (1 is 100%), `current` until it's set. Returns whether
+/// A percentage within `range` (0 to 1 is 0 to 100%), `current` until it's set. Returns whether
 /// it changed.
 pub fn volume(
     ui: &mut egui::Ui,
     current: f32,
     setting: &mut Setting<f32>,
+    range: RangeInclusive<f32>,
     name: &str,
     hover: &str,
-    max: f32,
 ) -> bool {
     setting.edit(current, |value| {
         ui.add(
-            egui::Slider::new(value, 0.0..=max)
+            egui::Slider::new(value, range)
                 .text(name)
                 .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
                 .custom_parser(|text| {

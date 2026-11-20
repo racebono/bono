@@ -126,15 +126,17 @@ impl Drop for Process {
     }
 }
 
-/// Distributions ship it in `phonemizer/`, next to its espeak-ng data. During development
-/// it's built next to the executable (or its parent for test binaries).
+/// Distributions ship it in `phonemizer/`, next to its espeak-ng data. During development it's
+/// built in the profile directory: the executable's directory, or for test binaries its parent
+/// (`deps/`) or fourth ancestor (`build/{package}/{hash}/out/`, where Cargo nests build outputs by
+/// package).
 fn exe_path() -> Option<PathBuf> {
     let name = format!("{EXE_NAME}{}", std::env::consts::EXE_SUFFIX);
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent()?;
 
     std::iter::once(exe_dir.join("phonemizer"))
-        .chain(exe_dir.ancestors().take(2).map(PathBuf::from))
+        .chain(exe_dir.ancestors().take(5).map(PathBuf::from))
         .map(|dir| dir.join(&name))
         .find(|path| path.is_file())
 }

@@ -3,8 +3,17 @@
 //! player drives, so the game's threads never wait on the web API: they only take the last answer.
 //! It's only asked in realtime: after realtime ends the game may unload the car, and asking about
 //! it then may crash the game.
+//!
+//! The same thread asks for the player's garage setup (see `garage`), only at two moments: when the
+//! car leaves the garage (realtime starts, or a new player or event) and when it leaves the pit lane
+//! after coming in from the track. Nothing else changes the garage setup, and cockpit changes are in
+//! the telemetry, so it's a handful of questions a session.
 
-use bono_sim::sys::bono_telemetry;
+use crate::garage;
+use bono_sim::{
+    setup::{Setup, SetupSource},
+    sys::bono_telemetry,
+};
 use serde_json::Value;
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -23,6 +32,8 @@ const POLL: Duration = Duration::from_secs(1);
 const STALE: Duration = Duration::from_secs(5);
 /// It's only asked this long after the player's last telemetry update, so not from the menus.
 const DRIVING: Duration = Duration::from_secs(5);
+/// How many times the setup is asked at a moment, a poll apart, before it's given up until the next.
+const SETUP_ATTEMPTS: u8 = 3;
 
 /// What one answer says, as fractions: 0 none to 1 destroyed.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -43,6 +54,18 @@ struct State {
     vehicle: Option<i64>,
     /// Bumped by `clear`, so an answer asked for before it is dropped
     generation: u64,
+    /// The setup's moment: where the car is coming from, and how many attempts are left
+    setup_wanted: Option<(SetupSource, u8)>,
+    /// The setup read, until the game's thread takes it
+    setup: Option<Setup>,
+    /// Whether the player's car was in the pit lane in its last telemetry
+    in_pit_lane: Option<bool>,
+    /// Whether it came into the pit lane from the track, or started in it, so leaving it may be
+    /// after a stop
+    came_in: bool,
+    /// Whether a setup has been read since the car left the garage: until one has, a read on the
+    /// way out of the pit lane is the garage's, with no earlier setup for a stop to have changed
+    read_since_garage: bool,
 }
 
 #[derive(Default)]
@@ -65,16 +88,26 @@ impl VehicleCondition {
     pub fn start() -> Self {
         // Asked every second: anything slow means it isn't answering. About 1.5 s in all
         let agent = crate::local_agent(Duration::from_millis(400));
-        Self::with(POLL, move || fetch(&agent))
+        // The setup's answer is longer, and it's asked rarely. About 3 s in all
+        let setup_agent = crate::local_agent(Duration::from_millis(750));
+        Self::with(
+            POLL,
+            move || fetch(&agent),
+            move || garage::fetch(&setup_agent),
+        )
     }
 
-    fn with(poll: Duration, mut fetch: impl FnMut() -> Option<Condition> + Send + 'static) -> Self {
+    fn with(
+        poll: Duration,
+        mut fetch: impl FnMut() -> Option<Condition> + Send + 'static,
+        mut fetch_setup: impl FnMut() -> Option<Setup> + Send + 'static,
+    ) -> Self {
         let shared = Arc::new(Shared::default());
         let thread = {
             let shared = shared.clone();
             std::thread::Builder::new()
                 .name("bono-lmu-condition".into())
-                .spawn(move || shared.run(poll, &mut fetch))
+                .spawn(move || shared.run(poll, &mut fetch, &mut fetch_setup))
                 .ok()
         };
         Self { shared, thread }
@@ -86,13 +119,24 @@ impl VehicleCondition {
         state.forget();
         state.driving = None;
         state.vehicle = None;
+        state.leave_garage();
     }
 
     /// Whether the game is in realtime, where the car can be driven. Outside it, it isn't asked. A
     /// request already in flight when realtime ends isn't waited for (that would hold the game's
     /// thread): it normally takes milliseconds, well before the game unloads the car.
+    ///
+    /// Realtime starting is the car leaving the garage, so its setup is asked again. Answers asked
+    /// for before then are dropped: the car may have changed in the garage.
     pub fn set_realtime(&self, realtime: bool) {
-        lock(&self.shared.state).realtime = realtime;
+        let mut state = lock(&self.shared.state);
+        if realtime && !state.realtime {
+            state.forget();
+            state.leave_garage();
+            // The player drives again once their telemetry says so, not on what came before
+            state.driving = None;
+        }
+        state.realtime = realtime;
     }
 
     /// Takes the player's car from a scoring update (`None`: no car is theirs). Another car, or none,
@@ -103,7 +147,14 @@ impl VehicleCondition {
             state.forget();
             state.driving = None;
             state.vehicle = vehicle;
+            state.leave_garage();
         }
+    }
+
+    /// The setup read since the last call, if any. The game's thread takes it, never waiting on the
+    /// web API.
+    pub fn take_setup(&self) -> Option<Setup> {
+        lock(&self.shared.state).setup.take()
     }
 
     /// Fills in the player's aero and suspension damage, when the web API answered recently.
@@ -118,13 +169,35 @@ impl VehicleCondition {
         }
         let answer = {
             let mut state = lock(&self.shared.state);
-            // Another car's answer isn't this one's
+            // Another car's answer isn't this one's, and its setup is read as `set_player` would
+            // (telemetry can name the new car before scoring does)
             let vehicle = telemetry.vehicle_id.get();
             if state.vehicle != vehicle {
                 state.forget();
+                state.leave_garage();
                 state.vehicle = vehicle;
             }
             state.driving = Some(now);
+            let in_pit_lane = telemetry.in_pit_lane.get();
+            match (state.in_pit_lane, in_pit_lane) {
+                // In from the track, or starting in the pit lane: a driver taking over in the pit
+                // box is read as they start, perhaps with the crew still at work, so the way out is
+                // read again. After a plain garage exit, that read is the same and writes nothing
+                (Some(false) | None, Some(true)) => state.came_in = true,
+                (Some(true), Some(false)) if state.came_in => {
+                    state.came_in = false;
+                    // A garage read still wanted stays one
+                    if state.setup_wanted.is_none() {
+                        let source = match state.read_since_garage {
+                            true => SetupSource::PitStop,
+                            false => SetupSource::Garage,
+                        };
+                        state.setup_wanted = Some((source, SETUP_ATTEMPTS));
+                    }
+                }
+                _ => {}
+            }
+            state.in_pit_lane = in_pit_lane;
             state.answer
         };
         let Some((condition, _)) =
@@ -147,7 +220,8 @@ impl VehicleCondition {
 
 impl Drop for VehicleCondition {
     /// Waits for the thread, as the DLL may be unloaded next. This runs on the game's thread when the
-    /// game closes: a request in flight holds it for up to the request's timeouts, about 1.5 s, and
+    /// game closes: a request in flight holds it for up to the request's timeouts, about 1.5 s (3 s
+    /// for the setup's), and
     /// only if the web API stops answering just then. Not waiting would leave the thread running code
     /// that is gone.
     fn drop(&mut self) {
@@ -165,10 +239,25 @@ impl State {
         self.answer = None;
         self.generation = self.generation.wrapping_add(1);
     }
+
+    /// Wants the garage setup, as the car is leaving the garage: any setup read and pit lane seen
+    /// before are about before.
+    fn leave_garage(&mut self) {
+        self.setup_wanted = Some((SetupSource::Garage, SETUP_ATTEMPTS));
+        self.setup = None;
+        self.in_pit_lane = None;
+        self.came_in = false;
+        self.read_since_garage = false;
+    }
 }
 
 impl Shared {
-    fn run(&self, poll: Duration, fetch: &mut impl FnMut() -> Option<Condition>) {
+    fn run(
+        &self,
+        poll: Duration,
+        fetch: &mut impl FnMut() -> Option<Condition>,
+        fetch_setup: &mut impl FnMut() -> Option<Setup>,
+    ) {
         let mut state = lock(&self.state);
         loop {
             state = self
@@ -193,6 +282,40 @@ impl Shared {
             {
                 state.answer = Some((answer, Instant::now()));
             }
+
+            // The setup, at its moments, also only in realtime while the player drives. Not once
+            // asked to stop, so closing waits for one request at most
+            let Some((source, attempts)) = state.setup_wanted else {
+                continue;
+            };
+            if self.stop.load(Ordering::Relaxed)
+                || !state.realtime
+                || !state.driving.is_some_and(|at| at.elapsed() < DRIVING)
+            {
+                continue;
+            }
+            let generation = state.generation;
+            drop(state);
+            let setup = fetch_setup();
+            state = lock(&self.state);
+            // A new moment came while it was asked: the answer may be from before it
+            if state.generation != generation || state.setup_wanted != Some((source, attempts)) {
+                continue;
+            }
+            state.setup_wanted = match setup {
+                Some(setup) => {
+                    state.setup = Some(Setup {
+                        source: Some(source),
+                        ..setup
+                    });
+                    state.read_since_garage = true;
+                    None
+                }
+                None => attempts
+                    .checked_sub(1)
+                    .filter(|left| *left > 0)
+                    .map(|left| (source, left)),
+            };
         }
     }
 }
@@ -235,6 +358,7 @@ fn lock(mutex: &Mutex<State>) -> MutexGuard<'_, State> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bono_sim::setup::Setting;
     use std::sync::mpsc;
 
     const BODY: &str = r#"{
@@ -278,6 +402,32 @@ mod tests {
         state.vehicle = Some(1);
         drop(state);
         condition
+    }
+
+    /// Telemetry can name a new player's car before scoring does: that car's setup is still read.
+    /// Telemetry from before realtime ended isn't the player driving now: nothing is asked until
+    /// the next telemetry comes.
+    #[test]
+    fn realtime_starting_waits_for_fresh_telemetry() {
+        let condition = answered(parse(BODY).unwrap(), Instant::now());
+        lock(&condition.shared.state).driving = Some(Instant::now());
+        condition.set_realtime(true);
+        assert_eq!(lock(&condition.shared.state).driving, None);
+    }
+
+    #[test]
+    fn a_new_car_first_seen_in_telemetry_reads_its_setup() {
+        let condition = answered(parse(BODY).unwrap(), Instant::now());
+        lock(&condition.shared.state).setup_wanted = None;
+        let mut telemetry = bono_telemetry::default();
+        telemetry.vehicle_id = Some(2).into();
+        condition.fill_at(&mut telemetry, true, Instant::now());
+        let state = lock(&condition.shared.state);
+        assert_eq!(state.vehicle, Some(2));
+        assert_eq!(
+            state.setup_wanted,
+            Some((SetupSource::Garage, SETUP_ATTEMPTS))
+        );
     }
 
     #[test]
@@ -351,10 +501,14 @@ mod tests {
     fn an_answer_asked_for_before_clearing_is_dropped() {
         let (asked_tx, asked) = mpsc::channel();
         let (answer, answer_rx) = mpsc::channel::<Condition>();
-        let condition = VehicleCondition::with(Duration::from_millis(1), move || {
-            let _ = asked_tx.send(());
-            answer_rx.recv().ok()
-        });
+        let condition = VehicleCondition::with(
+            Duration::from_millis(1),
+            move || {
+                let _ = asked_tx.send(());
+                answer_rx.recv().ok()
+            },
+            || None,
+        );
         let first = Condition {
             aero: Some(0.1),
             suspension: Some(0.2),
@@ -386,10 +540,14 @@ mod tests {
         let (asked_tx, asked) = mpsc::channel();
         let (answer, answer_rx) = mpsc::channel::<Condition>();
         // Bounded, so a failing assertion can't leave dropping `condition` waiting on the question
-        let condition = VehicleCondition::with(Duration::from_millis(1), move || {
-            let _ = asked_tx.send(());
-            answer_rx.recv_timeout(Duration::from_secs(5)).ok()
-        });
+        let condition = VehicleCondition::with(
+            Duration::from_millis(1),
+            move || {
+                let _ = asked_tx.send(());
+                answer_rx.recv_timeout(Duration::from_secs(5)).ok()
+            },
+            || None,
+        );
         damage(&condition, true, Instant::now());
         assert!(asked.recv_timeout(Duration::from_millis(50)).is_err());
 
@@ -403,5 +561,208 @@ mod tests {
         answer.send(Condition::default()).unwrap();
         assert!(asked.recv_timeout(Duration::from_millis(50)).is_err());
         drop(answer);
+    }
+
+    /// The player's telemetry in car 1, in the pit lane or not.
+    fn drive(condition: &VehicleCondition, in_pit_lane: bool) {
+        drive_car(condition, 1, in_pit_lane);
+    }
+
+    fn drive_car(condition: &VehicleCondition, vehicle: i64, in_pit_lane: bool) {
+        let mut telemetry = bono_telemetry {
+            vehicle_id: Some(vehicle).into(),
+            in_pit_lane: Some(in_pit_lane).into(),
+            ..bono_telemetry::default()
+        };
+        condition.fill_at(&mut telemetry, true, Instant::now());
+    }
+
+    /// A condition whose setup reads send on `asked` and answer `answer`, and whose damage reads
+    /// get nothing.
+    fn asking_setup(answer: Option<Setup>) -> (VehicleCondition, mpsc::Receiver<()>) {
+        let (asked_tx, asked) = mpsc::channel();
+        let condition = VehicleCondition::with(
+            Duration::from_millis(1),
+            || None,
+            move || {
+                let _ = asked_tx.send(());
+                answer.clone()
+            },
+        );
+        (condition, asked)
+    }
+
+    /// The setup the thread stored, waiting for it a while.
+    fn taken(condition: &VehicleCondition) -> Option<Setup> {
+        for _ in 0..500 {
+            if let Some(setup) = condition.take_setup() {
+                return Some(setup);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
+    fn not_asked(asked: &mpsc::Receiver<()>) -> bool {
+        asked.recv_timeout(Duration::from_millis(50)).is_err()
+    }
+
+    fn wing() -> Setup {
+        Setup {
+            settings: vec![Setting {
+                name: "VM_REAR_WING".into(),
+                value: "P5".into(),
+                ..Setting::default()
+            }],
+            ..Setup::default()
+        }
+    }
+
+    #[test]
+    fn the_setup_is_asked_when_realtime_starts_and_after_the_pit_lane() {
+        let (condition, asked) = asking_setup(Some(wing()));
+        condition.set_realtime(true);
+        drive(&condition, true);
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        let setup = taken(&condition).unwrap();
+        assert_eq!(setup.source, Some(SetupSource::Garage));
+        assert_eq!(setup.settings, wing().settings);
+        assert_eq!(condition.take_setup(), None);
+        assert!(not_asked(&asked));
+
+        // Out of the pit lane it started in: asked once more, as it may have been a stop (a
+        // driver taking over in the pit box, the crew still at work). Unchanged, it writes nothing
+        drive(&condition, false);
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            taken(&condition).unwrap().source,
+            Some(SetupSource::PitStop)
+        );
+        drive(&condition, false);
+        assert!(not_asked(&asked));
+        // In from the track and out again
+        drive(&condition, true);
+        assert!(not_asked(&asked));
+        drive(&condition, false);
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        let setup = taken(&condition).unwrap();
+        assert_eq!(setup.source, Some(SetupSource::PitStop));
+
+        drive(&condition, false);
+        drive(&condition, false);
+        assert!(not_asked(&asked));
+
+        // Back to the garage and out again
+        condition.set_realtime(false);
+        condition.set_realtime(true);
+        drive(&condition, true);
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(taken(&condition).unwrap().source, Some(SetupSource::Garage));
+        drive(&condition, false);
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            taken(&condition).unwrap().source,
+            Some(SetupSource::PitStop)
+        );
+        drive(&condition, false);
+        assert!(not_asked(&asked));
+    }
+
+    /// Every garage read failing, the first read that works is still the garage's: there's no
+    /// earlier setup for a stop to have changed.
+    #[test]
+    fn the_first_read_after_failed_garage_reads_is_the_garages() {
+        let (asked_tx, asked) = mpsc::channel();
+        let answers = std::sync::atomic::AtomicUsize::new(0);
+        let condition = VehicleCondition::with(
+            Duration::from_millis(1),
+            || None,
+            move || {
+                let _ = asked_tx.send(());
+                // The garage's three attempts fail, the next works
+                (answers.fetch_add(1, Ordering::Relaxed) >= SETUP_ATTEMPTS as usize).then(wing)
+            },
+        );
+        condition.set_realtime(true);
+        drive(&condition, true);
+        for _ in 0..SETUP_ATTEMPTS {
+            asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert!(not_asked(&asked));
+        drive(&condition, false);
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(taken(&condition).unwrap().source, Some(SetupSource::Garage));
+    }
+
+    #[test]
+    fn a_failed_setup_read_is_retried_then_given_up() {
+        let (condition, asked) = asking_setup(None);
+        condition.set_realtime(true);
+        drive(&condition, false);
+        for _ in 0..SETUP_ATTEMPTS {
+            asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert!(not_asked(&asked));
+        assert_eq!(condition.take_setup(), None);
+
+        // The next moment asks again
+        drive(&condition, true);
+        drive(&condition, false);
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn the_setup_is_never_asked_outside_realtime() {
+        let (condition, asked) = asking_setup(Some(wing()));
+        condition.set_player(Some(1));
+        drive(&condition, false);
+        drive(&condition, true);
+        drive(&condition, false);
+        assert!(not_asked(&asked));
+
+        // Realtime starting is the moment it waited for
+        condition.set_realtime(true);
+        drive(&condition, false);
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(taken(&condition).unwrap().source, Some(SetupSource::Garage));
+    }
+
+    #[test]
+    fn a_new_player_or_event_asks_for_the_garage_setup_again() {
+        let condition = answered(parse(BODY).unwrap(), Instant::now());
+        let mut state = lock(&condition.shared.state);
+        state.setup = Some(wing());
+        state.in_pit_lane = Some(false);
+        drop(state);
+        condition.set_player(Some(2));
+        let state = lock(&condition.shared.state);
+        assert_eq!(
+            state.setup_wanted,
+            Some((SetupSource::Garage, SETUP_ATTEMPTS))
+        );
+        assert!(state.setup.is_none() && state.in_pit_lane.is_none());
+        drop(state);
+        // Leaving the pit lane before it's read doesn't make it a pit stop's
+        for in_pit_lane in [false, true, false] {
+            drive_car(&condition, 2, in_pit_lane);
+        }
+        let state = lock(&condition.shared.state);
+        assert_eq!(
+            state.setup_wanted,
+            Some((SetupSource::Garage, SETUP_ATTEMPTS))
+        );
+        drop(state);
+
+        let mut state = lock(&condition.shared.state);
+        state.setup = Some(wing());
+        state.setup_wanted = None;
+        drop(state);
+        condition.clear();
+        let state = lock(&condition.shared.state);
+        assert_eq!(
+            state.setup_wanted,
+            Some((SetupSource::Garage, SETUP_ATTEMPTS))
+        );
+        assert!(state.setup.is_none());
     }
 }

@@ -1,0 +1,74 @@
+CarSetup:
+ UpdateCount: 2
+ TiresAero:
+  TireType:
+   TireType: Dry
+  LeftFront:
+   ColdPressure: 117 kPa
+   LastHotPressure: 117 kPa
+   LastTempsOMI: 68C, 68C, 68C
+   TreadRemaining: 100%, 100%, 100%
+  LeftRear:
+   ColdPressure: 117 kPa
+   LastHotPressure: 117 kPa
+   LastTempsOMI: 68C, 68C, 68C
+   TreadRemaining: 100%, 100%, 100%
+  RightFront:
+   ColdPressure: 117 kPa
+   LastHotPressure: 117 kPa
+   LastTempsIMO: 68C, 68C, 68C
+   TreadRemaining: 100%, 100%, 100%
+  RightRear:
+   ColdPressure: 117 kPa
+   LastHotPressure: 117 kPa
+   LastTempsIMO: 68C, 68C, 68C
+   TreadRemaining: 100%, 100%, 100%
+  Aero:
+   FrontMainplaneAngle: 2 deg
+   RearWingAngle: 10 deg
+  AeroCalculator:
+   FrontRhAtSpeed: 18.0 mm
+   RearRhAtSpeed: 26.0 mm
+   DownforceToDrag: 1.37:1
+   AeroBalance: 45.5%
+ Chassis:
+  Front:
+   PushrodOffset: 14.0 mm
+   ArbBlade:  5 
+   DamperCompressionStiffness: +7 clicks
+   DamperReboundStiffness: +8 clicks
+   BrakePressureBias: 57.5%
+   CrossWeight: 50.0%
+  LeftFront:
+   CornerWeight: 1352 N
+   RideHeight: 20.1 mm
+   SpringRate: 88 N/mm
+   Caster: +11.0 deg
+   Camber: -4.0 deg
+   ToeIn: -1.6 mm
+  LeftRear:
+   CornerWeight: 1887 N
+   SpringRate: 106 N/mm
+   Camber: -3.9 deg
+   ToeIn: +0.0 mm
+  Rear:
+   RideHeight: 30.1 mm
+   PushrodOffset: -17.0 mm
+   ArbBlade:  3
+   DamperCompressionStiffness: +7 clicks
+   DamperReboundStiffness: +10 clicks
+   FuelLevel: 14.0 L
+  RightFront:
+   CornerWeight: 1352 N
+   RideHeight: 20.1 mm
+   SpringRate: 88 N/mm
+   Caster: +11.0 deg
+   Camber: -4.0 deg
+   ToeIn: -1.6 mm
+  RightRear:
+   CornerWeight: 1887 N
+   SpringRate: 106 N/mm
+   Camber: -3.9 deg
+   ToeIn: +0.0 mm
+
+...

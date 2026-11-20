@@ -5,6 +5,7 @@
 
 use bono_sim::{
     recorder::{self, ForecastSource, Recorder},
+    sql::EpochReason,
     sys::{bono_session_info, bono_standing, bono_telemetry},
 };
 use std::{
@@ -20,6 +21,7 @@ mod car_numbers;
 mod class_positions;
 mod condition;
 mod forecast;
+mod garage;
 mod track_limits;
 
 use car_numbers::CarNumbers;
@@ -143,7 +145,11 @@ pub unsafe extern "C" fn bono_lmu_push_telemetry(
             .get()
             .is_some_and(|vehicle| recorder.is_player(vehicle));
         condition.fill_telemetry(&mut telemetry, is_player);
-        recorder.push_telemetry(&telemetry)
+        recorder.push_telemetry(&telemetry);
+        // After the telemetry, so the setup is recorded with this update's row
+        if is_player && let Some(setup) = condition.take_setup() {
+            recorder.push_setup(setup);
+        }
     })
 }
 
@@ -188,6 +194,20 @@ pub unsafe extern "C" fn bono_lmu_clear(recorder: *const LmuRecorder) {
         track_limits.clear();
         condition.clear();
         recorder.clear()
+    })
+}
+
+/// # Safety
+/// `recorder` must come from `bono_lmu_open`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bono_lmu_begin_session(recorder: *const LmuRecorder) {
+    let LmuRecorder(recorder, _, track_limits, condition) = unsafe { &*recorder };
+    guard((), || {
+        // The session's rule, its scoring says again: until then, points are unknown
+        track_limits.clear();
+        // The last session's damage isn't this one's: it's asked again once the player drives
+        condition.clear();
+        recorder.begin_epoch(EpochReason::Session)
     })
 }
 

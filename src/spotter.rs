@@ -18,6 +18,7 @@ use crate::{
     synthesizer::{Drain, Drained, Effects, Speech, Synthesizer, plays_on},
 };
 use bono_i18n::t;
+use bono_sim::sql::{Epoch, active_epoch};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
 use sdl3::audio::{AudioDevice, AudioStreamOwner};
 use std::{
@@ -58,13 +59,14 @@ const LAP_INVALID_GRACE: f64 = 1.0;
 /// A lap's time: its number is in milliseconds.
 const LAP_TIME: &str = "lap time {}";
 /// Calls synthesized ahead, so the first of each is said without waiting for the voice.
-const WARM: [&str; 6] = [
+const WARM: [&str; 7] = [
     "car left",
     "car right",
     "three wide",
     "clear left",
     "clear right",
     "clear all round",
+    "green, green, green",
 ];
 
 /// Something the spotter says. `text` is English (a `{}` in it takes `number`); [`Raised::words`]
@@ -154,7 +156,10 @@ impl Raised {
             | "clear left" | "clear right" | "clear all round" | "still there left"
             | "still there right" => WarningCategory::Traffic,
             "limiter, limiter" => WarningCategory::Limiter,
-            "full course yellow" | "green flag, green flag" | "red flag" => WarningCategory::Flag,
+            "full course yellow"
+            | "green flag, green flag"
+            | "red flag"
+            | "green, green, green" => WarningCategory::Flag,
             "car close behind" | "car within a second behind" => WarningCategory::GapBehind,
             text => WarningCategory::Other(text),
         }
@@ -184,8 +189,8 @@ impl Raised {
     }
 
     /// A traffic update replaces only the sides it describes; other updates replace the older
-    /// state in their category, as urgent as they are. Nothing but a red flag replaces a red
-    /// flag: the session's stopped until it restarts, which isn't called.
+    /// state in their category, as urgent as they are. Only a red flag, or the race going green
+    /// again, replaces a red flag: the session's stopped until it restarts.
     fn supersedes(&self, older: &Raised) -> bool {
         if self.urgent != older.urgent {
             return false;
@@ -195,7 +200,7 @@ impl Raised {
                 self.traffic_sides() & older.traffic_sides() != 0
             }
             (WarningCategory::Flag, WarningCategory::Flag) => {
-                older.text != "red flag" || self.text == "red flag"
+                older.text != "red flag" || matches!(self.text, "red flag" | "green, green, green")
             }
             (WarningCategory::Other(_), _) | (_, WarningCategory::Other(_)) => false,
             (new, old) => new == old,
@@ -223,7 +228,7 @@ pub struct Spotter {
     queue: VecDeque<(Raised, Instant)>,
     /// The call being said
     saying: Option<Saying>,
-    /// Calls already synthesized, by (language, voice, radio effect, words)
+    /// Calls already synthesized
     cache: HashMap<CacheKey, Arc<Speech>>,
     /// Calls being synthesized ahead
     warming: Vec<(CacheKey, oneshot::Receiver<anyhow::Result<Speech>>)>,
@@ -231,7 +236,18 @@ pub struct Spotter {
     warm_failed: HashMap<CacheKey, Instant>,
 }
 
-type CacheKey = (ArrayStr<2>, PathBuf, u32, String);
+/// What a call was synthesized with: the same words said another way are another call.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    lang: ArrayStr<2>,
+    /// The voice's model (empty without one)
+    voice: PathBuf,
+    /// The radio effect, as bits
+    radio: u32,
+    /// The speech speed, as bits
+    speed: u32,
+    words: String,
+}
 
 struct Running {
     db: PathBuf,
@@ -245,6 +261,8 @@ enum Heard {
     Call(Raised),
     /// It's gone quiet (qualifying, with the spotter off for it): nothing from before is said
     Muted,
+    /// The recording moved on to another epoch: the calls before are about another session's cars
+    Epoch,
 }
 
 impl Drop for Running {
@@ -338,7 +356,7 @@ impl Spotter {
         match heard {
             Heard::Call(call) => self.hear(call, at),
             // The calls waiting, and the one being said
-            Heard::Muted => {
+            Heard::Muted | Heard::Epoch => {
                 self.queue.clear();
                 self.saying = None;
             }
@@ -428,12 +446,13 @@ impl Spotter {
             .voices()
             .get(&lang)
             .map(|path| path.as_std_path().to_owned());
-        (
+        CacheKey {
             lang,
-            voice.unwrap_or_default(),
-            config.radio_effect().to_bits(),
+            voice: voice.unwrap_or_default(),
+            radio: config.radio_effect().to_bits(),
+            speed: config.speech_speed().to_bits(),
             words,
-        )
+        }
     }
 
     fn effects(config: &Config) -> Effects {
@@ -444,9 +463,19 @@ impl Spotter {
         }
     }
 
-    /// Synthesizes the traffic calls ahead, so the first ones aren't late.
+    /// Synthesizes the traffic calls and the race start ahead, so the first ones aren't late.
     fn warm(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer, lang: ArrayStr<2>) {
         self.finish_warming(Instant::now());
+
+        // Ones for other settings (a slider being dragged) would hold up the ones for these: the
+        // voice skips those dropped before it gets to them
+        let now = Self::key(config, lang, String::new());
+        self.warming.retain(|(key, _)| {
+            key.lang == now.lang
+                && key.voice == now.voice
+                && key.radio == now.radio
+                && key.speed == now.speed
+        });
 
         for text in WARM {
             let words = translate(text, lang).to_owned();
@@ -667,20 +696,27 @@ fn follow(
     let mut logic = Logic::default();
     let mut sizes = Sizes::default();
     let mut last_id = None;
+    let mut epoch = None;
     let mut failing = false;
     let mut muted = false;
     while !stop.load(Ordering::Relaxed) {
         let start = Instant::now();
         let (config, frequency) = settings.borrow().clone();
 
-        match poll(
+        let followed = epoch;
+        let polled = poll(
             &conn,
             &mut logic,
             &mut sizes,
             &config,
             frequency,
             &mut last_id,
-        ) {
+            &mut epoch,
+        );
+        if epoch != followed && calls.send(Heard::Epoch).is_err() {
+            return;
+        }
+        match polled {
             Ok(raised) => {
                 failing = false;
                 for heard in outgoing(raised, logic.muted, &mut muted) {
@@ -722,7 +758,10 @@ fn open(db: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// The calls for the player's newest row, if it's new.
+/// The calls for the player's newest row, if it's new. Only the newest epoch's rows count (see
+/// `bono_sim::sql`): in another session, what was called before starts over, and until the player
+/// has a row in it (spectating, or a replay, which isn't recorded) there's nothing to call. The
+/// epoch and its rows are read in one transaction, so they're as of the same write.
 fn poll(
     conn: &Connection,
     logic: &mut Logic,
@@ -730,8 +769,19 @@ fn poll(
     config: &SpotterConfig,
     frequency: u32,
     last_id: &mut Option<i64>,
+    seen_epoch: &mut Option<i64>,
 ) -> rusqlite::Result<Vec<Raised>> {
-    let Some(mut car) = latest(conn)? else {
+    let _snapshot = conn.unchecked_transaction()?;
+    let epoch = active_epoch(conn)?;
+    if epoch.id != *seen_epoch {
+        *seen_epoch = epoch.id;
+        *logic = Logic::default();
+        // Its cars' sizes are read again from its own standings
+        *sizes = Sizes::default();
+        // A cleared recording numbers its rows from 1 again
+        *last_id = None;
+    }
+    let Some(mut car) = latest(conn, &epoch)? else {
         return Ok(Vec::new());
     };
     if Some(car.id) == *last_id {
@@ -742,13 +792,13 @@ fn poll(
 
     // Only once it's all read: a row that failed is tried again, rather than left unfollowed
     let id = car.id;
-    sizes.update(conn, None)?;
+    sizes.update(conn, None, &epoch)?;
     sizes.apply(&mut car);
     let player = player(conn, car)?;
-    let mut others = frame(conn, &player.car, frequency)?;
+    let mut others = frame(conn, &player.car, frequency, &epoch)?;
     others.iter_mut().for_each(|other| sizes.apply(other));
     let wheels = wheels(conn, player.car.id)?;
-    let scoring = scoring(conn, None)?;
+    let scoring = scoring(conn, None, &epoch)?;
     *last_id = Some(id);
     Ok(logic.update(config, &player, &others, &wheels, scoring.as_ref()))
 }
@@ -770,13 +820,13 @@ pub fn replay(db: &Path, config: &SpotterConfig) -> rusqlite::Result<Vec<Raised>
     let mut calls = Vec::new();
     for mut car in cars.into_iter().filter(|car| car.time.is_some()) {
         let time = car.time;
-        sizes.update(&conn, time)?;
+        sizes.update(&conn, time, &Epoch::ALL)?;
         sizes.apply(&mut car);
         let player = player(&conn, car)?;
-        let mut others = frame(&conn, &player.car, 5)?;
+        let mut others = frame(&conn, &player.car, 5, &Epoch::ALL)?;
         others.iter_mut().for_each(|other| sizes.apply(other));
         let wheels = wheels(&conn, player.car.id)?;
-        let scoring = scoring(&conn, time)?;
+        let scoring = scoring(&conn, time, &Epoch::ALL)?;
         calls.extend(logic.update(config, &player, &others, &wheels, scoring.as_ref()));
     }
     Ok(calls)
@@ -852,10 +902,15 @@ fn session_of((sessions, latest): (u32, Option<f64>), clock: f64) -> u32 {
 }
 
 impl Sizes {
-    /// Reads the standings written since the last call (only up to the player's session time
+    /// Reads `epoch`'s standings written since the last call (only up to the player's session time
     /// `upto`, in the same session, when replaying). A recording cleared since (its rows deleted,
     /// their ids reused) is read again from the start.
-    fn update(&mut self, conn: &Connection, upto: Option<f64>) -> rusqlite::Result<()> {
+    fn update(
+        &mut self,
+        conn: &Connection,
+        upto: Option<f64>,
+        epoch: &Epoch,
+    ) -> rusqlite::Result<()> {
         if let Some(upto) = upto {
             self.replay[PLAYER] = (session_of(self.replay[PLAYER], upto), Some(upto));
         }
@@ -885,9 +940,10 @@ impl Sizes {
         }
         let mut statement = conn.prepare_cached(
             "SELECT id, vehicle_id, session_time, vehicle_width, vehicle_length FROM standings \
-             WHERE id > ?1 ORDER BY id",
+             WHERE id > ?1 AND id >= ?2 ORDER BY id",
         )?;
-        let mut rows = statement.query([self.last.map_or(0, |(id, ..)| id)])?;
+        let mut rows =
+            statement.query([self.last.map_or(0, |(id, ..)| id), epoch.standings_from])?;
         while let Some(row) = rows.next()? {
             let vehicle = row.get::<_, Option<i64>>(1)?;
             let time = row.get::<_, Option<f64>>(2)?;
@@ -981,12 +1037,13 @@ struct Scoring {
     forecast: Vec<(f64, f64)>,
 }
 
-/// The player's newest row.
-fn latest(conn: &Connection) -> rusqlite::Result<Option<Car>> {
+/// The player's newest row in `epoch`.
+fn latest(conn: &Connection, epoch: &Epoch) -> rusqlite::Result<Option<Car>> {
     conn.prepare_cached(&format!(
-        "SELECT {CAR_COLUMNS} FROM telemetry WHERE is_player = 1 ORDER BY id DESC LIMIT 1"
+        "SELECT {CAR_COLUMNS} FROM telemetry WHERE is_player = 1 AND id >= ?1 \
+         ORDER BY id DESC LIMIT 1"
     ))?
-    .query_row([], car)
+    .query_row([epoch.telemetry_from], car)
     .optional()
 }
 
@@ -1076,8 +1133,13 @@ fn wheels(conn: &Connection, telemetry_id: i64) -> rusqlite::Result<Wheels> {
     Ok(wheels)
 }
 
-/// Every other car near the player's row, moved to the player's time.
-fn frame(conn: &Connection, player: &Car, frequency: u32) -> rusqlite::Result<Vec<Car>> {
+/// Every other car near the player's row in `epoch`, moved to the player's time.
+fn frame(
+    conn: &Connection,
+    player: &Car,
+    frequency: u32,
+    epoch: &Epoch,
+) -> rusqlite::Result<Vec<Car>> {
     let Some(time) = player.time else {
         return Ok(Vec::new());
     };
@@ -1088,9 +1150,11 @@ fn frame(conn: &Connection, player: &Car, frequency: u32) -> rusqlite::Result<Ve
         let previous = conn
             .prepare_cached(
                 "SELECT session_time FROM telemetry WHERE is_player = 1 AND id < ?1 \
-                 ORDER BY id DESC LIMIT 1",
+                 AND id >= ?2 ORDER BY id DESC LIMIT 1",
             )?
-            .query_row([player.id], |row| row.get::<_, Option<f64>>(0))
+            .query_row([player.id, epoch.telemetry_from], |row| {
+                row.get::<_, Option<f64>>(0)
+            })
             .optional()?
             .flatten();
         let interval = previous.map_or(0.0, |previous| (time - previous).max(0.0));
@@ -1104,7 +1168,13 @@ fn frame(conn: &Connection, player: &Car, frequency: u32) -> rusqlite::Result<Ve
     let mut statement = conn.prepare_cached(&format!(
         "SELECT {CAR_COLUMNS} FROM telemetry WHERE id BETWEEN ?1 AND ?2"
     ))?;
-    let rows = statement.query_map([player.id - window, player.id + window], car)?;
+    let rows = statement.query_map(
+        [
+            (player.id - window).max(epoch.telemetry_from),
+            player.id + window,
+        ],
+        car,
+    )?;
 
     // Per car, the row closest in time (then in id) to the player's
     let mut best = HashMap::<i64, ((f64, i64), Car)>::new();
@@ -1132,8 +1202,12 @@ fn frame(conn: &Connection, player: &Car, frequency: u32) -> rusqlite::Result<Ve
 }
 
 /// The newest session row, the player's newest standing and the session's newest forecast (at or
-/// before `upto`, when replaying).
-fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scoring>> {
+/// before `upto`, when replaying), in `epoch`.
+fn scoring(
+    conn: &Connection,
+    upto: Option<f64>,
+    epoch: &Epoch,
+) -> rusqlite::Result<Option<Scoring>> {
     let session = conn
         .prepare_cached(
             "SELECT full_course_yellow, phase, \
@@ -1141,9 +1215,10 @@ fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scor
              rain, track_wetness_average, session_type, session_end_time, \
              EXISTS (SELECT 1 FROM session_sector WHERE session_id = session.id \
                  AND local_yellow IS NOT NULL) \
-             FROM session WHERE ?1 IS NULL OR session_time <= ?1 ORDER BY id DESC LIMIT 1",
+             FROM session WHERE (?1 IS NULL OR session_time <= ?1) AND id >= ?2 \
+             ORDER BY id DESC LIMIT 1",
         )?
-        .query_row([upto], |row| {
+        .query_row(rusqlite::params![upto, epoch.session_from], |row| {
             Ok((
                 Scoring {
                     full_course_yellow: row.get(0)?,
@@ -1175,25 +1250,26 @@ fn scoring(conn: &Connection, upto: Option<f64>) -> rusqlite::Result<Option<Scor
         None => conn
             .prepare_cached(&format!(
                 "SELECT {columns} FROM standings WHERE is_player = 1 \
-                 AND id > (SELECT coalesce(max(id), 0) - 5000 FROM standings) \
+                 AND id > (SELECT coalesce(max(id), 0) - 5000 FROM standings) AND id >= ?1 \
                  ORDER BY id DESC LIMIT 1"
             ))?
-            .query_row([], standing)
+            .query_row([epoch.standings_from], standing)
             .optional()?
             .map(|standing| Ok(Some(standing)))
             .unwrap_or_else(|| {
                 conn.prepare_cached(&format!(
-                    "SELECT {columns} FROM standings WHERE is_player = 1 ORDER BY id DESC LIMIT 1"
+                    "SELECT {columns} FROM standings WHERE is_player = 1 AND id >= ?1 \
+                     ORDER BY id DESC LIMIT 1"
                 ))?
-                .query_row([], standing)
+                .query_row([epoch.standings_from], standing)
                 .optional()
             })?,
         Some(upto) => conn
             .prepare_cached(&format!(
                 "SELECT {columns} FROM standings WHERE is_player = 1 AND session_time <= ?1 \
-                 ORDER BY id DESC LIMIT 1"
+                 AND id >= ?2 ORDER BY id DESC LIMIT 1"
             ))?
-            .query_row([upto], standing)
+            .query_row(rusqlite::params![upto, epoch.standings_from], standing)
             .optional()?,
     };
     if let Some((flag, penalties, laps_completed, last_lap_time, under_yellow)) = standing {
@@ -1473,6 +1549,9 @@ struct Logic {
     /// The gap behind opened up since it was last called
     gap_armed: bool,
     prev_scoring: Option<Scoring>,
+    /// A caution was still shown as the race went green, which is still racing: the start call
+    /// said its end
+    start_caution: bool,
     /// The last bands called
     rain_band: Option<usize>,
     track_band: Option<usize>,
@@ -1509,6 +1588,7 @@ impl Default for Logic {
             prev_flat: [None; 4],
             gap_armed: true,
             prev_scoring: None,
+            start_caution: false,
             rain_band: None,
             track_band: None,
             last_rain_call: f64::NEG_INFINITY,
@@ -1634,7 +1714,7 @@ impl Logic {
         }
         if let Some(scoring) = scoring {
             self.lap_times(config, scoring, p.in_pit_lane, t, &mut calls);
-            self.flags(scoring, &mut calls);
+            self.flags(config, scoring, &mut calls);
             self.weather(config, scoring, wheels.wet, t, stopped, &mut calls);
         }
 
@@ -1853,21 +1933,41 @@ impl Logic {
         }
     }
 
-    /// Rising edges of flags and penalties.
-    fn flags(&mut self, now: &Scoring, calls: &mut Calls) {
+    /// Rising edges of flags and penalties, and the race going green: at the start, and as it
+    /// restarts after a red flag.
+    fn flags(&mut self, config: &SpotterConfig, now: &Scoring, calls: &mut Calls) {
         let Some(last) = self.prev_scoring.replace(now.clone()) else {
             return;
         };
         let caution = |fcy: &Option<String>| fcy.as_deref().is_some_and(|fcy| fcy != "none");
 
+        // A start is called once: a caution ending around it is said by the start call
+        let calls_starts = *config.race_starts() && now.session_type.as_deref() == Some("race");
+        if calls_starts
+            && now.phase.as_deref() == Some("green")
+            && matches!(
+                last.phase.as_deref(),
+                Some("formation_lap" | "countdown" | "stopped")
+            )
+        {
+            calls.raise("green, green, green", true);
+            self.start_caution = caution(&last.full_course_yellow);
+        }
+        // Until the race is held up again: a new caution or a red flag is called as it ends
+        self.start_caution &= now.phase.as_deref() == Some("green");
         if caution(&now.full_course_yellow) && !caution(&last.full_course_yellow) {
             calls.raise("full course yellow", true);
         } else if caution(&last.full_course_yellow)
             && now.full_course_yellow.as_deref() == Some("none")
-            // The caution ending as the session's stopped isn't a restart: it's still red
-            && now.phase.as_deref() != Some("stopped")
         {
-            calls.raise("green flag, green flag", true);
+            let started = std::mem::take(&mut self.start_caution);
+            // Ending before the race goes green: the start's still to say it
+            let said_by_the_start = calls_starts
+                && (started || matches!(now.phase.as_deref(), Some("formation_lap" | "countdown")));
+            // The caution ending as the session's stopped isn't a restart: it's still red
+            if !said_by_the_start && now.phase.as_deref() != Some("stopped") {
+                calls.raise("green flag, green flag", true);
+            }
         }
         if now.phase.as_deref() == Some("stopped") && last.phase.as_deref() != Some("stopped") {
             calls.raise("red flag", true);
@@ -2042,6 +2142,7 @@ pub fn translate(text: &'static str, lang: ArrayStr<2>) -> &'static str {
         "car within a second behind" => t!("call.car_within_a_second": lang),
         "full course yellow" => t!("call.full_course_yellow": lang),
         "green flag, green flag" => t!("call.green_flag": lang),
+        "green, green, green" => t!("call.race_start": lang),
         "red flag" => t!("call.red_flag": lang),
         "yellow flag on track" => t!("call.yellow_flag": lang),
         "blue flag" => t!("call.blue_flag": lang),
@@ -2108,19 +2209,39 @@ mod tests {
                 .unwrap();
             for upto in [None, Some(time)] {
                 assert_eq!(
-                    scoring(&conn, upto).unwrap().unwrap().forecast,
+                    scoring(&conn, upto, &Epoch::ALL).unwrap().unwrap().forecast,
                     vec![(0.0, 0.0), (1.0, 0.1)]
                 );
             }
         }
         assert_eq!(
-            scoring(&conn, Some(0.0)).unwrap().unwrap().forecast,
+            scoring(&conn, Some(0.0), &Epoch::ALL)
+                .unwrap()
+                .unwrap()
+                .forecast,
             vec![(0.0, 0.0), (1.0, 0.1)]
         );
         writer
             .write(vec![point(30.0, "qualifying", 0.0, 0.6)])
             .unwrap();
-        assert!(scoring(&conn, None).unwrap().unwrap().forecast.is_empty());
+        assert!(
+            scoring(&conn, None, &Epoch::ALL)
+                .unwrap()
+                .unwrap()
+                .forecast
+                .is_empty()
+        );
+    }
+
+    /// `words` in English, with no voice and no effects.
+    fn english_key(words: &str) -> CacheKey {
+        CacheKey {
+            lang: arrstr!("en"),
+            voice: PathBuf::new(),
+            radio: 0,
+            speed: 0,
+            words: words.into(),
+        }
     }
 
     #[test]
@@ -2128,7 +2249,7 @@ mod tests {
         let now = Instant::now();
         for closed in [false, true] {
             let mut spotter = Spotter::new();
-            let key = (arrstr!("en"), PathBuf::new(), 0, "car left".into());
+            let key = english_key("car left");
             let (send, recv) = oneshot::channel();
             spotter.warming.push((key.clone(), recv));
             if closed {
@@ -2141,9 +2262,22 @@ mod tests {
             assert!(spotter.cache.is_empty());
             assert!(spotter.warm_failed.contains_key(&key));
             for changed in [
-                (arrstr!("es"), key.1.clone(), key.2, key.3.clone()),
-                (key.0, PathBuf::from("voice.onnx"), key.2, key.3.clone()),
-                (key.0, key.1.clone(), 1.0_f32.to_bits(), key.3.clone()),
+                CacheKey {
+                    lang: arrstr!("es"),
+                    ..key.clone()
+                },
+                CacheKey {
+                    voice: PathBuf::from("voice.onnx"),
+                    ..key.clone()
+                },
+                CacheKey {
+                    radio: 1.0_f32.to_bits(),
+                    ..key.clone()
+                },
+                CacheKey {
+                    speed: 1.5_f32.to_bits(),
+                    ..key.clone()
+                },
             ] {
                 assert!(!spotter.warm_failed.contains_key(&changed));
             }
@@ -2155,9 +2289,53 @@ mod tests {
     }
 
     #[test]
+    fn a_new_speed_is_a_new_call_with_the_beep_still_off() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let lang = arrstr!("en");
+        let before = Spotter::key(&config, lang, "car left".into());
+
+        config.update(|raw| raw.speech_speed.set(1.5));
+        assert_ne!(Spotter::key(&config, lang, "car left".into()), before);
+        let effects = Spotter::effects(&config);
+        assert_eq!(effects.speed, 1.5);
+        assert_eq!(effects.beep_volume, 0.0);
+    }
+
+    #[test]
+    fn warmups_for_old_settings_are_dropped() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let mut synth = Synthesizer::new(runtime.handle(), &config.get());
+        let lang = arrstr!("en");
+        let mut spotter = Spotter::new();
+        let old = Spotter::key(&config, lang, "car left".into());
+        let (_send, recv) = oneshot::channel();
+        spotter.warming.push((old.clone(), recv));
+
+        config.update(|raw| raw.speech_speed.set(1.5));
+        spotter.warm(runtime.handle(), &config, &mut synth, lang);
+        assert!(!spotter.warming.iter().any(|(key, _)| *key == old));
+        assert!(!spotter.warm_failed.contains_key(&old));
+        assert!(
+            spotter
+                .warming
+                .iter()
+                .all(|(key, _)| key.speed == 1.5_f32.to_bits())
+        );
+    }
+
+    #[test]
     fn warmups_keep_pending_jobs_and_cache_successes() {
         let mut spotter = Spotter::new();
-        let key = (arrstr!("en"), PathBuf::new(), 0, "car left".into());
+        let key = english_key("car left");
         let (send, recv) = oneshot::channel();
         spotter.warming.push((key.clone(), recv));
         spotter.finish_warming(Instant::now());
@@ -2237,7 +2415,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_red_flag_replaces_a_red_flag() {
+    fn only_a_red_flag_or_the_race_going_green_replaces_a_red_flag() {
         for newer in ["full course yellow", "green flag, green flag"] {
             let queue = queued(&[("red flag", true), (newer, true)]);
             assert_eq!(
@@ -2247,6 +2425,12 @@ mod tests {
         }
         let queue = queued(&[("red flag", true), ("red flag", true)]);
         assert_eq!(queue.len(), 1);
+        // The race going green again: the red flag's over
+        let queue = queued(&[("red flag", true), ("green, green, green", true)]);
+        assert_eq!(
+            queue.iter().map(|(call, _)| call.text).collect::<Vec<_>>(),
+            ["green, green, green"]
+        );
     }
 
     #[test]
@@ -2327,7 +2511,7 @@ mod tests {
         let mut spotter = Spotter::new();
         let (send, recv) = oneshot::channel();
         spotter.saying = Some(Saying::Synthesizing {
-            key: (arrstr!("en"), PathBuf::new(), 0, text.into()),
+            key: english_key(text),
             recv,
             call: Raised {
                 text,
@@ -2904,10 +3088,10 @@ mod tests {
             let mut p = player(t);
             p.car.id = conn.last_insert_rowid();
             p.car.z = Some(-50.0 * t);
-            let others = frame(&conn, &p.car, 60).unwrap();
+            let others = frame(&conn, &p.car, 60, &Epoch::ALL).unwrap();
             assert_eq!(others.len(), 60);
             if tick == 59 {
-                default_expired = frame(&conn, &p.car, 5).unwrap().is_empty();
+                default_expired = frame(&conn, &p.car, 5, &Epoch::ALL).unwrap().is_empty();
             }
             calls.extend(texts(logic.update(
                 &SpotterConfig::default(),
@@ -3120,7 +3304,7 @@ mod tests {
         )
         .unwrap();
         let mut sizes = Sizes::default();
-        sizes.update(&conn, None).unwrap();
+        sizes.update(&conn, None, &Epoch::ALL).unwrap();
         assert!(sizes.sizes.is_empty());
 
         let size_of = |sizes: &Sizes, vehicle| {
@@ -3137,7 +3321,7 @@ mod tests {
              INSERT INTO standings VALUES (2, 2, 2.0, 1.8, 4.5), (3, 3, 2.0, 2.0, 5.0);",
         )
         .unwrap();
-        sizes.update(&conn, None).unwrap();
+        sizes.update(&conn, None, &Epoch::ALL).unwrap();
         assert_eq!(size_of(&sizes, 2), size(1.8, 4.5));
         assert_eq!(size_of(&sizes, 3), size(2.0, 5.0));
         assert_eq!(size_of(&sizes, 4), None);
@@ -3145,22 +3329,22 @@ mod tests {
         // Slot 2 taken by a car without a size, then by another car; slot 3 by an implausible one
         conn.execute("INSERT INTO standings VALUES (4, 2, 3.0, NULL, NULL)", [])
             .unwrap();
-        sizes.update(&conn, None).unwrap();
+        sizes.update(&conn, None, &Epoch::ALL).unwrap();
         assert_eq!(size_of(&sizes, 2), None);
         conn.execute_batch(
             "INSERT INTO standings VALUES (5, 2, 4.0, 1.9, 4.7), (6, 3, 4.0, 190, 470);",
         )
         .unwrap();
-        sizes.update(&conn, None).unwrap();
+        sizes.update(&conn, None, &Epoch::ALL).unwrap();
         assert_eq!(size_of(&sizes, 2), size(1.9, 4.7));
         assert_eq!(size_of(&sizes, 3), None);
 
         // Replaying, standings after the player's time aren't read yet
         let mut replaying = Sizes::default();
-        replaying.update(&conn, Some(3.5)).unwrap();
+        replaying.update(&conn, Some(3.5), &Epoch::ALL).unwrap();
         assert_eq!(size_of(&replaying, 2), None);
         assert_eq!(size_of(&replaying, 3), size(2.0, 5.0));
-        replaying.update(&conn, Some(4.0)).unwrap();
+        replaying.update(&conn, Some(4.0), &Epoch::ALL).unwrap();
         assert_eq!(size_of(&replaying, 2), size(1.9, 4.7));
         assert_eq!(size_of(&replaying, 3), None);
 
@@ -3169,30 +3353,30 @@ mod tests {
             "INSERT INTO standings VALUES (7, 2, 0.5, 2.0, 5.5), (8, 2, 2.5, 1.8, 4.2);",
         )
         .unwrap();
-        replaying.update(&conn, Some(5.0)).unwrap();
+        replaying.update(&conn, Some(5.0), &Epoch::ALL).unwrap();
         assert_eq!(size_of(&replaying, 2), size(1.9, 4.7));
-        replaying.update(&conn, Some(1.0)).unwrap();
+        replaying.update(&conn, Some(1.0), &Epoch::ALL).unwrap();
         assert_eq!(size_of(&replaying, 2), size(2.0, 5.5));
-        replaying.update(&conn, Some(3.0)).unwrap();
+        replaying.update(&conn, Some(3.0), &Epoch::ALL).unwrap();
         assert_eq!(size_of(&replaying, 2), size(1.8, 4.2));
         // A third session, which the player's rows join at a later clock than its last standing
         conn.execute("INSERT INTO standings VALUES (9, 5, 0.3, 2.0, 4.6)", [])
             .unwrap();
-        replaying.update(&conn, Some(100.0)).unwrap();
+        replaying.update(&conn, Some(100.0), &Epoch::ALL).unwrap();
         assert_eq!(size_of(&replaying, 5), None);
-        replaying.update(&conn, Some(20.0)).unwrap();
+        replaying.update(&conn, Some(20.0), &Epoch::ALL).unwrap();
         assert_eq!(size_of(&replaying, 5), size(2.0, 4.6));
 
         // The recording cleared, its ids used again: read from the start (slot 3 has no standing
         // yet, so no size)
-        sizes.update(&conn, None).unwrap();
+        sizes.update(&conn, None, &Epoch::ALL).unwrap();
         assert_eq!(size_of(&sizes, 2), size(1.8, 4.2));
         conn.execute_batch(
             "DELETE FROM standings;
              INSERT INTO standings VALUES (1, 2, 9.0, 2.0, 4.9), (2, 4, 9.0, 1.9, 4.6);",
         )
         .unwrap();
-        sizes.update(&conn, None).unwrap();
+        sizes.update(&conn, None, &Epoch::ALL).unwrap();
         assert_eq!(size_of(&sizes, 2), size(2.0, 4.9));
         assert_eq!(size_of(&sizes, 3), None);
         assert_eq!(size_of(&sizes, 4), size(1.9, 4.6));
@@ -3203,7 +3387,7 @@ mod tests {
                  (3, 4, 12.0, 2.1, 5.1);",
         )
         .unwrap();
-        sizes.update(&conn, None).unwrap();
+        sizes.update(&conn, None, &Epoch::ALL).unwrap();
         assert_eq!(size_of(&sizes, 2), size(1.8, 4.3));
         assert_eq!(size_of(&sizes, 4), size(2.1, 5.1));
     }
@@ -3227,7 +3411,8 @@ mod tests {
             .unwrap();
         }
 
-        let (mut logic, mut sizes, mut last_id) = (Logic::default(), Sizes::default(), None);
+        let (mut logic, mut sizes, mut last_id, mut epoch) =
+            (Logic::default(), Sizes::default(), None, None);
         let mut calls = Vec::new();
         for tick in 0..30 {
             let t = f64::from(tick) / 30.0;
@@ -3247,6 +3432,7 @@ mod tests {
                 &SpotterConfig::default(),
                 5,
                 &mut last_id,
+                &mut epoch,
             )
             .unwrap();
             calls.extend(texts(raised));
@@ -3409,10 +3595,21 @@ mod tests {
         let mut config = SpotterConfig::default();
         config.qualifying.set(true);
         let mut logic = Logic::default();
-        let mut last_id = None;
+        let (mut last_id, mut epoch) = (None, None);
         let mut sizes = Sizes::default();
 
-        assert!(poll(&conn, &mut logic, &mut sizes, &config, 5, &mut last_id).is_err());
+        assert!(
+            poll(
+                &conn,
+                &mut logic,
+                &mut sizes,
+                &config,
+                5,
+                &mut last_id,
+                &mut epoch
+            )
+            .is_err()
+        );
         assert_eq!(last_id, None);
 
         // The same row (the game paused) is read once it can be, so switching qualifying off
@@ -3420,16 +3617,32 @@ mod tests {
         conn.execute_batch("ALTER TABLE broken RENAME TO session;")
             .unwrap();
         assert!(
-            poll(&conn, &mut logic, &mut sizes, &config, 5, &mut last_id)
-                .unwrap()
-                .is_empty()
+            poll(
+                &conn,
+                &mut logic,
+                &mut sizes,
+                &config,
+                5,
+                &mut last_id,
+                &mut epoch
+            )
+            .unwrap()
+            .is_empty()
         );
         assert!(last_id.is_some());
         config.qualifying.set(false);
         assert!(
-            poll(&conn, &mut logic, &mut sizes, &config, 5, &mut last_id)
-                .unwrap()
-                .is_empty()
+            poll(
+                &conn,
+                &mut logic,
+                &mut sizes,
+                &config,
+                5,
+                &mut last_id,
+                &mut epoch
+            )
+            .unwrap()
+            .is_empty()
         );
         assert!(logic.muted);
     }
@@ -3448,6 +3661,7 @@ mod tests {
                 .map(|heard| match heard {
                     Heard::Call(call) => call.text,
                     Heard::Muted => "muted",
+                    Heard::Epoch => "epoch",
                 })
                 .collect::<Vec<_>>()
         };
@@ -3487,6 +3701,28 @@ mod tests {
         // What comes after it's back on is said
         spotter.heard(Heard::Call(call("rain starting")), at);
         assert_eq!(spotter.queue.len(), 1);
+    }
+
+    #[test]
+    fn another_epoch_drops_the_calls_waiting_and_being_said() {
+        let at = Instant::now();
+        let (mut spotter, send) = pending_call("car right", true, at);
+        spotter.heard(
+            Heard::Call(Raised {
+                text: "blue flag",
+                urgent: false,
+                number: None,
+                session_time: 0.0,
+            }),
+            at,
+        );
+        assert_eq!(spotter.queue.len(), 1);
+
+        // They're about the last session's cars
+        spotter.heard(Heard::Epoch, at);
+        assert!(spotter.queue.is_empty());
+        assert!(spotter.saying.is_none());
+        assert!(send.is_closed());
     }
 
     /// Runs the logic at 30 Hz from `from` to `to` with the simulator reporting the cars
@@ -3725,6 +3961,229 @@ mod tests {
         assert!(step(0.9, &scoring).is_empty());
     }
 
+    /// A race in `phase`, with the full course yellow in `fcy`.
+    fn race(phase: &str, fcy: &str) -> Scoring {
+        Scoring {
+            session_type: Some("race".into()),
+            phase: Some(phase.into()),
+            full_course_yellow: Some(fcy.into()),
+            ..Scoring::default()
+        }
+    }
+
+    /// The calls of each update in turn, a tenth of a second apart, from a spotter just started.
+    fn calls_of(config: &SpotterConfig, updates: &[Scoring]) -> Vec<Vec<(&'static str, bool)>> {
+        let mut logic = Logic::default();
+        updates
+            .iter()
+            .enumerate()
+            .map(|(i, scoring)| {
+                logic
+                    .update(
+                        config,
+                        &player(i as f64 * 0.1),
+                        &[],
+                        &Wheels::default(),
+                        Some(scoring),
+                    )
+                    .into_iter()
+                    .map(|call| (call.text, call.urgent))
+                    .collect()
+            })
+            .collect()
+    }
+
+    const START: (&str, bool) = ("green, green, green", true);
+    const CAUTION_OVER: (&str, bool) = ("green flag, green flag", true);
+
+    #[test]
+    fn calls_the_race_start_once() {
+        let config = SpotterConfig::default();
+        for from in ["formation_lap", "countdown", "stopped"] {
+            let green = race("green", "none");
+            assert_eq!(
+                calls_of(&config, &[race(from, "none"), green.clone(), green]),
+                [vec![], vec![START], vec![]],
+                "from {from}"
+            );
+        }
+
+        // Following a race already under way
+        let green = race("green", "none");
+        assert_eq!(calls_of(&config, &[green.clone(), green]), [vec![], vec![]]);
+        // A caution ending is its own call
+        assert_eq!(
+            calls_of(
+                &config,
+                &[race("full_course_yellow", "pending"), race("green", "none")]
+            ),
+            [vec![], vec![CAUTION_OVER]]
+        );
+        // A red flag restarting behind the safety car: green once the caution ends
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("stopped", "pending"),
+                    race("full_course_yellow", "pending"),
+                    race("green", "none"),
+                ]
+            ),
+            [vec![], vec![], vec![CAUTION_OVER]]
+        );
+    }
+
+    #[test]
+    fn no_race_start_call_outside_races() {
+        let mut config = SpotterConfig::default();
+        config.qualifying.set(true);
+        for kind in [Some("practice"), Some("qualifying"), Some("warmup"), None] {
+            let session = |phase: &str| Scoring {
+                session_type: kind.map(str::to_owned),
+                ..race(phase, "none")
+            };
+            assert_eq!(
+                calls_of(&config, &[session("formation_lap"), session("green")]),
+                [vec![], vec![]],
+                "in {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_call_for_a_start_as_a_caution_ends() {
+        let config = SpotterConfig::default();
+        // As it goes green
+        assert_eq!(
+            calls_of(
+                &config,
+                &[race("formation_lap", "last_lap"), race("green", "none")]
+            ),
+            [vec![], vec![START]]
+        );
+        // Just after
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "last_lap"),
+                    race("green", "resume"),
+                    race("green", "none"),
+                ]
+            ),
+            [vec![], vec![START], vec![]]
+        );
+        // Just before
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("countdown", "last_lap"),
+                    race("countdown", "none"),
+                    race("green", "none"),
+                ]
+            ),
+            [vec![], vec![], vec![START]]
+        );
+        // A red flag after the start: its restart behind the safety car is called
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "last_lap"),
+                    race("green", "resume"),
+                    race("stopped", "race_halt"),
+                    race("full_course_yellow", "pending"),
+                    race("green", "none"),
+                ]
+            ),
+            [
+                vec![],
+                vec![START],
+                vec![("red flag", true)],
+                vec![],
+                vec![CAUTION_OVER]
+            ]
+        );
+        // A caution out again before the start's has cleared: its end is called
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "last_lap"),
+                    race("green", "resume"),
+                    race("full_course_yellow", "pending"),
+                    race("green", "none"),
+                ]
+            ),
+            [vec![], vec![START], vec![], vec![CAUTION_OVER]]
+        );
+        // A caution coming out at the start is called, and so is its end
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "none"),
+                    race("green", "pending"),
+                    race("green", "none"),
+                ]
+            ),
+            [
+                vec![],
+                vec![START, ("full course yellow", true)],
+                vec![CAUTION_OVER]
+            ]
+        );
+    }
+
+    #[test]
+    fn race_start_call_can_be_turned_off() {
+        let mut config = SpotterConfig::default();
+        config.race_starts.set(false);
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "none"),
+                    race("green", "none"),
+                    race("full_course_yellow", "pending"),
+                    race("green", "none"),
+                ]
+            ),
+            [
+                vec![],
+                vec![],
+                vec![("full course yellow", true)],
+                vec![CAUTION_OVER]
+            ]
+        );
+        // A caution ending before the start is called as before
+        assert_eq!(
+            calls_of(
+                &config,
+                &[
+                    race("formation_lap", "last_lap"),
+                    race("formation_lap", "none")
+                ]
+            ),
+            [vec![], vec![CAUTION_OVER]]
+        );
+
+        // Turned off after the start, before its caution ends
+        let mut logic = Logic::default();
+        let mut step = |config: &SpotterConfig, t: f64, scoring: Scoring| {
+            logic
+                .update(config, &player(t), &[], &Wheels::default(), Some(&scoring))
+                .into_iter()
+                .map(|call| (call.text, call.urgent))
+                .collect::<Vec<_>>()
+        };
+        let on = SpotterConfig::default();
+        assert!(step(&on, 0.0, race("formation_lap", "last_lap")).is_empty());
+        assert_eq!(step(&on, 0.1, race("green", "resume")), [START]);
+        assert_eq!(step(&config, 0.2, race("green", "none")), [CAUTION_OVER]);
+    }
+
     #[test]
     fn keeps_flags_and_penalties_outside_the_standing_window() {
         let conn = Connection::open_in_memory().unwrap();
@@ -3744,7 +4203,7 @@ mod tests {
         let config = SpotterConfig::default();
         let mut logic = Logic::default();
         let mut step = |t| {
-            let scoring = scoring(&conn, None).unwrap().unwrap();
+            let scoring = scoring(&conn, None, &Epoch::ALL).unwrap().unwrap();
             assert_eq!(scoring.flag.as_deref(), Some("blue"));
             assert_eq!(scoring.penalties, Some(1));
             texts(logic.update(&config, &player(t), &[], &Wheels::default(), Some(&scoring)))
@@ -3762,7 +4221,7 @@ mod tests {
         // The recorder clears the tables for a new session.
         conn.execute_batch("DELETE FROM standings; DELETE FROM session; INSERT INTO session (session_time) VALUES (0);")
             .unwrap();
-        let latest = scoring(&conn, None).unwrap().unwrap();
+        let latest = scoring(&conn, None, &Epoch::ALL).unwrap().unwrap();
         assert_eq!(latest.flag, None);
         assert_eq!(latest.penalties, None);
         assert!(!latest.yellow);
@@ -3772,7 +4231,75 @@ mod tests {
              INSERT INTO session_sector SELECT MAX(id), 4, 1 FROM session;",
         )
         .unwrap();
-        assert!(scoring(&conn, None).unwrap().unwrap().yellow);
+        assert!(scoring(&conn, None, &Epoch::ALL).unwrap().unwrap().yellow);
+    }
+
+    #[test]
+    fn follows_the_newest_epoch_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        bono_sim::sql::begin_epoch(&conn, 1, bono_sim::sql::EpochReason::Start).unwrap();
+        conn.execute_batch(
+            "INSERT INTO telemetry (vehicle_id, is_player, session_time, speed) VALUES (1, 1, 100, 50);
+             INSERT INTO session (session_time, session_type) VALUES (100, 'practice');
+             INSERT INTO standings (vehicle_id, is_player, session_time, flag, vehicle_width, \
+                 vehicle_length) VALUES (1, 1, 100, 'blue', 1.9, 4.7);",
+        )
+        .unwrap();
+        let config = SpotterConfig::default();
+        let mut logic = Logic::default();
+        let mut sizes = Sizes::default();
+        let (mut last_id, mut epoch) = (None, None);
+        poll(
+            &conn,
+            &mut logic,
+            &mut sizes,
+            &config,
+            5,
+            &mut last_id,
+            &mut epoch,
+        )
+        .unwrap();
+        assert_eq!((last_id, epoch), (Some(1), Some(1)));
+        assert!(logic.prev.is_some());
+        assert!(sizes.sizes.contains_key(&1));
+
+        // Another session, spectating: its rows say nothing of the player, and the last session's
+        // aren't taken for now
+        bono_sim::sql::begin_epoch(&conn, 2, bono_sim::sql::EpochReason::Session).unwrap();
+        conn.execute_batch(
+            "INSERT INTO telemetry (vehicle_id, is_player, session_time, speed) VALUES (1, 0, 200, 50);
+             INSERT INTO session (session_time, session_type) VALUES (200, 'qualifying');",
+        )
+        .unwrap();
+        assert!(
+            poll(
+                &conn,
+                &mut logic,
+                &mut sizes,
+                &config,
+                5,
+                &mut last_id,
+                &mut epoch
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(epoch, Some(2));
+        assert!(logic.prev.is_none(), "the calls start over");
+        assert!(
+            sizes.sizes.is_empty(),
+            "the last session's sizes aren't this one's"
+        );
+        assert_eq!(
+            last_id, None,
+            "a cleared recording numbers its rows from 1 again"
+        );
+        let current = active_epoch(&conn).unwrap();
+        assert!(latest(&conn, &current).unwrap().is_none());
+        let scoring = scoring(&conn, None, &current).unwrap().unwrap();
+        assert_eq!(scoring.session_type.as_deref(), Some("qualifying"));
+        assert_eq!(scoring.flag, None);
     }
 
     /// Simulators that don't say which sectors are yellow (iRacing) give the yellow shown to the
@@ -3794,10 +4321,10 @@ mod tests {
              INSERT INTO standings VALUES (1, 1, 0, 'green', 0, 1, NULL, NULL);",
         )
         .unwrap();
-        assert!(scoring(&conn, None).unwrap().unwrap().yellow);
+        assert!(scoring(&conn, None, &Epoch::ALL).unwrap().unwrap().yellow);
         conn.execute_batch("INSERT INTO standings VALUES (2, 1, 1, 'green', 0, 0, NULL, NULL);")
             .unwrap();
-        assert!(!scoring(&conn, None).unwrap().unwrap().yellow);
+        assert!(!scoring(&conn, None, &Epoch::ALL).unwrap().unwrap().yellow);
 
         // Sectors that say they're clear outweigh the player's flag
         conn.execute_batch(
@@ -3805,7 +4332,7 @@ mod tests {
              INSERT INTO standings VALUES (3, 1, 2, 'green', 0, 1, NULL, NULL);",
         )
         .unwrap();
-        assert!(!scoring(&conn, None).unwrap().unwrap().yellow);
+        assert!(!scoring(&conn, None, &Epoch::ALL).unwrap().unwrap().yellow);
     }
 
     #[test]
@@ -4233,10 +4760,10 @@ mod tests {
         scoring.phase = Some("formation_lap".into());
         scoring.session_end_time = Some(83.0);
         assert!(at(30.0, &scoring).is_empty());
-        // Under way, the rain's 15 minutes off
+        // Under way, the rain's 15 minutes off: only the start's called
         scoring.phase = Some("green".into());
         scoring.session_end_time = Some(1883.0);
-        assert!(at(90.0, &scoring).is_empty());
+        assert_eq!(at(90.0, &scoring), ["green, green, green"]);
     }
 
     #[test]
@@ -4306,6 +4833,7 @@ mod tests {
             "libero a sinistra",
             "libero a destra",
             "tutto libero",
+            "verde, verde, verde",
         ]) {
             assert_eq!(translate(text, arrstr!("it")), expected);
         }

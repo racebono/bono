@@ -1,0 +1,140 @@
+CarSetup:
+ UpdateCount: 3
+ TiresAero:
+  TireType:
+   TireType: Dry
+  LeftFront:
+   StartingPressure: 152 kPa
+   LastHotPressure: 152 kPa
+   LastTempsOMI: 40C, 40C, 40C
+   TreadRemaining: 100%, 100%, 100%
+  LeftRearTire:
+   StartingPressure: 152 kPa
+   LastHotPressure: 152 kPa
+   LastTempsOMI: 40C, 40C, 40C
+   TreadRemaining: 100%, 100%, 100%
+  RightFront:
+   StartingPressure: 152 kPa
+   LastHotPressure: 152 kPa
+   LastTempsIMO: 40C, 40C, 40C
+   TreadRemaining: 100%, 100%, 100%
+  RightRearTire:
+   StartingPressure: 152 kPa
+   LastHotPressure: 152 kPa
+   LastTempsIMO: 40C, 40C, 40C
+   TreadRemaining: 100%, 100%, 100%
+  AeroSettings:
+   RearWingAngle: 17 deg
+  AeroCalculator:
+   FrontRhAtSpeed: 50.0 mm
+   RearRhAtSpeed: 25.0 mm
+   DownforceBalance: 37.45%
+   LD: 3.285
+ Chassis:
+  Front:
+   HeaveSpring: 70 N/mm
+   HeavePerchOffset: -42.5 mm
+   HeaveSpringDefl: 24.2 mm 84.8 mm
+   HeaveSliderDefl: 29.3 mm 200.0 mm
+   ArbSize:  Soft
+   ArbBlades: 1
+   ToeIn: -0.8 mm
+   PushrodLengthOffset: -32.5 mm
+   PowerSteeringAssist: 8 (EPAS)
+  LeftFront:
+   CornerWeight: 2821 N
+   RideHeight: 30.0 mm
+   ShockDefl: 10.5 mm 100.0 mm
+   TorsionBarDefl: 4.5 mm
+   TorsionBarTurns: 0.080 Turns
+   TorsionBarOD:  14.76 mm
+   LsCompDamping: 2 clicks
+   HsCompDamping: 6 clicks
+   HsCompDampSlope: 11 clicks
+   LsRbdDamping: 5 clicks
+   HsRbdDamping: 7 clicks
+   Camber: -2.9 deg
+  LeftRear:
+   CornerWeight: 2988 N
+   RideHeight: 46.6 mm
+   ShockDefl: 24.4 mm 150.0 mm
+   SpringDefl: 1.7 mm 76.8 mm
+   SpringPerchOffset: 50.5 mm
+   SpringRate: 180 N/mm
+   LsCompDamping: 7 clicks
+   HsCompDamping: 6 clicks
+   HsCompDampSlope: 11 clicks
+   LsRbdDamping: 8 clicks
+   HsRbdDamping: 6 clicks
+   Camber: -1.9 deg
+   ToeIn: +0.1 mm
+  RightFront:
+   CornerWeight: 2821 N
+   RideHeight: 30.0 mm
+   ShockDefl: 10.5 mm 100.0 mm
+   TorsionBarDefl: 4.5 mm
+   TorsionBarTurns: 0.080 Turns
+   TorsionBarOD:  14.76 mm
+   LsCompDamping: 2 clicks
+   HsCompDamping: 6 clicks
+   HsCompDampSlope: 11 clicks
+   LsRbdDamping: 5 clicks
+   HsRbdDamping: 7 clicks
+   Camber: -2.9 deg
+  RightRear:
+   CornerWeight: 2988 N
+   RideHeight: 46.6 mm
+   ShockDefl: 24.4 mm 150.0 mm
+   SpringDefl: 1.7 mm 76.8 mm
+   SpringPerchOffset: 50.5 mm
+   SpringRate: 180 N/mm
+   LsCompDamping: 7 clicks
+   HsCompDamping: 6 clicks
+   HsCompDampSlope: 11 clicks
+   LsRbdDamping: 8 clicks
+   HsRbdDamping: 6 clicks
+   Camber: -1.9 deg
+   ToeIn: +0.1 mm
+  Rear:
+   ThirdSpring: 620 N/mm
+   ThirdPerchOffset: 41.5 mm
+   ThirdSpringDefl: 12.2 mm 40.2 mm
+   ThirdSliderDefl: 25.9 mm 150.0 mm
+   ArbSize:  Soft
+   ArbBlades: 1
+   PushrodLengthOffset: -13.0 mm
+   CrossWeight: 50.0%
+ BrakesDriveUnit:
+  Lighting:
+   RoofIdLightColor: Blue
+  BrakeSpec:
+   PadCompound: Medium
+   FrontMasterCyl: 20.6 mm
+   RearMasterCyl: 22.2 mm
+   BrakePressureBias: 49.25%
+   BrakeBiasTarget: 0
+   BrakeBiasMigration: -3
+  Fuel:
+   FuelLevel: 89.0 L
+   FuelTarget: 2.00 L
+   FuelLowWarning: 10.0 L
+  TcAndThrottle:
+   TractionControlGain: 4 (TC B)
+   TractionControlSlip: 4 (TC A)
+   ThrottleShape: 12
+  GearRatios:
+   GearStack: Short
+   SpeedInFirst: 127.6 Km/h
+   SpeedInSecond: 158.6 Km/h
+   SpeedInThird: 187.4 Km/h
+   SpeedInFourth: 223.4 Km/h
+   SpeedInFifth: 261.2 Km/h
+   SpeedInSixth: 293.4 Km/h
+   SpeedInSeventh: 322.2 Km/h
+  DiffSpec:
+   DiffCoastRampAngle: 40 deg
+   DiffDriveRampAngle: 40 deg
+   ClutchFrictionPlates: 6
+   Preload: 60 Nm
+
+...
