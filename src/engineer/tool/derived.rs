@@ -2877,19 +2877,19 @@ impl Leaders {
 /// How a session numbers its opening lap, as far as its cars have shown it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct OpeningLap {
-    /// A car stayed on lap 0 past its first crossing of the line (for longer than the lap count
+    /// A car stayed on lap 1 past its first crossing of the line (for longer than the lap count
     /// can lag the distance): the run to the line and the circuit after it are one lap
     run_and_circuit: bool,
-    /// A car's run to the line ended its lap 0: it went on to lap 1 at its first crossing
+    /// A car's run to the line ended its lap 1: it went on to lap 2 at its first crossing
     run_only: bool,
 }
 
-/// How cars still running to the line count their lap 0.
+/// How cars still running to the line count their lap 1.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Counting {
     /// Under the same number as the circuit after it: a lap short of the cars past the line
     RunAndCircuit,
-    /// On its own, the cars past the line being on lap 1: the count is right as it is
+    /// On its own, the cars past the line being on lap 2: the count is right as it is
     RunOnly,
 }
 
@@ -2940,7 +2940,7 @@ pub(super) struct Stream {
     laps_completed: HashMap<i64, (i64, f64)>,
     /// Who's led the standings, as of each car's last row
     leaders: Leaders,
-    /// How the cars followed have been seen to count their opening lap, as of the laps 0 over
+    /// How the cars followed have been seen to count their opening lap, as of the opening laps over
     /// (the one under way can still be replayed from a later start: see `Stream::counting`)
     opening_lap: OpeningLap,
     official: HashMap<i64, Vec<Official>>,
@@ -3508,11 +3508,11 @@ impl Stream {
                 .is_none_or(|current| current.lap != lap)
             {
                 let current = car.current.take();
-                // Its lap 0 over, nothing can replay it now: what it showed of the session's counting
+                // Its lap 1 over, nothing can replay it now: what it showed of the session's counting
                 // holds for good
                 if let Some(current) = current
                     .as_ref()
-                    .filter(|current| current.lap == 0 && lap == 1)
+                    .filter(|current| current.lap == 1 && lap == 2)
                 {
                     opening_lap.run_and_circuit |= current.stayed_past_its_crossing();
                     opening_lap.run_only |= current.only_a_run_to_the_line(sample.session_time);
@@ -4227,7 +4227,7 @@ impl Stream {
     }
 
     /// The lap a car's race distance counts from, given its standings and telemetry rows (`now`
-    /// being the player's latest, on a lap `length` metres long): its lap count, except on lap 0
+    /// being the player's latest, on a lap `length` metres long): its lap count, except on lap 1
     /// while it runs from the grid to the line. A session can count that run under the same
     /// number as the circuit after it (RaceRoom does): a lap short of the cars that have crossed.
     /// `None` when it isn't known.
@@ -4248,7 +4248,7 @@ impl Stream {
             return None;
         }
         let lap = t.i("lap")?;
-        if lap != 0 {
+        if lap != 1 {
             return Some(given(lap));
         }
         let at = t.f("session_time");
@@ -4258,7 +4258,7 @@ impl Stream {
             .cars
             .get(&vehicle)
             .and_then(|car| car.current.as_ref())
-            .filter(|build| build.lap == 0)
+            .filter(|build| build.lap == 1)
             .filter(|build| {
                 let last = build.samples.last().and_then(|sample| sample.session_time);
                 last.zip(at)
@@ -4273,8 +4273,8 @@ impl Stream {
         // Only when it's needed: it looks at every car
         let counting = || self.counting();
         // Past its own crossing of the line: its share of the lap is how far it is in the race.
-        // Unless the lap count is a moment behind the distance, about to go to 1, or behind for
-        // longer where cars have been seen going to lap 1 at the line
+        // Unless the lap count is a moment behind the distance, about to go to 2, or behind for
+        // longer where cars have been seen going to lap 2 at the line
         if let Some((build, crossing)) = build
             .and_then(|build| Some((build, build.crossed()?)))
             .filter(|(_, crossing)| at.is_none_or(|at| at >= *crossing))
@@ -4285,13 +4285,13 @@ impl Stream {
             // Until it's been round to the middle of the lap, or round past the line again (a fast
             // car's rows of the middle can be missing without a hole), or there's a hole in its
             // rows it could have been round in: from there its distance can wrap again before its
-            // lap count goes to 1. Against the row its crossing wrapped on: the crossing's put
+            // lap count goes to 2. Against the row its crossing wrapped on: the crossing's put
             // between it and the one before, however far apart
             let again = build.last_wrap.is_some_and(|wrap| {
                 wrap > build.first_wrap.unwrap_or(crossing) + LINE_APPROACH_SECONDS
             });
             return counted.then_some(RaceLap {
-                lap: 0,
+                lap: 1,
                 past_its_crossing: !build.mid_lap && !again && !build.hole,
             });
         }
@@ -4306,7 +4306,7 @@ impl Stream {
             return None;
         }
         let Some(length) = length else {
-            return Some(given(0));
+            return Some(given(1));
         };
         // Seen from the lap's start, from past the middle of the lap and never round to it since,
         // nor any hole in its rows to have been round in: still running to the line from the
@@ -4320,7 +4320,7 @@ impl Stream {
         });
         let share = along_lap(t, now, length);
         if share.is_none_or(|share| share <= FIRST_DISTANCE) {
-            // Its distance taken for the old lap's, the lap having just started: lap 0's can be
+            // Its distance taken for the old lap's, the lap having just started: lap 1's can be
             // the run to the line
             if t.f("lap_distance")
                 .is_some_and(|d| d > length * FIRST_DISTANCE)
@@ -4331,7 +4331,7 @@ impl Stream {
             // unless it's been seen to: a pit-lane start, or a start with no run to the line, or
             // past a crossing not seen
             if !running {
-                return Some(given(0));
+                return Some(given(1));
             }
             match share {
                 // Seen running to the line, and now just past it: its crossing isn't in the rows
@@ -4340,7 +4340,7 @@ impl Stream {
                 // circuit with the run; elsewhere its lap count is behind
                 Some(share) if share <= 0.5 => {
                     return (counting() == Some(Counting::RunAndCircuit)).then_some(RaceLap {
-                        lap: 0,
+                        lap: 1,
                         past_its_crossing: true,
                     });
                 }
@@ -4369,21 +4369,21 @@ impl Stream {
         };
         match early? {
             // Near the end of a circuit after the line
-            false => Some(given(0)),
+            false => Some(given(1)),
             true => match counting()? {
-                Counting::RunAndCircuit => Some(given(-1)),
-                Counting::RunOnly => Some(given(0)),
+                Counting::RunAndCircuit => Some(given(0)),
+                Counting::RunOnly => Some(given(1)),
             },
         }
     }
 
-    /// How the session counts its opening lap, from the laps 0 over and those under way.
+    /// How the session counts its opening lap, from the opening laps over and those under way.
     fn counting(&self) -> Option<Counting> {
         let live = self
             .cars
             .values()
             .filter_map(|car| car.current.as_ref())
-            .any(|build| build.lap == 0 && build.stayed_past_its_crossing());
+            .any(|build| build.lap == 1 && build.stayed_past_its_crossing());
         OpeningLap {
             run_and_circuit: self.opening_lap.run_and_circuit || live,
             ..self.opening_lap
@@ -4606,7 +4606,7 @@ const MOVE_ALONG: f64 = 1.0;
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct RaceLap {
     lap: i64,
-    /// On lap 0, past its own crossing of the line as seen: however little of the lap it's done
+    /// On lap 1, past its own crossing of the line as seen: however little of the lap it's done
     /// on a lap that began long ago, its distance hasn't gone round before its lap count
     past_its_crossing: bool,
 }
@@ -5060,7 +5060,7 @@ fn range(
     match (level, per_lap.filter(|v| *v != 0.0)) {
         (Some(level), Some(per_lap)) => {
             let left = level / per_lap;
-            (Some(left), Some(lap.unwrap_or(0) as f64 + frac + left))
+            (Some(left), Some(lap.unwrap_or(1) as f64 + frac + left))
         }
         _ => (None, None),
     }
@@ -5164,10 +5164,10 @@ fn projection(
         ("laps_left", real(limit.map(|(_, left)| left))),
         (
             "last_full_lap",
-            // Lap N spans [N, N + 1), so reaching N completes lap N - 1.
+            // Lap N runs from N - 1 to N laps done, so reaching position N completes lap N - 1.
             integer(
                 limit.map(|(_, left)| {
-                    (lap_now.unwrap_or(0) as f64 + frac + left).floor() as i64 - 1
+                    (lap_now.unwrap_or(1) as f64 + frac + left).floor() as i64 - 1
                 }),
             ),
         ),
@@ -6118,7 +6118,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let race = session(&conn, "race");
         let now = Some(500.0);
-        // The player, a GT3 two laps down on the overall leader, 900 m into lap 10
+        // The player, a GT3 two laps down on the overall leader, 900 m into lap 11
         let me = standing(
             &conn,
             "GT3",
@@ -6127,12 +6127,12 @@ mod tests {
             Some(100.0),
             Some(99.0),
         );
-        let my_lap = on_lap(&conn, 10, 900.0);
+        let my_lap = on_lap(&conn, 11, 900.0);
 
         // The class car ahead, three places ahead overall and 175 m up the road over the line.
         // Its own gap to its place ahead says nothing of the player's
         let ahead = standing(&conn, "GT3", 6, (Some(2), Some(22.5)), Some(100.5), None);
-        let ahead_lap = on_lap(&conn, 11, 75.0);
+        let ahead_lap = on_lap(&conn, 12, 75.0);
         let to = estimated(&race, (&me, &my_lap), (&ahead, &ahead_lap), now);
         assert!(close(to.race_gap, 17.5), "{to:?}");
         assert_eq!(to.race_laps, Some(0));
@@ -6149,11 +6149,11 @@ mod tests {
             Some(80.0),
             Some(79.5),
         );
-        let fast_lap = on_lap(&conn, 12, 700.0);
+        let fast_lap = on_lap(&conn, 13, 700.0);
         let to = estimated(&race, (&me, &my_lap), (&fast, &fast_lap), now);
         // A different number of laps down: no time, rather than a wrong one
         assert_eq!(to.race_gap, None);
-        // 12.7 - 10.9 laps of race distance: a whole lap ahead
+        // 13.7 - 11.9 laps of race distance: a whole lap ahead
         assert_eq!(to.race_laps, Some(1));
         assert!(close(to.track_gap, -0.2 * 80.0), "{to:?}");
 
@@ -6166,7 +6166,7 @@ mod tests {
             Some(110.0),
             Some(108.0),
         );
-        let lapped_lap = on_lap(&conn, 8, 850.0);
+        let lapped_lap = on_lap(&conn, 9, 850.0);
         let to = estimated(&race, (&me, &my_lap), (&lapped, &lapped_lap), now);
         assert_eq!(to.race_gap, None);
         assert_eq!(to.race_laps, Some(-2));
@@ -6174,7 +6174,7 @@ mod tests {
 
         // Behind in the race, the same laps down
         let behind = standing(&conn, "GT3", 10, (Some(2), Some(51.0)), Some(101.0), None);
-        let behind_lap = on_lap(&conn, 10, 790.0);
+        let behind_lap = on_lap(&conn, 11, 790.0);
         let to = estimated(&race, (&me, &my_lap), (&behind, &behind_lap), now);
         assert!(close(to.race_gap, -11.0), "{to:?}");
         assert_eq!(to.race_laps, Some(0));
@@ -6199,8 +6199,8 @@ mod tests {
         let car = standing(&conn, "GT3", 1, (Some(0), Some(0.0)), Some(98.0), None);
         let to = estimated(
             &practice,
-            (&me, &on_lap(&conn, 4, 100.0)),
-            (&car, &on_lap(&conn, 9, 400.0)),
+            (&me, &on_lap(&conn, 5, 100.0)),
+            (&car, &on_lap(&conn, 10, 400.0)),
             Some(500.0),
         );
         assert_eq!(to.race_gap, None);
@@ -6222,7 +6222,7 @@ mod tests {
         let race = session(&conn, "race");
         let now = Some(500.0);
         let me = standing(&conn, "GT3", 5, (Some(0), Some(20.0)), Some(100.0), None);
-        let my_lap = on_lap(&conn, 3, 500.0);
+        let my_lap = on_lap(&conn, 4, 500.0);
         let unknown = ToPlayer {
             race_gap: None,
             race_laps: None,
@@ -6236,7 +6236,7 @@ mod tests {
             unknown
         );
         // No time behind the leader, or no laps behind it
-        let lap = on_lap(&conn, 3, 600.0);
+        let lap = on_lap(&conn, 4, 600.0);
         for behind in [(Some(0), None), (None, Some(10.0))] {
             let car = standing(&conn, "GT3", 4, behind, Some(100.0), None);
             let to = estimated(&race, (&me, &my_lap), (&car, &lap), now);
@@ -6311,12 +6311,12 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let race = session(&conn, "race");
         let me = standing(&conn, "GT3", 2, (Some(0), Some(1.0)), Some(100.0), None);
-        let my_lap = on_lap(&conn, 3, 500.0);
+        let my_lap = on_lap(&conn, 4, 500.0);
         let car = standing(&conn, "GT3", 1, (Some(0), Some(0.0)), Some(100.0), None);
         // Half a second old at 50 m/s: 25 m further on by now
         let old = columns(
             &conn,
-            "499.5 AS session_time, 3 AS lap, 575.0 AS lap_distance, 400.0 AS lap_start_time, \
+            "499.5 AS session_time, 4 AS lap, 575.0 AS lap_distance, 400.0 AS lap_start_time, \
              50.0 AS speed",
         );
         let to = estimated(&race, (&me, &my_lap), (&car, &old), Some(500.0));
@@ -6324,7 +6324,7 @@ mod tests {
         // Just over the line, still with the old lap's distance: at the line, not a lap further on
         let crossed = columns(
             &conn,
-            "500.0 AS session_time, 4 AS lap, 995.0 AS lap_distance, 499.7 AS lap_start_time, \
+            "500.0 AS session_time, 5 AS lap, 995.0 AS lap_distance, 499.7 AS lap_start_time, \
              0.0 AS speed",
         );
         let to = estimated(&race, (&me, &my_lap), (&car, &crossed), Some(500.0));
@@ -6593,7 +6593,7 @@ mod tests {
             vehicle: 1,
             is_player: false,
             session_time: Some(t),
-            lap: Some(0),
+            lap: Some(1),
             lap_start: None,
             lap_distance: Some(d),
             in_pit: false,
@@ -6676,11 +6676,11 @@ mod tests {
         let practice = session(&conn, "practice");
         let now = Some(500.0);
         let me = standing(&conn, "GT3", 5, (None, None), Some(100.0), None);
-        let my_lap = on_lap(&conn, 4, 900.0);
+        let my_lap = on_lap(&conn, 5, 900.0);
         // A Hypercar 200 m up the road at 80 m/s was where the player is 2.5 s ago, not the 20 s
         // that 200 m takes at the player's pace
         let fast = standing(&conn, "Hypercar", 1, (None, None), Some(80.0), None);
-        let fast_lap = on_lap(&conn, 7, 100.0);
+        let fast_lap = on_lap(&conn, 8, 100.0);
         let fast_trail = unclocked([(495.0, 700.0), (497.5, 900.0), (500.0, 100.0)].into());
         let to = ToPlayer::new(
             &practice,
@@ -6695,7 +6695,7 @@ mod tests {
         let to = ToPlayer::new(
             &practice,
             (&me, &my_lap, Some(&my_trail)),
-            (&slow, &on_lap(&conn, 4, 800.0), None),
+            (&slow, &on_lap(&conn, 5, 800.0), None),
             now,
         );
         assert!(close(to.track_gap, -5.0), "{to:?}");
@@ -6718,7 +6718,7 @@ mod tests {
         );
         let stopped = columns(
             &conn,
-            "500.0 AS session_time, 4 AS lap, 910.0 AS lap_distance, 400.0 AS lap_start_time, \
+            "500.0 AS session_time, 5 AS lap, 910.0 AS lap_distance, 400.0 AS lap_start_time, \
              0.0 AS speed",
         );
         let to = ToPlayer::new(
@@ -6734,7 +6734,7 @@ mod tests {
         let to = ToPlayer::new(
             &practice,
             (&me, &my_lap, None),
-            (&timeless, &on_lap(&conn, 4, 900.0), Some(&jittered)),
+            (&timeless, &on_lap(&conn, 5, 900.0), Some(&jittered)),
             now,
         );
         assert_eq!(to.track_gap, Some(0.0), "{to:?}");
@@ -6747,7 +6747,7 @@ mod tests {
         let now = Some(500.0);
         // No time behind the leader, as on RaceRoom
         let me = standing(&conn, "GT3", 5, (None, None), Some(100.0), None);
-        let my_lap = on_lap(&conn, 10, 900.0);
+        let my_lap = on_lap(&conn, 11, 900.0);
         let my_trail = unclocked([(490.0, 700.0), (495.0, 800.0), (500.0, 900.0)].into());
 
         // Ahead in the race, 0.2 laps up the road over the line: when it was where the player is
@@ -6756,7 +6756,7 @@ mod tests {
         let to = ToPlayer::new(
             &race,
             (&me, &my_lap, Some(&my_trail)),
-            (&ahead, &on_lap(&conn, 11, 100.0), Some(&ahead_trail)),
+            (&ahead, &on_lap(&conn, 12, 100.0), Some(&ahead_trail)),
             now,
         );
         assert!(close(to.race_gap, 2.5), "{to:?}");
@@ -6767,7 +6767,7 @@ mod tests {
         let to = ToPlayer::new(
             &race,
             (&me, &my_lap, Some(&my_trail)),
-            (&behind, &on_lap(&conn, 10, 800.0), None),
+            (&behind, &on_lap(&conn, 11, 800.0), None),
             now,
         );
         assert!(close(to.race_gap, -5.0), "{to:?}");
@@ -6787,7 +6787,7 @@ mod tests {
         let to = ToPlayer::new(
             &race,
             (&me, &my_lap, Some(&my_trail)),
-            (&far, &on_lap(&conn, 11, 600.0), Some(&far_trail)),
+            (&far, &on_lap(&conn, 12, 600.0), Some(&far_trail)),
             now,
         );
         assert!(close(to.race_gap, 6.0), "{to:?}");
@@ -6801,7 +6801,7 @@ mod tests {
         let to = ToPlayer::new(
             &race,
             (&me_down, &my_lap, Some(&my_trail)),
-            (&ahead_down, &on_lap(&conn, 11, 100.0), Some(&ahead_trail)),
+            (&ahead_down, &on_lap(&conn, 12, 100.0), Some(&ahead_trail)),
             now,
         );
         assert!(close(to.race_gap, 2.5), "{to:?}");
@@ -6816,11 +6816,11 @@ mod tests {
                 })
                 .collect(),
         );
-        let me_mid = on_lap(&conn, 10, 500.0);
+        let me_mid = on_lap(&conn, 11, 500.0);
         let to = ToPlayer::new(
             &race,
             (&me, &me_mid, None),
-            (&ahead, &on_lap(&conn, 11, 499.995), Some(&almost_lap)),
+            (&ahead, &on_lap(&conn, 12, 499.995), Some(&almost_lap)),
             now,
         );
         assert!(
@@ -6835,14 +6835,14 @@ mod tests {
         let to = ToPlayer::new(
             &race,
             (&me_timed, &my_lap, Some(&my_trail)),
-            (&ahead_timed, &on_lap(&conn, 11, 100.0), Some(&ahead_trail)),
+            (&ahead_timed, &on_lap(&conn, 12, 100.0), Some(&ahead_trail)),
             now,
         );
         assert!(close(to.race_gap, 2.5), "{to:?}");
         let to = ToPlayer::new(
             &race,
             (&me_timed, &my_lap, Some(&my_trail)),
-            (&ahead_timed, &on_lap(&conn, 11, 100.0), None),
+            (&ahead_timed, &on_lap(&conn, 12, 100.0), None),
             now,
         );
         assert!(close(to.race_gap, 3.0), "{to:?}");
@@ -6853,7 +6853,7 @@ mod tests {
         let to = ToPlayer::new(
             &unknown_leader,
             (&me_timed, &my_lap, Some(&my_trail)),
-            (&ahead_timed, &on_lap(&conn, 11, 100.0), None),
+            (&ahead_timed, &on_lap(&conn, 12, 100.0), None),
             now,
         );
         assert_eq!(to.race_gap, None);
@@ -6863,7 +6863,7 @@ mod tests {
         let to = ToPlayer::new(
             &race,
             (&me, &my_lap, Some(&my_trail)),
-            (&lapping, &on_lap(&conn, 12, 100.0), Some(&ahead_trail)),
+            (&lapping, &on_lap(&conn, 13, 100.0), Some(&ahead_trail)),
             now,
         );
         assert_eq!((to.race_gap, to.race_laps), (None, Some(1)));
@@ -6881,7 +6881,7 @@ mod tests {
             let to = ToPlayer::new(
                 &race,
                 (&me, &my_lap, Some(&my_trail)),
-                (&car, &on_lap(&conn, 11, 100.0), trail),
+                (&car, &on_lap(&conn, 12, 100.0), trail),
                 now,
             );
             assert_eq!(to.race_gap, None, "{to:?}");
@@ -6893,7 +6893,7 @@ mod tests {
              10.0 AS time_behind_leader, 100.0 AS last_lap_time",
         );
         let ahead_new = standing(&conn, "GT3", 4, (Some(0), Some(30.0)), Some(100.0), None);
-        let ahead_lap = on_lap(&conn, 11, 100.0);
+        let ahead_lap = on_lap(&conn, 12, 100.0);
         let to = ToPlayer::new(
             &race,
             (&me_old, &my_lap, Some(&my_trail)),
@@ -6943,7 +6943,7 @@ mod tests {
         // count did, so how far it is in the race isn't known
         let wrapped = columns(
             &conn,
-            "500.0 AS session_time, 10 AS lap, 20.0 AS lap_distance, 401.0 AS lap_start_time, \
+            "500.0 AS session_time, 11 AS lap, 20.0 AS lap_distance, 401.0 AS lap_start_time, \
              50.0 AS speed",
         );
         let to = ToPlayer::new(
@@ -6968,7 +6968,7 @@ mod tests {
         let to = ToPlayer::new(
             &practice,
             (&me, &my_lap, Some(&my_trail)),
-            (&ahead, &on_lap(&conn, 11, 100.0), Some(&ahead_trail)),
+            (&ahead, &on_lap(&conn, 12, 100.0), Some(&ahead_trail)),
             now,
         );
         assert_eq!(to.race_gap, None);
@@ -7095,12 +7095,12 @@ mod tests {
 
     #[test]
     fn a_run_to_the_line_under_the_circuits_lap_counts_short_of_the_line() {
-        // RaceRoom's way: car 2 crosses the line 1.67 s in and stays on lap 0. Car 3 is at the
+        // RaceRoom's way: car 2 crosses the line 1.67 s in and stays on lap 1. Car 3 is at the
         // back of the grid, further back than the lap's last part
         let samples = on_the_grid(vec![
-            (1, driven(1820.0, &[(0, 1994.0, &|_, _| Some(0.0))])),
-            (2, driven(1900.0, &[(0, 2074.0, &|_, _| Some(0.0))])),
-            (3, driven(1560.0, &[(0, 1734.0, &|_, _| Some(0.0))])),
+            (1, driven(1820.0, &[(1, 1994.0, &|_, _| Some(0.0))])),
+            (2, driven(1900.0, &[(1, 2074.0, &|_, _| Some(0.0))])),
+            (3, driven(1560.0, &[(1, 1734.0, &|_, _| Some(0.0))])),
         ]);
         let before = |t: f64| {
             samples
@@ -7125,7 +7125,7 @@ mod tests {
         assert_eq!(stream.counting(), None);
         assert_eq!(lap_at(&stream, before(1.5), 1), None);
         assert_eq!(lap_at(&stream, before(1.5), 2), None);
-        // Car 2's just crossed, still on lap 0: the count can lag the distance for a moment
+        // Car 2's just crossed, still on lap 1: the count can lag the distance for a moment
         stream
             .apply_telemetry(&conn, &samples[before(1.5)..before(2.2)])
             .unwrap();
@@ -7139,14 +7139,14 @@ mod tests {
         );
         assert_eq!(stream.counting(), None);
         assert_eq!(lap_at(&stream, before(2.2), 2), None);
-        // Over a second on, it's still lap 0: the run and the circuit are one lap
+        // Over a second on, it's still lap 1: the run and the circuit are one lap
         stream
             .apply_telemetry(&conn, &samples[before(2.2)..])
             .unwrap();
         assert_eq!(stream.counting(), Some(Counting::RunAndCircuit));
-        assert_eq!(lap_at(&stream, samples.len(), 1), Some(-1));
-        assert_eq!(lap_at(&stream, samples.len(), 2), Some(0));
-        assert_eq!(lap_at(&stream, samples.len(), 3), Some(-1));
+        assert_eq!(lap_at(&stream, samples.len(), 1), Some(0));
+        assert_eq!(lap_at(&stream, samples.len(), 2), Some(1));
+        assert_eq!(lap_at(&stream, samples.len(), 3), Some(0));
         // A row newer than the stream's rows, just past the line: the player's crossed after all
         let newer = newest(&conn, &samples, 1).with(vec![
             ("lap_distance".to_owned(), Value::Real(5.0)),
@@ -7156,7 +7156,7 @@ mod tests {
         assert_eq!(
             stream.race_lap(1, &me, &newer, Some(3.0), Some(2000.0)),
             Some(RaceLap {
-                lap: 0,
+                lap: 1,
                 past_its_crossing: true
             })
         );
@@ -7173,7 +7173,7 @@ mod tests {
         assert_eq!(
             lap,
             Some(RaceLap {
-                lap: 0,
+                lap: 1,
                 past_its_crossing: false
             })
         );
@@ -7204,10 +7204,10 @@ mod tests {
     }
 
     #[test]
-    fn a_second_wrap_under_lap_0_can_be_line_lag_again() {
-        // RaceRoom's way: car 2 crosses under lap 0, goes round, and its distance wraps again
-        // before its lap count goes to 1
-        let samples = on_the_grid(vec![(2, driven(1900.0, &[(0, 4010.0, &|_, _| Some(0.0))]))]);
+    fn a_second_wrap_under_lap_1_can_be_line_lag_again() {
+        // RaceRoom's way: car 2 crosses under lap 1, goes round, and its distance wraps again
+        // before its lap count goes to 2
+        let samples = on_the_grid(vec![(2, driven(1900.0, &[(1, 4010.0, &|_, _| Some(0.0))]))]);
         let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
         let early = samples
             .iter()
@@ -7215,15 +7215,15 @@ mod tests {
             .unwrap();
         stream.apply_telemetry(&conn, &samples[..early]).unwrap();
         let row = counted_at(&conn, &stream, &samples[..early], 2);
-        assert_eq!(row.i("lap"), Some(0));
+        assert_eq!(row.i("lap"), Some(1));
         assert!(row.b(PAST_ITS_CROSSING));
         stream.apply_telemetry(&conn, &samples[early..]).unwrap();
         let row = counted_at(&conn, &stream, &samples, 2);
-        assert_eq!(row.i("lap"), Some(0));
+        assert_eq!(row.i("lap"), Some(1));
         assert!(!row.b(PAST_ITS_CROSSING));
 
         // Rows 1.5 s apart at the line are no hole
-        let rows = driven(1900.0, &[(0, 2240.0, &|_, _| Some(0.0))]);
+        let rows = driven(1900.0, &[(1, 2240.0, &|_, _| Some(0.0))]);
         let apart = on_the_grid(vec![(
             2,
             rows.into_iter()
@@ -7233,7 +7233,7 @@ mod tests {
         let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
         stream.apply_telemetry(&conn, &apart).unwrap();
         let row = counted_at(&conn, &stream, &apart, 2);
-        assert_eq!(row.i("lap"), Some(0));
+        assert_eq!(row.i("lap"), Some(1));
         assert!(row.b(PAST_ITS_CROSSING));
 
         // Nor with the whole circuit unseen
@@ -7245,7 +7245,7 @@ mod tests {
         let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
         stream.apply_telemetry(&conn, &unseen).unwrap();
         let row = counted_at(&conn, &stream, &unseen, 2);
-        assert_eq!(row.i("lap"), Some(0));
+        assert_eq!(row.i("lap"), Some(1));
         assert!(!row.b(PAST_ITS_CROSSING));
 
         // With no rows of the middle of the lap, passed fast enough to leave no hole: the wrap
@@ -7271,7 +7271,7 @@ mod tests {
         let build = stream.cars[&2].current.as_ref().unwrap();
         assert!(!build.mid_lap && !build.hole);
         let row = counted_at(&conn, &stream, &fast, 2);
-        assert_eq!(row.i("lap"), Some(0));
+        assert_eq!(row.i("lap"), Some(1));
         assert!(!row.b(PAST_ITS_CROSSING));
 
         // With no rows of the middle of the lap either: half a lap missing is a hole
@@ -7284,21 +7284,21 @@ mod tests {
         let build = stream.cars[&2].current.as_ref().unwrap();
         assert!(!build.mid_lap && build.hole);
         let row = counted_at(&conn, &stream, &samples, 2);
-        assert_eq!(row.i("lap"), Some(0));
+        assert_eq!(row.i("lap"), Some(1));
         assert!(!row.b(PAST_ITS_CROSSING));
     }
 
     #[test]
     fn a_circuit_without_rows_in_its_middle_isnt_a_run_on_its_own() {
-        // Car 2 crosses under lap 0 and stays on it round a circuit the recording has no rows of
-        // the middle of, then goes on to lap 1
+        // Car 2 crosses under lap 1 and stays on it round a circuit the recording has no rows of
+        // the middle of, then goes on to lap 2
         let samples = on_the_grid(vec![(
             2,
             driven(
                 1900.0,
                 &[
-                    (0, 3990.0, &|_, _| Some(0.0)),
-                    (1, 4100.0, &|_, _| Some(2100.0 / 60.0)),
+                    (1, 3990.0, &|_, _| Some(0.0)),
+                    (2, 4100.0, &|_, _| Some(2100.0 / 60.0)),
                 ],
             ),
         )])
@@ -7307,15 +7307,15 @@ mod tests {
         .collect::<Vec<_>>();
         let (conn, mut stream) = stream_with(vec![turn_at(1800.0)]);
         stream.apply_telemetry(&conn, &samples).unwrap();
-        assert_eq!(stream.cars[&2].current.as_ref().unwrap().lap, 1);
+        assert_eq!(stream.cars[&2].current.as_ref().unwrap().lap, 2);
         assert_eq!(stream.counting(), Some(Counting::RunAndCircuit));
 
         // Nor with the crossing unseen too: a hole that long could hide a circuit, in the lap's
         // rows or before the next lap's
         let samples = samples
             .into_iter()
-            .filter(|s| s.lap == Some(1) || s.session_time.unwrap() < 0.5 || s.id > 400)
-            .filter(|s| s.lap == Some(1) || s.lap_distance.unwrap() > 1800.0)
+            .filter(|s| s.lap == Some(2) || s.session_time.unwrap() < 0.5 || s.id > 400)
+            .filter(|s| s.lap == Some(2) || s.lap_distance.unwrap() > 1800.0)
             .collect::<Vec<_>>();
         // Or rows all there but without a distance, from the lap's start: a pit-lane start round
         // to the lap's last part unseen
@@ -7324,14 +7324,14 @@ mod tests {
             driven(
                 100.0,
                 &[
-                    (0, 1995.0, &|_, _| Some(0.0)),
-                    (1, 2100.0, &|_, _| Some(1900.0 / 60.0)),
+                    (1, 1995.0, &|_, _| Some(0.0)),
+                    (2, 2100.0, &|_, _| Some(1900.0 / 60.0)),
                 ],
             ),
         )])
         .into_iter()
         .map(|mut s| {
-            if s.lap_distance.is_some_and(|d| d < 1900.0) && s.lap == Some(0) {
+            if s.lap_distance.is_some_and(|d| d < 1900.0) && s.lap == Some(1) {
                 s.lap_distance = None;
             }
             s
@@ -7342,14 +7342,14 @@ mod tests {
             driven(
                 1900.0,
                 &[
-                    (0, 3990.0, &|_, _| Some(0.0)),
-                    (1, 4100.0, &|_, _| Some(2100.0 / 60.0)),
+                    (1, 3990.0, &|_, _| Some(0.0)),
+                    (2, 4100.0, &|_, _| Some(2100.0 / 60.0)),
                 ],
             ),
         )])
         .into_iter()
         .map(|mut s| {
-            if s.lap == Some(0) && (6..400).contains(&s.id) {
+            if s.lap == Some(1) && (6..400).contains(&s.id) {
                 s.lap_distance = None;
             }
             s
@@ -7359,7 +7359,7 @@ mod tests {
             samples.clone(),
             samples
                 .iter()
-                .filter(|s| s.lap == Some(1) || s.session_time.unwrap() < 0.5)
+                .filter(|s| s.lap == Some(2) || s.session_time.unwrap() < 0.5)
                 .copied()
                 .collect(),
             blank,
@@ -7367,23 +7367,23 @@ mod tests {
         ] {
             let (conn, mut stream) = stream_with(vec![turn_at(1800.0)]);
             stream.apply_telemetry(&conn, &samples).unwrap();
-            assert_eq!(stream.cars[&2].current.as_ref().unwrap().lap, 1);
+            assert_eq!(stream.cars[&2].current.as_ref().unwrap().lap, 2);
             assert_eq!(stream.counting(), None);
         }
     }
 
     #[test]
     fn a_run_to_the_line_on_a_lap_of_its_own_counts_as_given() {
-        // Car 2 goes on to lap 1 at its first crossing: lap 0 was only the run to the line
+        // Car 2 goes on to lap 2 at its first crossing: lap 1 was only the run to the line
         let samples = on_the_grid(vec![
-            (1, driven(1820.0, &[(0, 1994.0, &|_, _| Some(0.0))])),
+            (1, driven(1820.0, &[(1, 1994.0, &|_, _| Some(0.0))])),
             (
                 2,
                 driven(
                     1900.0,
                     &[
-                        (0, 1995.0, &|_, _| Some(0.0)),
-                        (1, 2074.0, &|_, _| Some(100.0 / 60.0)),
+                        (1, 1995.0, &|_, _| Some(0.0)),
+                        (2, 2074.0, &|_, _| Some(100.0 / 60.0)),
                     ],
                 ),
             ),
@@ -7391,19 +7391,19 @@ mod tests {
         let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
         stream.apply_telemetry(&conn, &samples).unwrap();
         assert_eq!(stream.counting(), Some(Counting::RunOnly));
-        assert_eq!(race_lap_at(&conn, &stream, &samples, 1), Some(0));
-        assert_eq!(race_lap_at(&conn, &stream, &samples, 2), Some(1));
+        assert_eq!(race_lap_at(&conn, &stream, &samples, 1), Some(1));
+        assert_eq!(race_lap_at(&conn, &stream, &samples, 2), Some(2));
         the_player_80_m_behind(&gap_on_the_grid(&conn, &stream, &samples));
     }
 
     #[test]
     fn a_pit_lane_start_counts_as_given() {
-        // RaceRoom's way, shown by car 2 crossing under lap 0. Car 3 starts from the pit lane,
-        // past the line: its lap 0 is a circuit, all of it race distance, even in the lap's last
+        // RaceRoom's way, shown by car 2 crossing under lap 1. Car 3 starts from the pit lane,
+        // past the line: its lap 1 is a circuit, all of it race distance, even in the lap's last
         // part
         let samples = on_the_grid(vec![
-            (2, driven(1900.0, &[(0, 2074.0, &|_, _| Some(0.0))])),
-            (3, driven(100.0, &[(0, 1950.0, &|_, _| Some(0.0))])),
+            (2, driven(1900.0, &[(1, 2074.0, &|_, _| Some(0.0))])),
+            (3, driven(100.0, &[(1, 1950.0, &|_, _| Some(0.0))])),
         ]);
         let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
         let after = samples
@@ -7412,35 +7412,35 @@ mod tests {
             .unwrap();
         stream.apply_telemetry(&conn, &samples[..after]).unwrap();
         assert_eq!(stream.counting(), Some(Counting::RunAndCircuit));
-        assert_eq!(race_lap_at(&conn, &stream, &samples[..after], 3), Some(0));
+        assert_eq!(race_lap_at(&conn, &stream, &samples[..after], 3), Some(1));
         stream.apply_telemetry(&conn, &samples[after..]).unwrap();
         let t = newest(&conn, &samples, 3);
         assert!(t.f("lap_distance").unwrap() > 2000.0 * FIRST_DISTANCE);
-        assert_eq!(race_lap_at(&conn, &stream, &samples, 3), Some(0));
+        assert_eq!(race_lap_at(&conn, &stream, &samples, 3), Some(1));
 
         // Seen at the green behind the line and next in the lap's last part half a minute on: it's
         // been round in the hole, not still running to the line
-        let rows = driven(1900.0, &[(0, 3820.0, &|_, _| Some(0.0))]);
+        let rows = driven(1900.0, &[(1, 3820.0, &|_, _| Some(0.0))]);
         let holed = on_the_grid(vec![
-            (2, driven(1900.0, &[(0, 2074.0, &|_, _| Some(0.0))])),
+            (2, driven(1900.0, &[(1, 2074.0, &|_, _| Some(0.0))])),
             (5, vec![rows[0], rows[12], *rows.last().unwrap()]),
         ]);
         let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
         stream.apply_telemetry(&conn, &holed).unwrap();
         assert_eq!(stream.counting(), Some(Counting::RunAndCircuit));
-        assert_eq!(race_lap_at(&conn, &stream, &holed, 5), Some(0));
+        assert_eq!(race_lap_at(&conn, &stream, &holed, 5), Some(1));
 
         // Seen only at its start and in the lap's last part, nothing between: it started past the
         // line, so it's been round, with no lap time to tell too
-        let rows = driven(100.0, &[(0, 1900.0, &|_, _| Some(0.0))]);
+        let rows = driven(100.0, &[(1, 1900.0, &|_, _| Some(0.0))]);
         let sparse = on_the_grid(vec![
-            (2, driven(1900.0, &[(0, 2074.0, &|_, _| Some(0.0))])),
+            (2, driven(1900.0, &[(1, 2074.0, &|_, _| Some(0.0))])),
             (4, vec![rows[0], *rows.last().unwrap()]),
         ]);
         let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
         stream.apply_telemetry(&conn, &sparse).unwrap();
         assert_eq!(stream.counting(), Some(Counting::RunAndCircuit));
-        assert_eq!(race_lap_at(&conn, &stream, &sparse, 4), Some(0));
+        assert_eq!(race_lap_at(&conn, &stream, &sparse, 4), Some(1));
         let t = newest(&conn, &sparse, 4);
         let timeless = standing(&conn, "GT3", 4, (None, None), None, None);
         let now = t.f("session_time");
@@ -7448,25 +7448,25 @@ mod tests {
             stream
                 .race_lap(4, &timeless, &t, now, Some(2000.0))
                 .map(|lap| lap.lap),
-            Some(0)
+            Some(1)
         );
     }
 
     #[test]
     fn joining_mid_race_counts_the_first_lap_seen() {
-        // The recording starts with the player and car 2 on lap 7, nothing of them seen before
+        // The recording starts with the player and car 2 on lap 8, nothing of them seen before
         let samples = on_the_grid(vec![
-            (1, driven(500.0, &[(7, 1450.0, &|_, _| Some(-50.0))])),
-            (2, driven(700.0, &[(7, 1650.0, &|_, _| Some(-50.0))])),
-            // On lap 0 a minute after a crossing the recording didn't see, now in the lap's last
+            (1, driven(500.0, &[(8, 1450.0, &|_, _| Some(-50.0))])),
+            (2, driven(700.0, &[(8, 1650.0, &|_, _| Some(-50.0))])),
+            // On lap 1 a minute after a crossing the recording didn't see, now in the lap's last
             // part: seen round the middle of the lap, or else told by its lap time
-            (3, driven(1000.0, &[(0, 1950.0, &|_, _| Some(-60.0))])),
-            (4, driven(1810.0, &[(0, 1950.0, &|_, _| Some(-60.0))])),
+            (3, driven(1000.0, &[(1, 1950.0, &|_, _| Some(-60.0))])),
+            (4, driven(1810.0, &[(1, 1950.0, &|_, _| Some(-60.0))])),
         ]);
         let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
         stream.apply_telemetry(&conn, &samples).unwrap();
         assert!(stream.cars.values().all(|car| car.finished.is_empty()));
-        for (vehicle, lap) in [(1, 7), (2, 7), (3, 0), (4, 0)] {
+        for (vehicle, lap) in [(1, 8), (2, 8), (3, 1), (4, 1)] {
             assert_eq!(
                 race_lap_at(&conn, &stream, &samples, vehicle),
                 Some(lap),
@@ -7484,27 +7484,27 @@ mod tests {
 
     #[test]
     fn a_wrap_before_the_lap_count_changes_doesnt_decide_the_counting() {
-        // Car 2's distance wraps at the line 0.4 s before its lap count goes to 1
+        // Car 2's distance wraps at the line 0.4 s before its lap count goes to 2
         let samples = on_the_grid(vec![
-            (1, driven(1820.0, &[(0, 1994.0, &|_, _| Some(0.0))])),
+            (1, driven(1820.0, &[(1, 1994.0, &|_, _| Some(0.0))])),
             (
                 2,
                 driven(
                     1900.0,
                     &[
-                        (0, 2025.0, &|_, _| Some(0.0)),
-                        (1, 2074.0, &|_, _| Some(100.0 / 60.0)),
+                        (1, 2025.0, &|_, _| Some(0.0)),
+                        (2, 2074.0, &|_, _| Some(100.0 / 60.0)),
                     ],
                 ),
             ),
         ]);
         let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
-        let lap_1 = samples
+        let lap_2 = samples
             .iter()
-            .position(|s| s.vehicle == 2 && s.lap == Some(1))
+            .position(|s| s.vehicle == 2 && s.lap == Some(2))
             .unwrap();
-        stream.apply_telemetry(&conn, &samples[..lap_1]).unwrap();
-        // Past the line under lap 0, but not for long enough to say it stays there
+        stream.apply_telemetry(&conn, &samples[..lap_2]).unwrap();
+        // Past the line under lap 1, but not for long enough to say it stays there
         assert!(
             stream.cars[&2]
                 .current
@@ -7514,44 +7514,44 @@ mod tests {
                 .is_some()
         );
         assert_eq!(stream.counting(), None);
-        assert_eq!(race_lap_at(&conn, &stream, &samples[..lap_1], 2), None);
-        // Then lap 1: lap 0 was only the run to the line
-        stream.apply_telemetry(&conn, &samples[lap_1..]).unwrap();
+        assert_eq!(race_lap_at(&conn, &stream, &samples[..lap_2], 2), None);
+        // Then lap 2: lap 1 was only the run to the line
+        stream.apply_telemetry(&conn, &samples[lap_2..]).unwrap();
         assert_eq!(stream.counting(), Some(Counting::RunOnly));
-        assert_eq!(race_lap_at(&conn, &stream, &samples, 1), Some(0));
+        assert_eq!(race_lap_at(&conn, &stream, &samples, 1), Some(1));
         the_player_80_m_behind(&gap_on_the_grid(&conn, &stream, &samples));
 
         // A run too short to tell from the old lap's rows leaves the crossing undecided: its wrap,
         // seen from the start, is a crossing all the same
         let samples = on_the_grid(vec![
-            (1, driven(1820.0, &[(0, 1994.0, &|_, _| Some(0.0))])),
+            (1, driven(1820.0, &[(1, 1994.0, &|_, _| Some(0.0))])),
             (
                 2,
                 driven(
                     1980.0,
                     &[
-                        (0, 2025.0, &|_, _| Some(0.0)),
-                        (1, 2154.0, &|_, _| Some(20.0 / 60.0)),
+                        (1, 2025.0, &|_, _| Some(0.0)),
+                        (2, 2154.0, &|_, _| Some(20.0 / 60.0)),
                     ],
                 ),
             ),
         ]);
         let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
-        let lap_1 = samples
+        let lap_2 = samples
             .iter()
-            .position(|s| s.vehicle == 2 && s.lap == Some(1))
+            .position(|s| s.vehicle == 2 && s.lap == Some(2))
             .unwrap();
-        stream.apply_telemetry(&conn, &samples[..lap_1]).unwrap();
+        stream.apply_telemetry(&conn, &samples[..lap_2]).unwrap();
         let build = stream.cars[&2].current.as_ref().unwrap();
         assert_eq!(build.line_crossing, None);
         assert!(build.crossed().is_some());
-        assert_eq!(race_lap_at(&conn, &stream, &samples[..lap_1], 2), None);
-        stream.apply_telemetry(&conn, &samples[lap_1..]).unwrap();
+        assert_eq!(race_lap_at(&conn, &stream, &samples[..lap_2], 2), None);
+        stream.apply_telemetry(&conn, &samples[lap_2..]).unwrap();
         assert_eq!(stream.counting(), Some(Counting::RunOnly));
 
         // A pit-lane start just past the line whose first rows still carry the old lap's distance:
         // that wrap is no crossing it stays past
-        let mut stale = driven(40.0, &[(0, 200.0, &|_, _| Some(0.0))]);
+        let mut stale = driven(40.0, &[(1, 200.0, &|_, _| Some(0.0))]);
         for s in &mut stale {
             s.session_time = s.session_time.map(|t| t + 0.1);
         }
@@ -7577,20 +7577,20 @@ mod tests {
             driven(
                 1980.0,
                 &[
-                    (0, 2025.0, &|_, _| Some(-0.3)),
-                    (1, 2154.0, &|_, _| Some(20.0 / 60.0)),
+                    (1, 2025.0, &|_, _| Some(-0.3)),
+                    (2, 2154.0, &|_, _| Some(20.0 / 60.0)),
                 ],
             ),
         )]);
         let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
-        let lap_1 = samples.iter().position(|s| s.lap == Some(1)).unwrap();
-        stream.apply_telemetry(&conn, &samples[..lap_1]).unwrap();
+        let lap_2 = samples.iter().position(|s| s.lap == Some(2)).unwrap();
+        stream.apply_telemetry(&conn, &samples[..lap_2]).unwrap();
         let build = stream.cars[&2].current.as_ref().unwrap();
         assert!(!build.seen_from_start());
         assert!(build.first_wrap.is_some());
-        assert_eq!(race_lap_at(&conn, &stream, &samples[..lap_1], 2), None);
+        assert_eq!(race_lap_at(&conn, &stream, &samples[..lap_2], 2), None);
 
-        // Cars seen going to lap 1 at the line, one staying on lap 0 well past it is a lap count
+        // Cars seen going to lap 2 at the line, one staying on lap 1 well past it is a lap count
         // behind for longer: not known
         let samples = on_the_grid(vec![
             (
@@ -7598,12 +7598,12 @@ mod tests {
                 driven(
                     1900.0,
                     &[
-                        (0, 1995.0, &|_, _| Some(0.0)),
-                        (1, 2240.0, &|_, _| Some(100.0 / 60.0)),
+                        (1, 1995.0, &|_, _| Some(0.0)),
+                        (2, 2240.0, &|_, _| Some(100.0 / 60.0)),
                     ],
                 ),
             ),
-            (3, driven(1900.0, &[(0, 2240.0, &|_, _| Some(0.0))])),
+            (3, driven(1900.0, &[(1, 2240.0, &|_, _| Some(0.0))])),
         ]);
         let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
         stream.apply_telemetry(&conn, &samples).unwrap();
@@ -7700,16 +7700,16 @@ mod tests {
         assert_eq!(
             rows,
             [
-                ["0", "100", "1", "1", "1", "0"],
                 ["1", "100", "1", "1", "1", "0"],
                 ["2", "100", "1", "1", "1", "0"],
-                ["3", "NULL", "0", "0", "1", "0"],
+                ["3", "100", "1", "1", "1", "0"],
+                ["4", "NULL", "0", "0", "1", "0"],
             ]
         );
         assert_eq!(
             number(
                 &engineer,
-                "SELECT official_time_s FROM lap_stats WHERE vehicle_id = 2 AND lap = 0"
+                "SELECT official_time_s FROM lap_stats WHERE vehicle_id = 2 AND lap = 1"
             )
             .await,
             99.8
@@ -7722,7 +7722,7 @@ mod tests {
         let rows = query(
             &engineer,
             "SELECT wheel_name, ROUND(inner_avg_c - outer_avg_c), ROUND(optimal_c), ROUND(life_start_pct) \
-             FROM lap_wheel_stats WHERE vehicle_id = 1 AND lap = 0 ORDER BY wheel",
+             FROM lap_wheel_stats WHERE vehicle_id = 1 AND lap = 1 ORDER BY wheel",
         )
         .await;
         assert_eq!(rows.len(), 4);
@@ -7783,19 +7783,19 @@ mod tests {
         let (_dir, engineer) = shifted_ring();
         let rows = query(
             &engineer,
-            "SELECT COUNT(*), turn_name FROM corner_passes WHERE vehicle_id = 1 AND lap = 1 GROUP BY turn_index ORDER BY turn_index",
+            "SELECT COUNT(*), turn_name FROM corner_passes WHERE vehicle_id = 1 AND lap = 2 GROUP BY turn_index ORDER BY turn_index",
         )
         .await;
         assert_eq!(rows.len(), 5, "{rows:?}");
         assert!(rows[0][1].contains("T1"), "{rows:?}");
         let total = number(
             &engineer,
-            "SELECT SUM(total_s) FROM corner_passes WHERE vehicle_id = 1 AND lap = 1",
+            "SELECT SUM(total_s) FROM corner_passes WHERE vehicle_id = 1 AND lap = 2",
         )
         .await;
         let lap = number(
             &engineer,
-            "SELECT time_s FROM lap_stats WHERE vehicle_id = 1 AND lap = 1",
+            "SELECT time_s FROM lap_stats WHERE vehicle_id = 1 AND lap = 2",
         )
         .await;
         assert!((total - lap).abs() < 0.01, "{total} {lap}");
@@ -7803,17 +7803,17 @@ mod tests {
         let (brake, speed, at) = (
             number(
                 &engineer,
-                "SELECT brake_m_before_apex FROM corner_passes WHERE lap = 1 AND turn_index = 0",
+                "SELECT brake_m_before_apex FROM corner_passes WHERE lap = 2 AND turn_index = 0",
             )
             .await,
             number(
                 &engineer,
-                "SELECT min_speed_kmh FROM corner_passes WHERE lap = 1 AND turn_index = 0",
+                "SELECT min_speed_kmh FROM corner_passes WHERE lap = 2 AND turn_index = 0",
             )
             .await,
             number(
                 &engineer,
-                "SELECT min_speed_at_m FROM corner_passes WHERE lap = 1 AND turn_index = 0",
+                "SELECT min_speed_at_m FROM corner_passes WHERE lap = 2 AND turn_index = 0",
             )
             .await,
         );
@@ -7824,7 +7824,7 @@ mod tests {
 
     fn lap_with(pit: bool, refuelled: bool, wear: (f64, f64)) -> Lap {
         Lap {
-            lap: 0,
+            lap: 1,
             first_id: 0,
             last_id: 0,
             start: None,
@@ -7855,14 +7855,14 @@ mod tests {
     #[test]
     fn representative_laps_prefer_clean_but_keep_invalidated_fallbacks() {
         let mut clean = lap_with(false, false, (1.0, 0.9));
-        clean.lap = 1;
+        clean.lap = 2;
         clean.time = Some(105.0);
         let mut invalid = clean.clone();
-        invalid.lap = 2;
+        invalid.lap = 3;
         invalid.invalid = true;
         invalid.time = Some(100.0);
         let mut pit = clean.clone();
-        pit.lap = 3;
+        pit.lap = 4;
         pit.green = false;
         pit.pit = true;
         pit.time = Some(90.0);
@@ -7872,9 +7872,9 @@ mod tests {
                 .iter()
                 .map(|lap| lap.lap)
                 .collect::<Vec<_>>(),
-            [1, 2]
+            [2, 3]
         );
-        assert_eq!(best_lap(&[invalid]).unwrap().lap, 2);
+        assert_eq!(best_lap(&[invalid]).unwrap().lap, 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7882,14 +7882,14 @@ mod tests {
         let (dir, _engineer) = race();
         let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
         let mut invalid = lap_with(false, false, (1.0, 0.9));
-        invalid.lap = 2;
+        invalid.lap = 3;
         invalid.start = Some(0.0);
         invalid.time = Some(100.0);
         invalid.first_id = 1;
         invalid.last_id = 400;
         invalid.invalid = true;
         let mut missing = invalid.clone();
-        missing.lap = 1;
+        missing.lap = 2;
         missing.invalid = false;
         missing.first_id = 999999;
         missing.last_id = 999999;
@@ -7900,7 +7900,7 @@ mod tests {
                 .unwrap()
                 .0
                 .lap,
-            2
+            3
         );
         assert!(
             best_seen_lap(&conn, 1, &laps, 1000.0, false)
@@ -7910,12 +7910,12 @@ mod tests {
 
         let mut no_zones = invalid.clone();
         no_zones.invalid = false;
-        no_zones.lap = 1;
+        no_zones.lap = 2;
         no_zones.first_id = 401;
         no_zones.last_id = 800;
         no_zones.start = Some(100.0);
         conn.execute(
-            "UPDATE telemetry SET brake = 0 WHERE vehicle_id = 1 AND lap = 1",
+            "UPDATE telemetry SET brake = 0 WHERE vehicle_id = 1 AND lap = 2",
             [],
         )
         .unwrap();
@@ -7929,7 +7929,7 @@ mod tests {
         );
 
         let mut clean = invalid.clone();
-        clean.lap = 4;
+        clean.lap = 5;
         clean.invalid = false;
         clean.time = Some(101.0);
         // Exhaust usable clean candidates before falling back, rather than stopping after
@@ -7941,7 +7941,7 @@ mod tests {
                 .unwrap()
                 .0
                 .lap,
-            4
+            5
         );
     }
 
@@ -7952,10 +7952,10 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO corner_passes (vehicle_id, lap, turn_index, turn_name, total_s, \
              lap_invalid, in_pit, contact, low_precision, brake_m_before_apex, min_speed_kmh, exit_speed_kmh) VALUES \
-             (1, 0, 0, 'T1', 9.0, 0, 0, 0, 0, 100, 80, 100), \
-             (1, 1, 0, 'T1', 10.5, 0, 0, 0, 0, 100, 80, 100), \
-             (1, 2, 0, 'T1', 10.0, 1, 0, 0, 0, 100, 80, 100), \
-             (1, 2, 10, 'T11', 0.5, 0, 0, 0, 0, 100, 80, 100);",
+             (1, 1, 0, 'T1', 9.0, 0, 0, 0, 0, 100, 80, 100), \
+             (1, 2, 0, 'T1', 10.5, 0, 0, 0, 0, 100, 80, 100), \
+             (1, 3, 0, 'T1', 10.0, 1, 0, 0, 0, 100, 80, 100), \
+             (1, 3, 10, 'T11', 0.5, 0, 0, 0, 0, 100, 80, 100);",
         )
         .unwrap();
         let sql = SKILL
@@ -7970,8 +7970,8 @@ mod tests {
             .unwrap()
             .replace(":P", "1")
             .replace(":TURN_INDEX", "0")
-            .replace(":FROM_LAP", "1")
-            .replace(":TO_LAP", "2");
+            .replace(":FROM_LAP", "2")
+            .replace(":TO_LAP", "3");
         let selected = |observed: i64| {
             let sql = sql.replace(":OBSERVED_LAP", &observed.to_string());
             conn.query_row(&sql, [], |row| {
@@ -7979,30 +7979,30 @@ mod tests {
             })
             .unwrap()
         };
-        assert_eq!(selected(3), (1, 0));
-        conn.execute("UPDATE corner_passes SET total_s = NULL WHERE lap = 1", [])
+        assert_eq!(selected(4), (2, 0));
+        conn.execute("UPDATE corner_passes SET total_s = NULL WHERE lap = 2", [])
             .unwrap();
         // An older clean pass outside the requested window must not suppress the fallback.
-        assert_eq!(selected(3), (2, 1));
+        assert_eq!(selected(4), (3, 1));
         conn.execute(
-            "UPDATE corner_passes SET total_s = 10.5, brake_m_before_apex = NULL WHERE lap = 1",
+            "UPDATE corner_passes SET total_s = 10.5, brake_m_before_apex = NULL WHERE lap = 2",
             [],
         )
         .unwrap();
-        assert_eq!(selected(3), (2, 1));
+        assert_eq!(selected(4), (3, 1));
         conn.execute(
-            "UPDATE corner_passes SET brake_m_before_apex = 100 WHERE lap = 1",
+            "UPDATE corner_passes SET brake_m_before_apex = 100 WHERE lap = 2",
             [],
         )
         .unwrap();
-        assert_eq!(selected(1), (2, 1));
+        assert_eq!(selected(2), (3, 1));
         // The same exact index also works for inferred braking-zone names.
         conn.execute(
             "UPDATE corner_passes SET turn_name = 'braking zone 1' WHERE turn_index = 0",
             [],
         )
         .unwrap();
-        assert_eq!(selected(1), (2, 1));
+        assert_eq!(selected(2), (3, 1));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -8011,7 +8011,7 @@ mod tests {
         drop(original);
         let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
         conn.execute_batch(TABLES).unwrap();
-        conn.execute("UPDATE telemetry SET brake = CASE WHEN lap_distance BETWEEN 100 AND 145 THEN 1 ELSE 0 END WHERE vehicle_id = 1 AND lap = 0", []).unwrap();
+        conn.execute("UPDATE telemetry SET brake = CASE WHEN lap_distance BETWEEN 100 AND 145 THEN 1 ELSE 0 END WHERE vehicle_id = 1 AND lap = 1", []).unwrap();
         let mut invalid = lap_with(false, false, (1.0, 0.9));
         invalid.invalid = true;
         invalid.first_id = 1;
@@ -8023,7 +8023,7 @@ mod tests {
             ..Car::default()
         };
         let mut second_invalid = invalid.clone();
-        second_invalid.lap = 1;
+        second_invalid.lap = 2;
         second_invalid.first_id = 401;
         second_invalid.last_id = 800;
         second_invalid.start = Some(100.0);
@@ -8041,7 +8041,7 @@ mod tests {
         assert_eq!(stream.cars[&1].finished.len(), 1);
         let mut clean = invalid.clone();
         clean.invalid = false;
-        clean.lap = 2;
+        clean.lap = 3;
         clean.first_id = 801;
         clean.last_id = 1200;
         clean.start = Some(200.0);
@@ -8099,7 +8099,7 @@ mod tests {
             "SELECT lap, lap_invalid FROM corner_passes WHERE vehicle_id = 1 ORDER BY lap",
         )
         .await;
-        assert_eq!(passes, [["0", "1"], ["1", "1"], ["2", "1"]]);
+        assert_eq!(passes, [["1", "1"], ["2", "1"], ["3", "1"]]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -8475,14 +8475,14 @@ mod tests {
         assert_eq!(invalid(), Some(1));
     }
 
-    /// Laps of 100 s from lap 0, each `(pit, refuelled)`.
+    /// Laps of 100 s from lap 1, each `(pit, refuelled)`.
     fn spans_of(laps: &[(bool, bool)]) -> Vec<LapSpan> {
         laps.iter()
-            .zip(0..)
+            .zip(1..)
             .map(|((pit, refuelled), lap)| LapSpan {
                 lap,
-                start: Some(lap as f64 * 100.0),
-                end: Some(lap as f64 * 100.0 + 100.0),
+                start: Some((lap - 1) as f64 * 100.0),
+                end: Some(lap as f64 * 100.0),
                 stopped: *pit || *refuelled,
             })
             .collect()
@@ -8564,15 +8564,15 @@ mod tests {
 
     #[test]
     fn rows_before_a_laps_timer_starts_arent_the_laps() {
-        // Out on track from 1400 m under lap 0's number before its timer starts at 1850 m: then
-        // round to the line, a whole lap, and into lap 1
+        // Out on track from 1400 m under lap 1's number before its timer starts at 1850 m: then
+        // round to the line, a whole lap, and into lap 2
         let timer = 450.0 / 60.0;
-        let lap_1 = (450.0 + 150.0 + 2000.0) / 60.0;
+        let lap_2 = (450.0 + 150.0 + 2000.0) / 60.0;
         let samples = driven(
             1400.0,
             &[
-                (0, 3995.0, &|t, _| (t >= timer).then_some(timer)),
-                (1, 4300.0, &|_, _| Some(lap_1)),
+                (1, 3995.0, &|t, _| (t >= timer).then_some(timer)),
+                (2, 4300.0, &|_, _| Some(lap_2)),
             ],
         );
         let (conn, mut stream) = stream_with(vec![turn_at(1700.0)]);
@@ -8602,13 +8602,13 @@ mod tests {
         assert!(trace.ok, "the full circuit still supplies corner geometry");
         assert!((trace.time_at(0.0) - 600.0 / 60.0).abs() < 0.01);
         assert!((trace.span(0.0, 100.0) - 100.0 / 60.0).abs() < 0.01);
-        assert!((trace.time_at(2000.0) - lap_1).abs() < 0.01);
+        assert!((trace.time_at(2000.0) - lap_2).abs() < 0.01);
 
         // The turn passed before the timer started isn't the lap's pass of it: that one's left at
         // its exit after 350 m, the lap's after 600 m to the line and 1750 m more
         let passes = conn
             .prepare(
-                "SELECT first_id, exited_at_s FROM corner_passes WHERE vehicle_id = 1 AND lap = 0",
+                "SELECT first_id, exited_at_s FROM corner_passes WHERE vehicle_id = 1 AND lap = 1",
             )
             .unwrap()
             .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))
@@ -8633,8 +8633,8 @@ mod tests {
             let mut samples = driven(
                 1400.0,
                 &[
-                    (0, 3995.0, &|t, _| (t >= timer).then_some(timer)),
-                    (1, 4300.0, &|_, _| Some(next)),
+                    (1, 3995.0, &|t, _| (t >= timer).then_some(timer)),
+                    (2, 4300.0, &|_, _| Some(next)),
                 ],
             );
             let (conn, mut stream) = stream_with(vec![]);
@@ -8671,9 +8671,9 @@ mod tests {
         let mut samples = driven(
             1400.0,
             &[
-                (0, 3995.0, &|t, _| (t >= timer).then_some(timer)),
-                (1, 5995.0, &|_, _| Some(2600.0 / 60.0)),
-                (2, 6300.0, &|_, _| Some(4600.0 / 60.0)),
+                (1, 3995.0, &|t, _| (t >= timer).then_some(timer)),
+                (2, 5995.0, &|_, _| Some(2600.0 / 60.0)),
+                (3, 6300.0, &|_, _| Some(4600.0 / 60.0)),
             ],
         );
         let (conn, mut stream) = stream_with(vec![]);
@@ -8682,8 +8682,8 @@ mod tests {
             .unwrap();
         for sample in &mut samples {
             let d = sample.lap_distance.unwrap();
-            // Lap 0 brakes for 250 m, lap 1 for 1050 m
-            let apex = if sample.lap == Some(0) { 250.0 } else { 1050.0 };
+            // Lap 1 brakes for 250 m, lap 2 for 1050 m
+            let apex = if sample.lap == Some(1) { 250.0 } else { 1050.0 };
             sample.brake = Some(if (apex - 150.0..apex - 50.0).contains(&d) {
                 1.0
             } else {
@@ -8696,15 +8696,15 @@ mod tests {
                     sample.lap_distance, sample.speed, sample.brake, sample.throttle, sample.gear],
             ).unwrap();
         }
-        // Lap 0 over: its zones are all there is
-        let lap_1 = samples.iter().position(|s| s.lap == Some(1)).unwrap();
+        // Lap 1 over: its zones are all there is
+        let lap_2 = samples.iter().position(|s| s.lap == Some(2)).unwrap();
         stream
-            .apply_telemetry(&conn, &samples[..lap_1 + 10])
+            .apply_telemetry(&conn, &samples[..lap_2 + 10])
             .unwrap();
         stream.find_braking_zones(&conn).unwrap();
         assert_eq!(stream.layout.as_ref().unwrap().corners[0].apex, 250.0);
         assert!(stream.zones_from_fallback);
-        // Read again from the start, with lap 1 over too
+        // Read again from the start, with lap 2 over too
         stream.apply_telemetry(&conn, &samples).unwrap();
         stream.find_braking_zones(&conn).unwrap();
         let layout = stream.layout.as_ref().unwrap();
@@ -8721,8 +8721,8 @@ mod tests {
             let samples = driven(
                 from,
                 &[
-                    (0, 3995.0, &|_, _| Some(start)),
-                    (1, 4300.0, &|_, _| Some(next)),
+                    (1, 3995.0, &|_, _| Some(start)),
+                    (2, 4300.0, &|_, _| Some(next)),
                 ],
             );
             for chunk_size in [1, samples.len()] {
@@ -8744,7 +8744,7 @@ mod tests {
                 assert!((trace.time_at(0.0) - crossing).abs() < 0.01);
                 let entered: f64 = conn
                     .query_row(
-                        "SELECT entered_at_s FROM corner_passes WHERE lap = 0 AND turn_index = 0",
+                        "SELECT entered_at_s FROM corner_passes WHERE lap = 1 AND turn_index = 0",
                         [],
                         |row| row.get(0),
                     )
@@ -8759,7 +8759,7 @@ mod tests {
         let start = 300.0 / 60.0;
         let samples = driven(
             1400.0,
-            &[(0, 4005.0, &|t, _| (t >= 1100.0 / 60.0).then_some(start))],
+            &[(1, 4005.0, &|t, _| (t >= 1100.0 / 60.0).then_some(start))],
         );
         for with_prestart in [true, false] {
             let samples = samples
@@ -8803,12 +8803,12 @@ mod tests {
                     stream.apply_telemetry(&conn, chunk).unwrap();
                 }
                 let (rise, end): (f64, f64) = conn.query_row(
-                    "SELECT brake_rise_c, brake_end_c FROM corner_pass_wheels WHERE vehicle_id = 1 AND lap = 0 AND wheel = 0 AND turn_index = 0",
+                    "SELECT brake_rise_c, brake_end_c FROM corner_pass_wheels WHERE vehicle_id = 1 AND lap = 1 AND wheel = 0 AND turn_index = 0",
                     [], |row| Ok((row.get(0)?, row.get(1)?)),
                 ).unwrap();
                 assert_eq!((rise, end), (200.0, 200.0), "chunk size {chunk_size}");
                 let later_rise: f64 = conn.query_row(
-                    "SELECT brake_rise_c FROM corner_pass_wheels WHERE vehicle_id = 1 AND lap = 0 AND wheel = 0 AND turn_index = 1",
+                    "SELECT brake_rise_c FROM corner_pass_wheels WHERE vehicle_id = 1 AND lap = 1 AND wheel = 0 AND turn_index = 1",
                     [], |row| row.get(0),
                 ).unwrap();
                 assert_eq!(later_rise, 0.0, "heat belongs to the first section");
@@ -8818,12 +8818,12 @@ mod tests {
 
     #[test]
     fn a_timer_started_just_past_the_line_still_finds_a_second_circuit() {
-        // Lap 0's timer starts 50 m past the line, and its number holds for another circuit
+        // Lap 1's timer starts 50 m past the line, and its number holds for another circuit
         let samples = driven(
             50.0,
             &[
-                (0, 3995.0, &|_, _| Some(0.0)),
-                (1, 4300.0, &|_, _| Some(3950.0 / 60.0)),
+                (1, 3995.0, &|_, _| Some(0.0)),
+                (2, 4300.0, &|_, _| Some(3950.0 / 60.0)),
             ],
         );
         for chunk_size in [1, samples.len()] {
@@ -8842,7 +8842,7 @@ mod tests {
             assert!(trace.ok);
             assert!((trace.time_at(0.0) - 1950.0 / 60.0).abs() < 0.01);
             let entered: Vec<f64> = conn
-                .prepare("SELECT entered_at_s FROM corner_passes WHERE lap = 0")
+                .prepare("SELECT entered_at_s FROM corner_passes WHERE lap = 1")
                 .unwrap()
                 .query_map([], |row| row.get(0))
                 .unwrap()
@@ -8858,23 +8858,23 @@ mod tests {
         let dense = driven(
             0.0,
             &[
-                (0, 1995.0, &|_, _| Some(0.0)),
-                (1, 3995.0, &|_, _| Some(2000.0 / 60.0)),
-                (2, 4300.0, &|_, _| Some(4000.0 / 60.0)),
+                (1, 1995.0, &|_, _| Some(0.0)),
+                (2, 3995.0, &|_, _| Some(2000.0 / 60.0)),
+                (3, 4300.0, &|_, _| Some(4000.0 / 60.0)),
             ],
         );
-        // Every half second, and lap 1's first row still has lap 0's distance
+        // Every half second, and lap 2's first row still has lap 1's distance
         let mut samples = dense
             .iter()
-            .filter(|sample| sample.lap != Some(1) || (sample.id - 401) % 6 == 0)
+            .filter(|sample| sample.lap != Some(2) || (sample.id - 401) % 6 == 0)
             .copied()
             .collect::<Vec<_>>();
-        let first = samples.iter().position(|s| s.lap == Some(1)).unwrap();
+        let first = samples.iter().position(|s| s.lap == Some(2)).unwrap();
         samples[first].lap_distance = Some(1995.0);
         let (conn, mut stream) = stream_with(vec![turn_at(500.0)]);
         stream.apply_telemetry(&conn, &samples).unwrap();
         let lap = &stream.cars[&1].finished[1];
-        assert_eq!(lap.lap, 1);
+        assert_eq!(lap.lap, 2);
         assert!(lap.green);
     }
 
@@ -8883,16 +8883,16 @@ mod tests {
         let dense = driven(
             0.0,
             &[
-                (0, 1995.0, &|_, _| Some(0.0)),
-                (1, 3995.0, &|_, _| Some(2000.0 / 60.0)),
-                (2, 4300.0, &|_, _| Some(4000.0 / 60.0)),
+                (1, 1995.0, &|_, _| Some(0.0)),
+                (2, 3995.0, &|_, _| Some(2000.0 / 60.0)),
+                (3, 4300.0, &|_, _| Some(4000.0 / 60.0)),
             ],
         );
-        // Lap 1's first half second still has lap 0's distance, advancing
+        // Lap 2's first half second still has lap 1's distance, advancing
         let mut samples = dense.clone();
         for (k, sample) in samples
             .iter_mut()
-            .filter(|s| s.lap == Some(1))
+            .filter(|s| s.lap == Some(2))
             .take(6)
             .enumerate()
         {
@@ -8904,7 +8904,7 @@ mod tests {
                 stream.apply_telemetry(&conn, chunk).unwrap();
             }
             let lap = &stream.cars[&1].finished[1];
-            assert_eq!(lap.lap, 1);
+            assert_eq!(lap.lap, 2);
             assert!(lap.green, "chunk size {chunk_size}");
             let rows = samples
                 .iter()
@@ -8921,12 +8921,12 @@ mod tests {
         let mut samples = driven(
             0.0,
             &[
-                (0, 1995.0, &|_, _| Some(0.0)),
-                (1, 3995.0, &|_, _| Some(2000.0 / 60.0)),
-                (2, 4300.0, &|_, _| Some(4000.0 / 60.0)),
+                (1, 1995.0, &|_, _| Some(0.0)),
+                (2, 3995.0, &|_, _| Some(2000.0 / 60.0)),
+                (3, 4300.0, &|_, _| Some(4000.0 / 60.0)),
             ],
         );
-        let second = samples.iter().position(|s| s.lap == Some(1)).unwrap() + 1;
+        let second = samples.iter().position(|s| s.lap == Some(2)).unwrap() + 1;
         samples[second].lap_distance = Some(1995.0);
         for chunk_size in [1, samples.len()] {
             let (conn, mut stream) = stream_with(vec![turn_at(500.0)]);
@@ -8934,7 +8934,7 @@ mod tests {
                 stream.apply_telemetry(&conn, chunk).unwrap();
             }
             let lap = &stream.cars[&1].finished[1];
-            assert_eq!(lap.lap, 1);
+            assert_eq!(lap.lap, 2);
             assert!(lap.green, "chunk size {chunk_size}");
         }
     }
@@ -8946,8 +8946,8 @@ mod tests {
         let samples = driven(
             50.0,
             &[
-                (0, 3995.0, &|_, _| Some(0.0)),
-                (1, 4300.0, &|_, _| Some(3950.0 / 60.0)),
+                (1, 3995.0, &|_, _| Some(0.0)),
+                (2, 4300.0, &|_, _| Some(3950.0 / 60.0)),
             ],
         )
         .into_iter()
@@ -8968,13 +8968,13 @@ mod tests {
 
     #[test]
     fn a_stale_first_row_doesnt_hide_a_second_circuit() {
-        // Lap 0's timer starts at the line, its first row has the old lap's distance, and its
+        // Lap 1's timer starts at the line, its first row has the old lap's distance, and its
         // number holds for two circuits
         let mut samples = driven(
             0.0,
             &[
-                (0, 3995.0, &|_, _| Some(0.0)),
-                (1, 4300.0, &|_, _| Some(4000.0 / 60.0)),
+                (1, 3995.0, &|_, _| Some(0.0)),
+                (2, 4300.0, &|_, _| Some(4000.0 / 60.0)),
             ],
         );
         samples[0].lap_distance = Some(1995.0);
@@ -8986,7 +8986,7 @@ mod tests {
             let lap = &stream.cars[&1].finished[0];
             assert!(!lap.green, "two circuits aren't a pace lap");
             let entered: Vec<f64> = conn
-                .prepare("SELECT entered_at_s FROM corner_passes WHERE lap = 0")
+                .prepare("SELECT entered_at_s FROM corner_passes WHERE lap = 1")
                 .unwrap()
                 .query_map([], |row| row.get(0))
                 .unwrap()
@@ -9004,8 +9004,8 @@ mod tests {
         let samples = driven(
             1850.0,
             &[
-                (0, 3995.0, &|_, _| Some(0.0)),
-                (1, 4300.0, &|_, _| Some(2150.0 / 60.0)),
+                (1, 3995.0, &|_, _| Some(0.0)),
+                (2, 4300.0, &|_, _| Some(2150.0 / 60.0)),
             ],
         );
         let at_line = samples
@@ -9032,7 +9032,7 @@ mod tests {
             }
             let rise: f64 = conn
                 .query_row(
-                    "SELECT brake_rise_c FROM corner_pass_wheels WHERE lap = 0 AND wheel = 0 AND turn_index = 0",
+                    "SELECT brake_rise_c FROM corner_pass_wheels WHERE lap = 1 AND wheel = 0 AND turn_index = 0",
                     [],
                     |row| row.get(0),
                 )
@@ -9047,8 +9047,8 @@ mod tests {
         let mut samples = driven(
             1400.0,
             &[
-                (0, 3995.0, &|t, _| (t >= timer).then_some(timer)),
-                (1, 4300.0, &|_, _| Some(2600.0 / 60.0)),
+                (1, 3995.0, &|t, _| (t >= timer).then_some(timer)),
+                (2, 4300.0, &|_, _| Some(2600.0 / 60.0)),
             ],
         );
         samples[0].session_time = None;
@@ -9068,8 +9068,8 @@ mod tests {
         let samples = driven(
             1400.0,
             &[
-                (0, 3995.0, &|t, _| (t >= timer).then_some(timer)),
-                (1, 4300.0, &|_, _| Some(2600.0 / 60.0)),
+                (1, 3995.0, &|t, _| (t >= timer).then_some(timer)),
+                (2, 4300.0, &|_, _| Some(2600.0 / 60.0)),
             ],
         )
         .into_iter()
@@ -9091,7 +9091,7 @@ mod tests {
             assert!((trace.time_at(0.0) - 600.0 / 60.0).abs() < 0.01);
             let entered: f64 = conn
                 .query_row(
-                    "SELECT entered_at_s FROM corner_passes WHERE lap = 0",
+                    "SELECT entered_at_s FROM corner_passes WHERE lap = 1",
                     [],
                     |row| row.get(0),
                 )
@@ -9108,7 +9108,7 @@ mod tests {
         // Recorded from 1700 m of a lap whose timer started earlier: the run to the line is
         // believable, so the circuit only shows once it's past 1800 m; that row of it has no
         // distance
-        let mut samples = driven(1700.0, &[(0, 3995.0, &|_, _| Some(-10.0))]);
+        let mut samples = driven(1700.0, &[(1, 3995.0, &|_, _| Some(-10.0))]);
         let missing = samples
             .iter()
             .position(|s| s.session_time.unwrap() > 10.0 && s.lap_distance == Some(1800.0))
@@ -9121,7 +9121,7 @@ mod tests {
             }
             // The lap's still under way
             let entered: Vec<f64> = conn
-                .prepare("SELECT entered_at_s FROM corner_passes WHERE lap = 0")
+                .prepare("SELECT entered_at_s FROM corner_passes WHERE lap = 1")
                 .unwrap()
                 .query_map([], |row| row.get(0))
                 .unwrap()
@@ -9138,8 +9138,8 @@ mod tests {
         let samples = driven(
             200.0,
             &[
-                (0, 2005.0, &|_, _| Some(0.0)),
-                (1, 2300.0, &|_, _| Some(1800.0 / 60.0)),
+                (1, 2005.0, &|_, _| Some(0.0)),
+                (2, 2300.0, &|_, _| Some(1800.0 / 60.0)),
             ],
         );
         for chunk_size in [1, samples.len()] {
@@ -9149,7 +9149,7 @@ mod tests {
             }
             let passes: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM corner_passes WHERE vehicle_id = 1 AND lap = 0",
+                    "SELECT COUNT(*) FROM corner_passes WHERE vehicle_id = 1 AND lap = 1",
                     [],
                     |row| row.get(0),
                 )
@@ -9164,8 +9164,8 @@ mod tests {
         let samples = driven(
             0.0,
             &[
-                (0, 1995.0, &|_, d| (d >= 20.0).then_some(0.0)),
-                (1, 2300.0, &|_, _| Some(2000.0 / 60.0)),
+                (1, 1995.0, &|_, d| (d >= 20.0).then_some(0.0)),
+                (2, 2300.0, &|_, _| Some(2000.0 / 60.0)),
             ],
         );
         let (conn, mut stream) = stream_with(vec![turn_at(500.0)]);
@@ -9180,8 +9180,8 @@ mod tests {
         let samples = driven(
             700.0,
             &[
-                (0, 2005.0, &|_, _| Some(-700.0 / 60.0)),
-                (1, 2300.0, &|_, _| Some(1300.0 / 60.0)),
+                (1, 2005.0, &|_, _| Some(-700.0 / 60.0)),
+                (2, 2300.0, &|_, _| Some(1300.0 / 60.0)),
             ],
         );
         for chunk_size in [1, samples.len()] {
@@ -9192,7 +9192,7 @@ mod tests {
             let lap = &stream.cars[&1].finished[0];
             assert!(!lap.green);
             let (passes, imprecise): (i64, i64) = conn.query_row(
-                "SELECT COUNT(*), MIN(low_precision) FROM corner_passes WHERE vehicle_id = 1 AND lap = 0 AND turn_index = 1",
+                "SELECT COUNT(*), MIN(low_precision) FROM corner_passes WHERE vehicle_id = 1 AND lap = 1 AND turn_index = 1",
                 [], |row| Ok((row.get(0)?, row.get(1)?)),
             ).unwrap();
             assert_eq!((passes, imprecise), (1, 1));
@@ -9205,8 +9205,8 @@ mod tests {
         let samples = driven(
             700.0,
             &[
-                (0, 1995.0, &|_, _| Some(-700.0 / 60.0)),
-                (1, 2300.0, &|_, _| Some(1300.0 / 60.0)),
+                (1, 1995.0, &|_, _| Some(-700.0 / 60.0)),
+                (2, 2300.0, &|_, _| Some(1300.0 / 60.0)),
             ],
         );
         let (conn, mut stream) = stream_with(vec![turn_at(500.0)]);
@@ -9244,7 +9244,7 @@ mod tests {
         let stints = stints_of(&spans, &[spell(1, 0.0, 300.0), spell(2, 310.0, 450.0)]);
         assert_eq!(stints.len(), 2);
         assert_eq!(stints[1].start.reason, "pit stop and driver change");
-        assert_eq!(stints[1].start.lap, Some(3));
+        assert_eq!(stints[1].start.lap, Some(4));
         assert_eq!(
             (stints[1].start.from, stints[1].start.to),
             (Some(300.0), Some(310.0))
@@ -9254,11 +9254,11 @@ mod tests {
         // The out lap had both of them: it's no one stint's
         assert_eq!(numbers(&stints, &spans), [1, 1, 1, 0, 2]);
         // So are its corners up to the handover, but not those after it
-        assert_eq!(place(&stints, 3, Some(300.0), Some(305.0)), Place::Across);
-        assert_eq!(place(&stints, 3, Some(320.0), Some(330.0)), Place::Stint(1));
-        assert_eq!(place(&stints, 2, Some(250.0), Some(260.0)), Place::Stint(0));
+        assert_eq!(place(&stints, 4, Some(300.0), Some(305.0)), Place::Across);
+        assert_eq!(place(&stints, 4, Some(320.0), Some(330.0)), Place::Stint(1));
+        assert_eq!(place(&stints, 3, Some(250.0), Some(260.0)), Place::Stint(0));
         // When it was driven isn't known
-        assert_eq!(place(&stints, 4, None, None), Place::Unknown);
+        assert_eq!(place(&stints, 5, None, None), Place::Unknown);
     }
 
     /// A setup change is its stint's by when it came, not by the first lap wholly in a stint: the
@@ -9268,19 +9268,19 @@ mod tests {
         let no = (false, false);
         let spans = spans_of(&[no, no, no]);
         let stints = stints_of(&spans, &[spell(1, 0.0, 150.0), spell(2, 160.0, 290.0)]);
-        // Lap 1 is the handover's, from 150 s to 160 s
+        // Lap 2 is the handover's, from 150 s to 160 s
         assert_eq!(
-            setup_stint(&stints, Some(1), Some(200.0)),
+            setup_stint(&stints, Some(2), Some(200.0)),
             Some(stints[1].id)
         );
         assert_eq!(
-            setup_stint(&stints, Some(1), Some(120.0)),
+            setup_stint(&stints, Some(2), Some(120.0)),
             Some(stints[0].id)
         );
         // During the handover, or not known when
-        assert_eq!(setup_stint(&stints, Some(1), Some(155.0)), None);
+        assert_eq!(setup_stint(&stints, Some(2), Some(155.0)), None);
         assert_eq!(setup_stint(&stints, None, Some(200.0)), None);
-        assert_eq!(setup_stint(&[], Some(1), Some(200.0)), None);
+        assert_eq!(setup_stint(&[], Some(2), Some(200.0)), None);
     }
 
     #[test]
@@ -9472,8 +9472,8 @@ mod tests {
         let third = Stint::new(&laps, &places(&laps, &stints), &stints, 2);
         assert_eq!(third.baseline_source, Some("this driver"));
         let used = third.baseline.iter().map(|lap| lap.lap).collect::<Vec<_>>();
-        assert_eq!(used, [0, 1, 2, 8]);
-        assert_eq!(third.own.iter().map(|lap| lap.lap).collect::<Vec<_>>(), [8]);
+        assert_eq!(used, [1, 2, 3, 9]);
+        assert_eq!(third.own.iter().map(|lap| lap.lap).collect::<Vec<_>>(), [9]);
         // Enough of its own
         assert_eq!(
             Stint::new(&laps, &places(&laps, &stints), &stints, 0).baseline_source,
@@ -9481,7 +9481,7 @@ mod tests {
         );
     }
 
-    /// Five laps of a 1000 m track at 10 m/s, a stop between laps 2 and 3, and one driver handing
+    /// Five laps of a 1000 m track at 10 m/s, a stop between laps 3 and 4, and one driver handing
     /// over to another during it, as the standings saw it.
     fn relay(standings_first: bool) -> (Connection, Stream) {
         let conn = Connection::open_in_memory().unwrap();
@@ -9506,6 +9506,7 @@ mod tests {
         let samples = (0..=460)
             .map(|i| {
                 let t = i as f64;
+                // Laps done; the car is on the next
                 let lap = i / 100;
                 let d = t * 10.0 - lap as f64 * 1000.0;
                 Sample {
@@ -9513,7 +9514,7 @@ mod tests {
                     vehicle: 1,
                     is_player: true,
                     session_time: Some(t),
-                    lap: Some(lap),
+                    lap: Some(lap + 1),
                     lap_start: Some(lap as f64 * 100.0),
                     lap_distance: Some(d),
                     in_pit: (lap == 2 && d >= 900.0) || (lap == 3 && d < 100.0),
@@ -9595,11 +9596,11 @@ mod tests {
             assert_eq!(
                 laps,
                 [
-                    (Some(0), Some(first), Some(0)),
                     (Some(1), Some(first), Some(0)),
                     (Some(2), Some(first), Some(0)),
+                    (Some(3), Some(first), Some(0)),
                     // The out lap: one driver, then the other
-                    (Some(3), None, Some(1)),
+                    (Some(4), None, Some(1)),
                 ],
                 "standings first: {standings_first}"
             );
@@ -9615,12 +9616,12 @@ mod tests {
             assert_eq!(
                 passes,
                 [
-                    (Some(0), Some(first), Some(0)),
                     (Some(1), Some(first), Some(0)),
                     (Some(2), Some(first), Some(0)),
+                    (Some(3), Some(first), Some(0)),
                     // Its section starts at the line, before the handover
-                    (Some(3), None, Some(1)),
-                    (Some(4), Some(second), Some(0)),
+                    (Some(4), None, Some(1)),
+                    (Some(5), Some(second), Some(0)),
                 ],
                 "standings first: {standings_first}"
             );
@@ -9670,7 +9671,7 @@ mod tests {
         // A session of just over a second, then another
         for t in [0.0, 0.5, 1.6, 0.0, 0.5] {
             conn.execute(
-                "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_start_time) VALUES (1, 1, ?, 0, 0)",
+                "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_start_time) VALUES (1, 1, ?, 1, 0)",
                 [t],
             )
             .unwrap();
@@ -9696,14 +9697,14 @@ mod tests {
         let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
         // A late row of the lap just ended changes nothing
         conn.execute(
-            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_start_time, lap_distance) VALUES (2, 0, 311, 2, 200, 999)",
+            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_start_time, lap_distance) VALUES (2, 0, 311, 3, 200, 999)",
             [],
         )
         .unwrap();
         assert_eq!(number(&engineer, count).await, 4.0);
         // Someone else in the slot, on their first laps: none of the last car's is theirs
         conn.execute(
-            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_start_time, lap_distance) VALUES (2, 0, 311.5, 1, 290, 100)",
+            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_start_time, lap_distance) VALUES (2, 0, 311.5, 2, 290, 100)",
             [],
         )
         .unwrap();
@@ -9771,13 +9772,13 @@ mod tests {
                 .lap(&conn, 1, Some(&next), None)
                 .unwrap()
         };
-        let clean = lap(1, 2, &whole);
+        let clean = lap(2, 3, &whole);
         assert!(clean.green);
         assert_eq!(clean.time, Some(40.0));
         assert_eq!(clean.fuel_used, Some(0.0));
 
         // Laps missing after it: nothing says how long this one took or what it used
-        let skipped = lap(1, 3, &whole);
+        let skipped = lap(2, 4, &whole);
         assert!(skipped.complete && !skipped.green);
         assert_eq!((skipped.time, skipped.fuel_used), (None, None));
 
@@ -9787,12 +9788,12 @@ mod tests {
             .filter(|s| s.lap_distance.unwrap() >= 1900.0)
             .copied()
             .collect::<Vec<_>>();
-        assert!(!lap(1, 2, &last).green);
+        assert!(!lap(2, 3, &last).green);
         let mut last_wrapped = last.clone();
         let mut row = *last_wrapped.last().unwrap();
         row.lap_distance = Some(1.0);
         last_wrapped.push(row);
-        assert!(!lap(1, 2, &last_wrapped).green);
+        assert!(!lap(2, 3, &last_wrapped).green);
 
         // Joined midway
         let joined = whole
@@ -9800,17 +9801,17 @@ mod tests {
             .filter(|s| s.lap_distance.unwrap() >= 1200.0)
             .copied()
             .collect::<Vec<_>>();
-        assert!(!lap(1, 2, &joined).green);
+        assert!(!lap(2, 3, &joined).green);
         // Nor does a distance wrapping before the lap number make it a whole lap
         let mut wrapped = joined.clone();
         let mut row = *wrapped.last().unwrap();
         row.lap_distance = Some(1.0);
         wrapped.push(row);
-        assert!(!lap(1, 2, &wrapped).green);
+        assert!(!lap(2, 3, &wrapped).green);
         // And rows of the old lap's distance don't stop one being one
         let mut stale = whole.clone();
         stale[0].lap_distance = Some(1999.0);
-        assert!(lap(1, 2, &stale).green);
+        assert!(lap(2, 3, &stale).green);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -9899,12 +9900,12 @@ mod tests {
             .into_iter()
             .filter(|s| s.lap_distance.unwrap() >= 900.0)
             .collect::<Vec<_>>();
-        let mut build = LapBuild::new(&joined[0], 0, Some(&layout));
+        let mut build = LapBuild::new(&joined[0], 1, Some(&layout));
         for sample in &joined {
             build.add(sample, Some(2000.0));
         }
         build.start = Some(0.0);
-        let mut next = LapBuild::new(&joined[0], 1, Some(&layout));
+        let mut next = LapBuild::new(&joined[0], 2, Some(&layout));
         next.start = Some(33.0);
         writer.finish(1, &mut Car::default(), build, &next).unwrap();
         let rows = conn
@@ -9945,7 +9946,7 @@ mod tests {
             .into_iter()
             .filter(|s| s.lap_distance.unwrap() >= 1200.0)
             .collect::<Vec<_>>();
-        let mut build = LapBuild::new(&joined[0], 0, Some(&layout));
+        let mut build = LapBuild::new(&joined[0], 1, Some(&layout));
         for sample in &joined {
             build.add(sample, Some(2000.0));
             writer.sample_added(1, &mut build, &[]).unwrap();
@@ -10011,7 +10012,7 @@ mod tests {
                 vehicle: 1,
                 is_player: true,
                 session_time: Some(d / 60.0),
-                lap: Some(0),
+                lap: Some(1),
                 lap_start: Some(0.0),
                 lap_distance: Some(d),
                 in_pit: false,
@@ -10050,7 +10051,7 @@ mod tests {
             player: Some(1),
         };
         let samples = partial(1990.0);
-        let mut build = LapBuild::new(&samples[0], 0, Some(&layout));
+        let mut build = LapBuild::new(&samples[0], 1, Some(&layout));
         let pass = |conn: &Connection, column: &str| -> Option<Option<f64>> {
             let sql = format!("SELECT {column} FROM corner_passes WHERE turn_index = 0");
             conn.query_row(&sql, [], |r| r.get(0)).ok()
@@ -10079,7 +10080,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn current_lap_passes_are_there_before_the_lap_ends() {
         let (_dir, engineer) = race();
-        // Lap 3 is under way at 100 m of a 1000 m track, before its one braking zone
+        // Lap 4 is under way at 100 m of a 1000 m track, before its one braking zone
         let rows = query(
             &engineer,
             "SELECT lap, turn_name, total_s IS NOT NULL FROM corner_passes WHERE vehicle_id = 1 ORDER BY lap",
@@ -10088,7 +10089,7 @@ mod tests {
         assert_eq!(rows.len(), 3, "{rows:?}");
         assert!(rows.iter().all(|row| row[1].contains("braking zone 1")));
         // Without a description the corners were found on the first clean lap, then read again
-        assert_eq!(rows[0][0], "0");
+        assert_eq!(rows[0][0], "1");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -10097,7 +10098,7 @@ mod tests {
         let fl = query(
             &engineer,
             "SELECT surface_rise_c, surface_rise_braking_c, brake_rise_braking_c \
-             FROM corner_pass_wheels WHERE vehicle_id = 1 AND lap = 1 AND wheel = 0",
+             FROM corner_pass_wheels WHERE vehicle_id = 1 AND lap = 2 AND wheel = 0",
         )
         .await;
         assert_eq!(fl.len(), 1, "{fl:?}");
@@ -10122,7 +10123,7 @@ mod tests {
         assert_eq!(
             number(
                 &engineer,
-                "SELECT brake_rise_c FROM corner_pass_wheels WHERE lap = 1 AND wheel = 3"
+                "SELECT brake_rise_c FROM corner_pass_wheels WHERE lap = 2 AND wheel = 3"
             )
             .await,
             0.0
@@ -10134,7 +10135,7 @@ mod tests {
         let (_dir, engineer) = race();
         for (vehicle, expected) in [(1, 0.0), (2, 1.0)] {
             let sql = format!(
-                "SELECT low_precision FROM corner_passes WHERE vehicle_id = {vehicle} AND lap = 1"
+                "SELECT low_precision FROM corner_passes WHERE vehicle_id = {vehicle} AND lap = 2"
             );
             assert_eq!(number(&engineer, &sql).await, expected);
         }
@@ -10174,26 +10175,26 @@ mod tests {
         assert_eq!(wheels.len(), 4);
     }
 
-    /// The player's setup: {A 1, B 2} on lap 1, B to 3 on lap 2, A gone on lap 3 after a stop.
+    /// The player's setup: {A 1, B 2} on lap 2, B to 3 on lap 3, A gone on lap 4 after a stop.
     fn changing_setup(dir: &tempfile::TempDir) {
         write_setup_set(
             dir,
             Some(1),
-            1,
+            2,
             (Some("a.sto"), Some(false), Some("garage")),
             &[("A", Some("1")), ("B", Some("2"))],
         );
         write_setup_set(
             dir,
             Some(1),
-            2,
+            3,
             (Some("a.sto"), Some(true), None),
             &[("B", Some("3"))],
         );
         write_setup_set(
             dir,
             Some(1),
-            3,
+            4,
             (Some("a.sto"), Some(true), Some("pit stop")),
             &[("A", None)],
         );
@@ -10208,13 +10209,13 @@ mod tests {
             "SELECT name, value, step, saved_value, changed_lap FROM setup_now ORDER BY name",
         )
         .await;
-        assert_eq!(now, [["\"B\"", "\"3\"", "NULL", "NULL", "2"]]);
+        assert_eq!(now, [["\"B\"", "\"3\"", "NULL", "NULL", "3"]]);
         let state = query(
             &engineer,
             "SELECT setup_file, setup_modified, setup_as_of_lap FROM race_state",
         )
         .await;
-        assert_eq!(state, [["\"a.sto\"", "1", "3"]]);
+        assert_eq!(state, [["\"a.sto\"", "1", "4"]]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -10232,28 +10233,28 @@ mod tests {
         assert_eq!(
             changes,
             [
-                ["\"B\"", "2", "\"2\"", "\"3\"", "NULL", "1", "1", "1"],
-                ["\"A\"", "3", "\"1\"", "NULL", "\"pit stop\"", "1", "1", "1"],
+                ["\"B\"", "3", "\"2\"", "\"3\"", "NULL", "1", "1", "1"],
+                ["\"A\"", "4", "\"1\"", "NULL", "\"pit stop\"", "1", "1", "1"],
             ]
         );
     }
 
-    /// The setup carries over to the next session, but its laps were the earlier session's: lap 2
-    /// of practice isn't lap 2 of the race.
+    /// The setup carries over to the next session, but its laps were the earlier session's: lap 3
+    /// of practice isn't lap 3 of the race.
     #[tokio::test(flavor = "multi_thread")]
     async fn setup_laps_from_an_earlier_session_are_not_this_sessions() {
         let (dir, engineer) = race();
         write_setup_set(
             &dir,
             Some(1),
-            1,
+            2,
             (Some("a.sto"), Some(false), Some("garage")),
             &[("A", Some("1"))],
         );
         write_setup_set(
             &dir,
             Some(1),
-            2,
+            3,
             (Some("a.sto"), Some(true), None),
             &[("A", Some("2"))],
         );
@@ -10269,7 +10270,7 @@ mod tests {
         for i in 0..20 {
             conn.execute(
                 "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_distance, speed) \
-                 VALUES (1, 1, ?, 0, ?, 10)",
+                 VALUES (1, 1, ?, 1, ?, 10)",
                 params![i as f64 * 0.5, i as f64 * 5.0],
             )
             .unwrap();
@@ -10301,7 +10302,7 @@ mod tests {
         write_setup_set(
             &dir,
             Some(1),
-            1,
+            2,
             (Some("a.sto"), Some(false), Some("garage")),
             &[("A", Some("1"))],
         );
@@ -10310,7 +10311,7 @@ mod tests {
         let row = |vehicle: i64, t: f64| {
             conn.execute(
                 "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_distance, speed) \
-                 VALUES (?1, ?1 = 1, ?2, 0, ?2 * 10, 10)",
+                 VALUES (?1, ?1 = 1, ?2, 1, ?2 * 10, 10)",
                 params![vehicle, t],
             )
             .unwrap();
@@ -10361,7 +10362,7 @@ mod tests {
         write_setup_set(
             &dir,
             Some(1),
-            1,
+            2,
             (Some("a.sto"), Some(false), Some("garage")),
             &[("A", Some("1"))],
         );
@@ -10369,7 +10370,7 @@ mod tests {
         let row = |vehicle: i64, t: f64| {
             conn.execute(
                 "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_distance, speed) \
-                 VALUES (?1, ?1 = 1, ?2, 0, ?2 * 10, 10)",
+                 VALUES (?1, ?1 = 1, ?2, 1, ?2 * 10, 10)",
                 params![vehicle, t],
             )
             .unwrap();
@@ -10409,14 +10410,14 @@ mod tests {
     async fn the_setup_written_again_does_not_look_newer() {
         let (dir, engineer) = race();
         let set = (Some("a.sto"), Some(false), Some("garage"));
-        write_setup_set(&dir, Some(1), 1, set, &[("A", Some("1"))]);
         write_setup_set(&dir, Some(1), 2, set, &[("A", Some("1"))]);
+        write_setup_set(&dir, Some(1), 3, set, &[("A", Some("1"))]);
         let state = query(&engineer, "SELECT setup_as_of_lap FROM race_state").await;
-        assert_eq!(state, [["1"]]);
+        assert_eq!(state, [["2"]]);
         // A change, or another file, does make it newer
-        write_setup_set(&dir, Some(1), 3, (Some("b.sto"), Some(false), None), &[]);
+        write_setup_set(&dir, Some(1), 4, (Some("b.sto"), Some(false), None), &[]);
         let state = query(&engineer, "SELECT setup_as_of_lap FROM race_state").await;
-        assert_eq!(state, [["3"]]);
+        assert_eq!(state, [["4"]]);
     }
 
     /// Before the player drives (iRacing writes no rows for their car in the garage), their car is
@@ -10470,8 +10471,8 @@ mod tests {
     async fn an_earlier_sessions_lap_is_not_this_sessions_before_the_player_drives() {
         let (dir, engineer) = race();
         let set = (Some("a.sto"), Some(false), Some("garage"));
-        write_setup_set(&dir, Some(1), 1, set, &[("A", Some("1"))]);
-        write_setup_set(&dir, Some(1), 2, set, &[("A", Some("2"))]);
+        write_setup_set(&dir, Some(1), 2, set, &[("A", Some("1"))]);
+        write_setup_set(&dir, Some(1), 3, set, &[("A", Some("2"))]);
         let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
         conn.execute("UPDATE setup_set SET session_type = 'practice'", [])
             .unwrap();
@@ -10501,8 +10502,8 @@ mod tests {
     async fn a_garage_change_before_the_player_drives_has_no_lap() {
         let (dir, engineer) = race();
         let set = (Some("a.sto"), Some(false), Some("garage"));
-        write_setup_set(&dir, Some(1), 1, set, &[("A", Some("1"))]);
-        write_setup_set(&dir, Some(1), 2, set, &[("A", Some("2"))]);
+        write_setup_set(&dir, Some(1), 2, set, &[("A", Some("1"))]);
+        write_setup_set(&dir, Some(1), 3, set, &[("A", Some("2"))]);
         let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
         conn.execute("UPDATE setup_set SET session_type = 'practice'", [])
             .unwrap();
@@ -10539,7 +10540,7 @@ mod tests {
         write_setup_set(
             &dir,
             Some(1),
-            1,
+            2,
             none,
             &[("A", Some("1")), ("B", Some("2"))],
         );
@@ -10547,7 +10548,7 @@ mod tests {
         write_setup_set(
             &dir,
             Some(1),
-            2,
+            3,
             none,
             &[("A", Some("1")), ("B", Some("2"))],
         );
@@ -10561,7 +10562,7 @@ mod tests {
                 "SELECT name, changed_lap FROM setup_now ORDER BY name"
             )
             .await,
-            [["\"A\"", "1"], ["\"B\"", "1"]]
+            [["\"A\"", "2"], ["\"B\"", "2"]]
         );
     }
 
@@ -10569,8 +10570,8 @@ mod tests {
     async fn another_cars_setup_is_not_the_players() {
         let (dir, engineer) = race();
         let none = (None, None, None);
-        write_setup_set(&dir, Some(2), 1, none, &[("X", Some("9"))]);
-        write_setup_set(&dir, None, 2, none, &[("A", Some("1"))]);
+        write_setup_set(&dir, Some(2), 2, none, &[("X", Some("9"))]);
+        write_setup_set(&dir, None, 3, none, &[("A", Some("1"))]);
         assert_eq!(
             query(&engineer, "SELECT name FROM setup_now").await,
             [["\"A\""]]
@@ -10581,15 +10582,15 @@ mod tests {
         write_setup_set(
             &dir,
             Some(1),
-            1,
+            2,
             none,
             &[("A", Some("1")), ("B", Some("2"))],
         );
-        write_setup_set(&dir, Some(2), 2, none, &[("C", Some("5"))]);
+        write_setup_set(&dir, Some(2), 3, none, &[("C", Some("5"))]);
         write_setup_set(
             &dir,
             Some(1),
-            3,
+            4,
             none,
             &[("A", Some("1")), ("D", Some("4"))],
         );
@@ -10599,7 +10600,7 @@ mod tests {
                 "SELECT name, changed_lap FROM setup_now ORDER BY name"
             )
             .await,
-            [["\"A\"", "3"], ["\"D\"", "3"]]
+            [["\"A\"", "4"], ["\"D\"", "4"]]
         );
         assert_eq!(
             number(&engineer, "SELECT COUNT(*) FROM setup_changes").await,
@@ -10643,13 +10644,13 @@ mod tests {
                 "\"energy\"",
                 "16.9",
                 "15",
-                "18",
+                "19",
                 "0",
                 "NULL",
                 "100",
                 "\"this stint\"",
                 "\"first seen\"",
-                "0",
+                "1",
                 "1"
             ]],
             "{rows:?}"
@@ -10660,6 +10661,44 @@ mod tests {
             number(&engineer, "SELECT COUNT(*) FROM drivers_now").await,
             2.0
         );
+    }
+
+    #[test]
+    fn the_lap_fuel_runs_out_on_is_the_games() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut used = lap_with(false, false, (1.0, 1.0));
+        used.fuel_used = Some(2.0);
+        let stint = Stint {
+            own: vec![&used],
+            baseline: vec![&used],
+            baseline_source: Some("this stint"),
+            avg_time: Some(100.0),
+        };
+        let sc = Scoring {
+            session: None,
+            yellow_sectors: Vec::new(),
+            sector_yellows: false,
+            cars: BTreeMap::new(),
+            player: None,
+        };
+        // Halfway round lap 3, as the game numbers it, with 2.6 laps of fuel at 2 L a lap: out 0.1
+        // into lap 6, so lap 5 is the last it finishes. With the lap not known, it's taken for the
+        // opening lap: out 0.1 into lap 4
+        for (lap, out, last) in [("3", 6.1, 5), ("NULL", 4.1, 3)] {
+            let p = columns(&conn, &format!("{lap} AS lap, 5.2 AS fuel"));
+            let row = projection(&sc, &BTreeMap::new(), 1, &p, &stint, 0.5, Some(500.0));
+            let value = |name: &str| {
+                row.iter()
+                    .find(|(column, _)| *column == name)
+                    .map(|(_, value)| value.clone())
+                    .unwrap()
+            };
+            assert!(
+                matches!(value("fuel_runs_out_lap"), Value::Real(at) if (at - out).abs() < 1e-9),
+                "{row:?}"
+            );
+            assert_eq!(value("last_full_lap"), Value::Integer(last), "{row:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -10796,7 +10835,7 @@ mod tests {
         let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
         // An opponent's clock alone doesn't start one
         conn.execute(
-            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap) VALUES (2, 0, 0, 0)",
+            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap) VALUES (2, 0, 0, 1)",
             [],
         )
         .unwrap();
@@ -10810,7 +10849,7 @@ mod tests {
         );
         // The player's does
         conn.execute(
-            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_start_time) VALUES (1, 1, 0, 0, 0)",
+            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_start_time) VALUES (1, 1, 0, 1, 0)",
             [],
         )
         .unwrap();
@@ -10848,7 +10887,7 @@ mod tests {
         }
         // Its first row: the same slot, the clock later than the last session's
         conn.execute(
-            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_start_time) VALUES (1, 1, 5000, 0, 5000)",
+            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_start_time) VALUES (1, 1, 5000, 1, 5000)",
             [],
         )
         .unwrap();
@@ -10875,7 +10914,7 @@ mod tests {
         drop(engineer);
         let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
         conn.execute(
-            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_start_time) VALUES (1, 1, 0, 0, 0)",
+            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_start_time) VALUES (1, 1, 0, 1, 0)",
             [],
         )
         .unwrap();
@@ -10904,12 +10943,12 @@ mod tests {
             9.0
         );
         let lap = "SELECT SUM(s.time_s) - l.official_time_s FROM lap_sector_stats s \
-                   JOIN lap_stats l USING (vehicle_id, lap) WHERE vehicle_id = 2 AND lap = 1";
+                   JOIN lap_stats l USING (vehicle_id, lap) WHERE vehicle_id = 2 AND lap = 2";
         assert!(number(&engineer, lap).await.abs() < 1e-9);
         assert_eq!(
             number(
                 &engineer,
-                "SELECT time_s FROM lap_sector_stats WHERE vehicle_id = 2 AND lap = 1 AND sector = 2"
+                "SELECT time_s FROM lap_sector_stats WHERE vehicle_id = 2 AND lap = 2 AND sector = 2"
             )
             .await,
             35.0
@@ -11033,7 +11072,7 @@ mod tests {
         assert!(quick.contains("TRACK"), "{quick}");
         let apex = number(
             &engineer,
-            "SELECT apex_m FROM corner_passes WHERE lap = 1 AND turn_index = 0",
+            "SELECT apex_m FROM corner_passes WHERE lap = 2 AND turn_index = 0",
         )
         .await;
         assert!((apex - 300.0).abs() < 5.0, "{apex}");
@@ -11079,7 +11118,7 @@ mod tests {
         let mut telemetry = bono_telemetry::default();
         telemetry.vehicle_id = Some(1).into();
         telemetry.session_time = Some(t).into();
-        telemetry.lap = Some(laps).into();
+        telemetry.lap = Some(laps + 1).into();
         telemetry.lap_distance = Some(t * 10.0 % 1000.0).into();
         telemetry.speed = Some(10.0).into();
         if recorder.wants_telemetry(1, t, 10.0) {
@@ -11095,7 +11134,7 @@ mod tests {
         tx.execute(
             "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, speed) \
              VALUES (1, 1, ?1, ?2, ?3)",
-            params![t, laps, speed],
+            params![t, laps + 1, speed],
         )
         .unwrap();
         tx.execute(
