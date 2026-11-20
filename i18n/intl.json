@@ -220,6 +220,26 @@
         "es": "Steam no lo tiene instalado en ninguna de sus bibliotecas",
         "ca": "Steam no el té instal·lat a cap de les seves biblioteques"
     },
+    "simulators.iracing_behind_live": {
+        "en": "Replay after this many seconds behind live",
+        "es": "Repetición a partir de estos segundos por detrás del directo",
+        "ca": "Repetició a partir d'aquests segons per darrere del directe"
+    },
+    "simulators.iracing_behind_live_hover": {
+        "en": "How far behind the live race the replay must be before Bono treats it as a replay and stops recording. At the live point, watching from outside the car is recorded like driving",
+        "es": "Cuánto por detrás de la carrera en directo debe ir la repetición para que Bono la trate como repetición y deje de grabar. En el punto en directo, mirar desde fuera del coche se graba como si condujeras",
+        "ca": "Quant per darrere de la cursa en directe ha d'anar la repetició perquè Bono la tracti com a repetició i deixi de gravar. Al punt en directe, mirar des de fora del cotxe es grava com si conduïssis"
+    },
+    "simulators.iracing_keep_live": {
+        "en": "Keep the replay at live",
+        "es": "Mantener la repetición en directo",
+        "ca": "Mantén la repetició en directe"
+    },
+    "simulators.iracing_keep_live_hover": {
+        "en": "Jumps the replay back to live whenever it falls behind, so every lap is recorded while you watch a teammate or spectate. While it's on, rewinding and pausing don't work in a live session. Saved replays aren't affected",
+        "es": "Devuelve la repetición al directo cada vez que se queda atrás, para que se grabe cada vuelta mientras miras a un compañero o como espectador. Mientras está activado, rebobinar y pausar no funcionan en una sesión en directo. No afecta a las repeticiones guardadas",
+        "ca": "Torna la repetició al directe cada cop que es queda enrere, perquè es gravi cada volta mentre mires un company o com a espectador. Mentre està activat, rebobinar i pausar no funcionen en una sessió en directe. No afecta les repeticions desades"
+    },
     "plugin.not_installed": {
         "en": "Plugin not installed: nothing is recorded",
         "es": "Plugin no instalado: no se graba nada",

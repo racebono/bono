@@ -330,8 +330,7 @@ impl Source for Game {
             self.last_pull = Some(now);
         }
         self.converter.behind_live_frames = frames;
-        match self.converter.convert(&frame, info, now)
-        {
+        match self.converter.convert(&frame, info, now) {
             Some(update) => Read::Update(update),
             None => Read::Idle,
         }
