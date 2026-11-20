@@ -1622,8 +1622,11 @@ struct Logic {
     lap_timed: Option<(f64, f64)>,
     /// When the player's lap last ended
     lap_started: Option<f64>,
-    /// The player's lap was called invalidated as it was driven
+    /// The player's lap was called invalidated as it was driven (where its line is checked)
     lap_called: bool,
+    /// The player's lap began where its line is checked: the simulator says whether laps count
+    /// (LMU), not a race, the session green and the player not finished, seen from its start
+    lap_judged: bool,
     /// The player's last lap ended where the simulator says whether laps count (LMU), until
     /// its time has had `LAP_MATCH` to come
     line_check: Option<LineCheck>,
@@ -1659,6 +1662,7 @@ impl Default for Logic {
             lap_timed: None,
             lap_started: None,
             lap_called: false,
+            lap_judged: false,
             line_check: None,
             qualifying: false,
             muted: false,
@@ -1716,6 +1720,8 @@ impl Logic {
                 lap_ended: self.lap_ended,
                 lap_timed: self.lap_timed,
                 lap_started: self.lap_started,
+                lap_called: self.lap_called,
+                lap_judged: self.lap_judged,
                 qualifying: true,
                 muted: true,
                 ..Logic::default()
@@ -1808,7 +1814,8 @@ impl Logic {
             && !self.lap_called
         {
             calls.raise("lap invalidated", false);
-            self.lap_called = true;
+            // Elsewhere every rise is called, as before
+            self.lap_called = scoring.is_some_and(|s| s.lap_time_counts.is_some());
         }
 
         self.prev_flat = wheels.flat;
@@ -2013,24 +2020,23 @@ impl Logic {
             let timed = !self.lap_invalidated && !self.lap_in_pit_lane;
             self.lap_ended = Some((t, timed));
             // A lap LMU doesn't count gets no time: whether it did is known once it's had its
-            // chance to come (it may already have, a row before the count). Not in races, which
-            // give points instead, nor once the session or the player's over
-            // Nor a lap begun before the spotter was following (its pit lane unseen)
-            let judged = self.lap_started.is_some()
-                && last.lap_time_counts.is_some()
-                && last.session_type.as_deref() != Some("race")
-                && last.phase.as_deref() == Some("green")
-                && last
-                    .finish_status
-                    .as_deref()
-                    .is_none_or(|status| status == "none");
-            self.line_check = judged.then(|| LineCheck {
+            // chance to come (it may already have, a row before the count). Judged by how it
+            // began: not in races, which give points instead, nor once the session or the
+            // player's over, nor a lap begun before the spotter was following (pit lane unseen)
+            self.line_check = self.lap_judged.then(|| LineCheck {
                 at: t,
                 called: self.lap_called,
                 pit: self.lap_in_pit_lane,
                 timed: self.lap_timed.is_some_and(|(at, _)| t - at <= LAP_MATCH),
             });
             self.lap_called = false;
+            self.lap_judged = now.lap_time_counts.is_some()
+                && now.session_type.as_deref() != Some("race")
+                && now.phase.as_deref() == Some("green")
+                && now
+                    .finish_status
+                    .as_deref()
+                    .is_none_or(|status| status == "none");
             self.lap_started = Some(t);
             self.lap_invalidated = false;
             self.lap_in_pit_lane = in_pit_lane;
@@ -4737,10 +4743,129 @@ mod tests {
     /// The calls of `rows`, with the lap before them seen from its start: the spotter only judges
     /// laps it saw begin.
     fn line_calls(rows: &[(f64, i64, Option<f64>, bool, bool, Option<bool>)]) -> Vec<String> {
+        seen_line_calls("none", rows)
+    }
+
+    fn seen_line_calls(
+        finish_status: &str,
+        rows: &[(f64, i64, Option<f64>, bool, bool, Option<bool>)],
+    ) -> Vec<String> {
         let (t, laps, _, _, _, counts) = rows[0];
         let mut seen = vec![(t - 100.0, laps - 1, None, false, false, counts)];
         seen.extend_from_slice(rows);
-        line_calls_with("none", &seen)
+        line_calls_with(finish_status, &seen)
+    }
+
+    /// The invalidation calls of rows (`t`, laps, session phase, lap invalidated) in practice,
+    /// none of their laps timed.
+    fn phased_line_calls(rows: &[(f64, i64, &str, bool)]) -> Vec<String> {
+        let mut logic = Logic::default();
+        let mut calls = Vec::new();
+        for &(t, laps, phase, invalidated) in rows {
+            let scoring = Scoring {
+                session_type: Some("practice".into()),
+                phase: Some(phase.into()),
+                laps_completed: Some(laps),
+                lap_time_counts: Some(true),
+                finish_status: Some("none".into()),
+                ..Scoring::default()
+            };
+            let mut p = player(t);
+            p.lap_invalidated = invalidated;
+            calls.extend(
+                logic
+                    .update(
+                        &SpotterConfig::default(),
+                        &p,
+                        &[],
+                        &Wheels::default(),
+                        Some(&scoring),
+                    )
+                    .into_iter()
+                    .map(|call| call.words(arrstr!("en")))
+                    .filter(|words| words.contains("invalidated")),
+            );
+        }
+        calls
+    }
+
+    #[test]
+    fn a_lap_is_judged_by_how_it_began() {
+        // Begun green, over at its end: judged
+        assert_eq!(
+            phased_line_calls(&[
+                (0.0, 3, "green", false),
+                (10.0, 4, "green", false),
+                (100.0, 4, "full_course_yellow", false),
+                (110.0, 5, "full_course_yellow", false),
+                (120.0, 5, "full_course_yellow", false),
+            ]),
+            ["lap invalidated"]
+        );
+        // Begun under a caution, green at its end: not
+        assert!(
+            phased_line_calls(&[
+                (0.0, 3, "green", false),
+                (10.0, 4, "full_course_yellow", false),
+                (100.0, 4, "green", false),
+                (110.0, 5, "green", false),
+                (120.0, 5, "green", false),
+            ])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn called_lap_is_not_called_again_after_being_quiet_for_a_while() {
+        let mut config = SpotterConfig::default();
+        config.qualifying.set(true);
+        let mut logic = Logic::default();
+        let mut calls = Vec::new();
+        for (t, laps, invalidated, on) in [
+            (0.0, 3, false, true),
+            (10.0, 4, false, true),
+            (50.0, 4, true, true),
+            (60.0, 4, true, false),
+            (70.0, 4, true, true),
+            (110.0, 5, false, true),
+            (120.0, 5, false, true),
+        ] {
+            config.qualifying.set(on);
+            let scoring = Scoring {
+                session_type: Some("qualifying".into()),
+                phase: Some("green".into()),
+                laps_completed: Some(laps),
+                lap_time_counts: Some(true),
+                finish_status: Some("none".into()),
+                ..Scoring::default()
+            };
+            let mut p = player(t);
+            p.lap_invalidated = invalidated;
+            calls.extend(
+                logic
+                    .update(&config, &p, &[], &Wheels::default(), Some(&scoring))
+                    .into_iter()
+                    .map(|call| call.words(arrstr!("en")))
+                    .filter(|words| words.contains("invalidated")),
+            );
+        }
+        assert_eq!(calls, ["lap invalidated"]);
+    }
+
+    #[test]
+    fn rise_before_the_count_is_not_called_twice() {
+        assert_eq!(
+            line_calls(&[
+                (10.0, 4, None, false, false, Some(true)),
+                (50.0, 4, None, false, true, Some(false)),
+                (109.9, 4, None, false, false, Some(false)),
+                (110.0, 4, None, false, true, Some(false)),
+                (110.1, 5, None, false, true, Some(false)),
+                (113.5, 5, None, false, true, Some(false)),
+                (150.0, 5, None, false, true, Some(false)),
+            ]),
+            ["lap invalidated", "next lap invalidated"]
+        );
     }
 
     #[test]
@@ -4897,17 +5022,13 @@ mod tests {
 
     #[test]
     fn no_line_call_after_the_finish() {
-        assert!(
-            line_calls_with(
-                "finished",
-                &[
-                    (10.0, 4, None, false, false, Some(false)),
-                    (110.0, 5, None, false, false, Some(false)),
-                    (120.0, 5, None, false, false, Some(false)),
-                ]
-            )
-            .is_empty()
-        );
+        let rows = [
+            (10.0, 4, None, false, false, Some(false)),
+            (110.0, 5, None, false, false, Some(false)),
+            (120.0, 5, None, false, false, Some(false)),
+        ];
+        assert!(seen_line_calls("finished", &rows).is_empty());
+        assert_eq!(seen_line_calls("none", &rows), ["lap invalidated"]);
     }
 
     #[test]
@@ -4931,6 +5052,16 @@ mod tests {
                 (110.0, 5, None, false, false, None),
                 (110.2, 5, None, false, true, None),
                 (120.0, 5, None, false, true, None),
+            ]),
+            ["lap invalidated", "lap invalidated"]
+        );
+        // Every rise, the flag having gone off within the lap
+        assert_eq!(
+            line_calls(&[
+                (10.0, 4, None, false, false, None),
+                (20.0, 4, None, false, true, None),
+                (30.0, 4, None, false, false, None),
+                (40.0, 4, None, false, true, None),
             ]),
             ["lap invalidated", "lap invalidated"]
         );
