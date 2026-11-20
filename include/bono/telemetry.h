@@ -28,7 +28,7 @@
     X(boolean, is_player)                   /* the car the local player is driving */                    \
     X(f64, session_time)                                                                                 \
     X(f64, time_since_last_update)                                                                       \
-    X(i64, lap)                                                                                          \
+    X(i64, lap)                             /* the lap the car is on, from 1: laps completed + 1 (iRacing's out lap, -1 done, is lap 1 too) */ \
     X(f64, lap_start_time)                  /* session time the current lap started */                   \
     X(f64, lap_distance)                    /* metres from the start/finish line (LMU: estimated, see the plugin; iRacing: its lap fraction times the track's length) */ \
     X(i64, sector)                          /* zero-based */                                             \

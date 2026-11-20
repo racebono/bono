@@ -126,7 +126,7 @@ one). The first two are NULL without a setup.
 `stints`, whose `driver_id` is who's driving), `team`, `car_number`, `vehicle`, `vehicle_class`,
 `telemetry_id`, `sample_age_s`; `position`, `class_position`,
 `position_estimated`, `qualifying_position`, `place_ahead_vehicle_id`, `place_behind_vehicle_id`;
-`lap`, `laps_completed`, `sector` (from 1 to `race_state.sector_count`), `lap_distance_m`, `lap_elapsed_s`, `laps_behind_leader`,
+`lap` (the lap the car is on, from 1, as the game shows it), `laps_completed`, `sector` (from 1 to `race_state.sector_count`), `lap_distance_m`, `lap_elapsed_s`, `laps_behind_leader`,
 `laps_behind_next`; `gap_place_ahead_s`, `gap_place_behind_s` (standings order, live),
 `gap_car_ahead_s`, `gap_car_behind_s` (nearest on track, any class, live), `time_behind_leader_s`,
 `time_behind_next_s` (as of the car's last scoring row); `ahead_of_player_m`, `right_of_player_m`;
@@ -167,10 +167,10 @@ row; the NULLs below are for the other cars' rows:
   (behind the cars that have crossed it), whether the simulator gives that run a lap number of its
   own or counts it with the circuit after it. NULL without live telemetry; for a car running to
   the line in the first second of its lap's timer, or before any car's crossing has shown how the
-  session counts that run; for a car on lap 0 in the lap's last part when neither its run nor a
+  session counts that run; for a car on lap 1 in the lap's last part when neither its run nor a
   lap time tells whether it has crossed yet (as when the recording starts during the run); for a
-  moment after the first crossings under lap 0, and for a car past its crossing still under lap 0
-  where other cars went to lap 1 at the line; just past the line while the lap count catches up
+  moment after the first crossings under lap 1, and for a car past its crossing still under lap 1
+  where other cars went to lap 2 at the line; just past the line while the lap count catches up
   (or stopped in the pits just past it); and when the race gap is NULL for being out, finished or
   garaged. While it's NULL, `race_gap_to_player_s` only comes from the standings.
 - `track_gap_to_player_s`: seconds on track, the nearest way round the lap, in any session and
@@ -282,7 +282,7 @@ aren't in the conversation, `SELECT name FROM setup_now` lists them.
 
 Updated as the cars drive, the lap in progress too.
 
-**`lap_stats`**, one row per car and lap: `vehicle_id`, `lap`, `stint_id` (in `stints`, for who drove
+**`lap_stats`**, one row per car and lap: `vehicle_id`, `lap` (from 1, as the game numbers it), `stint_id` (in `stints`, for who drove
 it), `stint_boundary` (1: the lap is across the start of a stint, such as an out lap the drivers
 swapped during, and `stint_id` is NULL; a NULL `stint_id` with 0 means there's no telling), `first_id`, `last_id`
 (the lap's telemetry rows), `start_s`; `time_s`, `official_time_s`, `top_speed_kmh`; `complete`, `invalid`, `pit` (in or out lap; one stop is one more stint), `refuelled`, `contact`,
@@ -382,7 +382,7 @@ that iRacing leaves it NULL for every car.
 - `telemetry`: a row per car per recorded update; the player at every update, rivals every few.
   Timing: `id`, `vehicle_id` (the simulator's slot), `is_player`, `session_time`,
   `time_since_last_update` (the simulator's step, not the time since the car's previous row),
-  `lap` (RaceRoom and iRacing: laps completed, 0 on the first), `lap_start_time`, `lap_distance`
+  `lap` (the lap the car is on, from 1, as the game shows it), `lap_start_time`, `lap_distance`
   (LMU: estimated between its scoring updates; iRacing: lap fraction times track length), `sector`,
   `in_pit_lane`, `lap_invalidated` (not iRacing; RaceRoom: NULL for the first half second of a
   lap), `delta_best` (RaceRoom and iRacing: the player only). Gaps: `gap_to_car_ahead`,
@@ -500,8 +500,9 @@ only cornering or braking). It has no sector yellows:
 `race_state.local_yellow` is NULL (as on any simulator that doesn't say), and
 `cars_now.under_yellow` is the yellow shown to the car. `laps_completed` (and
 `leader_laps_completed`) is -1 until the car first crosses the line after getting in (its out lap,
-or before the start): no lap is done yet, and it then steps from -1 to 0. While driving, iRacing
-reports no live surface temperatures, running pressures or ride heights: say they aren't known.
+or before the start): no lap is done yet, and it then steps from -1 to 0. `lap` is 1 on the out
+lap and stays 1 for the lap after it. While driving, iRacing reports no live surface temperatures,
+running pressures or ride heights: say they aren't known.
 Carcass temperatures and tread left (`carcass_c`, `core_c`, `life_left_pct`, and the snapshot's
 `TYRES last reading`) are the last reading, not current values: give their age as at least
 `reading_age_s`, don't treat them as the tyres now, and take no wear rate from them (`stint_wear_pct_per_lap` and

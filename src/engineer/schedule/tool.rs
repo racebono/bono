@@ -650,7 +650,8 @@ mod tests {
             let mut telemetry = bono_telemetry::default();
             telemetry.vehicle_id = Some(1).into();
             telemetry.session_time = Some(t).into();
-            telemetry.lap = Some(laps).into();
+            // On the lap after those done, as the game counts from lap 1
+            telemetry.lap = Some(laps + 1).into();
             telemetry.lap_distance = Some(t * 10.0).into();
             telemetry.speed = Some(10.0).into();
             if recorder.wants_telemetry(1, t, 10.0) {

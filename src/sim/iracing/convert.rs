@@ -752,7 +752,7 @@ impl Converter {
             out.vehicle_id = Some(car.idx).into();
             out.session_time = Some(time).into();
             out.time_since_last_update = dt.into();
-            out.lap = car.laps_completed.map(|laps| laps.max(0)).into();
+            out.lap = car.laps_completed.map(|laps| laps.max(0) + 1).into();
             out.lap_start_time = track.lap_start.into();
             out.lap_distance = car.pct.map(|pct| pct * length).into();
             out.sector = track.sector.map(|s| s as i64).into();
@@ -5339,7 +5339,7 @@ mod tests {
     }
 
     /// The out lap is the game's -1 laps done: the standings keep it, so the line that ends the out
-    /// lap is a lap ending there, but the telemetry's lap and laps behind go from none done.
+    /// lap is a lap ending there, but the telemetry records it as lap 1, as it does the first lap.
     #[test]
     fn the_out_lap_is_no_lap_done_yet() {
         use super::super::sdk::{Value, Vars};
@@ -5379,8 +5379,8 @@ mod tests {
                 telemetry.unwrap().lap.get(),
             )
         };
-        assert_eq!(laps(0), (Some(-1), Some(0)));
-        assert_eq!(laps(1), (Some(3), Some(3)));
+        assert_eq!(laps(0), (Some(-1), Some(1)));
+        assert_eq!(laps(1), (Some(3), Some(4)));
     }
 
     #[test]
