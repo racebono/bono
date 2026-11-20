@@ -496,6 +496,7 @@ mod tests {
         sim.clear();
         sim.apply(&SimulatorSettings {
             opponent_frequency: NonZeroU32::new(7).unwrap(),
+            pit_requests: true,
         });
         sim.clear();
         // Changes run in order, so this one runs once the others are written

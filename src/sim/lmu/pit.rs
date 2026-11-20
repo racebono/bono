@@ -3,14 +3,22 @@
 //! options' text in the game's language and the option set now (`currentSetting`); tyre options
 //! also carry their compound (`type`, in English) and whether they're used (`isUsed`).
 
-use crate::sim::pit::{
-    Choice, Clear, Corner, CornerMenu, Number, PitMenu, PitService, Position, Resolved, Tyre,
+use super::keys;
+use crate::sim::{
+    Game,
+    pit::{
+        Choice, Clear, Corner, CornerMenu, Number, PitMenu, PitService, Position, Resolved,
+        StopOutcome, Tyre,
+    },
 };
 use anyhow::{Context as _, bail};
 use serde_json::Value;
 use std::{
-    sync::{Arc, atomic::AtomicBool},
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 const MENU_URL: &str = "http://localhost:6397/rest/garage/PitMenu/receivePitMenu";
@@ -20,6 +28,10 @@ const STANDINGS_URL: &str = "http://localhost:6397/rest/watch/standings";
 /// How long each step of a web API request may take. It's on this PC: anything slower means it
 /// isn't answering.
 const STEP: Duration = Duration::from_millis(750);
+/// How long a stop request waits for LMU to show it
+const REQUEST_WAIT: Duration = Duration::from_millis(1500);
+/// How often a stop request waiting for LMU looks again
+const REQUEST_POLL: Duration = Duration::from_millis(250);
 
 const TYRE_ROWS: [&str; 4] = ["FL TIRE:", "FR TIRE:", "RL TIRE:", "RR TIRE:"];
 const PRESSURE_ROWS: [&str; 4] = ["FL PRESS:", "FR PRESS:", "RL PRESS:", "RR PRESS:"];
@@ -36,17 +48,28 @@ const REAR_BRAKE_DUCT: &str = "R BRAKE DUCT:";
 /// LMU's pit menu, for the engineer. Blocking: the `pit` tool calls it off the async workers.
 pub struct LmuPit {
     agent: ureq::Agent,
+    /// Where the game is, for the pilot's Pit Request key
+    game: Game,
     /// Whether the pilot lets the engineer request stops (Bono's setting)
-    #[allow(dead_code, reason = "read by request_stop")]
     requests_on: Arc<AtomicBool>,
 }
 
 impl LmuPit {
-    pub fn new(requests_on: Arc<AtomicBool>) -> Self {
+    pub fn new(game: Game, requests_on: Arc<AtomicBool>) -> Self {
         Self {
             agent: local_agent(STEP),
+            game,
             requests_on,
         }
+    }
+
+    /// Where the player's car is now
+    fn position(&self) -> anyhow::Result<Position> {
+        let standings = self.get(STANDINGS_URL)?;
+        let pit_state = player(&standings)?
+            .and_then(|car| car.get("pitState"))
+            .and_then(Value::as_str);
+        Ok(pit_state.map_or(Position::Unknown, position))
     }
 
     fn get(&self, url: &str) -> anyhow::Result<Value> {
@@ -76,6 +99,57 @@ impl PitService for LmuPit {
             .map_err(not_answering)?;
         Ok(())
     }
+
+    /// Presses the pilot's Pit Request key, which toggles the request: only when it changes what
+    /// the pilot asked for, and checked by LMU showing it.
+    fn request_stop(&self, request: bool) -> anyhow::Result<StopOutcome> {
+        if !self.requests_on.load(Ordering::Relaxed) {
+            bail!(
+                "the pilot turned stop requests off in Bono's settings (\"Let the engineer request \
+                 pit stops\")"
+            );
+        }
+        let now = self.position()?;
+        if let Some(outcome) = decide(request, now)? {
+            return Ok(outcome);
+        }
+        let key = keys::read_key(&self.game)?.context(
+            "LMU's Pit Request has no key: Bono binds F11 to it once the game is closed, or the \
+             pilot can bind one in the game's controls",
+        )?;
+        keys::press(key)?;
+        let start = Instant::now();
+        loop {
+            std::thread::sleep(REQUEST_POLL);
+            let requested = self.position()? == Position::StopRequested;
+            match (request, requested) {
+                (true, true) => return Ok(StopOutcome::Requested),
+                (false, false) => return Ok(StopOutcome::Cancelled),
+                _ if start.elapsed() >= REQUEST_WAIT => bail!(
+                    "LMU didn't take the Pit Request key ({}): is it bound to that key in the \
+                     game's controls?",
+                    crate::sim::key_name(key)
+                ),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// What a stop request comes to without pressing anything, from where the car is: `None` when
+/// the key is to be pressed. The key toggles, so it's never pressed for a request already made,
+/// or for a cancel with nothing to cancel.
+fn decide(request: bool, now: Position) -> anyhow::Result<Option<StopOutcome>> {
+    Ok(match (request, now) {
+        (true, Position::StopRequested) => Some(StopOutcome::AlreadyRequested),
+        (true, Position::Entering | Position::Stopped | Position::Exiting) => {
+            bail!("the car is already in the pits")
+        }
+        (true, Position::Unknown) => bail!("LMU doesn't say where the car is: is it on track?"),
+        (true, Position::OnTrack) => None,
+        (false, Position::StopRequested) => None,
+        (false, _) => Some(StopOutcome::NotRequested),
+    })
 }
 
 fn not_answering(error: ureq::Error) -> anyhow::Error {
@@ -555,6 +629,16 @@ mod tests {
     }
 
     #[test]
+    fn request_when_already_requested_does_not_press() {
+        let decided = |request, now| decide(request, now).unwrap();
+        assert_eq!(decided(true, Position::StopRequested), Some(StopOutcome::AlreadyRequested));
+        assert_eq!(decided(false, Position::OnTrack), Some(StopOutcome::NotRequested));
+        assert_eq!(decided(true, Position::OnTrack), None);
+        assert_eq!(decided(false, Position::StopRequested), None);
+        assert!(decide(true, Position::Stopped).is_err());
+    }
+
+    #[test]
     fn unknown_pit_state_is_unknown() {
         assert_eq!(position("SOMETHING"), Position::Unknown);
         assert_eq!(position("STOPPED"), Position::Stopped);
@@ -566,7 +650,7 @@ mod tests {
     #[ignore = "needs LMU running, on track"]
     fn live_lmu_round_trip() {
         use crate::sim::pit::TyreRequest;
-        let pit = LmuPit::new(Arc::new(AtomicBool::new(true)));
+        let pit = LmuPit::new(Game::fake(), Arc::new(AtomicBool::new(true)));
         let before = pit.read().unwrap();
         let wet: TyreRequest = serde_json::from_value(serde_json::json!({"compound": "Wet"})).unwrap();
         let change = PitChange {
@@ -593,6 +677,19 @@ mod tests {
         assert_eq!(restored.corners.as_ref().unwrap()[0].fitted, None);
         assert_eq!(restored.energy_leave_pct, before.energy_leave_pct);
         assert_eq!(restored.replace_brakes, before.replace_brakes);
+    }
+
+    /// Against the running game, with Pit Request bound: requests a stop, then cancels it.
+    /// `just test live_lmu_stop_request -- --ignored`, on track in LMU, with `BONO_TEST_GAME_DIR`
+    /// set to the game's folder.
+    #[test]
+    #[ignore = "needs LMU running, on track, with Pit Request bound"]
+    fn live_lmu_stop_request() {
+        let pit = LmuPit::new(Game::from_test_env(), Arc::new(AtomicBool::new(true)));
+        assert_eq!(pit.request_stop(true).unwrap(), StopOutcome::Requested);
+        assert_eq!(pit.request_stop(true).unwrap(), StopOutcome::AlreadyRequested);
+        assert_eq!(pit.request_stop(false).unwrap(), StopOutcome::Cancelled);
+        assert_eq!(pit.request_stop(false).unwrap(), StopOutcome::NotRequested);
     }
 
     #[test]

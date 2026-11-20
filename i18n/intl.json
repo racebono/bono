@@ -190,6 +190,46 @@
         "es": "Las sesiones no pueden empezar con esta versión del plugin: cierra el juego y actualízalo desde Simuladores",
         "ca": "Les sessions no poden començar amb aquesta versió del plugin: tanca el joc i actualitza'l des de Simuladors"
     },
+    "settings.pit_requests": {
+        "en": "Let the engineer request pit stops (LMU)",
+        "es": "Dejar que el ingeniero pida paradas en boxes (LMU)",
+        "ca": "Deixar que l'enginyer demani parades a boxes (LMU)"
+    },
+    "settings.pit_requests_hover": {
+        "en": "The engineer presses your Pit Request key, bringing Le Mans Ultimate to the front for a moment. If Pit Request has no key, Bono binds F11 to it while the game is closed",
+        "es": "El ingeniero pulsa tu tecla de Pit Request y pone Le Mans Ultimate delante un momento. Si Pit Request no tiene tecla, Bono le asigna F11 mientras el juego está cerrado",
+        "ca": "L'enginyer prem la teva tecla de Pit Request i posa Le Mans Ultimate al davant un moment. Si Pit Request no té tecla, Bono li assigna F11 mentre el joc és tancat"
+    },
+    "topbar.pit_key": {
+        "en": "Pit request: {key}",
+        "es": "Petición de boxes: {key}",
+        "ca": "Petició de boxes: {key}"
+    },
+    "topbar.pit_key_hover": {
+        "en": "The key the engineer presses to request a stop. Le Mans Ultimate comes to the front for a moment when it does; in VR the view may flash",
+        "es": "La tecla que pulsa el ingeniero para pedir una parada. Le Mans Ultimate se pone delante un momento cuando lo hace; en VR la imagen puede parpadear",
+        "ca": "La tecla que prem l'enginyer per demanar una parada. Le Mans Ultimate es posa al davant un moment quan ho fa; en VR la imatge pot parpellejar"
+    },
+    "topbar.pit_key_none": {
+        "en": "No pit request key",
+        "es": "Sin tecla de petición de boxes",
+        "ca": "Sense tecla de petició de boxes"
+    },
+    "topbar.pit_key_unbound_hover": {
+        "en": "Pit Request has no key in Le Mans Ultimate: Bono binds F11 to it once the game is closed, or bind one in the game's controls",
+        "es": "Pit Request no tiene tecla en Le Mans Ultimate: Bono le asigna F11 cuando cierres el juego, o asígnale una en los controles del juego",
+        "ca": "Pit Request no té tecla a Le Mans Ultimate: Bono li assigna F11 quan tanquis el joc, o assigna-li'n una als controls del joc"
+    },
+    "topbar.pit_key_taken_hover": {
+        "en": "Pit Request has no key, and F11 is bound to another control: bind a key to Pit Request in Le Mans Ultimate's controls",
+        "es": "Pit Request no tiene tecla, y F11 está asignada a otro control: asigna una tecla a Pit Request en los controles de Le Mans Ultimate",
+        "ca": "Pit Request no té tecla, i F11 està assignada a un altre control: assigna una tecla a Pit Request als controls de Le Mans Ultimate"
+    },
+    "topbar.pit_key_unreadable_hover": {
+        "en": "Bono couldn't read Le Mans Ultimate's keyboard controls, so the engineer can't request stops: check that the game has saved its controls",
+        "es": "Bono no ha podido leer los controles de teclado de Le Mans Ultimate, así que el ingeniero no puede pedir paradas: comprueba que el juego haya guardado sus controles",
+        "ca": "Bono no ha pogut llegir els controls de teclat de Le Mans Ultimate, així que l'enginyer no pot demanar parades: comprova que el joc hagi desat els seus controls"
+    },
     "simulators": {
         "en": "Simulators",
         "es": "Simuladores",

@@ -296,6 +296,9 @@ settings! {
         /// The pilot's input language; automatic when `None` (fixed by a lone voice language).
         pub heard_language: Option<ArrayStr<2>> = None,
         pub opponent_frequency: NonZeroU32 = NonZeroU32::new(5).unwrap(),
+        /// Whether the engineer may request pit stops in LMU: Bono binds Pit Request to F11 when it
+        /// has no key, and brings LMU to the front for a moment to press it
+        pub pit_requests: bool = true,
         /// Changed with `set_voice`, which loads the voice too
         voices: BTreeMap<ArrayStr<2>, Utf8PathBuf> = BTreeMap::new(),
         pub whisper_model: Option<Arc<Utf8Path>> = None,
