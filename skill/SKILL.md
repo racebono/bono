@@ -371,28 +371,109 @@ result gives the session's first `standings` and `session` ids too (`standings_f
 `session_row_first_id`): stay at or after them. The recording can hold earlier sessions (each row's `epoch` says which), and a `vehicle_id` or
 `is_player` from one of them says nothing about this session's cars.
 
+Which simulator fills what: LMU fills nearly every column for every car, but reports 0 rather than
+NULL for a control the car lacks or an AI car's unknown setting. On RaceRoom and iRacing, rivals'
+`telemetry` rows hold only timing, gaps and `speed` (RaceRoom adds position, `heading`, `course`
+and `virtual_energy`; iRacing `gear` and `engine_rpm`), and their `telemetry_wheel` and `car_state`
+rows are NULL, apart from iRacing's `incident_points` and push to pass. iRacing records no row for a
+car in its garage. Below, "LMU only" means no other simulator fills the column, and "not iRacing"
+that iRacing leaves it NULL for every car.
+
 - `telemetry`: a row per car per recorded update; the player at every update, rivals every few.
-  `id`, `vehicle_id`, `is_player`, `session_time`, `lap`, `lap_start_time`, `lap_distance`,
-  `sector`, `in_pit_lane`, `lap_invalidated`, `delta_best`, `position_x/y/z`, `heading`, `course`,
-  `pitch`, `roll`, `speed` (m/s), `velocity_longitudinal/lateral/vertical`,
-  `acceleration_longitudinal/lateral/vertical` (m/s^2), `pitch_rate`, `yaw_rate`, `roll_rate`,
-  `throttle`, `brake`, `clutch` (0 to 1), `steering` (-1 left to 1 right), `throttle_filtered`,
-  `brake_filtered`, `gear`, `engine_rpm`, `fuel`, `virtual_energy`, `battery_charge`,
-  `traction_control_active`, `abs_active`, `front_ride_height`, `rear_ride_height`, `drag`,
-  `gap_to_car_ahead/behind` (and `car_ahead_id`/`car_behind_id`, the `vehicle_id` each is to, where
-  known; RaceRoom has no gaps on track, only those ids, the cars either side round the lap),
-  `gap_to_place_ahead/behind`, `cars_left/right` (the player's row:
-  cars alongside as the simulator reports them, 0 to 2; NULL on simulators that don't).
-- `telemetry_wheel`: four rows per `telemetry` row (`telemetry_id`, `wheel`): `suspension_deflection`,
-  `ride_height`, `camber`, `toe` (rad), `brake_temperature`, `brake_pressure`, `rotation_speed`,
-  `lateral_force`, `longitudinal_force`, `tire_load`, `sliding_fraction`, `surface_type`,
-  `tire_pressure`, `tire_surface_temperature_left/center/right`,
-  `tire_inner_temperature_left/center/right`, `tire_carcass_temperature`, `tire_wear`,
-  `tire_reading_time` (session time the inner, carcass and wear values last changed, or were first
-  seen, where they're a reading rather than live), `tire_cold_pressure` (garage cold pressure), `tire_flat`.
+  Timing: `id`, `vehicle_id` (the simulator's slot), `is_player`, `session_time`,
+  `time_since_last_update` (the simulator's step, not the time since the car's previous row),
+  `lap` (RaceRoom and iRacing: laps completed, 0 on the first), `lap_start_time`, `lap_distance`
+  (LMU: estimated between its scoring updates; iRacing: lap fraction times track length), `sector`,
+  `in_pit_lane`, `lap_invalidated` (not iRacing; RaceRoom: NULL for the first half second of a
+  lap), `delta_best` (RaceRoom and iRacing: the player only). Gaps: `gap_to_car_ahead`,
+  `gap_to_car_behind` (seconds on track; not RaceRoom; iRacing works them out, NULL in the pit
+  lane), `car_ahead_id`, `car_behind_id` (the `vehicle_id` each is to: the cars either side round
+  the lap, so possibly a lapped or lapping car; not LMU, whose gaps don't say), `gap_to_place_ahead`,
+  `gap_to_place_behind` (standings order; iRacing: races only), `cars_left`, `cars_right` (iRacing
+  only, the player's row: cars alongside as its spotter reports them, 0 to 2).
+  Position and motion: `position_x`, `position_y`, `position_z`, `heading`, `course`, `pitch`,
+  `roll` (RaceRoom: rivals' `heading` is their direction of travel; its `pitch`, `roll` and rates
+  keep the game's own signs), `speed` (m/s; iRacing rivals': from their progress round the lap),
+  `velocity_longitudinal`, `velocity_lateral`, `velocity_vertical`, `acceleration_longitudinal`,
+  `acceleration_lateral`, `acceleration_vertical` (m/s^2), `pitch_rate`, `yaw_rate`, `roll_rate`,
+  `pitch_acceleration`, `yaw_acceleration`, `roll_acceleration` (LMU only).
+  Inputs: `throttle`, `brake`, `clutch` (0 to 1, as the pedals are pressed), `steering` (-1 left to
+  1 right), the values after assists `throttle_filtered`, `brake_filtered`, `clutch_filtered`,
+  `steering_filtered` (LMU only), `steering_shaft_torque` (force feedback; its unit is documented
+  only on iRacing, Nm).
+  Powertrain: `gear` (-1 reverse, 0 neutral), `engine_rpm`, `engine_torque` (not iRacing),
+  `clutch_rpm` (LMU only), `engine_water_temperature`, `engine_oil_temperature`,
+  `engine_overheating` (not RaceRoom), `turbo_boost_pressure` (not iRacing; RaceRoom: bar; LMU:
+  unit not documented), `anti_stall_active` (LMU only).
+  Energy: `fuel` (litres), `virtual_energy` (not iRacing; a fraction of the tank when 1 or less:
+  LMU doesn't document its scale), `battery_charge` (fraction), `state_of_charge`
+  (LMU only, scale not documented), `regeneration_power` (kW), `electric_motor_torque` (Nm,
+  negative while regenerating), `electric_motor_state` (0 unavailable, 1 inactive, 2 propulsion,
+  3 regeneration; those three not RaceRoom; iRacing reads it from the torque's sign, so a car
+  without a hybrid shows 1), `electric_motor_rpm`, `electric_motor_temperature`,
+  `electric_motor_water_temperature`, `lift_and_coast_progress` (LMU only, scale not documented).
+  Aids: `traction_control_active` (LMU only), `abs_active` (not RaceRoom), `speed_limiter_active`
+  (the pit limiter engaged), `push_to_pass_active_time_left`, `push_to_pass_cooldown_left` (seconds;
+  RaceRoom only).
+  Chassis and aero: `front_third_spring_deflection`, `rear_third_spring_deflection` (heave springs,
+  on cars with them), `front_wing_height` (not iRacing), `front_ride_height`, `rear_ride_height`
+  (RaceRoom and iRacing: the axle's two wheels averaged), `drag`, `front_downforce`,
+  `rear_downforce` (LMU only), `total_downforce` (RaceRoom only, which doesn't split it by axle),
+  `front_flap_active` (LMU only), `rear_flap_active` (DRS open; not iRacing). LMU leaves the
+  chassis and aero units undocumented: compare its values with each other, not with figures you know.
+- `telemetry_wheel`: four rows per `telemetry` row (`telemetry_id`, `wheel`). Suspension and
+  brakes: `suspension_deflection`, `suspension_force` (pushrod load; LMU only), `ride_height`,
+  `wheel_vertical_position` (relative to the car; LMU only), `camber` (rad; not iRacing), `toe`
+  (LMU only), `brake_temperature` (not iRacing), `brake_optimal_temperature` (RaceRoom only),
+  `brake_pressure` (not RaceRoom; iRacing: kPa; LMU: 0 to 1 from the pedal and brake bias, not a
+  pressure). Wheel and contact patch: `rotation_speed` (rad/s; not iRacing), `tire_load` (not
+  iRacing), `surface_type` (not iRacing), `lateral_patch_velocity`, `longitudinal_patch_velocity`,
+  `lateral_ground_velocity`, `longitudinal_ground_velocity`, `lateral_force`, `longitudinal_force`,
+  `sliding_fraction` (LMU only, an approximation). Tyre: `tire_pressure` (running),
+  `tire_cold_pressure` (iRacing only: the garage cold pressure), `tire_surface_temperature_left`,
+  `tire_surface_temperature_center`, `tire_surface_temperature_right`, `tire_inner_temperature_left`,
+  `tire_inner_temperature_center`, `tire_inner_temperature_right`, `tire_carcass_temperature` (the
+  inner and carcass ones not RaceRoom; iRacing's inner ones are its carcass readings and the carcass
+  their mean), `tire_optimal_temperature` (not iRacing), `tire_wear`, `tire_reading_time` (iRacing
+  only: session time the inner, carcass and wear values last changed, or were first seen, as
+  they're a reading rather than live), `tire_compound` (RaceRoom: 0 primary, 1 alternate, 2 soft, 3
+  medium, 4 hard; LMU and iRacing: the car's own compound index; the names are in `cars_now`),
+  `tire_compound_type` (LMU only, encoding not documented), `tire_vertical_deflection`,
+  `tire_flat`, `wheel_detached` (LMU only).
 - `car_state`: settings, pit stops, track-limit steps, damage, impacts, written only when one
   changes; a car's value at row X is its latest row with `telemetry_id <= X` (indexed on
   `(vehicle_id, telemetry_id)`). A setting change is a new row: use it for when a setting changed.
+  `id`, `telemetry_id`, `vehicle_id`, `session_time`. Settings, as the car's own step numbers:
+  `traction_control`, `abs`, `engine_map` (iRacing: the fuel mixture), `front_anti_roll_bar`,
+  `rear_anti_roll_bar` (the bars not RaceRoom), `traction_control_slip`, `traction_control_cut`,
+  `brake_migration` (LMU only), `rear_brake_bias` (the rear's share; not iRacing),
+  `speed_limiter_on` (switched on; engaged is `speed_limiter_active`), `headlights` (not iRacing),
+  `ignition` (0 off, 1 on, 2 starter), `wipers` (encoding not documented), `scheduled_pit_stops`
+  (those three LMU only). Each control's highest step, LMU only and NULL where it lacks the control
+  or doesn't know an AI car's: `traction_control_max`, `traction_control_slip_max`,
+  `traction_control_cut_max`, `abs_max`, `engine_map_max`, `brake_migration_max`,
+  `front_anti_roll_bar_max`, `rear_anti_roll_bar_max`. The car: `steering_wheel_range` (RaceRoom
+  and iRacing: degrees, lock to lock; LMU: unit not documented), `engine_max_rpm` (the rev limit,
+  not the shift point), `max_gears` (forward gears). DRS: `drs_equipped`, `drs_available` (an
+  activation left, not that it can be used here), `drs_activations_left` (this lap; NULL when
+  unlimited), `drs_activations_unlimited`, `drs_activations_total` (RaceRoom only), and LMU's
+  `rear_flap_status` (0 not allowed, 1 detected but not allowed yet, 2 allowed). Push to pass:
+  `push_to_pass_equipped`, `push_to_pass_charged` (NULL without a charge cycle; false while
+  charging), `push_to_pass_activations_total` (RaceRoom only), `push_to_pass_engaged`,
+  `push_to_pass_activations_left` (RaceRoom and iRacing; NULL when unlimited or unknown).
+  Fuel: `fuel_capacity` (litres; iRacing: the session's fuel limit), `fuel_per_lap` (the
+  simulator's estimate, iRacing's worked out over the last lap; not LMU), `virtual_energy_per_lap`
+  (fraction of a tank; RaceRoom only); prefer the use in `stints`. Track limits:
+  `track_limits_steps` (LMU only), `incident_points` (RaceRoom: its incident points; LMU:
+  track-limit points; iRacing: incident counts, rivals' only when the session shares them).
+  Damage: `parts_detached`, `body_damage_front_left`, `body_damage_front`,
+  `body_damage_front_right`, `body_damage_left`, `body_damage_right`, `body_damage_rear_left`,
+  `body_damage_rear`, `body_damage_rear_right` (0 none, 1 some, 2 more), `last_impact_time`
+  (session time), `last_impact_magnitude`, `last_impact_position_x`, `last_impact_position_y`,
+  `last_impact_position_z` (frame not documented) (all LMU only), `engine_damage`,
+  `transmission_damage` (0 none to 1 destroyed; RaceRoom only), `aerodynamics_damage`,
+  `suspension_damage` (RaceRoom, and LMU's player: its one overall figure and the worst wheel's,
+  read about once a second).
 - `setup_set`, `setup`: the player's garage setup, a `setup_set` row each time the game sends a
   changed one, with `setup` rows for only the settings that changed. Prefer `setup_now` and
   `setup_changes`.
