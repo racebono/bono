@@ -25,6 +25,7 @@ mod iracing;
 mod lmu;
 #[cfg(windows)]
 mod memory;
+pub mod pit;
 #[cfg(any(windows, test))]
 mod probe;
 #[cfg(windows)]
