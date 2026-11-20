@@ -132,6 +132,17 @@ pub fn press(scan: u16) -> anyhow::Result<()> {
 
     let window = lmu_window().context("couldn't find LMU's window")?;
     let previous = unsafe { GetForegroundWindow() };
+    /// Puts the window that was in front back, however the press ends (even when LMU only came
+    /// to the front after the wait gave up)
+    struct Restore(windows_sys::Win32::Foundation::HWND);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if !self.0.is_null() && unsafe { SetForegroundWindow(self.0) } == 0 {
+                log::warn!("Couldn't put the window that was in front back after pressing LMU's Pit Request");
+            }
+        }
+    }
+    let _restore = (previous != window).then(|| Restore(previous));
     if previous != window && unsafe { SetForegroundWindow(window) } == 0 {
         // Windows lets a program that just had input bring a window to the front: an Alt tap
         send(&[key(VK_MENU, 0, 0), key(VK_MENU, 0, KEYEVENTF_KEYUP)])
@@ -153,14 +164,14 @@ pub fn press(scan: u16) -> anyhow::Result<()> {
         _ => (scan & 0x7F, KEYEVENTF_EXTENDEDKEY),
     };
     let flags = KEYEVENTF_SCANCODE | extended;
+    // The key goes to whichever window is in front: not one that took LMU's place meanwhile
+    if unsafe { GetForegroundWindow() } != window {
+        bail!("LMU's window lost the front before the key was pressed");
+    }
     send(&[key(0, code, flags)]).context("couldn't press the Pit Request key")?;
     std::thread::sleep(HOLD);
-    let released = send(&[key(0, code, flags | KEYEVENTF_KEYUP)]);
-
-    if previous != window && !previous.is_null() && unsafe { SetForegroundWindow(previous) } == 0 {
-        log::warn!("Couldn't put the window that was in front back after pressing LMU's Pit Request");
-    }
-    released.context("couldn't release the Pit Request key")?;
+    // Released before the window that was in front comes back (`_restore`, dropped after)
+    send(&[key(0, code, flags | KEYEVENTF_KEYUP)]).context("couldn't release the Pit Request key")?;
     Ok(())
 }
 

@@ -172,8 +172,10 @@ pub enum NoChangeTag {
     NoChange,
 }
 
-/// A value per corner, each optional.
+/// A value per corner, each optional. Any other key is an error: `"FL"` or `"all"` mustn't read
+/// as no corner at all.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CornerMap<T> {
     pub fl: Option<T>,
     pub fr: Option<T>,
@@ -303,6 +305,9 @@ pub fn check(menu: &PitMenu, change: &PitChange) -> anyhow::Result<Resolved> {
     let pressures = change.pressures_kpa.by_corner();
     let touched = tyres.iter().any(Option::is_some) || pressures.iter().any(Option::is_some);
     let corners = match (&menu.corners, touched) {
+        (_, false) if resolved == Resolved::default() => {
+            bail!("the change sets nothing: give the fields to change, as PIT OPTIONS names them")
+        }
         (_, false) => return Ok(resolved),
         (None, true) => bail!("this car's tyres can't be set from the pit menu"),
         (Some(corners), true) => corners,
@@ -336,10 +341,31 @@ pub fn check(menu: &PitMenu, change: &PitChange) -> anyhow::Result<Resolved> {
             let at = resolved.tyres[corner as usize]??;
             Some(&corners[corner as usize].tyres[at].compound)
         });
-        if let Some(first) = compounds.next()
-            && compounds.any(|other| other != first)
-        {
-            bail!("iRacing fits one compound for the whole stop: pick the same one for every corner");
+        if let Some(first) = compounds.next() {
+            if compounds.any(|other| other != first) {
+                bail!(
+                    "iRacing fits one compound for the whole stop: pick the same one for every \
+                     corner"
+                );
+            }
+            // The compound is the stop's: a corner already being changed would take it too
+            let moved: Vec<_> = (Corner::ALL.into_iter())
+                .filter(|corner| {
+                    let at = *corner as usize;
+                    resolved.tyres[at].is_none()
+                        && resolved.clear.is_none()
+                        && (corners[at].fitted)
+                            .is_some_and(|fitted| &corners[at].tyres[fitted].compound != first)
+                })
+                .map(Corner::name)
+                .collect();
+            if !moved.is_empty() {
+                bail!(
+                    "iRacing fits one compound for the whole stop, and {} already has a tyre \
+                     change on another one: set it to {first} too, or to no_change",
+                    moved.join(", ")
+                );
+            }
         }
         for corner in Corner::ALL {
             let at = corner as usize;
@@ -479,6 +505,24 @@ pub fn unmet(after: &PitMenu, resolved: &Resolved) -> Vec<String> {
     number("fuel", &after.fuel_leave_l, resolved.fuel_leave_l);
     number("energy", &after.energy_leave_pct, resolved.energy_leave_pct);
     number("fuel ratio", &after.fuel_ratio, resolved.fuel_ratio);
+    // A clear adds no fuel: what it couldn't clear is said, not taken as cleared
+    if resolved.clear == Some(Clear::All) {
+        if resolved.fuel_add_l.is_none()
+            && after.fuel_add_l.as_ref().is_some_and(|fuel| fuel.value > 0.5)
+        {
+            unmet.push("fuel".into());
+        }
+        // The litres the car has now aren't known, so the level it leaves with stays as set
+        if resolved.fuel_leave_l.is_none() && after.fuel_leave_l.is_some() {
+            unmet.push("fuel".into());
+        }
+        if resolved.energy_leave_pct.is_none()
+            && after.energy_leave_pct.is_some()
+            && after.level_now.is_none()
+        {
+            unmet.push("energy".into());
+        }
+    }
 
     let cleared = resolved.clear.is_some();
     for corner in Corner::ALL {
@@ -737,6 +781,64 @@ pub mod tests {
     fn unknown_fields_rejected() {
         let parsed = serde_json::from_value::<PitChange>(json!({"fuel": 20}));
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn empty_change_rejected() {
+        let e = check(&menu(), &PitChange::default()).unwrap_err().to_string();
+        assert!(e.contains("nothing"), "{e}");
+        let e = check(&menu(), &change(json!({"tyres": {}}))).unwrap_err().to_string();
+        assert!(e.contains("nothing"), "{e}");
+    }
+
+    #[test]
+    fn unknown_corner_key_rejected() {
+        let parsed = serde_json::from_value::<PitChange>(json!({"tyres": {"FL": {"compound": "Wet"}}}));
+        assert!(parsed.is_err());
+        let parsed = serde_json::from_value::<PitChange>(json!({"pressures_kpa": {"all": 150}}));
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn iracing_compound_change_names_other_ticked_corners() {
+        let mut menu = iracing_menu();
+        // RR already ticked on Hards: wets on FL would move it to wets too
+        menu.corners.as_mut().unwrap()[Corner::Rr as usize].fitted = Some(0);
+        let e = check(&menu, &change(json!({"tyres": {"fl": {"compound": "Wet"}}})))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("RR"), "{e}");
+        // Leaving RR out of the stop, or fitting it the same, is fine
+        assert!(check(&menu, &change(json!({"tyres": {"fl": {"compound": "Wet"}, "rr": "no_change"}}))).is_ok());
+        assert!(check(&menu, &change(json!({"tyres": {"fl": {"compound": "Hard"}}}))).is_ok());
+        // A clear unticks RR first
+        assert!(check(&menu, &change(json!({"clear": "tyres", "tyres": {"fl": {"compound": "Wet"}}}))).is_ok());
+    }
+
+    #[test]
+    fn clear_all_reports_fuel_it_cannot_clear() {
+        let clear = PitChange {
+            clear: Some(Clear::All),
+            ..Default::default()
+        };
+        // A car that sets the litres it leaves with: Bono can't tell the litres it has now
+        let mut litres = menu();
+        litres.energy_leave_pct = None;
+        litres.fuel_leave_l = Some(number(60.0, 0.0, 110.0, 1.0));
+        litres.level_now = None;
+        let r = check(&litres, &clear).unwrap();
+        assert!(unmet(&litres, &r).contains(&"fuel".to_string()));
+        // Energy without the level now is left as it is
+        let mut energy = menu();
+        energy.level_now = None;
+        assert!(unmet(&energy, &check(&energy, &clear).unwrap()).contains(&"energy".to_string()));
+        // iRacing: fuel still ticked after a clear didn't take
+        let mut iracing = iracing_menu();
+        iracing.fuel_add_l.as_mut().unwrap().value = 30.0;
+        let r = check(&iracing, &clear).unwrap();
+        assert!(unmet(&iracing, &r).contains(&"fuel".to_string()));
+        iracing.fuel_add_l.as_mut().unwrap().value = 0.0;
+        assert!(!unmet(&iracing, &r).contains(&"fuel".to_string()));
     }
 
     #[test]

@@ -26,6 +26,10 @@ const SETTLE_POLL: Duration = Duration::from_millis(250);
 pub struct PitTool {
     service: Arc<dyn PitService>,
     settle: Duration,
+    /// Held for a whole change or stop request: the calls of one message run at once, and two
+    /// changes each writing back the menu they read would undo each other (two presses of a
+    /// toggling key, too)
+    one_at_a_time: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// What the model asks the tool.
@@ -45,6 +49,7 @@ impl PitTool {
         Self {
             service,
             settle: SETTLE,
+            one_at_a_time: Arc::default(),
         }
     }
 
@@ -81,7 +86,8 @@ impl PitTool {
             serde_json::json!({
                 "type": "object",
                 "description": description,
-                "properties": {"fl": item, "fr": item, "rl": item, "rr": item}
+                "properties": {"fl": item, "fr": item, "rl": item, "rr": item},
+                "additionalProperties": false
             })
         };
         serde_json::json!({
@@ -136,9 +142,18 @@ impl PitTool {
                 let menu = self.read().await?;
                 Ok(format!("{}\n{}", options_text(&menu), current_text(&menu)))
             }
-            PitInput::Change(change) => self.change(change).await,
-            PitInput::RequestStop => self.stop(true).await,
-            PitInput::CancelStop => self.stop(false).await,
+            PitInput::Change(change) => {
+                let _one = self.one_at_a_time.lock().await;
+                self.change(change).await
+            }
+            PitInput::RequestStop => {
+                let _one = self.one_at_a_time.lock().await;
+                self.stop(true).await
+            }
+            PitInput::CancelStop => {
+                let _one = self.one_at_a_time.lock().await;
+                self.stop(false).await
+            }
         }
     }
 
@@ -473,6 +488,60 @@ PIT OPTIONS".into();
         let tool = PitTool::new(FakeService::new(menu(), true));
         let e = tool.run(PitInput::RequestStop).await.unwrap_err().to_string();
         assert!(e.contains("drives into the pits"), "{e}");
+    }
+
+    /// A game whose calls take a while, counting how many run at once
+    struct SlowService {
+        menu: Mutex<PitMenu>,
+        running: std::sync::atomic::AtomicU32,
+        most: std::sync::atomic::AtomicU32,
+    }
+
+    impl SlowService {
+        fn call(&self) {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.running.fetch_add(1, SeqCst) + 1;
+            self.most.fetch_max(now, SeqCst);
+            std::thread::sleep(Duration::from_millis(30));
+            self.running.fetch_sub(1, SeqCst);
+        }
+    }
+
+    impl PitService for SlowService {
+        fn read(&self) -> anyhow::Result<PitMenu> {
+            self.call();
+            Ok(self.menu.lock().unwrap().clone())
+        }
+
+        fn write(&self, _: &PitMenu, change: &Resolved) -> anyhow::Result<()> {
+            self.call();
+            let mut menu = self.menu.lock().unwrap();
+            for at in 0..4 {
+                if let Some(fit) = change.tyres[at] {
+                    menu.corners.as_mut().unwrap()[at].fitted = fit;
+                }
+            }
+            if let Some(energy) = change.energy_leave_pct {
+                menu.energy_leave_pct.as_mut().unwrap().value = energy;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn changes_in_one_message_run_one_at_a_time() {
+        let service = Arc::new(SlowService {
+            menu: Mutex::new(menu()),
+            running: Default::default(),
+            most: Default::default(),
+        });
+        let tool = PitTool::new(service.clone());
+        let tyres = tool.run(input(serde_json::json!({"action": "change", "tyres": {"fl": {"compound": "Wet"}}})));
+        let energy = tool.run(input(serde_json::json!({"action": "change", "energy_leave_pct": 50})));
+        let (tyres, energy) = tokio::join!(tyres, energy);
+        tyres.unwrap();
+        energy.unwrap();
+        assert_eq!(service.most.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

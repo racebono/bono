@@ -14,6 +14,7 @@ const LF_TIRE: u32 = 0x01;
 const RF_TIRE: u32 = 0x02;
 const LR_TIRE: u32 = 0x04;
 const RR_TIRE: u32 = 0x08;
+const FUEL_FILL: u32 = 0x10;
 const WINDSHIELD_TEAROFF: u32 = 0x20;
 const FAST_REPAIR: u32 = 0x40;
 /// Indexed by `Corner as usize`
@@ -31,6 +32,7 @@ const CLEAR_TIRES: u16 = 7;
 const FAST_REPAIR_ON: u16 = 8;
 const CLEAR_TEAROFF: u16 = 9;
 const CLEAR_FAST_REPAIR: u16 = 10;
+const CLEAR_FUEL: u16 = 11;
 const COMPOUND: u16 = 12;
 
 /// `irsdk_BroadcastMsg`'s `irsdk_BroadcastPitCommand`
@@ -100,8 +102,12 @@ fn parse(frame: &Frame, tires: &HashMap<i64, String>, fuel_capacity: Option<f64>
     });
     PitMenu {
         position: position(frame),
-        fuel_add_l: frame.f64("PitSvFuel").map(|value| Number {
-            value,
+        // The amount stays in the box with refuel unticked: nothing is added then
+        fuel_add_l: frame.f64("PitSvFuel").map(|amount| Number {
+            value: match flags {
+                Some(flags) if flags & FUEL_FILL == 0 => 0.0,
+                _ => amount,
+            },
             min: Some(0.0),
             max: fuel_capacity,
             // The command takes whole litres
@@ -168,8 +174,11 @@ fn commands(menu: &PitMenu, change: &Resolved) -> Vec<(u16, u32)> {
         }
     }
 
-    if let Some(litres) = change.fuel_add_l {
-        out.push((FUEL, litres.max(0.0) as u32));
+    // The fuel command's 0 is "the amount set": no fuel unticks refuel instead
+    match change.fuel_add_l.map(|litres| litres.max(0.0) as u32) {
+        Some(0) => out.push((CLEAR_FUEL, 0)),
+        Some(litres) => out.push((FUEL, litres)),
+        None => {}
     }
     match change.tear_off {
         Some(true) => out.push((TEAROFF, 0)),
@@ -299,6 +308,25 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(commands(&frame_menu(0, 0, &[]), &r), vec![(0, 0), (2, 20)]);
+    }
+
+    #[test]
+    fn unticked_refuel_adds_nothing() {
+        // 12 L in the box, refuel unticked
+        let m = frame_menu(0, 0, &[]);
+        assert_eq!(m.fuel_add_l.unwrap().value, 0.0);
+        let m = frame_menu(0x10, 0, &[]);
+        assert_eq!(m.fuel_add_l.unwrap().value, 12.0);
+    }
+
+    #[test]
+    fn no_fuel_clears_refuel() {
+        // 0 L is "the amount set" to the SDK's fuel command: no fuel unticks refuel instead
+        let r = Resolved {
+            fuel_add_l: Some(0.0),
+            ..Default::default()
+        };
+        assert_eq!(commands(&frame_menu(0x10, 0, &[]), &r), vec![(11, 0)]);
     }
 
     #[test]

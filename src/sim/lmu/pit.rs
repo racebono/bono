@@ -121,11 +121,9 @@ impl PitService for LmuPit {
         let start = Instant::now();
         loop {
             std::thread::sleep(REQUEST_POLL);
-            let requested = self.position()? == Position::StopRequested;
-            match (request, requested) {
-                (true, true) => return Ok(StopOutcome::Requested),
-                (false, false) => return Ok(StopOutcome::Cancelled),
-                _ if start.elapsed() >= REQUEST_WAIT => bail!(
+            match settled(request, self.position()?) {
+                Some(outcome) => return Ok(outcome),
+                None if start.elapsed() >= REQUEST_WAIT => bail!(
                     "LMU didn't take the Pit Request key ({}): is it bound to that key in the \
                      game's controls?",
                     crate::sim::key_name(key)
@@ -133,6 +131,16 @@ impl PitService for LmuPit {
                 _ => {}
             }
         }
+    }
+}
+
+/// What a press came to, once LMU shows it: `None` while it doesn't (yet). A cancel only counts
+/// once the car is plainly on track without a request, not while LMU doesn't say where it is.
+fn settled(request: bool, now: Position) -> Option<StopOutcome> {
+    match (request, now) {
+        (true, Position::StopRequested) => Some(StopOutcome::Requested),
+        (false, Position::OnTrack) => Some(StopOutcome::Cancelled),
+        _ => None,
     }
 }
 
@@ -451,6 +459,14 @@ pub fn apply(rows: &Value, menu: &PitMenu, change: &Resolved) -> anyhow::Result<
         }
         set.push((name, want));
     }
+    // Written back as read unless the change sets it: this read must agree with the one the
+    // change was checked against (LMU's pit endpoints are known to flicker this row)
+    if change.replace_brakes.is_none()
+        && let Some(read_then) = menu.replace_brakes
+        && row(read, REPLACE_BRAKES)?.is_none_or(|row| (row.current != 0) != read_then)
+    {
+        return Err(changed());
+    }
     if let Some(want) = change.replace_brakes {
         if row(read, REPLACE_BRAKES)?.is_none() {
             return Err(changed());
@@ -626,6 +642,37 @@ mod tests {
         assert_eq!(leading_number("Abierto"), None);
         assert_eq!(tread("Usado Medio  99%"), Some(99.0));
         assert_eq!(tread("Nuevo Medio "), None);
+    }
+
+    #[test]
+    fn apply_refuses_when_replace_brakes_read_differs() {
+        // Read with brakes to replace, then a read that says otherwise: written back, it would
+        // untick them without anyone asking
+        let mut rows = menu_rows();
+        let brakes = |rows: &mut Value| {
+            (rows.as_array_mut().unwrap().iter_mut())
+                .find(|row| row["name"] == REPLACE_BRAKES)
+                .unwrap()["currentSetting"] = 1.into();
+        };
+        brakes(&mut rows);
+        let m = parse(&rows, &fixture("standings.json")).unwrap();
+        let change = PitChange {
+            energy_leave_pct: Some(50.0),
+            ..Default::default()
+        };
+        let resolved = check(&m, &change).unwrap();
+        let e = apply(&menu_rows(), &m, &resolved).unwrap_err().to_string();
+        assert!(e.contains("changed"), "{e}");
+        assert!(apply(&rows, &m, &resolved).is_ok());
+    }
+
+    #[test]
+    fn cancel_only_counts_once_on_track() {
+        assert_eq!(settled(false, Position::OnTrack), Some(StopOutcome::Cancelled));
+        assert_eq!(settled(false, Position::Unknown), None);
+        assert_eq!(settled(false, Position::StopRequested), None);
+        assert_eq!(settled(true, Position::StopRequested), Some(StopOutcome::Requested));
+        assert_eq!(settled(true, Position::OnTrack), None);
     }
 
     #[test]
