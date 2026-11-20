@@ -150,9 +150,40 @@ const REFUELLED: f64 = 0.001;
 /// What tells events apart: the session info's track, session and sub-session ids, and the track.
 type Event = ((Option<i64>, Option<i64>, Option<i64>), Option<String>);
 
+/// The rate of iRacing's replay frame counters (`ReplayFrameNum`: "60 per second").
+pub const FRAMES_PER_SECOND: i32 = 60;
+
+/// How far behind the live session a replay must be to count as one, in replay frames.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BehindLiveFrames(pub i32);
+
+impl Default for BehindLiveFrames {
+    fn default() -> Self {
+        Self(3 * FRAMES_PER_SECOND)
+    }
+}
+
+/// Whether the view is behind the live session by `threshold_frames` or more: a replay, rather
+/// than the live session watched.
+///
+/// The SDK documents `IsReplayPlaying` only as "0=replay not playing 1=replay playing", and
+/// `ReplayFrameNumEnd` as "Integer replay frame number from end of tape". iRacing shows the live
+/// session through its replay system: other tools report the flag set while watching it live from
+/// outside the car (in the garage, spectating, a teammate driving), and take the view at the end of
+/// the tape for live. That wasn't checked here (#245). So the flag alone isn't a replay: the view
+/// must be far enough from the end of the tape too. Without the counter, it's taken for one.
+pub fn behind_live(frame: &Frame<'_>, threshold_frames: i32) -> bool {
+    frame.bool("IsReplayPlaying") == Some(true)
+        && frame
+            .i32("ReplayFrameNumEnd")
+            .is_none_or(|end| end >= threshold_frames)
+}
+
 /// Turns updates into the recorder's.
 #[derive(Default)]
 pub struct Converter {
+    /// How far behind live the view counts as a replay
+    pub behind_live_frames: BehindLiveFrames,
     last_time: Option<f64>,
     last_scoring: Option<Instant>,
     /// The event being recorded: its ids and track
@@ -270,8 +301,9 @@ impl Converter {
         let length = info.track_length?;
         // A replay's frames aren't the live session's: they aren't recorded (the recorder skips
         // replays), nor do they move on what's been worked out about it (laps, pit stops, the
-        // clock), which carries on once it's live again
-        if info.replay || frame.bool("IsReplayPlaying") == Some(true) {
+        // clock), which carries on once it's live again. A replay is a saved one, or the live
+        // session's rewound behind live (see `behind_live`)
+        if info.replay || behind_live(frame, self.behind_live_frames.0) {
             return None;
         }
         if self.last_time == Some(time) {
@@ -642,7 +674,8 @@ impl Converter {
             self.laps_behind(&cars, before_green, &finished, &over_line, time);
         }
         // The player's own fuel: only while in the car (iRacing gives the fuel level and pit road
-        // as the player's then; a replay isn't converted), and only the player's car keeps a window
+        // as the player's then; a view behind live isn't converted, and watching live from outside
+        // the car isn't in it), and only the player's car keeps a window
         let in_car = frame.bool("IsOnTrack") == Some(true);
         for (idx, track) in &mut self.cars {
             if Some(*idx) != player {
@@ -4100,6 +4133,121 @@ mod tests {
         assert!(replayed.is_none());
         assert_eq!(converter.last_time, Some(500.0));
         assert!(converter.cars.contains_key(&0));
+    }
+
+    /// A race with one car, the player's.
+    fn one_car_race() -> SessionInfo {
+        use super::super::session::{Driver, Session};
+        SessionInfo {
+            track_length: Some(1000.0),
+            player: Some(0),
+            drivers: HashMap::from([(0, Driver::default())]),
+            sessions: vec![Session {
+                num: 0,
+                kind: Some("race"),
+                number: 1,
+                results: HashMap::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// An update at `t`, with the replay flag and, if given, how many frames from the end of the
+    /// tape the view is.
+    fn watched(t: f64, replay: bool, end: Option<i32>) -> (super::super::sdk::Vars, Vec<u8>) {
+        use super::super::sdk::{Value, Vars};
+        let mut values = vec![
+            ("SessionTime", Value::Double(t)),
+            ("SessionNum", Value::Int(0)),
+            ("SessionState", Value::Int(STATE_RACING)),
+            ("PlayerCarIdx", Value::Int(0)),
+            ("IsReplayPlaying", Value::Bool(replay)),
+            ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
+            ("CarIdxLapCompleted", Value::Ints(vec![2])),
+        ];
+        if let Some(end) = end {
+            values.push(("ReplayFrameNumEnd", Value::Int(end)));
+        }
+        Vars::of(&values)
+    }
+
+    /// Watching the live session from outside the car is recorded like driving it.
+    #[test]
+    fn watching_live_is_converted() {
+        let info = one_car_race();
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        let (vars, data) = watched(500.0, true, Some(0));
+        converter.convert(&Frame::new(&vars, &data), &info, start);
+        let (vars, data) = watched(501.0, true, Some(0));
+        let update = converter.convert(
+            &Frame::new(&vars, &data),
+            &info,
+            start + std::time::Duration::from_secs(1),
+        );
+        assert!(update.is_some());
+    }
+
+    #[test]
+    fn rewound_behind_live_is_not_converted() {
+        let info = one_car_race();
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        let (vars, data) = watched(500.0, false, Some(0));
+        assert!(
+            converter
+                .convert(&Frame::new(&vars, &data), &info, start)
+                .is_some()
+        );
+        // Ten seconds behind live
+        let (vars, data) = watched(400.0, true, Some(600));
+        let converted = converter.convert(
+            &Frame::new(&vars, &data),
+            &info,
+            start + std::time::Duration::from_secs(1),
+        );
+        assert!(converted.is_none());
+        assert_eq!(converter.last_time, Some(500.0));
+    }
+
+    #[test]
+    fn a_replay_file_is_never_converted() {
+        let info = SessionInfo {
+            replay: true,
+            ..one_car_race()
+        };
+        let mut converter = Converter::default();
+        let (vars, data) = watched(500.0, true, Some(0));
+        assert!(
+            converter
+                .convert(&Frame::new(&vars, &data), &info, Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_missing_counter_counts_as_behind_live() {
+        let (vars, data) = watched(500.0, true, None);
+        assert!(behind_live(&Frame::new(&vars, &data), 180));
+    }
+
+    #[test]
+    fn the_threshold_moves_where_live_ends() {
+        let behind = |end: i32, threshold: i32| {
+            let (vars, data) = watched(500.0, true, Some(end));
+            behind_live(&Frame::new(&vars, &data), threshold)
+        };
+        assert!(behind(300, 180));
+        assert!(!behind(300, 600));
+        assert!(!behind(179, 180));
+        assert!(behind(180, 180));
+        // Not a replay at all, however far the counter says
+        let (vars, data) = watched(500.0, false, Some(600));
+        assert!(!behind_live(&Frame::new(&vars, &data), 180));
+        assert_eq!(
+            BehindLiveFrames::default(),
+            BehindLiveFrames(3 * FRAMES_PER_SECOND)
+        );
     }
 
     /// The clock going back is scored at once, however soon after the last scoring.
