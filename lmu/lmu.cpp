@@ -42,7 +42,6 @@ static void convert(const TelemInfoV01& in, bono_telemetry_s& out) {
     // The sign bit of mCurrentSector marks the pit lane.
     out.sector = in.mCurrentSector & 0x7FFFFFFF;
     out.in_pit_lane = in.mCurrentSector < 0;
-    out.lap_invalidated = in.mLapInvalidated;
     out.delta_best = in.mDeltaBest;
     out.gap_to_car_ahead = in.mTimeGapCarAhead;
     out.gap_to_car_behind = in.mTimeGapCarBehind;

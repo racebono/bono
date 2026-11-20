@@ -22,14 +22,22 @@ mod class_positions;
 mod condition;
 mod forecast;
 mod garage;
+mod lap_validity;
 mod track_limits;
 
 use car_numbers::CarNumbers;
 use condition::VehicleCondition;
+use lap_validity::LapValidity;
 use track_limits::TrackLimits;
 
 /// What `bono_lmu_recorder*` points to.
-pub struct LmuRecorder(Recorder, Arc<CarNumbers>, TrackLimits, VehicleCondition);
+pub struct LmuRecorder(
+    Recorder,
+    Arc<CarNumbers>,
+    TrackLimits,
+    VehicleCondition,
+    LapValidity,
+);
 
 /// What the recorder's writer thread reads from the web API now and then. Closing the recorder waits
 /// for the writer on the game's thread, so a hung web API can hold the game's exit for both requests'
@@ -73,6 +81,7 @@ pub unsafe extern "C" fn bono_lmu_open(dir: *const u16, len: usize) -> *mut LmuR
                 numbers,
                 TrackLimits::default(),
                 VehicleCondition::start(),
+                LapValidity::default(),
             ))),
             Err(_) => std::ptr::null_mut(),
         }
@@ -136,10 +145,11 @@ pub unsafe extern "C" fn bono_lmu_push_telemetry(
     recorder: *const LmuRecorder,
     telemetry: *const bono_telemetry,
 ) {
-    let LmuRecorder(recorder, _, track_limits, condition) = unsafe { &*recorder };
+    let LmuRecorder(recorder, _, track_limits, condition, lap_validity) = unsafe { &*recorder };
     let mut telemetry = unsafe { *telemetry };
     guard((), || {
         track_limits.fill_telemetry(&mut telemetry);
+        lap_validity.fill_telemetry(&mut telemetry);
         let is_player = telemetry
             .vehicle_id
             .get()
@@ -164,7 +174,8 @@ pub unsafe extern "C" fn bono_lmu_push_scoring(
     standings: *mut bono_standing,
     count: usize,
 ) {
-    let LmuRecorder(recorder, numbers, track_limits, condition) = unsafe { &*recorder };
+    let LmuRecorder(recorder, numbers, track_limits, condition, lap_validity) =
+        unsafe { &*recorder };
     let session = std::mem::take(unsafe { &mut *session });
     let standings = match count {
         0 => Vec::new(),
@@ -176,6 +187,7 @@ pub unsafe extern "C" fn bono_lmu_push_scoring(
     guard((), move || {
         let mut session = session;
         track_limits.fill_session(&mut session);
+        lap_validity.fill_scoring(&session, &standings);
         let mut standings = standings;
         numbers.fill(&mut standings);
         class_positions::fill(&mut standings);
@@ -188,11 +200,13 @@ pub unsafe extern "C" fn bono_lmu_push_scoring(
 /// `recorder` must come from `bono_lmu_open`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bono_lmu_clear(recorder: *const LmuRecorder) {
-    let LmuRecorder(recorder, numbers, track_limits, condition) = unsafe { &*recorder };
+    let LmuRecorder(recorder, numbers, track_limits, condition, lap_validity) =
+        unsafe { &*recorder };
     guard((), || {
         numbers.clear();
         track_limits.clear();
         condition.clear();
+        lap_validity.clear();
         recorder.clear()
     })
 }
@@ -201,12 +215,14 @@ pub unsafe extern "C" fn bono_lmu_clear(recorder: *const LmuRecorder) {
 /// `recorder` must come from `bono_lmu_open`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bono_lmu_begin_session(recorder: *const LmuRecorder) {
-    let LmuRecorder(recorder, _, track_limits, condition) = unsafe { &*recorder };
+    let LmuRecorder(recorder, _, track_limits, condition, lap_validity) = unsafe { &*recorder };
     guard((), || {
         // The session's rule, its scoring says again: until then, points are unknown
         track_limits.clear();
         // The last session's damage isn't this one's: it's asked again once the player drives
         condition.clear();
+        // Its laps start afresh
+        lap_validity.clear();
         recorder.begin_epoch(EpochReason::Session)
     })
 }
