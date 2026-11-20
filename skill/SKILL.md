@@ -500,8 +500,9 @@ only cornering or braking). It has no sector yellows:
 `race_state.local_yellow` is NULL (as on any simulator that doesn't say), and
 `cars_now.under_yellow` is the yellow shown to the car. `laps_completed` (and
 `leader_laps_completed`) is -1 until the car first crosses the line after getting in (its out lap,
-or before the start): no lap is done yet, and it then steps from -1 to 0. While driving, iRacing
-reports no live surface temperatures, running pressures or ride heights: say they aren't known.
+or before the start): no lap is done yet, and it then steps from -1 to 0. `lap` is 1 on the out
+lap and stays 1 for the lap after it. While driving, iRacing reports no live surface temperatures,
+running pressures or ride heights: say they aren't known.
 Carcass temperatures and tread left (`carcass_c`, `core_c`, `life_left_pct`, and the snapshot's
 `TYRES last reading`) are the last reading, not current values: give their age as at least
 `reading_age_s`, don't treat them as the tyres now, and take no wear rate from them (`stint_wear_pct_per_lap` and
