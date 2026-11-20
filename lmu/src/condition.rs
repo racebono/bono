@@ -673,6 +673,13 @@ mod tests {
         assert_eq!(wheel_range(&condition, Some(540.0), true), Some(540.0));
         // The garage is only the player's
         assert_eq!(wheel_range(&condition, None, false), None);
+        // A pit stop can't change it
+        drive(&condition, true);
+        assert_eq!(wheel_range(&condition, None, true), Some(310.0));
+        // The garage can: unknown until its setup is read
+        condition.set_realtime(false);
+        condition.set_realtime(true);
+        assert_eq!(wheel_range(&condition, None, true), None);
         // A new event's car may be another one: unknown until its setup is read
         condition.clear();
         assert_eq!(wheel_range(&condition, None, true), None);

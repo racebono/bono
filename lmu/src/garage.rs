@@ -70,28 +70,24 @@ fn parse(body: &str) -> Option<Setup> {
 }
 
 /// The steering wheel's range in degrees, from the setup's `VM_STEER_LOCK`, for when the plugin
-/// interface reports none. Its caption is "Wheel Range (Lock)" and its text is like `310 (12) deg`
-/// (or just `310 deg`): the wheel's range first, then what is likely the front wheels' lock (the GT3
-/// fixture's current and saved texts, `310 (12)` and `240 (9.3)`, keep the same ratio of the two).
-/// Nothing documents that this range is the same quantity as the plugin interface's physical
-/// range, or its span: like that one, it's taken as degrees lock to lock, as other tools take it.
-/// Any other text is none, rather than a guess at which number is the range.
+/// interface reports none. Its caption is "Wheel Range (Lock)" and its text is like `310 (12) deg`:
+/// the wheel's range first, then what is likely the front wheels' lock (the GT3 fixture's current
+/// and saved texts, `310 (12)` and `240 (9.3)`, keep the same ratio of the two). Nothing documents
+/// that this range is the same quantity as the plugin interface's physical range, or its span: it's
+/// taken as degrees lock to lock, as other tools take the plugin interface's. Any other text, even
+/// a single number, is none, rather than a guess at which number it is.
 pub fn wheel_range(setup: &Setup) -> Option<f64> {
     let setting = setup
         .settings
         .iter()
         .find(|setting| setting.name == "VM_STEER_LOCK")?;
-    let range = match *setting.value.split_whitespace().collect::<Vec<_>>() {
-        [range, "deg"] => range,
-        [range, lock, "deg"] => {
-            lock.strip_prefix('(')
-                .and_then(|lock| lock.strip_suffix(')'))?
-                .parse::<f64>()
-                .ok()?;
-            range
-        }
-        _ => return None,
+    let [range, lock, "deg"] = *setting.value.split_whitespace().collect::<Vec<_>>() else {
+        return None;
     };
+    lock.strip_prefix('(')
+        .and_then(|lock| lock.strip_suffix(')'))?
+        .parse::<f64>()
+        .ok()?;
     range
         .parse::<f64>()
         .ok()
@@ -292,7 +288,6 @@ mod tests {
     #[test]
     fn the_wheel_range_is_the_steer_locks_first_number() {
         assert_eq!(wheel_range(&parse(GT3).unwrap()), Some(310.0));
-        assert_eq!(wheel_range(&steer_lock("310 deg")), Some(310.0));
         assert_eq!(wheel_range(&steer_lock("240 (9.3) deg")), Some(240.0));
         assert_eq!(
             wheel_range(&steer_lock("  540.5   (14)  deg ")),
@@ -307,6 +302,8 @@ mod tests {
             "",
             "deg",
             "310",
+            "310 deg",
+            "12 deg",
             "310°",
             "310 degrees",
             "Non-adjustable",
