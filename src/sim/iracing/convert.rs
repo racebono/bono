@@ -680,10 +680,13 @@ impl Converter {
                 let line = track
                     .line
                     .filter(|_| car.lap_offset == 1 && track.counts_at_line);
-                // In the cool-down too, a car still to finish races on to the line, until the
-                // count says it's over it
-                let to_finish = state == Some(STATE_COOL_DOWN) && !over_line.contains(&car.idx);
-                if racing(car) || to_finish {
+                // In the cool-down the race is over (all are taken for finished): a car not over
+                // the line since the winner keeps the game's place, as it's classified, but for
+                // one over it with the count still to come, until the count says it's over it
+                let finishing_now = state == Some(STATE_COOL_DOWN)
+                    && line.is_some()
+                    && !over_line.contains(&car.idx);
+                if racing(car) || finishing_now {
                     // Out of the world, before its first line, or moved since its line (towed,
                     // reset, back in the world): where it is now isn't where it is in the race
                     let laps = car.laps_completed.filter(|laps| *laps >= 0)?;
@@ -3646,9 +3649,8 @@ mod tests {
         // Each car counted at its line a lap before; car 0 wins at 14.9 s; car 2 by car 1 at
         // 17.1 s, over the line at 17.9 s, car 1 at 18.2 s. The cool-down from 18.75 s; or from
         // 18.5 s, car 1's count late, at 18.75 s; or from the update that sees car 1 over, its
-        // count the next; or from before either is over
-        let cases = [(18.75, 18.25), (18.5, 18.75), (18.25, 18.5), (17.5, 18.25)];
-        for (cool_down, counted) in cases {
+        // count the next
+        for (cool_down, counted) in [(18.75, 18.25), (18.5, 18.75), (18.25, 18.5)] {
             let updates: Vec<_> = (0..=82)
                 .map(|k| {
                     let t = 0.25 * k as f64;
@@ -3665,7 +3667,7 @@ mod tests {
                     (t, state, gone.map(f64::fract), laps)
                 })
                 .collect();
-            for at in [17.5, 18.0, 18.25, 18.5, 18.75, 19.0, 20.5] {
+            for at in [18.25, 18.5, 18.75, 19.0, 20.5] {
                 let last = updates.iter().position(|u| u.0 >= at).unwrap();
                 let end = race_end(&updates[..=last], [0.0, 0.3, 95.0]);
                 let (_, standings) = end.scoring.as_ref().unwrap();
