@@ -3,9 +3,23 @@
 //! options' text in the game's language and the option set now (`currentSetting`); tyre options
 //! also carry their compound (`type`, in English) and whether they're used (`isUsed`).
 
-use crate::sim::pit::{Choice, Clear, Corner, CornerMenu, Number, PitMenu, Position, Resolved, Tyre};
+use crate::sim::pit::{
+    Choice, Clear, Corner, CornerMenu, Number, PitMenu, PitService, Position, Resolved, Tyre,
+};
 use anyhow::{Context as _, bail};
 use serde_json::Value;
+use std::{
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
+};
+
+const MENU_URL: &str = "http://localhost:6397/rest/garage/PitMenu/receivePitMenu";
+const LOAD_URL: &str = "http://localhost:6397/rest/garage/PitMenu/loadPitMenu";
+const STANDINGS_URL: &str = "http://localhost:6397/rest/watch/standings";
+
+/// How long each step of a web API request may take. It's on this PC: anything slower means it
+/// isn't answering.
+const STEP: Duration = Duration::from_millis(750);
 
 const TYRE_ROWS: [&str; 4] = ["FL TIRE:", "FR TIRE:", "RL TIRE:", "RR TIRE:"];
 const PRESSURE_ROWS: [&str; 4] = ["FL PRESS:", "FR PRESS:", "RL PRESS:", "RR PRESS:"];
@@ -18,6 +32,74 @@ const REAR_WING: &str = "R WING:";
 const GRILLE: &str = "GRILLE:";
 const FRONT_BRAKE_DUCT: &str = "F BRAKE DUCT:";
 const REAR_BRAKE_DUCT: &str = "R BRAKE DUCT:";
+
+/// LMU's pit menu, for the engineer. Blocking: the `pit` tool calls it off the async workers.
+pub struct LmuPit {
+    agent: ureq::Agent,
+    /// Whether the pilot lets the engineer request stops (Bono's setting)
+    #[allow(dead_code, reason = "read by request_stop")]
+    requests_on: Arc<AtomicBool>,
+}
+
+impl LmuPit {
+    pub fn new(requests_on: Arc<AtomicBool>) -> Self {
+        Self {
+            agent: local_agent(STEP),
+            requests_on,
+        }
+    }
+
+    fn get(&self, url: &str) -> anyhow::Result<Value> {
+        let body = (self.agent.get(url).call())
+            .and_then(|mut response| response.body_mut().read_to_string())
+            .map_err(not_answering)?;
+        serde_json::from_str(&body).context("LMU's web API answered with something that isn't JSON")
+    }
+}
+
+impl PitService for LmuPit {
+    fn read(&self) -> anyhow::Result<PitMenu> {
+        let rows = self.get(MENU_URL)?;
+        let standings = self.get(STANDINGS_URL)?;
+        parse(&rows, &standings)
+    }
+
+    /// A single read of the menu before writing it back: reads of `REPLACE BRAKES:` were checked
+    /// to agree with each other, so the row is written back as read unless the change sets it.
+    fn write(&self, menu: &PitMenu, change: &Resolved) -> anyhow::Result<()> {
+        let rows = self.get(MENU_URL)?;
+        // The whole array: LMU crashes on a bare row
+        let body = serde_json::to_string(&apply(&rows, menu, change)?)?;
+        (self.agent.post(LOAD_URL))
+            .header("Content-Type", "application/json")
+            .send(body)
+            .map_err(not_answering)?;
+        Ok(())
+    }
+}
+
+fn not_answering(error: ureq::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "LMU's web API didn't answer ({error}): is the game running, with the pilot in a session?"
+    )
+}
+
+/// A client for LMU's local web API, as the LMU plugin makes it (`lmu/src/lib.rs`): no proxy from
+/// the environment and no redirects, so nothing else is looked up or asked, and each of connecting,
+/// sending, waiting for the answer and reading it gets `step`. Finding the host gets no timeout:
+/// ureq documents that a timeout covering the lookup may make it look the host up on a thread of
+/// its own. Windows answers for localhost itself.
+fn local_agent(step: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .proxy(None)
+        .max_redirects(0)
+        .timeout_connect(Some(step))
+        .timeout_send_request(Some(step))
+        .timeout_recv_response(Some(step))
+        .timeout_recv_body(Some(step))
+        .build()
+        .into()
+}
 
 /// A row of the menu as read.
 struct Row<'a> {
@@ -476,6 +558,41 @@ mod tests {
     fn unknown_pit_state_is_unknown() {
         assert_eq!(position("SOMETHING"), Position::Unknown);
         assert_eq!(position("STOPPED"), Position::Stopped);
+    }
+
+    /// Against the running game: sets FL to new wets and the energy to 50%, checks the menu shows
+    /// it, and puts both back. `just test live_lmu_round_trip -- --ignored`, on track in LMU.
+    #[test]
+    #[ignore = "needs LMU running, on track"]
+    fn live_lmu_round_trip() {
+        use crate::sim::pit::TyreRequest;
+        let pit = LmuPit::new(Arc::new(AtomicBool::new(true)));
+        let before = pit.read().unwrap();
+        let wet: TyreRequest = serde_json::from_value(serde_json::json!({"compound": "Wet"})).unwrap();
+        let change = PitChange {
+            tyres: CornerMap { fl: Some(wet), ..Default::default() },
+            energy_leave_pct: Some(50.0),
+            ..Default::default()
+        };
+        pit.write(&before, &check(&before, &change).unwrap()).unwrap();
+        let after = pit.read().unwrap();
+        let fl = &after.corners.as_ref().unwrap()[0];
+        assert_eq!(fl.fitted.map(|at| fl.tyres[at].compound.as_str()), Some("Wet"));
+        assert_eq!(after.energy_leave_pct.as_ref().unwrap().value, 50.0);
+
+        let back = PitChange {
+            tyres: CornerMap {
+                fl: Some(serde_json::from_value(serde_json::json!("no_change")).unwrap()),
+                ..Default::default()
+            },
+            energy_leave_pct: Some(before.energy_leave_pct.as_ref().unwrap().value),
+            ..Default::default()
+        };
+        pit.write(&after, &check(&after, &back).unwrap()).unwrap();
+        let restored = pit.read().unwrap();
+        assert_eq!(restored.corners.as_ref().unwrap()[0].fitted, None);
+        assert_eq!(restored.energy_leave_pct, before.energy_leave_pct);
+        assert_eq!(restored.replace_brakes, before.replace_brakes);
     }
 
     #[test]
