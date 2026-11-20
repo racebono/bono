@@ -656,18 +656,20 @@ impl Converter {
             Some(Some(flag)) => Some(flag.since),
             _ => None,
         };
-        let live = match state {
-            Some(STATE_RACING) => true,
-            Some(STATE_CHECKERED) => match &self.flag {
-                Some(Some(flag)) if !flag.undecided && !flag.untimed => {
-                    let none_over = flag.most.is_some_and(|most| {
+        // In the cool-down too, for the cars just over the line (its order holds until the game's
+        // places catch up)
+        let live = match (state, &self.flag) {
+            (Some(STATE_RACING), _) => true,
+            (Some(STATE_CHECKERED | STATE_COOL_DOWN), Some(Some(flag)))
+                if !flag.undecided && !flag.untimed =>
+            {
+                let none_over = state == Some(STATE_CHECKERED)
+                    && flag.most.is_some_and(|most| {
                         cars.iter()
                             .all(|c| c.laps_completed.is_none_or(|laps| laps <= most))
                     });
-                    flag.finish.is_some() || none_over
-                }
-                _ => false,
-            },
+                flag.finish.is_some() || none_over
+            }
             _ => false,
         };
         if race && live {
@@ -708,7 +710,7 @@ impl Converter {
                 });
                 let finishing =
                     !untimed_before && track.finish_lap.is_none_or(|finish| lap <= finish);
-                (finished.contains(&car.idx) && finishing && time - at <= PLACES_LAG)
+                (over_line.contains(&car.idx) && finishing && time - at <= PLACES_LAG)
                     .then_some((f64::from(lap), at))
             });
         }
@@ -3628,6 +3630,45 @@ mod tests {
             update.2[1] = -1.0;
         }
         assert_eq!(places(&gone, 2.35), (Some(2), Some(1), Some(3)));
+    }
+
+    /// The cool-down coming a moment after a car's line: the order over it holds until the game's
+    /// places catch up, as before.
+    #[test]
+    fn the_line_order_holds_into_the_cool_down() {
+        // Car 0 wins at 4.9 s; car 2 by car 1 at 7.1 s, over the line at 7.9 s, car 1 at 8.2 s;
+        // the cool-down from 8.75 s
+        let updates: Vec<_> = (0..=42)
+            .map(|k| {
+                let t = 0.25 * k as f64;
+                let gone = [2.51 + 0.1 * t, 2.41 + 0.072 * t, 2.21 + 0.1 * t];
+                let state = match t {
+                    t if t >= 8.75 => STATE_COOL_DOWN,
+                    t if t >= 4.0 => STATE_CHECKERED,
+                    _ => STATE_RACING,
+                };
+                (
+                    t,
+                    state,
+                    gone.map(f64::fract),
+                    gone.map(|g| g.floor() as i32),
+                )
+            })
+            .collect();
+        for at in [8.5, 9.0, 10.5] {
+            let last = updates.iter().position(|u| u.0 >= at).unwrap();
+            let end = race_end(&updates[..=last], [0.0, 0.3, 95.0]);
+            let (_, standings) = end.scoring.as_ref().unwrap();
+            let place = |car: i64| {
+                let row = standings.iter().find(|s| s.vehicle_id.get() == Some(car));
+                row.and_then(|row| row.position.get())
+            };
+            assert_eq!(
+                (place(0), place(1), place(2)),
+                (Some(1), Some(3), Some(2)),
+                "{at}"
+            );
+        }
     }
 
     /// A race of so many laps ended on time, before any car has them all: no winner is taken, so
