@@ -1011,7 +1011,7 @@
       "session": "race",
       "pit": {
         "game": "iracing",
-        "menu": "PIT MENU NOW: car leaving the pits; fuel added 0 L; FL no change 165 kPa; FR no change 165 kPa; RL no change 160 kPa; RR no change 160 kPa; repair \"off\"; tear-off no\nPIT OPTIONS (the `pit` tool's fields)\nfuel_add_l: litres added, 0–110 L\ntyres FL: \"Hard\" new, \"Wet\" new\ntyres FR: \"Hard\" new, \"Wet\" new\ntyres RL: \"Hard\" new, \"Wet\" new\ntyres RR: \"Hard\" new, \"Wet\" new\npressures_kpa: from 1 kPa\niRacing tyres: one compound for every tyre fitted; a pressure only for a tyre being changed\nrepair: \"off\", \"on\"\ntear_off: true or false\niRacing: every service is ticked again as the car leaves the pits; repair is a fast repair, of which a race has a limited number",
+        "menu": "PIT MENU NOW: car leaving the pits; fuel added 0 L; FL no change 165 kPa; FR no change 165 kPa; RL no change 160 kPa; RR no change 160 kPa; repair \"off\"; tear-off no\nPIT OPTIONS (the `pit` tool's fields)\nfuel_add_l: litres added, 0–110 L\ntyres FL: \"Hard\" new, \"Wet\" new\ntyres FR: \"Hard\" new, \"Wet\" new\ntyres RL: \"Hard\" new, \"Wet\" new\ntyres RR: \"Hard\" new, \"Wet\" new\npressures_kpa: from 1 kPa\niRacing tyres: one compound for every tyre fitted; a pressure only for a tyre being changed\niRacing: every service is ticked again as the car leaves the pits; repair is a fast repair, of which a race has a limited number\nrepair: \"off\", \"on\"\ntear_off: true or false",
         "position": "leaving the pits",
         "takes": true
       },
