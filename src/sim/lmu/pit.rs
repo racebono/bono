@@ -513,7 +513,8 @@ pub fn apply(rows: &Value, menu: &PitMenu, change: &Resolved) -> anyhow::Result<
         return Err(changed());
     }
     if let Some(want) = change.replace_brakes {
-        if row(read, REPLACE_BRAKES)?.is_none() {
+        // Still its two options: index 1 is only in range then
+        if row(read, REPLACE_BRAKES)?.is_none_or(|row| row.options.len() != 2) {
             return Err(changed());
         }
         set.push((REPLACE_BRAKES, usize::from(want)));
@@ -767,6 +768,21 @@ mod tests {
         let m = parse(&rows, &fixture("standings.json")).unwrap();
         assert!(m.fuel_ratio.is_none() && m.replace_brakes.is_none());
         assert!(m.energy_leave_pct.is_some());
+    }
+
+    #[test]
+    fn replace_brakes_needs_its_two_options() {
+        // Read with two options, then a read with one: index 1 would be out of range
+        let m = parsed();
+        let change = PitChange { replace_brakes: Some(true), ..Default::default() };
+        let resolved = check(&m, &change).unwrap();
+        let mut rows = menu_rows();
+        let brakes = (rows.as_array_mut().unwrap().iter_mut())
+            .find(|row| row["name"] == REPLACE_BRAKES)
+            .unwrap();
+        brakes["settings"] = serde_json::json!([{"text": "N/D"}]);
+        brakes["currentSetting"] = 0.into();
+        assert!(apply(&rows, &m, &resolved).is_err());
     }
 
     #[test]

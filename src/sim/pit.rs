@@ -556,14 +556,6 @@ pub fn unmet(after: &PitMenu, resolved: &Resolved) -> Vec<String> {
         {
             unmet.push("fuel".into());
         }
-        // What the car leaves with has no "nothing added" for every stop to come (it depends on
-        // what's left by then): a clear leaves it as set, and says so
-        if resolved.fuel_leave_l.is_none() && after.fuel_leave_l.is_some() {
-            unmet.push("fuel (left as set: give fuel_leave_l to change it)".into());
-        }
-        if resolved.energy_leave_pct.is_none() && after.energy_leave_pct.is_some() {
-            unmet.push("energy (left as set: give energy_leave_pct to change it)".into());
-        }
     }
 
     let cleared = resolved.clear.is_some();
@@ -612,6 +604,21 @@ pub fn unmet(after: &PitMenu, resolved: &Resolved) -> Vec<String> {
     flag("replace brakes", after.replace_brakes, resolved.replace_brakes);
     flag("tear-off", after.tear_off, resolved.tear_off);
     unmet
+}
+
+/// The fields a clear of everything left as they were: what the car leaves with has no "nothing
+/// added" for every stop to come (it depends on what's left by then), so it stays as set.
+pub fn left_as_set(after: &PitMenu, resolved: &Resolved) -> Vec<&'static str> {
+    let mut left = Vec::new();
+    if resolved.clear == Some(Clear::All) {
+        if resolved.fuel_leave_l.is_none() && after.fuel_leave_l.is_some() {
+            left.push("fuel_leave_l");
+        }
+        if resolved.energy_leave_pct.is_none() && after.energy_leave_pct.is_some() {
+            left.push("energy_leave_pct");
+        }
+    }
+    left
 }
 
 /// What a stop request did.
@@ -973,20 +980,20 @@ pub mod tests {
             clear: Some(Clear::All),
             ..Default::default()
         };
-        // What a car leaves with is left as set by a clear, and said: no target means nothing
-        // added at every stop to come
-        let names = |menu: &PitMenu, r: &Resolved| unmet(menu, r).join("; ");
+        // What a car leaves with is left as set by a clear, and said apart: it isn't something
+        // that didn't take, so the clear can still be confirmed
         let mut litres = menu();
         litres.energy_leave_pct = None;
         litres.fuel_leave_l = Some(number(60.0, 0.0, 110.0, 1.0));
         let r = check(&litres, &clear).unwrap();
-        assert!(names(&litres, &r).contains("fuel (left as set"), "{}", names(&litres, &r));
+        assert_eq!(left_as_set(&litres, &r), ["fuel_leave_l"]);
+        assert!(unmet(&litres, &r).is_empty(), "{:?}", unmet(&litres, &r));
         let energy = menu();
         let r = check(&energy, &clear).unwrap();
-        assert!(names(&energy, &r).contains("energy (left as set"), "{}", names(&energy, &r));
+        assert_eq!(left_as_set(&energy, &r), ["energy_leave_pct"]);
         // Unless the change sets it
         let r = check(&energy, &change(json!({"clear": "all", "energy_leave_pct": 100}))).unwrap();
-        assert!(!names(&energy, &r).contains("energy"), "{}", names(&energy, &r));
+        assert!(left_as_set(&energy, &r).is_empty());
         // iRacing: fuel still ticked after a clear didn't take
         let mut iracing = iracing_menu();
         iracing.fuel_add_l.as_mut().unwrap().value = 30.0;

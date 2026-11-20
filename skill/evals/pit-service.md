@@ -11,7 +11,7 @@ the transcript. Each case's `pit` field gives the menu:
 - `game`: the game whose behaviour the fixture follows (`lmu` or `iracing`), for which stop a
   change counts for at each `position`.
 - `menu`: what the message's `PIT MENU NOW` and `PIT OPTIONS` lines carry, worded as the app words
-  them. The `pit` tool's `read` returns the same.
+  them. The `pit` tool's `read` returns the same lines.
 - `position`: where the car is when the change is made, for what `change` returns as the stop it
   counts for (`this stop`, `the next stop`, `not kept`, `unknown`).
 - `takes`: whether the fixture game takes a change; when it doesn't, `change` returns the fields

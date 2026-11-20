@@ -9,7 +9,7 @@ use crate::{
     provider::ToolHandler,
     sim::pit::{
         Corner, Number, PitChange, PitMenu, PitService, Position, StopOutcome, Timing, check,
-        timing, unmet,
+        left_as_set, timing, unmet,
     },
 };
 use anyhow::Context as _;
@@ -224,6 +224,10 @@ impl PitTool {
             Timing::Unknown => "unknown (say you're not sure which stop)",
         };
         let _ = write!(text, "\nApplied for: {when}");
+        let left = left_as_set(&after, &resolved);
+        if !left.is_empty() {
+            let _ = write!(text, "\nLeft as set (a clear doesn't change it): {}", left.join(", "));
+        }
         if !missing.is_empty() {
             let _ = write!(text, "\nNot taken: {}", missing.join(", "));
             // The menu didn't move at all: iRacing drops broadcasts from a program running with
@@ -686,6 +690,16 @@ mod tests {
         let text = format!("{}\n{}", options_text(&menu), current_text(&menu));
         assert!(text.contains("136.5 kPa") && text.contains("135.8–210.3 kPa"), "{text}");
         assert!(!text.contains("136.516"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn clear_all_says_what_it_leaves() {
+        let tool = PitTool::new(FakeService::new(menu(), true));
+        let text = (tool.run(input(serde_json::json!({"action": "change", "clear": "all"}))))
+            .await
+            .unwrap();
+        assert!(text.contains("Left as set (a clear doesn't change it): energy_leave_pct"), "{text}");
+        assert!(!text.contains("Not taken"), "{text}");
     }
 
     #[test]
