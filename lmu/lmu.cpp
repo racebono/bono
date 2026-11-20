@@ -37,7 +37,8 @@ static void convert(const TelemInfoV01& in, bono_telemetry_s& out) {
     out.vehicle_id = in.mID;
     out.session_time = in.mElapsedTime;
     out.time_since_last_update = in.mDeltaTime;
-    // mLapNumber is the laps completed; the lap the car is on is one more.
+    // The SDK only calls mLapNumber the "current lap number": seen in the game, it counts from 0 and
+    // equals scoring's mTotalLaps (laps completed), so the lap the car is on is one more.
     out.lap = in.mLapNumber + 1;
     out.lap_start_time = in.mLapStartET;
     // The sign bit of mCurrentSector marks the pit lane.

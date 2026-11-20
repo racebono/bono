@@ -4879,7 +4879,7 @@ fn range(
     match (level, per_lap.filter(|v| *v != 0.0)) {
         (Some(level), Some(per_lap)) => {
             let left = level / per_lap;
-            (Some(left), Some(lap.unwrap_or(0) as f64 + frac + left))
+            (Some(left), Some(lap.unwrap_or(1) as f64 + frac + left))
         }
         _ => (None, None),
     }
@@ -4986,7 +4986,7 @@ fn projection(
             // Lap N runs from N - 1 to N laps done, so reaching position N completes lap N - 1.
             integer(
                 limit.map(|(_, left)| {
-                    (lap_now.unwrap_or(0) as f64 + frac + left).floor() as i64 - 1
+                    (lap_now.unwrap_or(1) as f64 + frac + left).floor() as i64 - 1
                 }),
             ),
         ),
@@ -7025,7 +7025,7 @@ mod tests {
     #[test]
     fn a_second_wrap_under_lap_1_can_be_line_lag_again() {
         // RaceRoom's way: car 2 crosses under lap 1, goes round, and its distance wraps again
-        // before its lap count goes to 1
+        // before its lap count goes to 2
         let samples = on_the_grid(vec![(2, driven(1900.0, &[(1, 4010.0, &|_, _| Some(0.0))]))]);
         let (conn, mut stream) = stream_with(vec![turn_at(1000.0)]);
         let early = samples
@@ -7303,7 +7303,7 @@ mod tests {
 
     #[test]
     fn a_wrap_before_the_lap_count_changes_doesnt_decide_the_counting() {
-        // Car 2's distance wraps at the line 0.4 s before its lap count goes to 1
+        // Car 2's distance wraps at the line 0.4 s before its lap count goes to 2
         let samples = on_the_grid(vec![
             (1, driven(1820.0, &[(1, 1994.0, &|_, _| Some(0.0))])),
             (
@@ -8750,17 +8750,17 @@ mod tests {
         let stints = stints_of(&spans, &[spell(1, 0.0, 150.0), spell(2, 160.0, 290.0)]);
         // Lap 2 is the handover's, from 150 s to 160 s
         assert_eq!(
-            setup_stint(&stints, Some(1), Some(200.0)),
+            setup_stint(&stints, Some(2), Some(200.0)),
             Some(stints[1].id)
         );
         assert_eq!(
-            setup_stint(&stints, Some(1), Some(120.0)),
+            setup_stint(&stints, Some(2), Some(120.0)),
             Some(stints[0].id)
         );
         // During the handover, or not known when
-        assert_eq!(setup_stint(&stints, Some(1), Some(155.0)), None);
+        assert_eq!(setup_stint(&stints, Some(2), Some(155.0)), None);
         assert_eq!(setup_stint(&stints, None, Some(200.0)), None);
-        assert_eq!(setup_stint(&[], Some(1), Some(200.0)), None);
+        assert_eq!(setup_stint(&[], Some(2), Some(200.0)), None);
     }
 
     #[test]
@@ -9531,7 +9531,7 @@ mod tests {
             player: Some(1),
         };
         let samples = partial(1990.0);
-        let mut build = LapBuild::new(&samples[0], 0, Some(&layout));
+        let mut build = LapBuild::new(&samples[0], 1, Some(&layout));
         let pass = |conn: &Connection, column: &str| -> Option<Option<f64>> {
             let sql = format!("SELECT {column} FROM corner_passes WHERE turn_index = 0");
             conn.query_row(&sql, [], |r| r.get(0)).ok()

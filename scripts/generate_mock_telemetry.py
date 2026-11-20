@@ -84,8 +84,8 @@ def generate(output):
             start = t
             sectors.append([0.0] * SECTORS)
             for distance in range(0, int(LENGTH), 10):
-                # The last two complete laps, 9 and 10, brake 35 m early for T2; lap 7 loses exit
-                # speed at T3. Laps are numbered from 1, as the game shows them.
+                # The last two complete laps, 9 and 10, brake 35 m early for T2; lap 8 loses exit
+                # speed at T3, the lap before the impact. Laps are numbered from 1, as the game shows them.
                 early = vehicle == 1 and lap in (9, 10) and 1300 <= distance < 1500
                 speed = 80.0
                 braking = False
@@ -97,7 +97,7 @@ def generate(output):
                         braking = True
                     elif -100 <= before < 0:
                         speed = min(speed, 35 - 45 * before / 100)
-                    if vehicle == 1 and lap == 7 and index == 2 and -160 <= before <= 0:
+                    if vehicle == 1 and lap == 8 and index == 2 and -160 <= before <= 0:
                         speed = min(speed, 24 + abs(before) * 0.27)
                 if vehicle == 3:
                     speed *= 0.99

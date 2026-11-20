@@ -1362,8 +1362,8 @@ fn positions(
         true => {
             let mut order = frame.values().collect::<Vec<_>>();
             order.sort_by(|a, b| {
-                (-a.i("lap").unwrap_or(0))
-                    .cmp(&-b.i("lap").unwrap_or(0))
+                (-a.i("lap").unwrap_or(1))
+                    .cmp(&-b.i("lap").unwrap_or(1))
                     .then(
                         a.f("lap_start_time")
                             .unwrap_or(0.0)
@@ -2566,7 +2566,8 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         if forward.hypot(across) > 60.0 {
             continue;
         }
-        let laps_diff = r.i("lap").unwrap_or(0) - p.i("lap").unwrap_or(0);
+        // Only with both laps known: either missing says nothing of laps up or down
+        let laps_diff = r.i("lap").zip(p.i("lap")).map_or(0, |(r, p)| r - p);
         let mut tag = match laps_diff.cmp(&0) {
             Ordering::Equal => String::new(),
             Ordering::Less => format!(", {} lap down", -laps_diff),
