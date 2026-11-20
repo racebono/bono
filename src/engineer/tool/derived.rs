@@ -8123,14 +8123,14 @@ mod tests {
         .await;
         assert_eq!(
             laps,
-            [["0", "0", "100"], ["1", "1", "NULL"], ["2", "0", "100"]]
+            [["1", "0", "100"], ["2", "1", "NULL"], ["3", "0", "100"]]
         );
         let passes = query(
             &engineer,
             "SELECT lap, lap_invalid FROM corner_passes WHERE vehicle_id = 1 ORDER BY lap",
         )
         .await;
-        assert_eq!(passes, [["0", "0"], ["1", "1"], ["2", "0"]]);
+        assert_eq!(passes, [["1", "0"], ["2", "1"], ["3", "0"]]);
     }
 
     /// A car's own phase is the session's, or a flag shown to it while the session is green
@@ -8153,7 +8153,7 @@ mod tests {
                 "SELECT lap, invalid FROM lap_stats WHERE vehicle_id = 1 AND complete = 1 ORDER BY lap",
             )
             .await;
-            assert_eq!(laps, [["0", "0"], ["1", "1"], ["2", "0"]], "{phase}");
+            assert_eq!(laps, [["1", "0"], ["2", "1"], ["3", "0"]], "{phase}");
         }
     }
 

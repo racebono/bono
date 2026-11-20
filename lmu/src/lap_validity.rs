@@ -23,9 +23,9 @@ pub struct LapValidity(Mutex<HashMap<i64, Car>>);
 
 #[derive(Default)]
 struct Car {
-    /// From the newest scoring: the laps completed, whether that lap's time counts, and whether
-    /// the car's laps are judged at all
-    scored_laps: Option<i64>,
+    /// From the newest scoring: the lap the car's on (as telemetry numbers it), whether that
+    /// lap's time counts, and whether the car's laps are judged at all
+    scored_lap: Option<i64>,
     counting: Option<bool>,
     judged: bool,
     /// The first scoring of the laps completed: how the lap began
@@ -46,7 +46,7 @@ struct Car {
 
 #[derive(Clone, Copy)]
 struct Start {
-    laps: i64,
+    lap: i64,
     counting: Option<bool>,
     in_pits: bool,
     judged: bool,
@@ -55,7 +55,7 @@ struct Start {
 impl Car {
     /// Whether the lap, once its first scoring's here, began not counting away from the pits.
     fn judge_start(&mut self) {
-        let Some(start) = self.start.filter(|start| Some(start.laps) == self.lap) else {
+        let Some(start) = self.start.filter(|start| Some(start.lap) == self.lap) else {
             return;
         };
         if self.start_judged {
@@ -94,26 +94,27 @@ impl LapValidity {
                 continue;
             };
             let car = cars.entry(vehicle).or_default();
-            let laps = standing.laps_completed.get();
+            // Telemetry's lap is the one the car's on: laps completed + 1
+            let lap = standing.laps_completed.get().map(|laps| laps + 1);
             car.counting = standing.lap_time_counts.get();
             car.judged = session_judged
                 && standing
                     .finish_status
                     .as_deref()
                     .is_none_or(|s| s == "none");
-            if laps != car.scored_laps {
-                car.start = laps.map(|laps| Start {
-                    laps,
+            if lap != car.scored_lap {
+                car.start = lap.map(|lap| Start {
+                    lap,
                     counting: car.counting,
                     in_pits: standing.in_pits.get().unwrap_or(false),
                     judged: car.judged,
                 });
             }
-            car.scored_laps = laps;
+            car.scored_lap = lap;
             car.judge_start();
             // The lap counter and scoring tick over a moment apart: until then, scoring is the
             // last lap's
-            if car.rose && car.lap.is_some() && car.scored_laps == car.lap {
+            if car.rose && car.lap.is_some() && car.scored_lap == car.lap {
                 car.rose = false;
                 car.invalidated |= car.judged
                     && car.counting == Some(false)
@@ -168,16 +169,17 @@ mod tests {
         session
     }
 
+    /// The car on lap `lap` (`lap - 1` completed), as telemetry numbers it.
     fn standing(
         vehicle: i64,
-        laps: i64,
+        lap: i64,
         counting: Option<bool>,
         in_pits: bool,
         finish_status: &str,
     ) -> bono_standing {
         let mut standing = bono_standing::default();
         standing.vehicle_id = Some(vehicle).into();
-        standing.laps_completed = Some(laps).into();
+        standing.laps_completed = Some(lap - 1).into();
         standing.lap_time_counts = counting.into();
         standing.in_pits = Some(in_pits).into();
         standing.finish_status = Some(finish_status.to_owned()).into();
