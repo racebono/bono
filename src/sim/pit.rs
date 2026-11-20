@@ -47,24 +47,24 @@ pub enum Position {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Timing {
     ThisStop,
-    /// Not verified in the games yet: said as "probably"
-    ProbablyThisStop,
-    ProbablyNextStop,
     NextStop,
+    /// Set mid-service (iRacing): this stop if the crew hasn't done that part yet, else lost
+    ThisStopOrLost,
+    /// iRacing ticks every service again as the car leaves the pits
+    Lost,
     Unknown,
 }
 
-/// Which stop a change made while the car is at `position` counts for. `verified`: whether the
-/// game was seen to apply a change made entering the pit lane to that stop, and one made once
-/// stopped to the next; otherwise those are only probably so.
-pub fn timing(position: Position, verified: bool) -> Timing {
+/// Which stop a change made while the car is at `position` counts for. Seen in both games: a
+/// change made entering the pit lane is still set when the service starts. Once stopped, LMU
+/// keeps it for the next stop; iRacing clears everything when the service ends and ticks every
+/// service again as the car leaves the pits.
+pub fn timing(position: Position, iracing: bool) -> Timing {
     match position {
-        Position::OnTrack | Position::StopRequested => Timing::ThisStop,
-        Position::Entering if verified => Timing::ThisStop,
-        Position::Entering => Timing::ProbablyThisStop,
-        Position::Stopped if verified => Timing::NextStop,
-        Position::Stopped => Timing::ProbablyNextStop,
-        Position::Exiting => Timing::NextStop,
+        Position::OnTrack | Position::StopRequested | Position::Entering => Timing::ThisStop,
+        Position::Stopped if iracing => Timing::ThisStopOrLost,
+        Position::Exiting if iracing => Timing::Lost,
+        Position::Stopped | Position::Exiting => Timing::NextStop,
         Position::Unknown => Timing::Unknown,
     }
 }
@@ -678,17 +678,19 @@ pub mod tests {
 
     #[test]
     fn timing_table() {
-        for verified in [true, false] {
-            assert_eq!(timing(Position::OnTrack, verified), Timing::ThisStop);
-            assert_eq!(timing(Position::StopRequested, verified), Timing::ThisStop);
-            assert_eq!(timing(Position::Exiting, verified), Timing::NextStop);
-            assert_eq!(timing(Position::Unknown, verified), Timing::Unknown);
+        for iracing in [false, true] {
+            assert_eq!(timing(Position::OnTrack, iracing), Timing::ThisStop);
+            assert_eq!(timing(Position::StopRequested, iracing), Timing::ThisStop);
+            // Still ticked when the service starts, in both games
+            assert_eq!(timing(Position::Entering, iracing), Timing::ThisStop);
+            assert_eq!(timing(Position::Unknown, iracing), Timing::Unknown);
         }
-        assert_eq!(timing(Position::Entering, false), Timing::ProbablyThisStop);
-        assert_eq!(timing(Position::Stopped, false), Timing::ProbablyNextStop);
-        // Checked in the game: entering still counts for this stop, stopped for the next
-        assert_eq!(timing(Position::Entering, true), Timing::ThisStop);
-        assert_eq!(timing(Position::Stopped, true), Timing::NextStop);
+        // LMU keeps what's set once stopped for the next stop
+        assert_eq!(timing(Position::Stopped, false), Timing::NextStop);
+        assert_eq!(timing(Position::Exiting, false), Timing::NextStop);
+        // iRacing clears it all when the service ends, and ticks every service leaving the pits
+        assert_eq!(timing(Position::Stopped, true), Timing::ThisStopOrLost);
+        assert_eq!(timing(Position::Exiting, true), Timing::Lost);
     }
 
     #[test]

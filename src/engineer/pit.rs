@@ -177,12 +177,15 @@ impl PitTool {
         };
 
         let mut text = current_text(&after);
-        // Seen in LMU, not yet in iRacing
-        let when = match timing(before.position, !before.iracing_tyres) {
+        let when = match timing(before.position, before.iracing_tyres) {
             Timing::ThisStop => "this stop",
-            Timing::ProbablyThisStop => "probably this stop",
-            Timing::ProbablyNextStop => "probably the next stop",
             Timing::NextStop => "the next stop",
+            Timing::ThisStopOrLost => {
+                "this stop if the crew hasn't done it yet; otherwise it's lost, as iRacing clears                  the pit menu when the stop ends (set it again once back on track)"
+            }
+            Timing::Lost => {
+                "not kept: iRacing ticks every service again as the car leaves the pits (set it                  again once back on track)"
+            }
             Timing::Unknown => "unknown (say you're not sure which stop)",
         };
         let _ = write!(text, "\nApplied for: {when}");
@@ -284,7 +287,7 @@ pub fn options_text(menu: &PitMenu) -> String {
         if menu.iracing_tyres {
             line(
                 "iRacing",
-                "one compound for every tyre fitted; a pressure only for a tyre being changed"
+                "one compound for every tyre fitted; a pressure only for a tyre being changed;                  every service is ticked again as the car leaves the pits"
                     .into(),
             );
         }
@@ -439,14 +442,20 @@ mod tests {
         assert!(text.contains("FL \"Wet\" new"), "{text}");
         assert!(!text.contains("Not taken"), "{text}");
 
-        // Not yet seen in iRacing: only probably
-        let mut stopped = crate::sim::pit::tests::iracing_menu();
-        stopped.position = Position::Stopped;
-        let tool = PitTool::new(FakeService::new(stopped, true));
-        let text = (tool.run(input(serde_json::json!({"action": "change", "tyres": {"fl": {"compound": "Wet"}}}))))
-            .await
-            .unwrap();
-        assert!(text.contains("Applied for: probably the next stop"), "{text}");
+        // iRacing: too late or lost while stopped, lost leaving the pits
+        for (position, says) in [
+            (Position::Stopped, "this stop if the crew hasn't done it yet"),
+            (Position::Exiting, "not kept"),
+        ] {
+            let mut menu = crate::sim::pit::tests::iracing_menu();
+            menu.position = position;
+            let tool = PitTool::new(FakeService::new(menu, true));
+            let text = (tool.run(input(serde_json::json!({"action": "change", "tyres": {"fl": {"compound": "Wet"}}}))))
+                .await
+                .unwrap();
+            assert!(text.contains(says), "{text}");
+            assert!(!text.contains("next stop"), "{text}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
