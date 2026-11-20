@@ -110,6 +110,8 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
+    # Asking iRacing to jump its replay back to live (its SDK's broadcast messages)
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]

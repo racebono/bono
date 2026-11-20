@@ -22,8 +22,11 @@ use sdk::{Frame, HEADER_LEN, Header, MEMORY_NAME, VERSION, Vars};
 use session::SessionInfo;
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
-    time::Instant,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 /// How often the session info is read again while its update count stays the same.
@@ -39,6 +42,59 @@ static BEHIND_LIVE_SECS: AtomicU32 = AtomicU32::new(3);
 /// below a second, the lag at the live point could count as a replay.
 fn behind_live_frames(secs: u32) -> BehindLiveFrames {
     BehindLiveFrames(secs.clamp(1, 30) as i32 * FRAMES_PER_SECOND)
+}
+
+/// How often the replay is asked to jump back to live while it stays behind: the game may take a
+/// moment to, or not do it at all.
+const PULL_EVERY: Duration = Duration::from_secs(1);
+
+/// Whether to ask the game to jump its replay back to live: only when the pilot asked for it, the
+/// replay is the live session's (not a saved one) and behind live, and it wasn't asked to lately.
+fn should_pull_live(
+    keep_live: bool,
+    replay_file: bool,
+    behind: bool,
+    last_pull: Option<Instant>,
+    now: Instant,
+) -> bool {
+    keep_live
+        && !replay_file
+        && behind
+        && last_pull.is_none_or(|at| now.duration_since(at) >= PULL_EVERY)
+}
+
+/// The SDK's broadcast message (`IRSDK_BROADCASTMSGNAME` in `irsdk_defines.h`).
+const BROADCAST_MESSAGE: &str = "IRSDK_BROADCASTMSG";
+/// `irsdk_BroadcastReplaySearch`, with its mode as the first argument.
+const BROADCAST_REPLAY_SEARCH: usize = 5;
+/// `irsdk_RpySrch_ToEnd`: to the end of the tape, the live session.
+const REPLAY_SEARCH_TO_END: usize = 1;
+
+/// Asks the game to jump its replay to the end of the tape, as `irsdk_defines.h` documents: its
+/// broadcast message, sent to every top-level window, the command in the low word of `wParam` and
+/// its argument in the high word. `SendNotifyMessageW` doesn't wait for windows of other threads.
+fn pull_to_live() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HWND_BROADCAST, RegisterWindowMessageW, SendNotifyMessageW,
+    };
+    static MESSAGE: OnceLock<u32> = OnceLock::new();
+    let message = *MESSAGE.get_or_init(|| {
+        let name: Vec<u16> = BROADCAST_MESSAGE.encode_utf16().chain([0]).collect();
+        // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the call
+        unsafe { RegisterWindowMessageW(name.as_ptr()) }
+    });
+    if message == 0 {
+        log::debug!("Couldn't register iRacing's broadcast message");
+        return;
+    }
+    let wparam = BROADCAST_REPLAY_SEARCH | (REPLAY_SEARCH_TO_END << 16);
+    // SAFETY: a notification with plain integer arguments, no pointers
+    if unsafe { SendNotifyMessageW(HWND_BROADCAST, message, wparam, 0) } == 0 {
+        log::debug!(
+            "Couldn't ask iRacing to jump its replay to live: {}",
+            std::io::Error::last_os_error()
+        );
+    }
 }
 
 pub struct IRacing(Recording);
@@ -98,6 +154,8 @@ struct Game {
     /// The last update read
     buffer: Vec<u8>,
     converter: Converter,
+    /// When the replay was last asked to jump back to live
+    last_pull: Option<Instant>,
     warned_version: bool,
     warned_range: bool,
 }
@@ -262,11 +320,17 @@ impl Source for Game {
         let (Some((_, vars)), Some((_, _, info))) = (&self.vars, &self.info) else {
             return Read::Idle;
         };
-        self.converter.behind_live_frames =
-            behind_live_frames(BEHIND_LIVE_SECS.load(Ordering::Relaxed));
-        match self
-            .converter
-            .convert(&Frame::new(vars, &self.buffer), info, now)
+        let frame = Frame::new(vars, &self.buffer);
+        let frames = behind_live_frames(BEHIND_LIVE_SECS.load(Ordering::Relaxed));
+        // Asked from the reader thread, never the UI's (see `pull_to_live`)
+        let behind = convert::behind_live(&frame, frames.0);
+        let keep_live = KEEP_LIVE.load(Ordering::Relaxed);
+        if should_pull_live(keep_live, info.replay, behind, self.last_pull, now) {
+            pull_to_live();
+            self.last_pull = Some(now);
+        }
+        self.converter.behind_live_frames = frames;
+        match self.converter.convert(&frame, info, now)
         {
             Some(update) => Read::Update(update),
             None => Read::Idle,
@@ -380,6 +444,49 @@ mod tests {
         assert_eq!(behind_live_frames(3), BehindLiveFrames(180));
         assert_eq!(behind_live_frames(0), BehindLiveFrames(60));
         assert_eq!(behind_live_frames(10_000), BehindLiveFrames(1800));
+    }
+
+    #[test]
+    fn off_never_pulls() {
+        let now = Instant::now();
+        assert!(!should_pull_live(false, false, true, None, now));
+    }
+
+    #[test]
+    fn never_pulls_a_replay_file() {
+        let now = Instant::now();
+        assert!(!should_pull_live(true, true, true, None, now));
+    }
+
+    #[test]
+    fn live_isnt_pulled() {
+        let now = Instant::now();
+        assert!(!should_pull_live(true, false, false, None, now));
+    }
+
+    #[test]
+    fn pulls_when_turned_on_while_behind() {
+        let now = Instant::now();
+        assert!(should_pull_live(true, false, true, None, now));
+    }
+
+    #[test]
+    fn pulls_at_most_once_a_second() {
+        let now = Instant::now();
+        assert!(!should_pull_live(
+            true,
+            false,
+            true,
+            Some(now),
+            now + Duration::from_millis(999)
+        ));
+        assert!(should_pull_live(
+            true,
+            false,
+            true,
+            Some(now),
+            now + PULL_EVERY
+        ));
     }
 
     /// Records a saved telemetry file as if the game were sharing it live, into `dir`. Returns
