@@ -2,16 +2,18 @@
 
 Controlled manual/model scenarios, not executed results. They cover changing the car's next stop
 with the `pit` tool: what the pilot asks for directly, proposals of the engineer's own, saying
-which stop a change counts for, standing orders and stop requests. They are evals 48 to 58 in
+which stop a change counts for, standing orders and stop requests. They are evals 48 to 59 in
 `evals.json`, run against the synthetic race fixture.
 
 They need a harness that registers the `pit` tool with a fixture menu and records its calls in
 the transcript. Each case's `pit` field gives the menu:
 
+- `game`: the game whose behaviour the fixture follows (`lmu` or `iracing`), for which stop a
+  change counts for at each `position`.
 - `menu`: what the message's `PIT MENU NOW` and `PIT OPTIONS` lines carry, worded as the app words
   them. The `pit` tool's `read` returns the same.
 - `position`: where the car is when the change is made, for what `change` returns as the stop it
-  counts for (`this stop`, `probably the next stop`, …).
+  counts for (`this stop`, `the next stop`, `not kept`, `unknown`).
 - `takes`: whether the fixture game takes a change; when it doesn't, `change` returns the fields
   as `Not taken`.
 
@@ -30,7 +32,8 @@ harness without the `pit` tool says nothing about these behaviours: leave these 
 | Fronts only, mediums | One `change` setting FL and FR only; the rears untouched. |
 | Add fuel for ten more laps, in a car that sets the level it leaves with | A `change` of the level field (`energy_leave_pct` or `fuel_leave_l`), worked out from the level now and the use per lap, not `fuel_add_l` and not ten itself. |
 | Change the tear-off, in a car without one | No `change` claimed as done: says plainly it can't be set for this car. |
-| Wets on, made while the car is stopped in its box | Says the change counts for the next stop (probably), not this one. |
+| Wets on, made while the car is stopped in its box, in a game that keeps it for the next stop | Says the change counts for the next stop, not this one. |
+| Wets on, made while the car leaves the pits, in a game that ticks every service again then | Says the change won't stick and offers to set it again once back on track; never that it's set for a stop. |
 | Box this lap, in a game with stop requests | One `request_stop`, confirmed in a few words. |
 
 ## The engineer's own idea

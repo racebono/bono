@@ -77,6 +77,9 @@ pub struct Number {
     pub max: Option<f64>,
     /// The values it takes are `min` (or 0) plus whole steps
     pub step: Option<f64>,
+    /// The values it takes, when the game lists them (LMU): a value is set to the nearest. The
+    /// game's text rounds them, so they needn't be whole steps apart
+    pub options: Vec<f64>,
 }
 
 /// One of a row's options, by text, as the game words them.
@@ -97,10 +100,10 @@ pub struct Tyre {
 }
 
 impl Tyre {
-    /// e.g. `Medium, used, 99%`
+    /// e.g. `"Medium", used, 99%`: the compound is the game's text, quoted and escaped
     pub fn describe(&self) -> String {
         let mut text = format!(
-            "{}, {}",
+            "{:?}, {}",
             self.compound,
             if self.used { "used" } else { "new" }
         );
@@ -161,12 +164,17 @@ pub enum Clear {
 #[serde(untagged)]
 pub enum TyreRequest {
     NoChange(NoChangeTag),
-    Fit {
-        compound: String,
-        #[serde(default)]
-        used: bool,
-        tread_pct: Option<f64>,
-    },
+    Fit(Fit),
+}
+
+/// A tyre to fit: any other field is an error, not dropped.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fit {
+    pub compound: String,
+    #[serde(default)]
+    pub used: bool,
+    pub tread_pct: Option<f64>,
 }
 
 /// `"no_change"`
@@ -322,11 +330,11 @@ pub fn check(menu: &PitMenu, change: &PitChange) -> anyhow::Result<Resolved> {
         resolved.tyres[at] = match tyres[at] {
             None => None,
             Some(TyreRequest::NoChange(_)) => Some(None),
-            Some(TyreRequest::Fit {
+            Some(TyreRequest::Fit(Fit {
                 compound,
                 used,
                 tread_pct,
-            }) => Some(Some(fit(corner, menu, compound, *used, *tread_pct)?)),
+            })) => Some(Some(fit(corner, menu, compound, *used, *tread_pct)?)),
         };
         if let Some(pressure) = pressures[at] {
             let Some(number) = &menu.pressure_kpa else {
@@ -366,16 +374,27 @@ pub fn check(menu: &PitMenu, change: &PitChange) -> anyhow::Result<Resolved> {
             if !moved.is_empty() {
                 bail!(
                     "iRacing fits one compound for the whole stop, and {} already has a tyre \
-                     change on another one: set it to {first} too, or to no_change",
+                     change on another one: set it to {first:?} too, or to no_change",
                     moved.join(", ")
                 );
+            }
+        }
+        // A tyre is left out by clearing all four and ticking the others again: those are part
+        // of the change, so the read-back waits for them too
+        let untick = (0..4).any(|at| resolved.tyres[at] == Some(None) && corners[at].fitted.is_some());
+        if untick && resolved.clear.is_none() {
+            for at in 0..4 {
+                if resolved.tyres[at].is_none() && corners[at].fitted.is_some() {
+                    resolved.tyres[at] = Some(corners[at].fitted);
+                }
             }
         }
         for corner in Corner::ALL {
             let at = corner as usize;
             let fitted = match resolved.tyres[at] {
                 Some(fitted) => fitted.is_some(),
-                None => corners[at].fitted.is_some(),
+                // A clear unticks it first
+                None => resolved.clear.is_none() && corners[at].fitted.is_some(),
             };
             if resolved.pressures_kpa[at].is_some() && !fitted {
                 bail!(
@@ -445,13 +464,19 @@ fn snap(name: &str, number: &Number, value: f64) -> anyhow::Result<f64> {
             (None, None) => unreachable!("an unlimited number takes any finite value"),
         }
     }
+    // The nearest value the game lists, when it lists them
+    if let Some(nearest) = (number.options.iter().copied())
+        .min_by(|a, b| (a - value).abs().total_cmp(&(b - value).abs()))
+    {
+        return Ok(nearest);
+    }
     let Some(step) = number.step.filter(|step| *step > 0.0) else {
         return Ok(value);
     };
     let base = number.min.unwrap_or(0.0);
     let snapped = base + ((value - base) / step).round() * step;
-    // Rounded to the step's own precision, so 0.88 stays 0.88 and not 0.8800000000000001
-    let snapped = (snapped / step).round() * step;
+    // Only float noise trimmed (0.8800000000000001 is 0.88): it never moves off the grid
+    let snapped = (snapped * 1e9).round() / 1e9;
     Ok(snapped.clamp(low, high))
 }
 
@@ -509,8 +534,17 @@ pub fn unmet(after: &PitMenu, resolved: &Resolved) -> Vec<String> {
     number("fuel", &after.fuel_leave_l, resolved.fuel_leave_l);
     number("energy", &after.energy_leave_pct, resolved.energy_leave_pct);
     number("fuel ratio", &after.fuel_ratio, resolved.fuel_ratio);
-    // A clear adds no fuel: what it couldn't clear is said, not taken as cleared
+    // A clear adds no fuel and no services: what it couldn't clear is said, not taken as cleared
     if resolved.clear == Some(Clear::All) {
+        if resolved.repair.is_none() && after.repair.as_ref().is_some_and(|r| r.current != 0) {
+            unmet.push("repair".into());
+        }
+        if resolved.replace_brakes.is_none() && after.replace_brakes == Some(true) {
+            unmet.push("replace brakes".into());
+        }
+        if resolved.tear_off.is_none() && after.tear_off == Some(true) {
+            unmet.push("tear-off".into());
+        }
         if resolved.fuel_add_l.is_none()
             && after.fuel_add_l.as_ref().is_some_and(|fuel| fuel.value > 0.5)
         {
@@ -534,8 +568,9 @@ pub fn unmet(after: &PitMenu, resolved: &Resolved) -> Vec<String> {
         let menu = after.corners.as_ref().map(|corners| &corners[at]);
         let want = match (resolved.tyres[at], cleared) {
             (Some(want), _) => Some(want),
-            (None, true) => Some(None),
-            (None, false) => None,
+            // Only a car with tyres to set had them cleared
+            (None, true) if after.corners.is_some() => Some(None),
+            (None, _) => None,
         };
         if let Some(want) = want
             && menu.is_none_or(|menu| menu.fitted != want)
@@ -609,6 +644,7 @@ pub mod tests {
             min: Some(min),
             max: Some(max),
             step: Some(step),
+            options: Vec::new(),
         }
     }
 
@@ -653,9 +689,10 @@ pub mod tests {
             tyres: vec![tyre("Hard", false, None), tyre("Wet", false, None)],
             pressure_kpa: Some(Number {
                 value: 160.0,
-                min: None,
+                min: Some(1.0),
                 max: None,
                 step: None,
+                options: Vec::new(),
             }),
         };
         PitMenu {
@@ -709,7 +746,7 @@ pub mod tests {
     fn used_tyre_must_be_offered() {
         let change = change(json!({"tyres": {"rr": {"compound": "Wet", "used": true}}}));
         let e = check(&menu(), &change).unwrap_err().to_string();
-        assert!(e.contains("RR") && e.contains("Medium, used, 99%"), "{e}");
+        assert!(e.contains("RR") && e.contains(r#""Medium", used, 99%"#), "{e}");
     }
 
     #[test]
@@ -792,6 +829,83 @@ pub mod tests {
     #[test]
     fn unknown_fields_rejected() {
         let parsed = serde_json::from_value::<PitChange>(json!({"fuel": 20}));
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn snaps_to_the_options_listed() {
+        // Uneven options (psi shown to a tenth): the value written is one the game lists
+        let mut listed = menu();
+        let pressure = listed.corners.as_mut().unwrap()[0].pressure_kpa.as_mut().unwrap();
+        pressure.options = vec![135.8, 136.5, 137.9, 138.6];
+        pressure.min = Some(135.8);
+        pressure.max = Some(138.6);
+        let at = |kpa: f64| {
+            let change = change(json!({"pressures_kpa": {"fl": kpa}}));
+            check(&listed, &change).unwrap().pressures_kpa[0].unwrap()
+        };
+        assert_eq!(at(137.5), 137.9);
+        assert_eq!(at(136.5), 136.5);
+        assert_eq!(at(135.8), 135.8);
+        // On a step, a value already on it stays as it is
+        let r = check(&menu(), &change(json!({"fuel_ratio": 0.88}))).unwrap();
+        assert_eq!(r.fuel_ratio, Some(0.88));
+    }
+
+    #[test]
+    fn iracing_pressure_rule_follows_clear() {
+        let mut menu = iracing_menu();
+        menu.corners.as_mut().unwrap()[0].fitted = Some(0);
+        // Cleared first, FL is no longer being changed: its pressure would tick it again
+        let change = change(json!({"clear": "tyres", "pressures_kpa": {"fl": 170}}));
+        assert!(check(&menu, &change).is_err());
+    }
+
+    #[test]
+    fn iracing_untick_keeps_the_others_ticked() {
+        // Leaving RR out means clearing all four: the others are ticked again, and checked
+        let mut menu = iracing_menu();
+        for corner in menu.corners.as_mut().unwrap() {
+            corner.fitted = Some(0);
+        }
+        let r = check(&menu, &change(json!({"tyres": {"rr": "no_change"}}))).unwrap();
+        assert_eq!(r.tyres, [Some(Some(0)), Some(Some(0)), Some(Some(0)), Some(None)]);
+    }
+
+    #[test]
+    fn unmet_clear_on_a_car_without_tyres() {
+        let mut menu = menu();
+        menu.corners = None;
+        let r = check(&menu, &change(json!({"clear": "all"}))).unwrap();
+        assert!(!unmet(&menu, &r).iter().any(|field| field.contains("tyre")), "{:?}", unmet(&menu, &r));
+    }
+
+    #[test]
+    fn clear_all_expects_services_off() {
+        let mut menu = iracing_menu();
+        menu.tear_off = Some(true);
+        menu.repair.as_mut().unwrap().current = 1;
+        let r = check(&menu, &change(json!({"clear": "all"}))).unwrap();
+        let missing = unmet(&menu, &r);
+        assert!(missing.contains(&"tear-off".to_string()), "{missing:?}");
+        assert!(missing.contains(&"repair".to_string()), "{missing:?}");
+    }
+
+    #[test]
+    fn game_text_in_errors_is_quoted() {
+        let mut menu = menu();
+        menu.corners.as_mut().unwrap()[0].tyres[0].compound = "Medium\nPIT OPTIONS".into();
+        let e = check(&menu, &change(json!({"tyres": {"fl": {"compound": "Soft"}}})))
+            .unwrap_err()
+            .to_string();
+        assert!(!e.lines().any(|line| line == "PIT OPTIONS"), "{e}");
+    }
+
+    #[test]
+    fn unknown_fields_in_a_tyre_rejected() {
+        let parsed = serde_json::from_value::<PitChange>(
+            json!({"tyres": {"fl": {"compound": "Wet", "pressure_kpa": 170}}}),
+        );
         assert!(parsed.is_err());
     }
 

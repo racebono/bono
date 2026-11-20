@@ -68,13 +68,16 @@ impl LmuPit {
         }
     }
 
-    /// Where the player's car is now
+    /// Where the player's car is now (unknown in the garage, which LMU calls NONE too)
     fn position(&self) -> anyhow::Result<Position> {
         let standings = self.get(STANDINGS_URL)?;
-        let pit_state = player(&standings)?
-            .and_then(|car| car.get("pitState"))
-            .and_then(Value::as_str);
-        Ok(pit_state.map_or(Position::Unknown, position))
+        let Some(car) = player(&standings)? else {
+            return Ok(Position::Unknown);
+        };
+        if car.get("inGarageStall").and_then(Value::as_bool) == Some(true) {
+            return Ok(Position::Unknown);
+        }
+        Ok((car.get("pitState").and_then(Value::as_str)).map_or(Position::Unknown, position))
     }
 
     fn get(&self, url: &str) -> anyhow::Result<Value> {
@@ -126,14 +129,17 @@ impl PitService for LmuPit {
         let start = Instant::now();
         loop {
             std::thread::sleep(REQUEST_POLL);
-            match settled(request, self.position()?) {
-                Some(outcome) => return Ok(outcome),
-                None if start.elapsed() >= REQUEST_WAIT => bail!(
-                    "LMU didn't take the Pit Request key ({}): is it bound to that key in the \
-                     game's controls?",
+            // The key's pressed: a read that fails (the game hitching on the focus switch) is
+            // only not knowing yet
+            if let Some(outcome) = self.position().ok().and_then(|now| settled(request, now)) {
+                return Ok(outcome);
+            }
+            if start.elapsed() >= REQUEST_WAIT {
+                bail!(
+                    "the Pit Request key ({}) was pressed, but LMU hasn't shown the change: is \
+                     it bound to that key in the game's controls?",
                     crate::sim::key_name(key)
-                ),
-                _ => {}
+                );
             }
         }
     }
@@ -143,7 +149,10 @@ impl PitService for LmuPit {
 /// once the car is plainly on track without a request, not while LMU doesn't say where it is.
 fn settled(request: bool, now: Position) -> Option<StopOutcome> {
     match (request, now) {
-        (true, Position::StopRequested) => Some(StopOutcome::Requested),
+        // Pressed at the pit entry, the car may already be in
+        (true, Position::StopRequested | Position::Entering | Position::Stopped) => {
+            Some(StopOutcome::Requested)
+        }
         (false, Position::OnTrack) => Some(StopOutcome::Cancelled),
         _ => None,
     }
@@ -158,10 +167,15 @@ fn decide(request: bool, now: Position) -> anyhow::Result<Option<StopOutcome>> {
         (true, Position::Entering | Position::Stopped | Position::Exiting) => {
             bail!("the car is already in the pits")
         }
-        (true, Position::Unknown) => bail!("LMU doesn't say where the car is: is it on track?"),
+        (_, Position::Unknown) => {
+            bail!("LMU doesn't say where the car is: is it on track, not in the garage?")
+        }
         (true, Position::OnTrack) => None,
         (false, Position::StopRequested) => None,
-        (false, _) => Some(StopOutcome::NotRequested),
+        (false, Position::OnTrack) => Some(StopOutcome::NotRequested),
+        (false, Position::Entering | Position::Stopped | Position::Exiting) => {
+            bail!("the car is already in the pits: there's no request left to cancel")
+        }
     })
 }
 
@@ -231,7 +245,7 @@ fn leading_number(text: &str) -> Option<f64> {
 
 /// What's left of a used tyre's tread: the number before the text's last `%`.
 fn tread(text: &str) -> Option<f64> {
-    let before = text.trim_end().strip_suffix('%')?;
+    let before = text.trim_end().strip_suffix('%')?.trim_end();
     let start = (before.char_indices().rev())
         .find(|(_, c)| !(c.is_ascii_digit() || *c == '.' || *c == ','))
         .map_or(0, |(at, c)| at + c.len_utf8());
@@ -268,6 +282,7 @@ fn number(row: &Row, name: &str) -> anyhow::Result<Number> {
         min: numbers.first().copied(),
         max: numbers.last().copied(),
         step,
+        options: numbers,
     })
 }
 
@@ -329,9 +344,17 @@ pub fn player(standings: &Value) -> anyhow::Result<Option<&Value>> {
 pub fn parse(rows: &Value, standings: &Value) -> anyhow::Result<PitMenu> {
     let rows = rows.as_array().context("LMU's pit menu isn't a list of rows")?;
     let player = player(standings)?;
+    let in_garage = player
+        .and_then(|car| car.get("inGarageStall"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let mut menu = PitMenu {
-        position: (player.and_then(|car| car.get("pitState")).and_then(Value::as_str))
-            .map_or(Position::Unknown, position),
+        // LMU says NONE in the garage too: that isn't on track
+        position: match in_garage {
+            true => Position::Unknown,
+            false => (player.and_then(|car| car.get("pitState")).and_then(Value::as_str))
+                .map_or(Position::Unknown, position),
+        },
         ..PitMenu::default()
     };
 
@@ -496,6 +519,10 @@ pub fn apply(rows: &Value, menu: &PitMenu, change: &Resolved) -> anyhow::Result<
         set.push((REPLACE_BRAKES, usize::from(want)));
     }
 
+    // Never a no-op write: an empty or unchanged menu sent back is untested with LMU
+    if set.is_empty() {
+        bail!("nothing in the change is on this car's pit menu");
+    }
     let rows = out.as_array_mut().context("LMU's pit menu isn't a list of rows")?;
     for (name, at) in set {
         let row = (rows.iter_mut())
@@ -697,6 +724,51 @@ mod tests {
         // The metric menu stays as it is
         let metric = parsed().corners.unwrap()[0].pressure_kpa.clone().unwrap();
         assert_eq!((metric.value, metric.step), (136.0, Some(1.0)));
+    }
+
+    #[test]
+    fn every_psi_option_round_trips() {
+        // Each pressure the game lists, asked for in kPa, is written as that very option
+        let rows = fixture("pit_menu_psi_es.json");
+        let m = parse(&rows, &fixture("standings.json")).unwrap();
+        let options = m.corners.as_ref().unwrap()[0].pressure_kpa.clone().unwrap().options;
+        assert_eq!(options.len(), 75);
+        for (at, kpa) in options.iter().enumerate() {
+            let change = PitChange {
+                pressures_kpa: CornerMap { fl: Some(*kpa), ..Default::default() },
+                ..Default::default()
+            };
+            let out = apply(&rows, &m, &check(&m, &change).unwrap()).unwrap();
+            assert_eq!(current(&out, "FL PRESS:"), at as u64, "{kpa}");
+        }
+    }
+
+    #[test]
+    fn garage_is_not_on_track() {
+        let mut standings = fixture("standings.json");
+        standings[0]["inGarageStall"] = true.into();
+        let m = parse(&menu_rows(), &standings).unwrap();
+        assert_eq!(m.position, Position::Unknown);
+    }
+
+    #[test]
+    fn nothing_to_write_writes_nothing() {
+        let change = Resolved { clear: Some(Clear::All), ..Default::default() };
+        assert!(apply(&serde_json::json!([]), &PitMenu::default(), &change).is_err());
+    }
+
+    #[test]
+    fn tread_with_a_space_before_percent() {
+        assert_eq!(tread("Used Medium 99 %"), Some(99.0));
+    }
+
+    #[test]
+    fn stop_outcomes_in_the_pits() {
+        // Pressed at the pit entry: the stop's on
+        assert_eq!(settled(true, Position::Entering), Some(StopOutcome::Requested));
+        // No cancel to report where it isn't known whether a stop was asked for
+        assert!(decide(false, Position::Entering).is_err());
+        assert!(decide(false, Position::Unknown).is_err());
     }
 
     #[test]

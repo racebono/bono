@@ -794,6 +794,7 @@
       "files": [],
       "session": "race",
       "pit": {
+        "game": "lmu",
         "menu": "PIT MENU NOW: car on track; energy 60%; fuel ratio 0.88; FL no change 136 kPa; FR no change 136 kPa; RL no change 136 kPa; RR no change 136 kPa; repair \"No reparar\"; replace brakes no\nPIT OPTIONS (the `pit` tool's fields)\nenergy_leave_pct: energy the car leaves with, 0–100%\nfuel_ratio: 0.01–1.17\ntyres FL: \"Medium\" new, \"Wet\" new, \"Medium\" used 96%\ntyres FR: \"Medium\" new, \"Wet\" new, \"Medium\" used 97%\ntyres RL: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\ntyres RR: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\npressures_kpa: 136–210 kPa\nrepair: \"No reparar\", \"Reparar carrocería\"\nreplace_brakes: true or false",
         "position": "on track",
         "takes": true
@@ -811,6 +812,7 @@
       "files": [],
       "session": "race",
       "pit": {
+        "game": "lmu",
         "menu": "PIT MENU NOW: car on track; energy 60%; fuel ratio 0.88; FL no change 136 kPa; FR no change 136 kPa; RL no change 136 kPa; RR no change 136 kPa; repair \"No reparar\"; replace brakes no\nPIT OPTIONS (the `pit` tool's fields)\nenergy_leave_pct: energy the car leaves with, 0–100%\nfuel_ratio: 0.01–1.17\ntyres FL: \"Medium\" new, \"Wet\" new, \"Medium\" used 96%\ntyres FR: \"Medium\" new, \"Wet\" new, \"Medium\" used 97%\ntyres RL: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\ntyres RR: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\npressures_kpa: 136–210 kPa\nrepair: \"No reparar\", \"Reparar carrocería\"\nreplace_brakes: true or false",
         "position": "on track",
         "takes": true
@@ -827,6 +829,7 @@
       "files": [],
       "session": "race",
       "pit": {
+        "game": "lmu",
         "menu": "PIT MENU NOW: car on track; energy 60%; fuel ratio 0.88; FL no change 136 kPa; FR no change 136 kPa; RL no change 136 kPa; RR no change 136 kPa; repair \"No reparar\"; replace brakes no\nPIT OPTIONS (the `pit` tool's fields)\nenergy_leave_pct: energy the car leaves with, 0–100%\nfuel_ratio: 0.01–1.17\ntyres FL: \"Medium\" new, \"Wet\" new, \"Medium\" used 96%\ntyres FR: \"Medium\" new, \"Wet\" new, \"Medium\" used 97%\ntyres RL: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\ntyres RR: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\npressures_kpa: 136–210 kPa\nrepair: \"No reparar\", \"Reparar carrocería\"\nreplace_brakes: true or false",
         "position": "on track",
         "takes": true
@@ -844,6 +847,7 @@
       "files": [],
       "session": "race",
       "pit": {
+        "game": "lmu",
         "menu": "PIT MENU NOW: car on track; energy 60%; fuel ratio 0.88; FL no change 136 kPa; FR no change 136 kPa; RL no change 136 kPa; RR no change 136 kPa; repair \"No reparar\"; replace brakes no\nPIT OPTIONS (the `pit` tool's fields)\nenergy_leave_pct: energy the car leaves with, 0–100%\nfuel_ratio: 0.01–1.17\ntyres FL: \"Medium\" new, \"Wet\" new, \"Medium\" used 96%\ntyres FR: \"Medium\" new, \"Wet\" new, \"Medium\" used 97%\ntyres RL: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\ntyres RR: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\npressures_kpa: 136–210 kPa\nrepair: \"No reparar\", \"Reparar carrocería\"\nreplace_brakes: true or false",
         "position": "on track",
         "takes": true
@@ -861,13 +865,14 @@
       "files": [],
       "session": "race",
       "pit": {
+        "game": "lmu",
         "menu": "PIT MENU NOW: car stopped in its box; energy 60%; fuel ratio 0.88; FL no change 136 kPa; FR no change 136 kPa; RL no change 136 kPa; RR no change 136 kPa; repair \"No reparar\"; replace brakes no\nPIT OPTIONS (the `pit` tool's fields)\nenergy_leave_pct: energy the car leaves with, 0–100%\nfuel_ratio: 0.01–1.17\ntyres FL: \"Medium\" new, \"Wet\" new, \"Medium\" used 96%\ntyres FR: \"Medium\" new, \"Wet\" new, \"Medium\" used 97%\ntyres RL: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\ntyres RR: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\npressures_kpa: 136–210 kPa\nrepair: \"No reparar\", \"Reparar carrocería\"\nreplace_brakes: true or false",
         "position": "stopped in its box",
         "takes": true
       },
       "assertions": [
         "One `pit` `change` fitting new wets on all four",
-        "Says the change counts for the next stop, probably, not this one"
+        "Says the change counts for the next stop, not this one"
       ]
     },
     {
@@ -877,6 +882,7 @@
       "files": [],
       "session": "race",
       "pit": {
+        "game": "lmu",
         "menu": "PIT MENU NOW: car on track; energy 60%; fuel ratio 0.88; FL no change 136 kPa; FR no change 136 kPa; RL no change 136 kPa; RR no change 136 kPa; repair \"No reparar\"; replace brakes no\nPIT OPTIONS (the `pit` tool's fields)\nenergy_leave_pct: energy the car leaves with, 0–100%\nfuel_ratio: 0.01–1.17\ntyres FL: \"Medium\" new, \"Wet\" new, \"Medium\" used 96%\ntyres FR: \"Medium\" new, \"Wet\" new, \"Medium\" used 97%\ntyres RL: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\ntyres RR: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\npressures_kpa: 136–210 kPa\nrepair: \"No reparar\", \"Reparar carrocería\"\nreplace_brakes: true or false",
         "position": "on track",
         "takes": true
@@ -893,6 +899,7 @@
       "files": [],
       "session": "race",
       "pit": {
+        "game": "lmu",
         "menu": "PIT MENU NOW: car on track; energy 60%; fuel ratio 0.88; FL no change 136 kPa; FR no change 136 kPa; RL no change 136 kPa; RR no change 136 kPa; repair \"No reparar\"; replace brakes no\nPIT OPTIONS (the `pit` tool's fields)\nenergy_leave_pct: energy the car leaves with, 0–100%\nfuel_ratio: 0.01–1.17\ntyres FL: \"Medium\" new, \"Wet\" new, \"Medium\" used 96%\ntyres FR: \"Medium\" new, \"Wet\" new, \"Medium\" used 97%\ntyres RL: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\ntyres RR: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\npressures_kpa: 136–210 kPa\nrepair: \"No reparar\", \"Reparar carrocería\"\nreplace_brakes: true or false",
         "position": "on track",
         "takes": true
@@ -909,6 +916,7 @@
       "files": [],
       "session": "race",
       "pit": {
+        "game": "lmu",
         "menu": "PIT MENU NOW: car on track; energy 60%; fuel ratio 0.88; FL no change 136 kPa; FR no change 136 kPa; RL no change 136 kPa; RR no change 136 kPa; repair \"No reparar\"; replace brakes no\nPIT OPTIONS (the `pit` tool's fields)\nenergy_leave_pct: energy the car leaves with, 0–100%\nfuel_ratio: 0.01–1.17\ntyres FL: \"Medium\" new, \"Wet\" new, \"Medium\" used 96%\ntyres FR: \"Medium\" new, \"Wet\" new, \"Medium\" used 97%\ntyres RL: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\ntyres RR: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\npressures_kpa: 136–210 kPa\nrepair: \"No reparar\", \"Reparar carrocería\"\nreplace_brakes: true or false",
         "position": "on track",
         "takes": true
@@ -935,6 +943,7 @@
       "files": [],
       "session": "race",
       "pit": {
+        "game": "lmu",
         "menu": "PIT MENU NOW: car on track; energy 60%; fuel ratio 0.88; FL no change 136 kPa; FR no change 136 kPa; RL no change 136 kPa; RR no change 136 kPa; repair \"No reparar\"; replace brakes no\nPIT OPTIONS (the `pit` tool's fields)\nenergy_leave_pct: energy the car leaves with, 0–100%\nfuel_ratio: 0.01–1.17\ntyres FL: \"Medium\" new, \"Wet\" new, \"Medium\" used 96%\ntyres FR: \"Medium\" new, \"Wet\" new, \"Medium\" used 97%\ntyres RL: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\ntyres RR: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\npressures_kpa: 136–210 kPa\nrepair: \"No reparar\", \"Reparar carrocería\"\nreplace_brakes: true or false",
         "position": "on track",
         "takes": true
@@ -959,6 +968,7 @@
       "files": [],
       "session": "race",
       "pit": {
+        "game": "lmu",
         "menu": "PIT MENU NOW: car on track; energy 20%; fuel ratio 0.88; FL no change 136 kPa; FR no change 136 kPa; RL no change 136 kPa; RR no change 136 kPa; repair \"No reparar\"; replace brakes no\nPIT OPTIONS (the `pit` tool's fields)\nenergy_leave_pct: energy the car leaves with, 0–100%\nfuel_ratio: 0.01–1.17\ntyres FL: \"Medium\" new, \"Wet\" new, \"Medium\" used 96%\ntyres FR: \"Medium\" new, \"Wet\" new, \"Medium\" used 97%\ntyres RL: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\ntyres RR: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\npressures_kpa: 136–210 kPa\nrepair: \"No reparar\", \"Reparar carrocería\"\nreplace_brakes: true or false",
         "position": "on track",
         "takes": true
@@ -983,6 +993,7 @@
       "files": [],
       "session": "race",
       "pit": {
+        "game": "lmu",
         "menu": "PIT MENU NOW: car on track; energy 60%; fuel ratio 0.88; FL no change 136 kPa; FR no change 136 kPa; RL no change 136 kPa; RR no change 136 kPa; repair \"No reparar\"; replace brakes no\nPIT OPTIONS (the `pit` tool's fields)\nenergy_leave_pct: energy the car leaves with, 0–100%\nfuel_ratio: 0.01–1.17\ntyres FL: \"Medium\" new, \"Wet\" new, \"Medium\" used 96%\ntyres FR: \"Medium\" new, \"Wet\" new, \"Medium\" used 97%\ntyres RL: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\ntyres RR: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\npressures_kpa: 136–210 kPa\nrepair: \"No reparar\", \"Reparar carrocería\"\nreplace_brakes: true or false",
         "position": "on track",
         "takes": false
@@ -990,6 +1001,23 @@
       "assertions": [
         "Says the wets didn't take",
         "Never says a change was made that the transcript has no `change` for, or that its result lists as not taken"
+      ]
+    },
+    {
+      "id": 59,
+      "prompt": "wets on all four",
+      "expected_output": "Controlled synthetic fixture; pit service",
+      "files": [],
+      "session": "race",
+      "pit": {
+        "game": "iracing",
+        "menu": "PIT MENU NOW: car leaving the pits; fuel added 0 L; FL no change 165 kPa; FR no change 165 kPa; RL no change 160 kPa; RR no change 160 kPa; repair \"off\"; tear-off no\nPIT OPTIONS (the `pit` tool's fields)\nfuel_add_l: litres added, 0–110 L\ntyres FL: \"Hard\" new, \"Wet\" new\ntyres FR: \"Hard\" new, \"Wet\" new\ntyres RL: \"Hard\" new, \"Wet\" new\ntyres RR: \"Hard\" new, \"Wet\" new\npressures_kpa: from 1 kPa\niRacing: one compound for every tyre fitted; a pressure only for a tyre being changed; every service is ticked again as the car leaves the pits; repair is a fast repair, of which a race has a limited number\nrepair: \"off\", \"on\"\ntear_off: true or false",
+        "position": "leaving the pits",
+        "takes": true
+      },
+      "assertions": [
+        "Says the change won't stick, and offers to set it again once back on track",
+        "Never says the wets are set for this stop or the next one"
       ]
     }
   ]

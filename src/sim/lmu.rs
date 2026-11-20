@@ -279,7 +279,6 @@ impl Simulator for LeMansUltimate {
         );
     }
 
-    /// The plugin clears its data when the "clear" count in settings.json changes.
     fn pit(&self) -> Option<Arc<dyn PitService>> {
         Some(self.pit.clone())
     }
@@ -288,6 +287,7 @@ impl Simulator for LeMansUltimate {
         *self.pit_key.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The plugin clears its data when the "clear" count in settings.json changes.
     fn clear(&mut self) {
         self.update_settings("asking Le Mans Ultimate to clear its data", |json| {
             let clear = json.get("clear").and_then(Value::as_i64).unwrap_or(0);

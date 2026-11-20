@@ -92,11 +92,14 @@ fn parse(frame: &Frame, tires: &HashMap<i64, String>, fuel_capacity: Option<f64>
                 })
                 .collect(),
             // Limits are iRacing's to apply: the read-back says what it set
+            // A pressure of 0 means "the one set" to the command; iRacing limits the rest, and
+            // the read-back says what it set
             pressure_kpa: frame.f64(PRESSURES[corner as usize]).map(|value| Number {
                 value,
-                min: None,
+                min: Some(1.0),
                 max: None,
                 step: None,
+                options: Vec::new(),
             }),
         })
     });
@@ -109,9 +112,11 @@ fn parse(frame: &Frame, tires: &HashMap<i64, String>, fuel_capacity: Option<f64>
                 _ => amount,
             },
             min: Some(0.0),
-            max: fuel_capacity,
+            // Whole litres: a fractional tank's top is the whole litre under it
+            max: fuel_capacity.map(f64::floor),
             // The command takes whole litres
             step: Some(1.0),
+            options: Vec::new(),
         }),
         corners,
         iracing_tyres: true,
@@ -134,7 +139,9 @@ fn position(frame: &Frame) -> Position {
     match frame.i32("PlayerCarPitSvStatus") {
         Some(PIT_SV_IN_PROGRESS) => Position::Stopped,
         Some(PIT_SV_COMPLETE) => Position::Exiting,
-        _ if frame.bool("PlayerCarInPitStall") == Some(true) => Position::Stopped,
+        // In the box with no service running: at the session's start, the car leaves it with
+        // every service ticked again; arriving for a stop, the service is about to start
+        _ if frame.bool("PlayerCarInPitStall") == Some(true) => Position::Unknown,
         _ => Position::Entering,
     }
 }
@@ -152,16 +159,16 @@ fn commands(menu: &PitMenu, change: &Resolved) -> Vec<(u16, u32)> {
         change.clear.is_none()
             && (menu.corners.as_ref()).is_some_and(|corners| corners[at].fitted.is_some())
     };
-    // One compound for the stop, before the tyres it goes on
-    if let Some(compound) = change.tyres.iter().find_map(|tyre| tyre.flatten()) {
-        out.push((COMPOUND, compound as u32));
-    }
     let pressure = |at: usize| change.pressures_kpa[at].map_or(0, |kpa| kpa.round() as u32);
     let mode = |at: usize| LF + at as u16;
     // A tyre can only be left out by clearing them all and ticking the others again
     let untick = (0..4).any(|at| change.tyres[at] == Some(None) && fitted_now(at));
     if untick {
         out.push((CLEAR_TIRES, 0));
+    }
+    // One compound for the stop, after any clear (which may reset it) and before the tyres
+    if let Some(compound) = change.tyres.iter().find_map(|tyre| tyre.flatten()) {
+        out.push((COMPOUND, compound as u32));
     }
     for at in 0..4 {
         let fit = match change.tyres[at] {
@@ -271,11 +278,37 @@ mod tests {
             .position
         };
         assert_eq!(at(0, false), Position::Entering);
-        assert_eq!(at(0, true), Position::Stopped);
+        // In the box with no service (the session's start): leaving it ticks everything again
+        assert_eq!(at(0, true), Position::Unknown);
         assert_eq!(at(PIT_SV_IN_PROGRESS, true), Position::Stopped);
         assert_eq!(at(PIT_SV_COMPLETE, false), Position::Exiting);
         // Serviced, still in the box: what's set now is cleared, as when it drives off
         assert_eq!(at(PIT_SV_COMPLETE, true), Position::Exiting);
+    }
+
+    #[test]
+    fn fuel_and_pressure_limits() {
+        let (vars, data) = Vars::of(&[
+            ("PitSvFlags", Value::Int(0)),
+            ("PitSvFuel", Value::Double(0.0)),
+            ("PitSvLFP", Value::Double(165.0)),
+        ]);
+        let m = parse(&Frame::new(&vars, &data), &tires(), Some(101.92));
+        // Whole litres: a fractional tank's top is the whole litre under it
+        assert_eq!(m.fuel_add_l.unwrap().max, Some(101.0));
+        assert_eq!(m.corners.unwrap()[0].pressure_kpa.as_ref().unwrap().min, Some(1.0));
+    }
+
+    #[test]
+    fn compound_follows_the_untick() {
+        // A clear of the tyres may reset the compound: it's sent after it
+        let m = frame_menu((LF_TIRE | RF_TIRE | LR_TIRE | RR_TIRE) as i32, 0, &[]);
+        let mut r = Resolved::default();
+        r.tyres = [Some(Some(1)), Some(Some(0)), Some(Some(0)), Some(None)];
+        let sent = commands(&m, &r);
+        let clear = sent.iter().position(|c| *c == (7, 0)).unwrap();
+        let compound = sent.iter().position(|c| c.0 == 12).unwrap();
+        assert!(clear < compound, "{sent:?}");
     }
 
     #[test]

@@ -137,24 +137,24 @@ impl PitTool {
     }
 
     async fn run(&self, input: PitInput) -> anyhow::Result<String> {
-        match input {
-            PitInput::Read => {
-                let menu = self.read().await?;
-                Ok(format!("{}\n{}", options_text(&menu), current_text(&menu)))
-            }
-            PitInput::Change(change) => {
-                let _one = self.one_at_a_time.lock().await;
-                self.change(change).await
-            }
-            PitInput::RequestStop => {
-                let _one = self.one_at_a_time.lock().await;
-                self.stop(true).await
-            }
-            PitInput::CancelStop => {
-                let _one = self.one_at_a_time.lock().await;
-                self.stop(false).await
-            }
+        if let PitInput::Read = input {
+            let menu = self.read().await?;
+            return Ok(format!("{}\n{}", options_text(&menu), current_text(&menu)));
         }
+        // One at a time, and to the end even if the turn that asked is dropped: its write or key
+        // press goes on regardless, so the next call must wait for it
+        let tool = self.clone();
+        tokio::spawn(async move {
+            let _one = tool.one_at_a_time.lock().await;
+            match input {
+                PitInput::Change(change) => tool.change(change).await,
+                PitInput::RequestStop => tool.stop(true).await,
+                PitInput::CancelStop => tool.stop(false).await,
+                PitInput::Read => unreachable!("answered above"),
+            }
+        })
+        .await
+        .context("the pit change stopped")?
     }
 
     async fn change(&self, change: PitChange) -> anyhow::Result<String> {
@@ -166,18 +166,37 @@ impl PitTool {
             .await
             .context("the pit menu write stopped")??;
 
+        // Read back until it shows, or the wait ends: a read that fails is only not knowing yet
         let start = tokio::time::Instant::now();
-        let (after, missing) = loop {
-            let after = self.read().await?;
-            let missing = unmet(&after, &resolved);
-            if missing.is_empty() || start.elapsed() >= self.settle {
-                break (after, missing);
+        let mut last = None;
+        loop {
+            if let Ok(after) = self.read().await {
+                let missing = unmet(&after, &resolved);
+                let done = missing.is_empty();
+                last = Some((after, missing));
+                if done {
+                    break;
+                }
+            }
+            if start.elapsed() >= self.settle {
+                break;
             }
             tokio::time::sleep(SETTLE_POLL).await;
+        }
+        let Some((after, missing)) = last else {
+            return Ok("The change was sent, but the pit menu couldn't be read back to confirm \
+                       it: say it's not confirmed."
+                .into());
         };
 
         let mut text = current_text(&after);
-        let when = match timing(before.position, before.iracing_tyres) {
+        let iracing = before.iracing_tyres;
+        // The car moving on between the two reads (stopping, its service ending) leaves it open
+        let when = match timing(before.position, iracing) {
+            when if when == timing(after.position, iracing) => when,
+            _ => Timing::Unknown,
+        };
+        let when = match when {
             Timing::ThisStop => "this stop",
             Timing::NextStop => "the next stop",
             Timing::Lost => {
@@ -189,12 +208,16 @@ impl PitTool {
         let _ = write!(text, "\nApplied for: {when}");
         if !missing.is_empty() {
             let _ = write!(text, "\nNot taken: {}", missing.join(", "));
-            // Nothing moved at all: iRacing drops broadcasts from a program running with less
-            // privilege than it
-            if before.iracing_tyres && missing == unmet(&before, &resolved) {
+            // The menu didn't move at all: iRacing drops broadcasts from a program running with
+            // less privilege than it (a value it limited or refused moves nothing either)
+            let unchanged = PitMenu {
+                position: before.position,
+                ..after.clone()
+            } == before;
+            if iracing && unchanged {
                 text.push_str(
-                    "\nNothing in the change took. iRacing ignores Bono's pit commands when it \
-                     runs as administrator and Bono doesn't.",
+                    "\nNothing in the change took. If nothing Bono sets ever takes, iRacing may \
+                     be running as administrator and Bono not.",
                 );
             }
         }
@@ -286,7 +309,8 @@ pub fn options_text(menu: &PitMenu) -> String {
             line(
                 "iRacing",
                 "one compound for every tyre fitted; a pressure only for a tyre being changed; \
-                 every service is ticked again as the car leaves the pits"
+                 every service is ticked again as the car leaves the pits; repair is a fast \
+                 repair, of which a race has a limited number"
                     .into(),
             );
         }
@@ -381,25 +405,46 @@ mod tests {
         menu: Mutex<PitMenu>,
         applies: bool,
         writes: Mutex<u32>,
+        /// Reads fail once something was written
+        blind_after_write: bool,
+        /// Where the car is once something was written
+        moves_to: Option<Position>,
     }
 
     impl FakeService {
         fn new(menu: PitMenu, applies: bool) -> Arc<Self> {
+            Self::with(menu, applies, false, None)
+        }
+
+        fn with(
+            menu: PitMenu,
+            applies: bool,
+            blind_after_write: bool,
+            moves_to: Option<Position>,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 menu: Mutex::new(menu),
                 applies,
                 writes: Mutex::new(0),
+                blind_after_write,
+                moves_to,
             })
         }
     }
 
     impl PitService for FakeService {
         fn read(&self) -> anyhow::Result<PitMenu> {
+            if self.blind_after_write && *self.writes.lock().unwrap() > 0 {
+                anyhow::bail!("the game didn't answer");
+            }
             Ok(self.menu.lock().unwrap().clone())
         }
 
         fn write(&self, _: &PitMenu, change: &Resolved) -> anyhow::Result<()> {
             *self.writes.lock().unwrap() += 1;
+            if let Some(position) = self.moves_to {
+                self.menu.lock().unwrap().position = position;
+            }
             if self.applies {
                 let mut menu = self.menu.lock().unwrap();
                 if let Some(energy) = change.energy_leave_pct {
@@ -481,6 +526,65 @@ mod tests {
             .await
             .unwrap();
         assert!(text.contains("administrator"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn elevation_hint_only_when_nothing_moved() {
+        // The tyre took, the fuel didn't (a clamp, say): not the administrator case
+        let tool = PitTool::new(FakeService::new(crate::sim::pit::tests::iracing_menu(), true));
+        let text = (tool.run(input(serde_json::json!({
+            "action": "change", "tyres": {"fl": {"compound": "Hard"}}, "fuel_add_l": 20
+        }))))
+        .await
+        .unwrap();
+        assert!(text.contains("Not taken: fuel"), "{text}");
+        assert!(!text.contains("administrator"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unread_change_is_sent_not_failed() {
+        let tool = PitTool::new(FakeService::with(menu(), true, true, None));
+        let text = (tool.run(input(serde_json::json!({"action": "change", "energy_leave_pct": 50}))))
+            .await
+            .unwrap();
+        assert!(text.contains("couldn't be read back"), "{text}");
+        assert!(!text.contains("Applied for: this stop"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn timing_unknown_when_the_car_moved_meanwhile() {
+        // LMU: entering when read, stopped by the time it's written
+        let mut entering = menu();
+        entering.position = Position::Entering;
+        let tool = PitTool::new(FakeService::with(entering, true, false, Some(Position::Stopped)));
+        let text = (tool.run(input(serde_json::json!({"action": "change", "energy_leave_pct": 50}))))
+            .await
+            .unwrap();
+        assert!(text.contains("Applied for: unknown"), "{text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dropped_call_still_holds_the_others_off() {
+        // A turn cancelled mid-change: its blocking work goes on, and so must its turn
+        let service = Arc::new(SlowService {
+            menu: Mutex::new(menu()),
+            running: Default::default(),
+            most: Default::default(),
+        });
+        let tool = PitTool::new(service.clone());
+        let first = ToolHandler::handle(&tool, input(serde_json::json!({"action": "change", "energy_leave_pct": 50})));
+        let _ = tokio::time::timeout(Duration::from_millis(10), first).await;
+        tool.run(input(serde_json::json!({"action": "change", "energy_leave_pct": 60})))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(service.most.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn iracing_repair_is_fast_repair() {
+        let text = options_text(&crate::sim::pit::tests::iracing_menu());
+        assert!(text.contains("fast repair"), "{text}");
     }
 
     #[tokio::test]

@@ -38,8 +38,9 @@ fn input(json: &Value) -> anyhow::Result<&serde_json::Map<String, Value>> {
 pub fn pit_request_key(keyboard_json: &str) -> anyhow::Result<Option<u16>> {
     let json: Value = serde_json::from_str(keyboard_json).context("LMU's keyboard.json isn't JSON")?;
     let key = input(&json)?.get(PIT_REQUEST).and_then(Value::as_i64);
-    // Not a key: there's nothing to press
-    Ok(key.and_then(|key| u16::try_from(key).ok()).filter(|key| *key > 0))
+    // Only a keyboard scan code (1 to 0xFF, extended keys over 0x80): anything else isn't a
+    // key there is to press
+    Ok(key.and_then(|key| u16::try_from(key).ok()).filter(|key| (1..=0xFF).contains(key)))
 }
 
 /// The file with Pit Request bound to F11, every other key and value kept: `None` if another
@@ -87,7 +88,11 @@ pub fn upkeep(game: &Game, requests_on: bool) -> Option<PitKeyStatus> {
         let Some(bound) = bind_f11(&text)? else {
             return Ok(PitKeyStatus::F11Taken);
         };
-        std::fs::write(&path, bound)?;
+        // A temporary file moved over it: LMU never reads half a file of the pilot's bindings
+        let mut temp = path.clone().into_os_string();
+        temp.push(".tmp");
+        std::fs::write(&temp, bound)?;
+        std::fs::rename(&temp, &path)?;
         log::info!("Bound F11 to LMU's Pit Request, for the engineer's stop requests");
         anyhow::Ok(PitKeyStatus::Key(F11))
     })();
@@ -222,6 +227,11 @@ mod tests {
     #[test]
     fn reads_bound_key() {
         assert_eq!(pit_request_key(r#"{"Input":{"Pit Request":87}}"#).unwrap(), Some(0x57));
+    }
+
+    #[test]
+    fn only_keyboard_scan_codes() {
+        assert_eq!(pit_request_key(r#"{"Input":{"Pit Request":300}}"#).unwrap(), None);
     }
 
     #[test]
