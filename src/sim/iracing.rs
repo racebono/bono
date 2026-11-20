@@ -22,10 +22,7 @@ use sdk::{Frame, HEADER_LEN, Header, MEMORY_NAME, VERSION, Vars};
 use session::SessionInfo;
 use std::{
     path::PathBuf,
-    sync::{
-        OnceLock,
-        atomic::{AtomicBool, AtomicU32, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
     time::{Duration, Instant},
 };
 
@@ -65,35 +62,46 @@ fn should_pull_live(
 
 /// The SDK's broadcast message (`IRSDK_BROADCASTMSGNAME` in `irsdk_defines.h`).
 const BROADCAST_MESSAGE: &str = "IRSDK_BROADCASTMSG";
+/// `irsdk_BroadcastReplaySetPlaySpeed`, with the speed and whether in slow motion as arguments.
+const BROADCAST_REPLAY_SET_PLAY_SPEED: usize = 3;
 /// `irsdk_BroadcastReplaySearch`, with its mode as the first argument.
 const BROADCAST_REPLAY_SEARCH: usize = 5;
 /// `irsdk_RpySrch_ToEnd`: to the end of the tape, the live session.
 const REPLAY_SEARCH_TO_END: usize = 1;
 
-/// Asks the game to jump its replay to the end of the tape, as `irsdk_defines.h` documents: its
-/// broadcast message, sent to every top-level window, the command in the low word of `wParam` and
-/// its argument in the high word. `SendNotifyMessageW` doesn't wait for windows of other threads.
+/// Asks the game to jump its replay to the end of the tape and play it at normal speed (a paused
+/// one too), as `irsdk_defines.h` documents: its broadcast message, sent to every top-level
+/// window, the command in the low word of `wParam`, its first argument in the high word and its
+/// second in `lParam`. `SendNotifyMessageW` doesn't wait for windows of other threads.
 fn pull_to_live() {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         HWND_BROADCAST, RegisterWindowMessageW, SendNotifyMessageW,
     };
-    static MESSAGE: OnceLock<u32> = OnceLock::new();
-    let message = *MESSAGE.get_or_init(|| {
-        let name: Vec<u16> = BROADCAST_MESSAGE.encode_utf16().chain([0]).collect();
-        // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the call
-        unsafe { RegisterWindowMessageW(name.as_ptr()) }
-    });
+    let name: Vec<u16> = BROADCAST_MESSAGE.encode_utf16().chain([0]).collect();
+    // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the call. Registering the
+    // same name again gives the same message
+    let message = unsafe { RegisterWindowMessageW(name.as_ptr()) };
     if message == 0 {
-        log::debug!("Couldn't register iRacing's broadcast message");
-        return;
-    }
-    let wparam = BROADCAST_REPLAY_SEARCH | (REPLAY_SEARCH_TO_END << 16);
-    // SAFETY: a notification with plain integer arguments, no pointers
-    if unsafe { SendNotifyMessageW(HWND_BROADCAST, message, wparam, 0) } == 0 {
         log::debug!(
-            "Couldn't ask iRacing to jump its replay to live: {}",
+            "Couldn't register iRacing's broadcast message: {}",
             std::io::Error::last_os_error()
         );
+        return;
+    }
+    for (command, first, second) in [
+        (BROADCAST_REPLAY_SEARCH, REPLAY_SEARCH_TO_END, 0),
+        (BROADCAST_REPLAY_SET_PLAY_SPEED, 1, 0),
+    ] {
+        // SAFETY: a notification with plain integer arguments, no pointers
+        if unsafe { SendNotifyMessageW(HWND_BROADCAST, message, command | (first << 16), second) }
+            == 0
+        {
+            log::debug!(
+                "Couldn't ask iRacing to play its replay live: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
     }
 }
 

@@ -306,14 +306,25 @@ impl Converter {
         if info.replay || behind_live(frame, self.behind_live_frames.0) {
             return None;
         }
-        // Watching, the clock going back in the same session is the replay rewound by less than
-        // that: time already recorded, which doesn't reset what's known either
+        // Watching the same event, the replay rewound by less than that, into time already
+        // recorded, isn't recorded again, nor does it reset what's known: the clock going back no
+        // further than that (and a second) in the same session, or an earlier session (sessions
+        // only move on). Further back in the same session, it's the clock going back (a restart)
         let session = (frame.i32("SessionNum"), frame.i32("SessionUniqueID"));
-        if frame.bool("IsReplayPlaying") == Some(true)
-            && self.session == Some(session)
-            && self.last_time.is_some_and(|last| time < last)
-        {
-            return None;
+        let event = (info.event, info.track.clone());
+        if frame.bool("IsReplayPlaying") == Some(true) && self.event.as_ref() == Some(&event) {
+            let reach = f64::from(self.behind_live_frames.0) / f64::from(FRAMES_PER_SECOND) + 1.0;
+            let rewound = self.session == Some(session)
+                && self
+                    .last_time
+                    .is_some_and(|last| time < last && last - time <= reach);
+            let earlier_session = matches!(
+                (session.0, self.session.and_then(|(num, _)| num)),
+                (Some(num), Some(last)) if num < last
+            );
+            if rewound || earlier_session {
+                return None;
+            }
         }
         if self.last_time == Some(time) {
             return None;
@@ -325,7 +336,6 @@ impl Converter {
         let went_back = self.last_time.is_some_and(|last| time < last);
         self.last_time = Some(time);
 
-        let event = (info.event, info.track.clone());
         let new_event = self.event.as_ref().is_some_and(|last| *last != event);
         self.event = Some(event);
         // The recording starts again (see `memory::record`): the setup is sent again
@@ -762,7 +772,9 @@ impl Converter {
                     .filter(|t| *t >= 0.0 && *t < UNLIMITED_TIME);
                 self.session_end = session_end(self.session_end, time, remaining);
                 self.wind = steady_wind(self.wind, wind(frame));
-                Some(self.scoring(frame, info, &cars, player, race, time, &places, &behind))
+                Some(self.scoring(
+                    frame, info, &cars, player, own_car, race, time, &places, &behind,
+                ))
             }
         };
 
@@ -915,6 +927,7 @@ impl Converter {
         info: &SessionInfo,
         cars: &[Car<'_>],
         player: Option<i64>,
+        own_car: bool,
         race: bool,
         time: f64,
         places: &HashMap<i64, (Option<f64>, Option<f64>)>,
@@ -986,6 +999,7 @@ impl Converter {
                     info,
                     car,
                     is_player,
+                    own_car,
                     race,
                     time,
                     places,
@@ -1005,6 +1019,7 @@ impl Converter {
         info: &SessionInfo,
         car: &Car<'_>,
         is_player: bool,
+        own_car: bool,
         race: bool,
         time: f64,
         places: &HashMap<i64, (Option<f64>, Option<f64>)>,
@@ -1012,6 +1027,9 @@ impl Converter {
         phase: &Option<String>,
         result: Option<&super::session::Result>,
     ) -> bono_standing {
+        // The game's own-car variables are the player's car's, except while watching (see
+        // `convert`): it's read like any other car then
+        let own = is_player && own_car;
         let i = car.idx as usize;
         let d = car.driver;
         let track = self.cars.get(&car.idx);
@@ -1083,7 +1101,7 @@ impl Converter {
         }
 
         // The flags shown to the car: the player's own, or each car's where the game has them
-        let flags = match is_player {
+        let flags = match own {
             true => frame.bits("SessionFlags"),
             false => frame.bits_at("CarIdxSessionFlags", i),
         };
@@ -1111,7 +1129,7 @@ impl Converter {
                 .filter(|_| same_car)
                 .cloned()
         };
-        let index = match is_player {
+        let index = match own {
             true => frame
                 .i32("PlayerTireCompound")
                 .or_else(|| frame.i32_at("CarIdxTireCompound", i)),
@@ -1168,7 +1186,7 @@ impl Converter {
         );
         put("team_incidents", json!(d.team_incidents));
 
-        if is_player {
+        if own {
             out.in_garage = frame.bool("IsInGarage").into();
             let services = frame.bits("PitSvFlags");
             let selected = |bits: u32| services.map(|s| s & bits != 0);
@@ -4215,6 +4233,7 @@ mod tests {
                     ("ReplayFrameNumEnd", Value::Int(0)),
                     ("IsOnTrack", Value::Bool(!replay)),
                     ("FuelLevel", Value::Double(50.0)),
+                    ("FuelLevelPct", Value::Double(0.5)),
                     ("CarIdxLapDistPct", Value::Doubles(vec![0.5])),
                     ("CarIdxLapCompleted", Value::Ints(vec![2])),
                 ])
@@ -4222,7 +4241,10 @@ mod tests {
             let mut converter = Converter::default();
             let start = Instant::now();
             let (vars, data) = frame(500.0);
-            converter.convert(&Frame::new(&vars, &data), &info, start);
+            let first = converter
+                .convert(&Frame::new(&vars, &data), &info, start)
+                .unwrap();
+            let (_, standings) = first.scoring.unwrap();
             let (vars, data) = frame(501.0);
             let update = converter
                 .convert(
@@ -4231,10 +4253,13 @@ mod tests {
                     start + std::time::Duration::from_secs(1),
                 )
                 .unwrap();
-            update.telemetry[0].fuel.get()
+            (
+                update.telemetry[0].fuel.get(),
+                standings[0].fuel_fraction.get(),
+            )
         };
-        assert_eq!(fuel(false), Some(50.0));
-        assert_eq!(fuel(true), None);
+        assert_eq!(fuel(false), (Some(50.0), Some(0.5)));
+        assert_eq!(fuel(true), (None, None));
     }
 
     /// A replay rewound by less than the threshold is still a replay of time already recorded:
@@ -4258,19 +4283,71 @@ mod tests {
         assert_eq!(converter.last_time, Some(500.0));
         assert!(converter.cars.contains_key(&0));
         // The next session, watched from its start
-        let (vars, data) = Vars::of(&[
-            ("SessionTime", Value::Double(1.0)),
-            ("SessionNum", Value::Int(1)),
-            ("SessionState", Value::Int(STATE_RACING)),
-            ("PlayerCarIdx", Value::Int(0)),
-            ("IsReplayPlaying", Value::Bool(true)),
-            ("ReplayFrameNumEnd", Value::Int(0)),
-            ("CarIdxLapDistPct", Value::Doubles(vec![0.1])),
-            ("CarIdxLapCompleted", Value::Ints(vec![0])),
-        ]);
+        let next = |t: f64, num: i32| {
+            Vars::of(&[
+                ("SessionTime", Value::Double(t)),
+                ("SessionNum", Value::Int(num)),
+                ("SessionState", Value::Int(STATE_RACING)),
+                ("PlayerCarIdx", Value::Int(0)),
+                ("IsReplayPlaying", Value::Bool(true)),
+                ("ReplayFrameNumEnd", Value::Int(0)),
+                ("CarIdxLapDistPct", Value::Doubles(vec![0.1])),
+                ("CarIdxLapCompleted", Value::Ints(vec![0])),
+            ])
+        };
+        let (vars, data) = next(1.0, 1);
         assert!(
             converter
                 .convert(&Frame::new(&vars, &data), &info, later(2))
+                .is_some()
+        );
+        // Rewound into the session before, by less than the threshold too
+        let (vars, data) = watched(4000.0, true, Some(30));
+        assert!(
+            converter
+                .convert(&Frame::new(&vars, &data), &info, later(3))
+                .is_none()
+        );
+        assert_eq!(converter.last_time, Some(1.0));
+        // Back in it, on
+        let (vars, data) = next(2.0, 1);
+        assert!(
+            converter
+                .convert(&Frame::new(&vars, &data), &info, later(4))
+                .is_some()
+        );
+    }
+
+    /// Watching, the clock going back further than a rewind under the threshold could is the
+    /// session's clock going back (a restart), and another event's session is its own: both are
+    /// recorded.
+    #[test]
+    fn watching_a_restart_or_another_event_is_converted() {
+        let info = one_car_race();
+        let start = Instant::now();
+        let later = |s: u64| start + std::time::Duration::from_secs(s);
+        let mut converter = Converter::default();
+        let (vars, data) = watched(500.0, true, Some(0));
+        converter.convert(&Frame::new(&vars, &data), &info, start);
+        // Restarted: 495 s back, far beyond the 3 s threshold and a second
+        let (vars, data) = watched(5.0, true, Some(0));
+        assert!(
+            converter
+                .convert(&Frame::new(&vars, &data), &info, later(1))
+                .is_some()
+        );
+        // Another event, a second into the same session number
+        let mut converter = Converter::default();
+        let (vars, data) = watched(500.0, true, Some(0));
+        converter.convert(&Frame::new(&vars, &data), &info, start);
+        let other = SessionInfo {
+            event: (Some(2), None, None),
+            ..one_car_race()
+        };
+        let (vars, data) = watched(499.5, true, Some(0));
+        assert!(
+            converter
+                .convert(&Frame::new(&vars, &data), &other, later(1))
                 .is_some()
         );
     }
