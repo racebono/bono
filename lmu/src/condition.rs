@@ -7,7 +7,8 @@
 //! The same thread asks for the player's garage setup (see `garage`), only at two moments: when the
 //! car leaves the garage (realtime starts, or a new player or event) and when it leaves the pit lane
 //! after coming in from the track. Nothing else changes the garage setup, and cockpit changes are in
-//! the telemetry, so it's a handful of questions a session.
+//! the telemetry, so it's a handful of questions a session. The setup's steering wheel range also
+//! stands in for the one the plugin interface often reports as 0 (see `garage::wheel_range`).
 
 use crate::garage;
 use bono_sim::{
@@ -58,6 +59,8 @@ struct State {
     setup_wanted: Option<(SetupSource, u8)>,
     /// The setup read, until the game's thread takes it
     setup: Option<Setup>,
+    /// The steering wheel range in the last setup read since the car left the garage
+    wheel_range: Option<f64>,
     /// Whether the player's car was in the pit lane in its last telemetry
     in_pit_lane: Option<bool>,
     /// Whether it came into the pit lane from the track, or started in it, so leaving it may be
@@ -157,8 +160,9 @@ impl VehicleCondition {
         lock(&self.shared.state).setup.take()
     }
 
-    /// Fills in the player's aero and suspension damage, when the web API answered recently.
-    /// Other cars' stay unknown: the web API only has the player's.
+    /// Fills in the player's aero and suspension damage, when the web API answered recently, and
+    /// their steering wheel range from the setup when the telemetry has none. Other cars' stay
+    /// unknown: the web API only has the player's.
     pub fn fill_telemetry(&self, telemetry: &mut bono_telemetry, is_player: bool) {
         self.fill_at(telemetry, is_player, Instant::now());
     }
@@ -198,6 +202,10 @@ impl VehicleCondition {
                 _ => {}
             }
             state.in_pit_lane = in_pit_lane;
+            // LMU often reports 0, which `lmu.cpp` leaves NULL; one it reports is kept
+            if telemetry.state.steering_wheel_range.get().is_none() {
+                telemetry.state.steering_wheel_range = state.wheel_range.into();
+            }
             state.answer
         };
         let Some((condition, _)) =
@@ -245,6 +253,7 @@ impl State {
     fn leave_garage(&mut self) {
         self.setup_wanted = Some((SetupSource::Garage, SETUP_ATTEMPTS));
         self.setup = None;
+        self.wheel_range = None;
         self.in_pit_lane = None;
         self.came_in = false;
         self.read_since_garage = false;
@@ -304,6 +313,7 @@ impl Shared {
             }
             state.setup_wanted = match setup {
                 Some(setup) => {
+                    state.wheel_range = garage::wheel_range(&setup);
                     state.setup = Some(Setup {
                         source: Some(source),
                         ..setup
@@ -616,6 +626,65 @@ mod tests {
             }],
             ..Setup::default()
         }
+    }
+
+    fn steer_lock(text: &str) -> Setup {
+        Setup {
+            settings: vec![Setting {
+                name: "VM_STEER_LOCK".into(),
+                value: text.into(),
+                ..Setting::default()
+            }],
+            ..Setup::default()
+        }
+    }
+
+    /// The steering wheel range car 1's telemetry ends up with, from `reported` by `lmu.cpp` (NULL
+    /// for LMU's 0).
+    fn wheel_range(
+        condition: &VehicleCondition,
+        reported: Option<f64>,
+        is_player: bool,
+    ) -> Option<f64> {
+        let mut telemetry = bono_telemetry {
+            vehicle_id: Some(1).into(),
+            ..bono_telemetry::default()
+        };
+        telemetry.state.steering_wheel_range = reported.into();
+        condition.fill_at(&mut telemetry, is_player, Instant::now());
+        telemetry.state.steering_wheel_range.get()
+    }
+
+    /// The setup read, from a condition that answers with `setup` once the player drives.
+    fn read_setup(setup: Setup) -> VehicleCondition {
+        let (condition, asked) = asking_setup(Some(setup));
+        condition.set_realtime(true);
+        drive(&condition, false);
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        taken(&condition).unwrap();
+        condition
+    }
+
+    #[test]
+    fn the_setups_wheel_range_stands_in_for_one_lmu_does_not_report() {
+        let condition = read_setup(steer_lock("310 (12) deg"));
+        assert_eq!(wheel_range(&condition, None, true), Some(310.0));
+        // One LMU reports wins
+        assert_eq!(wheel_range(&condition, Some(540.0), true), Some(540.0));
+        // The garage is only the player's
+        assert_eq!(wheel_range(&condition, None, false), None);
+        // A new event's car may be another one: unknown until its setup is read
+        condition.clear();
+        assert_eq!(wheel_range(&condition, None, true), None);
+    }
+
+    #[test]
+    fn an_unknown_steer_lock_leaves_the_wheel_range_unknown() {
+        let condition = read_setup(steer_lock("Non-adjustable"));
+        assert_eq!(wheel_range(&condition, None, true), None);
+        assert_eq!(wheel_range(&condition, Some(540.0), true), Some(540.0));
+        let condition = read_setup(wing());
+        assert_eq!(wheel_range(&condition, None, true), None);
     }
 
     #[test]

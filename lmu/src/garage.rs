@@ -69,6 +69,35 @@ fn parse(body: &str) -> Option<Setup> {
     })
 }
 
+/// The steering wheel's range in degrees, from the setup's `VM_STEER_LOCK`, for when the plugin
+/// interface reports none. Its caption is "Wheel Range (Lock)" and its text is like `310 (12) deg`
+/// (or just `310 deg`): the wheel's range first, then what is likely the front wheels' lock (the GT3
+/// fixture's current and saved texts, `310 (12)` and `240 (9.3)`, keep the same ratio of the two).
+/// Nothing documents that this range is the same quantity as the plugin interface's physical
+/// range, or its span: like that one, it's taken as degrees lock to lock, as other tools take it.
+/// Any other text is none, rather than a guess at which number is the range.
+pub fn wheel_range(setup: &Setup) -> Option<f64> {
+    let setting = setup
+        .settings
+        .iter()
+        .find(|setting| setting.name == "VM_STEER_LOCK")?;
+    let range = match *setting.value.split_whitespace().collect::<Vec<_>>() {
+        [range, "deg"] => range,
+        [range, lock, "deg"] => {
+            lock.strip_prefix('(')
+                .and_then(|lock| lock.strip_suffix(')'))?
+                .parse::<f64>()
+                .ok()?;
+            range
+        }
+        _ => return None,
+    };
+    range
+        .parse::<f64>()
+        .ok()
+        .filter(|range| range.is_finite() && *range > 0.0)
+}
+
 /// A setting, `Some(None)` for one the car lacks, and `None` for one that isn't a setting.
 fn garage_setting(name: &str, setting: &Map<String, Value>) -> Option<Option<Setting>> {
     let text = |key| setting.get(key).and_then(Value::as_str).map(str::trim);
@@ -247,6 +276,53 @@ mod tests {
         assert_eq!(range("VM_DIFF_PRELOAD"), (Some(14), None, None));
         assert_eq!(range("VM_STEER_LOCK"), (None, None, None));
         assert_eq!(setting(&setup, "VM_STEER_LOCK").unwrap().value, "310 deg");
+    }
+
+    fn steer_lock(text: &str) -> Setup {
+        Setup {
+            settings: vec![Setting {
+                name: "VM_STEER_LOCK".into(),
+                value: text.into(),
+                ..Setting::default()
+            }],
+            ..Setup::default()
+        }
+    }
+
+    #[test]
+    fn the_wheel_range_is_the_steer_locks_first_number() {
+        assert_eq!(wheel_range(&parse(GT3).unwrap()), Some(310.0));
+        assert_eq!(wheel_range(&steer_lock("310 deg")), Some(310.0));
+        assert_eq!(wheel_range(&steer_lock("240 (9.3) deg")), Some(240.0));
+        assert_eq!(
+            wheel_range(&steer_lock("  540.5   (14)  deg ")),
+            Some(540.5)
+        );
+    }
+
+    /// Text that isn't like the known ones is no range, rather than a guess.
+    #[test]
+    fn an_unknown_steer_lock_text_is_no_wheel_range() {
+        for text in [
+            "",
+            "deg",
+            "310",
+            "310°",
+            "310 degrees",
+            "Non-adjustable",
+            "12 deg (310)",
+            "(12) 310 deg",
+            "310 (twelve) deg",
+            "310 (12 deg",
+            "310 12 deg",
+            "0 deg",
+            "-310 deg",
+            "inf deg",
+            "NaN (12) deg",
+        ] {
+            assert_eq!(wheel_range(&steer_lock(text)), None, "{text}");
+        }
+        assert_eq!(wheel_range(&Setup::default()), None);
     }
 
     /// With no saved text to compare with, whether it's been changed isn't known.
