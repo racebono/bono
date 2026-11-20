@@ -2200,6 +2200,11 @@ impl CarTrack {
             }
             _ => None,
         };
+        // Gone back over a crossing whose count is still to come: its count, when it comes, leaves
+        // it back over the line (see `moved`)
+        let short_of_line = self
+            .line
+            .is_some_and(|(_, at_distance)| after < at_distance);
         if counted_back {
             // Another session
             self.lap_start = None;
@@ -2270,7 +2275,7 @@ impl CarTrack {
             self.counted_at = Some(due.or(timed_crossing).unwrap_or(time));
             self.counted_lap = lap;
             self.counts_at_line = due.or(timed_crossing).is_some();
-            self.moved = false;
+            self.moved = short_of_line;
         } else if rose {
             self.counts_at_line = false;
             if recovered.is_some() {
@@ -3923,21 +3928,38 @@ mod tests {
     /// keeps the game's place.
     #[test]
     fn back_over_the_line_isnt_a_lap_on() {
-        let updates = [
-            (1.0, STATE_RACING, [0.45, 0.96, 0.5], [6, 5, 5]),
-            (1.25, STATE_RACING, [0.47, 0.98, 0.52], [6, 5, 5]),
-            // Car 1 over the line and counted; then a metre back
-            (1.5, STATE_RACING, [0.49, 0.0005, 0.54], [6, 6, 5]),
-            (1.75, STATE_RACING, [0.51, 0.9995, 0.56], [6, 6, 5]),
-            (2.0, STATE_RACING, [0.53, 0.9995, 0.58], [6, 6, 5]),
-        ];
-        let end = race_of(&updates, [0.0, 0.3, 95.0], None);
-        let (_, standings) = end.scoring.as_ref().unwrap();
-        let place = |car: i64| {
-            let row = standings.iter().find(|s| s.vehicle_id.get() == Some(car));
-            row.and_then(|row| row.position.get())
-        };
-        assert_eq!((place(0), place(1), place(2)), (Some(1), Some(2), Some(3)));
+        // Car 1 over the line at 1.5 s, then a metre back; counted with the crossing, or after it
+        // with going back, or after that
+        for counted in [1.5, 1.75, 2.0] {
+            let updates = [
+                (1.0, 0.96),
+                (1.25, 0.98),
+                (1.5, 0.0005),
+                (1.75, 0.9995),
+                (2.0, 0.9995),
+            ]
+            .map(|(t, pct)| {
+                let laps = if t >= counted { 6 } else { 5 };
+                let other = 0.08 * t;
+                (
+                    t,
+                    STATE_RACING,
+                    [0.37 + other, pct, 0.42 + other],
+                    [6, laps, 5],
+                )
+            });
+            let end = race_of(&updates, [0.0, 0.3, 95.0], None);
+            let (_, standings) = end.scoring.as_ref().unwrap();
+            let place = |car: i64| {
+                let row = standings.iter().find(|s| s.vehicle_id.get() == Some(car));
+                row.and_then(|row| row.position.get())
+            };
+            assert_eq!(
+                (place(0), place(1), place(2)),
+                (Some(1), Some(2), Some(3)),
+                "{counted}"
+            );
+        }
     }
 
     /// A car a lap down, counted out of the world after the flag (its finish, untimed), isn't at
