@@ -77,6 +77,14 @@ impl LapValidity {
         let session_judged = session.session_type.as_deref().is_some_and(|t| t != "race")
             && session.phase.as_deref() == Some("green");
         let mut cars = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        // A replay's (no telemetry comes meanwhile): the laps it spans are begun unseen
+        if standings
+            .iter()
+            .any(|standing| standing.control.as_deref() == Some("replay"))
+        {
+            cars.clear();
+            return;
+        }
         for standing in standings {
             let Some(vehicle) = standing.vehicle_id.get() else {
                 continue;
@@ -435,6 +443,19 @@ mod tests {
         let validity = LapValidity::default();
         scoring(&validity, 1, 6, Some(false), false);
         assert_eq!(telemetry(&validity, 1, 6, false, 0), Some(false));
+    }
+
+    #[test]
+    fn laps_across_a_replay_are_begun_unseen() {
+        let validity = LapValidity::default();
+        seen(&validity, 1, 5);
+        // A replay's scoring (not recorded, and no telemetry meanwhile) while lap 6 begins in the
+        // pits, then lap 6's first live scoring, out of the pits and still not counting
+        let mut replay = standing(1, 5, Some(true), false, "none");
+        replay.control = Some("replay".to_owned()).into();
+        validity.fill_scoring(&session("practice", "green"), &[replay]);
+        scoring(&validity, 1, 6, Some(false), false);
+        assert_eq!(telemetry(&validity, 1, 6, false, 4), Some(false));
     }
 
     #[test]

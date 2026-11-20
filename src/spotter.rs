@@ -1783,6 +1783,8 @@ impl Logic {
         self.follow_lap(player, t);
         // Back from quiet (its standings are kept for the laps): the flags start afresh
         let afresh = self.prev.is_none();
+        // The simulator says whether laps count (LMU): laps' lines are checked
+        let line_checked = scoring.is_some_and(|s| s.lap_time_counts.is_some());
         let prev = self.prev.take();
         if let Some(prev) = &prev {
             let race = scoring.is_some_and(|s| s.session_type.as_deref() == Some("race"));
@@ -1793,6 +1795,7 @@ impl Logic {
                 wheels,
                 t,
                 race && !formation_lap,
+                line_checked,
                 &mut calls,
             );
         }
@@ -1807,15 +1810,15 @@ impl Logic {
         }
         // After the line's check is opened (the lap count and the flag can come in one update):
         // just past a line the lap's verdict is waiting on, the lap just begun is said with it
-        if prev
-            .as_ref()
-            .is_some_and(|prev| player.lap_invalidated && !prev.lap_invalidated)
+        if line_checked
+            && prev
+                .as_ref()
+                .is_some_and(|prev| player.lap_invalidated && !prev.lap_invalidated)
             && self.line_check.is_none()
             && !self.lap_called
         {
             calls.raise("lap invalidated", false);
-            // Elsewhere every rise is called, as before
-            self.lap_called = scoring.is_some_and(|s| s.lap_time_counts.is_some());
+            self.lap_called = true;
         }
 
         self.prev_flat = wheels.flat;
@@ -1940,6 +1943,7 @@ impl Logic {
         wheels: &Wheels,
         t: f64,
         race_gap: bool,
+        line_checked: bool,
         calls: &mut Calls,
     ) {
         let rose = |now: bool, before: bool| now && !before;
@@ -1961,6 +1965,10 @@ impl Logic {
             && (rose(p.car.in_pit_lane, prev.car.in_pit_lane) || prev.limiter.unwrap_or(false))
         {
             calls.raise("limiter, limiter", true);
+        }
+        // Where laps' lines are checked, it's said after the line's check (see `update`)
+        if !line_checked && rose(p.lap_invalidated, prev.lap_invalidated) {
+            calls.raise("lap invalidated", false);
         }
 
         // A car closing to within a second, called again only once it's dropped back. Not on the
@@ -2023,7 +2031,8 @@ impl Logic {
             // chance to come (it may already have, a row before the count). Judged by how it
             // began: not in races, which give points instead, nor once the session or the
             // player's over, nor a lap begun before the spotter was following (pit lane unseen)
-            self.line_check = self.lap_judged.then(|| LineCheck {
+            // A lap already called isn't judged again, but what follows it is still said
+            self.line_check = (self.lap_judged || self.lap_called).then(|| LineCheck {
                 at: t,
                 called: self.lap_called,
                 pit: self.lap_in_pit_lane,
@@ -4850,6 +4859,49 @@ mod tests {
             );
         }
         assert_eq!(calls, ["lap invalidated"]);
+    }
+
+    #[test]
+    fn called_lap_unjudged_then_carried_over_says_next_lap() {
+        // Joined mid-lap: the lap's line isn't checked, but the next lap's loss is still news
+        assert_eq!(
+            line_calls_with(
+                "none",
+                &[
+                    (50.0, 4, None, false, false, Some(true)),
+                    (60.0, 4, None, false, true, Some(false)),
+                    (110.0, 5, None, false, false, Some(false)),
+                    (110.2, 5, None, false, true, Some(false)),
+                    (113.5, 5, None, false, true, Some(false)),
+                    (150.0, 5, None, false, true, Some(false)),
+                ]
+            ),
+            ["lap invalidated", "next lap invalidated"]
+        );
+    }
+
+    #[test]
+    fn raceroom_lap_invalidated_is_said_before_the_flags_as_before() {
+        let mut logic = Logic::default();
+        let mut said = Vec::new();
+        for (t, invalidated, penalties) in [(10.0, false, 0), (20.0, true, 1)] {
+            let scoring = Scoring {
+                session_type: Some("practice".into()),
+                laps_completed: Some(4),
+                penalties: Some(penalties),
+                ..Scoring::default()
+            };
+            let mut p = player(t);
+            p.lap_invalidated = invalidated;
+            said = texts(logic.update(
+                &SpotterConfig::default(),
+                &p,
+                &[],
+                &Wheels::default(),
+                Some(&scoring),
+            ));
+        }
+        assert_eq!(said, ["lap invalidated", "penalty"]);
     }
 
     #[test]
