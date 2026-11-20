@@ -260,6 +260,26 @@
         "es": "Steam no lo tiene instalado en ninguna de sus bibliotecas",
         "ca": "Steam no el té instal·lat a cap de les seves biblioteques"
     },
+    "simulators.iracing_behind_live": {
+        "en": "Replay after this many seconds behind live",
+        "es": "Repetición a partir de estos segundos por detrás del directo",
+        "ca": "Repetició a partir d'aquests segons per darrere del directe"
+    },
+    "simulators.iracing_behind_live_hover": {
+        "en": "How far behind the live session the replay must be before Bono treats it as a replay and stops recording. Closer to live, watching from outside the car is recorded, your car like any other car",
+        "es": "Cuánto por detrás de la sesión en directo debe ir la repetición para que Bono la trate como repetición y deje de grabar. Más cerca del directo, mirar desde fuera del coche se graba, y tu coche como cualquier otro",
+        "ca": "Quant per darrere de la sessió en directe ha d'anar la repetició perquè Bono la tracti com a repetició i deixi de gravar. Més a prop del directe, mirar des de fora del cotxe es grava, i el teu cotxe com qualsevol altre"
+    },
+    "simulators.iracing_keep_live": {
+        "en": "Keep the replay at live",
+        "es": "Mantener la repetición en directo",
+        "ca": "Mantén la repetició en directe"
+    },
+    "simulators.iracing_keep_live_hover": {
+        "en": "Jumps the replay back to live, and plays it, whenever it falls behind by the seconds above, so every lap is recorded while you watch a teammate or spectate. While it's on, in a live session, rewinding or pausing for longer than that jumps back to live. Saved replays aren't affected",
+        "es": "Devuelve la repetición al directo, y la reproduce, cada vez que se queda atrás los segundos de arriba, para que se grabe cada vuelta mientras miras a un compañero o como espectador. Mientras está activado, en una sesión en directo, rebobinar o pausar más tiempo que eso vuelve al directo. No afecta a las repeticiones guardadas",
+        "ca": "Torna la repetició al directe, i la reprodueix, cada cop que es queda enrere els segons de dalt, perquè es gravi cada volta mentre mires un company o com a espectador. Mentre està activat, en una sessió en directe, rebobinar o pausar més temps que això torna al directe. No afecta les repeticions desades"
+    },
     "plugin.not_installed": {
         "en": "Plugin not installed: nothing is recorded",
         "es": "Plugin no instalado: no se graba nada",
