@@ -7,7 +7,7 @@
 //! entry for a control without one). Bono binds F11 there for a pilot without one, while LMU is
 //! closed.
 
-use crate::sim::{Game, PitKeyStatus, key_name};
+use crate::sim::{Game, PitKeyStatus};
 use anyhow::{Context as _, bail};
 use serde_json::Value;
 use std::{
@@ -217,6 +217,7 @@ fn lmu_window() -> Option<windows_sys::Win32::Foundation::HWND> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::key_name;
 
     #[test]
     fn reads_bound_key() {
