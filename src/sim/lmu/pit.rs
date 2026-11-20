@@ -38,6 +38,11 @@ const PRESSURE_ROWS: [&str; 4] = ["FL PRESS:", "FR PRESS:", "RL PRESS:", "RR PRE
 const ENERGY: &str = "VIRTUAL ENERGY:";
 const FUEL: &str = "FUEL:";
 const FUEL_RATIO: &str = "FUEL RATIO:";
+/// kPa in a psi
+const PSI_KPA: f64 = 6.894757;
+/// Pressure options all under this are psi (the game set to imperial units), not kPa: a racing
+/// tyre's pressure is over 100 in kPa and under 60 in psi
+const PSI_BELOW: f64 = 60.0;
 const DAMAGE: &str = "DAMAGE:";
 const REPLACE_BRAKES: &str = "REPLACE BRAKES:";
 const REAR_WING: &str = "R WING:";
@@ -233,20 +238,31 @@ fn tread(text: &str) -> Option<f64> {
     before[start..].replace(',', ".").parse().ok()
 }
 
-/// The numbers a row's options stand for, in order.
+/// The numbers a row's options stand for, in order. Pressures are in kPa, whatever units the
+/// game shows them in.
 fn numbers(row: &Row, name: &str) -> anyhow::Result<Vec<f64>> {
-    (row.options.iter())
+    let numbers: Vec<f64> = (row.options.iter())
         .map(|option| text(option).and_then(leading_number))
         .collect::<Option<_>>()
-        .with_context(|| format!("an option of the pit menu's {name} row isn't a number"))
+        .with_context(|| format!("an option of the pit menu's {name} row isn't a number"))?;
+    if PRESSURE_ROWS.contains(&name) && numbers.iter().all(|number| *number < PSI_BELOW) {
+        return Ok(numbers.iter().map(|psi| psi * PSI_KPA).collect());
+    }
+    Ok(numbers)
+}
+
+/// The average step between a row's numbers: the game's text rounds them (a step of 1 kPa reads
+/// 0.1 or 0.2 psi apart)
+fn step(numbers: &[f64]) -> Option<f64> {
+    match numbers {
+        [first, .., last] => Some((last - first) / (numbers.len() - 1) as f64).filter(|s| *s > 0.0),
+        _ => None,
+    }
 }
 
 fn number(row: &Row, name: &str) -> anyhow::Result<Number> {
     let numbers = numbers(row, name)?;
-    let step = match numbers[..] {
-        [first, second, ..] => Some(second - first).filter(|step| *step > 0.0),
-        _ => None,
-    };
+    let step = step(&numbers);
     Ok(Number {
         value: numbers[row.current],
         min: numbers.first().copied(),
@@ -256,13 +272,18 @@ fn number(row: &Row, name: &str) -> anyhow::Result<Number> {
 }
 
 /// A tyre row's tyres (every option but "no change"), each with its option's index in the row.
-/// Options without a compound and a used flag (LMU has shown an `INVALID` one) are left out.
+/// Options without a compound and a used flag, and used ones without their tread, are left out.
 fn tyres(row: &Row) -> Vec<(usize, Tyre)> {
     (row.options.iter().enumerate().skip(1))
         .filter_map(|(at, option)| {
             let compound = option.get("type").and_then(Value::as_str)?;
             let used = option.get("isUsed").and_then(Value::as_bool)?;
             let tread_pct = used.then(|| text(option).and_then(tread)).flatten();
+            // A used tyre says how much tread it has left: LMU's "INVALID" one, where there's
+            // no used tyre, doesn't
+            if used && tread_pct.is_none() {
+                return None;
+            }
             Some((
                 at,
                 Tyre {
@@ -382,14 +403,15 @@ pub fn apply(rows: &Value, menu: &PitMenu, change: &Resolved) -> anyhow::Result<
     let number_at = |name: &'static str, want: f64| -> anyhow::Result<(&'static str, usize)> {
         let row = row(read, name)?.ok_or_else(changed)?;
         let numbers = numbers(&row, name)?;
-        let tolerance = match numbers[..] {
-            [first, second, ..] => (second - first).abs() / 2.0,
-            _ => 0.0,
-        }
-        .max(1e-6);
-        let at = (numbers.iter())
-            .position(|number| (number - want).abs() <= tolerance)
+        let tolerance = step(&numbers).map_or(0.0, |step| step / 2.0) + 1e-6;
+        // The nearest option, which must be within half a step: otherwise the row isn't the one
+        // the change was checked against
+        let (at, nearest) = (numbers.iter().enumerate())
+            .min_by(|(_, a), (_, b)| (*a - want).abs().total_cmp(&(*b - want).abs()))
             .ok_or_else(changed)?;
+        if (nearest - want).abs() > tolerance {
+            return Err(changed());
+        }
         Ok((name, at))
     };
 
@@ -642,6 +664,48 @@ mod tests {
         assert_eq!(leading_number("Abierto"), None);
         assert_eq!(tread("Usado Medio  99%"), Some(99.0));
         assert_eq!(tread("Nuevo Medio "), None);
+    }
+
+    #[test]
+    fn parses_psi_pressures_as_kpa() {
+        let rows = fixture("pit_menu_psi_es.json");
+        let m = parse(&rows, &fixture("standings.json")).unwrap();
+        let fl = m.corners.as_ref().unwrap()[0].pressure_kpa.clone().unwrap();
+        // 19.7 to 30.5 psi
+        assert!((fl.value - 135.8).abs() < 0.1, "{fl:?}");
+        assert!((fl.min.unwrap() - 135.8).abs() < 0.1, "{fl:?}");
+        assert!((fl.max.unwrap() - 210.3).abs() < 0.1, "{fl:?}");
+        let step = fl.step.unwrap();
+        assert!((0.8..1.2).contains(&step), "{fl:?}");
+        // Written back in the game's unit: the psi option nearest 150 kPa
+        let change = PitChange {
+            pressures_kpa: CornerMap {
+                fl: Some(150.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let out = apply(&rows, &m, &check(&m, &change).unwrap()).unwrap();
+        let row = (out.as_array().unwrap().iter())
+            .find(|row| row["name"] == "FL PRESS:")
+            .unwrap();
+        let text = row["settings"][row["currentSetting"].as_u64().unwrap() as usize]["text"]
+            .as_str()
+            .unwrap();
+        let psi = leading_number(text).unwrap();
+        assert!((psi * PSI_KPA - 150.0).abs() <= step / 2.0 + 0.01, "{text}");
+        // The metric menu stays as it is
+        let metric = parsed().corners.unwrap()[0].pressure_kpa.clone().unwrap();
+        assert_eq!((metric.value, metric.step), (136.0, Some(1.0)));
+    }
+
+    #[test]
+    fn empty_used_slot_is_not_a_tyre() {
+        // LMU lists an "INVALID" option with `isUsed: true` where no used tyre is
+        let m = parse(&fixture("pit_menu_psi_es.json"), &fixture("standings.json")).unwrap();
+        let fl = &m.corners.as_ref().unwrap()[0];
+        assert_eq!(fl.tyres.len(), 2, "{:?}", fl.tyres);
+        assert!(fl.tyres.iter().all(|tyre| !tyre.used));
     }
 
     #[test]

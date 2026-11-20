@@ -177,7 +177,8 @@ impl PitTool {
         };
 
         let mut text = current_text(&after);
-        let when = match timing(before.position) {
+        // Seen in LMU, not yet in iRacing
+        let when = match timing(before.position, !before.iracing_tyres) {
             Timing::ThisStop => "this stop",
             Timing::ProbablyThisStop => "probably this stop",
             Timing::ProbablyNextStop => "probably the next stop",
@@ -434,9 +435,18 @@ mod tests {
         let text = (tool.run(input(serde_json::json!({"action": "change", "tyres": {"fl": {"compound": "Wet"}}}))))
             .await
             .unwrap();
-        assert!(text.contains("Applied for: probably the next stop"), "{text}");
+        assert!(text.contains("Applied for: the next stop"), "{text}");
         assert!(text.contains("FL \"Wet\" new"), "{text}");
         assert!(!text.contains("Not taken"), "{text}");
+
+        // Not yet seen in iRacing: only probably
+        let mut stopped = crate::sim::pit::tests::iracing_menu();
+        stopped.position = Position::Stopped;
+        let tool = PitTool::new(FakeService::new(stopped, true));
+        let text = (tool.run(input(serde_json::json!({"action": "change", "tyres": {"fl": {"compound": "Wet"}}}))))
+            .await
+            .unwrap();
+        assert!(text.contains("Applied for: probably the next stop"), "{text}");
     }
 
     #[tokio::test(start_paused = true)]

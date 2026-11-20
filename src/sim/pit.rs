@@ -54,11 +54,15 @@ pub enum Timing {
     Unknown,
 }
 
-/// Which stop a change made while the car is at `position` counts for.
-pub fn timing(position: Position) -> Timing {
+/// Which stop a change made while the car is at `position` counts for. `verified`: whether the
+/// game was seen to apply a change made entering the pit lane to that stop, and one made once
+/// stopped to the next; otherwise those are only probably so.
+pub fn timing(position: Position, verified: bool) -> Timing {
     match position {
         Position::OnTrack | Position::StopRequested => Timing::ThisStop,
+        Position::Entering if verified => Timing::ThisStop,
         Position::Entering => Timing::ProbablyThisStop,
+        Position::Stopped if verified => Timing::NextStop,
         Position::Stopped => Timing::ProbablyNextStop,
         Position::Exiting => Timing::NextStop,
         Position::Unknown => Timing::Unknown,
@@ -674,12 +678,17 @@ pub mod tests {
 
     #[test]
     fn timing_table() {
-        assert_eq!(timing(Position::OnTrack), Timing::ThisStop);
-        assert_eq!(timing(Position::StopRequested), Timing::ThisStop);
-        assert_eq!(timing(Position::Entering), Timing::ProbablyThisStop);
-        assert_eq!(timing(Position::Stopped), Timing::ProbablyNextStop);
-        assert_eq!(timing(Position::Exiting), Timing::NextStop);
-        assert_eq!(timing(Position::Unknown), Timing::Unknown);
+        for verified in [true, false] {
+            assert_eq!(timing(Position::OnTrack, verified), Timing::ThisStop);
+            assert_eq!(timing(Position::StopRequested, verified), Timing::ThisStop);
+            assert_eq!(timing(Position::Exiting, verified), Timing::NextStop);
+            assert_eq!(timing(Position::Unknown, verified), Timing::Unknown);
+        }
+        assert_eq!(timing(Position::Entering, false), Timing::ProbablyThisStop);
+        assert_eq!(timing(Position::Stopped, false), Timing::ProbablyNextStop);
+        // Checked in the game: entering still counts for this stop, stopped for the next
+        assert_eq!(timing(Position::Entering, true), Timing::ThisStop);
+        assert_eq!(timing(Position::Stopped, true), Timing::NextStop);
     }
 
     #[test]
