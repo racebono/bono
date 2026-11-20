@@ -225,6 +225,7 @@ mod tests {
     #[test]
     fn forgiven_off_is_not_invalid() {
         let validity = LapValidity::default();
+        seen(&validity, 1, 2);
         for counting in [true, false, true] {
             scoring(&validity, 1, 3, Some(counting), false);
             assert_eq!(telemetry(&validity, 1, 3, false, 4), Some(false));
@@ -388,11 +389,12 @@ mod tests {
         let vehicle = standing.vehicle_id.get().unwrap();
         scoring(validity, vehicle, 5, Some(true), false);
         telemetry(validity, vehicle, 5, false, 0);
-        validity.fill_scoring(session, &[standing]);
-        [
-            telemetry(validity, vehicle, 6, false, 0),
-            telemetry(validity, vehicle, 6, false, 4),
-        ]
+        validity.fill_scoring(session, std::slice::from_ref(&standing));
+        let start = telemetry(validity, vehicle, 6, false, 0);
+        // A rise is judged by the scoring after it
+        telemetry(validity, vehicle, 6, false, 4);
+        validity.fill_scoring(session, std::slice::from_ref(&standing));
+        [start, telemetry(validity, vehicle, 6, false, 4)]
     }
 
     #[test]
