@@ -3212,14 +3212,15 @@ impl Stream {
             };
             self.laps_completed.insert(vehicle, (laps, ended));
             if new_lap {
-                // A lap ended, not another car in the slot (fewer laps)
+                // A lap ended, not another car in the slot (fewer laps), whose lap began unseen
                 let ended_lap = before.is_some_and(|(before, _)| laps > before);
                 if self.judged.remove(&vehicle) && ended_lap {
                     self.awaiting.insert(vehicle, ended);
                 }
                 // The lap starting now, judged by how it starts: with the session green, whatever
                 // flag the car itself is shown
-                if !race
+                if ended_lap
+                    && !race
                     && r.i("lap_time_counts").is_some()
                     && matches!(
                         r.text("phase"),
@@ -3238,7 +3239,13 @@ impl Stream {
             let Some(time) = r.f("last_lap_time").filter(|time| *time > 0.0) else {
                 continue;
             };
+            // Of a lap the line is checked for (LMU, whose times don't repeat to the digit), the
+            // last lap's time still showing as the count changes isn't this lap's
+            let checked = self.awaiting.get(&vehicle) == Some(&ended);
             let entries = self.official.entry(vehicle).or_default();
+            if new_lap && checked && entries.last().is_some_and(|last| last.time == Some(time)) {
+                continue;
+            }
             // The lap count and its time can come a row apart: the time goes with the count
             let same_lap = entries.last().is_some_and(|last| last.at == ended);
             let late = !new_lap
@@ -3343,6 +3350,16 @@ impl Stream {
                         .is_some_and(|(start, time)| (start + time - ended).abs() < OFFICIAL_MATCH)
                 {
                     lap.invalid = true;
+                    // Braking zones it may have given are a fallback now, looked for again
+                    if self.player == Some(vehicle)
+                        && self
+                            .layout
+                            .as_ref()
+                            .is_some_and(|layout| layout.source == "braking zones")
+                    {
+                        self.zones_from_fallback = true;
+                        self.zones_from = None;
+                    }
                 }
             }
             let laps = "SELECT lap FROM lap_stats WHERE vehicle_id = ?1 AND complete = 1 \
@@ -8165,6 +8182,65 @@ mod tests {
     #[test]
     fn no_line_check_without_lap_time_counts() {
         assert_eq!(line_checked("practice", false, &untimed(None)), (0, 0));
+    }
+
+    #[test]
+    fn the_last_laps_time_still_showing_at_the_count_is_not_this_ones() {
+        let rows = [
+            (50.0, 0, None, Some(true)),
+            (100.0, 1, Some(99.0), Some(true)),
+            (200.0, 2, Some(99.0), Some(true)),
+            (200.4, 2, None, Some(true)),
+            (204.0, 2, None, Some(true)),
+        ];
+        assert_eq!(line_checked("practice", false, &rows), (1, 1));
+    }
+
+    #[test]
+    fn another_cars_first_lap_in_the_slot_is_not_line_checked() {
+        let rows = [
+            (50.0, 3, None, Some(true)),
+            (100.0, 0, None, Some(true)),
+            (200.0, 1, None, Some(true)),
+            (204.0, 1, None, Some(true)),
+        ];
+        assert_eq!(line_checked("practice", false, &rows), (0, 0));
+    }
+
+    #[test]
+    fn braking_zones_from_a_lap_lost_at_the_line_are_a_fallback() {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        let mut lap = lap_with(false, false, (1.0, 0.9));
+        lap.start = Some(100.0);
+        lap.time = Some(100.0);
+        let turn = Turn {
+            label: "braking zone 1".into(),
+            direction: None,
+            scale: None,
+            start: 450.0,
+            apex: 500.0,
+            end: 560.0,
+        };
+        let mut stream = Stream {
+            player: Some(1),
+            layout: Some(layout(vec![turn], 2000.0, "braking zones")),
+            zones_from: Some((1, 1)),
+            cars: BTreeMap::from([(
+                1,
+                Car {
+                    finished: vec![lap],
+                    ..Car::default()
+                },
+            )]),
+            awaiting: HashMap::from([(1, 200.0)]),
+            ..Stream::default()
+        };
+        stream.settle_untimed(&conn, 204.0).unwrap();
+        assert!(stream.cars[&1].finished[0].invalid);
+        assert!(stream.zones_from_fallback);
+        assert_eq!(stream.zones_from, None);
     }
 
     #[test]
