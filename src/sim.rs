@@ -302,6 +302,11 @@ pub trait Simulator: Send {
     fn plugin_outdated(&self) -> bool {
         false
     }
+
+    /// The game's pit menu, for games the engineer can change it in: `None` for the others.
+    fn pit(&self) -> Option<Arc<dyn pit::PitService>> {
+        None
+    }
 }
 
 /// What a game's plugin looks like on this computer.

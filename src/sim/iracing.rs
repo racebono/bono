@@ -21,8 +21,9 @@ use crate::{
 use convert::Converter;
 use sdk::{Frame, HEADER_LEN, Header, MEMORY_NAME, VERSION, Vars};
 use session::SessionInfo;
-pub use pit::IracingPit;
-use std::{path::PathBuf, time::Instant};
+use crate::sim::pit::PitService;
+use pit::IracingPit;
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 /// How often the session info is read again while its update count stays the same.
 const INFO_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
@@ -61,6 +62,10 @@ impl Simulator for IRacing {
 
     fn clear(&mut self) {
         self.0.clear();
+    }
+
+    fn pit(&self) -> Option<Arc<dyn PitService>> {
+        Some(Arc::new(IracingPit))
     }
 }
 

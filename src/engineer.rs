@@ -11,7 +11,10 @@ use crate::{
         self, Model, Reply, Steer, StopReason, Tools,
         bono_cloud::{GameSession, Lease},
     },
-    sim::Sim,
+    sim::{
+        Sim,
+        pit::{PitMenu, PitService},
+    },
     sqlite::pool::Pool,
     synthesizer::{Drain, Drained, Speech, SpeechInput, SpeechOutput, Synthesizer, plays_on},
     task::Task,
@@ -36,6 +39,7 @@ use tokio::{
     runtime::Handle,
     sync::{Mutex, mpsc},
 };
+use pit::PitTool;
 use tool::{ConditionId, Engineer as EngineerTool, Progress, SKILL, instructions};
 
 mod pit;
@@ -585,6 +589,8 @@ struct SessionState {
     tool: EngineerTool,
     /// Stages the turn's changes to the requests, for the engineer to apply once it finishes
     schedule_tool: ScheduleTool,
+    /// Reads and changes the game's pit menu, in games the engineer can change it in
+    pit_tool: Option<PitTool>,
     /// The weekend the conversation is about, for `auto_session`: the recording's oldest epoch,
     /// which only a clear (a new weekend) replaces
     weekend: Option<i64>,
@@ -1311,10 +1317,10 @@ impl Engineer {
         let mut sim = sim;
         let database = sim
             .as_deref_mut()
-            .and_then(|sim| Some((sim.id(), sim.database()?.clone())));
+            .and_then(|sim| Some((sim.id(), sim.database()?.clone(), sim.pit())));
         // After `database`, which takes in the latest look at the plugin
         let outdated = sim.as_deref().is_some_and(|sim| sim.plugin_outdated());
-        let Some((sim, pool)) = database else {
+        let Some((sim, pool, pit)) = database else {
             // Said in the pilot's language, when there's a voice for it
             let lang = self.voice(config, lang).unwrap_or(lang);
             let (text, detail) = match outdated {
@@ -1332,7 +1338,7 @@ impl Engineer {
             return;
         };
 
-        if let Err(e) = self.follow_session(rt, config, sim, pool) {
+        if let Err(e) = self.follow_session(rt, config, sim, pool, pit) {
             self.notice(t!("engineer.error_starting", error = format!("{e:#}")));
             self.no_beep();
             return;
@@ -1349,6 +1355,7 @@ impl Engineer {
         config: &Config,
         sim: &'static str,
         pool: Pool,
+        pit: Option<Arc<dyn PitService>>,
     ) -> anyhow::Result<()> {
         let db = pool.database().path().to_owned();
         let model_changed = self
@@ -1373,7 +1380,7 @@ impl Engineer {
             || self.session.as_ref().is_none_or(|s| s.db != db)
         {
             let tool = self.tool_for(rt, &pool);
-            let session = self.start(config, sim, pool, tool)?;
+            let session = self.start(config, sim, pool, tool, pit)?;
             self.drop_session(rt);
             self.session = Some(session);
             self.new_session = false;
@@ -1491,13 +1498,14 @@ impl Engineer {
         let Some(batch) = self.schedule.take_batch(now) else {
             return;
         };
-        let database = sim.and_then(|sim| Some((sim.id(), sim.database()?.clone())));
+        let database =
+            sim.and_then(|sim| Some((sim.id(), sim.database()?.clone(), sim.pit())));
         // Nothing to answer from: they stay due (no progress comes either, so nothing moves on)
-        let Some((sim, pool)) = database else {
+        let Some((sim, pool, pit)) = database else {
             self.schedule.batch_dropped();
             return;
         };
-        if let Err(e) = self.follow_session(rt, config, sim, pool) {
+        if let Err(e) = self.follow_session(rt, config, sim, pool, pit) {
             self.scheduled_failed(&e, now);
             return;
         }
@@ -2120,21 +2128,12 @@ impl Engineer {
         sim: &'static str,
         pool: Pool,
         tool: EngineerTool,
+        pit: Option<Arc<dyn PitService>>,
     ) -> anyhow::Result<Session> {
-        let mut tools = Tools::default();
-        tools.insert(
-            EngineerTool::NAME,
-            Some(EngineerTool::description()),
-            EngineerTool::input_schema(),
-            tool.clone(),
-        );
         let schedule_tool = ScheduleTool::new(tool.clone());
-        tools.insert(
-            ScheduleTool::NAME,
-            Some(ScheduleTool::description()),
-            ScheduleTool::input_schema(),
-            schedule_tool.clone(),
-        );
+        // Only for a game the engineer can change the pit menu in
+        let pit_tool = pit.map(PitTool::new);
+        let tools = session_tools(&tool, &schedule_tool, pit_tool.as_ref());
         let model = config.get().model.clone();
         let corner_names = *config.get().corner_names();
         // Taken before the conversation: if the account signs out meanwhile, it ends next frame
@@ -2160,6 +2159,7 @@ impl Engineer {
                 conversation,
                 tool,
                 schedule_tool,
+                pit_tool,
                 pool,
                 sim,
                 weekend: None,
@@ -2360,7 +2360,13 @@ impl SessionState {
         // The setup's names, unless this conversation still has them
         self.notice_forgotten();
         let mut shown = self.setup_outline;
-        let message = self.tool.question_with_snapshot(message, &mut shown).await;
+        let pit: Option<PitMenu> = match &self.pit_tool {
+            Some(pit_tool) => pit_tool.menu().await,
+            None => None,
+        };
+        let message = (self.tool)
+            .question_with_snapshot(message, &mut shown, pit.as_ref())
+            .await;
         self.outline_offered = shown;
         let message = briefed(message, &pending_text, &notes, briefing.note.as_deref());
         self.conversation.set_tool_result_note(briefing.note);
@@ -2419,6 +2425,37 @@ impl SessionState {
         }
         started_over
     }
+}
+
+/// A conversation's tools: the engineer's, the schedule's, and the pit menu's in a game the
+/// engineer can change it in.
+fn session_tools(
+    tool: &EngineerTool,
+    schedule_tool: &ScheduleTool,
+    pit_tool: Option<&PitTool>,
+) -> Tools {
+    let mut tools = Tools::default();
+    tools.insert(
+        EngineerTool::NAME,
+        Some(EngineerTool::description()),
+        EngineerTool::input_schema(),
+        tool.clone(),
+    );
+    tools.insert(
+        ScheduleTool::NAME,
+        Some(ScheduleTool::description()),
+        ScheduleTool::input_schema(),
+        schedule_tool.clone(),
+    );
+    if let Some(pit_tool) = pit_tool {
+        tools.insert(
+            PitTool::NAME,
+            Some(PitTool::description()),
+            PitTool::input_schema(),
+            pit_tool.clone(),
+        );
+    }
+    tools
 }
 
 /// The game session in the database (its track, type and number, and how long it's scheduled to
@@ -3543,6 +3580,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn pit_tool_registered_only_with_service() {
+        struct NoMenu;
+        impl PitService for NoMenu {
+            fn read(&self) -> anyhow::Result<PitMenu> {
+                anyhow::bail!("no game")
+            }
+            fn write(&self, _: &PitMenu, _: &crate::sim::pit::Resolved) -> anyhow::Result<()> {
+                anyhow::bail!("no game")
+            }
+        }
+        let rt = tokio::runtime::Handle::current();
+        let dir = tempfile::tempdir().unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+        let pool = Pool::new(Database::read_only(Arc::new(dir.path().join("a.db"))), one, one);
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        let tool = engineer.tool_for(&rt, &pool);
+        let schedule_tool = ScheduleTool::new(tool.clone());
+        let names = |pit: Option<&PitTool>| {
+            (session_tools(&tool, &schedule_tool, pit).definitions())
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(None), [EngineerTool::NAME, ScheduleTool::NAME]);
+        let pit = PitTool::new(Arc::new(NoMenu));
+        assert_eq!(
+            names(Some(&pit)),
+            [EngineerTool::NAME, ScheduleTool::NAME, PitTool::NAME]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_conversation_ends_when_its_recording_is_lost_or_switched() {
         let rt = tokio::runtime::Handle::current();
         for switch in [false, true] {
@@ -3573,6 +3641,7 @@ mod tests {
                     pool: original,
                     tool: first.clone(),
                     schedule_tool: ScheduleTool::new(first.clone()),
+                    pit_tool: None,
                     sim: "lmu",
                     weekend: None,
                     starts: Arc::default(),
@@ -3781,6 +3850,7 @@ mod tests {
                     }),
                     tool: tool.clone(),
                     schedule_tool,
+                    pit_tool: None,
                     pool,
                     sim: "test",
                     weekend: None,
@@ -5327,6 +5397,7 @@ mod tests {
                 sim: state.sim,
                 tool: state.tool.clone(),
                 schedule_tool: state.schedule_tool.clone(),
+                pit_tool: None,
                 weekend: None,
                 starts: Arc::default(),
                 setup_outline: None,
@@ -5806,6 +5877,7 @@ mod tests {
             let mut state = SessionState {
                 conversation: Box::new(RecordingModel(recorded.clone())),
                 schedule_tool: ScheduleTool::new(tool.clone()),
+                pit_tool: None,
                 tool,
                 pool,
                 sim: "lmu",

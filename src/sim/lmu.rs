@@ -7,8 +7,8 @@
 
 use crate::{
     sim::{
-        Game, PluginStatus, Simulator, SimulatorInfo, SimulatorSettings, probe::Probe,
-        steam_install_dir,
+        Game, PluginStatus, Simulator, SimulatorInfo, SimulatorSettings, pit::PitService,
+        probe::Probe, steam_install_dir,
     },
     sqlite::{Database, pool::Pool},
     task::MaybeDone,
@@ -19,7 +19,7 @@ use serde_json::{Map, Value};
 use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -68,6 +68,10 @@ pub struct LeMansUltimate {
     plugin_outdated: Option<bool>,
     /// Whether the plugin's version has been read this run
     plugin_version_read: bool,
+    /// The game's pit menu, for the engineer
+    pit: Arc<pit::LmuPit>,
+    /// Whether the pilot lets the engineer request pit stops, shared with `pit`
+    pit_requests: Arc<AtomicBool>,
 }
 
 /// A change to settings.json in a folder, and what it's for (for the log, if it fails).
@@ -78,6 +82,7 @@ struct SettingsChange {
 
 impl LeMansUltimate {
     pub fn new(game: Game) -> Self {
+        let pit_requests = Arc::new(AtomicBool::new(true));
         Self {
             game,
             live: None,
@@ -87,6 +92,8 @@ impl LeMansUltimate {
             plugin_looked: None,
             plugin_outdated: None,
             plugin_version_read: false,
+            pit: Arc::new(pit::LmuPit::new(pit_requests.clone())),
+            pit_requests,
         }
     }
 
@@ -254,6 +261,10 @@ impl Simulator for LeMansUltimate {
     }
 
     /// The plugin clears its data when the "clear" count in settings.json changes.
+    fn pit(&self) -> Option<Arc<dyn PitService>> {
+        Some(self.pit.clone())
+    }
+
     fn clear(&mut self) {
         self.update_settings("asking Le Mans Ultimate to clear its data", |json| {
             let clear = json.get("clear").and_then(Value::as_i64).unwrap_or(0);
