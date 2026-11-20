@@ -161,8 +161,8 @@ impl VehicleCondition {
     }
 
     /// Fills in the player's aero and suspension damage, when the web API answered recently, and
-    /// their steering wheel range from the setup when the telemetry has none. Other cars' stay
-    /// unknown: the web API only has the player's.
+    /// in realtime their steering wheel range from the setup when the telemetry has none. Other
+    /// cars' stay unknown: the web API only has the player's.
     pub fn fill_telemetry(&self, telemetry: &mut bono_telemetry, is_player: bool) {
         self.fill_at(telemetry, is_player, Instant::now());
     }
@@ -202,8 +202,9 @@ impl VehicleCondition {
                 _ => {}
             }
             state.in_pit_lane = in_pit_lane;
-            // LMU often reports 0, which `lmu.cpp` leaves NULL; one it reports is kept
-            if telemetry.state.steering_wheel_range.get().is_none() {
+            // LMU often reports 0, which `lmu.cpp` leaves NULL; one it reports is kept. Only in
+            // realtime: in the garage, the setup may be changing
+            if state.realtime && telemetry.state.steering_wheel_range.get().is_none() {
                 telemetry.state.steering_wheel_range = state.wheel_range.into();
             }
             state.answer
@@ -673,13 +674,21 @@ mod tests {
         assert_eq!(wheel_range(&condition, Some(540.0), true), Some(540.0));
         // The garage is only the player's
         assert_eq!(wheel_range(&condition, None, false), None);
-        // A pit stop can't change it
+        // The setup read after a pit stop keeps it
         drive(&condition, true);
+        drive(&condition, false);
+        assert_eq!(
+            taken(&condition).unwrap().source,
+            Some(SetupSource::PitStop)
+        );
         assert_eq!(wheel_range(&condition, None, true), Some(310.0));
-        // The garage can: unknown until its setup is read
+        // In the garage it may change: unknown until its setup is read again
         condition.set_realtime(false);
+        assert_eq!(wheel_range(&condition, None, true), None);
         condition.set_realtime(true);
         assert_eq!(wheel_range(&condition, None, true), None);
+        assert_eq!(taken(&condition).unwrap().source, Some(SetupSource::Garage));
+        assert_eq!(wheel_range(&condition, None, true), Some(310.0));
         // A new event's car may be another one: unknown until its setup is read
         condition.clear();
         assert_eq!(wheel_range(&condition, None, true), None);

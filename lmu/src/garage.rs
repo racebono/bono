@@ -312,9 +312,9 @@ mod tests {
             "310 (twelve) deg",
             "310 (12 deg",
             "310 12 deg",
-            "0 deg",
-            "-310 deg",
-            "inf deg",
+            "0 (0) deg",
+            "-310 (12) deg",
+            "inf (12) deg",
             "NaN (12) deg",
         ] {
             assert_eq!(wheel_range(&steer_lock(text)), None, "{text}");
