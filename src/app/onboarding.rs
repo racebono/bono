@@ -96,8 +96,8 @@ pub struct Onboarding {
     session_button: ChangeButton,
     /// The radio check: how long the chat was when it started, so it shows what was said since
     radio_from: usize,
-    /// The radio check: what the pilot said was being transcribed last frame
-    transcribing: bool,
+    /// The radio check: the talk button was held, and what was said hasn't been heard yet
+    listened: bool,
     /// The radio check: how many times the pilot was understood, when the talk button was last
     /// pressed
     pilot_lines: usize,
@@ -113,7 +113,7 @@ impl Onboarding {
             talk_button: ChangeButton::default(),
             session_button: ChangeButton::default(),
             radio_from: 0,
-            transcribing: false,
+            listened: false,
             pilot_lines: 0,
             nothing_heard: false,
         }
@@ -236,6 +236,7 @@ impl Onboarding {
                 if self.step == Some(Step::RadioCheck) {
                     self.radio_from = engineer.chat().len();
                     self.nothing_heard = false;
+                    self.listened = false;
                 }
             }
             Some(Action::Close) => {
@@ -374,15 +375,17 @@ impl Onboarding {
         let pilot_lines = (said.iter())
             .filter(|entry| entry.speaker == Speaker::Pilot)
             .count();
-        // Something said that came out as nothing: no new line for the pilot
+        // Something said that came out as nothing: no new line for the pilot. Silence is heard
+        // before a frame may see it transcribing, so it's whether the button was held
         let transcribing = audio.transcribing();
         if audio.recording() {
             self.pilot_lines = pilot_lines;
             self.nothing_heard = false;
-        } else if self.transcribing && !transcribing {
+            self.listened = true;
+        } else if self.listened && !transcribing {
+            self.listened = false;
             self.nothing_heard = pilot_lines == self.pilot_lines;
         }
-        self.transcribing = transcribing;
 
         ui.horizontal(|ui| {
             if audio.recording() {

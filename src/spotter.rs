@@ -259,8 +259,11 @@ struct Running {
 /// What the thread sends, in order.
 enum Heard {
     Call(Raised),
-    /// It's gone quiet (qualifying, with the spotter off for it): nothing from before is said
-    Muted,
+    /// It's gone quiet (qualifying, with the spotter off for it): nothing from before is said but
+    /// lap times, if they still are
+    Muted {
+        lap_times: bool,
+    },
     /// The recording moved on to another epoch: the calls before are about another session's cars
     Epoch,
 }
@@ -355,8 +358,20 @@ impl Spotter {
     fn heard(&mut self, heard: Heard, at: Instant) {
         match heard {
             Heard::Call(call) => self.hear(call, at),
+            // The calls waiting, and the one being said, but for lap times if they're still said
+            Heard::Muted { lap_times } => {
+                let kept = |call: &Raised| lap_times && call.text == LAP_TIME;
+                self.queue.retain(|(call, _)| kept(call));
+                if !matches!(
+                    &self.saying,
+                    Some(Saying::Synthesizing { call, .. } | Saying::Playing { call, .. })
+                        if kept(call)
+                ) {
+                    self.saying = None;
+                }
+            }
             // The calls waiting, and the one being said
-            Heard::Muted | Heard::Epoch => {
+            Heard::Epoch => {
                 self.queue.clear();
                 self.saying = None;
             }
@@ -719,7 +734,8 @@ fn follow(
         match polled {
             Ok(raised) => {
                 failing = false;
-                for heard in outgoing(raised, logic.muted, &mut muted) {
+                let lap_times = *config.qualifying_lap_times();
+                for heard in outgoing(raised, logic.muted, lap_times, &mut muted) {
                     if calls.send(heard).is_err() {
                         return;
                     }
@@ -738,15 +754,16 @@ fn follow(
     }
 }
 
-/// What a poll sends: its calls, then [`Heard::Muted`] if it's just gone quiet.
-fn outgoing(raised: Vec<Raised>, muted: bool, was_muted: &mut bool) -> Vec<Heard> {
+/// What a poll sends: [`Heard::Muted`] if it's just gone quiet, then its calls (quiet, only lap
+/// times, which aren't to be dropped with what came before). `lap_times`: whether they're said.
+fn outgoing(raised: Vec<Raised>, muted: bool, lap_times: bool, was_muted: &mut bool) -> Vec<Heard> {
     let went_quiet = muted && !*was_muted;
     *was_muted = muted;
-    let mut heard = raised.into_iter().map(Heard::Call).collect::<Vec<_>>();
-    if went_quiet {
-        heard.push(Heard::Muted);
-    }
-    heard
+    went_quiet
+        .then_some(Heard::Muted { lap_times })
+        .into_iter()
+        .chain(raised.into_iter().map(Heard::Call))
+        .collect()
 }
 
 fn open(db: &Path) -> rusqlite::Result<Connection> {
@@ -1541,6 +1558,8 @@ struct Logic {
     geometry: Geometry,
     /// Cars alongside on each side as last called (0 while it can't be told)
     alongside: [u8; 2],
+    /// When the newest update was: an earlier one is a new session
+    time: Option<f64>,
     /// Since when each side has been taken, and when "still there" was last said for it
     side_since: [Option<f64>; 2],
     last_still: [Option<f64>; 2],
@@ -1582,6 +1601,7 @@ impl Default for Logic {
         Self {
             geometry: Geometry::default(),
             alongside: [0; 2],
+            time: None,
             side_since: [None; 2],
             last_still: [None; 2],
             prev: None,
@@ -1631,11 +1651,19 @@ impl Calls {
 impl Logic {
     /// Keeps quiet if switched off for the qualifying session it's in. Nothing's followed then, so
     /// it starts afresh (as in a new session) once it's on again, instead of calling what changed
-    /// while it was off. Whether it's quiet.
+    /// while it was off: nothing but the player's laps, whose times can still be said (and the
+    /// standings their ends are told by, and when the newest update was). Whether it's quiet.
     fn mute(&mut self, config: &SpotterConfig) -> bool {
         self.muted = self.qualifying && !*config.qualifying();
         if self.muted {
             *self = Logic {
+                time: self.time,
+                prev_scoring: self.prev_scoring.take(),
+                lap_invalidated: self.lap_invalidated,
+                lap_in_pit_lane: self.lap_in_pit_lane,
+                lap_ended: self.lap_ended,
+                lap_timed: self.lap_timed,
+                lap_started: self.lap_started,
                 qualifying: true,
                 muted: true,
                 ..Logic::default()
@@ -1663,18 +1691,21 @@ impl Logic {
         };
 
         // A new session
-        if self
-            .prev
-            .as_ref()
-            .and_then(|prev| prev.car.time)
-            .is_some_and(|prev| t < prev - 1.0)
-        {
+        if self.time.is_some_and(|prev| t < prev - 1.0) {
             *self = Logic::default();
         }
+        self.time = Some(t);
 
         self.qualifying = scoring.is_some_and(|s| s.session_type.as_deref() == Some("qualifying"));
         if self.mute(config) {
-            return Vec::new();
+            // Its lap times are still said, if asked for (`lap_times` sees to that), so the laps
+            // are followed all the same
+            if let Some(scoring) = scoring {
+                self.follow_lap(player, t);
+                self.lap_times(config, scoring, p.in_pit_lane, t, &mut calls);
+                self.prev_scoring = Some(scoring.clone());
+            }
+            return calls.calls;
         }
 
         let stopped = p.speed.unwrap_or(0.0) < *config.min_speed() || p.in_pit_lane;
@@ -1691,15 +1722,9 @@ impl Logic {
             self.geometry.update(config, p, others, t)
         };
         self.traffic(config, proximity, t, &mut calls);
-        // Invalidated as it's driven (or already, when the spotter starts mid-lap)
-        if player.lap_invalidated
-            && self
-                .lap_started
-                .is_none_or(|started| t - started > LAP_INVALID_GRACE)
-        {
-            self.lap_invalidated = true;
-        }
-        self.lap_in_pit_lane |= p.in_pit_lane;
+        self.follow_lap(player, t);
+        // Back from quiet (its standings are kept for the laps): the flags start afresh
+        let afresh = self.prev.is_none();
         if let Some(prev) = self.prev.take() {
             let race = scoring.is_some_and(|s| s.session_type.as_deref() == Some("race"));
             self.alerts(
@@ -1714,6 +1739,9 @@ impl Logic {
         }
         if let Some(scoring) = scoring {
             self.lap_times(config, scoring, p.in_pit_lane, t, &mut calls);
+            if afresh {
+                self.prev_scoring = None;
+            }
             self.flags(config, scoring, &mut calls);
             self.weather(config, scoring, wheels.wet, t, stopped, &mut calls);
         }
@@ -1888,6 +1916,19 @@ impl Logic {
                 false,
             );
         }
+    }
+
+    /// Whether the player's lap has been invalidated (as it's driven, or already when the spotter
+    /// starts mid-lap) or through the pit lane, so its time isn't called.
+    fn follow_lap(&mut self, player: &Player, t: f64) {
+        if player.lap_invalidated
+            && self
+                .lap_started
+                .is_none_or(|started| t - started > LAP_INVALID_GRACE)
+        {
+            self.lap_invalidated = true;
+        }
+        self.lap_in_pit_lane |= player.car.in_pit_lane;
     }
 
     /// In qualifying, the time of each lap the pilot finishes, once both the lap count and the
@@ -3519,6 +3560,10 @@ mod tests {
         assert_eq!(run(&on, &qualifying), ["car right"]);
         assert!(run(&off, &qualifying).is_empty());
         assert_eq!(run(&off, &race), ["car right"]);
+        // Saying lap times, it's quiet all the same
+        let mut lap_times = off.clone();
+        lap_times.qualifying_lap_times.set(true);
+        assert!(run(&lap_times, &qualifying).is_empty());
     }
 
     #[test]
@@ -3529,13 +3574,14 @@ mod tests {
             ..Scoring::default()
         };
         let mut config = SpotterConfig::default();
-        config.qualifying.set(false);
+        config.qualifying.set(true);
         let mut logic = Logic::default();
         let step = |logic: &mut Logic, config: &SpotterConfig, t: f64, scoring: &Scoring| {
             texts(logic.update(config, &player(t), &[], &Wheels::default(), Some(scoring)))
         };
 
         assert!(step(&mut logic, &config, 0.0, &scoring).is_empty());
+        config.qualifying.set(false);
         // The blue flag came while it was off: it isn't called once it's back on
         scoring.flag = Some("blue".into());
         assert!(step(&mut logic, &config, 0.1, &scoring).is_empty());
@@ -3547,6 +3593,15 @@ mod tests {
         assert!(step(&mut logic, &config, 0.3, &scoring).is_empty());
         scoring.flag = Some("blue".into());
         assert_eq!(step(&mut logic, &config, 0.4, &scoring), ["blue flag"]);
+
+        // Nor when it's back on with no rows coming (the game paused, or in the garage)
+        config.qualifying.set(false);
+        scoring.flag = Some("green".into());
+        assert!(step(&mut logic, &config, 0.5, &scoring).is_empty());
+        config.qualifying.set(true);
+        assert!(!logic.mute(&config));
+        scoring.flag = Some("blue".into());
+        assert!(step(&mut logic, &config, 0.6, &scoring).is_empty());
     }
 
     #[test]
@@ -3648,7 +3703,7 @@ mod tests {
     }
 
     #[test]
-    fn says_it_went_quiet_once_after_the_calls_before() {
+    fn says_it_went_quiet_once_before_its_calls() {
         let call = |text| Raised {
             text,
             urgent: true,
@@ -3660,24 +3715,46 @@ mod tests {
                 .into_iter()
                 .map(|heard| match heard {
                     Heard::Call(call) => call.text,
-                    Heard::Muted => "muted",
+                    Heard::Muted { lap_times } => {
+                        if lap_times {
+                            "muted, lap times"
+                        } else {
+                            "muted"
+                        }
+                    }
                     Heard::Epoch => "epoch",
                 })
                 .collect::<Vec<_>>()
         };
         let mut muted = false;
         assert_eq!(
-            texts(outgoing(vec![call("car right")], false, &mut muted)),
+            texts(outgoing(vec![call("car right")], false, false, &mut muted)),
             ["car right"]
         );
-        assert_eq!(texts(outgoing(Vec::new(), true, &mut muted)), ["muted"]);
-        assert!(texts(outgoing(Vec::new(), true, &mut muted)).is_empty());
+        assert_eq!(
+            texts(outgoing(Vec::new(), true, false, &mut muted)),
+            ["muted"]
+        );
+        assert!(texts(outgoing(Vec::new(), true, false, &mut muted)).is_empty());
         // Back on, its calls go through: it says so again only once it next goes quiet
         assert_eq!(
-            texts(outgoing(vec![call("car left")], false, &mut muted)),
+            texts(outgoing(vec![call("car left")], false, false, &mut muted)),
             ["car left"]
         );
-        assert_eq!(texts(outgoing(Vec::new(), true, &mut muted)), ["muted"]);
+        assert_eq!(
+            texts(outgoing(Vec::new(), true, false, &mut muted)),
+            ["muted"]
+        );
+        // A lap time on the update it goes quiet isn't dropped with what came before
+        let mut muted = false;
+        assert_eq!(
+            texts(outgoing(vec![call(LAP_TIME)], true, true, &mut muted)),
+            ["muted, lap times", LAP_TIME]
+        );
+        assert_eq!(
+            texts(outgoing(vec![call(LAP_TIME)], true, true, &mut muted)),
+            [LAP_TIME]
+        );
     }
 
     #[test]
@@ -3693,7 +3770,7 @@ mod tests {
         spotter.heard(Heard::Call(call("blue flag")), at);
         assert_eq!(spotter.queue.len(), 1);
 
-        spotter.heard(Heard::Muted, at);
+        spotter.heard(Heard::Muted { lap_times: true }, at);
         assert!(spotter.queue.is_empty());
         assert!(spotter.saying.is_none());
         assert!(send.is_closed());
@@ -3701,6 +3778,39 @@ mod tests {
         // What comes after it's back on is said
         spotter.heard(Heard::Call(call("rain starting")), at);
         assert_eq!(spotter.queue.len(), 1);
+    }
+
+    #[test]
+    fn going_quiet_keeps_the_lap_times_waiting_and_being_said() {
+        let at = Instant::now();
+        let call = |text| Raised {
+            text,
+            urgent: false,
+            number: Some(100_000),
+            session_time: 0.0,
+        };
+        let (mut spotter, send) = pending_call(LAP_TIME, false, at);
+        spotter.heard(Heard::Call(call("blue flag")), at);
+        spotter.heard(Heard::Call(call(LAP_TIME)), at);
+        assert_eq!(spotter.queue.len(), 2);
+
+        spotter.heard(Heard::Muted { lap_times: true }, at);
+        assert_eq!(
+            spotter
+                .queue
+                .iter()
+                .map(|(call, _)| call.text)
+                .collect::<Vec<_>>(),
+            [LAP_TIME]
+        );
+        assert!(spotter.saying.is_some());
+        assert!(!send.is_closed());
+
+        // Unless they're no longer said
+        spotter.heard(Heard::Muted { lap_times: false }, at);
+        assert!(spotter.queue.is_empty());
+        assert!(spotter.saying.is_none());
+        assert!(send.is_closed());
     }
 
     #[test]
@@ -4483,16 +4593,137 @@ mod tests {
     }
 
     #[test]
-    fn says_no_lap_times_when_quiet_in_qualifying() {
+    fn says_lap_times_even_when_quiet_in_qualifying() {
         let mut config = lap_times_on();
         config.qualifying.set(false);
         let rows = [
             (10.0, 0, None, false, false),
-            (110.0, 1, Some(100.25), false, false),
+            // Invalidated, then through the pits: not called while quiet either
+            (50.0, 0, None, false, true),
+            (110.0, 1, Some(100.0), false, false),
+            (150.0, 1, Some(100.0), true, false),
+            (210.0, 2, Some(99.0), false, false),
+            (310.0, 3, Some(100.25), false, false),
         ];
-        assert!(lap_calls(&config, "qualifying", &rows).is_empty());
+        assert_eq!(lap_calls(&config, "qualifying", &rows), ["lap time 1 40.3"]);
         config.qualifying.set(true);
         assert_eq!(lap_calls(&config, "qualifying", &rows), ["lap time 1 40.3"]);
+    }
+
+    #[test]
+    fn follows_the_lap_as_qualifying_is_switched_off_and_on() {
+        let mut config = lap_times_on();
+        let mut logic = Logic::default();
+        let mut step = |config: &SpotterConfig, t, laps, last, invalidated| {
+            let scoring = Scoring {
+                session_type: Some("qualifying".into()),
+                laps_completed: Some(laps),
+                last_lap_time: last,
+                ..Scoring::default()
+            };
+            let mut p = player(t);
+            p.lap_invalidated = invalidated;
+            logic
+                .update(config, &p, &[], &Wheels::default(), Some(&scoring))
+                .into_iter()
+                .filter(|call| call.text == LAP_TIME)
+                .map(|call| call.words(arrstr!("en")))
+                .collect::<Vec<_>>()
+        };
+        // Switched off mid-lap, and on again mid-lap: each lap's still timed
+        assert!(step(&config, 10.0, 0, None, false).is_empty());
+        config.qualifying.set(false);
+        assert!(step(&config, 50.0, 0, None, false).is_empty());
+        assert_eq!(
+            step(&config, 110.0, 1, Some(100.0), false),
+            ["lap time 1 40.0"]
+        );
+        config.qualifying.set(true);
+        assert!(step(&config, 150.0, 1, Some(100.0), false).is_empty());
+        assert_eq!(
+            step(&config, 210.0, 2, Some(99.0), false),
+            ["lap time 1 39.0"]
+        );
+        // Invalidated before it's switched off: not called
+        assert!(step(&config, 250.0, 2, Some(99.0), true).is_empty());
+        config.qualifying.set(false);
+        assert!(step(&config, 260.0, 2, Some(99.0), false).is_empty());
+        assert!(step(&config, 310.0, 3, Some(98.0), false).is_empty());
+        // The lap's count comes before it's switched off, its time after
+        config.qualifying.set(true);
+        assert!(step(&config, 410.0, 4, Some(98.0), false).is_empty());
+        config.qualifying.set(false);
+        assert_eq!(
+            step(&config, 410.2, 4, Some(97.0), false),
+            ["lap time 1 37.0"]
+        );
+        // The lap ends as it's switched on
+        config.qualifying.set(true);
+        assert_eq!(
+            step(&config, 510.0, 5, Some(96.0), false),
+            ["lap time 1 36.0"]
+        );
+        // Quiet, the time first, then the count
+        config.qualifying.set(false);
+        assert!(step(&config, 609.8, 5, Some(95.0), false).is_empty());
+        assert_eq!(
+            step(&config, 610.0, 6, Some(95.0), false),
+            ["lap time 1 35.0"]
+        );
+        // Still invalidated a moment past the line: the next lap isn't
+        assert!(step(&config, 610.5, 6, Some(95.0), true).is_empty());
+        assert!(step(&config, 611.0, 6, Some(95.0), false).is_empty());
+        assert_eq!(
+            step(&config, 710.0, 7, Some(94.0), false),
+            ["lap time 1 34.0"]
+        );
+    }
+
+    #[test]
+    fn quiet_in_qualifying_follows_the_laps_with_their_times_off() {
+        let mut config = SpotterConfig::default();
+        let mut logic = Logic::default();
+        let mut step = |config: &SpotterConfig, t, laps, last, in_pit_lane| {
+            let scoring = Scoring {
+                session_type: Some("qualifying".into()),
+                laps_completed: Some(laps),
+                last_lap_time: last,
+                ..Scoring::default()
+            };
+            let mut p = player(t);
+            p.car.in_pit_lane = in_pit_lane;
+            texts(logic.update(config, &p, &[], &Wheels::default(), Some(&scoring)))
+        };
+        // Out of the pits with lap times off, then on mid-lap: the out lap isn't called...
+        assert!(step(&config, 10.0, 0, None, true).is_empty());
+        assert!(step(&config, 20.0, 0, None, false).is_empty());
+        config.qualifying_lap_times.set(true);
+        assert!(step(&config, 30.0, 0, None, false).is_empty());
+        assert!(step(&config, 110.0, 1, Some(100.0), false).is_empty());
+        // ...but the next one is
+        assert_eq!(step(&config, 210.0, 2, Some(99.0), false), [LAP_TIME]);
+    }
+
+    #[test]
+    fn a_new_session_while_quiet_forgets_the_last_ones_laps() {
+        let mut config = lap_times_on();
+        config.qualifying.set(false);
+        let mut logic = Logic::default();
+        let mut step = |t, laps, last| {
+            let scoring = Scoring {
+                session_type: Some("qualifying".into()),
+                laps_completed: Some(laps),
+                last_lap_time: last,
+                ..Scoring::default()
+            };
+            texts(logic.update(&config, &player(t), &[], &Wheels::default(), Some(&scoring)))
+        };
+        // A lap ends, its time not yet come, as the session restarts
+        assert!(step(500.0, 4, Some(100.0)).is_empty());
+        assert!(step(600.0, 5, Some(100.0)).is_empty());
+        // The new session's first standing is a lap done long ago, not the lap that ended
+        assert!(step(10.0, 0, None).is_empty());
+        assert!(step(20.0, 0, Some(99.0)).is_empty());
     }
 
     #[test]

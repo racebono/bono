@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "bono"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "bono-i18n"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "phf 0.14.0",
  "phf_codegen",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "bono-phonemizer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "espeak-rs-sys",
@@ -517,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "bono-sim"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bindgen 0.72.1",
  "rusqlite",
@@ -6440,7 +6440,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "futures",

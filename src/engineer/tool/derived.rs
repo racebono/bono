@@ -10185,7 +10185,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_skill_documents_every_column_and_its_queries_run() {
         let (_dir, engineer) = race();
-        for table in STREAM_TABLES.into_iter().chain(NOW_TABLES) {
+        let recording = ["telemetry", "telemetry_wheel", "car_state"];
+        for table in STREAM_TABLES.into_iter().chain(NOW_TABLES).chain(recording) {
             let columns = query(&engineer, &format!("PRAGMA table_info({table})")).await;
             assert!(!columns.is_empty(), "{table}");
             for column in columns {
