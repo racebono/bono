@@ -80,12 +80,13 @@ def generate(output):
         t = 0.0
         durations = []
         sectors = []
-        for lap in range(11):
+        for lap in range(1, 12):
             start = t
             sectors.append([0.0] * SECTORS)
             for distance in range(0, int(LENGTH), 10):
-                # Last complete lap brakes 35 m early for T2; lap 7 loses exit speed at T3.
-                early = vehicle == 1 and lap in (8, 9) and 1300 <= distance < 1500
+                # The last two complete laps, 9 and 10, brake 35 m early for T2; lap 7 loses exit
+                # speed at T3. Laps are numbered from 1, as the game shows them.
+                early = vehicle == 1 and lap in (9, 10) and 1300 <= distance < 1500
                 speed = 80.0
                 braking = False
                 for index, apex in enumerate(APEXES):
@@ -104,8 +105,8 @@ def generate(output):
                     lap=lap, lap_start_time=start, lap_distance=float(distance), sector=min(SECTORS - 1, int(distance * SECTORS // LENGTH)),
                     speed=speed, heading=0.0, position_x=0.0, position_y=0.0, position_z=-float(distance),
                     brake=float(braking), throttle=0.0 if braking else 1.0, steering=0.1 if speed < 60 else 0.0,
-                    fuel=90 - (lap + distance / LENGTH) * 3.0,
-                    virtual_energy=0.84 - (lap + distance / LENGTH) * 0.04,
+                    fuel=90 - (lap - 1 + distance / LENGTH) * 3.0,
+                    virtual_energy=0.84 - (lap - 1 + distance / LENGTH) * 0.04,
                     in_pit_lane=0, lap_invalidated=0, engine_overheating=0, gear=4, engine_rpm=6500.0))
                 sectors[-1][traces[-1]['sector']] += 10 / speed
                 t += 10 / speed
@@ -117,7 +118,7 @@ def generate(output):
     traces = [row for row in traces if row['session_time'] < now]
     for vehicle in [2, 3, 4, 1]:
         latest = max((r for r in traces if r['vehicle_id'] == vehicle), key=lambda r: r['session_time']).copy()
-        latest.update(session_time=now, lap=9 if vehicle == 4 else 10,
+        latest.update(session_time=now, lap=10 if vehicle == 4 else 11,
             lap_distance=800.0 if vehicle == 2 else 760.0 if vehicle == 3 else 797.0 if vehicle == 4 else 800.0,
             position_x=-3.0 if vehicle == 4 else 0.0,
             position_z=-803.0 if vehicle == 2 else -760.0 if vehicle == 3 else -797.0 if vehicle == 4 else -800.0,
@@ -130,7 +131,7 @@ def generate(output):
     traces.sort(key=lambda r: (r['session_time'], 1 if r['vehicle_id'] == 1 else 0, r['vehicle_id']))
     for row in traces:
         row_id = insert('telemetry', row)
-        progress = row['lap'] + row['lap_distance'] / LENGTH
+        progress = row['lap'] - 1 + row['lap_distance'] / LENGTH
         for wheel in range(4):
             worn = progress * (0.035 if wheel == 0 else 0.009)
             temp = 110.0 if wheel == 0 else [0, 91, 89, 90][wheel]
@@ -141,8 +142,8 @@ def generate(output):
                 tire_flat=0, wheel_detached=0))
         if row['vehicle_id'] == 1 and (row['lap_distance'] == 0 or row['session_time'] == now):
             insert('car_state', dict(telemetry_id=row_id, vehicle_id=1, session_time=row['session_time'],
-                track_limits_steps=3, last_impact_time=sum(lap_durations[1][:8]) if row['lap'] >= 8 else 0.0,
-                last_impact_magnitude=100.0 if row['lap'] >= 8 else 0.0,
+                track_limits_steps=3, last_impact_time=sum(lap_durations[1][:8]) if row['lap'] >= 9 else 0.0,
+                last_impact_magnitude=100.0 if row['lap'] >= 9 else 0.0,
                 virtual_energy_per_lap=0.04, fuel_per_lap=3.0, fuel_capacity=90.0,
                 speed_limiter_on=0))
     for t in [0.0, now]:
