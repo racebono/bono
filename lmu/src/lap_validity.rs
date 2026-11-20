@@ -3,15 +3,16 @@
 //! in separate updates.
 //!
 //! A lap is invalidated, for the rest of it, once either:
-//! - its steps rise while its time isn't counting. The flag turns off as the car leaves the track,
-//!   and back on if LMU forgives it; scoring the cut while it's off is how LMU is seen to decide.
+//! - its steps rise while its time isn't counting, as the scoring after the rise says. The flag
+//!   turns off as the car leaves the track, and back on if LMU forgives it; scoring the cut while
+//!   it's off is how LMU is seen to decide.
 //!   That's observed, not documented: a lap this misses still ends without an official time, which
 //!   the laps table and the spotter check at the line.
-//! - it starts not counting, away from the pits. LMU's guide says a late or serious offence
-//!   invalidates the next lap too; an out lap doesn't count for being one.
+//! - it starts not counting (by its first scoring), away from the pits. LMU's guide says a late or
+//!   serious offence invalidates the next lap too; an out lap doesn't count for being one.
 //!
-//! Only in sessions other than races (races give points instead), while green, for cars that
-//! haven't finished.
+//! Only for laps whose start was seen, in sessions other than races (races give points instead),
+//! while green, for cars that haven't finished.
 
 use bono_sim::sys::{bono_session_info, bono_standing, bono_telemetry};
 use std::{collections::HashMap, sync::Mutex};
@@ -22,20 +23,47 @@ pub struct LapValidity(Mutex<HashMap<i64, Car>>);
 
 #[derive(Default)]
 struct Car {
-    /// From the newest scoring: the laps completed, whether that lap's time counts, whether the
-    /// car's in the pits, and whether its laps are judged at all
+    /// From the newest scoring: the laps completed, whether that lap's time counts, and whether
+    /// the car's laps are judged at all
     scored_laps: Option<i64>,
+    counting: Option<bool>,
+    judged: bool,
+    /// The first scoring of the laps completed: how the lap began
+    start: Option<Start>,
+    /// The telemetry lap the rest is about
+    lap: Option<i64>,
+    /// Its start was seen (straight on from the lap before), and it began in the pits
+    seen_start: bool,
+    began_in_pits: bool,
+    start_judged: bool,
+    steps: Option<i64>,
+    /// The steps rose: judged by the scoring after, as the flag may change with them
+    rose: bool,
+    invalidated: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Start {
+    laps: i64,
     counting: Option<bool>,
     in_pits: bool,
     judged: bool,
-    /// The telemetry lap the rest is about
-    lap: Option<i64>,
-    /// Its start was seen (not the lap the car was first seen on), in the pit lane or not
-    seen_start: bool,
-    began_in_pit_lane: bool,
-    start_judged: bool,
-    steps: Option<i64>,
-    invalidated: bool,
+}
+
+impl Car {
+    /// Whether the lap, once its first scoring's here, began not counting away from the pits.
+    fn judge_start(&mut self) {
+        let Some(start) = self.start.filter(|start| Some(start.laps) == self.lap) else {
+            return;
+        };
+        if self.start_judged {
+            return;
+        }
+        self.start_judged = true;
+        self.began_in_pits |= start.in_pits;
+        self.invalidated |=
+            start.judged && start.counting == Some(false) && self.seen_start && !self.began_in_pits;
+    }
 }
 
 impl LapValidity {
@@ -46,7 +74,7 @@ impl LapValidity {
 
     /// Takes each car's newest scoring.
     pub fn fill_scoring(&self, session: &bono_session_info, standings: &[bono_standing]) {
-        let judged = session.session_type.as_deref().is_some_and(|t| t != "race")
+        let session_judged = session.session_type.as_deref().is_some_and(|t| t != "race")
             && session.phase.as_deref() == Some("green");
         let mut cars = self.0.lock().unwrap_or_else(|e| e.into_inner());
         for standing in standings {
@@ -54,14 +82,32 @@ impl LapValidity {
                 continue;
             };
             let car = cars.entry(vehicle).or_default();
-            car.scored_laps = standing.laps_completed.get();
+            let laps = standing.laps_completed.get();
             car.counting = standing.lap_time_counts.get();
-            car.in_pits = standing.in_pits.get().unwrap_or(false);
-            car.judged = judged
+            car.judged = session_judged
                 && standing
                     .finish_status
                     .as_deref()
                     .is_none_or(|s| s == "none");
+            if laps != car.scored_laps {
+                car.start = laps.map(|laps| Start {
+                    laps,
+                    counting: car.counting,
+                    in_pits: standing.in_pits.get().unwrap_or(false),
+                    judged: car.judged,
+                });
+            }
+            car.scored_laps = laps;
+            car.judge_start();
+            // The lap counter and scoring tick over a moment apart: until then, scoring is the
+            // last lap's
+            if car.rose && car.lap.is_some() && car.scored_laps == car.lap {
+                car.rose = false;
+                car.invalidated |= car.judged
+                    && car.counting == Some(false)
+                    && car.seen_start
+                    && !car.began_in_pits;
+            }
         }
     }
 
@@ -80,23 +126,15 @@ impl LapValidity {
                 .zip(lap)
                 .is_some_and(|(before, now)| now == before + 1);
             car.lap = lap;
-            car.began_in_pit_lane = telemetry.in_pit_lane.get().unwrap_or(false);
+            car.began_in_pits = telemetry.in_pit_lane.get().unwrap_or(false);
             car.start_judged = false;
+            car.rose = false;
             car.invalidated = false;
         }
-        // The lap counter and scoring tick over a moment apart: until then, scoring is the last lap's
-        let this_lap = lap.is_some() && car.scored_laps == lap;
-        let not_counting = this_lap && car.judged && car.counting == Some(false);
-        if this_lap && !car.start_judged {
-            car.start_judged = true;
-            car.invalidated |=
-                not_counting && car.seen_start && !car.began_in_pit_lane && !car.in_pits;
-        }
+        car.judge_start();
         let steps = telemetry.state.track_limits_steps.get();
-        // Not on a lap begun in the pits, which never counts: points scored there are the in lap's
         if let (Some(before), Some(now)) = (car.steps, steps) {
-            car.invalidated |=
-                not_counting && now > before && !car.began_in_pit_lane && !car.in_pits;
+            car.rose |= now > before;
         }
         if steps.is_some() {
             car.steps = steps;
@@ -146,6 +184,13 @@ mod tests {
         );
     }
 
+    /// Lap `lap` of the car, counting, seen in telemetry with 4 steps: the next lap's start is
+    /// then seen.
+    fn seen(validity: &LapValidity, vehicle: i64, lap: i64) {
+        scoring(validity, vehicle, lap, Some(true), false);
+        telemetry(validity, vehicle, lap, false, 4);
+    }
+
     /// The car's `lap_invalidated` for a telemetry update.
     fn telemetry(
         validity: &LapValidity,
@@ -175,10 +220,14 @@ mod tests {
     #[test]
     fn points_while_not_counting_invalidate_the_rest_of_the_lap() {
         let validity = LapValidity::default();
+        seen(&validity, 1, 2);
         scoring(&validity, 1, 3, Some(true), false);
         assert_eq!(telemetry(&validity, 1, 3, false, 4), Some(false));
         scoring(&validity, 1, 3, Some(false), false);
         assert_eq!(telemetry(&validity, 1, 3, false, 4), Some(false));
+        // Judged by the scoring after the rise
+        assert_eq!(telemetry(&validity, 1, 3, false, 5), Some(false));
+        scoring(&validity, 1, 3, Some(false), false);
         assert_eq!(telemetry(&validity, 1, 3, false, 5), Some(true));
         scoring(&validity, 1, 3, Some(true), false);
         assert_eq!(telemetry(&validity, 1, 3, false, 5), Some(true));
@@ -190,9 +239,72 @@ mod tests {
     #[test]
     fn points_while_counting_do_not_invalidate() {
         let validity = LapValidity::default();
+        seen(&validity, 1, 2);
         scoring(&validity, 1, 3, Some(true), false);
         assert_eq!(telemetry(&validity, 1, 3, false, 4), Some(false));
         assert_eq!(telemetry(&validity, 1, 3, false, 5), Some(false));
+        scoring(&validity, 1, 3, Some(true), false);
+        assert_eq!(telemetry(&validity, 1, 3, false, 5), Some(false));
+    }
+
+    #[test]
+    fn points_scored_as_the_flag_comes_back_do_not_invalidate() {
+        let validity = LapValidity::default();
+        seen(&validity, 1, 2);
+        scoring(&validity, 1, 3, Some(true), false);
+        telemetry(&validity, 1, 3, false, 4);
+        scoring(&validity, 1, 3, Some(false), false);
+        // Telemetry sees the points before scoring says the lap counts again
+        assert_eq!(telemetry(&validity, 1, 3, false, 5), Some(false));
+        scoring(&validity, 1, 3, Some(true), false);
+        assert_eq!(telemetry(&validity, 1, 3, false, 5), Some(false));
+    }
+
+    #[test]
+    fn points_scored_as_the_flag_drops_invalidate() {
+        let validity = LapValidity::default();
+        seen(&validity, 1, 2);
+        scoring(&validity, 1, 3, Some(true), false);
+        telemetry(&validity, 1, 3, false, 4);
+        assert_eq!(telemetry(&validity, 1, 3, false, 5), Some(false));
+        scoring(&validity, 1, 3, Some(false), false);
+        assert_eq!(telemetry(&validity, 1, 3, false, 5), Some(true));
+    }
+
+    #[test]
+    fn points_on_a_lap_begun_unseen_do_not_invalidate() {
+        let validity = LapValidity::default();
+        scoring(&validity, 1, 3, Some(false), false);
+        telemetry(&validity, 1, 3, false, 4);
+        telemetry(&validity, 1, 3, false, 5);
+        scoring(&validity, 1, 3, Some(false), false);
+        assert_eq!(telemetry(&validity, 1, 3, false, 5), Some(false));
+    }
+
+    #[test]
+    fn in_lap_cut_scored_in_the_pits_is_invalid() {
+        let validity = LapValidity::default();
+        seen(&validity, 1, 2);
+        scoring(&validity, 1, 3, Some(true), false);
+        telemetry(&validity, 1, 3, false, 4);
+        // Cut before the pit entry, scored in the pit lane
+        scoring(&validity, 1, 3, Some(false), false);
+        assert_eq!(telemetry(&validity, 1, 3, false, 4), Some(false));
+        scoring(&validity, 1, 3, Some(false), true);
+        telemetry(&validity, 1, 3, true, 5);
+        scoring(&validity, 1, 3, Some(false), true);
+        assert_eq!(telemetry(&validity, 1, 3, true, 5), Some(true));
+    }
+
+    #[test]
+    fn carry_over_is_judged_by_the_laps_first_scoring() {
+        // The car's telemetry is only kept now and then: its first update of lap 6 comes after
+        // a moment off track, which LMU then forgives
+        let validity = LapValidity::default();
+        seen(&validity, 1, 5);
+        scoring(&validity, 1, 6, Some(true), false);
+        scoring(&validity, 1, 6, Some(false), false);
+        assert_eq!(telemetry(&validity, 1, 6, false, 0), Some(false));
     }
 
     #[test]
@@ -225,6 +337,8 @@ mod tests {
         // Cut before the pit entry, scored once the out lap's begun in the pits
         scoring(&validity, 1, 5, Some(false), true);
         assert_eq!(telemetry(&validity, 1, 5, true, 0), Some(false));
+        assert_eq!(telemetry(&validity, 1, 5, true, 4), Some(false));
+        scoring(&validity, 1, 5, Some(false), true);
         assert_eq!(telemetry(&validity, 1, 5, true, 4), Some(false));
     }
 
