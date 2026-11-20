@@ -40,6 +40,8 @@ struct Car {
     /// The steps rose: judged by the scoring after, as the flag may change with them
     rose: bool,
     invalidated: bool,
+    /// A replay's scoring came since its last telemetry (none comes meanwhile)
+    replayed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -77,12 +79,14 @@ impl LapValidity {
         let session_judged = session.session_type.as_deref().is_some_and(|t| t != "race")
             && session.phase.as_deref() == Some("green");
         let mut cars = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        // A replay's (no telemetry comes meanwhile): the laps it spans are begun unseen
+        // A replay's (no telemetry comes meanwhile): a lap begun during it is begun unseen
         if standings
             .iter()
             .any(|standing| standing.control.as_deref() == Some("replay"))
         {
-            cars.clear();
+            for car in cars.values_mut() {
+                car.replayed = true;
+            }
             return;
         }
         for standing in standings {
@@ -129,16 +133,18 @@ impl LapValidity {
         let lap = telemetry.lap.get();
         if car.lap != lap {
             // Only straight on from the lap before: after laps unseen, this one's begun unseen too
-            car.seen_start = car
-                .lap
-                .zip(lap)
-                .is_some_and(|(before, now)| now == before + 1);
+            car.seen_start = !car.replayed
+                && car
+                    .lap
+                    .zip(lap)
+                    .is_some_and(|(before, now)| now == before + 1);
             car.lap = lap;
             car.began_in_pits = telemetry.in_pit_lane.get().unwrap_or(false);
             car.start_judged = false;
             car.rose = false;
             car.invalidated = false;
         }
+        car.replayed = false;
         car.judge_start();
         let steps = telemetry.state.track_limits_steps.get();
         if let (Some(before), Some(now)) = (car.steps, steps) {
@@ -456,6 +462,19 @@ mod tests {
         validity.fill_scoring(&session("practice", "green"), &[replay]);
         scoring(&validity, 1, 6, Some(false), false);
         assert_eq!(telemetry(&validity, 1, 6, false, 4), Some(false));
+    }
+
+    #[test]
+    fn a_lap_driven_on_after_a_replay_keeps_its_verdict() {
+        let validity = LapValidity::default();
+        seen(&validity, 1, 5);
+        scoring(&validity, 1, 6, Some(false), false);
+        assert_eq!(telemetry(&validity, 1, 6, false, 4), Some(true));
+        let mut replay = standing(1, 6, Some(false), false, "none");
+        replay.control = Some("replay".to_owned()).into();
+        validity.fill_scoring(&session("practice", "green"), &[replay]);
+        scoring(&validity, 1, 6, Some(false), false);
+        assert_eq!(telemetry(&validity, 1, 6, false, 4), Some(true));
     }
 
     #[test]
