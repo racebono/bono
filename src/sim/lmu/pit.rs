@@ -226,6 +226,11 @@ fn row<'a>(rows: &'a [Value], name: &str) -> anyhow::Result<Option<Row<'a>>> {
     Ok(Some(Row { current, options }))
 }
 
+/// A row with something to choose: one with a single option ("N/D") isn't offered.
+fn choosable(row: Option<Row<'_>>) -> Option<Row<'_>> {
+    row.filter(|row| row.options.len() > 1)
+}
+
 fn text(option: &Value) -> Option<&str> {
     option.get("text").and_then(Value::as_str)
 }
@@ -363,15 +368,13 @@ pub fn parse(rows: &Value, standings: &Value) -> anyhow::Result<PitMenu> {
         ..PitMenu::default()
     };
 
-    if let Some(row) = row(rows, ENERGY)? {
+    if let Some(row) = choosable(row(rows, ENERGY)?) {
         menu.energy_leave_pct = Some(number(&row, ENERGY)?);
-        menu.level_now = (player.and_then(|car| car.get("veFraction")).and_then(Value::as_f64))
-            .map(|fraction| fraction * 100.0);
     }
-    if let Some(row) = row(rows, FUEL)? {
+    if let Some(row) = choosable(row(rows, FUEL)?) {
         menu.fuel_leave_l = Some(number(&row, FUEL)?);
     }
-    if let Some(row) = row(rows, FUEL_RATIO)? {
+    if let Some(row) = choosable(row(rows, FUEL_RATIO)?) {
         menu.fuel_ratio = Some(number(&row, FUEL_RATIO)?);
     }
 
@@ -384,7 +387,7 @@ pub fn parse(rows: &Value, standings: &Value) -> anyhow::Result<PitMenu> {
         let tyres = tyres(&tyre_row);
         let fitted = tyres.iter().position(|(at, _)| *at == tyre_row.current);
         let pressure_name = PRESSURE_ROWS[corner as usize];
-        let pressure_kpa = match row(rows, pressure_name)? {
+        let pressure_kpa = match choosable(row(rows, pressure_name)?) {
             Some(row) => Some(number(&row, pressure_name)?),
             None => None,
         };
@@ -400,7 +403,7 @@ pub fn parse(rows: &Value, standings: &Value) -> anyhow::Result<PitMenu> {
     if let Some(row) = row(rows, DAMAGE)? {
         menu.repair = Some(choice(&row, DAMAGE)?);
     }
-    if let Some(row) = row(rows, REPLACE_BRAKES)? {
+    if let Some(row) = choosable(row(rows, REPLACE_BRAKES)?) {
         if row.options.len() != 2 {
             bail!("the pit menu's {REPLACE_BRAKES} row doesn't have two options");
         }
@@ -454,14 +457,6 @@ pub fn apply(rows: &Value, menu: &PitMenu, change: &Resolved) -> anyhow::Result<
             for name in [DAMAGE, REPLACE_BRAKES] {
                 if row(read, name)?.is_some() {
                     set.push((name, 0));
-                }
-            }
-            if let (Some(_), Some(level)) = (&menu.energy_leave_pct, menu.level_now)
-                && let Some(row) = row(read, ENERGY)?
-            {
-                let numbers = numbers(&row, ENERGY)?;
-                if let Some(at) = numbers.iter().rposition(|number| *number <= level) {
-                    set.push((ENERGY, at));
                 }
             }
         }
@@ -585,8 +580,6 @@ mod tests {
         assert_eq!(m.rear_wing.as_ref().unwrap().options[5], "11.3 grados");
         assert_eq!(m.replace_brakes, Some(false));
         assert_eq!(m.position, Position::OnTrack);
-        let level = m.level_now.unwrap();
-        assert!((level - 88.488).abs() < 0.01, "{level}");
     }
 
     #[test]
@@ -655,7 +648,7 @@ mod tests {
     #[test]
     fn clear_all_spares_aero() {
         let rows = menu_rows();
-        let mut m = parsed();
+        let m = parsed();
         let change = PitChange {
             clear: Some(Clear::All),
             ..Default::default()
@@ -668,11 +661,7 @@ mod tests {
         for name in [REAR_WING, GRILLE, FRONT_BRAKE_DUCT, REAR_BRAKE_DUCT, FUEL_RATIO] {
             assert_eq!(current(&out, name), current(&rows, name), "{name}");
         }
-        // Nothing added: the highest energy not above the 88.5% the car has
-        assert_eq!(current(&out, ENERGY), 88);
-        // Without a level, the energy is left alone
-        m.level_now = None;
-        let out = apply(&rows, &m, &resolved).unwrap();
+        // What the car leaves with is left as set: no level now is right for every stop to come
         assert_eq!(current(&out, ENERGY), current(&rows, ENERGY));
     }
 
@@ -758,6 +747,26 @@ mod tests {
         standings[0]["pitState"] = "STOPPED".into();
         let m = parse(&menu_rows(), &standings).unwrap();
         assert_eq!(m.position, Position::Stopped);
+    }
+
+    #[test]
+    fn a_row_with_one_option_is_not_offered() {
+        // LMU shows a row with nothing to choose as one "N/D" option: that row isn't offered,
+        // and the rest of the menu still is
+        let mut rows = menu_rows();
+        let ratio = (rows.as_array_mut().unwrap().iter_mut())
+            .find(|row| row["name"] == FUEL_RATIO)
+            .unwrap();
+        ratio["settings"] = serde_json::json!([{"text": "N/D"}]);
+        ratio["currentSetting"] = 0.into();
+        let brakes = (rows.as_array_mut().unwrap().iter_mut())
+            .find(|row| row["name"] == REPLACE_BRAKES)
+            .unwrap();
+        brakes["settings"] = serde_json::json!([{"text": "N/D"}]);
+        brakes["currentSetting"] = 0.into();
+        let m = parse(&rows, &fixture("standings.json")).unwrap();
+        assert!(m.fuel_ratio.is_none() && m.replace_brakes.is_none());
+        assert!(m.energy_leave_pct.is_some());
     }
 
     #[test]

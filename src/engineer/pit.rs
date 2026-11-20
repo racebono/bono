@@ -97,7 +97,7 @@ impl PitTool {
                 "clear": {
                     "type": "string",
                     "enum": ["all", "tyres"],
-                    "description": "change: clears first, then sets the other fields. all: no tyres, no fuel added, no repair, no brakes; the car's adjustments stay."
+                    "description": "change: clears first, then sets the other fields. all: no tyres, no fuel added, no repair, no brakes; the car's adjustments stay, and so does what the car leaves the stop with (set that field to change it)."
                 },
                 "fuel_add_l": number("change: litres to add at the stop (cars that add fuel)."),
                 "fuel_leave_l": number("change: litres the car leaves the stop with (cars that set the level)."),
@@ -175,7 +175,12 @@ impl PitTool {
                 Ok(after) => {
                     anyhow::bail!("{e:#}\nThe pit menu now shows: {}", current_text(&after));
                 }
-                Err(_) => return Err(e),
+                Err(_) => {
+                    return Err(e.context(
+                        "part of it may have been set, and the pit menu couldn't be read back: \
+                         not confirmed",
+                    ));
+                }
             }
         }
 
@@ -213,8 +218,8 @@ impl PitTool {
             Timing::ThisStop => "this stop",
             Timing::NextStop => "the next stop",
             Timing::Lost => {
-                "not kept: iRacing ticks every service again as the car leaves the pits (set it \
-                 again once back on track)"
+                "not kept: iRacing ticks every service again as the car leaves the pits (the \
+                 pilot can ask again once back on track)"
             }
             Timing::Unknown => "unknown (say you're not sure which stop)",
         };
@@ -331,13 +336,19 @@ pub fn options_text(menu: &PitMenu) -> String {
         }
         if menu.iracing_tyres {
             line(
-                "iRacing",
-                "one compound for every tyre fitted; a pressure only for a tyre being changed; \
-                 every service is ticked again as the car leaves the pits; repair is a fast \
-                 repair, of which a race has a limited number"
+                "iRacing tyres",
+                "one compound for every tyre fitted; a pressure only for a tyre being changed"
                     .into(),
             );
         }
+    }
+    if menu.iracing_tyres {
+        line(
+            "iRacing",
+            "every service is ticked again as the car leaves the pits; repair is a fast repair, \
+             of which a race has a limited number"
+                .into(),
+        );
     }
     for (field, choice) in [
         ("repair", &menu.repair),
@@ -681,6 +692,40 @@ mod tests {
     fn iracing_repair_is_fast_repair() {
         let text = options_text(&crate::sim::pit::tests::iracing_menu());
         assert!(text.contains("fast repair"), "{text}");
+        // Even when the tyres can't be offered
+        let mut menu = crate::sim::pit::tests::iracing_menu();
+        menu.corners = None;
+        let text = options_text(&menu);
+        assert!(text.contains("fast repair") && text.contains("leaves the pits"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn not_kept_leaves_asking_again_to_the_pilot() {
+        let mut leaving = crate::sim::pit::tests::iracing_menu();
+        leaving.position = Position::Exiting;
+        let tool = PitTool::new(FakeService::new(leaving, true));
+        let text = (tool.run(input(serde_json::json!({"action": "change", "fuel_add_l": 20}))))
+            .await
+            .unwrap();
+        assert!(text.contains("the pilot can ask again once back on track"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_unconfirmed_write_may_have_set_part() {
+        let service = Arc::new(FakeService {
+            menu: Mutex::new(menu()),
+            applies: true,
+            writes: Mutex::new(0),
+            blind_after_write: true,
+            moves_to: None,
+            write_fails: true,
+        });
+        let tool = PitTool::new(service);
+        let e = (tool.run(input(serde_json::json!({"action": "change", "energy_leave_pct": 50}))))
+            .await
+            .unwrap_err();
+        let e = format!("{e:#}");
+        assert!(e.contains("part of it may have been set"), "{e}");
     }
 
     #[tokio::test]

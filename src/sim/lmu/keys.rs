@@ -39,9 +39,8 @@ pub fn pit_request_key(keyboard_json: &str) -> anyhow::Result<Option<u16>> {
     let json: Value = serde_json::from_str(keyboard_json).context("LMU's keyboard.json isn't JSON")?;
     let key = input(&json)?.get(PIT_REQUEST).and_then(Value::as_i64);
     match key {
-        // Unbound
+        // Unbound: only an absent control is (what 0 or less means to LMU isn't known)
         None => Ok(None),
-        Some(key) if key <= 0 => Ok(None),
         // A keyboard scan code (extended keys over 0x80)
         Some(key @ 1..=0xFF) => Ok(Some(key as u16)),
         // Bound to something that isn't a key there is to press: never taken as unbound, so it's
@@ -98,7 +97,11 @@ pub fn upkeep(game: &Game, requests_on: bool) -> Option<PitKeyStatus> {
         // A temporary file moved over it: LMU never reads half a file of the pilot's bindings
         let mut temp = path.clone().into_os_string();
         temp.push(".tmp");
-        std::fs::write(&temp, bound)?;
+        // On disk before it replaces the pilot's bindings, not only after a crash
+        let mut file = std::fs::File::create(&temp)?;
+        std::io::Write::write_all(&mut file, bound.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
         std::fs::rename(&temp, &path)?;
         log::info!("Bound F11 to LMU's Pit Request, for the engineer's stop requests");
         anyhow::Ok(PitKeyStatus::Key(F11))
@@ -143,7 +146,18 @@ pub fn press(scan: u16) -> anyhow::Result<()> {
     };
 
     let window = lmu_window().context("couldn't find LMU's window")?;
-    let previous = unsafe { GetForegroundWindow() };
+    // The window to put back: none while Windows is mid-switch, so it's waited for
+    let start = Instant::now();
+    let previous = loop {
+        let previous = unsafe { GetForegroundWindow() };
+        if !previous.is_null() {
+            break previous;
+        }
+        if start.elapsed() >= FOCUS_WAIT {
+            bail!("no window is in front to come back to: try again in a moment");
+        }
+        std::thread::sleep(FOCUS_POLL);
+    };
     /// Puts the window that was in front back, however the press ends (even when LMU only came
     /// to the front after the wait gave up)
     struct Restore(windows_sys::Win32::Foundation::HWND);
@@ -240,7 +254,8 @@ mod tests {
     fn only_keyboard_scan_codes() {
         // Bound, but not to a key there is to press: never taken as unbound (and rebound)
         assert!(pit_request_key(r#"{"Input":{"Pit Request":300}}"#).is_err());
-        assert_eq!(pit_request_key(r#"{"Input":{"Pit Request":0}}"#).unwrap(), None);
+        // Only an absent control is unbound: what 0 means to LMU isn't known
+        assert!(pit_request_key(r#"{"Input":{"Pit Request":0}}"#).is_err());
     }
 
     #[test]

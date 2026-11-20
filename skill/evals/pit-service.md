@@ -35,6 +35,7 @@ harness without the `pit` tool says nothing about these behaviours: leave these 
 | Wets on, made while the car is stopped in its box, in a game that keeps it for the next stop | Says the change counts for the next stop, not this one. |
 | Wets on, made while the car leaves the pits, in a game that ticks every service again then | Says the change won't stick and that the pilot can ask again once back on track; never that it's set for a stop. |
 | Box this lap, in a game with stop requests | One `request_stop`, confirmed in a few words. |
+| A change the game didn't take | Says it didn't take; never that it's set. |
 
 ## The engineer's own idea
 
@@ -49,7 +50,6 @@ harness without the `pit` tool says nothing about these behaviours: leave these 
 |---|---|
 | Keep the fuel set to finish, with the menu already right | No `change` call; exactly `[SILENCE]`. |
 | Keep the fuel set to finish, with the menu short of what's needed | One `change` to the needed level; one sentence opening with its subject, saying what it set. No `[SILENCE]`. |
-| A change the game didn't take | Says it didn't take; never that it's set. |
 
 Grade the reply as spoken, and the transcript for the tool calls. Any reply that says a change was
 made when the transcript has no `change`, or when the result lists it as not taken, fails.

@@ -135,8 +135,6 @@ pub struct PitMenu {
     /// Energy the car leaves the stop with (LMU with virtual energy)
     pub energy_leave_pct: Option<Number>,
     pub fuel_ratio: Option<Number>,
-    /// The fuel or energy the car has now, in the unit of whichever leave field it has
-    pub level_now: Option<f64>,
     /// Indexed by `Corner as usize`
     pub corners: Option<[CornerMenu; 4]>,
     /// iRacing: every fitted tyre takes one compound, and a pressure ticks its tyre
@@ -154,7 +152,8 @@ pub struct PitMenu {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Clear {
-    /// Every service: no tyres, no fuel added, no repair, no brakes, no tear-off
+    /// Every service: no tyres, no fuel added (iRacing), no repair, no brakes, no tear-off. What
+    /// the car leaves with (LMU) stays as set
     All,
     Tyres,
 }
@@ -557,15 +556,13 @@ pub fn unmet(after: &PitMenu, resolved: &Resolved) -> Vec<String> {
         {
             unmet.push("fuel".into());
         }
-        // The litres the car has now aren't known, so the level it leaves with stays as set
+        // What the car leaves with has no "nothing added" for every stop to come (it depends on
+        // what's left by then): a clear leaves it as set, and says so
         if resolved.fuel_leave_l.is_none() && after.fuel_leave_l.is_some() {
-            unmet.push("fuel".into());
+            unmet.push("fuel (left as set: give fuel_leave_l to change it)".into());
         }
-        if resolved.energy_leave_pct.is_none()
-            && after.energy_leave_pct.is_some()
-            && after.level_now.is_none()
-        {
-            unmet.push("energy".into());
+        if resolved.energy_leave_pct.is_none() && after.energy_leave_pct.is_some() {
+            unmet.push("energy (left as set: give energy_leave_pct to change it)".into());
         }
     }
 
@@ -678,7 +675,6 @@ pub mod tests {
             position: Position::OnTrack,
             energy_leave_pct: Some(number(100.0, 0.0, 100.0, 1.0)),
             fuel_ratio: Some(number(0.88, 0.01, 1.17, 0.01)),
-            level_now: Some(80.0),
             corners: Some([corner.clone(), corner.clone(), corner.clone(), corner]),
             repair: Some(Choice {
                 current: 0,
@@ -977,17 +973,20 @@ pub mod tests {
             clear: Some(Clear::All),
             ..Default::default()
         };
-        // A car that sets the litres it leaves with: Bono can't tell the litres it has now
+        // What a car leaves with is left as set by a clear, and said: no target means nothing
+        // added at every stop to come
+        let names = |menu: &PitMenu, r: &Resolved| unmet(menu, r).join("; ");
         let mut litres = menu();
         litres.energy_leave_pct = None;
         litres.fuel_leave_l = Some(number(60.0, 0.0, 110.0, 1.0));
-        litres.level_now = None;
         let r = check(&litres, &clear).unwrap();
-        assert!(unmet(&litres, &r).contains(&"fuel".to_string()));
-        // Energy without the level now is left as it is
-        let mut energy = menu();
-        energy.level_now = None;
-        assert!(unmet(&energy, &check(&energy, &clear).unwrap()).contains(&"energy".to_string()));
+        assert!(names(&litres, &r).contains("fuel (left as set"), "{}", names(&litres, &r));
+        let energy = menu();
+        let r = check(&energy, &clear).unwrap();
+        assert!(names(&energy, &r).contains("energy (left as set"), "{}", names(&energy, &r));
+        // Unless the change sets it
+        let r = check(&energy, &change(json!({"clear": "all", "energy_leave_pct": 100}))).unwrap();
+        assert!(!names(&energy, &r).contains("energy"), "{}", names(&energy, &r));
         // iRacing: fuel still ticked after a clear didn't take
         let mut iracing = iracing_menu();
         iracing.fuel_add_l.as_mut().unwrap().value = 30.0;
