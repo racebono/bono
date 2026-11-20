@@ -296,6 +296,12 @@ settings! {
         /// The pilot's input language; automatic when `None` (fixed by a lone voice language).
         pub heard_language: Option<ArrayStr<2>> = None,
         pub opponent_frequency: NonZeroU32 = NonZeroU32::new(5).unwrap(),
+        /// iRacing: whether the replay is jumped back to live whenever it falls behind, so every
+        /// lap is recorded while watching
+        pub iracing_keep_live: bool = false,
+        /// iRacing: how far behind live (seconds, 1 to 30) the replay must be to count as one,
+        /// and not be recorded
+        pub iracing_behind_live: u32 = 3,
         /// Changed with `set_voice`, which loads the voice too
         voices: BTreeMap<ArrayStr<2>, Utf8PathBuf> = BTreeMap::new(),
         pub whisper_model: Option<Arc<Utf8Path>> = None,

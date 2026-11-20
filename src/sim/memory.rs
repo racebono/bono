@@ -496,6 +496,8 @@ mod tests {
         sim.clear();
         sim.apply(&SimulatorSettings {
             opponent_frequency: NonZeroU32::new(7).unwrap(),
+            iracing_keep_live: false,
+            iracing_behind_live: 3,
         });
         sim.clear();
         // Changes run in order, so this one runs once the others are written

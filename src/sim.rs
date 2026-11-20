@@ -385,10 +385,17 @@ impl fmt::Display for Version {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SimulatorSettings {
     pub opponent_frequency: NonZeroU32,
+    /// iRacing: whether the replay is jumped back to live whenever it falls behind
+    pub iracing_keep_live: bool,
+    /// iRacing: how far behind live (seconds) the replay must be to count as one
+    pub iracing_behind_live: u32,
 }
+
+/// iRacing's name, for what's only shown for it (its simulator is only built on Windows).
+pub const IRACING_NAME: &str = "iRacing";
 
 /// Follows which simulator is running. The first one found running stays current for as long as
 /// it runs, even if another starts meanwhile; when it stops, the next one running (if any) takes
