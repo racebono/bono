@@ -107,11 +107,11 @@
     },
     {
       "id": 11,
-      "prompt": "how did lap 7 go, where did that one go wrong?",
+      "prompt": "how did lap 8 go, where did that one go wrong?",
       "expected_output": "",
       "files": [],
       "assertions": [
-        "Names T3 / Esse as where lap 7 lost its time",
+        "Names T3 / Esse as where lap 8 lost its time",
         "Says it was the exit / too slow through the corner (low apex or exit speed), not the braking point",
         "At most 3 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
         "Starts with a brief acknowledgement of a few words (like \"Copy, checking.\") before the answer, without guessing at the answer in it",
@@ -285,7 +285,7 @@
     },
     {
       "id": 26,
-      "prompt": "Why was lap 7 slow, and what should I change there?",
+      "prompt": "Why was lap 8 slow, and what should I change there?",
       "expected_output": "Controlled synthetic fixture; concise but complete advice",
       "files": [],
       "session": "race",

@@ -296,9 +296,9 @@
         "ca": "El plugin instal·lat no és el que ve amb bono"
     },
     "plugin.unexpected_code_hover": {
-        "en": "It says it's the same version, but its contents differ (a modified or damaged file, or another build). Reinstall it to be sure the recording works",
-        "es": "Dice ser la misma versión, pero su contenido es distinto (un archivo modificado o dañado, u otra compilación). Reinstálalo para asegurarte de que la grabación funciona",
-        "ca": "Diu que és la mateixa versió, però el contingut és diferent (un fitxer modificat o malmès, o una altra compilació). Reinstal·la'l per assegurar-te que la gravació funciona"
+        "en": "It says it's the same version, but its contents differ (a modified or damaged file, or another build). Update it so its sessions can start",
+        "es": "Dice ser la misma versión, pero su contenido es distinto (un archivo modificado o dañado, u otra compilación). Actualízalo para que sus sesiones puedan empezar",
+        "ca": "Diu que és la mateixa versió, però el contingut és diferent (un fitxer modificat o malmès, o una altra compilació). Actualitza'l perquè les seves sessions puguin començar"
     },
     "plugin.disabled": {
         "en": "Disabled in the game's plugin settings",
@@ -496,9 +496,9 @@
         "ca": "A la classificació"
     },
     "spotter.qualifying_hover": {
-        "en": "Whether it calls in qualifying sessions too. Off, it stays quiet until the session ends",
-        "es": "Si también avisa en las sesiones de clasificación. Desactivado, calla hasta que acaba la sesión",
-        "ca": "Si també avisa a les sessions de classificació. Desactivat, calla fins que s'acaba la sessió"
+        "en": "Whether it calls in qualifying sessions too. Off, it stays quiet until the session ends, but for lap times if those are on",
+        "es": "Si también avisa en las sesiones de clasificación. Desactivado, calla hasta que acaba la sesión, salvo los tiempos de vuelta si están activados",
+        "ca": "Si també avisa a les sessions de classificació. Desactivat, calla fins que s'acaba la sessió, llevat dels temps de volta si estan activats"
     },
     "spotter.pilots_language": {
         "en": "The pilot's",
@@ -531,9 +531,9 @@
         "ca": "Temps de volta a la classificació"
     },
     "spotter.qualifying_lap_times_hover": {
-        "en": "Says the time of each of your laps in qualifying, once it's over. Laps invalidated, or through the pit lane, aren't called",
-        "es": "Dice el tiempo de cada una de tus vueltas en clasificación, en cuanto la acabas. No dice las vueltas invalidadas, ni las que pasan por el pit lane",
-        "ca": "Diu el temps de cadascuna de les teves voltes a la classificació, tan bon punt l'acabes. No diu les voltes invalidades, ni les que passen pel pit lane"
+        "en": "Says the time of each of your laps in qualifying, once it's over. Laps invalidated, or through the pit lane, aren't called. Said even with the spotter quiet in qualifying",
+        "es": "Dice el tiempo de cada una de tus vueltas en clasificación, en cuanto la acabas. No dice las vueltas invalidadas, ni las que pasan por el pit lane. Los dice aunque el spotter calle en clasificación",
+        "ca": "Diu el temps de cadascuna de les teves voltes a la classificació, tan bon punt l'acabes. No diu les voltes invalidades, ni les que passen pel pit lane. Els diu encara que l'spotter calli a la classificació"
     },
     "lang.en": {
         "en": "English",

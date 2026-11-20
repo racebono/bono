@@ -347,15 +347,18 @@ impl PluginStatus {
     }
 
     /// Whether the installed copy is older than the one that comes with the app, another build of
-    /// its version, or too old to say its version: what it records may not be what the app reads.
-    /// Without the app's copy, or its version, there's nothing to tell it by, and a copy with the
-    /// same contents is the app's, whatever its version reads as.
+    /// its version, its version with other code (see `unexpected_code`), or too old to say its
+    /// version: what it records may not be what the app reads. Without the app's copy, or its
+    /// version, there's nothing to tell it by, and a copy with the same contents is the app's,
+    /// whatever its version reads as.
     pub fn outdated(&self) -> bool {
         if self.same_as_bundled == Some(true) {
             return false;
         }
         match (&self.installed, self.bundled_version()) {
-            (Some(Some(installed)), Some(latest)) => latest.replaces(installed),
+            (Some(Some(installed)), Some(latest)) => {
+                latest.replaces(installed) || self.unexpected_code()
+            }
             (Some(None), Some(_)) => true,
             _ => false,
         }
@@ -363,10 +366,10 @@ impl PluginStatus {
 
     /// Whether the installed copy says it's the same version as the one that comes with the app,
     /// but its code isn't (a local build, or a damaged or modified file). Other versions are
-    /// expected to differ.
+    /// expected to differ, and without the app's version there's nothing to tell it by.
     pub fn unexpected_code(&self) -> bool {
         self.same_as_bundled == Some(false)
-            && self.installed.is_some()
+            && self.bundled_version().is_some()
             && self.installed == self.bundled
     }
 }
@@ -965,6 +968,8 @@ mod tests {
         // Another version is expected to be other code
         assert!(!status(version(0), version(1), Some(false)).unexpected_code());
         assert!(!status(None, version(0), None).unexpected_code());
+        // Neither says its version
+        assert!(!status(Some(None), Some(None), Some(false)).unexpected_code());
     }
 
     #[test]
@@ -987,6 +992,18 @@ mod tests {
         assert!(status(version(0), version(1)).outdated());
         assert!(!status(version(1), version(1)).outdated());
         assert!(!status(version(2), version(1)).outdated());
+        // Its version, but other code
+        let other_code = PluginStatus {
+            same_as_bundled: Some(false),
+            ..status(version(1), version(1))
+        };
+        assert!(other_code.outdated());
+        // Another version is expected to be other code: only the version tells
+        let newer = PluginStatus {
+            same_as_bundled: Some(false),
+            ..status(version(2), version(1))
+        };
+        assert!(!newer.outdated());
         // Too old to say its version
         assert!(status(Some(None), version(1)).outdated());
         // The app's own copy, whatever its version reads as

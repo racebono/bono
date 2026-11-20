@@ -28,7 +28,7 @@
     X(boolean, is_player)                   /* the car the local player is driving */                    \
     X(f64, session_time)                                                                                 \
     X(f64, time_since_last_update)                                                                       \
-    X(i64, lap)                                                                                          \
+    X(i64, lap)                             /* the lap the car is on, from 1: laps completed + 1 (iRacing's out lap, -1 done, is lap 1 too) */ \
     X(f64, lap_start_time)                  /* session time the current lap started */                   \
     X(f64, lap_distance)                    /* metres from the start/finish line (LMU: estimated, see the plugin; iRacing: its lap fraction times the track's length) */ \
     X(i64, sector)                          /* zero-based */                                             \
@@ -137,7 +137,7 @@
     X(boolean, headlights)                                                                               \
     X(i64, wipers)                                                                                       \
     X(i64, scheduled_pit_stops)                                                                          \
-    X(f64, steering_wheel_range) /* physical; RaceRoom: degrees, full left to full right; LMU: unit and span not documented; iRacing: degrees, taken for lock to lock (its span isn't documented) */ \
+    X(f64, steering_wheel_range) /* physical; RaceRoom: degrees, full left to full right; LMU: taken as degrees lock to lock, as other tools do (not documented); often 0, so NULL, or the garage setup's wheel range for the player's car; iRacing: degrees, taken for lock to lock (its span isn't documented) */ \
     X(f64, engine_max_rpm) /* rev limit, not the best shift point */ \
     X(i64, max_gears) /* forward gears */ \
     /* The highest value of each control, which does not prove every step differs */ \
