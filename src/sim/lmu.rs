@@ -28,6 +28,7 @@ use tokio::{
 };
 
 mod plugin;
+mod pit;
 
 const STEAM_APP_ID: u32 = 2399420;
 /// The plugin's folder, in the game's UserData folder.

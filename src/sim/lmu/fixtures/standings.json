@@ -1,0 +1,11 @@
+[
+ {
+  "slotID": 0,
+  "player": true,
+  "pitState": "NONE",
+  "pitting": false,
+  "inGarageStall": false,
+  "fuelFraction": 0.6666666865348816,
+  "veFraction": 0.8848845958709717
+ }
+]
