@@ -96,11 +96,11 @@ fn pull_to_live() {
         if unsafe { SendNotifyMessageW(HWND_BROADCAST, message, command | (first << 16), second) }
             == 0
         {
+            // Each is sent anyway: a broadcast that some window didn't take may still reach iRacing
             log::debug!(
                 "Couldn't ask iRacing to play its replay live: {}",
                 std::io::Error::last_os_error()
             );
-            return;
         }
     }
 }

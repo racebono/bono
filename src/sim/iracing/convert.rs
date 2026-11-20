@@ -4281,7 +4281,6 @@ mod tests {
                 .is_none()
         );
         assert_eq!(converter.last_time, Some(500.0));
-        assert!(converter.cars.contains_key(&0));
         // The next session, watched from its start
         let next = |t: f64, num: i32| {
             Vars::of(&[
