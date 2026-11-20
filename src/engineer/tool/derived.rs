@@ -2927,7 +2927,7 @@ pub(super) struct Stream {
     laps_completed: HashMap<i64, (i64, f64)>,
     /// Who's led the standings, as of each car's last row
     leaders: Leaders,
-    /// How the cars followed have been seen to count their opening lap, as of the laps 1 over
+    /// How the cars followed have been seen to count their opening lap, as of the opening laps over
     /// (the one under way can still be replayed from a later start: see `Stream::counting`)
     opening_lap: OpeningLap,
     official: HashMap<i64, Vec<Official>>,
@@ -4196,7 +4196,7 @@ impl Stream {
         }
     }
 
-    /// How the session counts its opening lap, from the laps 1 over and those under way.
+    /// How the session counts its opening lap, from the opening laps over and those under way.
     fn counting(&self) -> Option<Counting> {
         let live = self
             .cars
