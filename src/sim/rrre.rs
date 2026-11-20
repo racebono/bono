@@ -1479,7 +1479,9 @@ mod tests {
             .find(|t| t.vehicle_id.get() == Some(7))
             .unwrap();
         assert_eq!(mine.session_time.get(), Some(500.0));
+        // The lap it's on, one past the laps the standings count
         assert_eq!(mine.lap.get(), Some(4));
+        assert_eq!(me.laps_completed.get(), Some(3));
         assert_eq!(mine.sector.get(), Some(1));
         assert_eq!(mine.lap_invalidated.get(), Some(false));
         // Travelling along -z, nose slightly right of that as it slides to its left

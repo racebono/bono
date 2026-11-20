@@ -3972,6 +3972,23 @@ mod tests {
         assert!(out.contains("ALERTS (act now) none"), "{out}");
     }
 
+    /// A car alongside a lap further on is a lap up; one whose lap isn't known is neither up nor down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quick_tags_laps_up_only_with_both_laps_known() {
+        let (dir, engineer) = race();
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        for (lap, tag) in [("NULL", ""), ("5", ", 1 lap up")] {
+            conn.execute_batch(&format!(
+                "UPDATE telemetry SET lap = {lap} WHERE vehicle_id = 2 AND session_time = 310"
+            ))
+            .unwrap();
+            let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+            assert!(out.contains(&format!("car 2) ALONGSIDE{tag}")), "{out}");
+            assert!(!out.contains("lap down"), "{out}");
+            assert_eq!(out.contains("lap up"), !tag.is_empty(), "{out}");
+        }
+    }
+
     /// A window of laps 5 to 10 closes on lap 10, as the game numbers its laps: the stop still owed
     /// has to be made on this lap.
     #[tokio::test(flavor = "multi_thread")]

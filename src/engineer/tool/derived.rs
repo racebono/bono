@@ -10146,8 +10146,6 @@ mod tests {
     #[test]
     fn the_lap_fuel_runs_out_on_is_the_games() {
         let conn = Connection::open_in_memory().unwrap();
-        // Halfway round lap 3, as the game numbers it, with 2.6 laps of fuel at 2 L a lap
-        let p = columns(&conn, "3 AS lap, 5.2 AS fuel");
         let mut used = lap_with(false, false, (1.0, 1.0));
         used.fuel_used = Some(2.0);
         let stint = Stint {
@@ -10163,19 +10161,24 @@ mod tests {
             cars: BTreeMap::new(),
             player: None,
         };
-        let row = projection(&sc, &BTreeMap::new(), 1, &p, &stint, 0.5, Some(500.0));
-        let value = |name: &str| {
-            row.iter()
-                .find(|(column, _)| *column == name)
-                .map(|(_, value)| value.clone())
-                .unwrap()
-        };
-        // Out 0.1 into lap 6: lap 5 is the last it finishes
-        assert!(
-            matches!(value("fuel_runs_out_lap"), Value::Real(lap) if (lap - 6.1).abs() < 1e-9),
-            "{row:?}"
-        );
-        assert_eq!(value("last_full_lap"), Value::Integer(5), "{row:?}");
+        // Halfway round lap 3, as the game numbers it, with 2.6 laps of fuel at 2 L a lap: out 0.1
+        // into lap 6, so lap 5 is the last it finishes. With the lap not known, it's taken for the
+        // opening lap: out 0.1 into lap 4
+        for (lap, out, last) in [("3", 6.1, 5), ("NULL", 4.1, 3)] {
+            let p = columns(&conn, &format!("{lap} AS lap, 5.2 AS fuel"));
+            let row = projection(&sc, &BTreeMap::new(), 1, &p, &stint, 0.5, Some(500.0));
+            let value = |name: &str| {
+                row.iter()
+                    .find(|(column, _)| *column == name)
+                    .map(|(_, value)| value.clone())
+                    .unwrap()
+            };
+            assert!(
+                matches!(value("fuel_runs_out_lap"), Value::Real(at) if (at - out).abs() < 1e-9),
+                "{row:?}"
+            );
+            assert_eq!(value("last_full_lap"), Value::Integer(last), "{row:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
