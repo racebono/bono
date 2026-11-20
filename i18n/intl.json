@@ -1081,6 +1081,18 @@
         "ca": "volta invalidada",
         "it": "giro invalidato"
     },
+    "call.lap_and_next_invalidated": {
+        "en": "lap invalidated, next lap too",
+        "es": "vuelta invalidada, y la siguiente también",
+        "ca": "volta invalidada, i la següent també",
+        "it": "giro invalidato, anche il prossimo"
+    },
+    "call.next_lap_invalidated": {
+        "en": "next lap invalidated",
+        "es": "siguiente vuelta invalidada",
+        "ca": "següent volta invalidada",
+        "it": "prossimo giro invalidato"
+    },
     "call.car_close_behind": {
         "en": "car close behind",
         "es": "coche pegado detrás",

@@ -19,7 +19,7 @@ use rusqlite::{
 };
 use std::{
     borrow::Cow,
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     sync::mpsc::{self, RecvTimeoutError},
 };
 
@@ -2346,7 +2346,8 @@ fn resegment(
 #[derive(Clone)]
 struct Official {
     at: f64,
-    time: f64,
+    /// `None`: none came, where that means the lap didn't count (see `Stream::judged`)
+    time: Option<f64>,
     /// Each sector's time from the line on, as many as the session has
     sectors: Vec<Option<f64>>,
 }
@@ -2681,7 +2682,19 @@ impl Writer<'_> {
         mut build: LapBuild,
         next: &LapBuild,
     ) -> rusqlite::Result<()> {
-        let lap = build.lap(self.conn, vehicle, Some(next), car.last_impact)?;
+        let mut lap = build.lap(self.conn, vehicle, Some(next), car.last_impact)?;
+        // Or it ended without an official time (see `Stream::settle_untimed`)
+        let untimed = lap.start.zip(lap.time).is_some_and(|(start, time)| {
+            self.official.get(&vehicle).is_some_and(|entries| {
+                entries.iter().any(|official| {
+                    official.time.is_none() && (official.at - (start + time)).abs() < OFFICIAL_MATCH
+                })
+            })
+        });
+        if untimed && lap.complete && !lap.pit {
+            lap.invalid = true;
+            build.invalid = true;
+        }
         if lap.impact.is_some_and(|impact| impact != 0.0) {
             car.last_impact = lap.impact;
         }
@@ -2742,7 +2755,7 @@ impl Writer<'_> {
                 ("last_id", Value::Integer(lap.last_id)),
                 ("start_s", real(lap.start)),
                 ("time_s", real(lap.time)),
-                ("official_time_s", real(official.map(|o| o.time))),
+                ("official_time_s", real(official.and_then(|o| o.time))),
                 ("top_speed_kmh", real(km_h(lap.top_speed))),
                 ("complete", flag(lap.complete)),
                 ("invalid", flag(lap.invalid)),
@@ -2931,6 +2944,12 @@ pub(super) struct Stream {
     /// (the one under way can still be replayed from a later start: see `Stream::counting`)
     opening_lap: OpeningLap,
     official: HashMap<i64, Vec<Official>>,
+    /// The cars whose lap under way started where one without an official time didn't count:
+    /// outside races, under green and not yet finished, with the standings saying whether a lap's
+    /// time counts (LMU's do, and give no time for a lap that doesn't)
+    judged: HashSet<i64>,
+    /// When their last such lap ended, until its official time comes or can't any more
+    awaiting: HashMap<i64, f64>,
     drivers: Drivers,
     stint_ids: StintIds,
     /// What each car's stints were on course for when last worked out, kept once they're over
@@ -2998,7 +3017,15 @@ impl Stream {
                 return Err(e.into());
             }
         };
-        let telemetry_behind = match self.apply_telemetry(conn, &samples) {
+        let newest = samples
+            .iter()
+            .filter_map(|sample| sample.session_time)
+            .reduce(f64::max)
+            .filter(|_| !standings_behind);
+        let telemetry_behind = match self
+            .apply_telemetry(conn, &samples)
+            .and_then(|behind| self.settle_from_telemetry(conn, newest).map(|()| behind))
+        {
             Ok(behind) => behind,
             Err(e) => {
                 // What was applied of those rows is gone with the transaction: read them again
@@ -3014,7 +3041,12 @@ impl Stream {
             return Err(e.into());
         }
 
-        if !self.behind {
+        // Lined up with clean laps only: not one that may yet be lost at the line
+        if !self.behind
+            && !self
+                .player
+                .is_some_and(|player| self.verdict_pending(player))
+        {
             self.calibrate(conn, shared)?;
         }
         self.find_braking_zones(conn)?;
@@ -3105,6 +3137,8 @@ impl Stream {
         self.laps_completed.clear();
         self.leaders = Leaders::default();
         self.official.clear();
+        self.judged.clear();
+        self.awaiting.clear();
         self.drivers = Drivers::default();
         // Whose car is whose, the epoch's player rows say again
         self.player = None;
@@ -3120,10 +3154,18 @@ impl Stream {
     fn read_standings(&mut self, conn: &Connection) -> rusqlite::Result<bool> {
         let standings = rows(
             conn,
-            "SELECT id, vehicle_id, session_time, laps_completed, last_lap_time, driver, position \
+            "SELECT id, vehicle_id, session_time, laps_completed, last_lap_time, driver, position, \
+             lap_time_counts, phase, finish_status, lap_start_time \
              FROM standings WHERE id > ? ORDER BY id LIMIT ?",
             params![self.standings_cursor, CHUNK],
         )?;
+        let race = scalar::<String>(
+            conn,
+            "SELECT session_type FROM session ORDER BY id DESC LIMIT 1",
+            [],
+        )?
+        .as_deref()
+            == Some("race");
         let behind = standings.len() as i64 == CHUNK;
         // The cars someone else has taken over, or all of them
         let mut taken_over = BTreeSet::new();
@@ -3137,12 +3179,15 @@ impl Stream {
             {
                 self.laps_completed.clear();
                 self.official.clear();
+                self.judged.clear();
+                self.awaiting.clear();
                 self.drivers = Drivers::default();
                 self.leaders = Leaders::default();
                 everyone = true;
             }
-            if t.is_some() {
-                self.standings_t = t;
+            if let Some(t) = t {
+                self.standings_t = Some(t);
+                self.settle_untimed(conn, t)?;
             }
             self.leaders.read(&r);
             // Fewer laps than the car had: another car in the slot. Found here, the standings'
@@ -3179,6 +3224,32 @@ impl Stream {
                 false => before.map_or(at, |(_, ended)| ended),
             };
             self.laps_completed.insert(vehicle, (laps, ended));
+            if new_lap {
+                // A lap ended, not another car in the slot (fewer laps), whose lap began unseen
+                let ended_lap = before.is_some_and(|(before, _)| laps > before);
+                if self.judged.remove(&vehicle) && ended_lap {
+                    self.awaiting.insert(vehicle, ended);
+                }
+                // The lap starting now, judged by how it starts: with the session green, whatever
+                // flag the car itself is shown
+                // Seen as it began, not after rows went unrecorded (a replay)
+                let seen_begin = r
+                    .f("lap_start_time")
+                    .is_none_or(|start| at - start < OFFICIAL_MATCH);
+                if ended_lap
+                    && seen_begin
+                    && !race
+                    && r.i("lap_time_counts").is_some()
+                    && matches!(
+                        r.text("phase"),
+                        Some("green" | "under_yellow" | "under_blue")
+                    )
+                    && r.text("finish_status")
+                        .is_none_or(|status| status == "none")
+                {
+                    self.judged.insert(vehicle);
+                }
+            }
             // The first we hear of a car says nothing about a lap ending
             let Some(_) = before else {
                 continue;
@@ -3186,14 +3257,26 @@ impl Stream {
             let Some(time) = r.f("last_lap_time").filter(|time| *time > 0.0) else {
                 continue;
             };
+            // Of a lap the line is checked for (LMU, whose times don't repeat to the digit), the
+            // last lap's time still showing as, or after, the count changes isn't this lap's
+            let checked = self.awaiting.get(&vehicle) == Some(&ended);
             let entries = self.official.entry(vehicle).or_default();
+            if checked
+                && entries
+                    .iter()
+                    .rev()
+                    .find(|official| official.at < ended)
+                    .is_some_and(|before| before.time == Some(time))
+            {
+                continue;
+            }
             // The lap count and its time can come a row apart: the time goes with the count
             let same_lap = entries.last().is_some_and(|last| last.at == ended);
             let late = !new_lap
                 && (at - ended) < OFFICIAL_MATCH
                 && entries
                     .last()
-                    .is_none_or(|last| last.at < ended || last.time != time);
+                    .is_none_or(|last| last.at < ended || last.time != Some(time));
             if !new_lap && !late {
                 continue;
             }
@@ -3214,7 +3297,7 @@ impl Stream {
             }
             let official = Official {
                 at: ended,
-                time,
+                time: Some(time),
                 sectors,
             };
             if same_lap {
@@ -3250,6 +3333,97 @@ impl Stream {
             resegment(conn, *vehicle, car, drivers.runs(*vehicle), stint_ids)?;
         }
         Ok(behind)
+    }
+
+    /// The car's newest lap may yet be lost at the line: its verdict is to come, or, a lap the
+    /// line is checked for, its count isn't in the standings yet. Not to be taken for clean
+    /// evidence until then.
+    fn verdict_pending(&self, vehicle: i64) -> bool {
+        if self.awaiting.contains_key(&vehicle) {
+            return true;
+        }
+        let end = self
+            .cars
+            .get(&vehicle)
+            .and_then(|car| car.finished.last())
+            .and_then(|lap| lap.start.zip(lap.time))
+            .map(|(start, time)| start + time);
+        end.is_some_and(|end| {
+            self.judged.contains(&vehicle)
+                && self
+                    .laps_completed
+                    .get(&vehicle)
+                    .is_none_or(|(_, ended)| *ended < end - OFFICIAL_MATCH)
+        })
+    }
+
+    /// Settles the laps whose time can't come any more by the newest telemetry, `now`: standings
+    /// rows only come as something changes. With a second's slack, telemetry being written a
+    /// little ahead of scoring.
+    fn settle_from_telemetry(
+        &mut self,
+        conn: &Connection,
+        now: Option<f64>,
+    ) -> rusqlite::Result<()> {
+        match now {
+            Some(now) => self.settle_untimed(conn, now - 1.0),
+            None => Ok(()),
+        }
+    }
+
+    /// The laps `awaiting` an official time that would have come by `now`, the standings' time:
+    /// without one they didn't count, so they're invalid, and so are their corner passes. Not a
+    /// lap through the pit lane, which has no time for that.
+    fn settle_untimed(&mut self, conn: &Connection, now: f64) -> rusqlite::Result<()> {
+        let due = self
+            .awaiting
+            .iter()
+            .filter(|(_, ended)| now - **ended >= OFFICIAL_MATCH)
+            .map(|(vehicle, ended)| (*vehicle, *ended))
+            .collect::<Vec<_>>();
+        for (vehicle, ended) in due {
+            self.awaiting.remove(&vehicle);
+            let entries = self.official.entry(vehicle).or_default();
+            if entries
+                .iter()
+                .any(|official| (official.at - ended).abs() < OFFICIAL_MATCH)
+            {
+                continue;
+            }
+            entries.push(Official {
+                at: ended,
+                time: None,
+                sectors: Vec::new(),
+            });
+            // The telemetry may have seen the lap end first
+            for lap in self
+                .cars
+                .get_mut(&vehicle)
+                .into_iter()
+                .flat_map(|car| &mut car.finished)
+            {
+                if lap.complete
+                    && !lap.pit
+                    && lap
+                        .start
+                        .zip(lap.time)
+                        .is_some_and(|(start, time)| (start + time - ended).abs() < OFFICIAL_MATCH)
+                {
+                    lap.invalid = true;
+                }
+            }
+            let laps = "SELECT lap FROM lap_stats WHERE vehicle_id = ?1 AND complete = 1 \
+                        AND pit = 0 AND ABS(start_s + time_s - ?2) < ?3";
+            conn.prepare_cached(&format!(
+                "UPDATE corner_passes SET lap_invalid = 1 WHERE vehicle_id = ?1 AND lap IN ({laps})"
+            ))?
+            .execute(params![vehicle, ended, OFFICIAL_MATCH])?;
+            conn.prepare_cached(&format!(
+                "UPDATE lap_stats SET invalid = 1 WHERE vehicle_id = ?1 AND lap IN ({laps})"
+            ))?
+            .execute(params![vehicle, ended, OFFICIAL_MATCH])?;
+        }
+        Ok(())
     }
 
     /// Takes in the telemetry's new rows. Whether there are more to read.
@@ -3560,7 +3734,11 @@ impl Stream {
         };
         vehicles.extend(quickest);
 
-        for vehicle in vehicles {
+        // Not another car's lap that may yet be lost at the line (the player's is waited for)
+        for vehicle in vehicles
+            .into_iter()
+            .filter(|vehicle| !self.verdict_pending(*vehicle))
+        {
             let laps = self
                 .cars
                 .get(&vehicle)
@@ -3601,6 +3779,9 @@ impl Stream {
         let Some(vehicle) = self.player else {
             return Ok(());
         };
+        if self.verdict_pending(vehicle) {
+            return Ok(());
+        }
         let Some(car) = self.cars.get(&vehicle) else {
             return Ok(());
         };
@@ -7919,6 +8100,345 @@ mod tests {
         )
         .await;
         assert_eq!(passes, [["1", "1"], ["2", "1"], ["3", "1"]]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lap_without_an_official_time_is_invalid() {
+        let (dir, original) = race();
+        drop(original);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute_batch(
+            "UPDATE session SET session_type = 'practice';
+             UPDATE standings SET lap_time_counts = 1, phase = 'green', finish_status = 'none';
+             UPDATE standings SET last_lap_time = NULL WHERE vehicle_id = 1 AND laps_completed = 2;",
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let laps = query(
+            &engineer,
+            "SELECT lap, invalid, official_time_s FROM lap_stats \
+             WHERE vehicle_id = 1 AND complete = 1 ORDER BY lap",
+        )
+        .await;
+        assert_eq!(
+            laps,
+            [["1", "0", "100"], ["2", "1", "NULL"], ["3", "0", "100"]]
+        );
+        let passes = query(
+            &engineer,
+            "SELECT lap, lap_invalid FROM corner_passes WHERE vehicle_id = 1 ORDER BY lap",
+        )
+        .await;
+        assert_eq!(passes, [["1", "0"], ["2", "1"], ["3", "0"]]);
+    }
+
+    /// A car's own phase is the session's, or a flag shown to it while the session is green
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lap_started_under_a_blue_or_local_yellow_is_line_checked() {
+        for phase in ["under_blue", "under_yellow"] {
+            let (dir, original) = race();
+            drop(original);
+            let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+            conn.execute_batch(&format!(
+                "UPDATE session SET session_type = 'practice';
+                 UPDATE standings SET lap_time_counts = 1, phase = '{phase}', finish_status = 'none';
+                 UPDATE standings SET last_lap_time = NULL WHERE vehicle_id = 1 AND laps_completed = 2;",
+            ))
+            .unwrap();
+            drop(conn);
+            let engineer = reopen(&dir);
+            let laps = query(
+                &engineer,
+                "SELECT lap, invalid FROM lap_stats WHERE vehicle_id = 1 AND complete = 1 ORDER BY lap",
+            )
+            .await;
+            assert_eq!(laps, [["1", "0"], ["2", "1"], ["3", "0"]], "{phase}");
+        }
+    }
+
+    /// Car 1's lap 1 (from 100 s, 100 s long) and a corner pass of it, once the standings have
+    /// `rows` of it in a session of `session_type`: (session time, laps completed, last lap time,
+    /// lap time counts). Whether the lap and the pass are invalid.
+    fn line_checked(
+        session_type: &str,
+        pit: bool,
+        rows: &[(f64, i64, Option<f64>, Option<bool>)],
+    ) -> (i64, i64) {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        conn.execute(
+            "INSERT INTO session (epoch, session_time, session_type) VALUES (1, 0, ?)",
+            [session_type],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO lap_stats (vehicle_id, lap, start_s, time_s, complete, invalid, pit) \
+             VALUES (1, 1, 100, 100, 1, 0, ?)",
+            [pit],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO corner_passes (vehicle_id, lap, turn_index, turn_name, lap_invalid) \
+             VALUES (1, 1, 0, 'T1', 0)",
+            [],
+        )
+        .unwrap();
+        // Each row with its lap's start: when the count last changed, as LMU has it
+        let mut lap_start = None;
+        let mut laps_before = None;
+        for &(t, laps, last, counts) in rows {
+            if laps_before != Some(laps) {
+                lap_start = Some(t);
+                laps_before = Some(laps);
+            }
+            conn.execute(
+                "INSERT INTO standings (epoch, session_time, vehicle_id, is_player, \
+                 laps_completed, last_lap_time, lap_time_counts, phase, finish_status, \
+                 lap_start_time) VALUES (1, ?, 1, 1, ?, ?, ?, 'green', 'none', ?)",
+                params![t, laps, last, counts, lap_start],
+            )
+            .unwrap();
+        }
+        let mut stream = Stream::default();
+        while stream.read_standings(&conn).unwrap() {}
+        let invalid = |sql| scalar::<i64>(&conn, sql, []).unwrap().unwrap();
+        (
+            invalid("SELECT invalid FROM lap_stats"),
+            invalid("SELECT lap_invalid FROM corner_passes"),
+        )
+    }
+
+    /// Lap 1 seen from its start, ending at 200 s with no time, and a row a while after
+    fn untimed(counts: Option<bool>) -> [(f64, i64, Option<f64>, Option<bool>); 4] {
+        [
+            (50.0, 0, None, counts),
+            (100.0, 1, Some(99.0), counts),
+            (200.0, 2, None, counts),
+            (204.0, 2, None, counts),
+        ]
+    }
+
+    #[test]
+    fn untimed_lap_is_invalid_once_its_time_cant_come() {
+        let mut rows = untimed(Some(true)).to_vec();
+        assert_eq!(line_checked("practice", false, &rows), (1, 1));
+        // Not before then: it may still come
+        rows.pop();
+        assert_eq!(line_checked("practice", false, &rows), (0, 0));
+    }
+
+    #[test]
+    fn pit_lap_without_an_official_time_is_not_invalid() {
+        assert_eq!(line_checked("practice", true, &untimed(Some(true))), (0, 0));
+    }
+
+    #[test]
+    fn time_arriving_a_row_late_is_valid() {
+        let mut rows = untimed(Some(true));
+        rows[3] = (200.4, 2, Some(100.0), Some(true));
+        let mut rows = rows.to_vec();
+        rows.push((204.0, 2, Some(100.0), Some(true)));
+        assert_eq!(line_checked("practice", false, &rows), (0, 0));
+    }
+
+    #[test]
+    fn no_line_check_without_lap_time_counts() {
+        assert_eq!(line_checked("practice", false, &untimed(None)), (0, 0));
+    }
+
+    #[test]
+    fn the_last_laps_time_still_showing_at_the_count_is_not_this_ones() {
+        let rows = [
+            (50.0, 0, None, Some(true)),
+            (100.0, 1, Some(99.0), Some(true)),
+            (200.0, 2, Some(99.0), Some(true)),
+            (200.4, 2, None, Some(true)),
+            (204.0, 2, None, Some(true)),
+        ];
+        assert_eq!(line_checked("practice", false, &rows), (1, 1));
+    }
+
+    #[test]
+    fn another_cars_first_lap_in_the_slot_is_not_line_checked() {
+        let rows = [
+            (50.0, 3, None, Some(true)),
+            (100.0, 0, None, Some(true)),
+            (200.0, 1, None, Some(true)),
+            (204.0, 1, None, Some(true)),
+        ];
+        assert_eq!(line_checked("practice", false, &rows), (0, 0));
+    }
+
+    #[test]
+    fn braking_zones_wait_for_the_lines_verdict() {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        let mut lap = lap_with(false, false, (1.0, 0.9));
+        lap.start = Some(100.0);
+        lap.time = Some(100.0);
+        let mut stream = Stream {
+            player: Some(1),
+            cars: BTreeMap::from([(
+                1,
+                Car {
+                    finished: vec![lap],
+                    ..Car::default()
+                },
+            )]),
+            awaiting: HashMap::from([(1, 200.0)]),
+            ..Stream::default()
+        };
+        // Not from a lap that may yet turn out lost
+        stream.find_braking_zones(&conn).unwrap();
+        assert_eq!(stream.zones_from, None);
+        stream.settle_untimed(&conn, 204.0).unwrap();
+        assert!(stream.cars[&1].finished[0].invalid);
+        stream.find_braking_zones(&conn).unwrap();
+        assert_eq!(stream.zones_from, Some((1, 1)));
+    }
+
+    #[test]
+    fn braking_zones_wait_for_a_judged_laps_count() {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        let mut lap = lap_with(false, false, (1.0, 0.9));
+        lap.lap = 1;
+        lap.start = Some(100.0);
+        lap.time = Some(100.0);
+        // The telemetry's finished lap 1, its count not yet in the standings
+        let mut stream = Stream {
+            player: Some(1),
+            cars: BTreeMap::from([(
+                1,
+                Car {
+                    finished: vec![lap],
+                    ..Car::default()
+                },
+            )]),
+            judged: HashSet::from([1]),
+            laps_completed: HashMap::from([(1, (1, 100.0))]),
+            ..Stream::default()
+        };
+        stream.find_braking_zones(&conn).unwrap();
+        assert_eq!(stream.zones_from, None);
+        // Counted, and settled
+        stream.laps_completed.insert(1, (2, 200.0));
+        stream.find_braking_zones(&conn).unwrap();
+        assert_eq!(stream.zones_from, Some((1, 1)));
+    }
+
+    #[test]
+    fn the_last_laps_time_still_showing_after_the_count_is_not_this_ones() {
+        let rows = [
+            (50.0, 0, None, Some(true)),
+            (100.0, 1, Some(99.0), Some(true)),
+            (200.0, 2, Some(99.0), Some(true)),
+            (200.2, 2, Some(99.0), Some(false)),
+            (200.4, 2, None, Some(false)),
+            (204.0, 2, None, Some(false)),
+        ];
+        assert_eq!(line_checked("practice", false, &rows), (1, 1));
+    }
+
+    #[test]
+    fn the_verdict_comes_with_the_telemetry_without_waiting_for_standings() {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        conn.execute(
+            "INSERT INTO lap_stats (vehicle_id, lap, start_s, time_s, complete, invalid, pit) \
+             VALUES (1, 1, 100, 100, 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+        let mut stream = Stream {
+            awaiting: HashMap::from([(1, 200.0)]),
+            ..Stream::default()
+        };
+        // Telemetry 5 s past the line, no standings row since
+        stream.settle_from_telemetry(&conn, Some(205.0)).unwrap();
+        let invalid = scalar::<i64>(&conn, "SELECT invalid FROM lap_stats", []).unwrap();
+        assert_eq!(invalid, Some(1));
+    }
+
+    #[test]
+    fn a_lap_begun_unrecorded_is_not_line_checked() {
+        // A replay (not recorded) spans lap 1's start: the first row after has its count changed,
+        // but the lap began long before
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        conn.execute(
+            "INSERT INTO session (epoch, session_time, session_type) VALUES (1, 0, 'practice')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO lap_stats (vehicle_id, lap, start_s, time_s, complete, invalid, pit) \
+             VALUES (1, 1, 100, 100, 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+        for (t, laps, start) in [
+            (50.0, 0, 0.0),
+            (150.0, 1, 100.0),
+            (200.0, 2, 200.0),
+            (204.0, 2, 200.0),
+        ] {
+            conn.execute(
+                "INSERT INTO standings (epoch, session_time, vehicle_id, is_player, \
+                 laps_completed, lap_start_time, lap_time_counts, phase, finish_status) \
+                 VALUES (1, ?, 1, 1, ?, ?, 1, 'green', 'none')",
+                params![t, laps, start],
+            )
+            .unwrap();
+        }
+        let mut stream = Stream::default();
+        while stream.read_standings(&conn).unwrap() {}
+        let invalid = scalar::<i64>(&conn, "SELECT invalid FROM lap_stats", []).unwrap();
+        assert_eq!(invalid, Some(0));
+    }
+
+    #[test]
+    fn any_cars_verdict_can_be_pending() {
+        let stream = Stream {
+            player: Some(1),
+            awaiting: HashMap::from([(2, 200.0)]),
+            ..Stream::default()
+        };
+        assert!(!stream.verdict_pending(1));
+        assert!(stream.verdict_pending(2));
+    }
+
+    #[test]
+    fn another_car_in_the_slot_is_no_lap_end() {
+        // Lap 1 (100 to 200 s) driven from its start, then someone else takes the slot over
+        let rows = [
+            (50.0, 0, None, Some(true)),
+            (100.0, 1, Some(99.0), Some(true)),
+            (200.0, 0, None, Some(true)),
+            (204.0, 0, None, Some(true)),
+        ];
+        assert_eq!(line_checked("practice", false, &rows), (0, 0));
+    }
+
+    #[test]
+    fn no_line_check_in_races() {
+        assert_eq!(line_checked("race", false, &untimed(Some(true))), (0, 0));
+    }
+
+    #[test]
+    fn first_lap_seen_is_not_line_checked() {
+        let rows = [
+            (150.0, 1, None, Some(true)),
+            (200.0, 2, None, Some(true)),
+            (204.0, 2, None, Some(true)),
+        ];
+        assert_eq!(line_checked("practice", false, &rows), (0, 0));
     }
 
     #[test]

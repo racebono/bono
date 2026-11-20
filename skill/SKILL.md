@@ -286,7 +286,7 @@ Updated as the cars drive, the lap in progress too.
 **`lap_stats`**, one row per car and lap: `vehicle_id`, `lap` (from 1, as the game numbers it), `stint_id` (in `stints`, for who drove
 it), `stint_boundary` (1: the lap is across the start of a stint, such as an out lap the drivers
 swapped during, and `stint_id` is NULL; a NULL `stint_id` with 0 means there's no telling), `first_id`, `last_id`
-(the lap's telemetry rows), `start_s`; `time_s`, `official_time_s`, `top_speed_kmh`; `complete`, `invalid`, `pit` (in or out lap; one stop is one more stint), `refuelled`, `contact`,
+(the lap's telemetry rows), `start_s`; `time_s`, `official_time_s`, `top_speed_kmh`; `complete`, `invalid` (also a lap the simulator decided only at the line, by giving it no official time, which `lap_invalidated` never showed; a lap just ended without `official_time_s` can still turn invalid within seconds, or once the car is driven again if it went straight to the garage, so don't call it valid yet), `pit` (in or out lap; one stop is one more stint), `refuelled`, `contact`,
 `green` (complete and seen whole, no pit or refuel: representative for pace and use), `track_limit_steps`;
 `fuel_start_l`, `fuel_end_l`, `fuel_used_l`, `energy_start_pct`, `energy_end_pct`,
 `energy_used_pct`; `gap_ahead_end_s`, `gap_behind_end_s`.
@@ -489,7 +489,7 @@ Traps: `tire_wear` falls during a stint where it's life left; `tire_optimal_temp
 is Kelvin; `*_left/center/right` are edges seen from behind the car (inside is right on left tyres
 and left on right tyres), and `tire_inner_*` is a layer under the tread, not the inside edge;
 `rear_brake_bias` is the rear's share; `session_time` restarts each session; lap time isn't stored
-in `telemetry`; `lap_invalidated` is the current lap's state; `lap_distance` can jump back a little;
+in `telemetry`; `lap_invalidated` is the current lap's state, once the simulator has decided it won't count (not from the moment of an off it may still forgive); `lap_distance` can jump back a little;
 `sector` is zero-based there and in `standings`; `delta_best` positive is slower. On iRacing,
 rivals' speed, lap starts, sector times and pit stops are worked out from their progress around the
 lap, and no car has a world position: `position_x/y/z`, `ahead_of_player_m` and
