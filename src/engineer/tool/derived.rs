@@ -3041,7 +3041,8 @@ impl Stream {
             return Err(e.into());
         }
 
-        if !self.behind {
+        // Lined up with clean laps only: not one that may yet be lost at the line
+        if !self.behind && !self.verdict_pending() {
             self.calibrate(conn, shared)?;
         }
         self.find_braking_zones(conn)?;
@@ -3328,6 +3329,31 @@ impl Stream {
     /// The laps `awaiting` an official time that would have come by `now`, the standings' time:
     /// without one they didn't count, so they're invalid, and so are their corner passes. Not a
     /// lap through the pit lane, which has no time for that.
+    /// The player's newest lap may yet be lost at the line: its verdict is to come, or, a lap the
+    /// line is checked for, its count isn't in the standings yet. Not to be taken for clean
+    /// evidence until then.
+    fn verdict_pending(&self) -> bool {
+        let Some(vehicle) = self.player else {
+            return false;
+        };
+        if self.awaiting.contains_key(&vehicle) {
+            return true;
+        }
+        let end = self
+            .cars
+            .get(&vehicle)
+            .and_then(|car| car.finished.last())
+            .and_then(|lap| lap.start.zip(lap.time))
+            .map(|(start, time)| start + time);
+        end.is_some_and(|end| {
+            self.judged.contains(&vehicle)
+                && self
+                    .laps_completed
+                    .get(&vehicle)
+                    .is_none_or(|(_, ended)| *ended < end - OFFICIAL_MATCH)
+        })
+    }
+
     /// Settles the laps whose time can't come any more by the newest telemetry, `now`: standings
     /// rows only come as something changes. With a second's slack, telemetry being written a
     /// little ahead of scoring.
@@ -3743,8 +3769,7 @@ impl Stream {
         let Some(vehicle) = self.player else {
             return Ok(());
         };
-        // Not while a lap's line verdict is to come: it may yet be lost
-        if self.awaiting.contains_key(&vehicle) {
+        if self.verdict_pending() {
             return Ok(());
         }
         let Some(car) = self.cars.get(&vehicle) else {
@@ -8254,6 +8279,37 @@ mod tests {
         assert_eq!(stream.zones_from, None);
         stream.settle_untimed(&conn, 204.0).unwrap();
         assert!(stream.cars[&1].finished[0].invalid);
+        stream.find_braking_zones(&conn).unwrap();
+        assert_eq!(stream.zones_from, Some((1, 1)));
+    }
+
+    #[test]
+    fn braking_zones_wait_for_a_judged_laps_count() {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        let mut lap = lap_with(false, false, (1.0, 0.9));
+        lap.lap = 1;
+        lap.start = Some(100.0);
+        lap.time = Some(100.0);
+        // The telemetry's finished lap 1, its count not yet in the standings
+        let mut stream = Stream {
+            player: Some(1),
+            cars: BTreeMap::from([(
+                1,
+                Car {
+                    finished: vec![lap],
+                    ..Car::default()
+                },
+            )]),
+            judged: HashSet::from([1]),
+            laps_completed: HashMap::from([(1, (1, 100.0))]),
+            ..Stream::default()
+        };
+        stream.find_braking_zones(&conn).unwrap();
+        assert_eq!(stream.zones_from, None);
+        // Counted, and settled
+        stream.laps_completed.insert(1, (2, 200.0));
         stream.find_braking_zones(&conn).unwrap();
         assert_eq!(stream.zones_from, Some((1, 1)));
     }

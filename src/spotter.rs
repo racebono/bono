@@ -2081,6 +2081,10 @@ impl Logic {
             return;
         };
         self.line_check = None;
+        // Long after, with no rows meanwhile (in the garage): no longer worth saying
+        if t - check.at > LAP_MATCH + OTHER_FOR.as_secs_f64() {
+            return;
+        }
         let lost = !check.timed && !check.pit && !check.called;
         match (lost, invalidated) {
             (true, true) => calls.raise("lap invalidated, next lap too", false),
@@ -5086,9 +5090,26 @@ mod tests {
     #[test]
     fn first_standing_says_nothing() {
         assert!(
+            line_calls_with(
+                "none",
+                &[
+                    (110.0, 5, None, false, false, Some(true)),
+                    (120.0, 5, None, false, false, Some(true)),
+                ]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_line_check_left_pending_in_the_garage_says_nothing_later() {
+        // Lost at the line, then straight to the garage: no rows until driving out minutes later
+        assert!(
             line_calls(&[
-                (110.0, 5, None, false, false, Some(true)),
-                (120.0, 5, None, false, false, Some(true)),
+                (10.0, 4, None, false, false, Some(true)),
+                (100.0, 4, None, false, false, Some(false)),
+                (110.0, 5, None, false, false, Some(false)),
+                (400.0, 5, None, false, false, Some(false)),
             ])
             .is_empty()
         );
