@@ -302,6 +302,9 @@ settings! {
         /// iRacing: how far behind live (seconds, 1 to 30) the replay must be to count as one,
         /// and not be recorded
         pub iracing_behind_live: u32 = 3,
+        /// Whether the engineer may request pit stops in LMU: Bono binds Pit Request to F11 when it
+        /// has no key, and brings LMU to the front for a moment to press it
+        pub pit_requests: bool = true,
         /// Changed with `set_voice`, which loads the voice too
         voices: BTreeMap<ArrayStr<2>, Utf8PathBuf> = BTreeMap::new(),
         pub whisper_model: Option<Arc<Utf8Path>> = None,
@@ -566,7 +569,8 @@ settings! {
     #[derive(Debug, PartialEq)]
     pub struct SpotterConfig {
         pub enabled: bool = true,
-        /// Whether it calls in qualifying sessions too (off, it keeps quiet in them)
+        /// Whether it calls in qualifying sessions too (off, it keeps quiet in them, but for the
+        /// lap times if [`Self::qualifying_lap_times`])
         pub qualifying: bool = false,
         /// The language of its calls: the pilot's (the last one they asked in) when `None`
         pub language: Option<ArrayStr<2>> = None,
@@ -618,7 +622,7 @@ settings! {
         pub wet_patch_repeat: f64 = 30.0,
 
         /// The time of each of the pilot's laps in qualifying, said once it's over (not for laps
-        /// invalidated, or through the pit lane)
+        /// invalidated, or through the pit lane). Said even when it's quiet in qualifying
         pub qualifying_lap_times: bool = false,
         /// The race going green: at the start, and as it restarts after a red flag
         pub race_starts: bool = true,

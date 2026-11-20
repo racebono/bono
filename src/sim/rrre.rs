@@ -344,7 +344,7 @@ impl Converter {
                 flag(driver.current_lap_valid).map(|valid| !valid),
                 time,
             );
-            out.lap = Some(lap as i64).into();
+            out.lap = Some(lap as i64 + 1).into();
             out.lap_start_time = lap_start.into();
             out.lap_distance = non_negative(driver.lap_distance).into();
             out.sector = sector(driver.track_sector).into();
@@ -1479,7 +1479,9 @@ mod tests {
             .find(|t| t.vehicle_id.get() == Some(7))
             .unwrap();
         assert_eq!(mine.session_time.get(), Some(500.0));
-        assert_eq!(mine.lap.get(), Some(3));
+        // The lap it's on, one past the laps the standings count
+        assert_eq!(mine.lap.get(), Some(4));
+        assert_eq!(me.laps_completed.get(), Some(3));
         assert_eq!(mine.sector.get(), Some(1));
         assert_eq!(mine.lap_invalidated.get(), Some(false));
         // Travelling along -z, nose slightly right of that as it slides to its left
@@ -1631,7 +1633,8 @@ mod tests {
     fn lap_starts_and_validity_hold_steady_across_the_line() {
         let mut converter = Converter::default();
         let start = Instant::now();
-        // Slot 3's lap, its timer and validity at `time`; what's recorded for it
+        // Slot 3's laps completed, its timer and validity at `time`; what's recorded for it. The
+        // laps below are the game's count; the recorded lap, the one the car is on, is one more.
         let mut read = |time: f64, lap: i32, into_lap: f32, valid: i32| {
             let mut shared = shared(time, 0.0);
             let mut drivers = shared.all_drivers_data_1;
@@ -1653,32 +1656,32 @@ mod tests {
         };
 
         // Lap 3 started at 400 (two reads agree) and went invalid
-        assert_eq!(read(499.0, 3, 99.0, 0), (Some(3), Some(400.0), Some(true)));
-        assert_eq!(read(500.0, 3, 100.0, 0), (Some(3), Some(400.0), Some(true)));
+        assert_eq!(read(499.0, 3, 99.0, 0), (Some(4), Some(400.0), Some(true)));
+        assert_eq!(read(500.0, 3, 100.0, 0), (Some(4), Some(400.0), Some(true)));
         // The timer resets before the count: still lap 3, still started at 400
-        assert_eq!(read(500.1, 3, 0.05, 0), (Some(3), Some(400.0), Some(true)));
+        assert_eq!(read(500.1, 3, 0.05, 0), (Some(4), Some(400.0), Some(true)));
         // The count before the timer and the flag: lap 4's start and validity aren't known yet
-        assert_eq!(read(500.2, 4, 100.2, 0), (Some(4), None, None));
+        assert_eq!(read(500.2, 4, 100.2, 0), (Some(5), None, None));
         // Lap 4's own timer, but lap 3's flag still: not trusted yet
-        assert_eq!(read(500.3, 4, 0.25, 0), (Some(4), Some(500.05), None));
+        assert_eq!(read(500.3, 4, 0.25, 0), (Some(5), Some(500.05), None));
         // Lap 4's own flag
         assert_eq!(
             read(501.0, 4, 0.95, 1),
-            (Some(4), Some(500.05), Some(false))
+            (Some(5), Some(500.05), Some(false))
         );
         // Held for the rest of the lap, whatever the timer jitters to
         assert_eq!(
             read(530.0, 4, 29.9, 1),
-            (Some(4), Some(500.05), Some(false))
+            (Some(5), Some(500.05), Some(false))
         );
         // The clock going back is a restart: its first lap starts over
-        assert_eq!(read(10.0, 0, 5.0, 1), (Some(0), Some(5.0), Some(false)));
+        assert_eq!(read(10.0, 0, 5.0, 1), (Some(1), Some(5.0), Some(false)));
 
         // A mixed first read (lap 0's count, lap 1's reset timer) isn't confirmed, so it doesn't
         // hold back lap 1's real start
         assert_eq!(read(20.0, 0, 0.5, 1).1, Some(19.5));
         assert_eq!(read(20.25, 1, 0.75, 1).1, Some(19.5));
-        assert_eq!(read(30.0, 1, 10.5, 1), (Some(1), Some(19.5), Some(false)));
+        assert_eq!(read(30.0, 1, 10.5, 1), (Some(2), Some(19.5), Some(false)));
     }
 
     fn vec3(x: f64, z: f64) -> r3e_vec3_f64 {

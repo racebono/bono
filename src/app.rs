@@ -391,6 +391,7 @@ impl AppState {
             let config = self.config.get();
             SimulatorSettings {
                 opponent_frequency: *config.opponent_frequency(),
+                pit_requests: *config.pit_requests(),
                 iracing_keep_live: *config.iracing_keep_live(),
                 iracing_behind_live: *config.iracing_behind_live(),
             }

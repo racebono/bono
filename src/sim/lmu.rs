@@ -7,8 +7,8 @@
 
 use crate::{
     sim::{
-        Game, PluginStatus, Simulator, SimulatorInfo, SimulatorSettings, probe::Probe,
-        steam_install_dir,
+        Game, PitKeyStatus, PluginStatus, Simulator, SimulatorInfo, SimulatorSettings,
+        pit::PitService, probe::Probe, steam_install_dir,
     },
     sqlite::{Database, pool::Pool},
     task::MaybeDone,
@@ -19,7 +19,10 @@ use serde_json::{Map, Value};
 use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -27,6 +30,8 @@ use tokio::{
     task::{JoinHandle, coop::unconstrained},
 };
 
+mod keys;
+mod pit;
 mod plugin;
 
 const STEAM_APP_ID: u32 = 2399420;
@@ -67,6 +72,14 @@ pub struct LeMansUltimate {
     plugin_outdated: Option<bool>,
     /// Whether the plugin's version has been read this run
     plugin_version_read: bool,
+    /// The game's pit menu, for the engineer
+    pit: Arc<pit::LmuPit>,
+    /// Whether the pilot lets the engineer request pit stops, shared with `pit`
+    pit_requests: Arc<AtomicBool>,
+    /// The Pit Request key, as the task keeping it last looked (see `keys::upkeep`)
+    pit_key: Arc<Mutex<Option<PitKeyStatus>>>,
+    /// Keeps the Pit Request key: started with the first settings
+    pit_key_upkeep: Option<JoinHandle<()>>,
 }
 
 /// A change to settings.json in a folder, and what it's for (for the log, if it fails).
@@ -77,8 +90,8 @@ struct SettingsChange {
 
 impl LeMansUltimate {
     pub fn new(game: Game) -> Self {
+        let pit_requests = Arc::new(AtomicBool::new(true));
         Self {
-            game,
             live: None,
             ready: Probe::new(LOOK_EVERY),
             settings: None,
@@ -86,6 +99,11 @@ impl LeMansUltimate {
             plugin_looked: None,
             plugin_outdated: None,
             plugin_version_read: false,
+            pit: Arc::new(pit::LmuPit::new(game.clone(), pit_requests.clone())),
+            pit_requests,
+            pit_key: Arc::default(),
+            pit_key_upkeep: None,
+            game,
         }
     }
 
@@ -249,6 +267,15 @@ impl Simulator for LeMansUltimate {
 
     /// The plugin reads settings.json when it starts recording and whenever it changes.
     fn apply(&mut self, settings: &SimulatorSettings) {
+        (self.pit_requests).store(settings.pit_requests, Ordering::Relaxed);
+        if self.pit_key_upkeep.is_none() {
+            let (game, on, status) = (
+                self.game.clone(),
+                self.pit_requests.clone(),
+                self.pit_key.clone(),
+            );
+            self.pit_key_upkeep = Some(tokio::spawn(keep_pit_key(game, on, status)));
+        }
         let frequency = settings.opponent_frequency.get();
         self.update_settings(
             "passing the recording settings to Le Mans Ultimate",
@@ -256,6 +283,14 @@ impl Simulator for LeMansUltimate {
                 json.insert("opponent_frequency".into(), frequency.into());
             },
         );
+    }
+
+    fn pit(&self) -> Option<Arc<dyn PitService>> {
+        Some(self.pit.clone())
+    }
+
+    fn pit_key(&self) -> Option<PitKeyStatus> {
+        *self.pit_key.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The plugin clears its data when the "clear" count in settings.json changes.
@@ -301,6 +336,31 @@ impl Simulator for LeMansUltimate {
 
     fn plugin_outdated(&self) -> bool {
         self.plugin_outdated == Some(true)
+    }
+}
+
+/// Looks at the Pit Request key every `PLUGIN_LOOK_EVERY`, binding F11 to it while the game is
+/// closed if it has none (see `keys::upkeep`), and keeps what it found in `status`.
+async fn keep_pit_key(
+    game: Game,
+    requests_on: Arc<AtomicBool>,
+    status: Arc<Mutex<Option<PitKeyStatus>>>,
+) {
+    loop {
+        let (look, on) = (game.clone(), requests_on.load(Ordering::Relaxed));
+        // It reads and writes the game's files
+        if let Ok(found) = tokio::task::spawn_blocking(move || keys::upkeep(&look, on)).await {
+            *status.lock().unwrap_or_else(PoisonError::into_inner) = found;
+        }
+        tokio::time::sleep(PLUGIN_LOOK_EVERY).await;
+    }
+}
+
+impl Drop for LeMansUltimate {
+    fn drop(&mut self) {
+        if let Some(upkeep) = &self.pit_key_upkeep {
+            upkeep.abort();
+        }
     }
 }
 

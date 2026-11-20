@@ -498,6 +498,7 @@ mod tests {
             opponent_frequency: NonZeroU32::new(7).unwrap(),
             iracing_keep_live: false,
             iracing_behind_live: 3,
+            pit_requests: true,
         });
         sim.clear();
         // Changes run in order, so this one runs once the others are written

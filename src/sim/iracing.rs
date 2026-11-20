@@ -6,10 +6,12 @@
 //! alone, and its folder isn't looked for (nothing needs it).
 
 mod convert;
+mod pit;
 mod sdk;
 mod session;
 mod yaml;
 
+use crate::sim::pit::PitService;
 use crate::{
     sim::{
         IRACING_NAME, Simulator, SimulatorInfo, SimulatorSettings,
@@ -18,11 +20,15 @@ use crate::{
     sqlite::pool::Pool,
 };
 use convert::{BehindLiveFrames, Converter, FRAMES_PER_SECOND};
+use pit::IracingPit;
 use sdk::{Frame, HEADER_LEN, Header, MEMORY_NAME, VERSION, Vars};
 use session::SessionInfo;
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -60,47 +66,51 @@ fn should_pull_live(
         && last_pull.is_none_or(|at| now.duration_since(at) >= PULL_EVERY)
 }
 
-/// The SDK's broadcast message (`IRSDK_BROADCASTMSGNAME` in `irsdk_defines.h`).
-const BROADCAST_MESSAGE: &str = "IRSDK_BROADCASTMSG";
 /// `irsdk_BroadcastReplaySetPlaySpeed`, with the speed and whether in slow motion as arguments.
-const BROADCAST_REPLAY_SET_PLAY_SPEED: usize = 3;
+const BROADCAST_REPLAY_SET_PLAY_SPEED: u16 = 3;
 /// `irsdk_BroadcastReplaySearch`, with its mode as the first argument.
-const BROADCAST_REPLAY_SEARCH: usize = 5;
+const BROADCAST_REPLAY_SEARCH: u16 = 5;
 /// `irsdk_RpySrch_ToEnd`: to the end of the tape, the live session.
-const REPLAY_SEARCH_TO_END: usize = 1;
+const REPLAY_SEARCH_TO_END: u16 = 1;
 
-/// Asks the game to jump its replay to the end of the tape and play it at normal speed (a paused
-/// one too), as `irsdk_defines.h` documents: its broadcast message, sent to every top-level
-/// window, the command in the low word of `wParam`, its first argument in the high word and its
-/// second in `lParam`. `SendNotifyMessageW` doesn't wait for windows of other threads.
-fn pull_to_live() {
+/// Sends iRacing one of its SDK's commands, as `irsdk_broadcastMsg` (`irsdk_defines.h`) does: its
+/// broadcast message, to every top-level window, with `MAKELONG(command, first)` as `wParam` and
+/// `second` as `lParam`. `SendNotifyMessageW` doesn't wait for windows of other threads.
+fn broadcast(command: u16, first: u16, second: u32) -> anyhow::Result<()> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         HWND_BROADCAST, RegisterWindowMessageW, SendNotifyMessageW,
     };
-    let name: Vec<u16> = BROADCAST_MESSAGE.encode_utf16().chain([0]).collect();
+    let name: Vec<u16> = "IRSDK_BROADCASTMSG\0".encode_utf16().collect();
     // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the call. Registering the
     // same name again gives the same message
     let message = unsafe { RegisterWindowMessageW(name.as_ptr()) };
     if message == 0 {
-        log::debug!(
-            "Couldn't register iRacing's broadcast message: {}",
+        anyhow::bail!(
+            "couldn't register iRacing's broadcast message: {}",
             std::io::Error::last_os_error()
         );
-        return;
     }
-    for (command, first, second) in [
-        (BROADCAST_REPLAY_SEARCH, REPLAY_SEARCH_TO_END, 0),
-        (BROADCAST_REPLAY_SET_PLAY_SPEED, 1, 0),
+    let wparam = (u32::from(command) | (u32::from(first) << 16)) as usize;
+    // SAFETY: a notification with plain integer arguments, no pointers
+    if unsafe { SendNotifyMessageW(HWND_BROADCAST, message, wparam, second as isize) } == 0 {
+        anyhow::bail!(
+            "couldn't send iRacing's broadcast message: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+/// Asks the game to jump its replay to the end of the tape and play it at normal speed (a paused
+/// one too).
+fn pull_to_live() {
+    for (command, first) in [
+        (BROADCAST_REPLAY_SEARCH, REPLAY_SEARCH_TO_END),
+        (BROADCAST_REPLAY_SET_PLAY_SPEED, 1),
     ] {
-        // SAFETY: a notification with plain integer arguments, no pointers
-        if unsafe { SendNotifyMessageW(HWND_BROADCAST, message, command | (first << 16), second) }
-            == 0
-        {
-            // Each is sent anyway: a broadcast that some window didn't take may still reach iRacing
-            log::debug!(
-                "Couldn't ask iRacing to play its replay live: {}",
-                std::io::Error::last_os_error()
-            );
+        // Each is sent anyway: a broadcast that some window didn't take may still reach iRacing
+        if let Err(e) = broadcast(command, first, 0) {
+            log::debug!("Couldn't ask iRacing to play its replay live: {e}");
         }
     }
 }
@@ -141,6 +151,10 @@ impl Simulator for IRacing {
 
     fn clear(&mut self) {
         self.0.clear();
+    }
+
+    fn pit(&self) -> Option<Arc<dyn PitService>> {
+        Some(Arc::new(IracingPit))
     }
 }
 
@@ -343,6 +357,39 @@ impl Source for Game {
             None => Read::Idle,
         }
     }
+}
+
+/// One look at the shared memory, for the engineer's pit menu: the variables, the latest update in
+/// them and the session info. `None` while the game isn't in a session, or if it wrote over what
+/// was copied meanwhile (the header changed, or the update's buffer was written again).
+pub(super) fn read_once() -> Option<(Vars, Vec<u8>, Vec<u8>)> {
+    let memory = SharedMemory::open()?;
+    let header = memory.header()?;
+    if !header.connected() || header.version != VERSION {
+        return None;
+    }
+    let fits = |range: Option<std::ops::Range<usize>>| range.filter(|r| r.end <= memory.len);
+    let headers = memory.copy(fits(header.var_headers())?)?;
+    let info = memory.copy(fits(header.session_info())?)?;
+    let (tick, offset) = header.latest()?;
+    let len = header.buf_len()?;
+    let buffer = memory.copy(fits(Some(offset..offset.checked_add(len)?))?)?;
+    let layout = |h: &Header| {
+        (
+            h.var_count,
+            h.var_header_offset,
+            h.buf_count,
+            h.buf_len,
+            h.session_info_offset,
+            h.session_info_len,
+            h.session_info_update,
+        )
+    };
+    let again = memory.header()?;
+    if !again.connected() || layout(&again) != layout(&header) || !again.holds(tick, offset) {
+        return None;
+    }
+    Some((Vars::from_headers(&headers, len), buffer, info))
 }
 
 /// The game's shared memory, mapped read-only.
