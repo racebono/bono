@@ -944,7 +944,7 @@
       "session": "race",
       "pit": {
         "game": "lmu",
-        "menu": "PIT MENU NOW: car on track; energy 60%; fuel ratio 0.88; FL no change 136 kPa; FR no change 136 kPa; RL no change 136 kPa; RR no change 136 kPa; repair \"No reparar\"; replace brakes no\nPIT OPTIONS (the `pit` tool's fields)\nenergy_leave_pct: energy the car leaves with, 0–100%\nfuel_ratio: 0.01–1.17\ntyres FL: \"Medium\" new, \"Wet\" new, \"Medium\" used 96%\ntyres FR: \"Medium\" new, \"Wet\" new, \"Medium\" used 97%\ntyres RL: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\ntyres RR: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\npressures_kpa: 136–210 kPa\nrepair: \"No reparar\", \"Reparar carrocería\"\nreplace_brakes: true or false",
+        "menu": "PIT MENU NOW: car on track; energy 53%; fuel ratio 0.88; FL no change 136 kPa; FR no change 136 kPa; RL no change 136 kPa; RR no change 136 kPa; repair \"No reparar\"; replace brakes no\nPIT OPTIONS (the `pit` tool's fields)\nenergy_leave_pct: energy the car leaves with, 0–100%\nfuel_ratio: 0.01–1.17\ntyres FL: \"Medium\" new, \"Wet\" new, \"Medium\" used 96%\ntyres FR: \"Medium\" new, \"Wet\" new, \"Medium\" used 97%\ntyres RL: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\ntyres RR: \"Medium\" new, \"Wet\" new, \"Medium\" used 98%\npressures_kpa: 136–210 kPa\nrepair: \"No reparar\", \"Reparar carrocería\"\nreplace_brakes: true or false",
         "position": "on track",
         "takes": true
       },
@@ -1016,7 +1016,7 @@
         "takes": true
       },
       "assertions": [
-        "Says the change won't stick, and offers to set it again once back on track",
+        "Says the change won't stick, and that the pilot can ask again once back on track",
         "Never says the wets are set for this stop or the next one"
       ]
     }

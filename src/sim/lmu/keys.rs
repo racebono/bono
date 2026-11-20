@@ -38,9 +38,16 @@ fn input(json: &Value) -> anyhow::Result<&serde_json::Map<String, Value>> {
 pub fn pit_request_key(keyboard_json: &str) -> anyhow::Result<Option<u16>> {
     let json: Value = serde_json::from_str(keyboard_json).context("LMU's keyboard.json isn't JSON")?;
     let key = input(&json)?.get(PIT_REQUEST).and_then(Value::as_i64);
-    // Only a keyboard scan code (1 to 0xFF, extended keys over 0x80): anything else isn't a
-    // key there is to press
-    Ok(key.and_then(|key| u16::try_from(key).ok()).filter(|key| (1..=0xFF).contains(key)))
+    match key {
+        // Unbound
+        None => Ok(None),
+        Some(key) if key <= 0 => Ok(None),
+        // A keyboard scan code (extended keys over 0x80)
+        Some(key @ 1..=0xFF) => Ok(Some(key as u16)),
+        // Bound to something that isn't a key there is to press: never taken as unbound, so it's
+        // never bound over
+        Some(key) => bail!("LMU's Pit Request is bound to {key}, which isn't a keyboard key"),
+    }
 }
 
 /// The file with Pit Request bound to F11, every other key and value kept: `None` if another
@@ -231,7 +238,9 @@ mod tests {
 
     #[test]
     fn only_keyboard_scan_codes() {
-        assert_eq!(pit_request_key(r#"{"Input":{"Pit Request":300}}"#).unwrap(), None);
+        // Bound, but not to a key there is to press: never taken as unbound (and rebound)
+        assert!(pit_request_key(r#"{"Input":{"Pit Request":300}}"#).is_err());
+        assert_eq!(pit_request_key(r#"{"Input":{"Pit Request":0}}"#).unwrap(), None);
     }
 
     #[test]

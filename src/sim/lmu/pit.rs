@@ -71,13 +71,7 @@ impl LmuPit {
     /// Where the player's car is now (unknown in the garage, which LMU calls NONE too)
     fn position(&self) -> anyhow::Result<Position> {
         let standings = self.get(STANDINGS_URL)?;
-        let Some(car) = player(&standings)? else {
-            return Ok(Position::Unknown);
-        };
-        if car.get("inGarageStall").and_then(Value::as_bool) == Some(true) {
-            return Ok(Position::Unknown);
-        }
-        Ok((car.get("pitState").and_then(Value::as_str)).map_or(Position::Unknown, position))
+        Ok(player(&standings)?.map_or(Position::Unknown, car_position))
     }
 
     fn get(&self, url: &str) -> anyhow::Result<Value> {
@@ -99,8 +93,12 @@ impl PitService for LmuPit {
     /// to agree with each other, so the row is written back as read unless the change sets it.
     fn write(&self, menu: &PitMenu, change: &Resolved) -> anyhow::Result<()> {
         let rows = self.get(MENU_URL)?;
+        let out = apply(&rows, menu, change)?;
+        if !changes_anything(&rows, &out) {
+            return Ok(());
+        }
         // The whole array: LMU crashes on a bare row
-        let body = serde_json::to_string(&apply(&rows, menu, change)?)?;
+        let body = serde_json::to_string(&out)?;
         (self.agent.post(LOAD_URL))
             .header("Content-Type", "application/json")
             .send(body)
@@ -200,6 +198,11 @@ fn local_agent(step: Duration) -> ureq::Agent {
         .timeout_recv_body(Some(step))
         .build()
         .into()
+}
+
+/// Whether `out` changes anything in `rows`: a menu sent back unchanged is untested with LMU.
+fn changes_anything(rows: &Value, out: &Value) -> bool {
+    rows != out
 }
 
 /// A row of the menu as read.
@@ -330,6 +333,17 @@ pub fn position(pit_state: &str) -> Position {
     }
 }
 
+/// Where a car in the standings is. LMU says NONE in the garage too: that isn't on track.
+fn car_position(car: &Value) -> Position {
+    let state = car.get("pitState").and_then(Value::as_str);
+    let in_garage = car.get("inGarageStall").and_then(Value::as_bool) == Some(true);
+    match state {
+        Some("NONE") if in_garage => Position::Unknown,
+        Some(state) => position(state),
+        None => Position::Unknown,
+    }
+}
+
 /// The player's car in the standings, if it's there.
 pub fn player(standings: &Value) -> anyhow::Result<Option<&Value>> {
     let cars = standings
@@ -344,17 +358,8 @@ pub fn player(standings: &Value) -> anyhow::Result<Option<&Value>> {
 pub fn parse(rows: &Value, standings: &Value) -> anyhow::Result<PitMenu> {
     let rows = rows.as_array().context("LMU's pit menu isn't a list of rows")?;
     let player = player(standings)?;
-    let in_garage = player
-        .and_then(|car| car.get("inGarageStall"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let mut menu = PitMenu {
-        // LMU says NONE in the garage too: that isn't on track
-        position: match in_garage {
-            true => Position::Unknown,
-            false => (player.and_then(|car| car.get("pitState")).and_then(Value::as_str))
-                .map_or(Position::Unknown, position),
-        },
+        position: player.map_or(Position::Unknown, car_position),
         ..PitMenu::default()
     };
 
@@ -749,6 +754,24 @@ mod tests {
         standings[0]["inGarageStall"] = true.into();
         let m = parse(&menu_rows(), &standings).unwrap();
         assert_eq!(m.position, Position::Unknown);
+        // Only NONE is ambiguous: a stop in progress stays one
+        standings[0]["pitState"] = "STOPPED".into();
+        let m = parse(&menu_rows(), &standings).unwrap();
+        assert_eq!(m.position, Position::Stopped);
+    }
+
+    #[test]
+    fn unchanged_menu_is_not_sent() {
+        let rows = menu_rows();
+        let m = parsed();
+        // Every tyre is already "no change": clearing them changes nothing
+        let change = PitChange { clear: Some(Clear::Tyres), ..Default::default() };
+        let out = apply(&rows, &m, &check(&m, &change).unwrap()).unwrap();
+        assert_eq!(out, rows);
+        assert!(!changes_anything(&rows, &out));
+        let change = PitChange { energy_leave_pct: Some(50.0), ..Default::default() };
+        let out = apply(&rows, &m, &check(&m, &change).unwrap()).unwrap();
+        assert!(changes_anything(&rows, &out));
     }
 
     #[test]

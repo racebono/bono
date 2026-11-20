@@ -434,6 +434,8 @@ fn fit(
     };
     match matches[..] {
         [at] => Ok(at),
+        // The same tyre twice: either will do
+        [first, ..] if matches.iter().all(|at| menu.tyres[*at] == menu.tyres[first]) => Ok(first),
         [] => bail!(
             "{} doesn't offer {compound}, {}; it offers: {}",
             corner.name(),
@@ -456,7 +458,12 @@ fn snap(name: &str, number: &Number, value: f64) -> anyhow::Result<f64> {
     }
     let low = number.min.unwrap_or(f64::NEG_INFINITY);
     let high = number.max.unwrap_or(f64::INFINITY);
-    if value < low || value > high {
+    // Listed options are shown rounded: a value at the end as shown is that end
+    let slack = match number.options.is_empty() {
+        true => 0.0,
+        false => number.step.map_or(0.0, |step| step / 2.0),
+    };
+    if value < low - slack || value > high + slack {
         match (number.min, number.max) {
             (Some(min), Some(max)) => bail!("`{name}` must be between {min} and {max}"),
             (Some(min), None) => bail!("`{name}` must be at least {min}"),
@@ -850,6 +857,29 @@ pub mod tests {
         // On a step, a value already on it stays as it is
         let r = check(&menu(), &change(json!({"fuel_ratio": 0.88}))).unwrap();
         assert_eq!(r.fuel_ratio, Some(0.88));
+    }
+
+    #[test]
+    fn listed_options_take_the_shown_ends() {
+        // The options as shown are rounded: 135.8 is the lowest one, 135.8267
+        let mut listed = menu();
+        let pressure = listed.corners.as_mut().unwrap()[0].pressure_kpa.as_mut().unwrap();
+        pressure.options = vec![135.8267, 136.5162, 137.2057];
+        pressure.min = Some(135.8267);
+        pressure.max = Some(137.2057);
+        pressure.step = Some(0.6895);
+        let at = |kpa: f64| check(&listed, &change(json!({"pressures_kpa": {"fl": kpa}})));
+        assert_eq!(at(135.8).unwrap().pressures_kpa[0], Some(135.8267));
+        assert_eq!(at(137.2).unwrap().pressures_kpa[0], Some(137.2057));
+        assert!(at(130.0).is_err());
+    }
+
+    #[test]
+    fn identical_tyres_take_the_first() {
+        let mut menu = menu();
+        menu.corners.as_mut().unwrap()[0].tyres.push(tyre("Medium", true, Some(99.0)));
+        let r = check(&menu, &change(json!({"tyres": {"fl": {"compound": "Medium", "used": true}}}))).unwrap();
+        assert_eq!(r.tyres[0], Some(Some(2)));
     }
 
     #[test]

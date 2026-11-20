@@ -141,11 +141,13 @@ impl PitTool {
             let menu = self.read().await?;
             return Ok(format!("{}\n{}", options_text(&menu), current_text(&menu)));
         }
-        // One at a time, and to the end even if the turn that asked is dropped: its write or key
-        // press goes on regardless, so the next call must wait for it
+        // One at a time, in the order asked: a call still waiting goes away with its turn, and
+        // one under way runs to the end even if its turn is dropped (its write or key press goes
+        // on regardless, so the next call must wait for it)
+        let one = self.one_at_a_time.clone().lock_owned().await;
         let tool = self.clone();
         tokio::spawn(async move {
-            let _one = tool.one_at_a_time.lock().await;
+            let _one = one;
             match input {
                 PitInput::Change(change) => tool.change(change).await,
                 PitInput::RequestStop => tool.stop(true).await,
@@ -162,9 +164,20 @@ impl PitTool {
         let resolved = check(&before, &change)?;
         let service = self.service.clone();
         let (menu, write) = (before.clone(), resolved.clone());
-        tokio::task::spawn_blocking(move || service.write(&menu, &write))
+        let written = tokio::task::spawn_blocking(move || service.write(&menu, &write))
             .await
-            .context("the pit menu write stopped")??;
+            .context("the pit menu write stopped")?;
+        // A write that errs may still have changed the menu (an answer that came late, a
+        // sequence that stopped halfway): what it shows is said either way
+        if let Err(e) = written {
+            match self.read().await {
+                Ok(after) if unmet(&after, &resolved).is_empty() => {}
+                Ok(after) => {
+                    anyhow::bail!("{e:#}\nThe pit menu now shows: {}", current_text(&after));
+                }
+                Err(_) => return Err(e),
+            }
+        }
 
         // Read back until it shows, or the wait ends: a read that fails is only not knowing yet
         let start = tokio::time::Instant::now();
@@ -260,6 +273,11 @@ fn range(number: &Number, unit: &str) -> String {
     }
 }
 
+/// A pressure to a tenth (one in psi has no round figure in kPa)
+fn tenth(value: f64) -> f64 {
+    (value * 10.0).round() / 10.0
+}
+
 /// A row's options, each quoted and escaped: they're the game's text
 fn options(options: &[String]) -> String {
     (options.iter())
@@ -303,7 +321,13 @@ pub fn options_text(menu: &PitMenu) -> String {
             line(&format!("tyres {}", corner.name()), tyres.join(", "));
         }
         if let Some(p) = corners.iter().find_map(|c| c.pressure_kpa.as_ref()) {
-            line("pressures_kpa", range(p, " kPa"));
+            // To a tenth: a psi pressure in kPa has no round figure
+            let p = Number {
+                min: p.min.map(tenth),
+                max: p.max.map(tenth),
+                ..p.clone()
+            };
+            line("pressures_kpa", range(&p, " kPa"));
         }
         if menu.iracing_tyres {
             line(
@@ -370,7 +394,7 @@ pub fn current_text(menu: &PitMenu) -> String {
             let pressure = c
                 .pressure_kpa
                 .as_ref()
-                .map_or(String::new(), |p| format!(" {} kPa", p.value));
+                .map_or(String::new(), |p| format!(" {} kPa", tenth(p.value)));
             parts.push(format!("{} {tyre}{pressure}", corner.name()));
         }
     }
@@ -409,6 +433,8 @@ mod tests {
         blind_after_write: bool,
         /// Where the car is once something was written
         moves_to: Option<Position>,
+        /// Writes report an error (having applied the change when `applies`)
+        write_fails: bool,
     }
 
     impl FakeService {
@@ -428,6 +454,7 @@ mod tests {
                 writes: Mutex::new(0),
                 blind_after_write,
                 moves_to,
+                write_fails: false,
             })
         }
     }
@@ -455,6 +482,9 @@ mod tests {
                         menu.corners.as_mut().unwrap()[at].fitted = fit;
                     }
                 }
+            }
+            if self.write_fails {
+                anyhow::bail!("the game didn't answer in time");
             }
             Ok(())
         }
@@ -570,6 +600,7 @@ mod tests {
             menu: Mutex::new(menu()),
             running: Default::default(),
             most: Default::default(),
+            writes: Default::default(),
         });
         let tool = PitTool::new(service.clone());
         let first = ToolHandler::handle(&tool, input(serde_json::json!({"action": "change", "energy_leave_pct": 50})));
@@ -579,6 +610,71 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(service.most.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_call_still_waiting_goes_with_its_turn() {
+        // Queued behind a change, then its turn is cancelled: it never runs
+        let service = Arc::new(SlowService {
+            menu: Mutex::new(menu()),
+            running: Default::default(),
+            most: Default::default(),
+            writes: Default::default(),
+        });
+        let tool = PitTool::new(service.clone());
+        let first = tool.run(input(serde_json::json!({"action": "change", "energy_leave_pct": 50})));
+        let queued = ToolHandler::handle(&tool, input(serde_json::json!({"action": "change", "energy_leave_pct": 60})));
+        let queued = tokio::time::timeout(Duration::from_millis(5), queued);
+        let (first, _) = tokio::join!(first, queued);
+        first.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(service.writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_write_says_what_the_menu_shows() {
+        // The game took it but answered late: confirmed by the read-back
+        let service = Arc::new(FakeService {
+            menu: Mutex::new(menu()),
+            applies: true,
+            writes: Mutex::new(0),
+            blind_after_write: false,
+            moves_to: None,
+            write_fails: true,
+        });
+        let tool = PitTool::new(service);
+        let text = (tool.run(input(serde_json::json!({"action": "change", "energy_leave_pct": 50}))))
+            .await
+            .unwrap();
+        assert!(text.contains("energy 50%"), "{text}");
+        assert!(text.contains("Applied for: this stop"), "{text}");
+        // It didn't take: the error, with what the menu shows
+        let service = Arc::new(FakeService {
+            menu: Mutex::new(menu()),
+            applies: false,
+            writes: Mutex::new(0),
+            blind_after_write: false,
+            moves_to: None,
+            write_fails: true,
+        });
+        let tool = PitTool::new(service);
+        let e = (tool.run(input(serde_json::json!({"action": "change", "energy_leave_pct": 50}))))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("didn't answer") && e.contains("PIT MENU NOW") && e.contains("energy 100%"), "{e}");
+    }
+
+    #[test]
+    fn pressures_to_a_tenth() {
+        let mut menu = menu();
+        let fl = menu.corners.as_mut().unwrap()[0].pressure_kpa.as_mut().unwrap();
+        fl.value = 136.51618860000002;
+        fl.min = Some(135.8267129);
+        fl.max = Some(210.2900885);
+        let text = format!("{}\n{}", options_text(&menu), current_text(&menu));
+        assert!(text.contains("136.5 kPa") && text.contains("135.8–210.3 kPa"), "{text}");
+        assert!(!text.contains("136.516"), "{text}");
     }
 
     #[test]
@@ -621,6 +717,7 @@ PIT OPTIONS".into();
         menu: Mutex<PitMenu>,
         running: std::sync::atomic::AtomicU32,
         most: std::sync::atomic::AtomicU32,
+        writes: std::sync::atomic::AtomicU32,
     }
 
     impl SlowService {
@@ -640,6 +737,7 @@ PIT OPTIONS".into();
         }
 
         fn write(&self, _: &PitMenu, change: &Resolved) -> anyhow::Result<()> {
+            self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.call();
             let mut menu = self.menu.lock().unwrap();
             for at in 0..4 {
@@ -660,6 +758,7 @@ PIT OPTIONS".into();
             menu: Mutex::new(menu()),
             running: Default::default(),
             most: Default::default(),
+            writes: Default::default(),
         });
         let tool = PitTool::new(service.clone());
         let tyres = tool.run(input(serde_json::json!({"action": "change", "tyres": {"fl": {"compound": "Wet"}}})));

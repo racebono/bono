@@ -79,7 +79,11 @@ fn parse(frame: &Frame, tires: &HashMap<i64, String>, fuel_capacity: Option<f64>
     let compound = (frame.i32("PitSvTireCompound"))
         .and_then(|index| usize::try_from(index).ok())
         .filter(|index| *index < compounds.len());
-    let corners = (flags.is_some() && !compounds.is_empty()).then(|| {
+    // A tyre ticked with a compound that isn't one the car lists can't be told from no change:
+    // tyres aren't offered then, rather than misread
+    let ticked = flags.is_some_and(|flags| flags & (LF_TIRE | RF_TIRE | LR_TIRE | RR_TIRE) != 0);
+    let known = !ticked || compound.is_some();
+    let corners = (flags.is_some() && !compounds.is_empty() && known).then(|| {
         Corner::ALL.map(|corner| CornerMenu {
             fitted: flags
                 .filter(|flags| flags & TIRE_FLAGS[corner as usize] != 0)
@@ -297,6 +301,15 @@ mod tests {
         // Whole litres: a fractional tank's top is the whole litre under it
         assert_eq!(m.fuel_add_l.unwrap().max, Some(101.0));
         assert_eq!(m.corners.unwrap()[0].pressure_kpa.as_ref().unwrap().min, Some(1.0));
+    }
+
+    #[test]
+    fn ticked_tyres_with_an_unknown_compound_are_not_offered() {
+        // Which compound goes on can't be told: tyres can't be set, rather than read as "no change"
+        let m = frame_menu((LF_TIRE | RR_TIRE) as i32, -1, &[]);
+        assert!(m.corners.is_none());
+        let m = frame_menu(0, -1, &[]);
+        assert!(m.corners.is_some());
     }
 
     #[test]
