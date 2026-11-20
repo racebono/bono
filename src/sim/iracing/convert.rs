@@ -675,7 +675,16 @@ impl Converter {
         if race && live {
             live_places(&mut cars, |car| {
                 let track = self.cars.get(&car.idx)?;
-                if racing(car) {
+                // Over the line with the count still to come (where the counts are timed at the
+                // line: not where they go up past it, where only the count finishes it)
+                let line = track
+                    .line
+                    .filter(|_| car.lap_offset == 1 && track.counts_at_line);
+                // In the cool-down too, until the count says it's over the line
+                let finishing_now = state == Some(STATE_COOL_DOWN)
+                    && line.is_some()
+                    && !over_line.contains(&car.idx);
+                if racing(car) || finishing_now {
                     // Out of the world, before its first line, or moved since its line (towed,
                     // reset, back in the world): where it is now isn't where it is in the race
                     let laps = car.laps_completed.filter(|laps| *laps >= 0)?;
@@ -687,12 +696,8 @@ impl Converter {
                     // over it with the cars counted there); with the count at a finish line
                     // further on, behind the cars finished there
                     let gone = car.progress()?;
-                    // (where the counts are timed at the line: not where they go up past it,
-                    // where only the count finishes it)
-                    let line = track
-                        .line
-                        .filter(|_| car.lap_offset == 1 && track.counts_at_line);
-                    return Some(match (state == Some(STATE_CHECKERED), line) {
+                    let flagged = matches!(state, Some(STATE_CHECKERED | STATE_COOL_DOWN));
+                    return Some(match (flagged, line) {
                         (true, Some((at, _))) => ((laps + 1) as f64, at),
                         (true, None) => (gone.min((laps + 1) as f64), f64::INFINITY),
                         (false, _) => (gone, f64::INFINITY),
@@ -883,10 +888,13 @@ impl Converter {
         }
         for car in cars {
             if let Some(track) = self.cars.get_mut(&car.idx) {
+                // The lap it finished on once it's over the line: in the cool-down, a car not yet
+                // over it (its count still to come) hasn't finished on the lap it's counted
+                let over = over_line.contains(&car.idx);
                 (track.finish_progress, track.finish_lap) = match finished.contains(&car.idx) {
                     true => (
                         track.finish_progress.or(car.progress()),
-                        track.finish_lap.or(track.counted_lap),
+                        track.finish_lap.or(track.counted_lap.filter(|_| over)),
                     ),
                     false => (None, None),
                 };
@@ -3636,38 +3644,41 @@ mod tests {
     /// places catch up, as before.
     #[test]
     fn the_line_order_holds_into_the_cool_down() {
-        // Car 0 wins at 4.9 s; car 2 by car 1 at 7.1 s, over the line at 7.9 s, car 1 at 8.2 s;
-        // the cool-down from 8.75 s
-        let updates: Vec<_> = (0..=42)
-            .map(|k| {
-                let t = 0.25 * k as f64;
-                let gone = [2.51 + 0.1 * t, 2.41 + 0.072 * t, 2.21 + 0.1 * t];
-                let state = match t {
-                    t if t >= 8.75 => STATE_COOL_DOWN,
-                    t if t >= 4.0 => STATE_CHECKERED,
-                    _ => STATE_RACING,
+        // Each car counted at its line a lap before; car 0 wins at 14.9 s; car 2 by car 1 at
+        // 17.1 s, over the line at 17.9 s, car 1 at 18.2 s. The cool-down from 18.75 s; or from
+        // 18.5 s, car 1's count late, at 18.75 s; or from the update that sees car 1 over, its
+        // count the next
+        for (cool_down, counted) in [(18.75, 18.25), (18.5, 18.75), (18.25, 18.5)] {
+            let updates: Vec<_> = (0..=82)
+                .map(|k| {
+                    let t = 0.25 * k as f64;
+                    let gone = [1.51 + 0.1 * t, 1.69 + 0.072 * t, 1.21 + 0.1 * t];
+                    let mut laps = gone.map(|g| g.floor() as i32);
+                    if t < counted {
+                        laps[1] = laps[1].min(2);
+                    }
+                    let state = match t {
+                        t if t >= cool_down => STATE_COOL_DOWN,
+                        t if t >= 14.0 => STATE_CHECKERED,
+                        _ => STATE_RACING,
+                    };
+                    (t, state, gone.map(f64::fract), laps)
+                })
+                .collect();
+            for at in [18.25, 18.5, 18.75, 19.0, 20.5] {
+                let last = updates.iter().position(|u| u.0 >= at).unwrap();
+                let end = race_end(&updates[..=last], [0.0, 0.3, 95.0]);
+                let (_, standings) = end.scoring.as_ref().unwrap();
+                let place = |car: i64| {
+                    let row = standings.iter().find(|s| s.vehicle_id.get() == Some(car));
+                    row.and_then(|row| row.position.get())
                 };
-                (
-                    t,
-                    state,
-                    gone.map(f64::fract),
-                    gone.map(|g| g.floor() as i32),
-                )
-            })
-            .collect();
-        for at in [8.5, 9.0, 10.5] {
-            let last = updates.iter().position(|u| u.0 >= at).unwrap();
-            let end = race_end(&updates[..=last], [0.0, 0.3, 95.0]);
-            let (_, standings) = end.scoring.as_ref().unwrap();
-            let place = |car: i64| {
-                let row = standings.iter().find(|s| s.vehicle_id.get() == Some(car));
-                row.and_then(|row| row.position.get())
-            };
-            assert_eq!(
-                (place(0), place(1), place(2)),
-                (Some(1), Some(3), Some(2)),
-                "{at}"
-            );
+                assert_eq!(
+                    (place(0), place(1), place(2)),
+                    (Some(1), Some(3), Some(2)),
+                    "{cool_down} {at}"
+                );
+            }
         }
     }
 
