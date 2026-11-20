@@ -3042,7 +3042,11 @@ impl Stream {
         }
 
         // Lined up with clean laps only: not one that may yet be lost at the line
-        if !self.behind && !self.verdict_pending() {
+        if !self.behind
+            && !self
+                .player
+                .is_some_and(|player| self.verdict_pending(player))
+        {
             self.calibrate(conn, shared)?;
         }
         self.find_braking_zones(conn)?;
@@ -3151,7 +3155,7 @@ impl Stream {
         let standings = rows(
             conn,
             "SELECT id, vehicle_id, session_time, laps_completed, last_lap_time, driver, position, \
-             lap_time_counts, phase, finish_status \
+             lap_time_counts, phase, finish_status, lap_start_time \
              FROM standings WHERE id > ? ORDER BY id LIMIT ?",
             params![self.standings_cursor, CHUNK],
         )?;
@@ -3228,7 +3232,12 @@ impl Stream {
                 }
                 // The lap starting now, judged by how it starts: with the session green, whatever
                 // flag the car itself is shown
+                // Seen as it began, not after rows went unrecorded (a replay)
+                let seen_begin = r
+                    .f("lap_start_time")
+                    .is_none_or(|start| at - start < OFFICIAL_MATCH);
                 if ended_lap
+                    && seen_begin
                     && !race
                     && r.i("lap_time_counts").is_some()
                     && matches!(
@@ -3329,13 +3338,10 @@ impl Stream {
     /// The laps `awaiting` an official time that would have come by `now`, the standings' time:
     /// without one they didn't count, so they're invalid, and so are their corner passes. Not a
     /// lap through the pit lane, which has no time for that.
-    /// The player's newest lap may yet be lost at the line: its verdict is to come, or, a lap the
+    /// The car's newest lap may yet be lost at the line: its verdict is to come, or, a lap the
     /// line is checked for, its count isn't in the standings yet. Not to be taken for clean
     /// evidence until then.
-    fn verdict_pending(&self) -> bool {
-        let Some(vehicle) = self.player else {
-            return false;
-        };
+    fn verdict_pending(&self, vehicle: i64) -> bool {
         if self.awaiting.contains_key(&vehicle) {
             return true;
         }
@@ -3728,7 +3734,11 @@ impl Stream {
         };
         vehicles.extend(quickest);
 
-        for vehicle in vehicles {
+        // Not another car's lap that may yet be lost at the line (the player's is waited for)
+        for vehicle in vehicles
+            .into_iter()
+            .filter(|vehicle| !self.verdict_pending(*vehicle))
+        {
             let laps = self
                 .cars
                 .get(&vehicle)
@@ -3769,7 +3779,7 @@ impl Stream {
         let Some(vehicle) = self.player else {
             return Ok(());
         };
-        if self.verdict_pending() {
+        if self.verdict_pending(vehicle) {
             return Ok(());
         }
         let Some(car) = self.cars.get(&vehicle) else {
@@ -8333,7 +8343,8 @@ mod tests {
         bono_sim::sql::create_tables(&conn).unwrap();
         conn.execute_batch(TABLES).unwrap();
         conn.execute(
-            "INSERT INTO lap_stats (vehicle_id, lap, start_s, time_s, complete, invalid, pit)              VALUES (1, 1, 100, 100, 1, 0, 0)",
+            "INSERT INTO lap_stats (vehicle_id, lap, start_s, time_s, complete, invalid, pit) \
+             VALUES (1, 1, 100, 100, 1, 0, 0)",
             [],
         )
         .unwrap();
@@ -8345,6 +8356,55 @@ mod tests {
         stream.settle_from_telemetry(&conn, Some(205.0)).unwrap();
         let invalid = scalar::<i64>(&conn, "SELECT invalid FROM lap_stats", []).unwrap();
         assert_eq!(invalid, Some(1));
+    }
+
+    #[test]
+    fn a_lap_begun_unrecorded_is_not_line_checked() {
+        // A replay (not recorded) spans lap 1's start: the first row after has its count changed,
+        // but the lap began long before
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        conn.execute(
+            "INSERT INTO session (epoch, session_time, session_type) VALUES (1, 0, 'practice')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO lap_stats (vehicle_id, lap, start_s, time_s, complete, invalid, pit) \
+             VALUES (1, 1, 100, 100, 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+        for (t, laps, start) in [
+            (50.0, 0, 0.0),
+            (150.0, 1, 100.0),
+            (200.0, 2, 200.0),
+            (204.0, 2, 200.0),
+        ] {
+            conn.execute(
+                "INSERT INTO standings (epoch, session_time, vehicle_id, is_player, \
+                 laps_completed, lap_start_time, lap_time_counts, phase, finish_status) \
+                 VALUES (1, ?, 1, 1, ?, ?, 1, 'green', 'none')",
+                params![t, laps, start],
+            )
+            .unwrap();
+        }
+        let mut stream = Stream::default();
+        while stream.read_standings(&conn).unwrap() {}
+        let invalid = scalar::<i64>(&conn, "SELECT invalid FROM lap_stats", []).unwrap();
+        assert_eq!(invalid, Some(0));
+    }
+
+    #[test]
+    fn any_cars_verdict_can_be_pending() {
+        let stream = Stream {
+            player: Some(1),
+            awaiting: HashMap::from([(2, 200.0)]),
+            ..Stream::default()
+        };
+        assert!(!stream.verdict_pending(1));
+        assert!(stream.verdict_pending(2));
     }
 
     #[test]
