@@ -5955,26 +5955,38 @@ mod tests {
     }
 
     #[test]
-    fn keeps_an_answer_written_before_a_schedule_call() {
-        let mut scripted = acknowledging();
-        scripted.hear_ago("¿Delanteros? Y avísame al final de la vuelta.", ACKNOWLEDGE_AFTER);
-        until_acknowledged(&mut scripted);
-        let acts = [
-            Act::Write("Delanteros bien.\n"),
-            Act::Tools(&[ScheduleTool::NAME]),
-            Act::Write("Te aviso al final de la vuelta."),
+    fn keeps_an_answer_written_before_a_schedule_or_pit_call() {
+        // What came before tools that only act answered; before any query, it acknowledged
+        let groups: [(&'static [&'static str], &str); 4] = [
+            (&[ScheduleTool::NAME], "Copiado.\nDelanteros bien.\nHecho."),
+            (&[PitTool::NAME], "Copiado.\nDelanteros bien.\nHecho."),
+            (&[PitTool::NAME, ScheduleTool::NAME], "Copiado.\nDelanteros bien.\nHecho."),
+            (&[ScheduleTool::NAME, EngineerTool::NAME], "Copiado.\nHecho."),
         ];
-        for act in acts {
-            scripted.acts.send(act).unwrap();
+        for (tools, heard) in groups {
+            let mut scripted = acknowledging();
+            scripted.hear_ago("¿Delanteros? Y avísame al final de la vuelta.", ACKNOWLEDGE_AFTER);
+            until_acknowledged(&mut scripted);
+            let acts = [Act::Write("Delanteros bien.\n"), Act::Tools(tools), Act::Write("Hecho.")];
+            for act in acts {
+                scripted.acts.send(act).unwrap();
+            }
+            scripted.finish(Act::End(StopReason::EndTurn, "Delanteros bien.\n\nHecho."));
+            assert_eq!(scripted.answer().unwrap().text, heard, "{tools:?}");
         }
-        scripted.finish(Act::End(
-            StopReason::EndTurn,
-            "Delanteros bien.\n\nTe aviso al final de la vuelta.",
-        ));
-        assert_eq!(
-            scripted.answer().unwrap().text,
-            "Copiado.\nDelanteros bien.\nTe aviso al final de la vuelta."
-        );
+    }
+
+    #[test]
+    fn acknowledges_a_typed_question_from_when_its_asked() {
+        let mut scripted = acknowledging();
+        let asked = Instant::now();
+        scripted.ask("How are the tyres?");
+        scripted.until("acknowledged", |s| s.answer().is_some());
+        assert!(asked.elapsed() > ACKNOWLEDGE_AFTER / 2, "{:?}", asked.elapsed());
+        scripted.acts.send(Act::Write("Fronts are fine.")).unwrap();
+        scripted.finish(Act::End(StopReason::EndTurn, "Fronts are fine."));
+        let answer = &scripted.answer().unwrap().text;
+        assert!(answer.ends_with("\nFronts are fine."), "{answer}");
     }
 
     #[test]
@@ -6022,11 +6034,11 @@ mod tests {
         scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
         until_acknowledged(&mut scripted);
         scripted.hear_ago("¿Y los traseros?", ACKNOWLEDGE_AFTER);
-        // The first turn ends without taking the steer: it's asked next
+        // The first turn ends without taking the steer: it's asked next, after this
+        let asked = Instant::now();
         scripted.acts.send(Act::Write("Delanteros bien.")).unwrap();
         scripted.acts.send(Act::End(StopReason::EndTurn, "Delanteros bien.")).unwrap();
         scripted.until("asked again", |s| s.questions().len() == 2);
-        let asked = Instant::now();
         let answers = |s: &Scripted| {
             (s.engineer.chat.iter())
                 .filter(|e| e.speaker == Speaker::Engineer)
