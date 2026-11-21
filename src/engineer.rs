@@ -213,8 +213,8 @@ impl Told {
     }
 }
 
-/// What a turn's message carries after its telemetry snapshot, taken from the engineer as the
-/// turn starts (see [`SessionState::brief`]).
+/// What a turn's message carries besides the question and its telemetry snapshot, taken from the
+/// engineer as the turn starts (see [`SessionState::brief`]).
 struct Briefing {
     auto_session: bool,
     /// The pending requests and the next id, which the `schedule` tool stages the turn's changes
@@ -2244,9 +2244,9 @@ fn unheard_note(text: &str, why: Unsaid) -> String {
 }
 
 /// What the model reads for a scheduled turn answering `batch`: that it's the engineer's own
-/// turn, the requests and why each fired, and how to answer them. The telemetry snapshot, the
-/// pending requests, the notes and the reply-language note follow, as for the pilot's questions
-/// (see [`SessionState::brief`]).
+/// turn, the requests and why each fired, and how to answer them. The notes, the telemetry
+/// snapshot, the pending requests and the reply-language note follow, as for the pilot's
+/// questions (see [`SessionState::brief`]).
 pub(crate) fn scheduled_message(batch: &Batch) -> String {
     let mut message = String::from(
         "[Scheduled turn: the pilot isn't speaking. Requests they made earlier have fired, and \

@@ -376,9 +376,10 @@ impl Conversation {
         let question_bytes = serde_json::to_vec(&question_message(question))?.len() + 1;
         let size =
             |this: &Self| -> anyhow::Result<usize> { Ok(this.request_size()? + question_bytes) };
-        // Leave a quarter of the envelope for the assistant and its tool results: history
-        // cannot be trimmed once a tool loop has started.
-        let turn_budget = limits.max_bytes - limits.max_bytes / 4;
+        // Leave a tenth of the envelope for the assistant and its tool results: history cannot
+        // be trimmed once a tool loop has started, and what doesn't fit of a round's results is
+        // cut to fit (see `fit_results`).
+        let turn_budget = limits.max_bytes - limits.max_bytes / 10;
         if target == limits.target
             && size(self)? <= turn_budget
             && self.body.messages.len() < limits.max_messages
@@ -2852,12 +2853,12 @@ mod tests {
                 },
             ]);
         }
-        assert!(conversation.request_size().unwrap() > 75_000);
+        assert!(conversation.request_size().unwrap() > 90_000);
         conversation.prepare_history("Next?", 0.5).unwrap();
-        // Half the room the prompt leaves under the trim threshold, not half the whole request
-        // (which the prompt alone is past): a few exchanges, the newest
+        // Half the room the prompt leaves under the trim threshold (90,000), about 15 KB, not
+        // half the whole request (which the prompt alone is past): several exchanges, the newest
         let kept = conversation.body.messages.len() / 2;
-        assert!((3..=6).contains(&kept), "{kept}");
+        assert!((8..=10).contains(&kept), "{kept}");
         assert_eq!(
             conversation.body.messages[0].content[0]["text"],
             format!("Question {}", 20 - kept)

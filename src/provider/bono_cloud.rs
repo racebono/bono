@@ -619,8 +619,10 @@ impl Conversation {
         let mut builder = claude::ConversationBuilder::from_config(&ClaudeConfig::default());
         builder
             .history_limits(claude::HistoryLimits {
-                // The server takes up to 160 KB
-                max_bytes: 150_000,
+                // The server takes up to 160 KB, but holds the allowance for a request past
+                // 100,000 bytes (its own payload, about this one's size) at the long-context
+                // rate, five times as much, which would refuse it to most users
+                max_bytes: 99_000,
                 // The server takes up to 128 messages, and a turn's tool loop adds up to 30
                 // (16 requests): one started under this always fits
                 max_messages: 98,
@@ -940,7 +942,7 @@ mod tests {
         }
         assert!(trimmed);
         for (_, body) in requests.iter() {
-            assert!(serde_json::to_vec(body).unwrap().len() <= 150_000);
+            assert!(serde_json::to_vec(body).unwrap().len() <= 99_000);
             let messages = body["messages"].as_array().unwrap();
             assert!(messages.len() <= 98);
             assert_eq!(messages[0]["role"], "user");
@@ -1010,7 +1012,9 @@ mod tests {
         let is_question =
             |message: &Value| message["role"] == "user" && message["content"][0]["type"] == "text";
         for (_, body) in requests.iter() {
-            assert!(serde_json::to_vec(body).unwrap().len() <= 150_000);
+            // Under the 100,000 bytes past which the server holds the allowance at the
+            // long-context rate
+            assert!(serde_json::to_vec(body).unwrap().len() <= 99_000);
             assert!(body.get("cache_control").is_none());
             let messages = body["messages"].as_array().unwrap();
             assert!(messages.len() <= 128);
@@ -1029,15 +1033,15 @@ mod tests {
                 }
             }
         }
-        // No trim in the first 24 questions: each one still has every question before it
-        for (index, &first) in firsts.iter().enumerate().take(24) {
+        // No trim in the first 10 questions, and a trim after them still keeps several
+        // exchanges: never only the newest
+        for (index, &first) in firsts.iter().enumerate() {
             let messages = requests[first].1["messages"].as_array().unwrap();
             let questions = messages.iter().filter(|m| is_question(m)).count();
-            assert_eq!(questions, index + 1, "question {index}");
-            assert_eq!(
-                messages[0]["content"][0]["text"], "Question 0",
-                "question {index}"
-            );
+            match index < 10 {
+                true => assert_eq!(questions, index + 1, "question {index}"),
+                false => assert!(questions > 5, "question {index}: {questions}"),
+            }
         }
     }
 

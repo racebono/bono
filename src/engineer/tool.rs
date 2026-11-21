@@ -1948,7 +1948,7 @@ fn either(items: &[&str]) -> String {
     }
 }
 
-/// The setup's setting names, compact enough for a conversation's first snapshot, a line each:
+/// The setup's setting names, compact enough for a conversation's first question, a line each:
 /// - paths (iRacing's `Chassis/LeftFront/Camber`) by their parent, `parent: setting, setting`,
 ///   parents with the same settings that differ in one part merged as `{a,b}`
 /// - LMU's per-wheel `WM_<SETTING>-W_<FL|FR|RL|RR>` by their wheels, those on the same wheels
