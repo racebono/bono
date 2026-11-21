@@ -531,7 +531,9 @@ impl Conversation {
             // Not even these calls' results cut to nothing would fit (see below): they don't
             // run, and the request just sent goes again, told there's no room, with no tools. Only
             // the tail of what was sent changes, so the thinking before it stays valid.
-            if let Some(limits) = self.history_limits {
+            let tail_asks = (self.body.messages.iter().rev().nth(1))
+                .is_some_and(|message| message.role == "user");
+            if let (Some(limits), true) = (self.history_limits, tail_asks) {
                 let frames = (calls.iter())
                     .map(|call| ResultBody {
                         r#type: "tool_result",
@@ -540,9 +542,10 @@ impl Conversation {
                         is_error: false,
                     })
                     .collect::<Vec<_>>();
+                let note = self.result_note.clone();
                 self.body.messages.push(RequestMessage {
                     role: "user",
-                    content: tool_results(&frames, None, None, Some(LAST_ROUND))?,
+                    content: tool_results(&frames, None, note.as_deref(), Some(LAST_ROUND))?,
                 });
                 // With `,"tool_choice":{"type":"none"}`
                 let size = self.request_size()? + 30;
@@ -557,7 +560,22 @@ impl Conversation {
                     if let Some(blocks) = (self.body.messages.last_mut())
                         .and_then(|message| message.content.as_array_mut())
                     {
-                        blocks.push(serde_json::json!({"type": "text", "text": LAST_ROUND}));
+                        // Where the last round's note goes (see `tool_results`): after the
+                        // results, or at the question's end, with the reply-language note again,
+                        // which is what's read last
+                        let last = serde_json::json!({"type": "text", "text": LAST_ROUND});
+                        let results = (blocks.iter())
+                            .take_while(|block| block["type"] == "tool_result")
+                            .count();
+                        match results {
+                            0 => {
+                                blocks.push(last);
+                                if let Some(note) = &note {
+                                    blocks.push(serde_json::json!({"type": "text", "text": &**note}));
+                                }
+                            }
+                            _ => blocks.insert(results, last),
+                        }
                     }
                     self.body.tool_choice = Some(serde_json::json!({"type": "none"}));
                     continue;
@@ -3123,6 +3141,8 @@ mod tests {
                 target: 0.5,
             });
         let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+        let note = "[Reply in Spanish.]";
+        conversation.set_tool_result_note(Some(note.into()));
         assert_eq!(send(&mut conversation, "Gap?").await.unwrap().text, "Answer");
         // Not even their results' frames would fit: the calls don't run, and the request goes
         // again, told there's no room, with no tools
@@ -3134,9 +3154,14 @@ mod tests {
         }
         let messages = requests[1]["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
+        // The reply-language note still comes last
+        let blocks = messages[0]["content"].as_array().unwrap();
         assert_eq!(
-            messages[0]["content"].as_array().unwrap().last().unwrap(),
-            &json!({"type": "text", "text": LAST_ROUND})
+            &blocks[blocks.len() - 2..],
+            &[
+                json!({"type": "text", "text": LAST_ROUND}),
+                json!({"type": "text", "text": note})
+            ]
         );
         assert_eq!(requests[1]["tool_choice"], json!({"type": "none"}));
         assert!(requests[0].get("tool_choice").is_none());
