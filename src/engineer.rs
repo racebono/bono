@@ -2244,9 +2244,9 @@ fn unheard_note(text: &str, why: Unsaid) -> String {
 }
 
 /// What the model reads for a scheduled turn answering `batch`: that it's the engineer's own
-/// turn, the requests and why each fired, and how to answer them. The notes, the telemetry
-/// snapshot, the pending requests and the reply-language note follow, as for the pilot's
-/// questions (see [`SessionState::brief`]).
+/// turn, the requests and why each fired, and how to answer them. The notes, the setup outline
+/// (when shown), the telemetry snapshot, the pending requests and the reply-language note follow,
+/// as for the pilot's questions (see [`SessionState::brief`]).
 pub(crate) fn scheduled_message(batch: &Batch) -> String {
     let mut message = String::from(
         "[Scheduled turn: the pilot isn't speaking. Requests they made earlier have fired, and \
@@ -2321,8 +2321,8 @@ fn system_prompt(skill: &str, corner_names: bool) -> Arc<str> {
 
 impl SessionState {
     /// Readies the conversation for a turn, and writes its `message` out with `briefing`'s notes,
-    /// then the telemetry snapshot, the pending requests and the reply-language note. Once per
-    /// turn: the `schedule` tool stages its changes from here.
+    /// then the setup outline (when shown), the telemetry snapshot, the pending requests and the
+    /// reply-language note. Once per turn: the `schedule` tool stages its changes from here.
     async fn brief(&mut self, message: String, briefing: Briefing) -> String {
         // Started over, it's a new weekend, which clears the requests: the briefing, taken before
         // the engineer saw it, still has the last weekend's, and its notes are about the

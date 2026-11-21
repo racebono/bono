@@ -578,9 +578,20 @@ impl Conversation {
                     role: "user",
                     content: tool_results(&results, steer.as_deref(), note.as_deref())?,
                 });
-                let size = self.request_size();
+                let size = self.request_size()?;
                 self.body.messages.pop();
-                fit_results(&mut contents, limits.max_bytes.saturating_sub(size?));
+                // Not all of what's left: the next round's call and its results go on top
+                let next_round = limits.max_bytes / 20;
+                fit_results(
+                    &mut contents,
+                    limits.max_bytes.saturating_sub(size + next_round),
+                );
+                if size > limits.max_bytes {
+                    log::warn!(
+                        "Tool results go back in a request of {size} bytes, over {}",
+                        limits.max_bytes
+                    );
+                }
                 for (result, content) in results.iter_mut().zip(contents) {
                     result.content = content;
                 }
@@ -2950,6 +2961,58 @@ mod tests {
         let result = &messages.last().unwrap()["content"][0]["content"];
         assert_eq!(result, &json!("x".repeat(10_000)));
         assert!(serde_json::to_vec(&requests[1]).unwrap().len() <= 120_000);
+    }
+
+    #[tokio::test]
+    async fn a_second_tool_round_still_fits_the_request() {
+        struct Big;
+
+        impl ToolHandler for Big {
+            type Input = Value;
+
+            fn handle(
+                &self,
+                _: Value,
+            ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
+                async { Ok("x".repeat(12_000)) }
+            }
+        }
+
+        // A round's call, with the signed thinking before it
+        let call = |id: &str| {
+            message(
+                "tool_use",
+                json!([
+                    {"type": "thinking", "thinking": "", "signature": "s".repeat(500)},
+                    {"type": "tool_use", "id": id, "name": "big", "input": {}}
+                ]),
+            )
+        };
+        let (url, requests) = mock(vec![
+            call("call1"),
+            call("call2"),
+            message("end_turn", json!([{"type": "text", "text": "Answer"}])),
+        ])
+        .await;
+        let mut builder = ConversationBuilder::new();
+        builder
+            .api_key("test")
+            .base_url(&url)
+            .system("y".repeat(16_000))
+            .tool("big", None, json!({"type": "object"}), Big)
+            .history_limits(HistoryLimits {
+                max_bytes: 20_000,
+                max_messages: 100,
+                target: 0.5,
+            });
+        let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+        assert_eq!(send(&mut conversation, "Gap?").await.unwrap().text, "Answer");
+        // The first round's results leave room for the second round's call and results
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests.iter() {
+            assert!(serde_json::to_vec(request).unwrap().len() <= 20_000);
+        }
     }
 
     #[tokio::test]
