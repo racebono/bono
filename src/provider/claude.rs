@@ -372,11 +372,8 @@ impl Conversation {
         if let Some(index) = strip_turns(&mut self.body.messages) {
             clear_thinking(&mut self.body.messages, index);
         }
-        let question_bytes = serde_json::to_vec(&serde_json::json!({
-            "role": "user", "content": question
-        }))?
-        .len()
-            + 1;
+        // As `run_turn` will push it, after a comma
+        let question_bytes = serde_json::to_vec(&question_message(question))?.len() + 1;
         let size =
             |this: &Self| -> anyhow::Result<usize> { Ok(this.request_size()? + question_bytes) };
         // Leave a quarter of the envelope for the assistant and its tool results: history
@@ -388,8 +385,23 @@ impl Conversation {
         {
             return Ok(());
         }
+        // What no trim can remove: the request with no history, and the new question. `target`
+        // is the share of what's left that history keeps, so a trim always leaves some.
+        let history = std::mem::take(&mut self.body.messages);
+        let overhead = size(self);
+        self.body.messages = history;
+        let overhead = overhead?;
+        let budget = match overhead < turn_budget {
+            true => overhead + ((turn_budget - overhead) as f64 * target) as usize,
+            false => {
+                log::warn!(
+                    "Bono Cloud: the request without history is {overhead} bytes, over {turn_budget}"
+                );
+                overhead
+            }
+        };
         let before = self.body.messages.len();
-        while size(self)? > (limits.max_bytes as f64 * target) as usize
+        while size(self)? > budget
             || self.body.messages.len() + 1 > (limits.max_messages as f64 * target) as usize
         {
             let next = self
@@ -2802,6 +2814,43 @@ mod tests {
             );
             assert_eq!(messages[2]["content"][0]["content"], OLD_RESULT);
         }
+    }
+
+    #[test]
+    fn trim_keeps_room_for_history_past_a_large_system_prompt() {
+        let mut builder = ConversationBuilder::new();
+        builder
+            .api_key("test")
+            .system("x".repeat(60_000))
+            .history_limits(HistoryLimits {
+                max_bytes: 100_000,
+                max_messages: 100,
+                target: 0.5,
+            });
+        let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+        for index in 0..20 {
+            let mut question = question_message(&format!("Question {index}"));
+            drop_breakpoints(std::slice::from_mut(&mut question));
+            let mut answer = format!("Answer {index} ");
+            answer.extend(std::iter::repeat_n('x', 1_500 - answer.len()));
+            conversation.body.messages.extend([
+                question,
+                RequestMessage {
+                    role: "assistant",
+                    content: json!([{"type": "text", "text": answer}]),
+                },
+            ]);
+        }
+        assert!(conversation.request_size().unwrap() > 75_000);
+        conversation.prepare_history("Next?", 0.5).unwrap();
+        // Half the room the prompt leaves under the trim threshold, not half the whole request
+        // (which the prompt alone is past): a few exchanges, the newest
+        let kept = conversation.body.messages.len() / 2;
+        assert!((3..=6).contains(&kept), "{kept}");
+        assert_eq!(
+            conversation.body.messages[0].content[0]["text"],
+            format!("Question {}", 20 - kept)
+        );
     }
 
     #[test]
