@@ -34,6 +34,7 @@ use std::{
     task::Poll,
     time::{Duration, Instant},
 };
+use acknowledgement::Acknowledgement;
 use timeline::Timeline;
 use tokio::{
     runtime::Handle,
@@ -321,6 +322,25 @@ struct Turn {
     steered: Option<(Option<ArrayStr<2>>, Option<Instant>)>,
     /// The notes its question carries
     told: Told,
+}
+
+impl Turn {
+    /// Writes the answer so far into its entry in `chat`.
+    fn write_into(&mut self, chat: &mut Vec<ChatEntry>) {
+        while let Ok(text) = self.text.try_recv() {
+            match self.entry {
+                Some(entry) => chat[entry].text.push_str(&text),
+                None => {
+                    self.entry = Some(chat.len());
+                    chat.push(ChatEntry {
+                        speaker: Speaker::Engineer,
+                        text,
+                        detail: None,
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// An answer in the engineer's line: speech played as it's synthesized.
@@ -1299,13 +1319,15 @@ impl Engineer {
             turn.steered = Some((lang, first));
             return;
         }
-        self.send_question(rt, sim, config, synth, question, lang, released);
+        self.send_question(rt, sim, config, synth, question, lang, released, false);
     }
 
     /// Sends `question` to the model on the running simulator's recording, starting the
     /// conversation over first if it must be (a new session was asked for, the model settings
     /// changed, another recording), or answers why it can't be. `lang` and `released`: as given
-    /// to [`Self::ask`], which has taken in `lang`.
+    /// to [`Self::ask`], which has taken in `lang`. `missed`: the questions a turn missed, asked
+    /// once it ended, long after they were let go of: the pilot has [`ACKNOWLEDGE_AFTER`] from
+    /// now to hear something.
     #[allow(clippy::too_many_arguments)]
     fn send_question(
         &mut self,
@@ -1316,6 +1338,7 @@ impl Engineer {
         question: String,
         lang: Option<ArrayStr<2>>,
         released: Option<Instant>,
+        missed: bool,
     ) {
         // Whisper distinguishes Nynorsk (`nn`), but both Norwegian forms use the `no` voice.
         let lang = lang.map(language::voice_code);
@@ -1323,6 +1346,10 @@ impl Engineer {
         let known = lang.is_some() || spoken.is_some();
         let lang = spoken.unwrap_or(lang.unwrap_or(self.last_lang));
         let timeline = Arc::new(Timeline::new(released, Instant::now()));
+        let acknowledge_from = match missed {
+            true => Instant::now(),
+            false => timeline.start(),
+        };
         let mut sim = sim;
         let database = sim
             .as_deref_mut()
@@ -1352,7 +1379,9 @@ impl Engineer {
             self.no_beep();
             return;
         }
-        self.start_turn(rt, config, synth, question, lang, known, timeline);
+        self.start_turn(
+            rt, config, synth, question, lang, known, timeline, acknowledge_from,
+        );
     }
 
     /// Makes the conversation the one for `pool`'s recording, of the simulator `sim`, starting it
@@ -1421,7 +1450,8 @@ impl Engineer {
     }
 
     /// Starts a turn on the current session for `question`, answered in `lang` (`known`: told
-    /// to the model, see [`Self::ask`]).
+    /// to the model, see [`Self::ask`]). If the model hasn't said anything [`ACKNOWLEDGE_AFTER`]
+    /// after `acknowledge_from`, the app acknowledges the question (see [`acknowledgement`]).
     #[allow(clippy::too_many_arguments)]
     fn start_turn(
         &mut self,
@@ -1432,6 +1462,7 @@ impl Engineer {
         lang: ArrayStr<2>,
         known: bool,
         timeline: Arc<Timeline>,
+        acknowledge_from: Instant,
     ) {
         let Some(session) = &self.session else {
             return;
@@ -1442,6 +1473,11 @@ impl Engineer {
         let speech = self.speak(rt, config, synth, lang, Some(timeline.clone()));
         let lang = speech.as_ref().map_or(lang, |(lang, _)| *lang);
         let speech = speech.map(|(_, speech)| speech);
+        // Pushed a little early, to be heard on time once it's synthesized
+        let phrase = acknowledgement::phrase(&lang);
+        let acknowledge_at = tokio::time::Instant::from_std(
+            acknowledge_from + ACKNOWLEDGE_AFTER.saturating_sub(ACKNOWLEDGE_LEAD),
+        );
         // Told last, after the question (and its snapshot) and after each tool result: by the
         // answer, the skill, the telemetry and often earlier answers are all in English
         let note: Option<Arc<str>> = known.then(|| language::reply_note(lang).into());
@@ -1455,20 +1491,63 @@ impl Engineer {
             // Once per turn, steers included: its changes apply together, or not at all
             let question = state.brief(question, briefing).await;
             state.conversation.set_steer(Some(slot));
-            let mut on_text = |event: Streamed<'_>| {
-                let Streamed::Text(text) = event else {
+            // Shared by the model's text and the timer, never locked across an await
+            let acknowledgement = std::sync::Mutex::new(Acknowledgement::new());
+            let say = |text: Option<String>| {
+                let Some(text) = text else {
                     return;
                 };
-                timeline.first_text();
                 if let Some(speech) = &speech {
-                    speech.push(text);
+                    speech.push(text.as_str());
                 }
-                let _ = chat.send(text.to_owned());
+                let _ = chat.send(text);
             };
-            let reply = state
-                .conversation
-                .send_streaming(question, &mut on_text)
-                .await;
+            let mut on_event = |event: Streamed<'_>| {
+                let text = {
+                    let mut acknowledgement = acknowledgement.lock().unwrap();
+                    match event {
+                        Streamed::Text(text) => {
+                            timeline.first_text();
+                            acknowledgement.text(text)
+                        }
+                        Streamed::Tools => {
+                            acknowledgement.tools();
+                            None
+                        }
+                    }
+                };
+                say(text);
+            };
+            let mut turn = state.conversation.send_streaming(question, &mut on_event);
+            // The turn's reply, unless the timer fires first
+            let early = match phrase {
+                Some(phrase) => tokio::select! {
+                    reply = &mut turn => Some(reply),
+                    () = tokio::time::sleep_until(acknowledge_at) => {
+                        let text = acknowledgement.lock().unwrap().fire(phrase);
+                        if text.is_some() {
+                            timeline.acknowledged();
+                        }
+                        say(text);
+                        None
+                    }
+                },
+                None => None,
+            };
+            let mut reply = match early {
+                Some(reply) => {
+                    drop(turn);
+                    reply
+                }
+                None => turn.await,
+            };
+            let end = acknowledgement.lock().unwrap().end();
+            say(end);
+            // The chat shows what the pilot heard
+            let heard = (acknowledgement.lock().unwrap().heard()).map(str::to_owned);
+            if let (Ok(reply), Some(heard)) = (&mut reply, heard) {
+                reply.text = heard;
+            }
             if reply.is_ok() {
                 timeline.answered();
             }
@@ -1709,24 +1788,13 @@ impl Engineer {
         self.follow_progress();
 
         if let Some(turn) = &mut self.turn {
-            // The answer so far
-            while let Ok(text) = turn.text.try_recv() {
-                match turn.entry {
-                    Some(entry) => self.chat[entry].text.push_str(&text),
-                    None => {
-                        turn.entry = Some(self.chat.len());
-                        self.chat.push(ChatEntry {
-                            speaker: Speaker::Engineer,
-                            text,
-                            detail: None,
-                        });
-                    }
-                }
-            }
+            turn.write_into(&mut self.chat);
 
             if let Some(result) = turn.task.update(rt)
                 && let Some(mut turn) = self.turn.take()
             {
+                // What it wrote just before it ended
+                turn.write_into(&mut self.chat);
                 // Questions the turn missed (it was writing its final text) are asked next, as
                 // any question is. A failed or refused turn was forgotten, and they go with it:
                 // they may build on its question
@@ -1766,7 +1834,7 @@ impl Engineer {
                 if !missed.is_empty() {
                     let question = missed.join("\n");
                     let sim = sim.as_deref_mut();
-                    self.send_question(rt, sim, config, synth, question, lang, released);
+                    self.send_question(rt, sim, config, synth, question, lang, released, true);
                 }
             }
         }
@@ -3687,6 +3755,10 @@ mod tests {
         TakeSteer,
         /// It calls the `schedule` tool with this input, and carries on
         Schedule(serde_json::Value),
+        /// It writes this text, and carries on
+        Write(&'static str),
+        /// It's about to run its tools, and carries on
+        Tools,
         /// It replies without looking at them
         Reply,
         /// It replies with this text
@@ -3723,7 +3795,7 @@ mod tests {
         fn send_streaming<'a>(
             &'a mut self,
             text: String,
-            _: &'a mut (dyn FnMut(Streamed<'_>) + Send),
+            on_event: &'a mut (dyn FnMut(Streamed<'_>) + Send),
         ) -> futures::future::BoxFuture<'a, anyhow::Result<Reply>> {
             self.asked.lock().unwrap().questions.push(text);
             Box::pin(async move {
@@ -3743,6 +3815,8 @@ mod tests {
                             let result = result.map_err(|e| format!("{e:#}"));
                             self.asked.lock().unwrap().calls.push(result);
                         }
+                        Some(Act::Write(text)) => on_event(Streamed::Text(text)),
+                        Some(Act::Tools) => on_event(Streamed::Tools),
                         Some(Act::Reply) => break (StopReason::EndTurn, "Copy.".into()),
                         Some(Act::Say(text)) => break (StopReason::EndTurn, text),
                         Some(Act::End(stop, text)) => break (stop, text.into()),
@@ -3920,6 +3994,20 @@ mod tests {
 
         fn questions(&self) -> Vec<String> {
             self.asked.lock().unwrap().questions.clone()
+        }
+
+        /// The engineer's latest entry in the chat
+        fn answer(&self) -> Option<&ChatEntry> {
+            (self.engineer.chat.iter()).rfind(|e| e.speaker == Speaker::Engineer)
+        }
+
+        /// Hears `text` in Spanish, let go of `ago` before now.
+        fn hear_ago(&mut self, text: &str, ago: Duration) {
+            self.hear(Heard::Question {
+                text: text.into(),
+                lang: arrstr!("es"),
+                released: Instant::now().checked_sub(ago).unwrap(),
+            });
         }
 
         fn cancelled(&self) -> bool {
@@ -5714,6 +5802,96 @@ mod tests {
         let asked = scripted.asked.lock().unwrap();
         assert_eq!(asked.steered, [vec!["And the rears?".to_owned()]]);
         assert_eq!(asked.questions.len(), 1);
+    }
+
+    /// Waits for the app's acknowledgement in the chat.
+    fn until_acknowledged(scripted: &mut Scripted) {
+        scripted.until("acknowledged", |s| {
+            s.answer().is_some_and(|e| e.text.starts_with("Copiado.\n"))
+        });
+    }
+
+    #[test]
+    fn acknowledges_a_slow_answer() {
+        let mut scripted = Scripted::new();
+        scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
+        until_acknowledged(&mut scripted);
+        scripted.acts.send(Act::Write("Delanteros bien.")).unwrap();
+        scripted.finish(Act::End(StopReason::EndTurn, "Delanteros bien."));
+        assert_eq!(scripted.answer().unwrap().text, "Copiado.\nDelanteros bien.");
+    }
+
+    #[test]
+    fn a_quick_answer_is_not_acknowledged() {
+        let mut scripted = Scripted::new();
+        scripted.hear_ago("¿Cómo van los neumáticos?", Duration::ZERO);
+        scripted.acts.send(Act::Write("Delanteros bien.")).unwrap();
+        scripted.finish(Act::End(StopReason::EndTurn, "Delanteros bien."));
+        assert_eq!(scripted.answer().unwrap().text, "Delanteros bien.");
+    }
+
+    #[test]
+    fn drops_the_models_late_acknowledgement() {
+        let mut scripted = Scripted::new();
+        scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
+        until_acknowledged(&mut scripted);
+        let acts = [
+            Act::Write("Copio, miro los neumáticos.\n"),
+            Act::Tools,
+            Act::Write("Delanteros bien."),
+        ];
+        for act in acts {
+            scripted.acts.send(act).unwrap();
+        }
+        scripted.finish(Act::End(
+            StopReason::EndTurn,
+            "Copio, miro los neumáticos.\n\nDelanteros bien.",
+        ));
+        assert_eq!(scripted.answer().unwrap().text, "Copiado.\nDelanteros bien.");
+    }
+
+    #[test]
+    fn a_failed_turn_keeps_what_it_held() {
+        let mut scripted = Scripted::new();
+        scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
+        until_acknowledged(&mut scripted);
+        scripted.acts.send(Act::Write("Los delanteros")).unwrap();
+        scripted.finish(Act::Fail);
+        let answer = scripted.answer().unwrap();
+        assert_eq!(answer.text, "Copiado.\nLos delanteros");
+        assert_eq!(answer.detail.as_deref(), Some(t!("engineer.detail_cut_off")));
+    }
+
+    #[test]
+    fn a_steering_question_is_not_acknowledged_again() {
+        let mut scripted = Scripted::new();
+        scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
+        until_acknowledged(&mut scripted);
+        scripted.hear_ago("¿Y los traseros?", ACKNOWLEDGE_AFTER);
+        // The running turn takes it, and answers both
+        scripted.acts.send(Act::TakeSteer).unwrap();
+        scripted.acts.send(Act::Write("Todos bien.")).unwrap();
+        scripted.finish(Act::End(StopReason::EndTurn, "Todos bien."));
+        let acknowledged = (scripted.engineer.chat.iter())
+            .filter(|e| e.text.contains("Copiado."))
+            .count();
+        assert_eq!(acknowledged, 1);
+        assert_eq!(scripted.answer().unwrap().text, "Copiado.\nTodos bien.");
+    }
+
+    #[test]
+    fn a_missed_question_waits_its_own_threshold() {
+        let mut scripted = Scripted::new();
+        scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
+        until_acknowledged(&mut scripted);
+        scripted.hear_ago("¿Y los traseros?", ACKNOWLEDGE_AFTER);
+        // The first turn ends without taking the steer: it's asked next
+        scripted.acts.send(Act::Write("Delanteros bien.")).unwrap();
+        scripted.acts.send(Act::End(StopReason::EndTurn, "Delanteros bien.")).unwrap();
+        scripted.until("asked again", |s| s.questions().len() == 2);
+        scripted.acts.send(Act::Write("Traseros bien.")).unwrap();
+        scripted.finish(Act::End(StopReason::EndTurn, "Traseros bien."));
+        assert_eq!(scripted.answer().unwrap().text, "Traseros bien.");
     }
 
     #[test]
