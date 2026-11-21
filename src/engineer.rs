@@ -2268,14 +2268,9 @@ pub(crate) fn scheduled_message(batch: &Batch) -> String {
 }
 
 /// A turn's `message`, its telemetry snapshot attached, with what follows it: the pending
-/// requests, the `notes` (each already led by a blank line) and the reply-language `note`, last.
-pub(crate) fn briefed(
-    message: String,
-    pending_text: &str,
-    notes: &str,
-    note: Option<&str>,
-) -> String {
-    let message = format!("{message}\n\n{pending_text}{notes}");
+/// requests and the reply-language `note`, last.
+pub(crate) fn briefed(message: String, pending_text: &str, note: Option<&str>) -> String {
+    let message = format!("{message}\n\n{pending_text}");
     match note {
         Some(note) => format!("{message}\n\n{note}"),
         None => message,
@@ -2325,8 +2320,8 @@ fn system_prompt(skill: &str, corner_names: bool) -> Arc<str> {
 }
 
 impl SessionState {
-    /// Readies the conversation for a turn, and writes its `message` out with the telemetry
-    /// snapshot, then `briefing`'s pending requests, notes and reply-language note. Once per
+    /// Readies the conversation for a turn, and writes its `message` out with `briefing`'s notes,
+    /// then the telemetry snapshot, the pending requests and the reply-language note. Once per
     /// turn: the `schedule` tool stages its changes from here.
     async fn brief(&mut self, message: String, briefing: Briefing) -> String {
         // Started over, it's a new weekend, which clears the requests: the briefing, taken before
@@ -2364,11 +2359,12 @@ impl SessionState {
             Some(pit_tool) => pit_tool.menu().await,
             None => None,
         };
+        // The notes are said once, so they go with the question, before what's sent every turn
         let message = (self.tool)
-            .question_with_snapshot(message, &mut shown, pit.as_ref())
+            .question_with_snapshot(message + &notes, &mut shown, pit.as_ref())
             .await;
         self.outline_offered = shown;
-        let message = briefed(message, &pending_text, &notes, briefing.note.as_deref());
+        let message = briefed(message, &pending_text, briefing.note.as_deref());
         self.conversation.set_tool_result_note(briefing.note);
         message
     }
@@ -4507,6 +4503,24 @@ mod tests {
     }
 
     #[test]
+    fn notes_come_before_the_snapshot() {
+        let mut scripted = Scripted::recorded();
+        let note = scripted.missed_change();
+        let turns = scripted.questions().len();
+        scripted.ask("Anything else?");
+        scripted.until("asked", |s| s.questions().len() > turns);
+        let question = &scripted.questions()[turns];
+        let snapshot = question
+            .find("\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\n")
+            .expect("a snapshot");
+        assert!(
+            question.find(&note).is_some_and(|at| at < snapshot),
+            "{question}"
+        );
+        scripted.finish(Act::Reply);
+    }
+
+    #[test]
     fn a_new_conversation_forgets_the_notes() {
         // The account the conversation is had as signs out
         let mut scripted = Scripted::recorded();
@@ -4740,11 +4754,15 @@ mod tests {
         }
         let progress = scripted.engineer.progress.clone().unwrap();
         let pending = scripted.engineer.schedule().pending_text(&progress);
+        // The note is said once, so it's kept with the message, before what comes every turn
+        let begin = message
+            .find("[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]")
+            .unwrap();
         let snapshot = message.find("[END UNTRUSTED TELEMETRY SNAPSHOT]").unwrap();
         let at = message.find(&pending).expect("the pending list");
         let told = message.find(&note).expect("the note");
         let reply = message.rfind(&language::reply_note(arrstr!("en"))).unwrap();
-        assert!(snapshot < at && at < told && told < reply, "{message}");
+        assert!(told < begin && snapshot < at && at < reply, "{message}");
     }
 
     #[test]
