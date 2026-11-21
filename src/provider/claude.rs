@@ -362,11 +362,16 @@ impl Conversation {
         builder.build(client)
     }
 
-    /// Trim only between complete user turns. The system prefix and newest turn survive.
+    /// Strips the turns so far of what the next question brings again (see `strip_turns`), then
+    /// trims only between complete user turns. The system prefix and newest turn survive.
     fn prepare_history(&mut self, question: &str, target: f64) -> anyhow::Result<()> {
         let Some(limits) = self.history_limits else {
             return Ok(());
         };
+        // Only the newest turn has anything to strip, so the cache still holds what's before it
+        if let Some(index) = strip_turns(&mut self.body.messages) {
+            clear_thinking(&mut self.body.messages, index);
+        }
         let question_bytes = serde_json::to_vec(&serde_json::json!({
             "role": "user", "content": question
         }))?
@@ -384,31 +389,6 @@ impl Conversation {
             return Ok(());
         }
         let before = self.body.messages.len();
-        let starts: Vec<_> = self
-            .body
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, message)| is_question(message))
-            .map(|(index, _)| index)
-            .collect();
-        let recent = starts.iter().rev().nth(3).copied().unwrap_or(0);
-        let mut first_edit = None;
-        for (index, message) in self.body.messages[0..recent].iter_mut().enumerate() {
-            if message.role == "user" {
-                if let Some(text) = message.content.as_str() {
-                    let stripped = strip_snapshot(text);
-                    if stripped != text {
-                        message.content = serde_json::Value::String(stripped);
-                        first_edit.get_or_insert(index);
-                    }
-                }
-            }
-        }
-        if let Some(index) = first_edit {
-            clear_thinking(&mut self.body.messages, index);
-            self.forgotten += 1;
-        }
         while size(self)? > (limits.max_bytes as f64 * target) as usize
             || self.body.messages.len() + 1 > (limits.max_messages as f64 * target) as usize
         {
@@ -1060,19 +1040,39 @@ fn is_question(message: &RequestMessage) -> bool {
                 == Some(&serde_json::Value::from("text")))
 }
 
-fn strip_snapshot(text: &str) -> String {
-    const BEGIN: &str = "[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]";
-    const END: &str = "[END UNTRUSTED TELEMETRY SNAPSHOT]";
-    let mut text = text.to_owned();
-    if let Some(start) = text.find(BEGIN) {
-        if let Some(end) = text[start + BEGIN.len()..].find(END) {
-            text.replace_range(
-                start..start + BEGIN.len() + end + END.len(),
-                "[telemetry snapshot omitted]",
-            );
+/// What an old tool result says in place of its content.
+const OLD_RESULT: &str = "[old tool result omitted]";
+
+/// Takes from the turns in `messages` what was only for their own answer: each question's
+/// snapshot onward (its second block, see `question_message`) and each tool result's content.
+/// What was said stays: the questions, the answers, the tool calls, the pilot's words alongside
+/// the results. Returns the first message changed, if any.
+fn strip_turns(messages: &mut [RequestMessage]) -> Option<usize> {
+    let mut first = None;
+    for (index, message) in messages.iter_mut().enumerate() {
+        let question = is_question(message);
+        if message.role != "user" {
+            continue;
+        }
+        let Some(blocks) = message.content.as_array_mut() else {
+            continue;
+        };
+        let mut changed = false;
+        if question && blocks.len() > 1 {
+            blocks.truncate(1);
+            changed = true;
+        }
+        for block in blocks.iter_mut().filter(|block| block["type"] == "tool_result") {
+            if block["content"] != OLD_RESULT {
+                block["content"] = serde_json::Value::from(OLD_RESULT);
+                changed = true;
+            }
+        }
+        if changed {
+            first.get_or_insert(index);
         }
     }
-    text
+    first
 }
 
 pub struct ConversationBuilder {
@@ -2114,6 +2114,7 @@ mod tests {
         }
         let mut newest = serde_json::to_value(&conversation.body.messages[16..]).unwrap();
         newest[1]["content"].as_array_mut().unwrap().drain(0..2);
+        newest[2]["content"][0]["content"] = json!(OLD_RESULT);
         conversation.prepare_history("Next?", 0.5).unwrap();
         assert_eq!(
             serde_json::to_value(&conversation.body.messages).unwrap(),
@@ -2136,15 +2137,14 @@ mod tests {
             target: 0.5,
         });
         for index in 0..6 {
+            let question = match index {
+                1 => with_snapshot("Question"),
+                _ => "Question".into(),
+            };
+            let mut question = question_message(&question);
+            drop_breakpoints(std::slice::from_mut(&mut question));
             conversation.body.messages.extend([
-                RequestMessage {
-                    role: "user",
-                    content: json!(if index == 1 {
-                        "Question [BEGIN UNTRUSTED TELEMETRY SNAPSHOT]old[END UNTRUSTED TELEMETRY SNAPSHOT]"
-                    } else {
-                        "Question"
-                    }),
-                },
+                question,
                 RequestMessage {
                     role: "assistant",
                     content: json!([
@@ -2155,25 +2155,18 @@ mod tests {
             ]);
         }
         let original = serde_json::to_value(&conversation.body.messages).unwrap();
-        // No trim must preserve everything, including empty thinking text.
         conversation.prepare_history("Next?", 0.5).unwrap();
-        assert_eq!(
-            serde_json::to_value(&conversation.body.messages).unwrap(),
-            original
-        );
+        // A snapshot taken out is data the next question brings again, not something forgotten
         assert_eq!(conversation.forgotten(), 0);
-        // Force preparation without forcing whole-turn removal.
-        conversation.prepare_history("Next?", 0.25).unwrap();
-        // A snapshot taken out: what it said is gone
-        assert_eq!(conversation.forgotten(), 1);
         let messages = serde_json::to_value(&conversation.body.messages).unwrap();
+        // What's before the edit keeps its thinking, empty text included
         assert_eq!(
             &messages.as_array().unwrap()[..2],
             &original.as_array().unwrap()[..2]
         );
         assert_eq!(
             messages[2]["content"],
-            "Question [telemetry snapshot omitted]"
+            json!([{"type": "text", "text": "Question"}])
         );
         assert_eq!(messages.as_array().unwrap().len(), 7);
         assert!(
@@ -2199,24 +2192,26 @@ mod tests {
             target: 0.5,
         });
         for index in 0..6 {
-            conversation.body.messages.push(RequestMessage { role: "user", content: json!(format!(
-                "Question {index} [BEGIN UNTRUSTED TELEMETRY SNAPSHOT]{}[END UNTRUSTED TELEMETRY SNAPSHOT] suffix",
-                "x".repeat(if index < 2 { 6000 } else { 10 }))) });
+            let mut question = question_message(&format!(
+                "Question {index}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\n{}\n[END UNTRUSTED TELEMETRY SNAPSHOT]\n\nsuffix",
+                "x".repeat(if index < 2 { 6000 } else { 10 })
+            ));
+            drop_breakpoints(std::slice::from_mut(&mut question));
+            conversation.body.messages.push(question);
             conversation.body.messages.push(RequestMessage {
                 role: "assistant",
                 content: json!([{"type": "text", "text": "Answer"}]),
             });
         }
-        let recent = serde_json::to_value(&conversation.body.messages[4..]).unwrap();
         conversation.prepare_history("Next?", 0.5).unwrap();
-        assert_eq!(
-            conversation.body.messages[0].content,
-            "Question 0 [telemetry snapshot omitted] suffix"
-        );
-        assert_eq!(
-            serde_json::to_value(&conversation.body.messages[4..]).unwrap(),
-            recent
-        );
+        // Without their snapshots, every question fits: none is dropped
+        assert_eq!(conversation.body.messages.len(), 12);
+        for (index, question) in conversation.body.messages.iter().step_by(2).enumerate() {
+            assert_eq!(
+                question.content,
+                json!([{"type": "text", "text": format!("Question {index}")}])
+            );
+        }
     }
 
     #[tokio::test]
@@ -2278,8 +2273,19 @@ mod tests {
                         })
                     }));
                 } else {
-                    assert_eq!(&first[..previous.len()], previous);
-                    assert_eq!(first[previous.len()]["content"], answer);
+                    // The turn before, as the next question has it: its results stripped, and
+                    // the thinking after them, no longer bound to what it saw, gone
+                    let mut stripped = previous.clone();
+                    for message in &mut stripped {
+                        for block in message["content"].as_array_mut().into_iter().flatten() {
+                            if block["type"] == "tool_result" {
+                                block["content"] = json!(OLD_RESULT);
+                            }
+                        }
+                    }
+                    let unbound = json!([{"type": "text", "text": "Answer"}]);
+                    assert_eq!(&first[..previous.len()], stripped.as_slice());
+                    assert_eq!(first[previous.len()]["content"], unbound);
                 }
             }
         }
@@ -2614,6 +2620,187 @@ mod tests {
                 .collect::<Vec<_>>();
             let newest = messages.iter().rposition(|m| m["role"] == "user").unwrap();
             assert_eq!(marked, [(newest, 0)], "{request}");
+        }
+    }
+
+    fn with_snapshot(question: &str) -> String {
+        format!(
+            "{question}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\nLap 2\n[END UNTRUSTED TELEMETRY SNAPSHOT]"
+        )
+    }
+
+    #[tokio::test]
+    async fn strips_earlier_turns_on_every_question() {
+        let call = || {
+            message(
+                "tool_use",
+                json!([{"type": "tool_use", "id": "t1", "name": "lookup", "input": {"what": "gap"}}]),
+            )
+        };
+        let answer = || message("end_turn", json!([{"type": "text", "text": "Box."}]));
+        let (url, requests) = mock(vec![call(), answer(), call(), answer()]).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+        conversation.history_limits = Some(HistoryLimits {
+            max_bytes: 100_000,
+            max_messages: 100,
+            target: 0.5,
+        });
+        send(&mut conversation, &with_snapshot("Gap?")).await.unwrap();
+        send(&mut conversation, &with_snapshot("Now?")).await.unwrap();
+        assert_eq!(conversation.forgotten(), 0);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        let second = requests[2]["messages"].as_array().unwrap();
+        assert_eq!(second.len(), 5);
+        assert_eq!(
+            second[0]["content"],
+            json!([{"type": "text", "text": "Gap?"}])
+        );
+        assert_eq!(
+            second[2]["content"],
+            json!([{"type": "tool_result", "tool_use_id": "t1", "content": OLD_RESULT, "is_error": false}])
+        );
+        assert_eq!(second[4]["content"].as_array().unwrap().len(), 2);
+        let live = requests[3]["messages"].as_array().unwrap();
+        assert_eq!(
+            live.last().unwrap()["content"][0]["content"],
+            "looked up \"gap\""
+        );
+        // The cache still holds everything up to the end of the first question
+        let mut first = without_cache_control(&requests[0]["messages"][0]);
+        first["content"].as_array_mut().unwrap().truncate(1);
+        assert_eq!(without_cache_control(&second[0]), first);
+    }
+
+    #[test]
+    fn stripping_keeps_steer_text() {
+        let mut messages = vec![
+            question_message(&with_snapshot("Gap?")),
+            RequestMessage {
+                role: "assistant",
+                content: json!([{"type": "tool_use", "id": "call", "name": "lookup", "input": {}}]),
+            },
+            RequestMessage {
+                role: "user",
+                content: json!([
+                    {"type": "tool_result", "tool_use_id": "call", "content": "data"},
+                    {"type": "text", "text": "And the gap?"}
+                ]),
+            },
+            RequestMessage {
+                role: "assistant",
+                content: json!([{"type": "text", "text": "Two seconds."}]),
+            },
+        ];
+        assert_eq!(strip_turns(&mut messages), Some(0));
+        assert_eq!(messages[0].content.as_array().unwrap().len(), 1);
+        assert_eq!(
+            messages[2].content,
+            json!([
+                {"type": "tool_result", "tool_use_id": "call", "content": OLD_RESULT},
+                {"type": "text", "text": "And the gap?"}
+            ])
+        );
+        // Once stripped, there's nothing more to take
+        let stripped = serde_json::to_value(&messages).unwrap();
+        assert_eq!(strip_turns(&mut messages), None);
+        assert_eq!(serde_json::to_value(&messages).unwrap(), stripped);
+    }
+
+    #[test]
+    fn strip_turns_is_idempotent() {
+        let mut messages = vec![
+            question_message("Gap?"),
+            RequestMessage {
+                role: "assistant",
+                content: json!([{"type": "text", "text": "Two seconds."}]),
+            },
+        ];
+        let original = serde_json::to_value(&messages).unwrap();
+        assert_eq!(strip_turns(&mut messages), None);
+        assert_eq!(serde_json::to_value(&messages).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn stripped_turn_rolls_back_on_error_refusal_and_cancellation() {
+        for failure in ["error", "refusal", "cancel"] {
+            let responses = match failure {
+                "error" => vec![(
+                    400,
+                    "",
+                    json!({"error": {"type": "invalid_request_error", "message": "invalid"}}),
+                )],
+                "refusal" => vec![message("refusal", json!([{"type": "text", "text": "No."}]))],
+                _ => vec![],
+            };
+            let (url, _) = mock(responses).await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut conversation = conversation(&url, &calls);
+            conversation.history_limits = Some(HistoryLimits {
+                max_bytes: 100_000,
+                max_messages: 100,
+                target: 0.5,
+            });
+            conversation.body.messages.extend([
+                question_message(&with_snapshot("Old question")),
+                RequestMessage {
+                    role: "assistant",
+                    content: json!([
+                        {"type": "thinking", "thinking": "", "signature": "signed"},
+                        {"type": "tool_use", "id": "call", "name": "lookup", "input": {}}
+                    ]),
+                },
+                RequestMessage {
+                    role: "user",
+                    content: json!([{"type": "tool_result", "tool_use_id": "call", "content": "data"}]),
+                },
+                RequestMessage {
+                    role: "assistant",
+                    content: json!([{"type": "text", "text": "Old answer"}]),
+                },
+            ]);
+            let original = serde_json::to_value(&conversation.body.messages).unwrap();
+            if failure == "cancel" {
+                assert!(
+                    timeout(
+                        Duration::from_millis(100),
+                        conversation.send("Next?".into())
+                    )
+                    .await
+                    .is_err()
+                );
+            } else {
+                let result = send(&mut conversation, "Next?").await;
+                if failure == "error" {
+                    assert!(result.is_err());
+                } else {
+                    assert_eq!(result.unwrap().stop, StopReason::Refusal);
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(&conversation.body.messages).unwrap(),
+                original,
+                "{failure}"
+            );
+            let (url, requests) = mock(vec![message(
+                "end_turn",
+                json!([{"type": "text", "text": "Recovered"}]),
+            )])
+            .await;
+            conversation.base_url = url;
+            assert_eq!(
+                send(&mut conversation, "Again?").await.unwrap().text,
+                "Recovered"
+            );
+            let requests = requests.lock().unwrap();
+            let messages = requests[0]["messages"].as_array().unwrap();
+            assert_eq!(
+                messages[0]["content"],
+                json!([{"type": "text", "text": "Old question"}]),
+                "{failure}"
+            );
+            assert_eq!(messages[2]["content"][0]["content"], OLD_RESULT);
         }
     }
 
@@ -3054,13 +3241,15 @@ mod tests {
                     .is_some_and(|s| s.contains("[BEGIN UNTRUSTED"))
             })
             .unwrap();
-        let earlier = serde_json::to_value(&original[..edited]).unwrap();
-        let earlier_thinking = thinking_count(&original[..edited]);
+        // Where stripping will first edit the history: everything before it stays as it was
+        let first_edit = strip_turns(&mut original.clone()).unwrap();
+        let earlier = serde_json::to_value(&original[..first_edit]).unwrap();
+        let earlier_thinking = thinking_count(&original[..first_edit]);
         assert!(earlier_thinking > 0);
 
         // Reproduce the old snapshot-only rewrite, without cleanup, against strict Claude.
         conversation.body.messages[edited].content =
-            json!(strip_snapshot(original[edited].content.as_str().unwrap()));
+            json!("How are the tyres? [telemetry snapshot omitted]");
         rejects_binding(&mut conversation).await;
         assert_eq!(
             calls.load(Ordering::Relaxed),
@@ -3084,7 +3273,7 @@ mod tests {
             "snapshot test removed full turns"
         );
         assert_eq!(
-            serde_json::to_value(&conversation.body.messages[..edited]).unwrap(),
+            serde_json::to_value(&conversation.body.messages[..first_edit]).unwrap(),
             earlier
         );
         assert_eq!(
@@ -3092,7 +3281,7 @@ mod tests {
             earlier_thinking
         );
         completes(&mut conversation, "How are the tyres?").await;
-        println!("snapshot-only trim: completed with unaffected earlier thinking preserved");
+        println!("stripped turns: completed with unaffected earlier thinking preserved");
 
         // Reproduce prefix deletion, then exercise normal automatic history preparation.
         let good = conversation.body.messages.clone();
@@ -3100,7 +3289,7 @@ mod tests {
             .iter()
             .enumerate()
             .skip(1)
-            .find(|(_, m)| m.role == "user" && m.content.is_string())
+            .find(|(_, m)| is_question(m))
             .unwrap()
             .0;
         conversation.history_limits = None;
@@ -3120,7 +3309,7 @@ mod tests {
                 .body
                 .messages
                 .iter()
-                .filter(|m| m.role == "user" && m.content.is_string())
+                .filter(|m| is_question(m))
                 .count();
             assert_eq!(
                 driver_turns, 2,
