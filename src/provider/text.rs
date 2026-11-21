@@ -71,13 +71,13 @@ impl<'a> TextSink<'a> {
 
     /// Flush spoken text before waiting for client tools, even when the model omitted
     /// trailing whitespace. Do not wait until the next response to emit its separator. Then tells
-    /// the tools are next.
-    pub fn before_tools(&mut self) {
+    /// the tools are next, those with `names`.
+    pub fn before_tools(&mut self, names: &[&str]) {
         self.end_block();
         if !self.text.is_empty() && !self.text.ends_with("\n\n") {
             self.emit("\n\n");
         }
-        (self.on_event)(Streamed::Tools);
+        (self.on_event)(Streamed::Tools(names));
     }
 
     fn emit(&mut self, text: &str) {
@@ -88,20 +88,20 @@ impl<'a> TextSink<'a> {
     }
 }
 
-/// Runs `conversation`'s turn for `text`, keeping what it hands out: a piece of text, or `None`
-/// where it told its tools were next.
+/// Runs `conversation`'s turn for `text`, keeping what it hands out: a piece of text, or the
+/// names of the tools it told were next.
 #[cfg(test)]
 pub(super) async fn send_streaming_events(
     conversation: &mut dyn super::Model,
     text: &str,
-) -> (anyhow::Result<super::Reply>, Vec<Option<String>>) {
+) -> (anyhow::Result<super::Reply>, Vec<Result<String, Vec<String>>>) {
     let mut events = Vec::new();
     let reply = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         conversation.send_streaming(text.into(), &mut |event| {
             events.push(match event {
-                Streamed::Text(piece) => Some(piece.to_owned()),
-                Streamed::Tools => None,
+                Streamed::Text(piece) => Ok(piece.to_owned()),
+                Streamed::Tools(names) => Err(names.iter().map(|&name| name.to_owned()).collect()),
             })
         }),
     )
@@ -111,14 +111,19 @@ pub(super) async fn send_streaming_events(
 }
 
 /// The text handed out before and after the one time `events` (see [`send_streaming_events`])
-/// told the tools were next.
+/// told tools were next, and which.
 #[cfg(test)]
-pub(super) fn around_tools(events: &[Option<String>]) -> (String, String) {
-    let tools = events.iter().filter(|event| event.is_none()).count();
+pub(super) fn around_tools(
+    events: &[Result<String, Vec<String>>],
+) -> (String, Vec<String>, String) {
+    let tools = events.iter().filter(|event| event.is_err()).count();
     assert_eq!(tools, 1, "{events:?}");
-    let at = events.iter().position(Option::is_none).unwrap();
-    let text = |events: &[Option<String>]| events.iter().flatten().cloned().collect::<String>();
-    (text(&events[..at]), text(&events[at + 1..]))
+    let at = events.iter().position(Result::is_err).unwrap();
+    let text = |events: &[Result<String, Vec<String>>]| {
+        events.iter().flatten().cloned().collect::<String>()
+    };
+    let names = events[at].clone().unwrap_err();
+    (text(&events[..at]), names, text(&events[at + 1..]))
 }
 
 #[cfg(test)]
@@ -136,7 +141,7 @@ mod tests {
         let mut sink = TextSink::new(&mut callback);
         sink.push("Copy, checking.");
         sink.end_block();
-        sink.before_tools();
+        sink.before_tools(&["lookup"]);
         assert_eq!(sink.text, "Copy, checking.\n\n");
         sink.start_response();
         sink.push("The hairpin on entry.");
@@ -152,13 +157,13 @@ mod tests {
         let mut callback = |event: Streamed<'_>| {
             events.push(match event {
                 Streamed::Text(text) => format!("text:{text}"),
-                Streamed::Tools => "tools".to_owned(),
+                Streamed::Tools(names) => format!("tools:{}", names.join(",")),
             })
         };
         let mut sink = TextSink::new(&mut callback);
         sink.push("Copy, checking.");
         sink.end_block();
-        sink.before_tools();
+        sink.before_tools(&["lookup", "schedule"]);
         sink.start_response();
         sink.push("The hairpin on entry.");
         drop(sink);
@@ -167,7 +172,7 @@ mod tests {
             [
                 "text:Copy, checking.",
                 "text:\n\n",
-                "tools",
+                "tools:lookup,schedule",
                 "text:The hairpin on entry."
             ]
         );
@@ -182,7 +187,7 @@ mod tests {
             }
         };
         let mut sink = TextSink::new(&mut callback);
-        sink.before_tools();
+        sink.before_tools(&["lookup"]);
         sink.start_response();
         sink.push("Radio check, loud and clear.");
         assert_eq!(sink.text, "Radio check, loud and clear.");

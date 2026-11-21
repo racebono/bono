@@ -60,8 +60,9 @@ pub async fn models(
 pub enum Streamed<'a> {
     /// More of the reply's text
     Text(&'a str),
-    /// The model's client tools are about to run: everything it wrote before them was handed out
-    Tools,
+    /// The model's client tools are about to run, those with these names: everything it wrote
+    /// before them was handed out
+    Tools(&'a [&'a str]),
 }
 
 /// A conversation with a language model.

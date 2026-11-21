@@ -520,7 +520,10 @@ impl Conversation {
 
             // Only once the turn is known to be whole: a `tool_use` cut off at `max_tokens` can
             // still parse, with part of its input missing
-            sink.before_tools();
+            let names = (calls.iter())
+                .map(|call| call["name"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>();
+            sink.before_tools(&names);
             let tools = &self.tools;
             let result_limit = self.history_limits.map(|limits| limits.max_bytes / 8);
             let tools_started = Instant::now();
@@ -2753,7 +2756,11 @@ mod tests {
         let reply = reply.unwrap();
         assert_eq!(
             around_tools(&events),
-            ("Checking the gap.\n\n".into(), "You are 2.1s ahead.".into())
+            (
+                "Checking the gap.\n\n".into(),
+                vec!["lookup".to_owned()],
+                "You are 2.1s ahead.".into()
+            )
         );
         assert_eq!(events.iter().flatten().cloned().collect::<String>(), reply.text);
     }

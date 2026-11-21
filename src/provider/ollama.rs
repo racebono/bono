@@ -280,7 +280,10 @@ impl Conversation {
             }
 
             // The spoken text so far is all said before the tools run
-            sink.before_tools();
+            let names = (calls.iter())
+                .map(|call| call["function"]["name"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>();
+            sink.before_tools(&names);
             let tools = &self.tools;
             let mut results = join_all(calls.iter().map(|call| {
                 let function = &call["function"];
@@ -952,7 +955,11 @@ mod tests {
         let reply = reply.unwrap();
         assert_eq!(
             around_tools(&events),
-            ("Let me check.\n\n".into(), "The gap is 1.2s.".into())
+            (
+                "Let me check.\n\n".into(),
+                vec!["lookup".to_owned()],
+                "The gap is 1.2s.".into()
+            )
         );
         assert_eq!(events.iter().flatten().cloned().collect::<String>(), reply.text);
     }

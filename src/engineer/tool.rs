@@ -4789,7 +4789,9 @@ mod evals {
                             Streamed::Text(text) => {
                                 serde_json::json!({"kind": "text", "ms": ms, "text": text})
                             }
-                            Streamed::Tools => serde_json::json!({"kind": "tools", "ms": ms}),
+                            Streamed::Tools(names) => {
+                                serde_json::json!({"kind": "tools", "ms": ms, "names": names})
+                            }
                         });
                     }).await;
                     let elapsed = start.elapsed();

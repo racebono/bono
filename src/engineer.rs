@@ -1510,9 +1510,12 @@ impl Engineer {
                             timeline.first_text();
                             acknowledgement.text(text)
                         }
-                        Streamed::Tools => {
-                            acknowledgement.tools();
-                            None
+                        // Not a query: a `schedule` or `pit` call is confirmed once made, and
+                        // needs no acknowledgement first (see the skill)
+                        Streamed::Tools(names) => {
+                            let queried = (names.iter())
+                                .any(|&name| name != ScheduleTool::NAME && name != PitTool::NAME);
+                            acknowledgement.tools(queried)
                         }
                     }
                 };
@@ -3757,8 +3760,8 @@ mod tests {
         Schedule(serde_json::Value),
         /// It writes this text, and carries on
         Write(&'static str),
-        /// It's about to run its tools, and carries on
-        Tools,
+        /// It's about to run these tools, and carries on
+        Tools(&'static [&'static str]),
         /// It replies without looking at them
         Reply,
         /// It replies with this text
@@ -3816,7 +3819,7 @@ mod tests {
                             self.asked.lock().unwrap().calls.push(result);
                         }
                         Some(Act::Write(text)) => on_event(Streamed::Text(text)),
-                        Some(Act::Tools) => on_event(Streamed::Tools),
+                        Some(Act::Tools(names)) => on_event(Streamed::Tools(names)),
                         Some(Act::Reply) => break (StopReason::EndTurn, "Copy.".into()),
                         Some(Act::Say(text)) => break (StopReason::EndTurn, text),
                         Some(Act::End(stop, text)) => break (stop, text.into()),
@@ -5837,7 +5840,7 @@ mod tests {
         until_acknowledged(&mut scripted);
         let acts = [
             Act::Write("Copio, miro los neumáticos.\n"),
-            Act::Tools,
+            Act::Tools(&[EngineerTool::NAME]),
             Act::Write("Delanteros bien."),
         ];
         for act in acts {
@@ -5848,6 +5851,29 @@ mod tests {
             "Copio, miro los neumáticos.\n\nDelanteros bien.",
         ));
         assert_eq!(scripted.answer().unwrap().text, "Copiado.\nDelanteros bien.");
+    }
+
+    #[test]
+    fn keeps_an_answer_written_before_a_schedule_call() {
+        let mut scripted = Scripted::new();
+        scripted.hear_ago("¿Delanteros? Y avísame al final de la vuelta.", ACKNOWLEDGE_AFTER);
+        until_acknowledged(&mut scripted);
+        let acts = [
+            Act::Write("Delanteros bien.\n"),
+            Act::Tools(&[ScheduleTool::NAME]),
+            Act::Write("Te aviso al final de la vuelta."),
+        ];
+        for act in acts {
+            scripted.acts.send(act).unwrap();
+        }
+        scripted.finish(Act::End(
+            StopReason::EndTurn,
+            "Delanteros bien.\n\nTe aviso al final de la vuelta.",
+        ));
+        assert_eq!(
+            scripted.answer().unwrap().text,
+            "Copiado.\nDelanteros bien.\nTe aviso al final de la vuelta."
+        );
     }
 
     #[test]

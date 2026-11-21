@@ -55,16 +55,25 @@ impl Acknowledgement {
         }
     }
 
-    /// The model's client tools are about to run.
-    pub fn tools(&mut self) {
+    /// The model's client tools are about to run: `queried`, if any of them looks something up.
+    /// What it wrote before a query is its acknowledgement; what it wrote before tools that only
+    /// act (a `schedule` or `pit` call, confirmed once made) answered.
+    pub fn tools(&mut self, queried: bool) -> Option<String> {
         match self.state {
-            State::Waiting => self.tools_ran = true,
-            // What it wrote before them was its acknowledgement: the pilot heard the app's
-            State::Acknowledged => {
-                self.held.clear();
-                self.state = State::Passed;
+            State::Waiting => {
+                self.tools_ran = true;
+                None
             }
-            State::Passed => {}
+            State::Acknowledged => {
+                self.state = State::Passed;
+                let held = std::mem::take(&mut self.held);
+                match queried || held.is_empty() {
+                    // The pilot heard the app's acknowledgement instead
+                    true => None,
+                    false => self.say(held),
+                }
+            }
+            State::Passed => None,
         }
     }
 
@@ -137,9 +146,13 @@ pub fn phrase(lang: &str) -> Option<&'static str> {
         "ka" => "გასაგებია.",
         "kk" => "Түсінікті.",
         "ko" => "알겠습니다.",
+        "ku" => "Fêm kir.",
+        "lb" => "Verstanen.",
         "lt" => "Supratau.",
         "lv" => "Sapratu.",
+        "ml" => "മനസ്സിലായി.",
         "mr" => "समजलं.",
+        "ne" => "बुझें।",
         "nl" => "Begrepen.",
         "no" => "Oppfattet.",
         "pl" => "Zrozumiano.",
@@ -174,6 +187,8 @@ mod tests {
         "fr", "he", "hi", "hu", "hy", "id", "is", "it", "ja", "ka", "kk", "ko", "lt", "lv", "mr",
         "nl", "no", "pl", "pt", "ro", "ru", "sk", "sl", "sq", "sr", "sv", "sw", "te", "th", "tr",
         "uk", "ur", "vi", "zh",
+        // Voices Piper has that `lingua` doesn't tell apart (Whisper does)
+        "ku", "lb", "ml", "ne",
     ];
 
     #[test]
@@ -192,7 +207,7 @@ mod tests {
         assert_eq!(ack.text("Copio, lo compruebo.\n"), None);
         // Claude's separator before tools is only whitespace
         assert_eq!(ack.text("\n\n"), None);
-        ack.tools();
+        ack.tools(true);
         assert_eq!(ack.text("Delanteros bien.").as_deref(), Some("Delanteros bien."));
         assert_eq!(ack.end(), None);
         assert_eq!(ack.heard(), Some("Copiado.\nDelanteros bien."));
@@ -208,8 +223,19 @@ mod tests {
             Some("Los delanteros van bien.\nLos traseros")
         );
         assert_eq!(ack.text(" también.").as_deref(), Some(" también."));
-        ack.tools();
+        ack.tools(true);
         assert_eq!(ack.text("Y el resto.").as_deref(), Some("Y el resto."));
+    }
+
+    #[test]
+    fn keeps_an_answer_written_before_a_quiet_tool() {
+        let mut ack = Acknowledgement::new();
+        ack.fire("Copiado.");
+        assert_eq!(ack.text("Delanteros bien.\n"), None);
+        // A `schedule` or `pit` call needs no acknowledgement: what came before it answered
+        assert_eq!(ack.tools(false).as_deref(), Some("Delanteros bien.\n"));
+        assert_eq!(ack.text("Te aviso.").as_deref(), Some("Te aviso."));
+        assert_eq!(ack.heard(), Some("Copiado.\nDelanteros bien.\nTe aviso."));
     }
 
     #[test]
@@ -224,7 +250,7 @@ mod tests {
     #[test]
     fn a_silent_tool_call_keeps_the_timer_and_holds_nothing() {
         let mut ack = Acknowledgement::new();
-        ack.tools();
+        ack.tools(true);
         assert_eq!(ack.fire("Copiado.").as_deref(), Some("Copiado.\n"));
         // Written after a tool result: the answer, never an acknowledgement
         assert_eq!(
@@ -250,7 +276,6 @@ mod tests {
 
     #[test]
     fn has_no_phrase_for_an_unknown_language() {
-        assert_eq!(phrase("lb"), None);
         assert_eq!(phrase("xx"), None);
     }
 }
