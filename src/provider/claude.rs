@@ -443,6 +443,11 @@ impl Conversation {
         // Set for one request at most (see below), and not left over from a turn cut off
         self.body.tool_choice = None;
         for _ in 0..self.max_requests.get() {
+            // What this request takes, to tell what the round it starts adds to the next
+            let sent = match self.history_limits {
+                Some(_) => self.request_size()?,
+                None => 0,
+            };
             let response = self.post(sink).await;
             self.body.tool_choice = None;
             let mut response = response?;
@@ -573,6 +578,7 @@ impl Conversation {
                 .map(|questions| steer_text(&questions));
             // Together, too: the request that carries them back (steer included) must still fit
             let note = self.result_note.clone();
+            let mut last = false;
             if let Some(limits) = self.history_limits {
                 let mut contents = results
                     .iter_mut()
@@ -580,16 +586,31 @@ impl Conversation {
                     .collect::<Vec<_>>();
                 self.body.messages.push(RequestMessage {
                     role: "user",
-                    content: tool_results(&results, steer.as_deref(), note.as_deref())?,
+                    content: tool_results(&results, steer.as_deref(), note.as_deref(), None)?,
                 });
                 let size = self.request_size()?;
                 self.body.messages.pop();
-                // What's left, but for room for one more call
-                let next_call = limits.max_bytes / 50;
-                fit_results(
-                    &mut contents,
-                    limits.max_bytes.saturating_sub(size + next_call),
-                );
+                // Another round like this one (its call, the results' frame, the notes) and a
+                // little data must still fit after these results; if not, this round is the last:
+                // its results take all that's left, and the model answers with what it has
+                // rather than call tools whose results wouldn't fit
+                let room = limits.max_bytes.saturating_sub(size);
+                let round = size.saturating_sub(sent);
+                let wanted: usize = contents.iter().map(|content| json_len(content)).sum();
+                last = wanted + round + limits.max_bytes / 50 > room;
+                if last {
+                    // The note saying so, as a text block (`,{"type":"text","text":"…"}`), and
+                    // `,"tool_choice":{"type":"none"}`
+                    let told = json_len(LAST_ROUND) + 28 + 30;
+                    fit_results(&mut contents, room.saturating_sub(told));
+                    self.body.tool_choice = Some(serde_json::json!({"type": "none"}));
+                }
+                if size > limits.max_bytes {
+                    log::warn!(
+                        "Tool results go back in a request of {size} bytes, over {}",
+                        limits.max_bytes
+                    );
+                }
                 for (result, content) in results.iter_mut().zip(contents) {
                     result.content = content;
                 }
@@ -597,22 +618,13 @@ impl Conversation {
 
             self.body.messages.push(RequestMessage {
                 role: "user",
-                content: tool_results(&results, steer.as_deref(), note.as_deref())?,
+                content: tool_results(
+                    &results,
+                    steer.as_deref(),
+                    note.as_deref(),
+                    last.then_some(LAST_ROUND),
+                )?,
             });
-            if let Some(limits) = self.history_limits {
-                let size = self.request_size()?;
-                if size > limits.max_bytes {
-                    log::warn!(
-                        "Tool results go back in a request of {size} bytes, over {}",
-                        limits.max_bytes
-                    );
-                }
-                // Too little room for another round to bring anything back: the model answers
-                // with what it has, rather than call tools whose results wouldn't fit
-                if limits.max_bytes.saturating_sub(size) < limits.max_bytes / 25 {
-                    self.body.tool_choice = Some(serde_json::json!({"type": "none"}));
-                }
-            }
         }
 
         bail!(
@@ -808,16 +820,22 @@ impl Conversation {
     }
 }
 
-/// The content of the message carrying `results` back, with `steer` (the pilot's new questions)
-/// after them, then `note`: the API takes text in that message once every tool result is in.
+/// What the last round of a turn with no room for more says after its results (see `run_turn`).
+const LAST_ROUND: &str =
+    "[No room for more tool calls in this turn: answer with what you have.]";
+
+/// The content of the message carrying `results` back, with `last` (that it's the turn's last
+/// round) after them, then `steer` (the pilot's new questions), then `note`: the API takes text in
+/// that message once every tool result is in.
 fn tool_results(
     results: &[ResultBody],
     steer: Option<&str>,
     note: Option<&str>,
+    last: Option<&str>,
 ) -> anyhow::Result<serde_json::Value> {
     let mut content = serde_json::to_value(results)?;
     if let Some(blocks) = content.as_array_mut() {
-        for text in [steer, note].into_iter().flatten() {
+        for text in [last, steer, note].into_iter().flatten() {
             blocks.push(serde_json::json!({"type": "text", "text": text}));
         }
     }
@@ -3086,11 +3104,13 @@ mod tests {
         for request in requests.iter() {
             assert!(serde_json::to_vec(request).unwrap().len() <= 20_000);
         }
-        // The results fill what's left, with their data: no room for another round, so the
-        // model answers with what it has, and only for that request
-        let result = &requests[1]["messages"].as_array().unwrap().last().unwrap()["content"][0];
-        assert!(result["content"].as_str().unwrap().starts_with("xxx"));
+        // The results take all that's left, with their data: no room for another round, so the
+        // model is told to answer with what it has, and can't call more, for that request only
+        let results = &requests[1]["messages"].as_array().unwrap().last().unwrap()["content"];
+        assert!(results[0]["content"].as_str().unwrap().starts_with("xxx"));
+        assert_eq!(results[1], json!({"type": "text", "text": LAST_ROUND}));
         assert_eq!(requests[1]["tool_choice"], json!({"type": "none"}));
+        assert!(serde_json::to_vec(&requests[1]).unwrap().len() > 19_000);
         assert!(requests[0].get("tool_choice").is_none());
         assert!(requests[2].get("tool_choice").is_none());
     }
@@ -3896,7 +3916,8 @@ mod tests {
         // The steer is part of the message the results are sized in
         let requests = requests.lock().unwrap();
         let steered = steer_text(&["And how far back is the car behind?".into()]);
-        assert_eq!(requests[1]["messages"][2]["content"][9]["text"], steered);
+        let blocks = requests[1]["messages"][2]["content"].as_array().unwrap();
+        assert!(blocks[9..].iter().any(|block| block["text"] == steered.as_str()));
         assert!(serde_json::to_vec(&requests[1]).unwrap().len() <= 10_000);
     }
 
