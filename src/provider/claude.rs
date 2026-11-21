@@ -528,6 +528,42 @@ impl Conversation {
                 continue;
             }
 
+            // Not even these calls' results cut to nothing would fit (see below): they don't
+            // run, and the request just sent goes again, told there's no room, with no tools. Only
+            // the tail of what was sent changes, so the thinking before it stays valid.
+            if let Some(limits) = self.history_limits {
+                let frames = (calls.iter())
+                    .map(|call| ResultBody {
+                        r#type: "tool_result",
+                        tool_use_id: call["id"].clone(),
+                        content: TRUNCATED.into(),
+                        is_error: false,
+                    })
+                    .collect::<Vec<_>>();
+                self.body.messages.push(RequestMessage {
+                    role: "user",
+                    content: tool_results(&frames, None, None, Some(LAST_ROUND))?,
+                });
+                // With `,"tool_choice":{"type":"none"}`
+                let size = self.request_size()? + 30;
+                self.body.messages.pop();
+                if size > limits.max_bytes {
+                    log::warn!(
+                        "Not running {} tool calls: their results can't fit ({size} bytes, over {})",
+                        calls.len(),
+                        limits.max_bytes
+                    );
+                    self.body.messages.pop();
+                    if let Some(blocks) = (self.body.messages.last_mut())
+                        .and_then(|message| message.content.as_array_mut())
+                    {
+                        blocks.push(serde_json::json!({"type": "text", "text": LAST_ROUND}));
+                    }
+                    self.body.tool_choice = Some(serde_json::json!({"type": "none"}));
+                    continue;
+                }
+            }
+
             // Only once the turn is known to be whole: a `tool_use` cut off at `max_tokens` can
             // still parse, with part of its input missing
             sink.before_tools();
@@ -605,12 +641,6 @@ impl Conversation {
                     fit_results(&mut contents, room.saturating_sub(told));
                     self.body.tool_choice = Some(serde_json::json!({"type": "none"}));
                 }
-                if size > limits.max_bytes {
-                    log::warn!(
-                        "Tool results go back in a request of {size} bytes, over {}",
-                        limits.max_bytes
-                    );
-                }
                 for (result, content) in results.iter_mut().zip(contents) {
                     result.content = content;
                 }
@@ -625,6 +655,15 @@ impl Conversation {
                     last.then_some(LAST_ROUND),
                 )?,
             });
+            if let Some(limits) = self.history_limits {
+                let size = self.request_size()?;
+                if size > limits.max_bytes {
+                    log::warn!(
+                        "Tool results go back in a request of {size} bytes, over {}",
+                        limits.max_bytes
+                    );
+                }
+            }
         }
 
         bail!(
@@ -821,8 +860,9 @@ impl Conversation {
 }
 
 /// What the last round of a turn with no room for more says after its results (see `run_turn`).
-const LAST_ROUND: &str =
-    "[No room for more tool calls in this turn: answer with what you have.]";
+const LAST_ROUND: &str = "[No room for more tool calls in this turn: answer with what you have. \
+     Nothing more was looked up, changed or scheduled, so don't say it was: offer to do it if the \
+     pilot asks again.]";
 
 /// The content of the message carrying `results` back, with `last` (that it's the turn's last
 /// round) after them, then `steer` (the pilot's new questions), then `note`: the API takes text in
@@ -3053,6 +3093,55 @@ mod tests {
                 assert!(result["content"].as_str().unwrap().starts_with("xxx"), "{index}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn calls_with_no_room_for_their_results_are_not_run() {
+        let (url, requests) = mock(vec![
+            message(
+                "tool_use",
+                Value::Array(
+                    (0..8)
+                        .map(|i| json!({"type": "tool_use", "id": format!("call{i}"),
+                            "name": "lookup", "input": {"what": "q".repeat(500)}}))
+                        .collect(),
+                ),
+            ),
+            message("end_turn", json!([{"type": "text", "text": "Answer"}])),
+        ])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = ConversationBuilder::new();
+        builder
+            .api_key("test")
+            .base_url(&url)
+            .system("y".repeat(16_000))
+            .tool("lookup", None, json!({"type": "object"}), Lookup(calls.clone()))
+            .history_limits(HistoryLimits {
+                max_bytes: 20_000,
+                max_messages: 100,
+                target: 0.5,
+            });
+        let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+        assert_eq!(send(&mut conversation, "Gap?").await.unwrap().text, "Answer");
+        // Not even their results' frames would fit: the calls don't run, and the request goes
+        // again, told there's no room, with no tools
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert!(serde_json::to_vec(request).unwrap().len() <= 20_000);
+        }
+        let messages = requests[1]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0]["content"].as_array().unwrap().last().unwrap(),
+            &json!({"type": "text", "text": LAST_ROUND})
+        );
+        assert_eq!(requests[1]["tool_choice"], json!({"type": "none"}));
+        assert!(requests[0].get("tool_choice").is_none());
+        // What's kept: the question and the answer, not the calls that never ran
+        assert_eq!(conversation.body.messages.len(), 2);
     }
 
     #[tokio::test]
