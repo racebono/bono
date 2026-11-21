@@ -42,6 +42,7 @@ use tokio::{
 use pit::PitTool;
 use tool::{ConditionId, Engineer as EngineerTool, Progress, SKILL, instructions};
 
+mod acknowledgement;
 mod pit;
 mod schedule;
 mod timeline;
@@ -360,6 +361,14 @@ pub struct Playback {
 /// plays in its gap. The speaker may still be playing what SDL has taken from the stream (its
 /// queued bytes count only what SDL hasn't), and a short pause sounds natural on the radio.
 const GAP_AFTER: Duration = Duration::from_millis(300);
+
+/// How long after the pilot asked the app says a short acknowledgement, if the model hasn't
+/// written anything yet (see [`acknowledgement`])
+pub const ACKNOWLEDGE_AFTER: Duration = Duration::from_secs(2);
+
+/// How much earlier than that the acknowledgement is pushed to speech: about how long it takes
+/// to synthesize, so the pilot hears it at about [`ACKNOWLEDGE_AFTER`]
+const ACKNOWLEDGE_LEAD: Duration = Duration::from_millis(250);
 
 /// How far behind where it was interrupted an answer resumes, in seconds.
 const RESUME_BEHIND: f32 = 0.4;
