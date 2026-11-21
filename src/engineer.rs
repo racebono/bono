@@ -1502,10 +1502,6 @@ impl Engineer {
         let steer = Steer::default();
         let slot = steer.clone();
         let task = Task::spawn(async move {
-            let mut state = state.lock().await;
-            // Once per turn, steers included: its changes apply together, or not at all
-            let question = state.brief(question, briefing).await;
-            state.conversation.set_steer(Some(slot));
             // Shared by the model's text and the timer, never locked across an await
             let acknowledgement = std::sync::Mutex::new(Acknowledgement::new());
             let say = |text: Option<String>| {
@@ -1536,39 +1532,41 @@ impl Engineer {
                 };
                 say(text);
             };
-            let mut turn = state.conversation.send_streaming(question, &mut on_event);
-            // The turn's reply, unless the timer fires first
-            let early = match phrase {
-                Some(phrase) => tokio::select! {
-                    reply = &mut turn => Some(reply),
-                    () = tokio::time::sleep_until(acknowledge_at) => {
-                        let text = acknowledgement.lock().unwrap().fire(phrase);
-                        if text.is_some() {
-                            timeline.acknowledged();
-                        }
-                        say(text);
-                        None
-                    }
-                },
-                None => None,
-            };
-            let reply = match early {
-                Some(reply) => {
-                    drop(turn);
-                    reply
+            let turn = async {
+                let mut state = state.lock().await;
+                // Once per turn, steers included: its changes apply together, or not at all
+                let question = state.brief(question, briefing).await;
+                state.conversation.set_steer(Some(slot));
+                let reply = state.conversation.send_streaming(question, &mut on_event).await;
+                if reply.is_ok() {
+                    timeline.answered();
                 }
-                None => turn.await,
+                state.keep_outline(&reply);
+                let changes = state.schedule_tool.take();
+                reply.map(|reply| (reply, changes))
+            };
+            // From the start, the conversation's wait and the briefing included: the pilot is
+            // waiting through them too. It never ends, so the turn does
+            let acknowledge = async {
+                if let Some(phrase) = phrase {
+                    tokio::time::sleep_until(acknowledge_at).await;
+                    let text = acknowledgement.lock().unwrap().fire(phrase);
+                    if text.is_some() {
+                        timeline.acknowledged();
+                    }
+                    say(text);
+                }
+                std::future::pending::<()>().await
+            };
+            let result = tokio::select! {
+                result = turn => result,
+                () = acknowledge => unreachable!("never ends"),
             };
             let end = acknowledgement.lock().unwrap().end();
             say(end);
             // For the chat, which shows what the pilot heard
             let heard = (acknowledgement.lock().unwrap().heard()).map(str::to_owned);
-            if reply.is_ok() {
-                timeline.answered();
-            }
-            state.keep_outline(&reply);
-            let changes = state.schedule_tool.take();
-            reply.map(|reply| (reply, changes, heard))
+            result.map(|(reply, changes)| (reply, changes, heard))
             // The speech's text ends here, with the turn
         });
 
@@ -5851,6 +5849,21 @@ mod tests {
         let mut scripted = acknowledging();
         scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
         until_acknowledged(&mut scripted);
+        scripted.acts.send(Act::Write("Delanteros bien.")).unwrap();
+        scripted.finish(Act::End(StopReason::EndTurn, "Delanteros bien."));
+        assert_eq!(scripted.answer().unwrap().text, "Copiado.\nDelanteros bien.");
+    }
+
+    #[test]
+    fn acknowledges_while_the_question_waits_its_turn() {
+        let mut scripted = acknowledging();
+        let state = scripted.engineer.session.as_ref().unwrap().state.clone();
+        // The conversation is busy: the question can't be briefed, let alone asked
+        let busy = scripted.runtime.block_on(state.lock_owned());
+        scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
+        until_acknowledged(&mut scripted);
+        assert!(scripted.questions().is_empty());
+        drop(busy);
         scripted.acts.send(Act::Write("Delanteros bien.")).unwrap();
         scripted.finish(Act::End(StopReason::EndTurn, "Delanteros bien."));
         assert_eq!(scripted.answer().unwrap().text, "Copiado.\nDelanteros bien.");
