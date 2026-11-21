@@ -678,7 +678,6 @@ impl Engineer {
         }
     }
 
-    /// The wall clock the schedule goes by.
     /// Whether the app acknowledges a slow answer: always, unless a test says.
     fn acknowledges(&self) -> bool {
         #[cfg(test)]
@@ -687,6 +686,7 @@ impl Engineer {
         true
     }
 
+    /// The wall clock the schedule goes by.
     fn now(&self) -> Instant {
         #[cfg(test)]
         if let Some(clock) = self.clock {
@@ -1559,6 +1559,9 @@ impl Engineer {
                 std::future::pending::<()>().await
             };
             let result = tokio::select! {
+                // A turn that ends at once (a request refused before anything was sent) ends
+                // unacknowledged, every time
+                biased;
                 result = turn => result,
                 () = acknowledge => unreachable!("never ends"),
             };
@@ -1876,6 +1879,9 @@ impl Engineer {
     ) {
         log_reply(&reply);
         let mut detail = tokens_detail(&reply);
+        // What the pilot heard after the app's acknowledgement, if it acknowledged
+        let heard_after = (heard.as_deref())
+            .map(|heard| heard.split_once('\n').map_or("", |(_, after)| after).to_owned());
         // The model's text, unless the pilot heard something else
         let shown = heard.unwrap_or_else(|| reply.text.clone());
 
@@ -1905,8 +1911,13 @@ impl Engineer {
                 shown
             }
             StopReason::EndTurn | StopReason::StopSequence => {
-                // Nothing answered, even after the app's acknowledgement
-                if reply.text.trim().is_empty() {
+                // Nothing answered: the pilot heard nothing after the app's acknowledgement (its
+                // phrase is one line), or the model wrote nothing
+                let answered = match &heard_after {
+                    Some(after) => !after.trim().is_empty(),
+                    None => !reply.text.trim().is_empty(),
+                };
+                if !answered {
                     self.no_beep();
                 }
                 shown
@@ -3498,6 +3509,9 @@ mod tests {
             (StopReason::EndTurn, "", None, true),
             // The app acknowledged, and the model said nothing after it
             (StopReason::EndTurn, "", Some("Copiado.\n"), true),
+            // Nor after its own acknowledgement, dropped
+            (StopReason::EndTurn, "Copio, miro.\n\n", Some("Copiado.\n"), true),
+            (StopReason::EndTurn, "Copio.\n\nBien.", Some("Copiado.\nBien."), false),
             (StopReason::EndTurn, "Complete answer", None, false),
             (StopReason::StopSequence, "Complete answer", None, false),
         ] {
