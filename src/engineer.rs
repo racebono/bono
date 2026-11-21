@@ -5900,8 +5900,11 @@ mod tests {
     #[test]
     fn acknowledges_a_slow_answer() {
         let mut scripted = acknowledging();
+        let heard = Instant::now();
         scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
         until_acknowledged(&mut scripted);
+        // Counted from the release, already a threshold ago
+        assert!(heard.elapsed() < ACKNOWLEDGE_AFTER / 2, "{:?}", heard.elapsed());
         scripted.acts.send(Act::Write("Delanteros bien.")).unwrap();
         scripted.finish(Act::End(StopReason::EndTurn, "Delanteros bien."));
         assert_eq!(scripted.answer().unwrap().text, "Copiado.\nDelanteros bien.");
