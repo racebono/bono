@@ -55,22 +55,33 @@ pub async fn models(
     }
 }
 
+/// What a turn hands out as it runs (see [`Model::send_streaming`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Streamed<'a> {
+    /// More of the reply's text
+    Text(&'a str),
+    /// The model's client tools are about to run: everything it wrote before them was handed out
+    Tools,
+}
+
 /// A conversation with a language model.
 pub trait Model: Send {
     /// Sends the user's message and runs the model's turn to its end, tool calls included, with
-    /// the reply's text handed to `on_text` as the model writes it: put together, the pieces are
-    /// [`Reply::text`]. Text already handed over stays said, even if the turn then fails, or ends
-    /// in a refusal. On an error, or if the returned future is dropped before it finishes, the
-    /// conversation is left as it was before the call.
+    /// the reply's text handed to `on_event` as the model writes it: put together, the
+    /// [`Streamed::Text`] pieces are [`Reply::text`]. [`Streamed::Tools`] comes once before each
+    /// response's client tools run, after all of that response's text. Text already handed over
+    /// stays said, even if the turn then fails, or ends in a refusal. On an error, or if the
+    /// returned future is dropped before it finishes, the conversation is left as it was before
+    /// the call.
     fn send_streaming<'a>(
         &'a mut self,
         text: String,
-        on_text: &'a mut (dyn FnMut(&str) + Send),
+        on_event: &'a mut (dyn FnMut(Streamed<'_>) + Send),
     ) -> BoxFuture<'a, anyhow::Result<Reply>>;
 
     /// Like [`Self::send_streaming`], without the text as it comes.
     fn send(&mut self, text: String) -> BoxFuture<'_, anyhow::Result<Reply>> {
-        Box::pin(async move { self.send_streaming(text, &mut |_: &str| {}).await })
+        Box::pin(async move { self.send_streaming(text, &mut |_: Streamed<'_>| {}).await })
     }
 
     /// Starts the conversation over, e.g. for a new session: forgets every message. The settings

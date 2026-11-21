@@ -1,8 +1,10 @@
+use super::Streamed;
+
 /// Puts a turn's text together and hands it out as it comes: blocks of text (e.g. what the model
 /// wrote before and after its tool calls) are separated by blank lines, without the whitespace
 /// they start with, and those with nothing to say are left out.
 pub(super) struct TextSink<'a> {
-    on_text: &'a mut (dyn FnMut(&str) + Send),
+    on_event: &'a mut (dyn FnMut(Streamed<'_>) + Send),
     /// Everything handed out
     pub text: String,
     /// Whitespace the current block started with, held until the block says something (and only
@@ -15,9 +17,9 @@ pub(super) struct TextSink<'a> {
 }
 
 impl<'a> TextSink<'a> {
-    pub fn new(on_text: &'a mut (dyn FnMut(&str) + Send)) -> Self {
+    pub fn new(on_event: &'a mut (dyn FnMut(Streamed<'_>) + Send)) -> Self {
         Self {
-            on_text,
+            on_event,
             text: String::new(),
             pending: String::new(),
             started: false,
@@ -68,20 +70,55 @@ impl<'a> TextSink<'a> {
     }
 
     /// Flush spoken text before waiting for client tools, even when the model omitted
-    /// trailing whitespace. Do not wait until the next response to emit its separator.
+    /// trailing whitespace. Do not wait until the next response to emit its separator. Then tells
+    /// the tools are next.
     pub fn before_tools(&mut self) {
         self.end_block();
         if !self.text.is_empty() && !self.text.ends_with("\n\n") {
             self.emit("\n\n");
         }
+        (self.on_event)(Streamed::Tools);
     }
 
     fn emit(&mut self, text: &str) {
         if !text.is_empty() {
             self.text.push_str(text);
-            (self.on_text)(text);
+            (self.on_event)(Streamed::Text(text));
         }
     }
+}
+
+/// Runs `conversation`'s turn for `text`, keeping what it hands out: a piece of text, or `None`
+/// where it told its tools were next.
+#[cfg(test)]
+pub(super) async fn send_streaming_events(
+    conversation: &mut dyn super::Model,
+    text: &str,
+) -> (anyhow::Result<super::Reply>, Vec<Option<String>>) {
+    let mut events = Vec::new();
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        conversation.send_streaming(text.into(), &mut |event| {
+            events.push(match event {
+                Streamed::Text(piece) => Some(piece.to_owned()),
+                Streamed::Tools => None,
+            })
+        }),
+    )
+    .await
+    .expect("timed out");
+    (reply, events)
+}
+
+/// The text handed out before and after the one time `events` (see [`send_streaming_events`])
+/// told the tools were next.
+#[cfg(test)]
+pub(super) fn around_tools(events: &[Option<String>]) -> (String, String) {
+    let tools = events.iter().filter(|event| event.is_none()).count();
+    assert_eq!(tools, 1, "{events:?}");
+    let at = events.iter().position(Option::is_none).unwrap();
+    let text = |events: &[Option<String>]| events.iter().flatten().cloned().collect::<String>();
+    (text(&events[..at]), text(&events[at + 1..]))
 }
 
 #[cfg(test)]
@@ -91,7 +128,11 @@ mod tests {
     #[test]
     fn flushes_acknowledgement_before_tools_without_duplicate_separator() {
         let mut pieces = Vec::new();
-        let mut callback = |text: &str| pieces.push(text.to_owned());
+        let mut callback = |event: Streamed<'_>| {
+            if let Streamed::Text(text) = event {
+                pieces.push(text.to_owned());
+            }
+        };
         let mut sink = TextSink::new(&mut callback);
         sink.push("Copy, checking.");
         sink.end_block();
@@ -106,9 +147,40 @@ mod tests {
     }
 
     #[test]
+    fn tells_tools_are_next_after_the_text_before_them() {
+        let mut events = Vec::new();
+        let mut callback = |event: Streamed<'_>| {
+            events.push(match event {
+                Streamed::Text(text) => format!("text:{text}"),
+                Streamed::Tools => "tools".to_owned(),
+            })
+        };
+        let mut sink = TextSink::new(&mut callback);
+        sink.push("Copy, checking.");
+        sink.end_block();
+        sink.before_tools();
+        sink.start_response();
+        sink.push("The hairpin on entry.");
+        drop(sink);
+        assert_eq!(
+            events,
+            [
+                "text:Copy, checking.",
+                "text:\n\n",
+                "tools",
+                "text:The hairpin on entry."
+            ]
+        );
+    }
+
+    #[test]
     fn silent_tools_add_no_spoken_preamble() {
         let mut pieces = Vec::new();
-        let mut callback = |text: &str| pieces.push(text.to_owned());
+        let mut callback = |event: Streamed<'_>| {
+            if let Streamed::Text(text) = event {
+                pieces.push(text.to_owned());
+            }
+        };
         let mut sink = TextSink::new(&mut callback);
         sink.before_tools();
         sink.start_response();

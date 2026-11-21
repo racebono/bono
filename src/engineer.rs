@@ -8,7 +8,7 @@ use crate::{
     config::{ArrayStr, Config, ModelConfig, ModelProvider},
     language::{self, LanguageDetector},
     provider::{
-        self, Model, Reply, Steer, StopReason, Tools,
+        self, Model, Reply, Steer, StopReason, Streamed, Tools,
         bono_cloud::{GameSession, Lease},
     },
     sim::{
@@ -1446,7 +1446,10 @@ impl Engineer {
             // Once per turn, steers included: its changes apply together, or not at all
             let question = state.brief(question, briefing).await;
             state.conversation.set_steer(Some(slot));
-            let mut on_text = |text: &str| {
+            let mut on_text = |event: Streamed<'_>| {
+                let Streamed::Text(text) = event else {
+                    return;
+                };
                 timeline.first_text();
                 if let Some(speech) = &speech {
                     speech.push(text);
@@ -3517,7 +3520,7 @@ mod tests {
         fn send_streaming<'a>(
             &'a mut self,
             _: String,
-            _: &'a mut (dyn FnMut(&str) + Send),
+            _: &'a mut (dyn FnMut(Streamed<'_>) + Send),
         ) -> futures::future::BoxFuture<'a, anyhow::Result<Reply>> {
             unimplemented!()
         }
@@ -3711,7 +3714,7 @@ mod tests {
         fn send_streaming<'a>(
             &'a mut self,
             text: String,
-            _: &'a mut (dyn FnMut(&str) + Send),
+            _: &'a mut (dyn FnMut(Streamed<'_>) + Send),
         ) -> futures::future::BoxFuture<'a, anyhow::Result<Reply>> {
             self.asked.lock().unwrap().questions.push(text);
             Box::pin(async move {
