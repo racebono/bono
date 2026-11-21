@@ -1016,10 +1016,13 @@ const SNAPSHOT_LINE: &str = "\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\n";
 /// the breakpoint so it's never written to the cache, and dropped once the next question comes.
 fn question_message(text: &str) -> RequestMessage {
     let breakpoint = serde_json::json!({"type": "ephemeral"});
+    // The blank line before the snapshot goes with it, so the two never run together, however
+    // the API joins text blocks
     let split = text
         .find(SNAPSHOT_LINE)
-        .map(|at| (text[..at].trim_end(), &text[at + 1..]))
-        .filter(|(kept, _)| !kept.is_empty());
+        .map(|at| text[..at].trim_end())
+        .filter(|kept| !kept.is_empty())
+        .map(|kept| (kept, &text[kept.len()..]));
     let content = match split {
         Some((kept, resent)) => serde_json::json!([
             {"type": "text", "text": kept, "cache_control": breakpoint},
@@ -2569,10 +2572,18 @@ mod tests {
                 .ends_with("[END UNTRUSTED SETUP OUTLINE]")
         );
         assert_eq!(blocks[0]["cache_control"], json!({"type": "ephemeral"}));
+        // The blank line before the snapshot stays, in its block: however the API joins text
+        // blocks, the pilot's words and the marker never run together
         assert_eq!(
             blocks[1],
-            json!({"type": "text", "text": "[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\nLap 2\n[END UNTRUSTED TELEMETRY SNAPSHOT]"})
+            json!({"type": "text", "text": "\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\nLap 2\n[END UNTRUSTED TELEMETRY SNAPSHOT]"})
         );
+        let joined = format!(
+            "{}{}",
+            blocks[0]["text"].as_str().unwrap(),
+            blocks[1]["text"].as_str().unwrap()
+        );
+        assert!(joined.ends_with("[END UNTRUSTED SETUP OUTLINE]\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\nLap 2\n[END UNTRUSTED TELEMETRY SNAPSHOT]"));
     }
 
     #[test]
