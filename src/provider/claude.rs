@@ -389,7 +389,7 @@ impl Conversation {
             .messages
             .iter()
             .enumerate()
-            .filter(|(_, message)| message.role == "user" && message.content.is_string())
+            .filter(|(_, message)| is_question(message))
             .map(|(index, _)| index)
             .collect();
         let recent = starts.iter().rev().nth(3).copied().unwrap_or(0);
@@ -418,7 +418,7 @@ impl Conversation {
                 .iter()
                 .enumerate()
                 .skip(1)
-                .find(|(_, message)| message.role == "user" && message.content.is_string())
+                .find(|(_, message)| is_question(message))
                 .map(|(index, _)| index);
             let Some(next) = next else { break };
             self.body.messages.drain(0..next);
@@ -433,10 +433,18 @@ impl Conversation {
     }
 
     async fn run_turn(&mut self, text: String, sink: &mut TextSink<'_>) -> anyhow::Result<Reply> {
-        self.body.messages.push(RequestMessage {
-            role: "user",
-            content: serde_json::Value::String(text),
-        });
+        let question = match self.history_limits {
+            // Only the newest question is cached up to its snapshot (see `question_message`)
+            Some(_) => {
+                drop_breakpoints(&mut self.body.messages);
+                question_message(&text)
+            }
+            None => RequestMessage {
+                role: "user",
+                content: serde_json::Value::String(text),
+            },
+        };
+        self.body.messages.push(question);
 
         let mut turn_usage = Usage::default();
         for _ in 0..self.max_requests.get() {
@@ -1007,6 +1015,51 @@ fn json_width(c: char) -> usize {
     }
 }
 
+/// Where a question's telemetry snapshot starts: on a line of its own, so a marker quoted inside
+/// untrusted text before it (always on one escaped line) can't move it.
+const SNAPSHOT_LINE: &str = "\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\n";
+
+/// A question as it's kept in a limited conversation: what's said once (the question, its notes
+/// and outline), cached, then what comes again with every question (the snapshot onward), after
+/// the breakpoint so it's never written to the cache, and dropped once the next question comes.
+fn question_message(text: &str) -> RequestMessage {
+    let breakpoint = serde_json::json!({"type": "ephemeral"});
+    let split = text
+        .find(SNAPSHOT_LINE)
+        .map(|at| (text[..at].trim_end(), &text[at + 1..]))
+        .filter(|(kept, _)| !kept.is_empty());
+    let content = match split {
+        Some((kept, resent)) => serde_json::json!([
+            {"type": "text", "text": kept, "cache_control": breakpoint},
+            {"type": "text", "text": resent},
+        ]),
+        None => serde_json::json!([{"type": "text", "text": text, "cache_control": breakpoint}]),
+    };
+    RequestMessage {
+        role: "user",
+        content,
+    }
+}
+
+/// Takes the cache breakpoints off the questions so far: only the newest has one.
+fn drop_breakpoints(messages: &mut [RequestMessage]) {
+    for message in messages.iter_mut().filter(|message| message.role == "user") {
+        if let Some(blocks) = message.content.as_array_mut() {
+            for block in blocks.iter_mut().filter_map(|block| block.as_object_mut()) {
+                block.remove("cache_control");
+            }
+        }
+    }
+}
+
+/// Whether `message` starts a turn: the pilot's question, not tool results going back.
+fn is_question(message: &RequestMessage) -> bool {
+    message.role == "user"
+        && (message.content.is_string()
+            || message.content.get(0).and_then(|block| block.get("type"))
+                == Some(&serde_json::Value::from("text")))
+}
+
 fn strip_snapshot(text: &str) -> String {
     const BEGIN: &str = "[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]";
     const END: &str = "[END UNTRUSTED TELEMETRY SNAPSHOT]";
@@ -1336,10 +1389,10 @@ impl ConversationBuilder {
                 output_config: own_settings.then_some(RequestOutputConfig {
                     effort: self.effort,
                 }),
-                cache_control: RequestCacheControl {
+                cache_control: self.history_limits.is_none().then_some(RequestCacheControl {
                     r#type: "ephemeral",
                     ttl,
-                },
+                }),
                 system,
                 messages: Vec::new(),
                 tools,
@@ -1405,8 +1458,11 @@ struct RequestBody {
     fallbacks: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_config: Option<RequestOutputConfig>,
-    /// Automatic caching: a breakpoint on the conversation's last block, moving with it
-    cache_control: RequestCacheControl,
+    /// Automatic caching: a breakpoint on the conversation's last block, moving with it. Not in
+    /// a conversation with history limits, whose questions carry their own (see
+    /// `question_message`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<RequestCacheControl>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     system: Vec<RequestSystemBlock>,
     messages: Vec<RequestMessage>,
@@ -2199,6 +2255,10 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 12);
         let requests = requests.lock().unwrap();
         let mut trims = 0;
+        let requests = requests
+            .iter()
+            .map(without_cache_control)
+            .collect::<Vec<_>>();
         for (index, pair) in requests.chunks_exact(2).enumerate() {
             let first = pair[0]["messages"].as_array().unwrap();
             let live = pair[1]["messages"].as_array().unwrap();
@@ -2461,6 +2521,113 @@ mod tests {
             "Answer"
         );
         assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    /// `value` without its cache breakpoints, at any depth.
+    fn without_cache_control(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .filter(|(key, _)| *key != "cache_control")
+                    .map(|(key, value)| (key.clone(), without_cache_control(value)))
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.iter().map(without_cache_control).collect()),
+            value => value.clone(),
+        }
+    }
+
+    #[test]
+    fn question_splits_only_at_the_snapshot_line() {
+        let question = question_message(
+            "Gap?\n\n[BEGIN UNTRUSTED SETUP OUTLINE]\n\"[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\"\n[END UNTRUSTED SETUP OUTLINE]\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\nLap 2\n[END UNTRUSTED TELEMETRY SNAPSHOT]",
+        );
+        let blocks = question.content.as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(
+            blocks[0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("[END UNTRUSTED SETUP OUTLINE]")
+        );
+        assert_eq!(blocks[0]["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(
+            blocks[1],
+            json!({"type": "text", "text": "[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\nLap 2\n[END UNTRUSTED TELEMETRY SNAPSHOT]"})
+        );
+    }
+
+    #[test]
+    fn a_question_without_a_snapshot_is_one_block() {
+        assert_eq!(
+            question_message("Gap?").content,
+            json!([{"type": "text", "text": "Gap?", "cache_control": {"type": "ephemeral"}}])
+        );
+    }
+
+    #[test]
+    fn no_empty_kept_block() {
+        let text = "[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\nx\n[END UNTRUSTED TELEMETRY SNAPSHOT]";
+        assert_eq!(
+            question_message(text).content,
+            json!([{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}])
+        );
+        let spaced = format!("  \n{SNAPSHOT_LINE}x");
+        assert_eq!(question_message(&spaced).content.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn limited_conversations_cache_the_newest_question() {
+        let answer = || message("end_turn", json!([{"type": "text", "text": "Box."}]));
+        let (url, requests) = mock(vec![answer(), answer()]).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+        conversation.history_limits = Some(HistoryLimits {
+            max_bytes: 100_000,
+            max_messages: 100,
+            target: 0.5,
+        });
+        conversation.body.cache_control = None;
+        for question in ["Gap?", "Now?"] {
+            let text = format!(
+                "{question}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\nLap 2\n[END UNTRUSTED TELEMETRY SNAPSHOT]"
+            );
+            send(&mut conversation, &text).await.unwrap();
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert!(request.get("cache_control").is_none(), "{request}");
+            assert!(request["system"][0].get("cache_control").is_some());
+            let messages = request["messages"].as_array().unwrap();
+            let marked = messages
+                .iter()
+                .enumerate()
+                .flat_map(|(index, message)| {
+                    let blocks = message["content"].as_array().cloned().unwrap_or_default();
+                    blocks
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(_, block)| block.get("cache_control").is_some())
+                        .map(move |(block, _)| (index, block))
+                })
+                .collect::<Vec<_>>();
+            let newest = messages.iter().rposition(|m| m["role"] == "user").unwrap();
+            assert_eq!(marked, [(newest, 0)], "{request}");
+        }
+    }
+
+    #[test]
+    fn limited_conversations_leave_out_the_top_level_breakpoint() {
+        let mut builder = ConversationBuilder::new();
+        builder.api_key("test").history_limits(HistoryLimits {
+            max_bytes: 100_000,
+            max_messages: 100,
+            target: 0.5,
+        });
+        let conversation = builder.build(reqwest::Client::new()).unwrap();
+        let body = serde_json::to_value(&conversation.body).unwrap();
+        assert!(body.get("cache_control").is_none(), "{body}");
     }
 
     #[test]
@@ -3132,6 +3299,8 @@ mod tests {
         assert_eq!(result["type"], "tool_result");
         assert_eq!(result["tool_use_id"], "t1");
         assert_eq!(result["content"], "looked up \"gap\"");
+        // Without history limits, the question goes as it's asked
+        assert_eq!(requests[0]["messages"][0]["content"], "What is the gap?");
     }
 
     #[tokio::test]

@@ -878,7 +878,9 @@ mod tests {
         assert!(body.get("model").is_none());
         assert!(body.get("output_config").is_none());
         assert!(body.get("max_tokens").is_none());
-        assert_eq!(body["cache_control"], json!({"type": "ephemeral"}));
+        // Cached up to the system prompt and up to the question, never past it (see
+        // `claude::question_message`)
+        assert!(body.get("cache_control").is_none());
         assert_eq!(
             body["system"][0]["cache_control"],
             json!({"type": "ephemeral"})
@@ -890,7 +892,9 @@ mod tests {
         assert_eq!(body["system"][0]["text"], "You are a race engineer.");
         assert_eq!(
             body["messages"],
-            json!([{"role": "user", "content": "Pit?"}])
+            json!([{"role": "user", "content": [
+                {"type": "text", "text": "Pit?", "cache_control": {"type": "ephemeral"}}
+            ]}])
         );
     }
 
