@@ -1917,8 +1917,11 @@ impl Engineer {
                     Some(after) => !after.trim().is_empty(),
                     None => !reply.text.trim().is_empty(),
                 };
-                if !answered {
-                    self.no_beep();
+                match (answered, &heard_after) {
+                    (true, _) => {}
+                    // After the acknowledgement, which may still be on its way
+                    (false, Some(_)) => self.incomplete_beep(),
+                    (false, None) => self.no_beep(),
                 }
                 shown
             }
@@ -3488,6 +3491,42 @@ mod tests {
             engineer.play(&config, None);
             assert!(!engineer.is_speaking(), "tone must only play once");
         }
+    }
+
+    #[test]
+    fn the_no_answer_tone_follows_the_acknowledgement() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let rt = runtime.handle();
+        let dir = tempfile::tempdir().unwrap();
+        let config = rt
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let mut synth = Synthesizer::new(rt, &config.get());
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        // "Copiado." is still being synthesized when the turn ends with nothing after it
+        let (_send, answer) = being_written();
+        engineer.incoming.push(answer);
+        let (_, text) = mpsc::unbounded_channel();
+        let turn = Turn {
+            task: Task::spawn(std::future::pending()),
+            lang: arrstr!("es"),
+            text,
+            entry: None,
+            steer: Steer::default(),
+            steered: None,
+            told: Told::default(),
+        };
+        let reply = Reply {
+            text: String::new(),
+            stop: StopReason::EndTurn,
+            usage: Default::default(),
+            model: "test".into(),
+        };
+        engineer.answer(rt, &config, &mut synth, reply, Some("Copiado.\n".into()), turn);
+        // After it, not ahead of it
+        assert_eq!(engineer.incoming.len(), 1);
+        assert!(engineer.incoming[0].tone_after_drain);
     }
 
     #[test]
