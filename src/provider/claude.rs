@@ -881,7 +881,7 @@ impl Conversation {
 const LAST_ROUND: &str = "[No room for more tool calls in this turn: answer now with what you \
      have, without acknowledging again. Nothing beyond what's above was looked up, changed or \
      scheduled, so don't say it was. If something asked for or due can't be done now, say so \
-     briefly instead of staying silent.]";
+     briefly, and that it needs asking again, instead of staying silent.]";
 
 /// The content of the message carrying `results` back, with `last` (that it's the turn's last
 /// round) after them, then `steer` (the pilot's new questions), then `note`: the API takes text in
@@ -1184,10 +1184,13 @@ fn strip_turns(messages: &mut [RequestMessage]) -> Option<usize> {
                 changed = true;
             }
         }
-        // That a round was its turn's last says nothing about later turns
-        let before = blocks.len();
-        blocks.retain(|block| block["text"] != LAST_ROUND);
-        changed |= blocks.len() != before;
+        // That a round was its turn's last says nothing about later turns (a question's copy
+        // went with its second block; its first, the pilot's, is never touched)
+        if !question {
+            let before = blocks.len();
+            blocks.retain(|block| block["text"] != LAST_ROUND);
+            changed |= blocks.len() != before;
+        }
         if changed {
             first.get_or_insert(index);
         }
@@ -2841,6 +2844,16 @@ mod tests {
         let stripped = serde_json::to_value(&messages).unwrap();
         assert_eq!(strip_turns(&mut messages), None);
         assert_eq!(serde_json::to_value(&messages).unwrap(), stripped);
+    }
+
+    #[test]
+    fn a_question_is_never_stripped_to_nothing() {
+        // Whatever the pilot typed stays, even the last round's note word for word
+        let mut messages = vec![question_message(LAST_ROUND)];
+        drop_breakpoints(&mut messages);
+        let original = serde_json::to_value(&messages).unwrap();
+        assert_eq!(strip_turns(&mut messages), None);
+        assert_eq!(serde_json::to_value(&messages).unwrap(), original);
     }
 
     #[test]
