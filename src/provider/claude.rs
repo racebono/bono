@@ -440,8 +440,12 @@ impl Conversation {
         self.body.messages.push(question);
 
         let mut turn_usage = Usage::default();
+        // Set for one request at most (see below), and not left over from a turn cut off
+        self.body.tool_choice = None;
         for _ in 0..self.max_requests.get() {
-            let mut response = self.post(sink).await?;
+            let response = self.post(sink).await;
+            self.body.tool_choice = None;
+            let mut response = response?;
             if let Some(container_id) = response.container.and_then(|c| c.id) {
                 self.body.container.get_or_insert_default().id = Some(container_id);
             }
@@ -580,18 +584,12 @@ impl Conversation {
                 });
                 let size = self.request_size()?;
                 self.body.messages.pop();
-                // Not all of what's left: the next round's call and its results go on top
-                let next_round = limits.max_bytes / 20;
+                // What's left, but for room for one more call
+                let next_call = limits.max_bytes / 50;
                 fit_results(
                     &mut contents,
-                    limits.max_bytes.saturating_sub(size + next_round),
+                    limits.max_bytes.saturating_sub(size + next_call),
                 );
-                if size > limits.max_bytes {
-                    log::warn!(
-                        "Tool results go back in a request of {size} bytes, over {}",
-                        limits.max_bytes
-                    );
-                }
                 for (result, content) in results.iter_mut().zip(contents) {
                     result.content = content;
                 }
@@ -601,6 +599,20 @@ impl Conversation {
                 role: "user",
                 content: tool_results(&results, steer.as_deref(), note.as_deref())?,
             });
+            if let Some(limits) = self.history_limits {
+                let size = self.request_size()?;
+                if size > limits.max_bytes {
+                    log::warn!(
+                        "Tool results go back in a request of {size} bytes, over {}",
+                        limits.max_bytes
+                    );
+                }
+                // Too little room for another round to bring anything back: the model answers
+                // with what it has, rather than call tools whose results wouldn't fit
+                if limits.max_bytes.saturating_sub(size) < limits.max_bytes / 25 {
+                    self.body.tool_choice = Some(serde_json::json!({"type": "none"}));
+                }
+            }
         }
 
         bail!(
@@ -1423,6 +1435,7 @@ impl ConversationBuilder {
                 system,
                 messages: Vec::new(),
                 tools,
+                tool_choice: None,
                 container: (!self.skills.is_empty()).then(|| RequestContainer {
                     id: None,
                     skills: self.skills,
@@ -1495,6 +1508,10 @@ struct RequestBody {
     messages: Vec<RequestMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<RequestTool>,
+    /// `{"type": "none"}` for a request that has no room left for another round of tool results
+    /// (see `run_turn`): the model answers with what it has. Unset otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     container: Option<RequestContainer>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3001,18 +3018,81 @@ mod tests {
             .system("y".repeat(16_000))
             .tool("big", None, json!({"type": "object"}), Big)
             .history_limits(HistoryLimits {
+                max_bytes: 40_000,
+                max_messages: 100,
+                target: 0.5,
+            });
+        let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+        assert_eq!(send(&mut conversation, "Gap?").await.unwrap().text, "Answer");
+        // With room, each round's results carry their data, and the model may call again
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        for (index, request) in requests.iter().enumerate() {
+            assert!(serde_json::to_vec(request).unwrap().len() <= 40_000);
+            assert!(request.get("tool_choice").is_none());
+            if index > 0 {
+                let result = &request["messages"].as_array().unwrap().last().unwrap()["content"][0];
+                assert!(result["content"].as_str().unwrap().starts_with("xxx"), "{index}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_turn_answers_with_what_it_has() {
+        struct Big;
+
+        impl ToolHandler for Big {
+            type Input = Value;
+
+            fn handle(
+                &self,
+                _: Value,
+            ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
+                async { Ok("x".repeat(12_000)) }
+            }
+        }
+
+        let (url, requests) = mock(vec![
+            message(
+                "tool_use",
+                json!([
+                    {"type": "thinking", "thinking": "", "signature": "s".repeat(500)},
+                    {"type": "tool_use", "id": "call1", "name": "big", "input": {}}
+                ]),
+            ),
+            message("end_turn", json!([{"type": "text", "text": "Answer"}])),
+            message("end_turn", json!([{"type": "text", "text": "Next answer"}])),
+        ])
+        .await;
+        let mut builder = ConversationBuilder::new();
+        builder
+            .api_key("test")
+            .base_url(&url)
+            .system("y".repeat(16_000))
+            .tool("big", None, json!({"type": "object"}), Big)
+            .history_limits(HistoryLimits {
                 max_bytes: 20_000,
                 max_messages: 100,
                 target: 0.5,
             });
         let mut conversation = builder.build(reqwest::Client::new()).unwrap();
         assert_eq!(send(&mut conversation, "Gap?").await.unwrap().text, "Answer");
-        // The first round's results leave room for the second round's call and results
+        assert_eq!(
+            send(&mut conversation, "And now?").await.unwrap().text,
+            "Next answer"
+        );
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
         for request in requests.iter() {
             assert!(serde_json::to_vec(request).unwrap().len() <= 20_000);
         }
+        // The results fill what's left, with their data: no room for another round, so the
+        // model answers with what it has, and only for that request
+        let result = &requests[1]["messages"].as_array().unwrap().last().unwrap()["content"][0];
+        assert!(result["content"].as_str().unwrap().starts_with("xxx"));
+        assert_eq!(requests[1]["tool_choice"], json!({"type": "none"}));
+        assert!(requests[0].get("tool_choice").is_none());
+        assert!(requests[2].get("tool_choice").is_none());
     }
 
     #[tokio::test]
