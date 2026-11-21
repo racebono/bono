@@ -878,9 +878,10 @@ impl Conversation {
 }
 
 /// What the last round of a turn with no room for more says after its results (see `run_turn`).
-const LAST_ROUND: &str = "[No room for more tool calls in this turn: answer with what you have. \
-     Nothing more was looked up, changed or scheduled, so don't say it was: offer to do it if the \
-     pilot asks again.]";
+const LAST_ROUND: &str = "[No room for more tool calls in this turn: answer now with what you \
+     have, without acknowledging again. Nothing beyond what's above was looked up, changed or \
+     scheduled, so don't say it was. If something asked for or due can't be done now, say so \
+     briefly instead of staying silent.]";
 
 /// The content of the message carrying `results` back, with `last` (that it's the turn's last
 /// round) after them, then `steer` (the pilot's new questions), then `note`: the API takes text in
@@ -1183,6 +1184,10 @@ fn strip_turns(messages: &mut [RequestMessage]) -> Option<usize> {
                 changed = true;
             }
         }
+        // That a round was its turn's last says nothing about later turns
+        let before = blocks.len();
+        blocks.retain(|block| block["text"] != LAST_ROUND);
+        changed |= blocks.len() != before;
         if changed {
             first.get_or_insert(index);
         }
@@ -2813,6 +2818,7 @@ mod tests {
                 role: "user",
                 content: json!([
                     {"type": "tool_result", "tool_use_id": "call", "content": "data"},
+                    {"type": "text", "text": LAST_ROUND},
                     {"type": "text", "text": "And the gap?"}
                 ]),
             },
@@ -2822,6 +2828,7 @@ mod tests {
             },
         ];
         assert_eq!(strip_turns(&mut messages), Some(0));
+        // What was only for that turn's answer goes, the last round's note too
         assert_eq!(messages[0].content.as_array().unwrap().len(), 1);
         assert_eq!(
             messages[2].content,
