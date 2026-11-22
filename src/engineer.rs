@@ -1823,9 +1823,12 @@ impl Engineer {
                 // Its answer stops, unheard or not, as the chat only shows "say again"
                 self.drop_answers(|playback| playback.writing);
                 let say_again = t!("engineer.say_again": &turn.lang);
-                self.say(rt, config, synth, say_again, turn.lang, None);
-                if self.voice(config, turn.lang).is_none() {
-                    self.no_beep();
+                // A voice that failed this turn would fail again, sounding a second tone
+                if !turn.toned {
+                    self.say(rt, config, synth, say_again, turn.lang, None);
+                    if self.voice(config, turn.lang).is_none() {
+                        self.no_beep();
+                    }
                 }
                 say_again.to_owned()
             }
@@ -3551,6 +3554,41 @@ mod tests {
             assert_eq!(waiting, 1, "one tone (fails first: {fails_first})");
             assert!(engineer.line[0].complete);
         }
+
+        // A refused answer's "say again" isn't tried with a voice that just failed
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        let (speech, output) = SpeechOutput::channel();
+        let mut answer = Playback::new(output, false);
+        answer.writing = true;
+        engineer.queue(answer);
+        let (_, text) = mpsc::unbounded_channel();
+        engineer.turn = Some(Turn {
+            task: Task::spawn(std::future::pending()),
+            lang: arrstr!("en"),
+            text,
+            entry: None,
+            steer: Steer::default(),
+            steered: None,
+            told: Told::default(),
+            toned: false,
+        });
+        speech.send(Err(anyhow::anyhow!("no voice"))).unwrap();
+        engineer.admit(1.0);
+        let turn = engineer.turn.take().unwrap();
+        engineer.answer(
+            rt,
+            &config,
+            &mut synth,
+            Reply {
+                text: String::new(),
+                stop: StopReason::Refusal,
+                usage: Default::default(),
+                model: "test".into(),
+            },
+            turn,
+        );
+        let waiting = engineer.incoming.len() + engineer.line.len();
+        assert_eq!(waiting, 1, "one tone for a refused answer");
     }
 
     /// A typed question answered the way the app does it: `ask_text`, then `update` every frame
