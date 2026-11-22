@@ -26,7 +26,10 @@ const ENABLED: &str = " Enabled";
 /// The plugin as installed in `install_dir` (the game's folder, if it's installed), and the copy
 /// that comes with the app.
 pub async fn status(install_dir: Option<PathBuf>) -> PluginStatus {
-    let bundled_dll = bundled_dll().await;
+    status_from(bundled_dll().await, install_dir).await
+}
+
+async fn status_from(bundled_dll: Option<PathBuf>, install_dir: Option<PathBuf>) -> PluginStatus {
     let installed_dll = install_dir
         .as_deref()
         .map(installed_dll)
@@ -236,7 +239,7 @@ mod tests {
         )
         .unwrap();
 
-        let before = status(Some(game.path().to_owned())).await;
+        let before = status_from(None, Some(game.path().to_owned())).await;
         assert!(before.installed.is_none());
         assert!(!before.enabled);
 
@@ -257,11 +260,26 @@ mod tests {
             })
         );
 
-        let after = status(Some(game.path().to_owned())).await;
+        let after = status_from(None, Some(game.path().to_owned())).await;
         assert_eq!(after.installed, Some(None));
         assert!(after.enabled);
-        // No bundled copy next to the test binary to compare it with
+        // No bundled copy to compare it with
         assert_eq!(after.same_as_bundled, None);
+    }
+
+    #[tokio::test]
+    async fn compares_the_installed_copy_with_the_bundled_one() {
+        let game = tempfile::tempdir().unwrap();
+        let bundled = game.path().join("bundled.dll");
+        std::fs::write(&bundled, b"plugin").unwrap();
+        install_from(&bundled, game.path()).await.unwrap();
+
+        let same = status_from(Some(bundled.clone()), Some(game.path().to_owned())).await;
+        assert_eq!(same.same_as_bundled, Some(true));
+
+        std::fs::write(&bundled, b"plugin, rebuilt").unwrap();
+        let changed = status_from(Some(bundled), Some(game.path().to_owned())).await;
+        assert_eq!(changed.same_as_bundled, Some(false));
     }
 
     #[tokio::test]
@@ -314,7 +332,7 @@ mod tests {
             assert!(error.to_string().contains("CustomPluginVariables.JSON"));
             assert_eq!(std::fs::read(&settings).unwrap(), contents.as_bytes());
             assert_eq!(std::fs::read(&dll).unwrap(), b"original dll");
-            assert!(!status(Some(game.path().to_owned())).await.enabled);
+            assert!(!status_from(None, Some(game.path().to_owned())).await.enabled);
         }
     }
 
