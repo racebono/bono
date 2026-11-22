@@ -2,11 +2,10 @@
 
 These are controlled scenarios for manual/model evaluation, separate from `evals.json`'s
 database-backed cases. Supply the stated evidence as current tool results and allow the
-engineer to request missing evidence. They are not reconstructions of the Barcelona
-telemetry: the supplied transcript and screenshots show replies, not surface readings.
-Compare baseline and candidate with the same model/settings; record actual replies and
-grade the assertions. See `wet-transition-results.md` for actual controlled forward-test
-results and their limitations; adding scenarios alone does not establish a pass.
+engineer to request missing evidence. They are synthetic scenarios, not reconstructions
+of real session telemetry. Compare baseline and candidate with the same model/settings;
+record actual replies outside the skill and grade the assertions. Adding scenarios alone
+does not establish a pass.
 
 ## Present severity versus rain
 
