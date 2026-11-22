@@ -1494,6 +1494,11 @@
         "es": "Quedan unas {hours} h de conducción esta semana (se renueva en {resets})",
         "ca": "Queden unes {hours} h de conducció aquesta setmana (es renova en {resets})"
     },
+    "provider.bono_cloud_trial_hours_left": {
+        "en": "About {hours} h of driving left in the Bono Cloud trial (a trial doesn't reset)",
+        "es": "Quedan unas {hours} h de conducción en la prueba de Bono Cloud (una prueba no se renueva)",
+        "ca": "Queden unes {hours} h de conducció a la prova de Bono Cloud (una prova no es renova)"
+    },
     "provider.bono_cloud_allowance_low": {
         "en": "Bono Cloud allowance running low: about {hours} h left this week (resets in {resets})",
         "es": "Queda poca asignación de Bono Cloud: unas {hours} h esta semana (se renueva en {resets})",

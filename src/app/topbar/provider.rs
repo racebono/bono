@@ -721,7 +721,8 @@ impl ProviderTopbar {
         }
     }
 
-    /// What's left of the account's allowance this week, warning when it runs low.
+    /// What's left of the account's allowance (this week's, or the trial's), warning when a
+    /// week's runs low.
     fn show_allowance(&mut self, rt: &Handle, ui: &mut egui::Ui) {
         let Some(entitlement) = self.allowance(rt) else {
             return;
@@ -729,11 +730,17 @@ impl ProviderTopbar {
         let Some(hours) = entitlement.estimated_hours_left else {
             return;
         };
+        let hours_left = format!("{:.1}", hours.max(0.0));
+        // A trial's allowance never starts over, and is no more than a couple of hours in all:
+        // it's not "this week's", nor "running low" from the start
+        if entitlement.status == "trial" {
+            ui.weak(t!("provider.bono_cloud_trial_hours_left", hours = hours_left));
+            return;
+        }
         let resets = (entitlement.week.as_ref())
             .and_then(|week| week.resets_at.as_deref())
             .and_then(resets_in)
             .unwrap_or_else(|| "?".into());
-        let hours_left = format!("{:.1}", hours.max(0.0));
         if hours < ALLOWANCE_LOW_HOURS {
             let text = t!(
                 "provider.bono_cloud_allowance_low",
