@@ -1316,6 +1316,8 @@ impl Engineer {
         // The turn hears it at its next tool hand-back, or answers it next
         if let Some(turn) = &mut self.turn {
             turn.steer.push(question);
+            // A tone that already sounded doesn't answer a question asked after it
+            turn.toned = false;
             let first = turn.steered.map_or(released, |(_, first)| first);
             turn.steered = Some((lang, first));
             return;
