@@ -14,6 +14,7 @@ pub struct Timeline {
     /// measured from. A typed one is measured from when it's asked.
     released: Option<Instant>,
     asked: Instant,
+    acknowledged: OnceLock<Instant>,
     first_text: OnceLock<Instant>,
     answered: OnceLock<Instant>,
     first_audio: OnceLock<Instant>,
@@ -25,11 +26,24 @@ impl Timeline {
         Self {
             released,
             asked,
+            acknowledged: OnceLock::new(),
             first_text: OnceLock::new(),
             answered: OnceLock::new(),
             first_audio: OnceLock::new(),
             played: OnceLock::new(),
         }
+    }
+
+    /// What the rest is measured from: the talk button's release, or when a typed question was
+    /// asked.
+    pub fn start(&self) -> Instant {
+        self.released.unwrap_or(self.asked)
+    }
+
+    /// The app acknowledged the question, the model having said nothing yet.
+    #[inline]
+    pub fn acknowledged(&self) {
+        let _ = self.acknowledged.set(Instant::now());
     }
 
     /// The model wrote something to say. Only the first counts, as with every mark.
@@ -77,7 +91,7 @@ impl Display for Timeline {
             }
         }
 
-        let start = self.released.unwrap_or(self.asked);
+        let start = self.start();
         let since = |at: &OnceLock<Instant>| Since(start, at.get().copied());
         write!(f, "Question timeline, from ")?;
         match self.released {
@@ -90,7 +104,8 @@ impl Display for Timeline {
         }
         write!(
             f,
-            "first text {}, first audio {}, answered {}, played {}",
+            "acknowledged {}, first text {}, first audio {}, answered {}, played {}",
+            since(&self.acknowledged),
             since(&self.first_text),
             since(&self.first_audio),
             since(&self.answered),
@@ -132,8 +147,22 @@ mod tests {
             .unwrap();
         assert_eq!(
             timeline.to_string(),
-            "Question timeline, from the talk button's release: asked 0.85s, first text 4.30s, \
-             first audio 4.50s, answered 4.60s, played 8.00s"
+            "Question timeline, from the talk button's release: asked 0.85s, acknowledged never, \
+             first text 4.30s, first audio 4.50s, answered 4.60s, played 8.00s"
+        );
+    }
+
+    #[test]
+    fn measures_the_acknowledgement() {
+        let released = Instant::now();
+        let timeline = Timeline::new(Some(released), released + Duration::from_millis(850));
+        timeline
+            .acknowledged
+            .set(released + Duration::from_millis(1750))
+            .unwrap();
+        assert!(
+            timeline.to_string().contains("acknowledged 1.75s, first text never"),
+            "{timeline}"
         );
     }
 
@@ -147,8 +176,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             timeline.to_string(),
-            "Question timeline, from being typed: first text never, first audio never, answered \
-             2.00s, played never"
+            "Question timeline, from being typed: acknowledged never, first text never, first \
+             audio never, answered 2.00s, played never"
         );
     }
 

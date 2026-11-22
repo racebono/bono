@@ -11,7 +11,7 @@
 //! reserved for it up front (`/v1/sessions`). Requests without one count against a rolling
 //! 24-hour ceiling instead, a fraction of the week, which a long race can run into midway.
 
-use super::{Model, ModelOption, Reply, Steer, Tools, Usage, claude};
+use super::{Model, ModelOption, Reply, Steer, Streamed, Tools, Usage, claude};
 use crate::{
     account::{Account, Status},
     config::ClaudeConfig,
@@ -647,10 +647,10 @@ impl Model for Conversation {
     fn send_streaming<'a>(
         &'a mut self,
         text: String,
-        on_text: &'a mut (dyn FnMut(&str) + Send),
+        on_event: &'a mut (dyn FnMut(Streamed<'_>) + Send),
     ) -> BoxFuture<'a, anyhow::Result<Reply>> {
         Box::pin(async move {
-            let reply = self.inner.send_streaming(text, on_text).await;
+            let reply = self.inner.send_streaming(text, on_event).await;
             TURNS.fetch_add(1, Ordering::Relaxed);
             reply.map_err(readable_error)
         })
@@ -1199,7 +1199,11 @@ mod tests {
         let mut conversation = conversation(&account, Tools::default());
         let mut pieces = Vec::new();
         let reply = conversation
-            .send_streaming("Pit?".into(), &mut |piece| pieces.push(piece.to_owned()))
+            .send_streaming("Pit?".into(), &mut |event| {
+                if let Streamed::Text(piece) = event {
+                    pieces.push(piece.to_owned())
+                }
+            })
             .await
             .unwrap();
         assert_eq!(reply.text, "Box.");
@@ -1415,7 +1419,11 @@ mod tests {
         let mut text = String::new();
         assert!(
             conversation
-                .send_streaming("Pit?".into(), &mut |piece| text.push_str(piece))
+                .send_streaming("Pit?".into(), &mut |event| {
+                    if let Streamed::Text(piece) = event {
+                        text.push_str(piece)
+                    }
+                })
                 .await
                 .is_err()
         );

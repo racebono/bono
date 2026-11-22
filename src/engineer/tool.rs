@@ -4386,7 +4386,7 @@ mod evals {
             scheduled_message,
         },
         language,
-        provider::{Model, claude::ConversationBuilder},
+        provider::{Model, Streamed, claude::ConversationBuilder},
         sqlite::Database,
     };
     use std::{num::NonZeroUsize, sync::Mutex as StdMutex, time::Instant};
@@ -4817,11 +4817,16 @@ mod evals {
                     let mut conversation = builder.build(reqwest::Client::new()).unwrap();
                     conversation.set_tool_result_note(note);
 
-                    let reply = conversation.send_streaming(question.clone(), &mut |text| {
-                        events.lock().unwrap().push(serde_json::json!({
-                            "kind": "text", "ms": start.elapsed().as_millis() as u64,
-                            "text": text,
-                        }));
+                    let reply = conversation.send_streaming(question.clone(), &mut |event| {
+                        let ms = start.elapsed().as_millis() as u64;
+                        events.lock().unwrap().push(match event {
+                            Streamed::Text(text) => {
+                                serde_json::json!({"kind": "text", "ms": ms, "text": text})
+                            }
+                            Streamed::Tools(names) => {
+                                serde_json::json!({"kind": "tools", "ms": ms, "names": names})
+                            }
+                        });
                     }).await;
                     let elapsed = start.elapsed();
                     // What the app would apply once the turn finishes

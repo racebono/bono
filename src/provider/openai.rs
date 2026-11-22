@@ -3,8 +3,8 @@
 //! OpenAI itself...
 
 use super::{
-    Model, ModelOption, Reply, Steer, StopReason, ToolHandler, Tools, Usage, steer_text,
-    text::TextSink,
+    Model, ModelOption, Reply, Steer, StopReason, Streamed, ToolHandler, Tools, Usage,
+    steer_text, text::TextSink,
 };
 use crate::config::OpenAiConfig;
 use anyhow::{Context, bail};
@@ -112,7 +112,7 @@ impl Model for Conversation {
     fn send_streaming<'a>(
         &'a mut self,
         text: String,
-        on_text: &'a mut (dyn FnMut(&str) + Send),
+        on_event: &'a mut (dyn FnMut(Streamed<'_>) + Send),
     ) -> BoxFuture<'a, anyhow::Result<Reply>> {
         Box::pin(async move {
             let mut turn = Turn {
@@ -122,7 +122,7 @@ impl Model for Conversation {
             };
             let reply = turn
                 .conversation
-                .run_turn(text, &mut TextSink::new(on_text))
+                .run_turn(text, &mut TextSink::new(on_event))
                 .await?;
 
             turn.keep = reply.stop != StopReason::Refusal;
@@ -233,6 +233,9 @@ impl Conversation {
                 });
             }
 
+            // The spoken text so far is all said before the tools run
+            let names = calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>();
+            sink.before_tools(&names);
             let tools = &self.tools;
             let mut results = join_all(calls.iter().map(|call| {
                 // The arguments are JSON text, empty for none
@@ -882,6 +885,7 @@ struct RequestFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::text::{around_tools, send_streaming_events};
     use serde_json::{Value, json};
     use std::sync::{
         Arc, Mutex,
@@ -1005,7 +1009,11 @@ mod tests {
         let mut pieces = Vec::new();
         let reply = timeout(
             Duration::from_secs(5),
-            conversation.send_streaming(text.into(), &mut |piece| pieces.push(piece.to_owned())),
+            conversation.send_streaming(text.into(), &mut |event| {
+                if let Streamed::Text(piece) = event {
+                    pieces.push(piece.to_owned())
+                }
+            }),
         )
         .await
         .expect("timed out")?;
@@ -1020,7 +1028,7 @@ mod tests {
             json!({"function": {"name": "lookup", "arguments": "{\"b\":2}"}}),
         ] {
             let mut response = Response::default();
-            let mut on_text = |_: &str| {};
+            let mut on_text = |_: Streamed<'_>| {};
             let mut sink = TextSink::new(&mut on_text);
             for piece in [
                 json!({"id": "call_1", "function": {"name": "lookup", "arguments": "{\"a\":"}}),
@@ -1053,7 +1061,7 @@ mod tests {
     #[test]
     fn reads_arguments_sent_as_json() {
         let mut response = Response::default();
-        let mut on_text = |_: &str| {};
+        let mut on_text = |_: Streamed<'_>| {};
         let mut sink = TextSink::new(&mut on_text);
         let line = format!(
             "data: {}",
@@ -1073,7 +1081,11 @@ mod tests {
     fn reads_content_sent_as_chunks_and_skips_thinking() {
         let mut response = Response::default();
         let mut pieces = Vec::new();
-        let mut on_text = |piece: &str| pieces.push(piece.to_owned());
+        let mut on_text = |event: Streamed<'_>| {
+            if let Streamed::Text(piece) = event {
+                pieces.push(piece.to_owned())
+            }
+        };
         let mut sink = TextSink::new(&mut on_text);
         let thinking =
             |text: &str| json!({"type": "thinking", "thinking": [{"type": "text", "text": text}]});
@@ -1091,6 +1103,36 @@ mod tests {
         drop(sink);
         assert_eq!(response.content, "Gap's 1.2 seconds.");
         assert_eq!(pieces.concat(), "Gap's 1.2 seconds.");
+    }
+
+    #[tokio::test]
+    async fn streams_tools_between_the_texts() {
+        let call =
+            |delta: Value| json!({"choices": [{"index": 0, "delta": {"tool_calls": [delta]}}]});
+        let (url, _) = mock(vec![
+            stream(vec![
+                text("Let me "),
+                text("check."),
+                call(json!({"index": 0, "id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}})),
+                finish("tool_calls"),
+            ]),
+            stream(vec![text("\nThe gap "), text("is 1.2s."), finish("stop")]),
+        ])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = builder(&url, &calls).build(reqwest::Client::new()).unwrap();
+
+        let (reply, events) = send_streaming_events(&mut conversation, "Gap?").await;
+        let reply = reply.unwrap();
+        assert_eq!(
+            around_tools(&events),
+            (
+                "Let me check.\n\n".into(),
+                vec!["lookup".to_owned()],
+                "The gap is 1.2s.".into()
+            )
+        );
+        assert_eq!(events.iter().flatten().cloned().collect::<String>(), reply.text);
     }
 
     #[tokio::test]

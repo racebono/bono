@@ -1,8 +1,8 @@
 //! Claude, through the Claude API.
 
 use super::{
-    Model, ModelOption, Reply, Steer, StopReason, ToolHandler, Tools, Usage, steer_text,
-    text::TextSink,
+    Model, ModelOption, Reply, Steer, StopReason, Streamed, ToolHandler, Tools, Usage,
+    steer_text, text::TextSink,
 };
 use crate::config::{ClaudeCacheTtl, ClaudeConfig};
 use anyhow::{Context, bail};
@@ -274,7 +274,7 @@ impl Model for Conversation {
     fn send_streaming<'a>(
         &'a mut self,
         text: String,
-        on_text: &'a mut (dyn FnMut(&str) + Send),
+        on_event: &'a mut (dyn FnMut(Streamed<'_>) + Send),
     ) -> BoxFuture<'a, anyhow::Result<Reply>> {
         Box::pin(async move {
             let original = self.history_limits.map(|_| self.body.messages.clone());
@@ -284,7 +284,7 @@ impl Model for Conversation {
                 keep: false,
                 original,
             };
-            let mut sink = TextSink::new(on_text);
+            let mut sink = TextSink::new(on_event);
             if let Some(limits) = turn.conversation.history_limits {
                 turn.conversation.prepare_history(&text, limits.target)?;
             }
@@ -584,7 +584,10 @@ impl Conversation {
 
             // Only once the turn is known to be whole: a `tool_use` cut off at `max_tokens` can
             // still parse, with part of its input missing
-            sink.before_tools();
+            let names = (calls.iter())
+                .map(|call| call["name"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>();
+            sink.before_tools(&names);
             let tools = &self.tools;
             let result_limit = self.history_limits.map(|limits| limits.max_bytes / 8);
             let tools_started = Instant::now();
@@ -2108,6 +2111,7 @@ pub(super) fn parse_retry_after(value: &HeaderValue) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::text::{around_tools, send_streaming_events};
     use serde_json::{Value, json};
     use std::sync::{
         Arc, Mutex,
@@ -2620,7 +2624,11 @@ mod tests {
             target: 0.5,
         });
         let mut spoken = String::new();
-        let mut on_text = |text: &str| spoken.push_str(text);
+        let mut on_text = |event: Streamed<'_>| {
+            if let Streamed::Text(text) = event {
+                spoken.push_str(text)
+            }
+        };
         let error = conversation
             .send_streaming("Gap?".into(), &mut on_text)
             .await
@@ -3348,7 +3356,11 @@ mod tests {
         let mut pieces = Vec::new();
         let reply = timeout(
             Duration::from_secs(5),
-            conversation.send_streaming(text.into(), &mut |piece| pieces.push(piece.to_owned())),
+            conversation.send_streaming(text.into(), &mut |event| {
+                if let Streamed::Text(piece) = event {
+                    pieces.push(piece.to_owned())
+                }
+            }),
         )
         .await
         .expect("timed out");
@@ -3422,6 +3434,47 @@ mod tests {
             requests[1]["messages"][2]["content"][0]["content"],
             "looked up \"gap\""
         );
+    }
+
+    #[tokio::test]
+    async fn streams_tools_between_the_texts() {
+        let mut first = vec![
+            message_start("claude-sonnet-5-5"),
+            block_start(0, json!({"type": "text", "text": ""})),
+            text_delta(0, "Checking"),
+            text_delta(0, " the gap."),
+            block_stop(0),
+            block_start(
+                1,
+                json!({"type": "tool_use", "id": "t1", "name": "lookup", "input": {}}),
+            ),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+            block_stop(1),
+        ];
+        first.extend(message_end("tool_use", 20));
+        let mut second = vec![
+            message_start("claude-sonnet-5-5"),
+            block_start(0, json!({"type": "text", "text": ""})),
+            text_delta(0, "You are 2.1s"),
+            text_delta(0, " ahead."),
+            block_stop(0),
+        ];
+        second.extend(message_end("end_turn", 7));
+        let (url, _) = mock(vec![sse(first), sse(second)]).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = conversation(&url, &calls);
+
+        let (reply, events) = send_streaming_events(&mut conversation, "What is the gap?").await;
+        let reply = reply.unwrap();
+        assert_eq!(
+            around_tools(&events),
+            (
+                "Checking the gap.\n\n".into(),
+                vec!["lookup".to_owned()],
+                "You are 2.1s ahead.".into()
+            )
+        );
+        assert_eq!(events.iter().flatten().cloned().collect::<String>(), reply.text);
     }
 
     #[tokio::test]
@@ -3701,8 +3754,10 @@ mod tests {
 
         let mut pieces = Vec::new();
         let reply = conversation
-            .send_streaming("Look up the gap, then tell me it.".into(), &mut |piece| {
-                pieces.push(piece.to_owned())
+            .send_streaming("Look up the gap, then tell me it.".into(), &mut |event| {
+                if let Streamed::Text(piece) = event {
+                    pieces.push(piece.to_owned())
+                }
             })
             .await
             .unwrap();
