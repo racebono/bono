@@ -1681,17 +1681,6 @@ impl Engineer {
         {
             lease.end();
         }
-        // The account the conversation is had as signed out (or another signed in): it ends,
-        // answer on its way included
-        if self.session.as_ref().is_some_and(|s| !self.signed_in_as(s)) {
-            let interrupted = self.turn.is_some();
-            self.stop();
-            self.drop_session(rt);
-            self.notice(t!("engineer.signed_out"));
-            if interrupted {
-                self.no_beep();
-            }
-        }
 
         // Before a turn's changes are applied, at the newest progress
         self.follow_progress();
@@ -1764,6 +1753,19 @@ impl Engineer {
             && let Some(scheduled) = self.scheduled.take()
         {
             self.finish_scheduled(rt, config, synth, scheduled, result);
+        }
+        // The account the conversation is had as signed out (or another signed in): it ends,
+        // answer on its way included. After the turns that finished are taken in: the conversation
+        // kept their exchanges, and the requests outlive it, so what they changed counts rather
+        // than being dropped as if they never ran
+        if self.session.as_ref().is_some_and(|s| !self.signed_in_as(s)) {
+            let interrupted = self.turn.is_some();
+            self.stop();
+            self.drop_session(rt);
+            self.notice(t!("engineer.signed_out"));
+            if interrupted {
+                self.no_beep();
+            }
         }
         self.run_scheduled(rt, sim, config);
 
@@ -4292,6 +4294,51 @@ mod tests {
             assert!(added.contains("#2"), "{added}");
             scripted.finish(Act::Reply);
             assert_eq!(scripted.pending(), [RequestId(1), RequestId(2)]);
+        }
+    }
+
+    #[test]
+    fn signing_out_takes_in_a_turn_that_finished() {
+        // A pilot turn or a scheduled one, its answer in but not yet taken when the account signs
+        // out: the conversation kept the exchange, and the requests outlive it
+        for scheduled in [false, true] {
+            let mut scripted = Scripted::recorded();
+            match scheduled {
+                false => {
+                    scripted.ask("Fuel every lap, please.");
+                    scripted.until("asked", |s| s.questions().len() == 1);
+                    scripted.schedule(fuel_every_lap()).unwrap();
+                    scripted.acts.send(Act::Reply).unwrap();
+                }
+                true => {
+                    scripted.scheduled_running();
+                    scripted.acts.send(Act::Say(SILENCE.into())).unwrap();
+                }
+            }
+            let finished = |e: &Engineer| match scheduled {
+                false => e.turn.as_ref().is_some_and(|t| t.task.is_finished()),
+                true => e.scheduled.as_ref().is_some_and(|s| s.task.is_finished()),
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !finished(&scripted.engineer) {
+                assert!(Instant::now() < deadline, "never finished");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let session = scripted.engineer.session.as_mut().unwrap();
+            session.user = Some("pilot".into());
+            scripted.frame();
+            assert!(scripted.engineer.session.is_none(), "scheduled: {scheduled}");
+            assert!(!scripted.cancelled(), "scheduled: {scheduled}");
+            match scheduled {
+                // Its request applied
+                false => assert_eq!(scripted.pending(), [RequestId(1)]),
+                // Answered, not due again
+                true => {
+                    let nothing = t!("engineer.nothing_to_report", what = marker_fired());
+                    assert!(scripted.noticed(&nothing));
+                    assert!(scripted.pending().is_empty());
+                }
+            }
         }
     }
 
