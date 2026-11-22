@@ -28,6 +28,9 @@ const DEFAULT_HOST: &str = "http://127.0.0.1:11434";
 /// The most of the context window a turn's first prompt may take: the rest is room for the
 /// answer, the turn's tool results, and the prompt's estimated size being off.
 const PROMPT_SHARE: f64 = 0.75;
+/// Past [`PROMPT_SHARE`], old exchanges are forgotten down to this share, so the next turns
+/// fit without forgetting again (and re-sending what the engineer re-sends when it forgets)
+const TRIMMED_SHARE: f64 = 0.5;
 
 /// The models pulled on Ollama at `host` (as `OLLAMA_HOST` says it: when `None`, `OLLAMA_HOST`,
 /// or this PC), by name.
@@ -228,24 +231,28 @@ impl Conversation {
         Ok(())
     }
 
-    /// Forgets the oldest exchanges, whole, until the prompt with `question` is expected to fit
-    /// in [`PROMPT_SHARE`] of the context window. Ollama doesn't document what it does with a
-    /// prompt that doesn't fit, so it's never sent one: what's forgotten is forgotten here, where
-    /// it's known. The prompt's tokens are estimated from its request's size in bytes, at the
-    /// last prompt's tokens per byte. Returns what it forgot, oldest first.
+    /// Forgets the oldest exchanges, whole, when the prompt with `question` isn't expected to fit
+    /// in [`PROMPT_SHARE`] of the context window: until it fits in [`TRIMMED_SHARE`] of it.
+    /// Ollama doesn't document what it does with a prompt that doesn't fit, so it's never sent
+    /// one: what's forgotten is forgotten here, where it's known. The prompt's tokens are
+    /// estimated from its request's size in bytes, at the last prompt's tokens per byte.
+    /// Returns what it forgot, oldest first.
     fn forget_to_fit(&mut self, question: &str) -> anyhow::Result<Vec<serde_json::Value>> {
         let Some(tokens_per_byte) = self.tokens_per_byte else {
             return Ok(Vec::new());
         };
-        let budget = f64::from(self.body.options.num_ctx.get()) * PROMPT_SHARE;
+        let num_ctx = f64::from(self.body.options.num_ctx.get());
         let question = serde_json::json!({"role": "user", "content": question});
         // Each message is separated from the next by a comma
         let mut bytes =
             serde_json::to_vec(&self.body)?.len() + serde_json::to_vec(&question)?.len() + 1;
+        if bytes as f64 * tokens_per_byte <= num_ctx * PROMPT_SHARE {
+            return Ok(Vec::new());
+        }
 
         let messages = &self.body.messages;
         let mut end = self.kept;
-        while end < messages.len() && bytes as f64 * tokens_per_byte > budget {
+        while end < messages.len() && bytes as f64 * tokens_per_byte > num_ctx * TRIMMED_SHARE {
             // An exchange runs from its question to the next one
             let next = messages[end + 1..]
                 .iter()
@@ -1201,6 +1208,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forgetting_makes_room_for_the_next_turns() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = builder("http://127.0.0.1:9", &calls);
+        builder.context_length(NonZeroU32::new(1000).unwrap());
+        let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+        let exchange = |conversation: &mut Conversation| {
+            for role in ["user", "assistant"] {
+                (conversation.body.messages).push(json!({"role": role, "content": "x".repeat(100)}));
+            }
+        };
+        for _ in 0..10 {
+            exchange(&mut conversation);
+        }
+        // Just past 3/4 of the window
+        let bytes = serde_json::to_vec(&conversation.body).unwrap().len();
+        conversation.tokens_per_byte = Some(760.0 / bytes as f64);
+
+        // Forgotten down to half the window, not just under 3/4...
+        let forgotten = conversation.forget_to_fit("Gap?").unwrap();
+        assert!(forgotten.len() > 2, "{}", forgotten.len());
+        // ...so the next exchange fits without forgetting again
+        exchange(&mut conversation);
+        assert!(conversation.forget_to_fit("Gap?").unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn forgets_the_oldest_exchanges_to_fit_the_context_window() {
         let (url, requests) = mock(vec![
             stream(&["Box."], Value::Null, "stop"),
