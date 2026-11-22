@@ -73,6 +73,11 @@ pub struct LeMansUltimate {
     /// The plugin's version, as last read this run: the game keeps the plugin it loaded, so it
     /// stands for a look that can't read it
     plugin_version: Option<Version>,
+    /// Whether the plugin's contents are the app's copy's, as last hashed this run: like its
+    /// version, it stands for a look that can't hash it
+    plugin_same_as_bundled: Option<bool>,
+    /// Whether `plugin_outdated` was decided on a version read, not on one that couldn't be
+    plugin_decided_on_version: bool,
     /// The game's pit menu, for the engineer
     pit: Arc<pit::LmuPit>,
     /// Whether the pilot lets the engineer request pit stops, shared with `pit`
@@ -100,6 +105,8 @@ impl LeMansUltimate {
             plugin_looked: None,
             plugin_outdated: None,
             plugin_version: None,
+            plugin_same_as_bundled: None,
+            plugin_decided_on_version: false,
             pit: Arc::new(pit::LmuPit::new(game.clone(), pit_requests.clone())),
             pit_requests,
             pit_key: Arc::default(),
@@ -127,16 +134,20 @@ impl LeMansUltimate {
                             }
                             _ => {}
                         }
+                        match status.same_as_bundled {
+                            Some(same) => self.plugin_same_as_bundled = Some(same),
+                            None => status.same_as_bundled = self.plugin_same_as_bundled,
+                        }
                         // The game's plugin not found while the game runs, or the app's copy's
                         // version not read: the lookup failed, which says nothing new about the
                         // plugin loaded. The app's own contents tell it's current, whatever else
                         // couldn't be read
                         let failed =
                             status.installed.is_none() || status.bundled_version().is_none();
-                        // The app's version, not hashed: only the contents tell those copies apart,
-                        // so the verdict on the version read earlier stands. Without a version read
-                        // before, this look decides: it says the app's version
-                        let unhashed = version_read
+                        // The app's version, never hashed: only the contents tell those copies
+                        // apart, so a verdict decided on a version read stands. One decided on a
+                        // version that couldn't be read doesn't: this look says the app's version
+                        let unhashed = self.plugin_decided_on_version
                             && status.same_as_bundled.is_none()
                             && status.installed == status.bundled;
                         if status.same_as_bundled != Some(true) && (failed || unhashed) {
@@ -150,6 +161,8 @@ impl LeMansUltimate {
                                 );
                             }
                             self.plugin_outdated = Some(outdated);
+                            self.plugin_decided_on_version =
+                                matches!(status.installed, Some(Some(_)));
                         }
                     }
                     // Not knowing isn't knowing it's outdated: the last answer stands, if any
@@ -237,6 +250,8 @@ impl Simulator for LeMansUltimate {
             self.plugin_looked = None;
             self.plugin_outdated = None;
             self.plugin_version = None;
+            self.plugin_same_as_bundled = None;
+            self.plugin_decided_on_version = false;
             None
         };
 
@@ -592,6 +607,24 @@ mod tests {
         assert!(!looked_at(&mut lmu, status(app.clone(), None)).await);
         // Until the contents are the app's
         assert!(looked_at(&mut lmu, status(Some(None), Some(true))).await);
+
+        // Other code seen while the version wasn't read: blocked, also once the app's version is
+        // read with the hash failing
+        let mut lmu = LeMansUltimate::new(Game::fake());
+        assert!(!looked_at(&mut lmu, status(Some(None), Some(false))).await);
+        assert!(!looked_at(&mut lmu, status(app.clone(), None)).await);
+        assert!(lmu.plugin_outdated());
+
+        // A version read on a failed look (the app's copy's not read) doesn't make the block of an
+        // unread version stand: the app's version read later lifts it
+        let mut lmu = LeMansUltimate::new(Game::fake());
+        assert!(!looked_at(&mut lmu, status(Some(None), None)).await);
+        let failed = PluginStatus {
+            bundled: None,
+            ..status(app.clone(), None)
+        };
+        assert!(!looked_at(&mut lmu, failed).await);
+        assert!(looked_at(&mut lmu, status(app.clone(), None)).await);
     }
 
     #[tokio::test]
