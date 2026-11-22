@@ -13,7 +13,10 @@ use anyhow::Context;
 use futures::join;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
+};
 use tokio::try_join;
 
 /// The DLL's name, in the app's `plugins` folder and the game's `Plugins` folder.
@@ -22,6 +25,8 @@ const DLL: &str = "bono_lmu.dll";
 const PLUGIN_SETTINGS: &[&str] = &["UserData", "player", "CustomPluginVariables.JSON"];
 /// The setting the game loads a plugin by (the space is the game's).
 const ENABLED: &str = " Enabled";
+/// Whether the last hash of the plugins failed, so the warning isn't repeated at every look.
+static HASH_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// The plugin as installed in `install_dir` (the game's folder, if it's installed), and the copy
 /// that comes with the app.
@@ -54,9 +59,15 @@ async fn status_from(bundled_dll: Option<PathBuf>, install_dir: Option<PathBuf>)
         match (installed_dll, bundled_dll) {
             (Some(installed), Some(bundled)) => match try_join!(digest(installed), digest(bundled))
             {
-                Ok((installed, bundled)) => Some(installed == bundled),
+                Ok((installed, bundled)) => {
+                    HASH_FAILED.store(false, Ordering::Relaxed);
+                    Some(installed == bundled)
+                }
                 Err(e) => {
-                    log::warn!("Couldn't hash the Le Mans Ultimate plugin: {e}");
+                    // Once until a hash works: the plugin is looked at again while the game runs
+                    if !HASH_FAILED.swap(true, Ordering::Relaxed) {
+                        log::warn!("Couldn't hash the Le Mans Ultimate plugin: {e}");
+                    }
                     None
                 }
             },

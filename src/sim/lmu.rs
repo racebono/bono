@@ -7,7 +7,7 @@
 
 use crate::{
     sim::{
-        Game, PitKeyStatus, PluginStatus, Simulator, SimulatorInfo, SimulatorSettings,
+        Game, PitKeyStatus, PluginStatus, Simulator, SimulatorInfo, SimulatorSettings, Version,
         pit::PitService, probe::Probe, steam_install_dir,
     },
     sqlite::{Database, pool::Pool},
@@ -70,8 +70,9 @@ pub struct LeMansUltimate {
     plugin_looked: Option<Instant>,
     /// Whether the plugin the game runs is outdated, once looked at this run
     plugin_outdated: Option<bool>,
-    /// Whether the plugin's version has been read this run
-    plugin_version_read: bool,
+    /// The plugin's version, as last read this run: the game keeps the plugin it loaded, so it
+    /// stands for a look that can't read it
+    plugin_version: Option<Version>,
     /// The game's pit menu, for the engineer
     pit: Arc<pit::LmuPit>,
     /// Whether the pilot lets the engineer request pit stops, shared with `pit`
@@ -98,7 +99,7 @@ impl LeMansUltimate {
             plugin_check: None,
             plugin_looked: None,
             plugin_outdated: None,
-            plugin_version_read: false,
+            plugin_version: None,
             pit: Arc::new(pit::LmuPit::new(game.clone(), pit_requests.clone())),
             pit_requests,
             pit_key: Arc::default(),
@@ -115,33 +116,41 @@ impl LeMansUltimate {
                 let check = self.plugin_check.take();
                 // Finished, so this doesn't wait
                 match check.and_then(|check| unconstrained(check).now_or_never()) {
-                    // The game's plugin not found while the game runs, the app's copy's version not
-                    // read, the plugin's no longer read once it was, or the same version as the
-                    // app's but not hashed (only the contents tell those apart): the lookup failed,
-                    // which says nothing new about the plugin loaded. The app's own contents tell
-                    // it's current, whatever else couldn't be read
-                    Some(Ok(status))
-                        if status.same_as_bundled != Some(true)
-                            && (status.installed.is_none()
-                                || status.bundled_version().is_none()
-                                || (self.plugin_version_read
-                                    && matches!(status.installed, Some(None)))
-                                || (status.same_as_bundled.is_none()
-                                    && status.installed == status.bundled)) =>
-                    {
-                        self.plugin_version_read |= matches!(status.installed, Some(Some(_)));
-                        self.plugin_outdated.get_or_insert(false);
-                    }
-                    Some(Ok(status)) => {
-                        self.plugin_version_read |= matches!(status.installed, Some(Some(_)));
-                        let outdated = status.outdated();
-                        if outdated && self.plugin_outdated != Some(true) {
-                            log::warn!(
-                                "The Le Mans Ultimate plugin is outdated: its sessions aren't \
-                                 followed until it's updated"
-                            );
+                    Some(Ok(mut status)) => {
+                        // A plugin whose version is no longer read is the one read earlier: the
+                        // game keeps the plugin it loaded
+                        let version_read = self.plugin_version.is_some();
+                        match &status.installed {
+                            Some(Some(version)) => self.plugin_version = Some(version.clone()),
+                            Some(None) if version_read => {
+                                status.installed = Some(self.plugin_version.clone());
+                            }
+                            _ => {}
                         }
-                        self.plugin_outdated = Some(outdated);
+                        // The game's plugin not found while the game runs, or the app's copy's
+                        // version not read: the lookup failed, which says nothing new about the
+                        // plugin loaded. The app's own contents tell it's current, whatever else
+                        // couldn't be read
+                        let failed =
+                            status.installed.is_none() || status.bundled_version().is_none();
+                        // The app's version, not hashed: only the contents tell those copies apart,
+                        // so the verdict on the version read earlier stands. Without a version read
+                        // before, this look decides: it says the app's version
+                        let unhashed = version_read
+                            && status.same_as_bundled.is_none()
+                            && status.installed == status.bundled;
+                        if status.same_as_bundled != Some(true) && (failed || unhashed) {
+                            self.plugin_outdated.get_or_insert(false);
+                        } else {
+                            let outdated = status.outdated();
+                            if outdated && self.plugin_outdated != Some(true) {
+                                log::warn!(
+                                    "The Le Mans Ultimate plugin is outdated: its sessions \
+                                     aren't followed until it's updated"
+                                );
+                            }
+                            self.plugin_outdated = Some(outdated);
+                        }
                     }
                     // Not knowing isn't knowing it's outdated: the last answer stands, if any
                     Some(Err(e)) => {
@@ -227,7 +236,7 @@ impl Simulator for LeMansUltimate {
             self.plugin_check = None;
             self.plugin_looked = None;
             self.plugin_outdated = None;
-            self.plugin_version_read = false;
+            self.plugin_version = None;
             None
         };
 
@@ -544,6 +553,89 @@ mod tests {
         assert!(looked_at(&mut lmu, status(None, version(1))).await);
         assert!(!looked_at(&mut lmu, status(Some(None), version(1))).await);
         assert!(lmu.plugin_outdated());
+    }
+
+    #[tokio::test]
+    async fn a_read_that_keeps_failing_doesnt_keep_a_wrong_verdict() {
+        let app = Some(Some(Version {
+            major: 0,
+            minor: 2,
+            patch: 1,
+            build: None,
+        }));
+        let status = |installed, same_as_bundled| PluginStatus {
+            installed,
+            enabled: true,
+            bundled: app.clone(),
+            same_as_bundled,
+        };
+
+        // The version not read on the first look blocks the plugin, until a look reads the app's
+        // version, even if the hash keeps failing
+        let mut lmu = LeMansUltimate::new(Game::fake());
+        assert!(!looked_at(&mut lmu, status(Some(None), None)).await);
+        assert!(lmu.plugin_outdated());
+        assert!(looked_at(&mut lmu, status(app.clone(), None)).await);
+        assert!(!lmu.plugin_outdated());
+        // From then on, its version is the app's
+        assert!(looked_at(&mut lmu, status(Some(None), None)).await);
+        assert!(looked_at(&mut lmu, status(app.clone(), None)).await);
+
+        // The app's version, not hashed, so followed; then the version isn't read again, but
+        // the hash shows other code: still the app's version, with other code
+        let mut lmu = LeMansUltimate::new(Game::fake());
+        assert!(looked_at(&mut lmu, status(app.clone(), None)).await);
+        assert!(!looked_at(&mut lmu, status(Some(None), Some(false))).await);
+        assert!(lmu.plugin_outdated());
+        // And it stays blocked while the hash fails, whether the version is read or not
+        assert!(!looked_at(&mut lmu, status(Some(None), None)).await);
+        assert!(!looked_at(&mut lmu, status(app.clone(), None)).await);
+        // Until the contents are the app's
+        assert!(looked_at(&mut lmu, status(Some(None), Some(true))).await);
+    }
+
+    #[tokio::test]
+    async fn a_restart_the_app_doesnt_see_as_a_stop_looks_at_the_plugin_again() {
+        use crate::{process::Program, sim::Sim, track::TrackData};
+        use tokio::sync::watch;
+
+        let (steam, running) = watch::channel(true);
+        let (process, processes) = watch::channel(Program::default());
+        let mut sim = Sim {
+            name: LeMansUltimate::NAME,
+            id: LeMansUltimate::TRACK_DATA_ID,
+            game: Game::fake(),
+            running,
+            process: processes,
+            track_data: Arc::new(tokio::sync::Mutex::new(TrackData::new("lmu"))),
+            _watcher: Err(steam),
+            retrying: None,
+            was_running: (false, false),
+            simulator: LeMansUltimate::new(Game::fake()),
+        };
+        let version = Some(Some(crate::sim::Version {
+            major: 0,
+            minor: 2,
+            patch: 1,
+            build: None,
+        }));
+        let status = |installed| PluginStatus {
+            installed,
+            enabled: true,
+            bundled: version.clone(),
+            same_as_bundled: None,
+        };
+
+        // Run 1 reads the app's version
+        assert!(sim.started());
+        assert!(looked_at(&mut sim, status(version.clone())).await);
+
+        // The game restarts with an older plugin, which doesn't say its version, while Steam
+        // still reports the first run: the new process is a new run, with a new verdict
+        process.send_modify(|program| program.running = true);
+        assert!(sim.started());
+        assert!(!looked_at(&mut sim, status(Some(None))).await);
+        assert!(sim.plugin_outdated());
     }
 
     #[tokio::test]
