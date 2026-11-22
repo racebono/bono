@@ -77,8 +77,9 @@ pub trait Model: Send {
     /// and tools stay.
     fn reset(&mut self);
 
-    /// Goes up whenever the conversation forgets earlier messages or parts of them on its own
-    /// (trimmed to fit a limit, compacted, started over): what they said may be gone.
+    /// Goes up whenever the conversation forgets earlier messages on its own (trimmed to fit a
+    /// limit, compacted, started over): what they said may be gone. Not when it drops what a
+    /// question brings again with every turn (its telemetry snapshot, old tool results).
     fn forgotten(&self) -> u64 {
         0
     }

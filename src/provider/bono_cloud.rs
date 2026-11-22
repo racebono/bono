@@ -619,8 +619,13 @@ impl Conversation {
         let mut builder = claude::ConversationBuilder::from_config(&ClaudeConfig::default());
         builder
             .history_limits(claude::HistoryLimits {
-                max_bytes: 120_000,
-                max_messages: 100,
+                // The server takes up to 160 KB, but holds the allowance for a request past
+                // 100,000 bytes (its own payload, about this one's size) at the long-context
+                // rate, five times as much, which would refuse it to most users
+                max_bytes: 99_000,
+                // The server takes up to 128 messages, and a turn's tool loop adds up to 30
+                // (16 requests): one started under this always fits
+                max_messages: 98,
                 target: 0.5,
             })
             .base_url(base_url(account))
@@ -878,7 +883,9 @@ mod tests {
         assert!(body.get("model").is_none());
         assert!(body.get("output_config").is_none());
         assert!(body.get("max_tokens").is_none());
-        assert_eq!(body["cache_control"], json!({"type": "ephemeral"}));
+        // Cached up to the system prompt and up to the question, never past it (see
+        // `claude::question_message`)
+        assert!(body.get("cache_control").is_none());
         assert_eq!(
             body["system"][0]["cache_control"],
             json!({"type": "ephemeral"})
@@ -890,7 +897,9 @@ mod tests {
         assert_eq!(body["system"][0]["text"], "You are a race engineer.");
         assert_eq!(
             body["messages"],
-            json!([{"role": "user", "content": "Pit?"}])
+            json!([{"role": "user", "content": [
+                {"type": "text", "text": "Pit?", "cache_control": {"type": "ephemeral"}}
+            ]}])
         );
     }
 
@@ -933,10 +942,106 @@ mod tests {
         }
         assert!(trimmed);
         for (_, body) in requests.iter() {
-            assert!(serde_json::to_vec(body).unwrap().len() <= 120_000);
+            assert!(serde_json::to_vec(body).unwrap().len() <= 99_000);
             let messages = body["messages"].as_array().unwrap();
-            assert!(messages.len() <= 100);
+            assert!(messages.len() <= 98);
             assert_eq!(messages[0]["role"], "user");
+        }
+    }
+
+    struct Gap;
+
+    impl ToolHandler for Gap {
+        type Input = Value;
+
+        fn handle(
+            &self,
+            _: Value,
+        ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
+            async { Ok("y".repeat(1_500)) }
+        }
+    }
+
+    /// A race as the engineer has it: a prompt and tools as large as the real ones, a 7 KB
+    /// snapshot with each question, a tool round (a query of a few hundred bytes) for three
+    /// questions in four, and answers of a few sentences.
+    #[tokio::test]
+    async fn a_race_keeps_its_history_within_the_limits() {
+        let call = json!({
+            "model": "claude-haiku-5-5",
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": "gap-1", "name": "gap",
+                "input": {"query": "q".repeat(300)}}],
+        });
+        let answer = || {
+            let message = json!({
+                "model": "claude-haiku-5-5",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": format!("Box. {}", "a".repeat(400))}],
+            });
+            (200, message.to_string())
+        };
+        let responses = (0..28)
+            .flat_map(|index| match index % 4 {
+                3 => vec![answer()],
+                _ => vec![(200, call.to_string()), answer()],
+            })
+            .collect();
+        let (url, requests) = mock(responses).await;
+        let account = signed_in(url, "access-1");
+        let mut tools = Tools::default();
+        tools.insert("gap", None, json!({"type": "object"}), Gap);
+        let mut conversation = Conversation::new(
+            Some(&account),
+            "x".repeat(66_000).into(),
+            tools,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let mut firsts = Vec::new();
+        for index in 0..28 {
+            firsts.push(requests.lock().unwrap().len());
+            let question = format!(
+                "Question {index}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\n{}\n[END UNTRUSTED TELEMETRY SNAPSHOT]",
+                "z".repeat(7_000)
+            );
+            let reply = conversation.send(question).await.unwrap();
+            assert!(reply.text.starts_with("Box. "));
+        }
+        let requests = requests.lock().unwrap();
+        let is_question =
+            |message: &Value| message["role"] == "user" && message["content"][0]["type"] == "text";
+        for (_, body) in requests.iter() {
+            // Under the 100,000 bytes past which the server holds the allowance at the
+            // long-context rate
+            assert!(serde_json::to_vec(body).unwrap().len() <= 99_000);
+            assert!(body.get("cache_control").is_none());
+            let messages = body["messages"].as_array().unwrap();
+            assert!(messages.len() <= 128);
+            assert_eq!(messages[0]["role"], "user");
+            let newest = messages.iter().rposition(is_question).unwrap();
+            for (index, message) in messages.iter().enumerate() {
+                let blocks = message["content"].as_array().unwrap();
+                if is_question(message) {
+                    // Only the newest question has its snapshot, and the breakpoint
+                    assert_eq!(blocks.len(), if index == newest { 2 } else { 1 });
+                    assert_eq!(blocks[0].get("cache_control").is_some(), index == newest);
+                }
+                for block in blocks.iter().filter(|b| b["type"] == "tool_result") {
+                    let live = block["content"].as_str().unwrap().starts_with('y');
+                    assert_eq!(live, index > newest, "{block}");
+                }
+            }
+        }
+        // No trim in the first 10 questions, and a trim after them still keeps several
+        // exchanges: never only the newest
+        for (index, &first) in firsts.iter().enumerate() {
+            let messages = requests[first].1["messages"].as_array().unwrap();
+            let questions = messages.iter().filter(|m| is_question(m)).count();
+            match index < 10 {
+                true => assert_eq!(questions, index + 1, "question {index}"),
+                false => assert!(questions > 5, "question {index}: {questions}"),
+            }
         }
     }
 
