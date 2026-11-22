@@ -1008,8 +1008,12 @@ impl Engineer {
             );
         }
         if advance.cleared {
-            // A new weekend: what was being answered or said is about the last one
-            self.drop_scheduled();
+            // A new weekend: what was being answered or said is about the last one. A scheduled
+            // turn that already finished was kept by the conversation: it's taken in as usual
+            // (its answer is about cleared requests, so it isn't said)
+            if !self.scheduled.as_ref().is_some_and(|s| s.task.is_finished()) {
+                self.drop_scheduled();
+            }
             self.drop_waiting_answers();
             self.notice(t!("engineer.requests_cleared"));
         }
@@ -4529,6 +4533,26 @@ mod tests {
             scripted.finish(Act::Reply);
             assert_eq!(scripted.pending(), [RequestId(1), RequestId(2)]);
         }
+    }
+
+    #[test]
+    fn a_new_weekend_takes_in_a_scheduled_turn_that_finished() {
+        // Its answer in but not yet taken when a new weekend clears the requests: the
+        // conversation kept the exchange, so it's taken in, not put back as due
+        let mut scripted = Scripted::recorded();
+        scripted.scheduled_running();
+        scripted.acts.send(Act::Say(SILENCE.into())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !(scripted.engineer.scheduled.as_ref()).is_some_and(|s| s.task.is_finished()) {
+            assert!(Instant::now() < deadline, "never finished");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        scripted.new_weekend();
+        scripted.tick();
+        assert!(scripted.engineer.scheduled.is_none());
+        let nothing = t!("engineer.nothing_to_report", what = marker_fired());
+        assert!(scripted.noticed(&nothing));
+        assert!(scripted.pending().is_empty());
     }
 
     #[test]
