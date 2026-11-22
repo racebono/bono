@@ -547,6 +547,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_restart_the_app_doesnt_see_as_a_stop_looks_at_the_plugin_again() {
+        use crate::{process::Program, sim::Sim, track::TrackData};
+        use tokio::sync::watch;
+
+        let (steam, running) = watch::channel(true);
+        let (process, processes) = watch::channel(Program::default());
+        let mut sim = Sim {
+            name: LeMansUltimate::NAME,
+            id: LeMansUltimate::TRACK_DATA_ID,
+            game: Game::fake(),
+            running,
+            process: processes,
+            track_data: Arc::new(tokio::sync::Mutex::new(TrackData::new("lmu"))),
+            _watcher: Err(steam),
+            retrying: None,
+            was_running: (false, false),
+            simulator: LeMansUltimate::new(Game::fake()),
+        };
+        let version = Some(Some(crate::sim::Version {
+            major: 0,
+            minor: 2,
+            patch: 1,
+            build: None,
+        }));
+        let status = |installed| PluginStatus {
+            installed,
+            enabled: true,
+            bundled: version.clone(),
+            same_as_bundled: None,
+        };
+
+        // Run 1 reads the app's version
+        assert!(sim.started());
+        assert!(looked_at(&mut sim, status(version.clone())).await);
+
+        // The game restarts with an older plugin, which doesn't say its version, while Steam
+        // still reports the first run: the new process is a new run, with a new verdict
+        process.send_modify(|program| program.running = true);
+        assert!(sim.started());
+        assert!(!looked_at(&mut sim, status(Some(None))).await);
+        assert!(sim.plugin_outdated());
+    }
+
+    #[tokio::test]
     async fn no_session_is_followed_before_the_plugin_is_looked_at() {
         let mut lmu = LeMansUltimate::new(Game::fake());
         assert!(lmu.database(true).is_none());
