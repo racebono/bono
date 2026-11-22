@@ -191,8 +191,11 @@ fn version(dll: &Path) -> Option<Version> {
         return None;
     }
 
-    // Points into `data`, which outlives it
-    let info = unsafe { &*info.cast::<VS_FIXEDFILEINFO>() };
+    // `info` and `text` below point into `data`, which outlives them. They are read unaligned:
+    // Microsoft documents a version resource's values as aligned on 32-bit boundaries within the
+    // resource (see `VS_VERSIONINFO` and `String`), but not that `data` itself is aligned or that
+    // the resource starts at its first byte
+    let info = unsafe { info.cast::<VS_FIXEDFILEINFO>().read_unaligned() };
 
     // The build is only in the version string ("0.1.0+abc1234"), in the language `lmu/build.rs`
     // writes it in. Older DLLs and release builds have none
@@ -204,8 +207,11 @@ fn version(dll: &Path) -> Option<Version> {
     let build = (found != 0 && !text.is_null())
         .then(|| {
             // `chars` counts the terminating NUL
-            let text = unsafe { std::slice::from_raw_parts(text.cast::<u16>(), chars as usize) };
-            let text = String::from_utf16_lossy(text);
+            let text = text.cast::<u16>();
+            let text = (0..chars as usize)
+                .map(|i| unsafe { text.add(i).read_unaligned() })
+                .collect::<Vec<_>>();
+            let text = String::from_utf16_lossy(&text);
             let (_, build) = text.trim_end_matches('\0').split_once('+')?;
             Some(build.to_owned())
         })
