@@ -128,6 +128,9 @@ pub struct Engineer {
     new_session: bool,
     /// The question being answered
     turn: Option<Turn>,
+    /// The turns aborted in this conversation. Each one's future holds the conversation until
+    /// the runtime drops it, so [`Self::drop_session`] waits for them first.
+    aborted: Vec<TurnTask>,
     /// Answers waiting for their first piece of speech, in the order they were
     /// [queued](Self::queue): each joins the back of `line` once it has one, so an answer still
     /// being thought about never holds up one that's ready
@@ -233,11 +236,14 @@ struct Briefing {
     started_over: Arc<AtomicBool>,
 }
 
+/// A turn's task: the reply, with the changes to the requests the turn staged.
+type TurnTask = Task<anyhow::Result<(Reply, Vec<Change>)>>;
+
 /// The engineer's own turn, answering requests that fired. It's never the pilot's: a question
 /// asked while it runs drops it rather than steering it, and its text is only had once it's done.
 struct ScheduledTurn {
     /// The reply, with the changes to the requests the turn staged
-    task: Task<anyhow::Result<(Reply, Vec<Change>)>>,
+    task: TurnTask,
     /// The requests it answers
     batch: Batch,
     /// The language it's answered in
@@ -305,7 +311,7 @@ impl Conversation {
 /// A question being answered.
 struct Turn {
     /// The reply, with the changes to the requests the turn staged
-    task: Task<anyhow::Result<(Reply, Vec<Change>)>>,
+    task: TurnTask,
     /// The language it's answered in
     lang: ArrayStr<2>,
     /// The answer as the model writes it, for the chat
@@ -622,6 +628,7 @@ impl Engineer {
             session: None,
             new_session: false,
             turn: None,
+            aborted: Vec::new(),
             incoming: Vec::new(),
             line: VecDeque::new(),
             spotter_held: false,
@@ -950,7 +957,16 @@ impl Engineer {
         if let Some(mut scheduled) = self.scheduled.take() {
             self.unheard.splice(0..0, scheduled.told.untold());
             self.schedule.batch_dropped();
+            self.abort(scheduled.task);
         }
+    }
+
+    /// Aborts a turn's `task`, kept until the conversation it holds is dropped (see
+    /// [`Self::drop_session`]). Those whose futures are gone already are let go.
+    fn abort(&mut self, task: TurnTask) {
+        task.abort();
+        self.aborted.retain(|task| !task.is_finished());
+        self.aborted.push(task);
     }
 
     /// Registers the schedule's conditions with the followed tool, if they changed: a swap of
@@ -1211,8 +1227,16 @@ impl Engineer {
     fn drop_session(&mut self, rt: &Handle) {
         // Its turn goes with it: it runs again on the next conversation
         self.drop_scheduled();
+        let aborted = std::mem::take(&mut self.aborted);
         if let Some(session) = self.session.take() {
-            rt.spawn_blocking(move || drop(session));
+            // An aborted turn's future, dropped by a runtime worker, mustn't hold the last
+            // reference: the session is dropped once they're gone, on a blocking thread
+            rt.spawn(async move {
+                for task in aborted {
+                    task.ended().await;
+                }
+                let _ = tokio::task::spawn_blocking(move || drop(session)).await;
+            });
             // About the conversation that's over
             self.unheard.clear();
         }
@@ -1665,7 +1689,11 @@ impl Engineer {
         self.languages.update(rt, config.get().voices());
         // The game stopped: the conversation lets go of the database, so the plugin can delete it
         if sim.is_none() && self.session.is_some() {
-            let interrupted = self.turn.take().is_some();
+            let turn = self.turn.take();
+            let interrupted = turn.is_some();
+            if let Some(turn) = turn {
+                self.abort(turn.task);
+            }
             self.drop_session(rt);
             self.notice(t!("engineer.sim_stopped"));
             // The recording goes with the game
@@ -2102,6 +2130,7 @@ impl Engineer {
                 self.chat[entry].detail = Some(t!("engineer.detail_cut_off").into());
             }
             self.notice(t!("engineer.cancelled"));
+            self.abort(turn.task);
         }
         self.clear_line();
     }
@@ -2204,6 +2233,7 @@ impl Engineer {
         self.schedule.clear();
         let session = self.session.take();
         let tool = self.tool.take();
+        let aborted = std::mem::take(&mut self.aborted);
         rt.spawn(async move {
             if let Some(lease) = session.as_ref().and_then(|s| s.lease.as_ref())
                 && tokio::time::timeout(WAIT, lease.end_and_wait())
@@ -2213,7 +2243,11 @@ impl Engineer {
                 log::warn!("Gave up ending the Cloud session lease: it expires on its own");
             }
             // Closing the final pool reference joins SQLite workers, including an interrupted
-            // snapshot's job. Keep this off both the UI and the async executor's workers.
+            // snapshot's job. Keep this off both the UI and the async executor's workers, and
+            // so after the aborted turns holding it are gone (see `drop_session`).
+            for task in aborted {
+                task.ended().await;
+            }
             let _ = tokio::task::spawn_blocking(move || drop((session, tool))).await;
         })
     }
@@ -3750,6 +3784,84 @@ mod tests {
             assert!(!engineer.tool.as_ref().unwrap().is_same(&first));
             engineer.quit(&rt).await.unwrap();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_aborted_turn_never_drops_the_last_hold_on_its_conversation() {
+        /// An aborted turn's hold on the conversation: whether it was the last one, once the
+        /// runtime dropped it (slowly, so the conversation's own drop has time to go first)
+        struct Hold {
+            state: Arc<Mutex<SessionState>>,
+            last: Arc<AtomicBool>,
+        }
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                std::thread::sleep(Duration::from_millis(100));
+                let last = Arc::strong_count(&self.state) == 1;
+                self.last.store(last, atomic::Ordering::SeqCst);
+            }
+        }
+
+        let rt = tokio::runtime::Handle::current();
+        let dir = tempfile::tempdir().unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+        let pool = Pool::new(Database::read_only(Arc::new(dir.path().join("a.db"))), one, one);
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        let tool = engineer.tool_for(&rt, &pool);
+        let state = Arc::new(Mutex::new(SessionState {
+            conversation: Box::new(RecordingModel(Arc::default())),
+            pool: pool.clone(),
+            tool: tool.clone(),
+            schedule_tool: ScheduleTool::new(tool),
+            pit_tool: None,
+            sim: "lmu",
+            weekend: None,
+            starts: Arc::default(),
+            setup_outline: None,
+            forgotten: 0,
+            outline_offered: None,
+        }));
+        let gone = Arc::downgrade(&state);
+        let last = Arc::new(AtomicBool::new(false));
+        let hold = Hold {
+            state: state.clone(),
+            last: last.clone(),
+        };
+        engineer.session = Some(Session {
+            db: pool.database().path().to_owned(),
+            model: ModelConfig::default(),
+            corner_names: false,
+            user: None,
+            lease: None,
+            state,
+            starts: Arc::default(),
+        });
+        let (_, text) = mpsc::unbounded_channel();
+        engineer.turn = Some(Turn {
+            task: Task::spawn(async move {
+                let _hold = hold;
+                std::future::pending().await
+            }),
+            lang: arrstr!("en"),
+            text,
+            entry: None,
+            steer: Steer::default(),
+            steered: None,
+            told: Told::default(),
+        });
+
+        // The game stopped
+        engineer.stop();
+        engineer.drop_session(&rt);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while gone.strong_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the conversation was dropped");
+        assert!(!last.load(atomic::Ordering::SeqCst));
+        engineer.quit(&rt).await.unwrap();
     }
 
     /// How a [`ScriptedModel`]'s turn ends, once the test says.
