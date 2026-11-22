@@ -18,15 +18,17 @@ fn main() -> std::io::Result<()> {
     let mut dest = BufWriter::new(File::create(out_dir.join("codegen.rs"))?);
 
     // The locales to pick from, each by its own name. Every language translated into must have
-    // one, or its translations could never be shown. Except the spotter's calls: they're said in
-    // the voice's language, whichever languages the app is in
+    // one, or its translations could never be shown. Except what's said over the radio (the
+    // spotter's calls, the engineer's acknowledgement): it's said in the voice's language,
+    // whichever languages the app is in
     let locales = data
         .get("language_name")
         .map(|names| names.keys().cloned().collect::<BTreeSet<_>>())
         .unwrap_or_default();
     let language = |locale: &str| locale.split('-').next().unwrap_or_default().to_owned();
     let languages = locales.iter().map(|l| language(l)).collect::<BTreeSet<_>>();
-    for (key, translations) in data.iter().filter(|(key, _)| !key.starts_with("call.")) {
+    let radio = |key: &str| key.starts_with("call.") || key.starts_with("radio.");
+    for (key, translations) in data.iter().filter(|(key, _)| !radio(key)) {
         for locale in translations.keys() {
             if !languages.contains(&language(locale)) {
                 panic!(

@@ -1,6 +1,8 @@
 //! What the pilot hears of a turn while its first word is late: the app says a short
-//! acknowledgement ("Copiado.") once [`super::ACKNOWLEDGE_AFTER`] passes with nothing said, and
-//! the model's own acknowledgement, if it then writes one, isn't said again.
+//! acknowledgement ("Copiado, lo miro.") once [`super::ACKNOWLEDGE_AFTER`] passes with nothing
+//! said, and the model's own acknowledgement, if it then writes one, isn't said again.
+
+use bono_i18n::t;
 
 /// A turn's acknowledgement: what of the model's text is said, around the app's own. Each method
 /// returns what to say now, if anything, as the model's text is said.
@@ -115,65 +117,13 @@ impl Acknowledgement {
 }
 
 /// The app's acknowledgement in the voice language `lang` (a voice code, e.g. `es` or `no`): a
-/// short, common word for "received", hard to get wrong. `None` for a language without one, which
-/// isn't acknowledged: another language's word can't be understood in its voice.
+/// short, common phrase for "received, I'll check", hard to get wrong. `None` for a language
+/// without one, which isn't acknowledged: another language's words can't be understood in its
+/// voice.
 pub fn phrase(lang: &str) -> Option<&'static str> {
-    Some(match lang {
-        "ar" => "مفهوم.",
-        "bg" => "Разбрано.",
-        "bn" => "বুঝেছি।",
-        "ca" => "Copiat.",
-        "cs" => "Rozumím.",
-        "cy" => "Wedi derbyn.",
-        "da" => "Modtaget.",
-        "de" => "Verstanden.",
-        "el" => "Ελήφθη.",
-        "en" => "Copy.",
-        "es" => "Copiado.",
-        "et" => "Selge.",
-        "eu" => "Ulertuta.",
-        "fa" => "دریافت شد.",
-        "fi" => "Selvä.",
-        "fr" => "Reçu.",
-        "he" => "קיבלתי.",
-        "hi" => "ठीक है।",
-        "hu" => "Vettem.",
-        "hy" => "Հասկացա։",
-        "id" => "Diterima.",
-        "is" => "Móttekið.",
-        "it" => "Ricevuto.",
-        "ja" => "了解。",
-        "ka" => "გასაგებია.",
-        "kk" => "Түсінікті.",
-        "ko" => "알겠습니다.",
-        "ku" => "Fêm kir.",
-        "lb" => "Verstanen.",
-        "lt" => "Supratau.",
-        "lv" => "Sapratu.",
-        "ml" => "മനസ്സിലായി.",
-        "mr" => "समजलं.",
-        "ne" => "बुझें।",
-        "nl" => "Begrepen.",
-        "no" => "Oppfattet.",
-        "pl" => "Zrozumiano.",
-        "pt" => "Copiado.",
-        "ro" => "Recepționat.",
-        "ru" => "Принято.",
-        "sk" => "Rozumiem.",
-        "sl" => "Razumem.",
-        "sq" => "Kuptova.",
-        "sr" => "Примљено.",
-        "sv" => "Uppfattat.",
-        "sw" => "Nimepokea.",
-        "te" => "అర్థమైంది.",
-        "th" => "รับทราบ",
-        "tr" => "Anlaşıldı.",
-        "uk" => "Прийнято.",
-        "ur" => "ٹھیک ہے۔",
-        "vi" => "Đã rõ.",
-        "zh" => "收到。",
-        _ => return None,
-    })
+    let phrase = t!("radio.acknowledgement": lang);
+    // A language without its own is given English's
+    (lang == "en" || phrase != t!("radio.acknowledgement": "en")).then_some(phrase)
 }
 
 #[cfg(test)]
@@ -276,6 +226,7 @@ mod tests {
 
     #[test]
     fn has_no_phrase_for_an_unknown_language() {
+        assert_eq!(phrase("en"), Some("Copy, I'll check."));
         assert_eq!(phrase("xx"), None);
     }
 }

@@ -3504,7 +3504,7 @@ mod tests {
             .unwrap();
         let mut synth = Synthesizer::new(rt, &config.get());
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
-        // "Copiado." is still being synthesized when the turn ends with nothing after it
+        // "Copiado, lo miro." is still being synthesized when the turn ends with nothing after it
         let (_send, answer) = being_written();
         engineer.incoming.push(answer);
         let (_, text) = mpsc::unbounded_channel();
@@ -3523,7 +3523,7 @@ mod tests {
             usage: Default::default(),
             model: "test".into(),
         };
-        engineer.answer(rt, &config, &mut synth, reply, Some("Copiado.\n".into()), turn);
+        engineer.answer(rt, &config, &mut synth, reply, Some("Copiado, lo miro.\n".into()), turn);
         // After it, not ahead of it
         assert_eq!(engineer.incoming.len(), 1);
         assert!(engineer.incoming[0].tone_after_drain);
@@ -3547,10 +3547,10 @@ mod tests {
             (StopReason::Refusal, "", None, true),
             (StopReason::EndTurn, "", None, true),
             // The app acknowledged, and the model said nothing after it
-            (StopReason::EndTurn, "", Some("Copiado.\n"), true),
+            (StopReason::EndTurn, "", Some("Copiado, lo miro.\n"), true),
             // Nor after its own acknowledgement, dropped
-            (StopReason::EndTurn, "Copio, miro.\n\n", Some("Copiado.\n"), true),
-            (StopReason::EndTurn, "Copio.\n\nBien.", Some("Copiado.\nBien."), false),
+            (StopReason::EndTurn, "Copio, miro.\n\n", Some("Copiado, lo miro.\n"), true),
+            (StopReason::EndTurn, "Copio.\n\nBien.", Some("Copiado, lo miro.\nBien."), false),
             (StopReason::EndTurn, "Complete answer", None, false),
             (StopReason::StopSequence, "Complete answer", None, false),
         ] {
@@ -5893,7 +5893,7 @@ mod tests {
     /// Waits for the app's acknowledgement in the chat.
     fn until_acknowledged(scripted: &mut Scripted) {
         scripted.until("acknowledged", |s| {
-            s.answer().is_some_and(|e| e.text.starts_with("Copiado.\n"))
+            s.answer().is_some_and(|e| e.text.starts_with("Copiado, lo miro.\n"))
         });
     }
 
@@ -5907,7 +5907,7 @@ mod tests {
         assert!(heard.elapsed() < ACKNOWLEDGE_AFTER / 2, "{:?}", heard.elapsed());
         scripted.acts.send(Act::Write("Delanteros bien.")).unwrap();
         scripted.finish(Act::End(StopReason::EndTurn, "Delanteros bien."));
-        assert_eq!(scripted.answer().unwrap().text, "Copiado.\nDelanteros bien.");
+        assert_eq!(scripted.answer().unwrap().text, "Copiado, lo miro.\nDelanteros bien.");
     }
 
     #[test]
@@ -5922,7 +5922,7 @@ mod tests {
         drop(busy);
         scripted.acts.send(Act::Write("Delanteros bien.")).unwrap();
         scripted.finish(Act::End(StopReason::EndTurn, "Delanteros bien."));
-        assert_eq!(scripted.answer().unwrap().text, "Copiado.\nDelanteros bien.");
+        assert_eq!(scripted.answer().unwrap().text, "Copiado, lo miro.\nDelanteros bien.");
     }
 
     #[test]
@@ -5951,17 +5951,17 @@ mod tests {
             StopReason::EndTurn,
             "Copio, miro los neumáticos.\n\nDelanteros bien.",
         ));
-        assert_eq!(scripted.answer().unwrap().text, "Copiado.\nDelanteros bien.");
+        assert_eq!(scripted.answer().unwrap().text, "Copiado, lo miro.\nDelanteros bien.");
     }
 
     #[test]
     fn keeps_an_answer_written_before_a_schedule_or_pit_call() {
         // What came before tools that only act answered; before any query, it acknowledged
         let groups: [(&'static [&'static str], &str); 4] = [
-            (&[ScheduleTool::NAME], "Copiado.\nDelanteros bien.\nHecho."),
-            (&[PitTool::NAME], "Copiado.\nDelanteros bien.\nHecho."),
-            (&[PitTool::NAME, ScheduleTool::NAME], "Copiado.\nDelanteros bien.\nHecho."),
-            (&[ScheduleTool::NAME, EngineerTool::NAME], "Copiado.\nHecho."),
+            (&[ScheduleTool::NAME], "Copiado, lo miro.\nDelanteros bien.\nHecho."),
+            (&[PitTool::NAME], "Copiado, lo miro.\nDelanteros bien.\nHecho."),
+            (&[PitTool::NAME, ScheduleTool::NAME], "Copiado, lo miro.\nDelanteros bien.\nHecho."),
+            (&[ScheduleTool::NAME, EngineerTool::NAME], "Copiado, lo miro.\nHecho."),
         ];
         for (tools, heard) in groups {
             let mut scripted = acknowledging();
@@ -5996,7 +5996,7 @@ mod tests {
         scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
         until_acknowledged(&mut scripted);
         scripted.finish(Act::End(StopReason::EndTurn, ""));
-        assert_eq!(scripted.answer().unwrap().text, "Copiado.\n");
+        assert_eq!(scripted.answer().unwrap().text, "Copiado, lo miro.\n");
     }
 
     #[test]
@@ -6007,7 +6007,7 @@ mod tests {
         scripted.acts.send(Act::Write("Los delanteros")).unwrap();
         scripted.finish(Act::Fail);
         let answer = scripted.answer().unwrap();
-        assert_eq!(answer.text, "Copiado.\nLos delanteros");
+        assert_eq!(answer.text, "Copiado, lo miro.\nLos delanteros");
         assert_eq!(answer.detail.as_deref(), Some(t!("engineer.detail_cut_off")));
     }
 
@@ -6022,10 +6022,10 @@ mod tests {
         scripted.acts.send(Act::Write("Todos bien.")).unwrap();
         scripted.finish(Act::End(StopReason::EndTurn, "Todos bien."));
         let acknowledged = (scripted.engineer.chat.iter())
-            .filter(|e| e.text.contains("Copiado."))
+            .filter(|e| e.text.contains("Copiado, lo miro."))
             .count();
         assert_eq!(acknowledged, 1);
-        assert_eq!(scripted.answer().unwrap().text, "Copiado.\nTodos bien.");
+        assert_eq!(scripted.answer().unwrap().text, "Copiado, lo miro.\nTodos bien.");
     }
 
     #[test]
@@ -6047,10 +6047,10 @@ mod tests {
         scripted.until("acknowledged again", |s| answers(s) == 2);
         // Not straight away, from the first question's release
         assert!(asked.elapsed() > ACKNOWLEDGE_AFTER / 2, "{:?}", asked.elapsed());
-        assert_eq!(scripted.answer().unwrap().text, "Copiado.\n");
+        assert_eq!(scripted.answer().unwrap().text, "Copiado, lo miro.\n");
         scripted.acts.send(Act::Write("Traseros bien.")).unwrap();
         scripted.finish(Act::End(StopReason::EndTurn, "Traseros bien."));
-        assert_eq!(scripted.answer().unwrap().text, "Copiado.\nTraseros bien.");
+        assert_eq!(scripted.answer().unwrap().text, "Copiado, lo miro.\nTraseros bien.");
     }
 
     #[test]
