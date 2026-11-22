@@ -1710,13 +1710,15 @@ impl Logic {
     /// Keeps quiet if switched off for the qualifying session it's in. Nothing's followed then, so
     /// it starts afresh (as in a new session) once it's on again, instead of calling what changed
     /// while it was off: nothing but the player's laps, whose times can still be said (and the
-    /// standings their ends are told by, and when the newest update was). Whether it's quiet.
+    /// standings their ends are told by, and when the newest update was), and the forecast points
+    /// already called, which aren't called again. Whether it's quiet.
     fn mute(&mut self, config: &SpotterConfig) -> bool {
         self.muted = self.qualifying && !*config.qualifying();
         if self.muted {
             *self = Logic {
                 time: self.time,
                 prev_scoring: self.prev_scoring.take(),
+                forecast_called: std::mem::take(&mut self.forecast_called),
                 lap_invalidated: self.lap_invalidated,
                 lap_in_pit_lane: self.lap_in_pit_lane,
                 lap_ended: self.lap_ended,
@@ -5592,6 +5594,31 @@ mod tests {
         assert_eq!(at(3060.0), ["rain likely in about 9 minutes"]);
         // Once
         assert!(at(3100.0).is_empty());
+    }
+
+    #[test]
+    fn rain_on_the_way_is_not_called_again_once_qualifying_is_switched_back_on() {
+        let mut config = SpotterConfig::default();
+        config.qualifying.set(true);
+        let mut logic = Logic::default();
+        let scoring = Scoring {
+            rain: Some(0.0),
+            phase: Some("green".into()),
+            session_type: Some("qualifying".into()),
+            session_end_time: Some(3600.0),
+            // Rain likely at the end, an hour in
+            forecast: vec![(0.0, 0.0), (1.0, 0.8)],
+            ..Scoring::default()
+        };
+        let mut at = |config: &SpotterConfig, t: f64| {
+            texts(logic.update(config, &player(t), &[], &Wheels::default(), Some(&scoring)))
+        };
+
+        assert_eq!(at(&config, 3060.0), ["rain likely in about {} minutes"]);
+        config.qualifying.set(false);
+        assert!(at(&config, 3061.0).is_empty());
+        config.qualifying.set(true);
+        assert!(at(&config, 3062.0).is_empty());
     }
 
     #[test]
