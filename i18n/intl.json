@@ -1475,9 +1475,9 @@
         "ca": "No s'ha pogut connectar amb Bono Cloud"
     },
     "provider.bono_cloud_no_allowance": {
-        "en": "You've used this week's Bono Cloud allowance: it starts over when the week resets",
-        "es": "Has gastado la asignación semanal de Bono Cloud: se renueva cuando empieza la nueva semana",
-        "ca": "Has gastat l'assignació setmanal de Bono Cloud: es renova quan comença la setmana nova"
+        "en": "There isn't enough Bono Cloud allowance left for this: a subscription's starts over each week, a trial's doesn't",
+        "es": "No queda suficiente asignación de Bono Cloud para esto: la de una suscripción se renueva cada semana, la de una prueba no",
+        "ca": "No queda prou assignació de Bono Cloud per a això: la d'una subscripció es renova cada setmana, la d'una prova no"
     },
     "provider.bono_cloud_daily_allowance": {
         "en": "You've reached Bono Cloud's daily limit: try again later",
