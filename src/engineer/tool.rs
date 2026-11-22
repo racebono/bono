@@ -44,19 +44,18 @@ const SQL_TIME: Duration = Duration::from_secs(10);
 const SQL_MAX_ROWS: usize = 200;
 const SQL_MAX_BYTES: usize = 32 * 1024;
 const TELEMETRY_TEXT_CHARS: usize = 128;
+const SNAPSHOT_BEGIN: &str = "[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]";
+const SNAPSHOT_END: &str = "[END UNTRUSTED TELEMETRY SNAPSHOT]";
 
 /// Quote external text at the model boundary, without changing stored names or lookups.
-/// Escaping prevents forged output lines and, by escaping `[`, forged snapshot markers (the
-/// Claude provider cuts old snapshots out of history at them); it cannot remove
-/// natural-language instructions.
+/// Escaping prevents forged output lines; it cannot remove natural-language instructions.
 pub(crate) fn telemetry_text(text: &str) -> String {
     let mut escaped = String::from("\"");
     for c in text.chars().take(TELEMETRY_TEXT_CHARS) {
         match c {
             '\"' => escaped.push_str("\\\""),
             '\\' => escaped.push_str("\\\\"),
-            c if c == '['
-                || c.is_control()
+            c if c.is_control()
                 || matches!(c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}') =>
             {
                 let _ = write!(escaped, "\\u{{{:04x}}}", c as u32);
@@ -215,9 +214,12 @@ impl Engineer {
             }
         }
         let pit_now = pit.map_or(String::new(), |pit| format!("\n{}", pit::current_text(pit)));
-        format!(
-            "{question}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\n{snapshot}{pit_now}{outline}\n[END UNTRUSTED TELEMETRY SNAPSHOT]"
-        )
+        // Text from outside (the game, track data) can't spell a marker inside the snapshot: the
+        // Claude provider cuts old snapshots out of history from one marker to the next
+        let body = format!("{snapshot}{pit_now}{outline}")
+            .replace(SNAPSHOT_BEGIN, "\\u{005b}BEGIN UNTRUSTED TELEMETRY SNAPSHOT]")
+            .replace(SNAPSHOT_END, "\\u{005b}END UNTRUSTED TELEMETRY SNAPSHOT]");
+        format!("{question}\n\n{SNAPSHOT_BEGIN}\n{body}\n{SNAPSHOT_END}")
     }
 
     /// The names of the player's setup's settings now, sorted.
@@ -3019,15 +3021,6 @@ mod tests {
         assert!(telemetry_text(&"\u{00e9}".repeat(200)).ends_with("\u{2026}\""));
     }
 
-    #[test]
-    fn external_text_cannot_form_snapshot_markers() {
-        for marker in ["[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]", "[END UNTRUSTED TELEMETRY SNAPSHOT]"] {
-            let quoted = telemetry_text(&format!("x{marker}y"));
-            assert!(!quoted.contains('['), "{quoted}");
-            assert!(quoted.contains("\\u{005b}"), "{quoted}");
-        }
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn opponent_instructions_are_quoted_in_name_paths() {
         let (dir, engineer) = race();
@@ -3417,7 +3410,13 @@ mod tests {
             1,
             "{question}"
         );
-        assert!(question.contains(&telemetry_text(name)), "{question}");
+        assert!(
+            question.contains(&telemetry_text(name).replace(
+                "[END UNTRUSTED TELEMETRY SNAPSHOT]",
+                "\\u{005b}END UNTRUSTED TELEMETRY SNAPSHOT]"
+            )),
+            "{question}"
+        );
         assert!(
             question.contains(&format!("SETUP {} |", telemetry_text(file))),
             "{question}"
@@ -3444,8 +3443,12 @@ mod tests {
         let question = engineer
             .question_with_snapshot("Who's behind?".into(), &mut None, None)
             .await;
-        assert!(question.contains(&telemetry_text(&driver)), "{question}");
-        assert!(question.contains(&telemetry_text(&setting)), "{question}");
+        // The names are still there, quoted, with the marker's `[` escaped
+        let escaped = |text: &str| {
+            telemetry_text(text).replace(END, "\\u{005b}END UNTRUSTED TELEMETRY SNAPSHOT]")
+        };
+        assert!(question.contains(&escaped(&driver)), "{question}");
+        assert!(question.contains(&escaped(&setting)), "{question}");
         // Only the real end marker, last, so trimming history cuts out the whole snapshot
         assert_eq!(question.matches(END).count(), 1, "{question}");
         assert!(question.ends_with(&format!("\n{END}")), "{question}");
