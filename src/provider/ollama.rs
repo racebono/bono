@@ -10,7 +10,7 @@ use futures::future::{BoxFuture, join_all};
 use bono_i18n::t;
 use reqwest::{
     StatusCode,
-    header::{AUTHORIZATION, HeaderMap, HeaderValue},
+    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -24,6 +24,10 @@ use std::{
 
 /// Where Ollama listens unless `OLLAMA_HOST` says otherwise.
 const DEFAULT_HOST: &str = "http://127.0.0.1:11434";
+
+/// The most of the context window a turn's first prompt may take: the rest is room for the
+/// answer, the turn's tool results, and the prompt's estimated size being off.
+const PROMPT_SHARE: f64 = 0.75;
 
 /// The models pulled on Ollama at `host` (as `OLLAMA_HOST` says it: when `None`, `OLLAMA_HOST`,
 /// or this PC), by name.
@@ -98,6 +102,11 @@ pub struct Conversation {
     usage: BTreeMap<String, Usage>,
     /// Questions the pilot asks while a turn runs (see [`Model::set_steer`])
     steer: Option<Steer>,
+    /// The last prompt's tokens (as Ollama counted them) per byte of its request, to estimate
+    /// the next one's: `None` until a response says
+    tokens_per_byte: Option<f64>,
+    /// See [`Model::forgotten`]
+    forgotten: u64,
 }
 
 impl Model for Conversation {
@@ -109,9 +118,11 @@ impl Model for Conversation {
         Box::pin(async move {
             self.check_thinking().await?;
 
+            let forgot = self.forget_to_fit(&text)?;
             let mut turn = Turn {
                 start: self.body.messages.len(),
                 conversation: self,
+                forgot,
                 keep: false,
             };
             let reply = turn
@@ -119,6 +130,9 @@ impl Model for Conversation {
                 .run_turn(text, &mut TextSink::new(on_text))
                 .await?;
 
+            if !turn.forgot.is_empty() {
+                turn.conversation.forgotten += 1;
+            }
             turn.keep = true;
             return Ok(reply);
         })
@@ -131,6 +145,11 @@ impl Model for Conversation {
     #[inline]
     fn usage(&self) -> &BTreeMap<String, Usage> {
         &self.usage
+    }
+
+    #[inline]
+    fn forgotten(&self) -> u64 {
+        self.forgotten
     }
 
     fn set_steer(&mut self, steer: Option<Steer>) {
@@ -209,6 +228,45 @@ impl Conversation {
         Ok(())
     }
 
+    /// Forgets the oldest exchanges, whole, until the prompt with `question` is expected to fit
+    /// in [`PROMPT_SHARE`] of the context window. Ollama doesn't document what it does with a
+    /// prompt that doesn't fit, so it's never sent one: what's forgotten is forgotten here, where
+    /// it's known. The prompt's tokens are estimated from its request's size in bytes, at the
+    /// last prompt's tokens per byte. Returns what it forgot, oldest first.
+    fn forget_to_fit(&mut self, question: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let Some(tokens_per_byte) = self.tokens_per_byte else {
+            return Ok(Vec::new());
+        };
+        let budget = f64::from(self.body.options.num_ctx.get()) * PROMPT_SHARE;
+        let question = serde_json::json!({"role": "user", "content": question});
+        // Each message is separated from the next by a comma
+        let mut bytes =
+            serde_json::to_vec(&self.body)?.len() + serde_json::to_vec(&question)?.len() + 1;
+
+        let messages = &self.body.messages;
+        let mut end = self.kept;
+        while end < messages.len() && bytes as f64 * tokens_per_byte > budget {
+            // An exchange runs from its question to the next one
+            let next = messages[end + 1..]
+                .iter()
+                .position(|message| message["role"] == "user")
+                .map_or(messages.len(), |i| end + 1 + i);
+            for message in &messages[end..next] {
+                bytes = bytes.saturating_sub(serde_json::to_vec(message)?.len() + 1);
+            }
+            end = next;
+        }
+
+        if end > self.kept {
+            log::info!(
+                "Ollama: forgot the {} oldest messages to fit {}'s context window",
+                end - self.kept,
+                self.body.model
+            );
+        }
+        Ok(self.body.messages.drain(self.kept..end).collect())
+    }
+
     async fn run_turn(&mut self, text: String, sink: &mut TextSink<'_>) -> anyhow::Result<Reply> {
         self.body.messages.push(serde_json::json!({
             "role": "user",
@@ -224,6 +282,10 @@ impl Conversation {
             sink.start_response();
             let response = self.post(sink).await?;
             sink.end_block();
+            if response.prompt_eval_count > 0 {
+                self.tokens_per_byte =
+                    Some(response.prompt_eval_count as f64 / response.request_bytes as f64);
+            }
 
             let model = response.model.unwrap_or_else(|| self.body.model.clone());
             let cached = response.prompt_eval_cached_count;
@@ -240,8 +302,8 @@ impl Conversation {
             let stop = match response.done_reason.as_deref() {
                 Some("stop") if !calls.is_empty() => None,
                 Some("stop") => Some(StopReason::EndTurn),
-                // Ollama cuts the prompt to fit the context window without saying so: running out
-                // of room is all there is to go by
+                // Ollama doesn't say the context window ran out: running out of room is all there
+                // is to go by
                 Some("length")
                     if response.prompt_eval_count + response.eval_count
                         >= u64::from(self.body.options.num_ctx.get()) =>
@@ -330,12 +392,15 @@ impl Conversation {
     /// Sends the request and reads the streamed response, handing its text to `sink` as it
     /// comes.
     async fn post(&self, sink: &mut TextSink<'_>) -> anyhow::Result<Response> {
+        let body = serde_json::to_vec(&self.body)?;
+        let request_bytes = body.len();
         let mut resp = self
             .client
             .post(format!("{}/api/chat", self.base_url))
             .headers(self.headers.clone())
+            .header(CONTENT_TYPE, "application/json")
             .timeout(self.timeout)
-            .json(&self.body)
+            .body(body)
             .send()
             .await
             .with_context(|| self.unreachable())?;
@@ -344,7 +409,10 @@ impl Conversation {
         }
 
         // One JSON object per line
-        let mut response = Response::default();
+        let mut response = Response {
+            request_bytes,
+            ..Response::default()
+        };
         let mut line = Vec::new();
         while let Some(chunk) = resp
             .chunk()
@@ -379,13 +447,18 @@ impl Conversation {
 struct Turn<'a> {
     conversation: &'a mut Conversation,
     start: usize,
+    /// The oldest messages forgotten to make room for the turn, put back if it isn't kept
+    forgot: Vec<serde_json::Value>,
     keep: bool,
 }
 
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
         if !self.keep {
-            self.conversation.body.messages.truncate(self.start);
+            let kept = self.conversation.kept;
+            let messages = &mut self.conversation.body.messages;
+            messages.truncate(self.start);
+            messages.splice(kept..kept, self.forgot.drain(..));
         }
     }
 }
@@ -402,6 +475,8 @@ struct Response {
     prompt_eval_count: u64,
     prompt_eval_cached_count: u64,
     eval_count: u64,
+    /// The size of the request it answers, in bytes
+    request_bytes: usize,
 }
 
 impl Response {
@@ -598,8 +673,8 @@ impl ConversationBuilder {
         self
     }
 
-    /// The context window the model is loaded with, in tokens: Ollama silently drops the start
-    /// of a conversation that doesn't fit. More takes more memory. Defaults to 32768.
+    /// The context window the model is loaded with, in tokens: the oldest exchanges are
+    /// forgotten to keep the conversation within it. More takes more memory. Defaults to 32768.
     #[inline]
     pub fn context_length(&mut self, context_length: NonZeroU32) -> &mut Self {
         self.context_length = context_length;
@@ -705,6 +780,8 @@ impl ConversationBuilder {
             tools: self.tools,
             usage: BTreeMap::new(),
             steer: None,
+            tokens_per_byte: None,
+            forgotten: 0,
         });
     }
 }
@@ -1121,6 +1198,44 @@ mod tests {
         conversation.body.options.num_ctx = NonZeroU32::new(320).unwrap();
         let (reply, _) = send_streaming(&mut conversation, "Pit?").await.unwrap();
         assert_eq!(reply.stop, StopReason::ContextWindowExceeded);
+    }
+
+    #[tokio::test]
+    async fn forgets_the_oldest_exchanges_to_fit_the_context_window() {
+        let (url, requests) = mock(vec![
+            stream(&["Box."], Value::Null, "stop"),
+            stream(&["1.2s."], Value::Null, "stop"),
+            (404, json!({"error": "model 'nope' not found"}).to_string()),
+        ])
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = builder(&url, &calls);
+        // Every prompt counts 300 tokens: one question is all that fits in 3/4 of 400
+        builder.context_length(NonZeroU32::new(400).unwrap());
+        let mut conversation = builder.build(reqwest::Client::new()).unwrap();
+
+        send_streaming(&mut conversation, "Pit?").await.unwrap();
+        assert_eq!(conversation.forgotten(), 0);
+
+        // The first exchange makes room for the next question, and the engineer is told
+        send_streaming(&mut conversation, "Gap?").await.unwrap();
+        assert_eq!(conversation.forgotten(), 1);
+        let sent = requests.lock().unwrap()[1].1["messages"].clone();
+        assert_eq!(sent.as_array().unwrap().len(), 2);
+        assert_eq!(sent[0]["role"], "system");
+        assert_eq!(sent[1]["content"], "Gap?");
+
+        // A turn that fails puts back what it forgot
+        let history = conversation.body.messages.clone();
+        send_streaming(&mut conversation, "Fuel?")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            requests.lock().unwrap()[2].1["messages"][1]["content"],
+            "Fuel?"
+        );
+        assert_eq!(conversation.body.messages, history);
+        assert_eq!(conversation.forgotten(), 1);
     }
 
     #[tokio::test]
