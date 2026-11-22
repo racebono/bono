@@ -319,26 +319,7 @@ impl Spotter {
             .filter(|_| *settings.enabled())
             .and_then(|sim| sim.database())
             .map(|pool| pool.database().path().to_owned());
-
-        match (&mut self.running, db) {
-            (Some(running), Some(db)) if running.db == db => {
-                running.settings.send_if_modified(|current| {
-                    let changed = *current != (settings.clone(), frequency);
-                    *current = (settings.clone(), frequency);
-                    changed
-                });
-            }
-            (_, Some(db)) => {
-                self.running = Some(Running::start(db, settings.clone(), frequency));
-                self.queue.clear();
-            }
-            (_, None) => {
-                if self.running.take().is_some() {
-                    self.queue.clear();
-                    self.saying = None;
-                }
-            }
-        }
+        self.follow_database(db, &settings, frequency);
 
         let lang = self.language(config, &settings, engineer);
         if self.running.is_some() {
@@ -353,6 +334,31 @@ impl Spotter {
         }
 
         self.say(rt, config, synth, speaker, engineer, lang);
+    }
+
+    /// Follows `db`, or stops following when there's none. Starting on another database, or
+    /// stopping, drops the calls waiting and the one being said: they're about the old session.
+    fn follow_database(&mut self, db: Option<PathBuf>, settings: &SpotterConfig, frequency: u32) {
+        match (&mut self.running, db) {
+            (Some(running), Some(db)) if running.db == db => {
+                running.settings.send_if_modified(|current| {
+                    let changed = *current != (settings.clone(), frequency);
+                    *current = (settings.clone(), frequency);
+                    changed
+                });
+            }
+            (_, Some(db)) => {
+                self.running = Some(Running::start(db, settings.clone(), frequency));
+                self.queue.clear();
+                self.saying = None;
+            }
+            (_, None) => {
+                if self.running.take().is_some() {
+                    self.queue.clear();
+                    self.saying = None;
+                }
+            }
+        }
     }
 
     fn heard(&mut self, heard: Heard, at: Instant) {
@@ -2691,6 +2697,30 @@ mod tests {
             at,
         });
         (spotter, send)
+    }
+
+    #[test]
+    fn following_another_database_drops_the_call_being_said() {
+        // Neither database exists, so the spotter's thread ends straight away
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("first.db"), dir.path().join("second.db"));
+        let config = SpotterConfig::default();
+        let at = Instant::now();
+        let (mut spotter, send) = pending_call("car right", true, at);
+        let saying = spotter.saying.take();
+        spotter.follow_database(Some(first.clone()), &config, 1);
+        spotter.saying = saying;
+        Spotter::enqueue(&mut spotter.queue, call("car left", true), at);
+
+        // Still the same database: the call carries on
+        spotter.follow_database(Some(first), &config, 1);
+        assert!(spotter.saying.is_some());
+
+        // Another sim's: the old session's calls are dropped, and the synthesis cancelled
+        spotter.follow_database(Some(second), &config, 1);
+        assert!(spotter.saying.is_none());
+        assert!(spotter.queue.is_empty());
+        assert!(send.is_closed());
     }
 
     #[test]
