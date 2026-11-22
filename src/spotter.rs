@@ -319,26 +319,7 @@ impl Spotter {
             .filter(|_| *settings.enabled())
             .and_then(|sim| sim.database())
             .map(|pool| pool.database().path().to_owned());
-
-        match (&mut self.running, db) {
-            (Some(running), Some(db)) if running.db == db => {
-                running.settings.send_if_modified(|current| {
-                    let changed = *current != (settings.clone(), frequency);
-                    *current = (settings.clone(), frequency);
-                    changed
-                });
-            }
-            (_, Some(db)) => {
-                self.running = Some(Running::start(db, settings.clone(), frequency));
-                self.queue.clear();
-            }
-            (_, None) => {
-                if self.running.take().is_some() {
-                    self.queue.clear();
-                    self.saying = None;
-                }
-            }
-        }
+        self.follow_database(db, &settings, frequency);
 
         let lang = self.language(config, &settings, engineer);
         if self.running.is_some() {
@@ -353,6 +334,31 @@ impl Spotter {
         }
 
         self.say(rt, config, synth, speaker, engineer, lang);
+    }
+
+    /// Follows `db`, or stops following when there's none. Starting on another database, or
+    /// stopping, drops the calls waiting and the one being said: they're about the old session.
+    fn follow_database(&mut self, db: Option<PathBuf>, settings: &SpotterConfig, frequency: u32) {
+        match (&mut self.running, db) {
+            (Some(running), Some(db)) if running.db == db => {
+                running.settings.send_if_modified(|current| {
+                    let changed = *current != (settings.clone(), frequency);
+                    *current = (settings.clone(), frequency);
+                    changed
+                });
+            }
+            (_, Some(db)) => {
+                self.running = Some(Running::start(db, settings.clone(), frequency));
+                self.queue.clear();
+                self.saying = None;
+            }
+            (_, None) => {
+                if self.running.take().is_some() {
+                    self.queue.clear();
+                    self.saying = None;
+                }
+            }
+        }
     }
 
     fn heard(&mut self, heard: Heard, at: Instant) {
@@ -1630,7 +1636,7 @@ struct Logic {
     /// The player's last lap ended where the simulator says whether laps count (LMU), until
     /// its time has had `LAP_MATCH` to come
     line_check: Option<LineCheck>,
-    /// The newest update was in qualifying
+    /// The newest update was in qualifying, or in a session not known yet (no session row)
     qualifying: bool,
     /// Keeping quiet: qualifying, with the spotter off for it
     muted: bool,
@@ -1710,13 +1716,15 @@ impl Logic {
     /// Keeps quiet if switched off for the qualifying session it's in. Nothing's followed then, so
     /// it starts afresh (as in a new session) once it's on again, instead of calling what changed
     /// while it was off: nothing but the player's laps, whose times can still be said (and the
-    /// standings their ends are told by, and when the newest update was). Whether it's quiet.
+    /// standings their ends are told by, and when the newest update was), and the forecast points
+    /// already called, which aren't called again. Whether it's quiet.
     fn mute(&mut self, config: &SpotterConfig) -> bool {
         self.muted = self.qualifying && !*config.qualifying();
         if self.muted {
             *self = Logic {
                 time: self.time,
                 prev_scoring: self.prev_scoring.take(),
+                forecast_called: std::mem::take(&mut self.forecast_called),
                 lap_invalidated: self.lap_invalidated,
                 lap_in_pit_lane: self.lap_in_pit_lane,
                 lap_ended: self.lap_ended,
@@ -1756,7 +1764,8 @@ impl Logic {
         }
         self.time = Some(t);
 
-        self.qualifying = scoring.is_some_and(|s| s.session_type.as_deref() == Some("qualifying"));
+        // Before the session's first row it isn't known yet, so it may be qualifying
+        self.qualifying = scoring.is_none_or(|s| s.session_type.as_deref() == Some("qualifying"));
         if self.mute(config) {
             // Its lap times are still said, if asked for (`lap_times` sees to that), so the laps
             // are followed all the same
@@ -2694,6 +2703,30 @@ mod tests {
     }
 
     #[test]
+    fn following_another_database_drops_the_call_being_said() {
+        // Neither database exists, so the spotter's thread ends straight away
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("first.db"), dir.path().join("second.db"));
+        let config = SpotterConfig::default();
+        let at = Instant::now();
+        let (mut spotter, send) = pending_call("car right", true, at);
+        let saying = spotter.saying.take();
+        spotter.follow_database(Some(first.clone()), &config, 1);
+        spotter.saying = saying;
+        Spotter::enqueue(&mut spotter.queue, call("car left", true), at);
+
+        // Still the same database: the call carries on
+        spotter.follow_database(Some(first), &config, 1);
+        assert!(spotter.saying.is_some());
+
+        // Another sim's: the old session's calls are dropped, and the synthesis cancelled
+        spotter.follow_database(Some(second), &config, 1);
+        assert!(spotter.saying.is_none());
+        assert!(spotter.queue.is_empty());
+        assert!(send.is_closed());
+    }
+
+    #[test]
     fn synthesis_expires_at_the_original_queue_deadline() {
         let at = Instant::now();
         for (urgent, lifetime) in [(true, URGENT_FOR), (false, OTHER_FOR)] {
@@ -3174,7 +3207,7 @@ mod tests {
                 &player,
                 others,
                 &Wheels::default(),
-                None,
+                Some(&Scoring::default()),
             )));
             t += 1.0 / 30.0;
         }
@@ -3267,7 +3300,7 @@ mod tests {
                 &p,
                 &others,
                 &Wheels::default(),
-                None,
+                Some(&Scoring::default()),
             )));
         }
         assert!(default_expired);
@@ -3571,6 +3604,11 @@ mod tests {
         } else {
             ((None, None), (None, None))
         };
+        conn.execute(
+            "INSERT INTO session (session_time, session_type) VALUES (0, 'race')",
+            [],
+        )
+        .unwrap();
         for (vehicle, (width, length), is_player) in [(1, mine, true), (2, theirs, false)] {
             conn.execute(
                 "INSERT INTO standings (vehicle_id, session_time, is_player, vehicle_width, \
@@ -3633,7 +3671,13 @@ mod tests {
         for i in 0..30 {
             let mut p = player(i as f64 / 30.0);
             p.car.speed = Some(2.0);
-            let calls = logic.update(&config, &p, &[other(2, 0.0, 3.0)], &Wheels::default(), None);
+            let calls = logic.update(
+                &config,
+                &p,
+                &[other(2, 0.0, 3.0)],
+                &Wheels::default(),
+                Some(&Scoring::default()),
+            );
             assert!(calls.is_empty());
         }
 
@@ -3758,10 +3802,49 @@ mod tests {
 
         // Not in qualifying, it isn't quiet whatever the setting
         let mut logic = Logic::default();
-        logic.update(&config, &player(0.0), &[], &Wheels::default(), None);
+        let race = Scoring {
+            session_type: Some("race".into()),
+            ..Scoring::default()
+        };
+        logic.update(&config, &player(0.0), &[], &Wheels::default(), Some(&race));
         config.qualifying.set(false);
         assert!(!logic.mute(&config));
         assert!(logic.prev.is_some());
+    }
+
+    #[test]
+    fn stays_quiet_until_the_session_is_known_if_off_for_qualifying() {
+        let race = Scoring {
+            session_type: Some("race".into()),
+            ..Scoring::default()
+        };
+        // A car alongside on the right for two seconds, the session known from `known_from`
+        let run = |config: &SpotterConfig, known_from: f64| {
+            let mut logic = Logic::default();
+            let mut calls = Vec::new();
+            for i in 0..60 {
+                let t = i as f64 / 30.0;
+                calls.extend(texts(logic.update(
+                    config,
+                    &player(t),
+                    &[other(2, 0.0, 3.0)],
+                    &Wheels::default(),
+                    (t >= known_from).then_some(&race),
+                )));
+            }
+            (calls, logic.muted)
+        };
+
+        // Off for qualifying, nothing's said before the first session row: it may be qualifying
+        let off = SpotterConfig::default();
+        assert_eq!(run(&off, f64::INFINITY), (vec![], true));
+        // Once it's known to be a race, it calls as usual
+        assert_eq!(run(&off, 1.0), (vec!["car right"], false));
+
+        // On for qualifying, it doesn't wait for the session
+        let mut on = SpotterConfig::default();
+        on.qualifying.set(true);
+        assert_eq!(run(&on, f64::INFINITY), (vec!["car right"], false));
     }
 
     #[test]
@@ -3983,7 +4066,7 @@ mod tests {
                 &p,
                 &[],
                 &Wheels::default(),
-                None,
+                Some(&Scoring::default()),
             )));
             t += 1.0 / 30.0;
         }
@@ -4599,8 +4682,9 @@ mod tests {
     fn calls_the_cars_own_alerts() {
         let config = SpotterConfig::default();
         let mut logic = Logic::default();
-        let mut step =
-            |p: &Player, wheels: &Wheels| texts(logic.update(&config, p, &[], wheels, None));
+        let mut step = |p: &Player, wheels: &Wheels| {
+            texts(logic.update(&config, p, &[], wheels, Some(&Scoring::default())))
+        };
 
         let mut p = player(30.0);
         assert!(step(&p, &Wheels::default()).is_empty());
@@ -5540,6 +5624,31 @@ mod tests {
         assert_eq!(at(3060.0), ["rain likely in about 9 minutes"]);
         // Once
         assert!(at(3100.0).is_empty());
+    }
+
+    #[test]
+    fn rain_on_the_way_is_not_called_again_once_qualifying_is_switched_back_on() {
+        let mut config = SpotterConfig::default();
+        config.qualifying.set(true);
+        let mut logic = Logic::default();
+        let scoring = Scoring {
+            rain: Some(0.0),
+            phase: Some("green".into()),
+            session_type: Some("qualifying".into()),
+            session_end_time: Some(3600.0),
+            // Rain likely at the end, an hour in
+            forecast: vec![(0.0, 0.0), (1.0, 0.8)],
+            ..Scoring::default()
+        };
+        let mut at = |config: &SpotterConfig, t: f64| {
+            texts(logic.update(config, &player(t), &[], &Wheels::default(), Some(&scoring)))
+        };
+
+        assert_eq!(at(&config, 3060.0), ["rain likely in about {} minutes"]);
+        config.qualifying.set(false);
+        assert!(at(&config, 3061.0).is_empty());
+        config.qualifying.set(true);
+        assert!(at(&config, 3062.0).is_empty());
     }
 
     #[test]

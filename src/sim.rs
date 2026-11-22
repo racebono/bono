@@ -122,16 +122,6 @@ where
         *self.running.borrow() || process_running(&self.process)
     }
 
-    /// Whether the game started running since the last call. A newly seen process also counts
-    /// while Steam still reports it running, so settings reach a game restarted under a lagging
-    /// Steam flag. Only reads channels, so it's cheap every frame.
-    pub fn started(&mut self) -> bool {
-        let process = process_running(&self.process);
-        let now = (*self.running.borrow() || process, process);
-        let (was_running, was_process) = std::mem::replace(&mut self.was_running, now);
-        (now.0 && !was_running) || (process && !was_process)
-    }
-
     /// Waits for Steam or the processes to report the game starting or stopping. Closed channels
     /// aren't waited on: `None` if both are.
     fn wait_for_change(&mut self) -> Option<Pin<Box<dyn Future<Output = ()> + '_>>> {
@@ -172,6 +162,22 @@ where
     pub fn database(&mut self) -> Option<&Pool> {
         let running = self.is_running();
         self.simulator.database(running)
+    }
+
+    /// Whether the game started running since the last call. A newly seen process also counts
+    /// while Steam still reports it running, so settings reach a game restarted under a lagging
+    /// Steam flag. A start also lets go of what the simulator knew of the last run, as
+    /// `release_if_stopped` does: under that lagging flag, a restart never looks like a stop.
+    /// Cheap every frame: it reads channels, and a start spawns any work it needs.
+    pub fn started(&mut self) -> bool {
+        let process = process_running(&self.process);
+        let now = (*self.running.borrow() || process, process);
+        let (was_running, was_process) = std::mem::replace(&mut self.was_running, now);
+        let started = (now.0 && !was_running) || (process && !was_process);
+        if started {
+            self.simulator.database(false);
+        }
+        started
     }
 
     /// Once the game stops, closes the database's connections (when nothing else still holds

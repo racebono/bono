@@ -51,10 +51,26 @@ impl<T> Task<T> {
         return None;
     }
 
-    /// Whether it's done, its result waiting for [`Self::update`] to take it.
-    #[cfg(test)]
+    /// Whether it's done, its result waiting for [`Self::update`] to take it. An aborted task is
+    /// done once its future is dropped.
     pub fn is_finished(&self) -> bool {
         self.handle.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    /// Stops it at its next `.await`, as dropping it does. Its future is dropped later, on the
+    /// runtime: [`Self::ended`] waits for that.
+    pub fn abort(&self) {
+        if let Some(handle) = &self.handle {
+            handle.inner.abort();
+        }
+    }
+
+    /// Waits for it to end, finished or aborted (its future dropped), and drops its result.
+    pub async fn ended(mut self) {
+        if let Some(mut handle) = self.handle.take() {
+            // A cancelled (or panicked) task's error is ignored: it's not wanted
+            let _ = (&mut handle.inner).await;
+        }
     }
 }
 

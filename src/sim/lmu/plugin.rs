@@ -13,7 +13,10 @@ use anyhow::Context;
 use futures::join;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
+};
 use tokio::try_join;
 
 /// The DLL's name, in the app's `plugins` folder and the game's `Plugins` folder.
@@ -22,11 +25,16 @@ const DLL: &str = "bono_lmu.dll";
 const PLUGIN_SETTINGS: &[&str] = &["UserData", "player", "CustomPluginVariables.JSON"];
 /// The setting the game loads a plugin by (the space is the game's).
 const ENABLED: &str = " Enabled";
+/// Whether the last hash of the plugins failed, so the warning isn't repeated at every look.
+static HASH_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// The plugin as installed in `install_dir` (the game's folder, if it's installed), and the copy
 /// that comes with the app.
 pub async fn status(install_dir: Option<PathBuf>) -> PluginStatus {
-    let bundled_dll = bundled_dll().await;
+    status_from(bundled_dll().await, install_dir).await
+}
+
+async fn status_from(bundled_dll: Option<PathBuf>, install_dir: Option<PathBuf>) -> PluginStatus {
     let installed_dll = install_dir
         .as_deref()
         .map(installed_dll)
@@ -51,9 +59,15 @@ pub async fn status(install_dir: Option<PathBuf>) -> PluginStatus {
         match (installed_dll, bundled_dll) {
             (Some(installed), Some(bundled)) => match try_join!(digest(installed), digest(bundled))
             {
-                Ok((installed, bundled)) => Some(installed == bundled),
+                Ok((installed, bundled)) => {
+                    HASH_FAILED.store(false, Ordering::Relaxed);
+                    Some(installed == bundled)
+                }
                 Err(e) => {
-                    log::warn!("Couldn't hash the Le Mans Ultimate plugin: {e}");
+                    // Once until a hash works: the plugin is looked at again while the game runs
+                    if !HASH_FAILED.swap(true, Ordering::Relaxed) {
+                        log::warn!("Couldn't hash the Le Mans Ultimate plugin: {e}");
+                    }
                     None
                 }
             },
@@ -188,8 +202,11 @@ fn version(dll: &Path) -> Option<Version> {
         return None;
     }
 
-    // Points into `data`, which outlives it
-    let info = unsafe { &*info.cast::<VS_FIXEDFILEINFO>() };
+    // `info` and `text` below point into `data`, which outlives them. They are read unaligned:
+    // Microsoft documents a version resource's values as aligned on 32-bit boundaries within the
+    // resource (see `VS_VERSIONINFO` and `String`), but not that `data` itself is aligned or that
+    // the resource starts at its first byte
+    let info = unsafe { info.cast::<VS_FIXEDFILEINFO>().read_unaligned() };
 
     // The build is only in the version string ("0.1.0+abc1234"), in the language `lmu/build.rs`
     // writes it in. Older DLLs and release builds have none
@@ -201,8 +218,11 @@ fn version(dll: &Path) -> Option<Version> {
     let build = (found != 0 && !text.is_null())
         .then(|| {
             // `chars` counts the terminating NUL
-            let text = unsafe { std::slice::from_raw_parts(text.cast::<u16>(), chars as usize) };
-            let text = String::from_utf16_lossy(text);
+            let text = text.cast::<u16>();
+            let text = (0..chars as usize)
+                .map(|i| unsafe { text.add(i).read_unaligned() })
+                .collect::<Vec<_>>();
+            let text = String::from_utf16_lossy(&text);
             let (_, build) = text.trim_end_matches('\0').split_once('+')?;
             Some(build.to_owned())
         })
@@ -236,7 +256,7 @@ mod tests {
         )
         .unwrap();
 
-        let before = status(Some(game.path().to_owned())).await;
+        let before = status_from(None, Some(game.path().to_owned())).await;
         assert!(before.installed.is_none());
         assert!(!before.enabled);
 
@@ -257,11 +277,26 @@ mod tests {
             })
         );
 
-        let after = status(Some(game.path().to_owned())).await;
+        let after = status_from(None, Some(game.path().to_owned())).await;
         assert_eq!(after.installed, Some(None));
         assert!(after.enabled);
-        // No bundled copy next to the test binary to compare it with
+        // No bundled copy to compare it with
         assert_eq!(after.same_as_bundled, None);
+    }
+
+    #[tokio::test]
+    async fn compares_the_installed_copy_with_the_bundled_one() {
+        let game = tempfile::tempdir().unwrap();
+        let bundled = game.path().join("bundled.dll");
+        std::fs::write(&bundled, b"plugin").unwrap();
+        install_from(&bundled, game.path()).await.unwrap();
+
+        let same = status_from(Some(bundled.clone()), Some(game.path().to_owned())).await;
+        assert_eq!(same.same_as_bundled, Some(true));
+
+        std::fs::write(&bundled, b"plugin, rebuilt").unwrap();
+        let changed = status_from(Some(bundled), Some(game.path().to_owned())).await;
+        assert_eq!(changed.same_as_bundled, Some(false));
     }
 
     #[tokio::test]
@@ -314,7 +349,7 @@ mod tests {
             assert!(error.to_string().contains("CustomPluginVariables.JSON"));
             assert_eq!(std::fs::read(&settings).unwrap(), contents.as_bytes());
             assert_eq!(std::fs::read(&dll).unwrap(), b"original dll");
-            assert!(!status(Some(game.path().to_owned())).await.enabled);
+            assert!(!status_from(None, Some(game.path().to_owned())).await.enabled);
         }
     }
 

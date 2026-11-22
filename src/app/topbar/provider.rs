@@ -36,6 +36,8 @@ const ALLOWANCE_DEBOUNCE: Duration = Duration::from_secs(30);
 const ALLOWANCE_MAX_AGE: Duration = Duration::from_mins(5);
 /// Below this many hours of driving left, the allowance is said to be running low
 const ALLOWANCE_LOW_HOURS: f64 = 2.0;
+/// ...and of a trial's, a couple of hours in all
+const TRIAL_LOW_HOURS: f64 = 0.5;
 
 /// How long Ollama keeps the model loaded, in seconds (`None`: Ollama's own)
 fn keep_alive_options() -> [(Option<f64>, &'static str); 5] {
@@ -721,7 +723,8 @@ impl ProviderTopbar {
         }
     }
 
-    /// What's left of the account's allowance this week, warning when it runs low.
+    /// What's left of the account's allowance (this week's, or the trial's), warning when it
+    /// runs low.
     fn show_allowance(&mut self, rt: &Handle, ui: &mut egui::Ui) {
         let Some(entitlement) = self.allowance(rt) else {
             return;
@@ -729,11 +732,23 @@ impl ProviderTopbar {
         let Some(hours) = entitlement.estimated_hours_left else {
             return;
         };
+        let hours_left = format!("{:.1}", hours.max(0.0));
+        // A trial's allowance never starts over, and is no more than a couple of hours in all:
+        // it's not "this week's", nor "running low" from the start
+        if entitlement.status == "trial" {
+            let text = t!("provider.bono_cloud_trial_hours_left", hours = hours_left);
+            if hours < TRIAL_LOW_HOURS {
+                let warn = ui.visuals().warn_fg_color;
+                ui.colored_label(warn, format!("{} {text}", egui_phosphor::bold::WARNING));
+            } else {
+                ui.weak(text);
+            }
+            return;
+        }
         let resets = (entitlement.week.as_ref())
             .and_then(|week| week.resets_at.as_deref())
             .and_then(resets_in)
             .unwrap_or_else(|| "?".into());
-        let hours_left = format!("{:.1}", hours.max(0.0));
         if hours < ALLOWANCE_LOW_HOURS {
             let text = t!(
                 "provider.bono_cloud_allowance_low",

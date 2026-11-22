@@ -742,6 +742,8 @@ fn readable_error(error: anyhow::Error) -> anyhow::Error {
     let readable = match (api.status, api.code.as_deref()) {
         (StatusCode::UNAUTHORIZED, _) => t!("provider.bono_cloud_session_ended"),
         (StatusCode::FORBIDDEN, _) => t!("provider.bono_cloud_unavailable"),
+        // Sent alike when a trial's allowance is used up (it never resets), a subscription's week
+        // is, or what's left can't cover the request, so the message must hold for all three
         (_, Some("allowance_exhausted")) => t!("provider.bono_cloud_no_allowance"),
         (_, Some("daily_allowance_exhausted")) => t!("provider.bono_cloud_daily_allowance"),
         (StatusCode::PAYLOAD_TOO_LARGE, _) => t!("provider.bono_cloud_too_long"),
@@ -1171,6 +1173,23 @@ mod tests {
                 assert_eq!(requests.lock().unwrap().len(), 1);
             }
         }
+    }
+
+    #[test]
+    fn used_up_trial_isnt_told_its_allowance_resets_weekly() {
+        let trial = claude::ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            r#type: Some("rate_limit_error".into()),
+            code: Some("allowance_exhausted".into()),
+            message: Some(
+                "Your Bono Cloud trial allowance is used up. Trial allowance does not reset.".into(),
+            ),
+            request_id: None,
+        };
+        let error = readable_error(trial.into());
+        assert_eq!(error.to_string(), t!("provider.bono_cloud_no_allowance"));
+        let english = t!("provider.bono_cloud_no_allowance": "en");
+        assert!(english.contains("a trial's doesn't"), "{english}");
     }
 
     #[tokio::test]

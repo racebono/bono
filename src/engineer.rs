@@ -130,6 +130,9 @@ pub struct Engineer {
     new_session: bool,
     /// The question being answered
     turn: Option<Turn>,
+    /// The turns aborted in this conversation. Each one's future holds the conversation until
+    /// the runtime drops it, so [`Self::drop_session`] waits for them first.
+    aborted: Vec<Box<dyn AbortedTurn>>,
     /// Answers waiting for their first piece of speech, in the order they were
     /// [queued](Self::queue): each joins the back of `line` once it has one, so an answer still
     /// being thought about never holds up one that's ready
@@ -308,6 +311,23 @@ impl Conversation {
     }
 }
 
+/// An aborted turn's task, a pilot's or a scheduled one, whatever its result: what
+/// [`Engineer::drop_session`] waits for.
+trait AbortedTurn: Send {
+    fn is_finished(&self) -> bool;
+    fn ended(self: Box<Self>) -> futures::future::BoxFuture<'static, ()>;
+}
+
+impl<T: Send + 'static> AbortedTurn for Task<T> {
+    fn is_finished(&self) -> bool {
+        Task::is_finished(self)
+    }
+
+    fn ended(self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
+        Box::pin(Task::ended(*self))
+    }
+}
+
 /// A question being answered.
 struct Turn {
     /// The reply, with the changes to the requests the turn staged, and everything the pilot
@@ -327,6 +347,8 @@ struct Turn {
     steered: Option<(Option<ArrayStr<2>>, Option<Instant>)>,
     /// The notes its question carries
     told: Told,
+    /// The low tone already sounded for it, as its speech failed: it ends without another
+    toned: bool,
 }
 
 impl Turn {
@@ -654,6 +676,7 @@ impl Engineer {
             session: None,
             new_session: false,
             turn: None,
+            aborted: Vec::new(),
             incoming: Vec::new(),
             line: VecDeque::new(),
             spotter_held: false,
@@ -992,7 +1015,16 @@ impl Engineer {
         if let Some(mut scheduled) = self.scheduled.take() {
             self.unheard.splice(0..0, scheduled.told.untold());
             self.schedule.batch_dropped();
+            self.abort(scheduled.task);
         }
+    }
+
+    /// Aborts a turn's `task`, waited for until the conversation it holds is dropped (see
+    /// [`Self::drop_session`]). Those whose futures are gone already are let go.
+    fn abort<T: Send + 'static>(&mut self, task: Task<T>) {
+        task.abort();
+        self.aborted.retain(|task| !task.is_finished());
+        self.aborted.push(Box::new(task));
     }
 
     /// Registers the schedule's conditions with the followed tool, if they changed: a swap of
@@ -1034,8 +1066,12 @@ impl Engineer {
             );
         }
         if advance.cleared {
-            // A new weekend: what was being answered or said is about the last one
-            self.drop_scheduled();
+            // A new weekend: what was being answered or said is about the last one. A scheduled
+            // turn that already finished was kept by the conversation: it's taken in as usual
+            // (its answer is about cleared requests, so it isn't said)
+            if !self.scheduled.as_ref().is_some_and(|s| s.task.is_finished()) {
+                self.drop_scheduled();
+            }
             self.drop_waiting_answers();
             self.notice(t!("engineer.requests_cleared"));
         }
@@ -1253,8 +1289,16 @@ impl Engineer {
     fn drop_session(&mut self, rt: &Handle) {
         // Its turn goes with it: it runs again on the next conversation
         self.drop_scheduled();
+        let aborted = std::mem::take(&mut self.aborted);
         if let Some(session) = self.session.take() {
-            rt.spawn_blocking(move || drop(session));
+            // An aborted turn's future, dropped by a runtime worker, mustn't hold the last
+            // reference: the session is dropped once they're gone, on a blocking thread
+            rt.spawn(async move {
+                for task in aborted {
+                    task.ended().await;
+                }
+                let _ = tokio::task::spawn_blocking(move || drop(session)).await;
+            });
             // About the conversation that's over
             self.unheard.clear();
         }
@@ -1330,6 +1374,8 @@ impl Engineer {
         // The turn hears it at its next tool hand-back, or answers it next
         if let Some(turn) = &mut self.turn {
             turn.steer.push(question);
+            // A tone that already sounded doesn't answer a question asked after it
+            turn.toned = false;
             let first = turn.steered.map_or(released, |(_, first)| first);
             turn.steered = Some((lang, first));
             return;
@@ -1581,6 +1627,7 @@ impl Engineer {
             steer,
             steered: None,
             told,
+            toned: false,
         });
     }
 
@@ -1769,7 +1816,11 @@ impl Engineer {
         self.languages.update(rt, config.get().voices());
         // The game stopped: the conversation lets go of the database, so the plugin can delete it
         if sim.is_none() && self.session.is_some() {
-            let interrupted = self.turn.take().is_some();
+            let turn = self.turn.take();
+            let interrupted = turn.is_some();
+            if let Some(turn) = turn {
+                self.abort(turn.task);
+            }
             self.drop_session(rt);
             self.notice(t!("engineer.sim_stopped"));
             // The recording goes with the game
@@ -1787,17 +1838,6 @@ impl Engineer {
             && session.model != config.get().model
         {
             lease.end();
-        }
-        // The account the conversation is had as signed out (or another signed in): it ends,
-        // answer on its way included
-        if self.session.as_ref().is_some_and(|s| !self.signed_in_as(s)) {
-            let interrupted = self.turn.is_some();
-            self.stop();
-            self.drop_session(rt);
-            self.notice(t!("engineer.signed_out"));
-            if interrupted {
-                self.no_beep();
-            }
         }
 
         // Before a turn's changes are applied, at the newest progress
@@ -1840,7 +1880,9 @@ impl Engineer {
                         }
                         self.notice(t!("engineer.error_asking", error = format!("{e:#}")));
                         // What it said before failing plays out first
-                        self.incomplete_beep();
+                        if !turn.toned {
+                            self.incomplete_beep();
+                        }
                     }
                 }
                 // Its answer has all it will have
@@ -1860,6 +1902,19 @@ impl Engineer {
             && let Some(scheduled) = self.scheduled.take()
         {
             self.finish_scheduled(rt, config, synth, scheduled, result);
+        }
+        // The account the conversation is had as signed out (or another signed in): it ends,
+        // answer on its way included. After the turns that finished are taken in: the conversation
+        // kept their exchanges, and the requests outlive it, so what they changed counts rather
+        // than being dropped as if they never ran
+        if self.session.as_ref().is_some_and(|s| !self.signed_in_as(s)) {
+            let interrupted = self.turn.is_some();
+            self.stop();
+            self.drop_session(rt);
+            self.notice(t!("engineer.signed_out"));
+            if interrupted {
+                self.no_beep();
+            }
         }
         self.run_scheduled(rt, sim, config);
 
@@ -1892,24 +1947,32 @@ impl Engineer {
                 // Its answer stops, unheard or not, as the chat only shows "say again"
                 self.drop_answers(|playback| playback.writing);
                 let say_again = t!("engineer.say_again": &turn.lang);
-                self.say(rt, config, synth, say_again, turn.lang, None);
-                if self.voice(config, turn.lang).is_none() {
-                    self.no_beep();
+                // A voice that failed this turn would fail again, sounding a second tone
+                if !turn.toned {
+                    self.say(rt, config, synth, say_again, turn.lang, None);
+                    if self.voice(config, turn.lang).is_none() {
+                        self.no_beep();
+                    }
                 }
                 say_again.to_owned()
             }
             StopReason::MaxTokens => {
                 detail = format!("{detail} | {}", t!("engineer.detail_cut_off"));
-                self.incomplete_beep();
+                if !turn.toned {
+                    self.incomplete_beep();
+                }
                 shown
             }
             // Every later question would end the same way: the next one starts over
             StopReason::ContextWindowExceeded => {
                 self.new_session = true;
                 detail = format!("{detail} | {}", t!("engineer.detail_full"));
-                self.incomplete_beep();
+                if !turn.toned {
+                    self.incomplete_beep();
+                }
                 shown
             }
+            // Its speech may still fail after this, sounding the tone: it's the one tone then
             StopReason::EndTurn | StopReason::StopSequence => {
                 // Nothing answered: the pilot heard nothing after the app's acknowledgement (its
                 // phrase is one line), or the model wrote nothing
@@ -1917,11 +1980,9 @@ impl Engineer {
                     Some(after) => !after.trim().is_empty(),
                     None => !reply.text.trim().is_empty(),
                 };
-                match (answered, &heard_after) {
-                    (true, _) => {}
-                    // After the acknowledgement, which may still be on its way
-                    (false, Some(_)) => self.incomplete_beep(),
-                    (false, None) => self.no_beep(),
+                // After what's still on its way (the acknowledgement, or nothing at all)
+                if !answered && !turn.toned {
+                    self.incomplete_beep();
                 }
                 shown
             }
@@ -2009,10 +2070,15 @@ impl Engineer {
                 Poll::Ready(Some(Err(e))) => {
                     let playback = self.incoming.remove(i);
                     let tone = playback.scheduled.is_none();
+                    let writing = playback.writing;
                     self.left(playback);
                     self.notice(t!("engineer.error_synthesizing", error = format!("{e:#}")));
                     if tone {
                         self.no_beep();
+                        // Its pilot turn ends without another
+                        if writing && let Some(turn) = &mut self.turn {
+                            turn.toned = true;
+                        }
                     }
                 }
                 // It said nothing
@@ -2084,10 +2150,15 @@ impl Engineer {
                 Poll::Ready(Some(Err(e))) => {
                     // No tone for a scheduled answer: the pilot didn't ask
                     let tone = playback.scheduled.is_none();
+                    let writing = playback.writing;
                     self.drop_front();
                     self.notice(t!("engineer.error_synthesizing", error = format!("{e:#}")));
                     if tone {
                         self.no_beep();
+                        // Its pilot turn ends without another
+                        if writing && let Some(turn) = &mut self.turn {
+                            turn.toned = true;
+                        }
                     }
                     return;
                 }
@@ -2193,6 +2264,7 @@ impl Engineer {
                 self.chat[entry].detail = Some(t!("engineer.detail_cut_off").into());
             }
             self.notice(t!("engineer.cancelled"));
+            self.abort(turn.task);
         }
         self.clear_line();
     }
@@ -2295,6 +2367,7 @@ impl Engineer {
         self.schedule.clear();
         let session = self.session.take();
         let tool = self.tool.take();
+        let aborted = std::mem::take(&mut self.aborted);
         rt.spawn(async move {
             if let Some(lease) = session.as_ref().and_then(|s| s.lease.as_ref())
                 && tokio::time::timeout(WAIT, lease.end_and_wait())
@@ -2304,7 +2377,11 @@ impl Engineer {
                 log::warn!("Gave up ending the Cloud session lease: it expires on its own");
             }
             // Closing the final pool reference joins SQLite workers, including an interrupted
-            // snapshot's job. Keep this off both the UI and the async executor's workers.
+            // snapshot's job. Keep this off both the UI and the async executor's workers, and
+            // so after the aborted turns holding it are gone (see `drop_session`).
+            for task in aborted {
+                task.ended().await;
+            }
             let _ = tokio::task::spawn_blocking(move || drop((session, tool))).await;
         })
     }
@@ -3166,6 +3243,7 @@ mod tests {
                     steer: Steer::default(),
                     steered: None,
                     told: Told::default(),
+                    toned: false,
                 },
             );
             assert!(engineer.line.is_empty(), "spoken: {spoken}");
@@ -3395,6 +3473,7 @@ mod tests {
             steer: Steer::default(),
             steered: None,
             told: Told::default(),
+            toned: false,
         });
         let deadline = Instant::now() + Duration::from_secs(10);
         while engineer.is_thinking() {
@@ -3461,6 +3540,7 @@ mod tests {
                     steer: Steer::default(),
                     steered: None,
                     told: Told::default(),
+                    toned: false,
                 },
             );
             assert_eq!(engineer.line.len(), 1, "{stop:?}");
@@ -3512,6 +3592,7 @@ mod tests {
             steer: Steer::default(),
             steered: None,
             told: Told::default(),
+            toned: false,
         };
         let reply = Reply {
             text: String::new(),
@@ -3560,6 +3641,7 @@ mod tests {
                 steer: Steer::default(),
                 steered: None,
                 told: Told::default(),
+                toned: false,
             };
             engineer.answer(
                 rt,
@@ -3585,6 +3667,102 @@ mod tests {
             }
         }
         assert!(engineer.new_session);
+    }
+
+    #[test]
+    fn failed_speech_and_an_empty_answer_sound_one_tone() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let rt = runtime.handle();
+        let dir = tempfile::tempdir().unwrap();
+        let config = rt
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let mut synth = Synthesizer::new(rt, &config.get());
+
+        // The speech fails while the turn runs (as without a voice), or after it ended
+        for fails_first in [true, false] {
+            let mut engineer = Engineer::new(reqwest::Client::new(), None);
+            let (speech, output) = SpeechOutput::channel();
+            let mut answer = Playback::new(output, false);
+            answer.writing = true;
+            engineer.queue(answer);
+            let (_, text) = mpsc::unbounded_channel();
+            engineer.turn = Some(Turn {
+                task: Task::spawn(std::future::pending()),
+                lang: arrstr!("en"),
+                text,
+                entry: None,
+                steer: Steer::default(),
+                steered: None,
+                told: Told::default(),
+                toned: false,
+            });
+            if fails_first {
+                speech.send(Err(anyhow::anyhow!("no voice"))).unwrap();
+                engineer.admit(1.0);
+            }
+            let turn = engineer.turn.take().unwrap();
+            engineer.answer(
+                rt,
+                &config,
+                &mut synth,
+                Reply {
+                    text: String::new(),
+                    stop: StopReason::EndTurn,
+                    usage: Default::default(),
+                    model: "test".into(),
+                },
+                None,
+                turn,
+            );
+            for playback in engineer.incoming.iter_mut().chain(&mut engineer.line) {
+                playback.writing = false;
+            }
+            if !fails_first {
+                speech.send(Err(anyhow::anyhow!("no voice"))).unwrap();
+                engineer.admit(1.0);
+            }
+            let waiting = engineer.incoming.len() + engineer.line.len();
+            assert_eq!(waiting, 1, "one tone (fails first: {fails_first})");
+            assert!(engineer.line[0].complete);
+        }
+
+        // A refused answer's "say again" isn't tried with a voice that just failed
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        let (speech, output) = SpeechOutput::channel();
+        let mut answer = Playback::new(output, false);
+        answer.writing = true;
+        engineer.queue(answer);
+        let (_, text) = mpsc::unbounded_channel();
+        engineer.turn = Some(Turn {
+            task: Task::spawn(std::future::pending()),
+            lang: arrstr!("en"),
+            text,
+            entry: None,
+            steer: Steer::default(),
+            steered: None,
+            told: Told::default(),
+            toned: false,
+        });
+        speech.send(Err(anyhow::anyhow!("no voice"))).unwrap();
+        engineer.admit(1.0);
+        let turn = engineer.turn.take().unwrap();
+        engineer.answer(
+            rt,
+            &config,
+            &mut synth,
+            Reply {
+                text: String::new(),
+                stop: StopReason::Refusal,
+                usage: Default::default(),
+                model: "test".into(),
+            },
+            None,
+            turn,
+        );
+        let waiting = engineer.incoming.len() + engineer.line.len();
+        assert_eq!(waiting, 1, "one tone for a refused answer");
     }
 
     /// A typed question answered the way the app does it: `ask_text`, then `update` every frame
@@ -3818,6 +3996,85 @@ mod tests {
             assert!(!engineer.tool.as_ref().unwrap().is_same(&first));
             engineer.quit(&rt).await.unwrap();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_aborted_turn_never_drops_the_last_hold_on_its_conversation() {
+        /// An aborted turn's hold on the conversation: whether it was the last one, once the
+        /// runtime dropped it (slowly, so the conversation's own drop has time to go first)
+        struct Hold {
+            state: Arc<Mutex<SessionState>>,
+            last: Arc<AtomicBool>,
+        }
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                std::thread::sleep(Duration::from_millis(100));
+                let last = Arc::strong_count(&self.state) == 1;
+                self.last.store(last, atomic::Ordering::SeqCst);
+            }
+        }
+
+        let rt = tokio::runtime::Handle::current();
+        let dir = tempfile::tempdir().unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+        let pool = Pool::new(Database::read_only(Arc::new(dir.path().join("a.db"))), one, one);
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        let tool = engineer.tool_for(&rt, &pool);
+        let state = Arc::new(Mutex::new(SessionState {
+            conversation: Box::new(RecordingModel(Arc::default())),
+            pool: pool.clone(),
+            tool: tool.clone(),
+            schedule_tool: ScheduleTool::new(tool),
+            pit_tool: None,
+            sim: "lmu",
+            weekend: None,
+            starts: Arc::default(),
+            setup_outline: None,
+            forgotten: 0,
+            outline_offered: None,
+        }));
+        let gone = Arc::downgrade(&state);
+        let last = Arc::new(AtomicBool::new(false));
+        let hold = Hold {
+            state: state.clone(),
+            last: last.clone(),
+        };
+        engineer.session = Some(Session {
+            db: pool.database().path().to_owned(),
+            model: ModelConfig::default(),
+            corner_names: false,
+            user: None,
+            lease: None,
+            state,
+            starts: Arc::default(),
+        });
+        let (_, text) = mpsc::unbounded_channel();
+        engineer.turn = Some(Turn {
+            task: Task::spawn(async move {
+                let _hold = hold;
+                std::future::pending().await
+            }),
+            lang: arrstr!("en"),
+            text,
+            entry: None,
+            steer: Steer::default(),
+            steered: None,
+            told: Told::default(),
+            toned: false,
+        });
+
+        // The game stopped
+        engineer.stop();
+        engineer.drop_session(&rt);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while gone.strong_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the conversation was dropped");
+        assert!(!last.load(atomic::Ordering::SeqCst));
+        engineer.quit(&rt).await.unwrap();
     }
 
     /// How a [`ScriptedModel`]'s turn ends, once the test says.
@@ -4467,6 +4724,71 @@ mod tests {
             assert!(added.contains("#2"), "{added}");
             scripted.finish(Act::Reply);
             assert_eq!(scripted.pending(), [RequestId(1), RequestId(2)]);
+        }
+    }
+
+    #[test]
+    fn a_new_weekend_takes_in_a_scheduled_turn_that_finished() {
+        // Its answer in but not yet taken when a new weekend clears the requests: the
+        // conversation kept the exchange, so it's taken in, not put back as due
+        let mut scripted = Scripted::recorded();
+        scripted.scheduled_running();
+        scripted.acts.send(Act::Say(SILENCE.into())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !(scripted.engineer.scheduled.as_ref()).is_some_and(|s| s.task.is_finished()) {
+            assert!(Instant::now() < deadline, "never finished");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        scripted.new_weekend();
+        scripted.tick();
+        assert!(scripted.engineer.scheduled.is_none());
+        let nothing = t!("engineer.nothing_to_report", what = marker_fired());
+        assert!(scripted.noticed(&nothing));
+        assert!(scripted.pending().is_empty());
+    }
+
+    #[test]
+    fn signing_out_takes_in_a_turn_that_finished() {
+        // A pilot turn or a scheduled one, its answer in but not yet taken when the account signs
+        // out: the conversation kept the exchange, and the requests outlive it
+        for scheduled in [false, true] {
+            let mut scripted = Scripted::recorded();
+            match scheduled {
+                false => {
+                    scripted.ask("Fuel every lap, please.");
+                    scripted.until("asked", |s| s.questions().len() == 1);
+                    scripted.schedule(fuel_every_lap()).unwrap();
+                    scripted.acts.send(Act::Reply).unwrap();
+                }
+                true => {
+                    scripted.scheduled_running();
+                    scripted.acts.send(Act::Say(SILENCE.into())).unwrap();
+                }
+            }
+            let finished = |e: &Engineer| match scheduled {
+                false => e.turn.as_ref().is_some_and(|t| t.task.is_finished()),
+                true => e.scheduled.as_ref().is_some_and(|s| s.task.is_finished()),
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !finished(&scripted.engineer) {
+                assert!(Instant::now() < deadline, "never finished");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let session = scripted.engineer.session.as_mut().unwrap();
+            session.user = Some("pilot".into());
+            scripted.frame();
+            assert!(scripted.engineer.session.is_none(), "scheduled: {scheduled}");
+            assert!(!scripted.cancelled(), "scheduled: {scheduled}");
+            match scheduled {
+                // Its request applied
+                false => assert_eq!(scripted.pending(), [RequestId(1)]),
+                // Answered, not due again
+                true => {
+                    let nothing = t!("engineer.nothing_to_report", what = marker_fired());
+                    assert!(scripted.noticed(&nothing));
+                    assert!(scripted.pending().is_empty());
+                }
+            }
         }
     }
 
