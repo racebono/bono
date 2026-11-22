@@ -3848,6 +3848,7 @@ mod tests {
             steer: Steer::default(),
             steered: None,
             told: Told::default(),
+            toned: false,
         });
 
         // The game stopped
