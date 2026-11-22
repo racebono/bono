@@ -320,6 +320,8 @@ struct Turn {
     steered: Option<(Option<ArrayStr<2>>, Option<Instant>)>,
     /// The notes its question carries
     told: Told,
+    /// The low tone already sounded for it, as its speech failed: it ends without another
+    toned: bool,
 }
 
 /// An answer in the engineer's line: speech played as it's synthesized.
@@ -1474,6 +1476,7 @@ impl Engineer {
             steer,
             steered: None,
             told,
+            toned: false,
         });
     }
 
@@ -1744,7 +1747,9 @@ impl Engineer {
                         }
                         self.notice(t!("engineer.error_asking", error = format!("{e:#}")));
                         // What it said before failing plays out first
-                        self.incomplete_beep();
+                        if !turn.toned {
+                            self.incomplete_beep();
+                        }
                     }
                 }
                 // Its answer has all it will have
@@ -1796,19 +1801,24 @@ impl Engineer {
             }
             StopReason::MaxTokens => {
                 detail = format!("{detail} | {}", t!("engineer.detail_cut_off"));
-                self.incomplete_beep();
+                if !turn.toned {
+                    self.incomplete_beep();
+                }
                 reply.text
             }
             // Every later question would end the same way: the next one starts over
             StopReason::ContextWindowExceeded => {
                 self.new_session = true;
                 detail = format!("{detail} | {}", t!("engineer.detail_full"));
-                self.incomplete_beep();
+                if !turn.toned {
+                    self.incomplete_beep();
+                }
                 reply.text
             }
+            // Its speech may still fail after this, sounding the tone: it's the one tone then
             StopReason::EndTurn | StopReason::StopSequence => {
-                if reply.text.trim().is_empty() {
-                    self.no_beep();
+                if reply.text.trim().is_empty() && !turn.toned {
+                    self.incomplete_beep();
                 }
                 reply.text
             }
@@ -1896,10 +1906,15 @@ impl Engineer {
                 Poll::Ready(Some(Err(e))) => {
                     let playback = self.incoming.remove(i);
                     let tone = playback.scheduled.is_none();
+                    let writing = playback.writing;
                     self.left(playback);
                     self.notice(t!("engineer.error_synthesizing", error = format!("{e:#}")));
                     if tone {
                         self.no_beep();
+                        // Its pilot turn ends without another
+                        if writing && let Some(turn) = &mut self.turn {
+                            turn.toned = true;
+                        }
                     }
                 }
                 // It said nothing
@@ -1971,10 +1986,15 @@ impl Engineer {
                 Poll::Ready(Some(Err(e))) => {
                     // No tone for a scheduled answer: the pilot didn't ask
                     let tone = playback.scheduled.is_none();
+                    let writing = playback.writing;
                     self.drop_front();
                     self.notice(t!("engineer.error_synthesizing", error = format!("{e:#}")));
                     if tone {
                         self.no_beep();
+                        // Its pilot turn ends without another
+                        if writing && let Some(turn) = &mut self.turn {
+                            turn.toned = true;
+                        }
                     }
                     return;
                 }
@@ -3056,6 +3076,7 @@ mod tests {
                     steer: Steer::default(),
                     steered: None,
                     told: Told::default(),
+                    toned: false,
                 },
             );
             assert!(engineer.line.is_empty(), "spoken: {spoken}");
@@ -3285,6 +3306,7 @@ mod tests {
             steer: Steer::default(),
             steered: None,
             told: Told::default(),
+            toned: false,
         });
         let deadline = Instant::now() + Duration::from_secs(10);
         while engineer.is_thinking() {
@@ -3350,6 +3372,7 @@ mod tests {
                     steer: Steer::default(),
                     steered: None,
                     told: Told::default(),
+                    toned: false,
                 },
             );
             assert_eq!(engineer.line.len(), 1, "{stop:?}");
@@ -3408,6 +3431,7 @@ mod tests {
                 steer: Steer::default(),
                 steered: None,
                 told: Told::default(),
+                toned: false,
             };
             engineer.answer(
                 rt,
@@ -3432,6 +3456,65 @@ mod tests {
             }
         }
         assert!(engineer.new_session);
+    }
+
+    #[test]
+    fn failed_speech_and_an_empty_answer_sound_one_tone() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let rt = runtime.handle();
+        let dir = tempfile::tempdir().unwrap();
+        let config = rt
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let mut synth = Synthesizer::new(rt, &config.get());
+
+        // The speech fails while the turn runs (as without a voice), or after it ended
+        for fails_first in [true, false] {
+            let mut engineer = Engineer::new(reqwest::Client::new(), None);
+            let (speech, output) = SpeechOutput::channel();
+            let mut answer = Playback::new(output, false);
+            answer.writing = true;
+            engineer.queue(answer);
+            let (_, text) = mpsc::unbounded_channel();
+            engineer.turn = Some(Turn {
+                task: Task::spawn(std::future::pending()),
+                lang: arrstr!("en"),
+                text,
+                entry: None,
+                steer: Steer::default(),
+                steered: None,
+                told: Told::default(),
+                toned: false,
+            });
+            if fails_first {
+                speech.send(Err(anyhow::anyhow!("no voice"))).unwrap();
+                engineer.admit(1.0);
+            }
+            let turn = engineer.turn.take().unwrap();
+            engineer.answer(
+                rt,
+                &config,
+                &mut synth,
+                Reply {
+                    text: String::new(),
+                    stop: StopReason::EndTurn,
+                    usage: Default::default(),
+                    model: "test".into(),
+                },
+                turn,
+            );
+            for playback in engineer.incoming.iter_mut().chain(&mut engineer.line) {
+                playback.writing = false;
+            }
+            if !fails_first {
+                speech.send(Err(anyhow::anyhow!("no voice"))).unwrap();
+                engineer.admit(1.0);
+            }
+            let waiting = engineer.incoming.len() + engineer.line.len();
+            assert_eq!(waiting, 1, "one tone (fails first: {fails_first})");
+            assert!(engineer.line[0].complete);
+        }
     }
 
     /// A typed question answered the way the app does it: `ask_text`, then `update` every frame
