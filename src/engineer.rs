@@ -176,10 +176,12 @@ pub struct Engineer {
     /// The schedule's clock, when a test sets it: it stands still, and the test moves it on
     #[cfg(test)]
     clock: Option<Instant>,
-    /// Whether the app acknowledges a slow answer (see [`acknowledgement`]): a test turns it off
-    /// when its turns may run on past [`ACKNOWLEDGE_AFTER`] without being about that
+    /// How long after a question is sent the app pushes its acknowledgement to speech (see
+    /// [`acknowledgement`]): `None` turns it off in tests whose turns may run on past
+    /// [`ACKNOWLEDGE_AFTER`] without being about that, and a zero delay lets non-timing tests fire
+    /// without waiting
     #[cfg(test)]
-    acknowledges: bool,
+    acknowledge_after: Option<Duration>,
     /// Scheduled answers given to the synthesizer, when a test stands in for it: their speech
     /// comes when the test sends it
     #[cfg(test)]
@@ -409,7 +411,7 @@ pub struct Playback {
 /// queued bytes count only what SDL hasn't), and a short pause sounds natural on the radio.
 const GAP_AFTER: Duration = Duration::from_millis(300);
 
-/// How long after the pilot asked the app says a short acknowledgement, if the model hasn't
+/// How long after a question is sent the app says a short acknowledgement, if the model hasn't
 /// written anything yet (see [`acknowledgement`])
 pub const ACKNOWLEDGE_AFTER: Duration = Duration::from_secs(2);
 
@@ -693,7 +695,7 @@ impl Engineer {
             #[cfg(test)]
             clock: None,
             #[cfg(test)]
-            acknowledges: true,
+            acknowledge_after: Some(ACKNOWLEDGE_AFTER.saturating_sub(ACKNOWLEDGE_LEAD)),
             #[cfg(test)]
             synthesis: None,
             #[cfg(test)]
@@ -701,12 +703,13 @@ impl Engineer {
         }
     }
 
-    /// Whether the app acknowledges a slow answer: always, unless a test says.
-    fn acknowledges(&self) -> bool {
+    /// How long after a question is sent the app pushes its acknowledgement to speech:
+    /// [`ACKNOWLEDGE_AFTER`] minus [`ACKNOWLEDGE_LEAD`], unless a test overrides or disables it.
+    fn acknowledge_delay(&self) -> Option<Duration> {
         #[cfg(test)]
-        return self.acknowledges;
+        return self.acknowledge_after;
         #[cfg(not(test))]
-        true
+        Some(ACKNOWLEDGE_AFTER.saturating_sub(ACKNOWLEDGE_LEAD))
     }
 
     /// The wall clock the schedule goes by.
@@ -1380,15 +1383,13 @@ impl Engineer {
             turn.steered = Some((lang, first));
             return;
         }
-        self.send_question(rt, sim, config, synth, question, lang, released, false);
+        self.send_question(rt, sim, config, synth, question, lang, released);
     }
 
     /// Sends `question` to the model on the running simulator's recording, starting the
     /// conversation over first if it must be (a new session was asked for, the model settings
     /// changed, another recording), or answers why it can't be. `lang` and `released`: as given
-    /// to [`Self::ask`], which has taken in `lang`. `missed`: the questions a turn missed, asked
-    /// once it ended, long after they were let go of: the pilot has [`ACKNOWLEDGE_AFTER`] from
-    /// now to hear something.
+    /// to [`Self::ask`], which has taken in `lang`.
     #[allow(clippy::too_many_arguments)]
     fn send_question(
         &mut self,
@@ -1399,7 +1400,6 @@ impl Engineer {
         question: String,
         lang: Option<ArrayStr<2>>,
         released: Option<Instant>,
-        missed: bool,
     ) {
         // Whisper distinguishes Nynorsk (`nn`), but both Norwegian forms use the `no` voice.
         let lang = lang.map(language::voice_code);
@@ -1407,10 +1407,6 @@ impl Engineer {
         let known = lang.is_some() || spoken.is_some();
         let lang = spoken.unwrap_or(lang.unwrap_or(self.last_lang));
         let timeline = Arc::new(Timeline::new(released, Instant::now()));
-        let acknowledge_from = match missed {
-            true => Instant::now(),
-            false => timeline.start(),
-        };
         let mut sim = sim;
         let database = sim
             .as_deref_mut()
@@ -1440,9 +1436,7 @@ impl Engineer {
             self.no_beep();
             return;
         }
-        self.start_turn(
-            rt, config, synth, question, lang, known, timeline, acknowledge_from,
-        );
+        self.start_turn(rt, config, synth, question, lang, known, timeline);
     }
 
     /// Makes the conversation the one for `pool`'s recording, of the simulator `sim`, starting it
@@ -1512,7 +1506,7 @@ impl Engineer {
 
     /// Starts a turn on the current session for `question`, answered in `lang` (`known`: told
     /// to the model, see [`Self::ask`]). If the model hasn't said anything [`ACKNOWLEDGE_AFTER`]
-    /// after `acknowledge_from`, the app acknowledges the question (see [`acknowledgement`]).
+    /// after the turn starts, the app acknowledges the question (see [`acknowledgement`]).
     #[allow(clippy::too_many_arguments)]
     fn start_turn(
         &mut self,
@@ -1523,7 +1517,6 @@ impl Engineer {
         lang: ArrayStr<2>,
         known: bool,
         timeline: Arc<Timeline>,
-        acknowledge_from: Instant,
     ) {
         let Some(session) = &self.session else {
             return;
@@ -1535,10 +1528,7 @@ impl Engineer {
         let lang = speech.as_ref().map_or(lang, |(lang, _)| *lang);
         let speech = speech.map(|(_, speech)| speech);
         // Pushed a little early, to be heard on time once it's synthesized
-        let phrase = acknowledgement::phrase(&lang).filter(|_| self.acknowledges());
-        let acknowledge_at = tokio::time::Instant::from_std(
-            acknowledge_from + ACKNOWLEDGE_AFTER.saturating_sub(ACKNOWLEDGE_LEAD),
-        );
+        let acknowledge = acknowledgement::phrase(&lang).zip(self.acknowledge_delay());
         // Told last, after the question (and its snapshot) and after each tool result: by the
         // answer, the skill, the telemetry and often earlier answers are all in English
         let note: Option<Arc<str>> = known.then(|| language::reply_note(lang).into());
@@ -1591,11 +1581,12 @@ impl Engineer {
                 let changes = state.schedule_tool.take();
                 reply.map(|reply| (reply, changes))
             };
-            // From the start, the conversation's wait and the briefing included: the pilot is
-            // waiting through them too. It never ends, so the turn does
+            // From when the question is asked (the conversation's wait and the briefing included),
+            // not from the talk button's release: slow transcription mustn't spend the delay
+            // before the model sees the question. It never ends, so the turn does
             let acknowledge = async {
-                if let Some(phrase) = phrase {
-                    tokio::time::sleep_until(acknowledge_at).await;
+                if let Some((phrase, delay)) = acknowledge {
+                    tokio::time::sleep(delay).await;
                     let text = acknowledgement.lock().unwrap().fire(phrase);
                     if text.is_some() {
                         timeline.acknowledged();
@@ -1892,7 +1883,7 @@ impl Engineer {
                 if !missed.is_empty() {
                     let question = missed.join("\n");
                     let sim = sim.as_deref_mut();
-                    self.send_question(rt, sim, config, synth, question, lang, released, true);
+                    self.send_question(rt, sim, config, synth, question, lang, released);
                 }
             }
         }
@@ -4237,7 +4228,7 @@ mod tests {
             // The schedule's clock moves only when the test says
             engineer.clock = Some(Instant::now());
             // Turns take as long as the test says: only those about it are acknowledged
-            engineer.acknowledges = false;
+            engineer.acknowledge_after = None;
             // Scheduled answers' speech comes when the test says
             engineer.synthesis = Some(Vec::new());
             // Followed as the app does every frame, and used by the conversation
@@ -6223,10 +6214,18 @@ mod tests {
         assert_eq!(asked.questions.len(), 1);
     }
 
-    /// A scripted engineer that acknowledges slow answers.
+    /// A scripted engineer that acknowledges slow answers after the real delay.
     fn acknowledging() -> Scripted {
         let mut scripted = Scripted::new();
-        scripted.engineer.acknowledges = true;
+        scripted.engineer.acknowledge_after =
+            Some(ACKNOWLEDGE_AFTER.saturating_sub(ACKNOWLEDGE_LEAD));
+        scripted
+    }
+
+    /// A scripted engineer whose acknowledgement fires without waiting, for non-timing tests.
+    fn acknowledging_immediately() -> Scripted {
+        let mut scripted = Scripted::new();
+        scripted.engineer.acknowledge_after = Some(Duration::ZERO);
         scripted
     }
 
@@ -6241,10 +6240,10 @@ mod tests {
     fn acknowledges_a_slow_answer() {
         let mut scripted = acknowledging();
         let heard = Instant::now();
+        // Slow transcription before `hear` must not make the acknowledgement fire immediately
         scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
         until_acknowledged(&mut scripted);
-        // Counted from the release, already a threshold ago
-        assert!(heard.elapsed() < ACKNOWLEDGE_AFTER / 2, "{:?}", heard.elapsed());
+        assert!(heard.elapsed() > ACKNOWLEDGE_AFTER / 2, "{:?}", heard.elapsed());
         scripted.acts.send(Act::Write("Delanteros bien.")).unwrap();
         scripted.finish(Act::End(StopReason::EndTurn, "Delanteros bien."));
         assert_eq!(scripted.answer().unwrap().text, "Copiado, lo miro.\nDelanteros bien.");
@@ -6252,11 +6251,11 @@ mod tests {
 
     #[test]
     fn acknowledges_while_the_question_waits_its_turn() {
-        let mut scripted = acknowledging();
+        let mut scripted = acknowledging_immediately();
         let state = scripted.engineer.session.as_ref().unwrap().state.clone();
         // The conversation is busy: the question can't be briefed, let alone asked
         let busy = scripted.runtime.block_on(state.lock_owned());
-        scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
+        scripted.hear_ago("¿Cómo van los neumáticos?", Duration::ZERO);
         until_acknowledged(&mut scripted);
         assert!(scripted.questions().is_empty());
         drop(busy);
@@ -6268,7 +6267,8 @@ mod tests {
     #[test]
     fn a_quick_answer_is_not_acknowledged() {
         let mut scripted = acknowledging();
-        scripted.hear_ago("¿Cómo van los neumáticos?", Duration::ZERO);
+        // Even if transcription took `ACKNOWLEDGE_AFTER`, a quick model reply beats the timer
+        scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
         scripted.acts.send(Act::Write("Delanteros bien.")).unwrap();
         scripted.finish(Act::End(StopReason::EndTurn, "Delanteros bien."));
         assert_eq!(scripted.answer().unwrap().text, "Delanteros bien.");
@@ -6276,8 +6276,8 @@ mod tests {
 
     #[test]
     fn drops_the_models_late_acknowledgement() {
-        let mut scripted = acknowledging();
-        scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
+        let mut scripted = acknowledging_immediately();
+        scripted.hear_ago("¿Cómo van los neumáticos?", Duration::ZERO);
         until_acknowledged(&mut scripted);
         let acts = [
             Act::Write("Copio, miro los neumáticos.\n"),
@@ -6304,8 +6304,8 @@ mod tests {
             (&[ScheduleTool::NAME, EngineerTool::NAME], "Copiado, lo miro.\nHecho."),
         ];
         for (tools, heard) in groups {
-            let mut scripted = acknowledging();
-            scripted.hear_ago("¿Delanteros? Y avísame al final de la vuelta.", ACKNOWLEDGE_AFTER);
+            let mut scripted = acknowledging_immediately();
+            scripted.hear_ago("¿Delanteros? Y avísame al final de la vuelta.", Duration::ZERO);
             until_acknowledged(&mut scripted);
             let acts = [Act::Write("Delanteros bien.\n"), Act::Tools(tools), Act::Write("Hecho.")];
             for act in acts {
@@ -6332,8 +6332,8 @@ mod tests {
     #[test]
     fn an_acknowledged_turn_that_says_nothing_shows_the_acknowledgement() {
         // Its tone: see `incomplete_answers_play_a_tone_without_a_voice`
-        let mut scripted = acknowledging();
-        scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
+        let mut scripted = acknowledging_immediately();
+        scripted.hear_ago("¿Cómo van los neumáticos?", Duration::ZERO);
         until_acknowledged(&mut scripted);
         scripted.finish(Act::End(StopReason::EndTurn, ""));
         assert_eq!(scripted.answer().unwrap().text, "Copiado, lo miro.\n");
@@ -6341,8 +6341,8 @@ mod tests {
 
     #[test]
     fn a_failed_turn_keeps_what_it_held() {
-        let mut scripted = acknowledging();
-        scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
+        let mut scripted = acknowledging_immediately();
+        scripted.hear_ago("¿Cómo van los neumáticos?", Duration::ZERO);
         until_acknowledged(&mut scripted);
         scripted.acts.send(Act::Write("Los delanteros")).unwrap();
         scripted.finish(Act::Fail);
@@ -6353,10 +6353,10 @@ mod tests {
 
     #[test]
     fn a_steering_question_is_not_acknowledged_again() {
-        let mut scripted = acknowledging();
-        scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
+        let mut scripted = acknowledging_immediately();
+        scripted.hear_ago("¿Cómo van los neumáticos?", Duration::ZERO);
         until_acknowledged(&mut scripted);
-        scripted.hear_ago("¿Y los traseros?", ACKNOWLEDGE_AFTER);
+        scripted.hear_ago("¿Y los traseros?", Duration::ZERO);
         // The running turn takes it, and answers both
         scripted.acts.send(Act::TakeSteer).unwrap();
         scripted.acts.send(Act::Write("Todos bien.")).unwrap();
@@ -6370,11 +6370,13 @@ mod tests {
 
     #[test]
     fn a_missed_question_waits_its_own_threshold() {
-        let mut scripted = acknowledging();
-        scripted.hear_ago("¿Cómo van los neumáticos?", ACKNOWLEDGE_AFTER);
+        let mut scripted = acknowledging_immediately();
+        scripted.hear_ago("¿Cómo van los neumáticos?", Duration::ZERO);
         until_acknowledged(&mut scripted);
         scripted.hear_ago("¿Y los traseros?", ACKNOWLEDGE_AFTER);
-        // The first turn ends without taking the steer: it's asked next, after this
+        // The first turn ends without taking the steer: it's asked next, with the real delay
+        scripted.engineer.acknowledge_after =
+            Some(ACKNOWLEDGE_AFTER.saturating_sub(ACKNOWLEDGE_LEAD));
         let asked = Instant::now();
         scripted.acts.send(Act::Write("Delanteros bien.")).unwrap();
         scripted.acts.send(Act::End(StopReason::EndTurn, "Delanteros bien.")).unwrap();
