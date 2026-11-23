@@ -1019,6 +1019,19 @@
         "Says the change won't stick, and that the pilot can ask again once back on track",
         "Never says the wets are set for this stop or the next one"
       ]
+    },
+    {
+      "id": 60,
+      "prompt": "What was my top speed on the last lap?",
+      "expected_output": "Controlled synthetic fixture; speed units spoken in full words",
+      "files": [],
+      "session": "race",
+      "assertions": [
+        "Gives the last lap's top speed (about 288)",
+        "Says \"kilometers per hour\" (or \"kilometres per hour\"), never \"kph\", \"km/h\" or \"kmh\"",
+        "Uses no symbols or abbreviations",
+        "One sentence, at most 20 words excluding acknowledgement"
+      ]
     }
   ]
 }
