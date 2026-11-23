@@ -36,7 +36,7 @@ impl Timeline {
 
     /// What the rest is measured from: the talk button's release, or when a typed question was
     /// asked.
-    pub fn start(&self) -> Instant {
+    fn start(&self) -> Instant {
         self.released.unwrap_or(self.asked)
     }
 
