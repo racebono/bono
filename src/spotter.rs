@@ -577,8 +577,16 @@ impl Spotter {
 
         // The call being said
         match &mut self.saying {
-            // Ready or not, it isn't said over the talk button's beep
-            Some(Saying::Synthesizing { call, .. }) if !call.urgent && engineer.is_beeping() => {}
+            // Ready or not, it isn't said over the talk button's beep. An urgent call doesn't wait
+            // with it
+            Some(Saying::Synthesizing { call, at, .. })
+                if !call.urgent && engineer.is_beeping() =>
+            {
+                if self.queue.iter().any(|(queued, _)| queued.urgent) {
+                    self.queue.push_front((call.clone(), *at));
+                    self.saying = None;
+                }
+            }
             Some(Saying::Synthesizing {
                 key, recv, call, ..
             }) => match recv.try_recv() {
@@ -3099,6 +3107,31 @@ mod tests {
         assert_eq!(left_after_talk_beep("penalty", false, false), (true, 0));
         assert_eq!(left_after_talk_beep("car left", true, true), (false, 0));
         assert_eq!(left_after_talk_beep("car left", true, false), (false, 0));
+    }
+
+    #[test]
+    fn an_urgent_call_goes_ahead_of_one_waiting_for_the_talk_beep() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let mut synth = Synthesizer::new(runtime.handle(), &config.get());
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.beep(true);
+        let lang = arrstr!("en");
+        let at = Instant::now();
+
+        let (mut spotter, _send) = pending_call("penalty", false, at);
+        let key = Spotter::key(&config, lang, call("car left", true).words(lang));
+        (spotter.cache).insert(key, Arc::new(Speech::no_beep(1.0)));
+        spotter.hear(call("car left", true), at);
+        let rt = runtime.handle();
+        spotter.say(rt, &config, &mut synth, None, &mut engineer, lang);
+        // Said (with no speaker, gone at once), and the other still to say
+        assert!(spotter.saying.is_none());
+        assert_eq!(texts_of(&spotter.queue), ["penalty"]);
     }
 
     #[test]

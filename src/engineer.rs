@@ -60,7 +60,7 @@ pub struct ChatEntry {
 /// What the pilot said on the radio, as it was heard.
 pub enum Heard {
     /// A question in the pilot's language, answered with the selected or an available voice.
-    /// `released`: when the talk button was let go.
+    /// `released`: when the pilot stopped talking.
     Question {
         text: String,
         lang: ArrayStr<2>,
@@ -75,7 +75,7 @@ pub enum Heard {
     NoVoice(Option<ArrayStr<2>>),
     /// A fixed input language requires a multilingual model, but the loaded one is English-only.
     UnsupportedLanguage(ArrayStr<2>),
-    /// The talk button was let go too soon to have said anything: likely pressed by accident
+    /// The pilot stopped too soon to have said anything: likely pressed by accident
     TooShort,
     /// The talk button was pressed, but nothing can listen
     NotListening(NotListening),
@@ -143,11 +143,11 @@ pub struct Engineer {
     line: VecDeque<Playback>,
     /// The spotter is speaking: the front answer waits, and carries on from there after
     spotter_held: bool,
-    /// The talk button is held: the front answer waits, as for the spotter
+    /// The pilot is talking: the front answer waits, as for the spotter
     talking: bool,
     /// The talk button's beep is playing: the front answer waits, as for the spotter
     beeping: bool,
-    /// When the talk button was let go, while what was said hasn't been heard: a question may be
+    /// When the pilot stopped talking, while what was said hasn't been heard: a question may be
     /// on its way, which would drop a scheduled turn started now. Waited for no longer than
     /// [`HEARING_WAIT`]
     hearing: Option<Instant>,
@@ -932,11 +932,11 @@ impl Engineer {
     }
 
     /// Pauses the answer at the front of the line (and holds one about to start) while the
-    /// talk button is held, as [`Self::hold`] does for the spotter, so it doesn't play over the
-    /// pilot. It stays paused until nothing else holds it.
+    /// pilot talks, as [`Self::hold`] does for the spotter, so it doesn't play over them. It stays
+    /// paused until nothing else holds it.
     ///
-    /// Its release holds scheduled turns back until what was said is [heard](Self::hear), so one
-    /// doesn't start just to be dropped by the question.
+    /// Once they stop, scheduled turns are held back until what was said is [heard](Self::hear), so
+    /// one doesn't start just to be dropped by the question.
     pub fn talk(&mut self, talking: bool) {
         if self.talking && !talking {
             self.hearing = Some(self.now());
@@ -1643,8 +1643,8 @@ impl Engineer {
     /// to become the next (it's asked earlier in the same frame). Nothing here waits: the
     /// conversation is locked, the snapshot taken and the model asked in the turn's task.
     fn run_scheduled(&mut self, rt: &Handle, sim: Option<&mut Sim>, config: &Config) {
-        // A pilot holding the talk button is about to ask something, which would drop it, and
-        // one who let go may have: what they said is still being heard
+        // A pilot talking is about to ask something, which would drop it, and one who stopped may
+        // have: what they said is still being heard
         if self.turn.is_some() || self.scheduled.is_some() || self.talking {
             return;
         }

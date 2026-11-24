@@ -246,8 +246,11 @@ impl App {
             }
             _ => {}
         }
-        // A text field taking the talk button's release mustn't leave the microphone open
-        if self.ui.on_event(&event).consumed
+        // The press a button being changed waits for doesn't do what the button did until now
+        let changes_button = self.state.gui.changing_button()
+            && matches!(event, Event::KeyDown { .. } | Event::JoyButtonDown { .. });
+        // Neither that nor a text field taking the event may leave the microphone open
+        if (self.ui.on_event(&event).consumed || changes_button)
             && !(self.state.gui.topbar.audio.whisper).ends_recording(&self.state.config, &event)
         {
             return AppResult::Continue;
@@ -514,6 +517,11 @@ impl Gui {
         // Not over the setup guide
         (self.topbar.update).popup(ui.ctx(), self.onboarding.is_open());
         question
+    }
+
+    /// Whether a button being changed waits for a press.
+    fn changing_button(&self) -> bool {
+        self.topbar.settings.changing_button() || self.onboarding.changing_button()
     }
 
     fn event(&mut self, rt: &Handle, config: &Config, event: &Event) -> bool {

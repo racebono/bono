@@ -391,9 +391,9 @@
         "ca": "Prem el botó de parlar un cop per començar a parlar i torna'l a prémer per parar, en comptes de mantenir-lo premut"
     },
     "settings.talk_close_beep": {
-        "en": "Closing beep",
-        "es": "Pitido al cerrar",
-        "ca": "Xiulet en tancar"
+        "en": "Beep when you stop talking",
+        "es": "Pitido al dejar de hablar",
+        "ca": "Xiulet en deixar de parlar"
     },
     "settings.talk_close_beep_hover": {
         "en": "Play a lower beep when you press the talk button again to stop talking",
@@ -481,9 +481,9 @@
         "ca": "Xiulet de ràdio"
     },
     "volume.beep_hover": {
-        "en": "The beeps when you start and stop talking, and the roger beep that ends each transmission (from the next one on)",
-        "es": "Los pitidos al empezar y al dejar de hablar, y el que cierra cada transmisión (a partir de la siguiente)",
-        "ca": "Els xiulets en començar i en deixar de parlar, i el que tanca cada transmissió (a partir de la següent)"
+        "en": "The beeps when you start (and stop) talking, and the roger beep that ends each transmission (from the next one on)",
+        "es": "Los pitidos al empezar a hablar (y al dejar de hacerlo), y el que cierra cada transmisión (a partir de la siguiente)",
+        "ca": "Els xiulets en començar a parlar (i en deixar de fer-ho), i el que tanca cada transmissió (a partir de la següent)"
     },
     "volume.radio_effect": {
         "en": "Radio effect",
@@ -1966,8 +1966,8 @@
     },
     "onboarding.radio_toggle": {
         "en": "Press {button} to start talking, say something like \"radio check\", then press it again.",
-        "es": "Pulsa {button} para empezar a hablar, di algo como \"prueba de radio\" y vuélvelo a pulsar.",
-        "ca": "Prem {button} per començar a parlar, digues alguna cosa com ara \"prova de ràdio\" i torna'l a prémer."
+        "es": "Pulsa {button} para empezar a hablar, di algo como \"prueba de radio\" y vuelve a pulsar.",
+        "ca": "Prem {button} per començar a parlar, digues alguna cosa com ara \"prova de ràdio\" i torna a prémer."
     },
     "onboarding.radio_listening": {
         "en": "Listening… let go when you're done",
@@ -1977,7 +1977,7 @@
     "onboarding.radio_listening_toggle": {
         "en": "Listening… press again when you're done",
         "es": "Escuchando… vuelve a pulsar cuando acabes",
-        "ca": "Escoltant… torna-ho a prémer quan acabis"
+        "ca": "Escoltant… torna a prémer quan acabis"
     },
     "onboarding.radio_understanding": {
         "en": "Understanding…",

@@ -128,6 +128,11 @@ impl Onboarding {
         self.step.is_some()
     }
 
+    /// Whether a button being changed waits for a press.
+    pub fn changing_button(&self) -> bool {
+        self.talk_button.is_waiting() || self.session_button.is_waiting()
+    }
+
     pub fn update(
         &mut self,
         rt: &Handle,

@@ -24,6 +24,11 @@ impl SettingsTopbar {
         self.session_button.cancel();
     }
 
+    /// Whether a button being changed waits for a press.
+    pub fn changing_button(&self) -> bool {
+        self.talk_button.is_waiting() || self.session_button.is_waiting()
+    }
+
     /// Returns whether the setup guide was asked for.
     pub fn update(
         &mut self,
@@ -198,6 +203,11 @@ pub struct ChangeButton {
 }
 
 impl ChangeButton {
+    /// Whether it's waiting for a press.
+    pub fn is_waiting(&self) -> bool {
+        self.waiting.is_some()
+    }
+
     /// Stops waiting for a press.
     pub fn cancel(&mut self) {
         self.waiting = None;
