@@ -1146,10 +1146,12 @@ impl Scoring {
         )
     }
 
-    /// The forecast from now to the end of this session, plus the race's if this isn't it (LMU
-    /// only). Every point is said as time from now, the way the pilot hears it, never as a mark of
-    /// the session: "in 41 min", "in 2 h 56 min (end of the session)". Without the session's clock
-    /// (or for a race still to come), as a part of it: "late in the race".
+    /// The upcoming forecast points for this session, plus the race's if this isn't it (LMU only).
+    /// Passed checkpoints are omitted because live conditions come from `WEATHER`, and an earlier
+    /// forecast point labelled as current can contradict it. Every point is said as time from now,
+    /// the way the pilot hears it, never as a mark of the session: "in 41 min", "in 2 h 56 min
+    /// (end of the session)". Without the session's clock (or for a race still to come), as a part
+    /// of it: "late in the race".
     fn forecast_line(
         &self,
         conn: &Connection,
@@ -1199,10 +1201,6 @@ impl Scoring {
             let progress = end.zip(now).map(|(end, now)| now / end);
             match (progress, end, now) {
                 (Some(progress), Some(end), Some(now)) => {
-                    let done = rows.iter().filter(|r| fraction(r) <= progress).last();
-                    if let Some(done) = done {
-                        parts.push(format!("now: {}", point(done)));
-                    }
                     for r in rows.iter().filter(|r| fraction(r) > progress) {
                         parts.push(format!(
                             "in {}{}: {}",
@@ -2930,6 +2928,67 @@ mod tests {
         let forecast = Scoring::forecast(&conn, "race").unwrap();
         assert_eq!(forecast.len(), 1);
         assert_eq!(forecast[0].f("rain_chance"), Some(0.1));
+    }
+
+    #[test]
+    fn forecast_line_omits_passed_checkpoints() {
+        use bono_sim::{sql::ForecastWriter, sys::bono_forecast_point};
+
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
+        let mut writer = ForecastWriter::new(&conn).unwrap();
+        let points = [
+            (0.0, 1, 0.0, 21.0),
+            (0.25, 1, 0.0, 22.0),
+            (0.5, 3, 0.0, 21.0),
+            (0.75, 6, 0.8, 20.0),
+            (1.0, 5, 0.7, 20.0),
+        ]
+        .into_iter()
+        .map(|(fraction, sky, rain_chance, temperature)| {
+            let mut point = bono_forecast_point::default();
+            point.session_time = Some(0.0).into();
+            point.session_type = Some("race".to_owned()).into();
+            point.session_fraction = Some(fraction).into();
+            point.sky = Some(sky).into();
+            point.rain_chance = Some(rain_chance).into();
+            point.temperature = Some(temperature).into();
+            point
+        })
+        .collect();
+        writer.write(points).unwrap();
+
+        let scoring = Scoring {
+            session: row(
+                &conn,
+                "SELECT 'race' AS session_type, 6000.0 AS session_end_time",
+                [],
+            )
+            .unwrap(),
+            yellow_sectors: Vec::new(),
+            sector_yellows: false,
+            cars: BTreeMap::new(),
+            player: None,
+        };
+
+        let line = scoring.forecast_line(&conn, Some(2520.0)).unwrap().unwrap();
+        assert!(!line.contains("now:"), "{line}");
+        assert!(!line.contains("light clouds"), "{line}");
+        assert_eq!(
+            line,
+            "race (58 min left): in 8 min: 0% rain, mostly cloudy, 21 C | \
+             in 33 min: 80% rain, overcast with light rain, 20 C | \
+             in 58 min (end of the session): 70% rain, overcast with drizzle, 20 C | \
+             rain most likely in 33 min (80%)"
+        );
+
+        // Once the session clock reaches the end, no future checkpoints remain.
+        assert_eq!(scoring.forecast_line(&conn, Some(6000.0)).unwrap(), None);
+
+        // Without a clock, every checkpoint stays labelled by its part of the session.
+        let unclocked = scoring.forecast_line(&conn, None).unwrap().unwrap();
+        assert!(unclocked.contains("at the start: 0% rain, light clouds, 21 C"), "{unclocked}");
+        assert!(unclocked.contains("at the end: 70% rain, overcast with drizzle, 20 C"), "{unclocked}");
     }
 
     #[test]
