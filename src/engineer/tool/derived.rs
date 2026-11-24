@@ -5159,13 +5159,19 @@ fn projection(
         .filter(|_| stint.energy_is_fraction())
         .map(|e| e * 100.0);
     let energy_left = energy_percent(energy);
-    let fuel_to_finish = need.zip(fuel_use).map(|(n, u)| n * u);
+    let fuel_to_finish = need
+        .zip(fuel_use)
+        .map(|(n, u)| n * u)
+        .filter(|v| v.is_finite());
     let fuel_deficit = fuel_to_finish
-        .zip(fuel)
+        .zip(fuel.filter(|v| v.is_finite()))
         .map(|(req, have)| (req - have).max(0.0));
-    let energy_to_finish = need.zip(energy_pct_use).map(|(n, u)| n * u);
+    let energy_to_finish = need
+        .zip(energy_pct_use)
+        .map(|(n, u)| n * u)
+        .filter(|v| v.is_finite());
     let energy_deficit = energy_to_finish
-        .zip(energy_left)
+        .zip(energy_left.filter(|v| v.is_finite()))
         .map(|(req, have)| (req - have).max(0.0));
     let fuel_full = tank_cap
         .zip(fuel_use.filter(|u| u.is_finite() && *u > 0.0))
@@ -10850,34 +10856,39 @@ mod tests {
             );
         }
 
-        // (c) Enough fuel/VE to finish (margin_laps >= 0) even with tank_capacity_l = NULL:
-        // stops_needed = 0 and deficits = 0
-        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
-        conn.execute("UPDATE session SET session_end_time = 1800.0", [])
+        // (c) Enough fuel to finish (margin_laps >= 0) with full_stint_laps == None
+        // (fuel-only, virtual_energy = NULL, tank_capacity_l = NULL or 0): stops_needed = 0
+        for cap_sql in ["NULL", "0.0"] {
+            let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+            conn.execute("UPDATE session SET session_end_time = 1800.0", [])
+                .unwrap();
+            conn.execute(
+                "UPDATE telemetry SET virtual_energy = NULL WHERE vehicle_id = 1",
+                [],
+            )
             .unwrap();
-        conn.execute(
-            "UPDATE telemetry SET virtual_energy = 1.0 - session_time * 0.0005 WHERE vehicle_id = 1",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE car_state SET fuel_capacity = NULL WHERE vehicle_id = 1",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-        let engineer = reopen(&dir);
-        let enough = query(
-            &engineer,
-            "SELECT margin_laps >= 0, tank_capacity_l, stops_needed, \
-                    fuel_deficit_l, energy_deficit_pct \
-             FROM stints s JOIN cars_now c ON c.current_stint_id = s.stint_id WHERE c.is_player = 1",
-        )
-        .await;
-        assert_eq!(enough, [["1", "NULL", "0", "0", "0"]], "{enough:?}");
-        drop(engineer);
+            conn.execute(
+                &format!("UPDATE car_state SET fuel_capacity = {cap_sql} WHERE vehicle_id = 1"),
+                [],
+            )
+            .unwrap();
+            drop(conn);
+            let engineer = reopen(&dir);
+            let enough = query(
+                &engineer,
+                "SELECT limited_by, margin_laps >= 0, stops_needed, \
+                        fuel_deficit_l, energy_deficit_pct \
+                 FROM stints s JOIN cars_now c ON c.current_stint_id = s.stint_id WHERE c.is_player = 1",
+            )
+            .await;
+            assert_eq!(
+                enough,
+                [["\"fuel\"", "1", "0", "0", "NULL"]],
+                "cap_sql={cap_sql}: {enough:?}"
+            );
+        }
 
-        // Direct projection() tests for (d) dual fuel+VE limits and (e) non-fraction VE > 1.0
+        // Direct projection() tests for (d) dual fuel+VE limits, (e) non-fraction VE, and boundaries
         let conn = Connection::open_in_memory().unwrap();
         let sess = columns(&conn, "'race' AS session_type, 36 AS max_laps");
         let me = columns(
@@ -10902,21 +10913,62 @@ mod tests {
             avg_time: Some(100.0),
         };
 
-        // (d1) Dual fuel+VE: fuel_full = 30, energy_full = 20, margin_laps = -25.0 -> stops_needed = 2
-        let p_dual = columns(
+        // (d1) Cross-resource min: limited_by = "fuel" (fuel_laps = 10, energy_laps = 15),
+        // fuel_full = 30 > energy_full = 20, margin_laps = -25.0 -> stops_needed = ceil(25/20) = 2
+        let p_fuel_min_ve = columns(
             &conn,
-            "2 AS lap, 30.0 AS fuel, 60.0 AS fuel_capacity, 0.50 AS virtual_energy",
+            "2 AS lap, 20.0 AS fuel, 60.0 AS fuel_capacity, 0.75 AS virtual_energy",
         );
-        let dual = projection(&sc, &BTreeMap::new(), 1, &p_dual, &stint, 0.0, Some(200.0));
-        assert_eq!(lookup(&dual, "limited_by"), Value::Text("energy".into()));
-        assert_real_close(&dual, "margin_laps", -25.0);
-        assert_eq!(lookup(&dual, "stops_needed"), Value::Integer(2));
-        assert_real_close(&dual, "fuel_to_finish_l", 70.0);
-        assert_real_close(&dual, "fuel_deficit_l", 40.0);
-        assert_real_close(&dual, "energy_to_finish_pct", 175.0);
-        assert_real_close(&dual, "energy_deficit_pct", 125.0);
+        let fuel_min_ve = projection(
+            &sc,
+            &BTreeMap::new(),
+            1,
+            &p_fuel_min_ve,
+            &stint,
+            0.0,
+            Some(200.0),
+        );
+        assert_eq!(lookup(&fuel_min_ve, "limited_by"), Value::Text("fuel".into()));
+        assert_real_close(&fuel_min_ve, "margin_laps", -25.0);
+        assert_eq!(lookup(&fuel_min_ve, "stops_needed"), Value::Integer(2));
+        assert_real_close(&fuel_min_ve, "fuel_to_finish_l", 70.0);
+        assert_real_close(&fuel_min_ve, "fuel_deficit_l", 50.0);
+        assert_real_close(&fuel_min_ve, "energy_to_finish_pct", 175.0);
+        assert_real_close(&fuel_min_ve, "energy_deficit_pct", 100.0);
 
-        // (d2) Fuel-limited with missing/zero tank_capacity_l while VE is present:
+        // (d2) Symmetric cross-resource min: limited_by = "energy" (energy_laps = 10, fuel_laps = 15),
+        // energy_full = 25 > fuel_full = 20, margin_laps = -25.0 -> stops_needed = ceil(25/20) = 2
+        let mut ve_longer_lap = lap_with(false, false, (1.0, 1.0));
+        ve_longer_lap.fuel_used = Some(2.0);
+        ve_longer_lap.energy_start = Some(1.0);
+        ve_longer_lap.energy_used = Some(0.04);
+        let ve_longer_stint = Stint {
+            own: vec![&ve_longer_lap],
+            baseline: vec![&ve_longer_lap],
+            baseline_source: Some("this stint"),
+            avg_time: Some(100.0),
+        };
+        let p_ve_min_fuel = columns(
+            &conn,
+            "2 AS lap, 30.0 AS fuel, 40.0 AS fuel_capacity, 0.40 AS virtual_energy",
+        );
+        let ve_min_fuel = projection(
+            &sc,
+            &BTreeMap::new(),
+            1,
+            &p_ve_min_fuel,
+            &ve_longer_stint,
+            0.0,
+            Some(200.0),
+        );
+        assert_eq!(
+            lookup(&ve_min_fuel, "limited_by"),
+            Value::Text("energy".into())
+        );
+        assert_real_close(&ve_min_fuel, "margin_laps", -25.0);
+        assert_eq!(lookup(&ve_min_fuel, "stops_needed"), Value::Integer(2));
+
+        // (d3) Fuel-limited with missing/zero tank_capacity_l while VE is present:
         // stops_needed MUST be NULL (must NOT fall back to VE's 20-lap full stint)
         for cap_sql in ["NULL", "0.0"] {
             let p_fuel_no_cap = columns(
@@ -10941,13 +10993,57 @@ mod tests {
                 Value::Null,
                 "cap_sql={cap_sql}: must not fall back to VE"
             );
-            assert_real_close(&fuel_no_cap, "fuel_to_finish_l", 70.0);
-            assert_real_close(&fuel_no_cap, "fuel_deficit_l", 50.0);
-            assert_real_close(&fuel_no_cap, "energy_to_finish_pct", 175.0);
-            assert_real_close(&fuel_no_cap, "energy_deficit_pct", 100.0);
         }
 
-        // (e) Non-fraction virtual_energy > 1.0 -> energy_to_finish_pct and energy_deficit_pct NULL
+        // (d4) Exact ceil boundaries (margin = 0 -> 0, -20/20 -> 1, -20.01/20 -> 2) & NULL session
+        for (ve, expected_stops) in [(1.75, 0), (0.75, 1), (0.7495, 2)] {
+            let p_bound = columns(
+                &conn,
+                &format!("2 AS lap, 80.0 AS fuel, 60.0 AS fuel_capacity, {ve} AS virtual_energy"),
+            );
+            let bound = projection(
+                &sc,
+                &BTreeMap::new(),
+                1,
+                &p_bound,
+                &stint,
+                0.0,
+                Some(200.0),
+            );
+            assert_eq!(
+                lookup(&bound, "stops_needed"),
+                Value::Integer(expected_stops),
+                "ve={ve}"
+            );
+        }
+        let no_session = Scoring {
+            session: None,
+            yellow_sectors: Vec::new(),
+            sector_yellows: false,
+            cars: BTreeMap::new(),
+            player: None,
+        };
+        let practice = projection(
+            &no_session,
+            &BTreeMap::new(),
+            1,
+            &p_fuel_min_ve,
+            &stint,
+            0.0,
+            Some(200.0),
+        );
+        for col in [
+            "stops_needed",
+            "fuel_to_finish_l",
+            "fuel_deficit_l",
+            "energy_to_finish_pct",
+            "energy_deficit_pct",
+        ] {
+            assert_eq!(lookup(&practice, col), Value::Null, "{col}");
+        }
+
+        // (e) Non-fraction virtual_energy > 1.0 -> energy_*_pct NULL, stops_needed NULL when short
+        // and 0 when margin_laps >= 0 (even though full_stint_laps is None)
         let mut non_frac_lap = lap_with(false, false, (1.0, 1.0));
         non_frac_lap.fuel_used = Some(2.0);
         non_frac_lap.energy_start = Some(100.0);
@@ -10978,6 +11074,22 @@ mod tests {
         assert_eq!(lookup(&non_frac, "stops_needed"), Value::Null);
         assert_real_close(&non_frac, "fuel_to_finish_l", 70.0);
         assert_real_close(&non_frac, "fuel_deficit_l", 30.0);
+
+        let p_non_frac_enough = columns(
+            &conn,
+            "2 AS lap, 80.0 AS fuel, 60.0 AS fuel_capacity, 200.0 AS virtual_energy",
+        );
+        let non_frac_enough = projection(
+            &sc,
+            &BTreeMap::new(),
+            1,
+            &p_non_frac_enough,
+            &non_frac_stint,
+            0.0,
+            Some(200.0),
+        );
+        assert_eq!(lookup(&non_frac_enough, "stops_needed"), Value::Integer(0));
+        assert_real_close(&non_frac_enough, "fuel_deficit_l", 0.0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
