@@ -4962,7 +4962,7 @@ mod evals {
                 "eval {eval_id}: pending ids number from #1 in order"
             );
             fields.insert("action".into(), "add".into());
-            let (instruction, trigger, repeat, stale_after) =
+            let (instruction, trigger, repeat, until, stale_after) =
                 serde_json::from_value::<ScheduleInput>(input)
                     .map_err(anyhow::Error::from)
                     .and_then(ScheduleInput::request)
@@ -4971,6 +4971,7 @@ mod evals {
                 instruction,
                 trigger,
                 repeat,
+                until,
                 stale_after,
                 made: progress.clone(),
                 checked: Default::default(),
@@ -5068,14 +5069,14 @@ mod evals {
         };
         let mut json = serde_json::json!({"action": action, "id": id.to_string()});
         if let Some(new) = new {
-            let (repeat, until) = match &new.repeat {
-                Repeat::Once => ("once", None),
-                Repeat::Every { until } => ("every", until.as_ref()),
+            let repeat = match new.repeat {
+                Repeat::Once => "once",
+                Repeat::Every => "every",
             };
             json["instruction"] = new.instruction.clone().into();
             json["trigger"] = trigger(&new.trigger);
             json["repeat"] = repeat.into();
-            json["until"] = until.map_or(serde_json::Value::Null, trigger);
+            json["until"] = new.until.as_ref().map_or(serde_json::Value::Null, trigger);
             json["stale_after"] =
                 (new.stale_after.as_ref()).map_or(serde_json::Value::Null, trigger);
         }
