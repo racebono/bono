@@ -189,11 +189,13 @@ CREATE TABLE stints (
     energy_left_pct REAL, energy_laps_left REAL, energy_runs_out_lap REAL,
     game_fuel_per_lap_l REAL, game_energy_per_lap_pct REAL,
     limited_by TEXT, laps_left REAL, last_full_lap INTEGER, laps_needed REAL,
-    laps_needed_source TEXT, margin_laps REAL, save_pct_needed REAL
+    laps_needed_source TEXT, margin_laps REAL, save_pct_needed REAL,
+    full_stint_laps REAL, stops_needed INTEGER, save_pct_one_fewer_stop REAL,
+    fuel_to_finish_l REAL, fuel_deficit_l REAL, energy_to_finish_pct REAL, energy_deficit_pct REAL
 );
 CREATE TABLE forecast_now (
     session_type TEXT, is_current_session INTEGER, session_fraction REAL, minutes_from_now REAL,
-    part_of_session TEXT, sky TEXT, sky_text TEXT, rain_chance_pct REAL, air_c REAL,
+    approx_lap REAL, part_of_session TEXT, sky TEXT, sky_text TEXT, rain_chance_pct REAL, air_c REAL,
     humidity_pct REAL, wind_speed_kmh REAL, wind_direction TEXT
 );
 CREATE TABLE setup_now (
@@ -4050,6 +4052,7 @@ impl Stream {
         vehicles.sort_unstable();
         vehicles.dedup();
 
+        let mut player_pace = None;
         for vehicle in vehicles {
             let order = (ids.as_slice(), &place, exact);
             let laps = match self.cars.get(&vehicle) {
@@ -4063,20 +4066,23 @@ impl Stream {
                 None => Vec::new(),
             };
             let stints = fresh.stints.get(&vehicle).map_or(&[][..], Vec::as_slice);
-            let projection =
+            let (projection, pace) =
                 match self.write_car_now(&ctx, sc, &frame, vehicle, now, order, stints, &laps) {
-                    Ok(projection) => projection,
+                    Ok(result) => result,
                     Err(e) => {
                         problems.push(format!("car {vehicle}: {e}"));
-                        None
+                        (None, None)
                     }
                 };
+            if vehicle == ctx.vehicle {
+                player_pace = pace;
+            }
             if let Some(projection) = projection {
                 fresh.projections.insert(vehicle, projection);
             }
             fresh.laps.insert(vehicle, laps);
         }
-        if let Err(e) = write_forecast(conn, sc, now) {
+        if let Err(e) = write_forecast(conn, sc, now, player_pace) {
             problems.push(format!("forecast_now: {e}"));
         }
         Ok(())
@@ -4093,7 +4099,7 @@ impl Stream {
         order: (&[i64], &HashMap<i64, usize>, bool),
         stints: &[Segment],
         laps: &[Lap],
-    ) -> rusqlite::Result<Option<(Columns, bool)>> {
+    ) -> rusqlite::Result<(Option<(Columns, bool)>, Option<PlayerPace>)> {
         let conn = ctx.conn;
         // The player's own row is the newest, with its car_state values
         let telemetry = match vehicle == ctx.vehicle {
@@ -4115,11 +4121,20 @@ impl Stream {
         )?;
         write_sectors(ctx, sc, vehicle)?;
         let Some(telemetry) = &telemetry else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let places = places(laps, stints);
         let stint = current.map(|_| Stint::new(laps, &places, stints, stints.len() - 1));
-        let frac = lap_fraction(stint.as_ref().and_then(|stint| stint.avg_time), telemetry);
+        let avg_lap_s = stint
+            .as_ref()
+            .and_then(|stint| stint.avg_time)
+            .filter(|t| t.is_finite() && *t > 0.0);
+        let frac = lap_fraction(avg_lap_s, telemetry);
+        let pace = avg_lap_s.map(|avg_lap_s| PlayerPace {
+            lap: telemetry.i("lap").unwrap_or(1),
+            frac,
+            avg_lap_s,
+        });
         write_wheels(ctx, vehicle, telemetry, laps, frac)?;
         let in_the_pits =
             telemetry.b("in_pit_lane") || laps.last().is_some_and(|lap| lap.pit || lap.refuelled);
@@ -4140,7 +4155,7 @@ impl Stream {
                 writer.write_lap(vehicle, car, lap, vehicle == ctx.vehicle)?;
             }
         }
-        Ok(projection)
+        Ok((projection, pace))
     }
 
     fn write_race_state(&self, ctx: &Ctx, sc: &Scoring, now: Option<f64>) -> rusqlite::Result<()> {
@@ -5115,6 +5130,43 @@ fn stint_row(vehicle: i64, segment: &Segment, stint: &Stint) -> Columns {
     ]
 }
 
+/// Full-stint range, minimum stops needed, and consumption saving (%) to drop one stop.
+fn multi_stop_plan(
+    fuel_laps: Option<f64>,
+    full_fuel_laps: Option<f64>,
+    energy_laps: Option<f64>,
+    full_energy_laps: Option<f64>,
+    laps_left: Option<f64>,
+    need: Option<f64>,
+) -> (Option<f64>, Option<i64>, Option<f64>) {
+    let full_stint_laps = match (full_fuel_laps, full_energy_laps) {
+        (Some(f), Some(e)) => Some(f.min(e)),
+        (Some(f), None) => Some(f),
+        (None, Some(e)) => Some(e),
+        (None, None) => None,
+    };
+    let (Some(left), Some(need)) = (laps_left, need) else {
+        return (full_stint_laps, None, None);
+    };
+    if left >= need {
+        return (full_stint_laps, Some(0), None);
+    }
+    // Never under-report stops_needed if a tracked resource is short but lacks full-stint capacity.
+    let fuel_short_unknown = fuel_laps.is_some_and(|l| l < need) && full_fuel_laps.is_none();
+    let energy_short_unknown = energy_laps.is_some_and(|l| l < need) && full_energy_laps.is_none();
+    if fuel_short_unknown || energy_short_unknown {
+        return (full_stint_laps, None, None);
+    }
+    let Some(full) = full_stint_laps.filter(|f| *f > 0.0) else {
+        return (full_stint_laps, None, None);
+    };
+    let stops = (((need - left) / full).ceil() as i64).max(1);
+    let target_stops = (stops - 1) as f64;
+    let avail = left + target_stops * full;
+    let save_one_fewer = ((need - avail) / need.max(0.1) * 100.0).max(0.0);
+    (full_stint_laps, Some(stops), Some(save_one_fewer))
+}
+
 /// What the car's current stint is on course for, as of `now`: kept with the stint once it's over.
 fn projection(
     sc: &Scoring,
@@ -5127,9 +5179,17 @@ fn projection(
 ) -> Columns {
     let lap_now = p.i("lap");
     let fuel = p.f("fuel");
+    let tank_capacity = p.f("fuel_capacity").filter(|c| *c > 0.0);
     let energy = p.f("virtual_energy");
     let fuel_use = stint.average_use(|lap| lap.fuel_used);
     let energy_use = stint.average_use(|lap| lap.energy_used);
+    let energy_is_fraction = match stint.baseline.iter().any(|lap| lap.energy_start.is_some()) {
+        true => stint
+            .baseline
+            .iter()
+            .any(|lap| lap.energy_start.is_some_and(|e| e <= 1.0)),
+        false => energy.is_some_and(|e| e <= 1.0),
+    };
     let (fuel_laps, fuel_out) = range(fuel, fuel_use, lap_now, frac);
     // Without any use seen, a level of zero only means the simulator has no such thing
     let (energy_laps, energy_out) = range(energy, energy_use, lap_now, frac);
@@ -5140,11 +5200,34 @@ fn projection(
         (None, None) => None,
     };
     let (need, source) = race_need(sc, frame, vehicle, now, frac, stint.avg_time);
-    let margin = limit.zip(need).map(|((_, left), need)| left - need);
+    let laps_left = limit.map(|(_, left)| left);
+    let margin = laps_left.zip(need).map(|(left, need)| left - need);
     let save = margin
         .zip(need)
         .filter(|(margin, _)| *margin < 0.0)
         .map(|(margin, need)| -margin / need.max(0.1) * 100.0);
+    let full_fuel_laps = tank_capacity
+        .zip(fuel_use.filter(|u| *u > 0.0))
+        .map(|(cap, u)| cap / u);
+    let full_energy_laps = energy_use
+        .filter(|u| energy_is_fraction && *u > 0.0)
+        .map(|u| 1.0 / u);
+    let (full_stint_laps, stops_needed, save_pct_one_fewer_stop) = multi_stop_plan(
+        fuel_laps,
+        full_fuel_laps,
+        energy_laps,
+        full_energy_laps,
+        laps_left,
+        need,
+    );
+    let fuel_to_finish = need.zip(fuel_use).map(|(n, u)| n * u);
+    let fuel_deficit = fuel_to_finish.zip(fuel).map(|(tot, cur)| (tot - cur).max(0.0));
+    let energy_left_pct = energy_percent(energy);
+    let energy_per_lap_pct = energy_use.filter(|_| energy_is_fraction).map(|e| e * 100.0);
+    let energy_to_finish = need.zip(energy_per_lap_pct).map(|(n, u)| n * u);
+    let energy_deficit = energy_to_finish
+        .zip(energy_left_pct)
+        .map(|(tot, cur)| (tot - cur).max(0.0));
     vec![
         ("calculated_at_s", real(now)),
         ("lap_fraction", real(Some(frac))),
@@ -5152,7 +5235,7 @@ fn projection(
         ("fuel_laps_left", real(fuel_laps)),
         ("fuel_runs_out_lap", real(fuel_out)),
         ("tank_capacity_l", copy(p, "fuel_capacity")),
-        ("energy_left_pct", real(energy_percent(energy))),
+        ("energy_left_pct", real(energy_left_pct)),
         ("energy_laps_left", real(energy_laps)),
         ("energy_runs_out_lap", real(energy_out)),
         ("game_fuel_per_lap_l", copy(p, "fuel_per_lap")),
@@ -5161,7 +5244,7 @@ fn projection(
             real(percent(p.f("virtual_energy_per_lap"))),
         ),
         ("limited_by", text_or_null(limit.map(|(which, _)| which))),
-        ("laps_left", real(limit.map(|(_, left)| left))),
+        ("laps_left", real(laps_left)),
         (
             "last_full_lap",
             // Lap N runs from N - 1 to N laps done, so reaching position N completes lap N - 1.
@@ -5175,6 +5258,13 @@ fn projection(
         ("laps_needed_source", Value::Text(source)),
         ("margin_laps", real(margin)),
         ("save_pct_needed", real(save)),
+        ("full_stint_laps", real(full_stint_laps)),
+        ("stops_needed", integer(stops_needed)),
+        ("save_pct_one_fewer_stop", real(save_pct_one_fewer_stop)),
+        ("fuel_to_finish_l", real(fuel_to_finish)),
+        ("fuel_deficit_l", real(fuel_deficit)),
+        ("energy_to_finish_pct", real(energy_to_finish)),
+        ("energy_deficit_pct", real(energy_deficit)),
     ]
 }
 
@@ -5305,8 +5395,21 @@ fn write_wheels(
     Ok(())
 }
 
+/// Player lap position and baseline lap time, used to estimate forecast lap numbers.
+#[derive(Clone, Copy)]
+struct PlayerPace {
+    lap: i64,
+    frac: f64,
+    avg_lap_s: f64,
+}
+
 /// The forecast for this session, and the race's if this isn't it.
-fn write_forecast(conn: &Connection, sc: &Scoring, now: Option<f64>) -> rusqlite::Result<()> {
+fn write_forecast(
+    conn: &Connection,
+    sc: &Scoring,
+    now: Option<f64>,
+    player_pace: Option<PlayerPace>,
+) -> rusqlite::Result<()> {
     let Some(s) = &sc.session else {
         return Ok(());
     };
@@ -5330,6 +5433,10 @@ fn write_forecast(conn: &Connection, sc: &Scoring, now: Option<f64>) -> rusqlite
                 .zip(now)
                 .filter(|_| current)
                 .map(|(end, now)| (fraction * end - now) / 60.0);
+            let approx_lap = minutes
+                .filter(|m| *m >= 0.0)
+                .zip(player_pace)
+                .map(|(m, pace)| pace.lap as f64 + pace.frac + (m * 60.0) / pace.avg_lap_s);
             insert(
                 conn,
                 "forecast_now",
@@ -5338,6 +5445,7 @@ fn write_forecast(conn: &Connection, sc: &Scoring, now: Option<f64>) -> rusqlite
                     ("is_current_session", flag(current)),
                     ("session_fraction", real(Some(fraction))),
                     ("minutes_from_now", real(minutes)),
+                    ("approx_lap", real(approx_lap)),
                     ("part_of_session", Value::Text(part_of(fraction).to_owned())),
                     ("sky", text_or_null(sky)),
                     ("sky_text", copy(&r, "sky_text")),
@@ -10699,6 +10807,201 @@ mod tests {
             );
             assert_eq!(value("last_full_lap"), Value::Integer(last), "{row:?}");
         }
+    }
+
+    #[test]
+    fn multi_stop_projection_computes_full_stint_stops_deficits_and_save_pct() {
+        let conn = Connection::open_in_memory().unwrap();
+        let make_sc = |max_laps: i64, completed: i64| {
+            let mut cars = BTreeMap::new();
+            cars.insert(
+                1,
+                columns(
+                    &conn,
+                    &format!("1 AS vehicle_id, {completed} AS laps_completed, 0 AS laps_behind_leader"),
+                ),
+            );
+            Scoring {
+                session: Some(columns(
+                    &conn,
+                    &format!("'race' AS session_type, {max_laps} AS max_laps"),
+                )),
+                yellow_sectors: Vec::new(),
+                sector_yellows: false,
+                cars,
+                player: None,
+            }
+        };
+        let get = |row: &Columns, name: &str| {
+            row.iter()
+                .find(|(column, _)| *column == name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| panic!("missing column {name}"))
+        };
+        let assert_real = |row: &Columns, name: &str, expected: f64| match get(row, name) {
+            Value::Real(v) => assert!(
+                (v - expected).abs() < 1e-6,
+                "{name}: got {v}, expected {expected}"
+            ),
+            other => panic!("{name}: got {other:?}, expected Real({expected})"),
+        };
+
+        // Case A: zero stops needed (fuel_laps 25 >= need 20, full tank 30)
+        let mut fuel_lap = lap_with(false, false, (1.0, 1.0));
+        fuel_lap.fuel_used = Some(2.0);
+        let stint = Stint {
+            own: vec![&fuel_lap],
+            baseline: vec![&fuel_lap],
+            baseline_source: Some("this stint"),
+            avg_time: Some(100.0),
+        };
+        let sc = make_sc(25, 5); // need = 20.0 at frac = 0.0
+        let p = columns(&conn, "6 AS lap, 50.0 AS fuel, 60.0 AS fuel_capacity");
+        let row = projection(&sc, &BTreeMap::new(), 1, &p, &stint, 0.0, Some(500.0));
+        assert_real(&row, "full_stint_laps", 30.0);
+        assert_eq!(get(&row, "stops_needed"), Value::Integer(0));
+        assert_eq!(get(&row, "save_pct_one_fewer_stop"), Value::Null);
+        assert_real(&row, "fuel_to_finish_l", 40.0);
+        assert_real(&row, "fuel_deficit_l", 0.0);
+        assert_eq!(get(&row, "energy_to_finish_pct"), Value::Null);
+        assert_eq!(get(&row, "energy_deficit_pct"), Value::Null);
+
+        // Case B: 1 stop needed (fuel_laps 18 < need 20, full tank 30)
+        let p = columns(&conn, "6 AS lap, 36.0 AS fuel, 60.0 AS fuel_capacity");
+        let row = projection(&sc, &BTreeMap::new(), 1, &p, &stint, 0.0, Some(500.0));
+        assert_real(&row, "full_stint_laps", 30.0);
+        assert_eq!(get(&row, "stops_needed"), Value::Integer(1));
+        assert_real(&row, "save_pct_one_fewer_stop", 10.0);
+        assert_real(&row, "save_pct_needed", 10.0);
+        assert_real(&row, "fuel_to_finish_l", 40.0);
+        assert_real(&row, "fuel_deficit_l", 4.0);
+
+        // Case C: 2 stops needed (fuel_laps 20, need 55, full tank 30)
+        let sc = make_sc(60, 5); // need = 55.0
+        let p = columns(&conn, "6 AS lap, 40.0 AS fuel, 60.0 AS fuel_capacity");
+        let row = projection(&sc, &BTreeMap::new(), 1, &p, &stint, 0.0, Some(500.0));
+        assert_real(&row, "full_stint_laps", 30.0);
+        assert_eq!(get(&row, "stops_needed"), Value::Integer(2));
+        assert_real(&row, "save_pct_one_fewer_stop", (55.0 - 50.0) / 55.0 * 100.0);
+        assert_real(&row, "save_pct_needed", (55.0 - 20.0) / 55.0 * 100.0);
+        assert_real(&row, "fuel_to_finish_l", 110.0);
+        assert_real(&row, "fuel_deficit_l", 70.0);
+
+        // Case D: dual fuel + VE where VE requires 2 stops (energy_laps 15, full_energy 20, need 40)
+        // and fuel requires 1 stop (fuel_laps 25, full_fuel 30, need 40)
+        let mut dual_lap = lap_with(false, false, (1.0, 1.0));
+        dual_lap.fuel_used = Some(2.0);
+        dual_lap.energy_start = Some(0.95);
+        dual_lap.energy_used = Some(0.05);
+        let dual_stint = Stint {
+            own: vec![&dual_lap],
+            baseline: vec![&dual_lap],
+            baseline_source: Some("this stint"),
+            avg_time: Some(100.0),
+        };
+        let sc = make_sc(45, 5); // need = 40.0
+        let p = columns(
+            &conn,
+            "6 AS lap, 50.0 AS fuel, 60.0 AS fuel_capacity, 0.75 AS virtual_energy",
+        );
+        let row = projection(&sc, &BTreeMap::new(), 1, &p, &dual_stint, 0.0, Some(500.0));
+        assert_real(&row, "full_stint_laps", 20.0);
+        assert_eq!(get(&row, "stops_needed"), Value::Integer(2));
+        assert_real(&row, "save_pct_one_fewer_stop", 12.5);
+        assert_real(&row, "fuel_to_finish_l", 80.0);
+        assert_real(&row, "fuel_deficit_l", 30.0);
+        assert_real(&row, "energy_to_finish_pct", 200.0);
+        assert_real(&row, "energy_deficit_pct", 125.0);
+
+        // Case E (Review Focus #1): fuel short (20 < 40) with NULL/0 fuel_capacity while VE has capacity
+        for cap in ["NULL", "0.0"] {
+            let p = columns(
+                &conn,
+                &format!("6 AS lap, 40.0 AS fuel, {cap} AS fuel_capacity, 0.75 AS virtual_energy"),
+            );
+            let row = projection(&sc, &BTreeMap::new(), 1, &p, &dual_stint, 0.0, Some(500.0));
+            assert_eq!(get(&row, "stops_needed"), Value::Null, "cap={cap}");
+            assert_eq!(get(&row, "save_pct_one_fewer_stop"), Value::Null, "cap={cap}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forecast_now_computes_approx_lap_for_future_current_session_points_only() {
+        use bono_sim::{sql::ForecastWriter, sys::bono_forecast_point};
+
+        // 1) Active race with established 100s average pace (at t=310s, on lap 4, frac ~0.1)
+        let (dir, engineer) = race();
+        {
+            let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+            let mut writer = ForecastWriter::new(&conn).unwrap();
+            let point = |kind: &str, frac: f64, rain: f64| {
+                let mut p = bono_forecast_point::default();
+                p.session_time = Some(310.0).into();
+                p.session_type = Some(kind.to_owned()).into();
+                p.session_fraction = Some(frac).into();
+                p.rain_chance = Some(rain).into();
+                p
+            };
+            // race() session_end_time is 1800s; at t=310s:
+            // frac 0.1 -> 180s (passed, minutes_from_now < 0) -> approx_lap IS NULL
+            // frac 1.0 -> 1800s (1490s ahead = 14.9 laps at 100s/lap) -> approx_lap ~= 4.1 + 14.9 = 19.0
+            writer
+                .write(vec![
+                    point("race", 0.1, 0.0),
+                    point("race", 1.0, 0.8),
+                ])
+                .unwrap();
+        }
+        let rows = query(
+            &engineer,
+            "SELECT is_current_session, ROUND(minutes_from_now, 1), ROUND(approx_lap, 1) \
+             FROM forecast_now ORDER BY session_fraction",
+        )
+        .await;
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0][0], "1");
+        assert_eq!(rows[0][2], "NULL", "passed point must have NULL approx_lap: {rows:?}");
+        assert_eq!(rows[1][0], "1");
+        let approx: f64 = rows[1][2].parse().expect("future current-session point needs approx_lap");
+        assert!(
+            (approx - 19.0).abs() <= 0.3,
+            "expected approx_lap near 19.0, got {approx} ({rows:?})"
+        );
+
+        // 2) Practice session with no completed laps yet + future "race" forecast -> all NULL
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        let (mut session, standings) = scoring("practice", 60.0, 0);
+        session.session_end_time = Some(1800.0).into();
+        recorder.push_scoring(session, standings);
+        drive(&recorder, "practice", 60.0, 0);
+        drop(recorder);
+        {
+            let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+            let mut writer = ForecastWriter::new(&conn).unwrap();
+            let point = |kind: &str, frac: f64| {
+                let mut p = bono_forecast_point::default();
+                p.session_time = Some(60.0).into();
+                p.session_type = Some(kind.to_owned()).into();
+                p.session_fraction = Some(frac).into();
+                p.rain_chance = Some(0.7).into();
+                p
+            };
+            writer
+                .write(vec![point("practice", 0.5), point("race", 0.5)])
+                .unwrap();
+        }
+        let engineer = reopen(&dir);
+        let rows = query(
+            &engineer,
+            "SELECT session_type, is_current_session, approx_lap FROM forecast_now ORDER BY session_type",
+        )
+        .await;
+        assert_eq!(
+            rows,
+            [["\"practice\"", "1", "NULL"], ["\"race\"", "0", "NULL"]],
+            "{rows:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
