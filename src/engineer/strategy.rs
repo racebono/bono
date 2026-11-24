@@ -34,8 +34,8 @@ impl StrategyChange {
 #[derive(Debug, Default)]
 pub struct Strategy {
     plan: Option<String>,
-    /// The weekend of the last progress or accepted change seen.
-    weekend: Option<Option<i64>>,
+    /// The newest weekend seen, if known. Weekends' ids only grow within a recording.
+    weekend: Option<i64>,
 }
 
 impl Strategy {
@@ -48,7 +48,7 @@ impl Strategy {
     }
 
     pub fn weekend(&self) -> Option<i64> {
-        self.weekend.flatten()
+        self.weekend
     }
 
     pub fn briefing_text(&self) -> String {
@@ -58,40 +58,32 @@ impl Strategy {
         }
     }
 
-    /// Updates tracked weekend; clears any active strategy and returns `true` when rolling into a
-    /// different weekend.
-    pub fn follow_weekend(&mut self, weekend: Option<i64>) -> bool {
-        let changed = self.weekend.is_some_and(|prev| prev != weekend);
-        self.weekend = Some(weekend);
-        if changed {
+    /// Notes the weekend `weekend` is seen to be. A newer one than the one known clears the
+    /// strategy; an older or unknown one (`None` is the least) is a reading that lags, and the
+    /// first one known is the one the strategy was already about.
+    pub fn follow_weekend(&mut self, weekend: Option<i64>) {
+        if weekend <= self.weekend {
+            return;
+        }
+        if self.weekend.is_some() {
             self.plan = None;
         }
-        changed
+        self.weekend = weekend;
     }
 
-    /// Applies a turn's staged strategy change against `current_weekend`.
-    /// Returns `true` if a staged change was dropped because it belonged to a different weekend.
-    pub fn apply(&mut self, change: Option<StrategyChange>, current_weekend: Option<i64>) -> bool {
-        self.follow_weekend(current_weekend);
-        let Some(change) = change else {
+    /// Applies a turn's staged strategy change. Returns `false`, changing nothing, if it's from an
+    /// earlier weekend.
+    pub fn apply(&mut self, change: StrategyChange) -> bool {
+        let weekend = change.weekend();
+        self.follow_weekend(weekend);
+        if weekend.is_some() && weekend < self.weekend {
             return false;
-        };
-        match change {
-            StrategyChange::Set { plan, weekend } => {
-                if weekend != current_weekend {
-                    return true;
-                }
-                self.plan = Some(plan);
-                false
-            }
-            StrategyChange::Clear { weekend } => {
-                if weekend != current_weekend {
-                    return true;
-                }
-                self.plan = None;
-                false
-            }
         }
+        self.plan = match change {
+            StrategyChange::Set { plan, .. } => Some(plan),
+            StrategyChange::Clear { .. } => None,
+        };
+        true
     }
 
     pub fn clear(&mut self) {
@@ -141,8 +133,8 @@ impl StrategyTool {
 
     pub fn description() -> String {
         "Records or clears the race strategy agreed with the pilot so it stays in every turn's \
-         briefing (`Race strategy: ...`). Call only after the pilot agrees to a plan, approves a \
-         revision, or asks to drop it—never for an unagreed proposal. Changes take effect once \
+         briefing (`Race strategy: ...`). Call only once the pilot agrees to, states or revises a \
+         plan, or asks to drop it—never for an unagreed proposal. Changes take effect once \
          your reply finishes."
             .into()
     }
@@ -270,46 +262,71 @@ mod tests {
         assert_eq!(s.plan(), None);
         assert_eq!(s.briefing_text(), NO_STRATEGY);
 
-        assert!(!s.apply(
-            Some(StrategyChange::Set {
-                plan: "1-stop lap 25".into(),
-                weekend: Some(1),
-            }),
-            Some(1),
-        ));
+        assert!(s.apply(StrategyChange::Set {
+            plan: "1-stop lap 25".into(),
+            weekend: Some(1),
+        }));
         assert_eq!(s.plan(), Some("1-stop lap 25"));
         assert_eq!(s.briefing_text(), "Race strategy: 1-stop lap 25");
 
         // Same weekend does not clear
-        assert!(!s.follow_weekend(Some(1)));
+        s.follow_weekend(Some(1));
         assert_eq!(s.plan(), Some("1-stop lap 25"));
 
-        // Stale cross-weekend Set is dropped and does not overwrite weekend 2 (Review Focus #4)
-        assert!(s.follow_weekend(Some(2)));
+        // Stale cross-weekend Set is dropped and does not overwrite weekend 2
+        s.follow_weekend(Some(2));
         assert_eq!(s.plan(), None);
-        assert!(s.apply(
-            Some(StrategyChange::Set {
-                plan: "old weekend".into(),
-                weekend: Some(1),
-            }),
-            Some(2),
-        ));
+        assert!(!s.apply(StrategyChange::Set {
+            plan: "old weekend".into(),
+            weekend: Some(1),
+        }));
         assert_eq!(s.plan(), None);
 
         // Set in weekend 2, stale weekend 1 Clear is dropped, then weekend 2 Clear resets plan
-        assert!(!s.apply(
-            Some(StrategyChange::Set {
-                plan: "2-stop".into(),
-                weekend: Some(2),
-            }),
-            Some(2),
-        ));
+        assert!(s.apply(StrategyChange::Set {
+            plan: "2-stop".into(),
+            weekend: Some(2),
+        }));
         assert_eq!(s.plan(), Some("2-stop"));
-        assert!(s.apply(Some(StrategyChange::Clear { weekend: Some(1) }), Some(2)));
+        assert!(!s.apply(StrategyChange::Clear { weekend: Some(1) }));
         assert_eq!(s.plan(), Some("2-stop"));
-        assert!(!s.apply(Some(StrategyChange::Clear { weekend: Some(2) }), Some(2)));
+        assert!(s.apply(StrategyChange::Clear { weekend: Some(2) }));
         assert_eq!(s.plan(), None);
         assert_eq!(s.briefing_text(), NO_STRATEGY);
+    }
+
+    #[test]
+    fn a_lagging_or_unknown_weekend_keeps_the_strategy() {
+        // Saved before the weekend is known: the first one known is its weekend
+        let mut s = Strategy::new();
+        assert!(s.apply(StrategyChange::Set {
+            plan: "early".into(),
+            weekend: None,
+        }));
+        s.follow_weekend(None);
+        s.follow_weekend(Some(2));
+        assert_eq!((s.plan(), s.weekend()), (Some("early"), Some(2)));
+
+        // Readings that lag behind neither clear it nor go back
+        s.follow_weekend(Some(1));
+        s.follow_weekend(None);
+        assert_eq!((s.plan(), s.weekend()), (Some("early"), Some(2)));
+
+        // A turn that didn't know the weekend still changes it
+        assert!(s.apply(StrategyChange::Set {
+            plan: "late".into(),
+            weekend: None,
+        }));
+        assert_eq!((s.plan(), s.weekend()), (Some("late"), Some(2)));
+
+        // A change made in a newer weekend replaces it, and a clear does too
+        assert!(s.apply(StrategyChange::Set {
+            plan: "next".into(),
+            weekend: Some(3),
+        }));
+        assert_eq!((s.plan(), s.weekend()), (Some("next"), Some(3)));
+        assert!(s.apply(StrategyChange::Clear { weekend: Some(4) }));
+        assert_eq!((s.plan(), s.weekend()), (None, Some(4)));
     }
 
     #[tokio::test]

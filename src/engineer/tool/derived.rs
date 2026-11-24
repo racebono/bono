@@ -4130,11 +4130,8 @@ impl Stream {
             .and_then(|stint| stint.avg_time)
             .filter(|t| t.is_finite() && *t > 0.0);
         let frac = lap_fraction(avg_lap_s, telemetry);
-        let pace = avg_lap_s.map(|avg_lap_s| PlayerPace {
-            lap: telemetry.i("lap").unwrap_or(1),
-            frac,
-            avg_lap_s,
-        });
+        let pace = (avg_lap_s.zip(telemetry.i("lap").filter(|lap| *lap > 0)))
+            .map(|(avg_lap_s, lap)| PlayerPace { lap, frac, avg_lap_s });
         write_wheels(ctx, vehicle, telemetry, laps, frac)?;
         let in_the_pits =
             telemetry.b("in_pit_lane") || laps.last().is_some_and(|lap| lap.pit || lap.refuelled);
@@ -4956,6 +4953,13 @@ impl<'a> Stint<'a> {
             .collect::<Vec<_>>();
         (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
     }
+
+    /// Whether the virtual energy it used is a fraction of a full load, not an amount.
+    fn energy_is_fraction(&self) -> bool {
+        self.baseline
+            .iter()
+            .any(|lap| lap.energy_start.is_some_and(|energy| energy <= 1.0))
+    }
 }
 
 /// How far into its lap the car is, by its stint's average lap.
@@ -5094,10 +5098,6 @@ fn stint_row(vehicle: i64, segment: &Segment, stint: &Stint) -> Columns {
         }
         _ => None,
     };
-    let energy_is_fraction = stint
-        .baseline
-        .iter()
-        .any(|lap| lap.energy_start.is_some_and(|energy| energy <= 1.0));
     let energy_use = stint.average_use(|lap| lap.energy_used);
     let start = &segment.start;
     vec![
@@ -5125,12 +5125,17 @@ fn stint_row(vehicle: i64, segment: &Segment, stint: &Stint) -> Columns {
         ),
         (
             "energy_per_lap_pct",
-            real(energy_use.filter(|_| energy_is_fraction).map(|e| e * 100.0)),
+            real(
+                energy_use
+                    .filter(|_| stint.energy_is_fraction())
+                    .map(|e| e * 100.0),
+            ),
         ),
     ]
 }
 
-/// Full-stint range, minimum stops needed, and consumption saving (%) to drop one stop.
+/// Full-stint range, minimum stops needed, and consumption saving (%) to drop one stop. The range
+/// is unknown if that of fuel or energy is, when the car uses it: it could be the shorter.
 fn multi_stop_plan(
     fuel_laps: Option<f64>,
     full_fuel_laps: Option<f64>,
@@ -5139,28 +5144,25 @@ fn multi_stop_plan(
     laps_left: Option<f64>,
     need: Option<f64>,
 ) -> (Option<f64>, Option<i64>, Option<f64>) {
+    /// What rounding may be off by, so a plan that lands exactly on a stop isn't given another.
+    const ROUNDING: f64 = 1e-9;
+    let unknown = (fuel_laps.is_some() && full_fuel_laps.is_none())
+        || (energy_laps.is_some() && full_energy_laps.is_none());
     let full_stint_laps = match (full_fuel_laps, full_energy_laps) {
+        _ if unknown => None,
         (Some(f), Some(e)) => Some(f.min(e)),
-        (Some(f), None) => Some(f),
-        (None, Some(e)) => Some(e),
-        (None, None) => None,
+        (f, e) => f.or(e),
     };
     let (Some(left), Some(need)) = (laps_left, need) else {
         return (full_stint_laps, None, None);
     };
-    if left >= need {
+    if left + ROUNDING >= need {
         return (full_stint_laps, Some(0), None);
     }
-    // Never under-report stops_needed if a tracked resource is short but lacks full-stint capacity.
-    let fuel_short_unknown = fuel_laps.is_some_and(|l| l < need) && full_fuel_laps.is_none();
-    let energy_short_unknown = energy_laps.is_some_and(|l| l < need) && full_energy_laps.is_none();
-    if fuel_short_unknown || energy_short_unknown {
-        return (full_stint_laps, None, None);
-    }
-    let Some(full) = full_stint_laps.filter(|f| *f > 0.0) else {
-        return (full_stint_laps, None, None);
+    let Some(full) = full_stint_laps else {
+        return (None, None, None);
     };
-    let stops = (((need - left) / full).ceil() as i64).max(1);
+    let stops = (((need - left) / full - ROUNDING).ceil() as i64).max(1);
     let target_stops = (stops - 1) as f64;
     let avail = left + target_stops * full;
     let save_one_fewer = ((need - avail) / need.max(0.1) * 100.0).max(0.0);
@@ -5183,13 +5185,7 @@ fn projection(
     let energy = p.f("virtual_energy");
     let fuel_use = stint.average_use(|lap| lap.fuel_used);
     let energy_use = stint.average_use(|lap| lap.energy_used);
-    let energy_is_fraction = match stint.baseline.iter().any(|lap| lap.energy_start.is_some()) {
-        true => stint
-            .baseline
-            .iter()
-            .any(|lap| lap.energy_start.is_some_and(|e| e <= 1.0)),
-        false => energy.is_some_and(|e| e <= 1.0),
-    };
+    let energy_use_fraction = energy_use.filter(|_| stint.energy_is_fraction());
     let (fuel_laps, fuel_out) = range(fuel, fuel_use, lap_now, frac);
     // Without any use seen, a level of zero only means the simulator has no such thing
     let (energy_laps, energy_out) = range(energy, energy_use, lap_now, frac);
@@ -5207,11 +5203,9 @@ fn projection(
         .filter(|(margin, _)| *margin < 0.0)
         .map(|(margin, need)| -margin / need.max(0.1) * 100.0);
     let full_fuel_laps = tank_capacity
-        .zip(fuel_use.filter(|u| *u > 0.0))
+        .zip(fuel_use)
         .map(|(cap, u)| cap / u);
-    let full_energy_laps = energy_use
-        .filter(|u| energy_is_fraction && *u > 0.0)
-        .map(|u| 1.0 / u);
+    let full_energy_laps = energy_use_fraction.map(|u| 1.0 / u);
     let (full_stint_laps, stops_needed, save_pct_one_fewer_stop) = multi_stop_plan(
         fuel_laps,
         full_fuel_laps,
@@ -5223,8 +5217,7 @@ fn projection(
     let fuel_to_finish = need.zip(fuel_use).map(|(n, u)| n * u);
     let fuel_deficit = fuel_to_finish.zip(fuel).map(|(tot, cur)| (tot - cur).max(0.0));
     let energy_left_pct = energy_percent(energy);
-    let energy_per_lap_pct = energy_use.filter(|_| energy_is_fraction).map(|e| e * 100.0);
-    let energy_to_finish = need.zip(energy_per_lap_pct).map(|(n, u)| n * u);
+    let energy_to_finish = need.zip(energy_use_fraction).map(|(n, u)| n * u * 100.0);
     let energy_deficit = energy_to_finish
         .zip(energy_left_pct)
         .map(|(tot, cur)| (tot - cur).max(0.0));
@@ -10922,7 +10915,44 @@ mod tests {
             let row = projection(&sc, &BTreeMap::new(), 1, &p, &dual_stint, 0.0, Some(500.0));
             assert_eq!(get(&row, "stops_needed"), Value::Null, "cap={cap}");
             assert_eq!(get(&row, "save_pct_one_fewer_stop"), Value::Null, "cap={cap}");
+            assert_eq!(get(&row, "full_stint_laps"), Value::Null, "cap={cap}");
         }
+
+        // Case F: a fill that lands exactly on the finish isn't rounded up to another stop
+        fuel_lap.fuel_used = Some(2.7);
+        let stint = Stint {
+            own: vec![&fuel_lap],
+            baseline: vec![&fuel_lap],
+            baseline_source: Some("this stint"),
+            avg_time: Some(100.0),
+        };
+        let sc = make_sc(45, 5); // need = 40.0 at frac = 0.0
+        let p = columns(&conn, "6 AS lap, 27.0 AS fuel, 81.0 AS fuel_capacity");
+        let row = projection(&sc, &BTreeMap::new(), 1, &p, &stint, 0.0, Some(500.0));
+        assert_eq!(get(&row, "stops_needed"), Value::Integer(1));
+        assert_real(&row, "save_pct_one_fewer_stop", 75.0);
+        assert_real(&row, "fuel_deficit_l", 81.0);
+
+        // Case G: energy that isn't a fraction has no full range, so neither does the stint
+        let mut energy_lap = lap_with(false, false, (1.0, 1.0));
+        energy_lap.fuel_used = Some(2.0);
+        energy_lap.energy_start = Some(800.0);
+        energy_lap.energy_used = Some(40.0);
+        let stint = Stint {
+            own: vec![&energy_lap],
+            baseline: vec![&energy_lap],
+            baseline_source: Some("this stint"),
+            avg_time: Some(100.0),
+        };
+        let p = columns(
+            &conn,
+            "6 AS lap, 50.0 AS fuel, 60.0 AS fuel_capacity, 400.0 AS virtual_energy",
+        );
+        let row = projection(&sc, &BTreeMap::new(), 1, &p, &stint, 0.0, Some(500.0));
+        assert_eq!(get(&row, "limited_by"), Value::Text("energy".into()));
+        assert_eq!(get(&row, "full_stint_laps"), Value::Null);
+        assert_eq!(get(&row, "stops_needed"), Value::Null);
+        assert_eq!(get(&row, "energy_deficit_pct"), Value::Null);
     }
 
     #[tokio::test(flavor = "multi_thread")]

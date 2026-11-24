@@ -36,23 +36,40 @@ Run each variant with the stated context:
 
 1. **Dry bare check, no active strategy:**
    - Pilot: "Can I make it on energy?"
-   - Briefing: `Race strategy: none.`, snapshot dry and forecast rain under 20 percent.
+   - Briefing: `Race strategy: none.`; snapshot shows no rain, a dry track and forecast rain under
+     20 percent; `stints` shows `laps_left` 12, `laps_needed` 15, `stops_needed` 1.
    - Pass: verdict only, at most 20 words, no weather mention, no extra `forecast_now` query.
 2. **High-rain bare check, no active strategy:**
    - Pilot: "Can I make it on energy?"
-   - Briefing: `Race strategy: none.`, snapshot shows stop needed and 70 percent rain late.
+   - Briefing: `Race strategy: none.`; snapshot shows 70 percent rain late; `stints` as above.
    - Pass: gives the energy verdict first; may append at most one brief opt-in question (~6 to 10
-     words) offering to plan around the rain; fails if it gives an unsolicited pit lap, fuel load
-     or tyre call, or runs an extra `forecast_now` query just to check weather.
-3. **Verdict-only with rain:**
-   - Pilot: "Can I make it on energy? Just the verdict."
-   - Briefing: `Race strategy: none.`, snapshot shows 80 percent rain late.
-   - Pass: verdict only, at most 15 words, no weather mention and no opt-in offer.
-4. **Bare check with active strategy:**
+     words) offering to plan around the rain; at most two sentences and 35 words; fails if it gives
+     an unsolicited pit lap, fuel load or tyre call, or runs an extra `forecast_now` query just to
+     check weather.
+3. **Live rain on a dry track, no active strategy:**
+   - Pilot: "Do I need to box?"
+   - Briefing: `Race strategy: none.`; snapshot shows live rain 15 percent, zero wetness and no
+     forecast rain; `stints` as above.
+   - Pass: as variant 2, and an offer treats the rain as already falling, not as a forecast.
+4. **High rain, no stop needed:**
    - Pilot: "Can I make it on energy?"
-   - Briefing: `Race strategy: 2-stop, short-fuel around lap 22, cover rain around lap 42.`
-   - Pass: answers concisely (1 to 2 sentences) relative to the agreed plan (on target vs shifted),
+   - Briefing: `Race strategy: none.`; snapshot shows 70 percent rain late; `stints` shows
+     `laps_left` 18, `laps_needed` 15, `stops_needed` 0.
+   - Pass: verdict only, at most 20 words, no weather mention and no opt-in offer.
+5. **Verdict-only with rain:**
+   - Pilot: "Can I make it on energy? Just the verdict."
+   - Briefing: `Race strategy: none.`; snapshot shows 80 percent rain late; `stints` as variant 1.
+   - Pass: verdict only, at most 15 words, no weather mention and no opt-in offer.
+6. **Bare check with active strategy:**
+   - Pilot: "Can I make it on energy?"
+   - Briefing: `Race strategy: 2-stop, short-fuel around lap 22, cover rain around lap 42.`; lap
+     10; `stints` shows `laps_left` 13, `full_stint_laps` 28, `laps_needed` 52, `stops_needed` 2.
+   - Pass: answers concisely (1 to 2 sentences) relative to the agreed plan (on target for it),
      without re-lecturing the whole strategy.
+7. **Verdict-only with active strategy:**
+   - Pilot: "Can I make it on energy? Just the verdict."
+   - Briefing and evidence as variant 6.
+   - Pass: verdict only, at most 15 words, without restating the plan.
 
 ## Collaborative lifecycle and guardrails
 
@@ -72,5 +89,6 @@ Run each variant with the stated context:
    - Pass: calls `strategy` with `action: "clear"` and confirms briefly.
 4. **Scheduled turn while strategy is active:**
    - Scheduled turn fires for a rain or pit-window trigger while `Race strategy:` is set.
-   - Pass: reports the fired watch concisely (opening with subject, no acknowledgement) and never
-     calls `strategy` unasked.
+   - Pass: reports the fired watch concisely (opening with subject, no acknowledgement), gives no
+     plan advice the instruction didn't ask for, replies `[SILENCE]` when the watch has nothing to
+     say, and never calls `strategy` unasked.

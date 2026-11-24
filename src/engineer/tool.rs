@@ -166,7 +166,9 @@ impl Engineer {
     }
 
     /// Attach current telemetry once, before the question enters provider history.
-    /// Use the same query and quoting as the tool; a failed read leaves the question intact.
+    /// Use the same query and quoting as the tool; a failed read says it's unavailable, in the same
+    /// marked block, so what follows it is still sent again with every question (see
+    /// `claude::question_message`).
     ///
     /// The setup's setting names come too, and what `pit` (the pit menu, in games the engineer can
     /// change it in) can take, when they aren't the ones `outline_shown` (a hash of both) says this
@@ -182,7 +184,9 @@ impl Engineer {
             Ok(snapshot) => snapshot,
             Err(e) => {
                 log::warn!("Error attaching the engineer's telemetry snapshot: {e:#}");
-                return question;
+                return format!(
+                    "{question}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\nunavailable\n[END UNTRUSTED TELEMETRY SNAPSHOT]"
+                );
             }
         };
         let names = match self.setup_names().await {
@@ -3514,7 +3518,7 @@ mod tests {
         let failed = engineer
             .question_with_snapshot("Gap?".into(), &mut None, None)
             .await;
-        assert_eq!(failed, "Gap?");
+        assert!(failed.contains("\nunavailable\n"), "{failed}");
         conn.execute("ALTER TABLE unavailable RENAME TO telemetry", [])
             .unwrap();
         let recovered = engineer
@@ -3522,7 +3526,6 @@ mod tests {
             .await;
         assert!(recovered.starts_with("And now?\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]"));
         assert!(recovered.contains("Fischer"), "{recovered}");
-        assert_eq!(failed, "Gap?");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3540,7 +3543,9 @@ mod tests {
             engineer
                 .question_with_snapshot(question.into(), &mut None, None)
                 .await,
-            question
+            format!(
+                "{question}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\nunavailable\n[END UNTRUSTED TELEMETRY SNAPSHOT]"
+            )
         );
         // And a query says it can't be answered
         let error = engineer

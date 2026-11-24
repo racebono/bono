@@ -1112,23 +1112,11 @@ impl Engineer {
         self.sync_conditions();
     }
 
-    /// Applies a finished turn's staged race strategy change against the newest known weekend.
+    /// Applies a finished turn's staged race strategy change, unless it's from an earlier weekend.
     fn apply_strategy(&mut self, change: Option<StrategyChange>) {
-        let Some(change) = change else {
-            return;
-        };
-        let staged_weekend = change.weekend();
-        // `weekend` (`min(id) FROM epoch`) increases monotonically within a recording (and
-        // replacing the recording clears both `progress` and `strategy`), so taking the maximum
-        // lets a fresh new-weekend update apply before `follow_progress` ticks while still
-        // dropping stale updates staged in an earlier weekend.
-        let current_weekend = self
-            .progress
-            .as_ref()
-            .and_then(|p| p.weekend)
-            .max(self.strategy.weekend())
-            .max(staged_weekend);
-        if self.strategy.apply(Some(change), current_weekend) {
+        if let Some(change) = change
+            && !self.strategy.apply(change)
+        {
             log::debug!("Dropped race strategy update staged in an earlier weekend");
         }
     }
@@ -1543,11 +1531,8 @@ impl Engineer {
             next_id: self.schedule.next_id(),
             pending_text: self.schedule.pending_text(&progress),
             strategy_text: self.strategy.briefing_text(),
-            weekend: self
-                .progress
-                .as_ref()
-                .and_then(|p| p.weekend)
-                .or_else(|| self.strategy.weekend()),
+            // The newest seen: a strategy saved in a new weekend knows it before the progress does
+            weekend: progress.weekend.max(self.strategy.weekend()),
             notes: told.notes.clone(),
             state,
             note,
@@ -2575,33 +2560,32 @@ fn system_prompt(skill: &str, corner_names: bool) -> Arc<str> {
 
 impl SessionState {
     /// Readies the conversation for a turn, and writes its `message` out with `briefing`'s notes,
-    /// then the setup outline (when shown), the telemetry snapshot, the pending requests and the
-    /// reply-language note. Once per turn: the `schedule` tool stages its changes from here.
+    /// then the setup outline (when shown), the telemetry snapshot, the pending requests, the race
+    /// strategy and the reply-language note. Once per turn: the `schedule` and `strategy` tools
+    /// stage their changes from here.
     async fn brief(&mut self, message: String, briefing: Briefing) -> String {
         // Started over, it's a new weekend, which clears the requests: the briefing, taken before
         // the engineer saw it, still has the last weekend's, and its notes are about the
         // conversation that's over. The next progress clears the requests too.
         let started_over = self.follow_game_session(briefing.auto_session).await;
-        let weekend_changed = started_over
-            || (self.weekend.is_some()
-                && briefing.weekend.is_some()
-                && self.weekend != briefing.weekend);
-        let (pending_text, strategy_text) = match started_over {
+        let pending_text = match started_over {
             true => {
                 (briefing.started_over).store(true, atomic::Ordering::Relaxed);
                 self.schedule_tool.begin(Vec::new(), briefing.next_id);
-                self.strategy_tool.begin(self.weekend);
-                (NO_REQUESTS.to_owned(), NO_STRATEGY.to_owned())
+                NO_REQUESTS.to_owned()
             }
             false => {
                 self.schedule_tool.begin(briefing.pending, briefing.next_id);
-                self.strategy_tool.begin(self.weekend.or(briefing.weekend));
-                let strategy_text = match weekend_changed {
-                    true => NO_STRATEGY.to_owned(),
-                    false => briefing.strategy_text,
-                };
-                (briefing.pending_text, strategy_text)
+                briefing.pending_text
             }
+        };
+        // Weekends' ids only grow, so the newer of what this conversation and the engineer have
+        // seen is the one it is (either can lag). A strategy from before it is the last weekend's
+        let weekend = self.weekend.max(briefing.weekend);
+        self.strategy_tool.begin(weekend);
+        let strategy_text = match briefing.weekend.is_some() && briefing.weekend < weekend {
+            true => NO_STRATEGY.to_owned(),
+            false => briefing.strategy_text,
         };
         // Only those about this conversation as it is now: one that's started over, here or
         // since a note was made, never had what it's about
@@ -6962,10 +6946,17 @@ mod tests {
             .strategy(serde_json::json!({"action": "set", "plan": "weekend 2 plan"}))
             .unwrap();
         scripted.finish(Act::Reply);
-        // Important #1: weekend 2 plan must not be dropped because progress lagged at weekend 1
+        // The weekend 2 plan must not be dropped because progress lagged at weekend 1
         assert_eq!(scripted.engineer.strategy(), Some("weekend 2 plan"));
 
-        // Important #2: subsequent tick clearing weekend 1's schedule must not wipe weekend 2's plan
+        // The next question is told it, while progress still lags
+        scripted.ask("What's the plan?");
+        scripted.until("asked w2 again", |s| s.questions().len() == 4);
+        let question = scripted.questions()[3].clone();
+        assert!(question.contains("Race strategy: weekend 2 plan"), "{question}");
+        scripted.finish(Act::Reply);
+
+        // The tick clearing weekend 1's schedule must not wipe weekend 2's plan
         scripted.tick();
         assert_eq!(scripted.engineer.strategy(), Some("weekend 2 plan"));
     }
@@ -7006,7 +6997,6 @@ mod tests {
             .strategy(serde_json::json!({"action": "set", "plan": "weekend 1 plan"}))
             .unwrap();
         scripted.finish(Act::Reply);
-        assert!(scripted.engineer.progress.is_none());
         assert_eq!(scripted.engineer.strategy(), Some("weekend 1 plan"));
 
         // Roll over to weekend 2 while `progress` is still `None` and `auto_session` is false
