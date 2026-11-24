@@ -85,6 +85,7 @@ CREATE TABLE lap_stats (
     fuel_start_l REAL, fuel_end_l REAL, fuel_used_l REAL,
     energy_start_pct REAL, energy_end_pct REAL, energy_used_pct REAL,
     gap_ahead_end_s REAL, gap_behind_end_s REAL,
+    gap_ahead_delta_s REAL, gap_behind_delta_s REAL,
     PRIMARY KEY (vehicle_id, lap)
 ) WITHOUT ROWID;
 CREATE TABLE lap_wheel_stats (
@@ -2710,7 +2711,11 @@ impl Writer<'_> {
                 [vehicle],
             )?;
         }
-        self.write_lap(vehicle, car, &lap, true)?;
+        let prev = lap
+            .lap
+            .checked_sub(1)
+            .and_then(|prev| car.finished.iter().rev().find(|l| l.lap == prev));
+        self.write_lap(vehicle, car, &lap, prev, true)?;
 
         if let Some(layout) = self.layout {
             let trace = Trace::build(&build.samples, build.start, lap.time, layout.length);
@@ -2730,7 +2735,14 @@ impl Writer<'_> {
     }
 
     /// `heat`: whether to add what the tyres did over the lap, which takes a scan of its rows.
-    fn write_lap(&self, vehicle: i64, car: &Car, lap: &Lap, heat: bool) -> rusqlite::Result<()> {
+    fn write_lap(
+        &self,
+        vehicle: i64,
+        car: &Car,
+        lap: &Lap,
+        prev: Option<&Lap>,
+        heat: bool,
+    ) -> rusqlite::Result<()> {
         let end = lap.start.zip(lap.time).map(|(start, time)| start + time);
         let official = end.and_then(|end| {
             self.official
@@ -2745,6 +2757,14 @@ impl Writer<'_> {
                 })
         });
         let [stint_id, boundary] = stint_columns(&car.stints, lap.lap, lap.start, lap.end);
+        let gap_ahead_delta = lap
+            .gap_ahead_end
+            .zip(prev.and_then(|p| p.gap_ahead_end))
+            .map(|(now, before)| now - before);
+        let gap_behind_delta = lap
+            .gap_behind_end
+            .zip(prev.and_then(|p| p.gap_behind_end))
+            .map(|(now, before)| now - before);
         insert(
             self.conn,
             "lap_stats",
@@ -2781,6 +2801,8 @@ impl Writer<'_> {
                 ),
                 ("gap_ahead_end_s", real(lap.gap_ahead_end)),
                 ("gap_behind_end_s", real(lap.gap_behind_end)),
+                ("gap_ahead_delta_s", real(gap_ahead_delta)),
+                ("gap_behind_delta_s", real(gap_behind_delta)),
             ],
         )?;
         let sectors = official.map_or(&[][..], |o| &o.sectors[..]);
@@ -4139,7 +4161,11 @@ impl Stream {
                 player: self.player,
             };
             for lap in laps.iter().skip(car.finished.len()) {
-                writer.write_lap(vehicle, car, lap, vehicle == ctx.vehicle)?;
+                let prev = lap
+                    .lap
+                    .checked_sub(1)
+                    .and_then(|prev| laps.iter().rev().find(|l| l.lap == prev));
+                writer.write_lap(vehicle, car, lap, prev, vehicle == ctx.vehicle)?;
             }
         }
         Ok(projection)
@@ -7775,6 +7801,131 @@ mod tests {
             .await,
             99.8
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lap_stats_gap_deltas_track_adjacent_and_in_progress_laps() {
+        let (dir, engineer) = race();
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        // Vehicle 1: distinct end-of-lap gaps across laps 1..4 (lap 4 in-progress)
+        //   lap 1: ahead 5.0, behind 2.0 -> deltas NULL, NULL
+        //   lap 2: ahead 4.2, behind 2.5 -> deltas -0.8 (closing), +0.5 (pulling away)
+        //   lap 3: ahead 4.5, behind 1.9 -> deltas +0.3 (falling back), -0.6 (rival closing)
+        //   lap 4: ahead 3.9, behind 2.1 -> deltas -0.6 (closing), +0.2 (pulling away)
+        // Vehicle 2: missing gaps (NULL on previous lap and/or current lap, complete & in-progress)
+        //   lap 1: ahead 5.0, behind NULL -> deltas NULL, NULL
+        //   lap 2: ahead NULL, behind 2.5 -> deltas NULL, NULL
+        //   lap 3: ahead 4.5, behind 1.9 -> deltas NULL, -0.6
+        //   lap 4: ahead 4.0, behind NULL -> deltas -0.5, NULL
+        conn.execute_batch(
+            "UPDATE telemetry SET gap_to_place_ahead = 5.0, gap_to_place_behind = 2.0 WHERE vehicle_id = 1 AND lap = 1;
+             UPDATE telemetry SET gap_to_place_ahead = 4.2, gap_to_place_behind = 2.5 WHERE vehicle_id = 1 AND lap = 2;
+             UPDATE telemetry SET gap_to_place_ahead = 4.5, gap_to_place_behind = 1.9 WHERE vehicle_id = 1 AND lap = 3;
+             UPDATE telemetry SET gap_to_place_ahead = 3.9, gap_to_place_behind = 2.1 WHERE vehicle_id = 1 AND lap = 4;
+             UPDATE telemetry SET gap_to_place_ahead = 5.0, gap_to_place_behind = NULL WHERE vehicle_id = 2 AND lap = 1;
+             UPDATE telemetry SET gap_to_place_ahead = NULL, gap_to_place_behind = 2.5 WHERE vehicle_id = 2 AND lap = 2;
+             UPDATE telemetry SET gap_to_place_ahead = 4.5, gap_to_place_behind = 1.9 WHERE vehicle_id = 2 AND lap = 3;
+             UPDATE telemetry SET gap_to_place_ahead = 4.0, gap_to_place_behind = NULL WHERE vehicle_id = 2 AND lap = 4;",
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let rows = query(
+            &engineer,
+            "SELECT lap, complete, ROUND(gap_ahead_delta_s, 1), ROUND(gap_behind_delta_s, 1) \
+             FROM lap_stats WHERE vehicle_id = 1 ORDER BY lap",
+        )
+        .await;
+        assert_eq!(
+            rows,
+            [
+                ["1", "1", "NULL", "NULL"],
+                ["2", "1", "-0.8", "0.5"],
+                ["3", "1", "0.3", "-0.6"],
+                ["4", "0", "-0.6", "0.2"],
+            ]
+        );
+        let missing = query(
+            &engineer,
+            "SELECT lap, complete, ROUND(gap_ahead_delta_s, 1), ROUND(gap_behind_delta_s, 1) \
+             FROM lap_stats WHERE vehicle_id = 2 ORDER BY lap",
+        )
+        .await;
+        assert_eq!(
+            missing,
+            [
+                ["1", "1", "NULL", "NULL"],
+                ["2", "1", "NULL", "NULL"],
+                ["3", "1", "NULL", "-0.6"],
+                ["4", "0", "-0.5", "NULL"],
+            ]
+        );
+
+        // Overlap case: lap 4 has no lap_start_time yet, so lap 3 stays in car.waiting (not
+        // car.finished) while lap 4 is car.current. Both must still compute deltas against lap - 1.
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute(
+            "UPDATE telemetry SET lap_start_time = NULL WHERE vehicle_id = 1 AND lap = 4",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let overlap = query(
+            &engineer,
+            "SELECT lap, complete, time_s, ROUND(gap_ahead_delta_s, 1), ROUND(gap_behind_delta_s, 1) \
+             FROM lap_stats WHERE vehicle_id = 1 ORDER BY lap",
+        )
+        .await;
+        assert_eq!(
+            overlap,
+            [
+                ["1", "1", "100", "NULL", "NULL"],
+                ["2", "1", "100", "-0.8", "0.5"],
+                ["3", "1", "NULL", "0.3", "-0.6"],
+                ["4", "0", "NULL", "-0.6", "0.2"],
+            ]
+        );
+
+        // Non-adjacent lap jumps (both finished and in-progress): never subtract a non-adjacent lap.
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute_batch(
+            "UPDATE telemetry SET lap_start_time = 300.0 WHERE vehicle_id = 1 AND lap = 4;
+             UPDATE telemetry SET gap_to_place_ahead = 4.0, gap_to_place_behind = 2.0 WHERE vehicle_id = 2 AND lap = 4;
+             DELETE FROM telemetry_wheel WHERE telemetry_id IN (
+                 SELECT id FROM telemetry WHERE (vehicle_id = 1 AND lap = 2) OR (vehicle_id = 2 AND lap = 3)
+             );
+             DELETE FROM car_state WHERE telemetry_id IN (
+                 SELECT id FROM telemetry WHERE (vehicle_id = 1 AND lap = 2) OR (vehicle_id = 2 AND lap = 3)
+             );
+             DELETE FROM telemetry WHERE (vehicle_id = 1 AND lap = 2) OR (vehicle_id = 2 AND lap = 3);",
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let skipped_finished = query(
+            &engineer,
+            "SELECT lap, complete, ROUND(gap_ahead_delta_s, 1), ROUND(gap_behind_delta_s, 1) \
+             FROM lap_stats WHERE vehicle_id = 1 AND lap IN (3, 4) ORDER BY lap",
+        )
+        .await;
+        assert_eq!(
+            skipped_finished,
+            [
+                ["3", "1", "NULL", "NULL"],
+                ["4", "0", "-0.6", "0.2"],
+            ]
+        );
+        let skipped_in_progress = query(
+            &engineer,
+            "SELECT lap, complete, gap_ahead_delta_s, gap_behind_delta_s \
+             FROM lap_stats WHERE vehicle_id = 2 AND lap = 4",
+        )
+        .await;
+        assert_eq!(skipped_in_progress, [["4", "0", "NULL", "NULL"]]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
