@@ -886,6 +886,30 @@ fn real_text(x: f64) -> String {
     }
 }
 
+/// Result column names whose values are lap times in seconds and receive an inline `m:ss.t`
+/// annotation in SQL text output when finite and at least a minute.
+const LAP_TIME_COLUMNS: [&str; 5] = [
+    "time_s",
+    "official_time_s",
+    "last_lap_s",
+    "best_lap_s",
+    "avg_lap_s",
+];
+
+/// Formats a lap-time column value for SQL text output, appending `(m:ss.t)` when finite and
+/// `>= 60.0` so the model does not divide seconds by 60 mentally. Rounds tenths before splitting
+/// minutes and seconds so values like `119.96` format as `2:00.0` rather than `1:60.0`.
+fn format_lap_time(x: f64) -> String {
+    if x.is_finite() && x >= 60.0 && x * 10.0 < u64::MAX as f64 {
+        let tenths = (x * 10.0).round() as u64;
+        let mins = tenths / 600;
+        let secs = (tenths % 600) as f64 / 10.0;
+        format!("{} ({mins}:{secs:04.1})", real_text(x))
+    } else {
+        real_text(x)
+    }
+}
+
 /// Runs `query`, stopped once it's taken [`SQL_TIME`], or as soon as `abandoned` says nobody waits
 /// for its answer.
 fn run_query(
@@ -941,8 +965,12 @@ fn run_query(
         Some(move || abandoned() || Instant::now() > deadline),
     )?;
     let result = (|| -> rusqlite::Result<()> {
-        let names = stmt
-            .column_names()
+        let raw_names = stmt.column_names();
+        let annotate: Vec<bool> = raw_names
+            .iter()
+            .map(|name| LAP_TIME_COLUMNS.contains(name))
+            .collect();
+        let names = raw_names
             .into_iter()
             .map(telemetry_text)
             .collect::<Vec<_>>();
@@ -961,7 +989,13 @@ fn run_query(
                     Ok(match row.get_ref(i)? {
                         ValueRef::Null => "NULL".into(),
                         ValueRef::Integer(n) => n.to_string(),
-                        ValueRef::Real(x) => real_text(x),
+                        ValueRef::Real(x) => {
+                            if annotate[i] {
+                                format_lap_time(x)
+                            } else {
+                                real_text(x)
+                            }
+                        }
                         ValueRef::Text(text) => telemetry_text(
                             std::str::from_utf8(text)
                                 .map_err(|e| rusqlite::Error::Utf8Error(i, e))?,
@@ -7787,19 +7821,19 @@ mod tests {
         assert_eq!(
             rows,
             [
-                ["1", "100", "1", "1", "1", "0"],
-                ["2", "100", "1", "1", "1", "0"],
-                ["3", "100", "1", "1", "1", "0"],
+                ["1", "100 (1:40.0)", "1", "1", "1", "0"],
+                ["2", "100 (1:40.0)", "1", "1", "1", "0"],
+                ["3", "100 (1:40.0)", "1", "1", "1", "0"],
                 ["4", "NULL", "0", "0", "1", "0"],
             ]
         );
         assert_eq!(
-            number(
+            query(
                 &engineer,
                 "SELECT official_time_s FROM lap_stats WHERE vehicle_id = 2 AND lap = 1"
             )
             .await,
-            99.8
+            [["99.8 (1:39.8)"]]
         );
     }
 
@@ -7882,8 +7916,8 @@ mod tests {
         assert_eq!(
             overlap,
             [
-                ["1", "1", "100", "NULL", "NULL"],
-                ["2", "1", "100", "-0.8", "0.5"],
+                ["1", "1", "100 (1:40.0)", "NULL", "NULL"],
+                ["2", "1", "100 (1:40.0)", "-0.8", "0.5"],
                 ["3", "1", "NULL", "0.3", "-0.6"],
                 ["4", "0", "NULL", "-0.6", "0.2"],
             ]
@@ -8007,7 +8041,7 @@ mod tests {
         .await;
         let lap = number(
             &engineer,
-            "SELECT time_s FROM lap_stats WHERE vehicle_id = 1 AND lap = 2",
+            "SELECT time_s + 0 FROM lap_stats WHERE vehicle_id = 1 AND lap = 2",
         )
         .await;
         assert!((total - lap).abs() < 0.01, "{total} {lap}");
@@ -8335,7 +8369,11 @@ mod tests {
         .await;
         assert_eq!(
             laps,
-            [["1", "0", "100"], ["2", "1", "NULL"], ["3", "0", "100"]]
+            [
+                ["1", "0", "100 (1:40.0)"],
+                ["2", "1", "NULL"],
+                ["3", "0", "100 (1:40.0)"],
+            ]
         );
         let passes = query(
             &engineer,
@@ -12212,6 +12250,85 @@ mod tests {
         assert_eq!(
             number(&engineer, "SELECT COUNT(*) FROM cars_now").await,
             2.0
+        );
+    }
+
+    #[test]
+    fn format_lap_time_annotates_minutes_with_clean_rollover() {
+        assert_eq!(format_lap_time(59.99), "59.99");
+        assert_eq!(format_lap_time(59.96), "59.96");
+        assert_eq!(format_lap_time(60.0), "60 (1:00.0)");
+        assert_eq!(format_lap_time(99.284), "99.284 (1:39.3)");
+        assert_eq!(format_lap_time(119.96), "119.96 (2:00.0)");
+        assert_eq!(format_lap_time(-5.0), "-5");
+        assert_eq!(format_lap_time(f64::NAN), "NaN");
+        assert_eq!(format_lap_time(f64::INFINITY), "inf");
+        assert_eq!(format_lap_time(f64::MAX), real_text(f64::MAX));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_query_annotates_lap_times_at_or_above_60s_with_clean_rollover() {
+        let (_dir, engineer) = race();
+        // All 5 target columns >= 60s get annotated; < 60s, NULL, and non-lap-time *_s columns
+        // stay plain numbers.
+        let rows = query(
+            &engineer,
+            "SELECT 99.284 AS time_s, 119.96 AS official_time_s, 60.0 AS last_lap_s, \
+                    85.0 AS best_lap_s, 100.0 AS avg_lap_s, \
+                    125.5 AS session_time_s, 72.4 AS gap_ahead_end_s, 61.2 AS entry_s",
+        )
+        .await;
+        assert_eq!(
+            rows,
+            [[
+                "99.284 (1:39.3)",
+                "119.96 (2:00.0)",
+                "60 (1:00.0)",
+                "85 (1:25.0)",
+                "100 (1:40.0)",
+                "125.5",
+                "72.4",
+                "61.2",
+            ]]
+        );
+
+        let below_and_null = query(
+            &engineer,
+            "SELECT 59.96 AS time_s, 35.0 AS official_time_s, 59.4 AS last_lap_s, \
+                    NULL AS best_lap_s, NULL AS avg_lap_s, NULL AS gap_ahead_end_s",
+        )
+        .await;
+        assert_eq!(
+            below_and_null,
+            [["59.96", "35", "59.4", "NULL", "NULL", "NULL"]]
+        );
+
+        // Qualified table alias still exposes the unqualified column name in SQLite and gets
+        // annotated on real table rows, while real non-lap-time *_s columns stay plain.
+        let aliased = query(
+            &engineer,
+            "SELECT l.time_s, l.official_time_s, s.avg_lap_s, r.session_time_s \
+             FROM lap_stats l \
+             JOIN stints s ON s.stint_id = l.stint_id \
+             CROSS JOIN race_state r \
+             WHERE l.vehicle_id = 2 AND l.lap = 1",
+        )
+        .await;
+        assert_eq!(aliased.len(), 1);
+        assert_eq!(aliased[0][0], "100 (1:40.0)");
+        assert_eq!(aliased[0][1], "99.8 (1:39.8)");
+        assert_eq!(aliased[0][2], "100 (1:40.0)");
+        assert!(!aliased[0][3].contains('('), "{aliased:?}");
+        assert!(aliased[0][3].parse::<f64>().unwrap() >= 60.0);
+
+        // Underlying SQL column remains numeric for arithmetic and sorting
+        assert_eq!(
+            number(
+                &engineer,
+                "SELECT time_s - 10.0 FROM lap_stats WHERE vehicle_id = 1 AND lap = 1"
+            )
+            .await,
+            90.0
         );
     }
 }
