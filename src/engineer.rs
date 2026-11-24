@@ -46,6 +46,7 @@ use tool::{ConditionId, Engineer as EngineerTool, Progress, SKILL, instructions}
 mod acknowledgement;
 mod pit;
 mod schedule;
+mod strategy;
 mod timeline;
 mod tool;
 
