@@ -19,7 +19,15 @@ pub const MAX_PLAN_CHARS: usize = 600;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StrategyChange {
     Set { plan: String, weekend: Option<i64> },
-    Clear,
+    Clear { weekend: Option<i64> },
+}
+
+impl StrategyChange {
+    pub fn weekend(&self) -> Option<i64> {
+        match self {
+            Self::Set { weekend, .. } | Self::Clear { weekend } => *weekend,
+        }
+    }
 }
 
 /// The agreed race strategy for the current weekend.
@@ -37,6 +45,10 @@ impl Strategy {
 
     pub fn plan(&self) -> Option<&str> {
         self.plan.as_deref()
+    }
+
+    pub fn weekend(&self) -> Option<i64> {
+        self.weekend.flatten()
     }
 
     pub fn briefing_text(&self) -> String {
@@ -58,7 +70,7 @@ impl Strategy {
     }
 
     /// Applies a turn's staged strategy change against `current_weekend`.
-    /// Returns `true` if a `Set` was dropped because it belonged to a different weekend.
+    /// Returns `true` if a staged change was dropped because it belonged to a different weekend.
     pub fn apply(&mut self, change: Option<StrategyChange>, current_weekend: Option<i64>) -> bool {
         self.follow_weekend(current_weekend);
         let Some(change) = change else {
@@ -72,7 +84,10 @@ impl Strategy {
                 self.plan = Some(plan);
                 false
             }
-            StrategyChange::Clear => {
+            StrategyChange::Clear { weekend } => {
+                if weekend != current_weekend {
+                    return true;
+                }
                 self.plan = None;
                 false
             }
@@ -191,7 +206,8 @@ impl StrategyTool {
                 if staging.turn != turn {
                     bail!("the turn moved on, so nothing was changed");
                 }
-                staging.change = Some(StrategyChange::Clear);
+                let weekend = staging.weekend;
+                staging.change = Some(StrategyChange::Clear { weekend });
                 Ok("Cleared.".into())
             }
         }
@@ -280,7 +296,7 @@ mod tests {
         ));
         assert_eq!(s.plan(), None);
 
-        // Set in weekend 2 then Clear resets plan
+        // Set in weekend 2, stale weekend 1 Clear is dropped, then weekend 2 Clear resets plan
         assert!(!s.apply(
             Some(StrategyChange::Set {
                 plan: "2-stop".into(),
@@ -289,7 +305,9 @@ mod tests {
             Some(2),
         ));
         assert_eq!(s.plan(), Some("2-stop"));
-        assert!(!s.apply(Some(StrategyChange::Clear), Some(2)));
+        assert!(s.apply(Some(StrategyChange::Clear { weekend: Some(1) }), Some(2)));
+        assert_eq!(s.plan(), Some("2-stop"));
+        assert!(!s.apply(Some(StrategyChange::Clear { weekend: Some(2) }), Some(2)));
         assert_eq!(s.plan(), None);
         assert_eq!(s.briefing_text(), NO_STRATEGY);
     }
@@ -336,7 +354,7 @@ mod tests {
         tool.begin(Some(7));
         let ok = call(&tool, json!({"action": "clear"})).await.unwrap();
         assert_eq!(ok, "Cleared.");
-        assert_eq!(tool.take(), Some(StrategyChange::Clear));
+        assert_eq!(tool.take(), Some(StrategyChange::Clear { weekend: Some(7) }));
     }
 
     #[tokio::test]

@@ -1093,7 +1093,6 @@ impl Engineer {
             );
         }
         if advance.cleared {
-            self.strategy.clear();
             // A new weekend: what was being answered or said is about the last one. A scheduled
             // turn that already finished was kept by the conversation: it's taken in as usual
             // (its answer is about cleared requests, so it isn't said)
@@ -1115,16 +1114,21 @@ impl Engineer {
 
     /// Applies a finished turn's staged race strategy change against the newest known weekend.
     fn apply_strategy(&mut self, change: Option<StrategyChange>) {
-        if change.is_none() {
+        let Some(change) = change else {
             return;
-        }
-        let current_weekend = self.progress.as_ref().map(|p| p.weekend).unwrap_or_else(|| {
-            match &change {
-                Some(StrategyChange::Set { weekend, .. }) => *weekend,
-                _ => None,
-            }
-        });
-        if self.strategy.apply(change, current_weekend) {
+        };
+        let staged_weekend = change.weekend();
+        // `weekend` (`min(id) FROM epoch`) increases monotonically within a recording (and
+        // replacing the recording clears both `progress` and `strategy`), so taking the maximum
+        // lets a fresh new-weekend update apply before `follow_progress` ticks while still
+        // dropping stale updates staged in an earlier weekend.
+        let current_weekend = self
+            .progress
+            .as_ref()
+            .and_then(|p| p.weekend)
+            .max(self.strategy.weekend())
+            .max(staged_weekend);
+        if self.strategy.apply(Some(change), current_weekend) {
             log::debug!("Dropped race strategy update staged in an earlier weekend");
         }
     }
@@ -1539,7 +1543,11 @@ impl Engineer {
             next_id: self.schedule.next_id(),
             pending_text: self.schedule.pending_text(&progress),
             strategy_text: self.strategy.briefing_text(),
-            weekend: self.progress.as_ref().and_then(|p| p.weekend),
+            weekend: self
+                .progress
+                .as_ref()
+                .and_then(|p| p.weekend)
+                .or_else(|| self.strategy.weekend()),
             notes: told.notes.clone(),
             state,
             note,
@@ -6929,5 +6937,88 @@ mod tests {
         // Next progress tick clears the weekend 1 strategy on Engineer
         scripted.tick();
         assert_eq!(scripted.engineer.strategy(), None);
+    }
+
+    #[test]
+    fn new_weekend_strategy_saved_before_progress_tick_survives_deferred_schedule_clear() {
+        let mut scripted = Scripted::recorded();
+        // Weekend 1 has both a pending request and a saved strategy
+        scripted.add("Fuel every lap, please.", fuel_every_lap());
+        scripted.tick();
+        scripted.ask("Lock weekend 1 plan.");
+        scripted.until("asked w1", |s| s.questions().len() == 2);
+        scripted
+            .strategy(serde_json::json!({"action": "set", "plan": "weekend 1 plan"}))
+            .unwrap();
+        scripted.finish(Act::Reply);
+        assert_eq!(scripted.engineer.strategy(), Some("weekend 1 plan"));
+
+        // Roll over to weekend 2 before follow_progress ticks, then save a weekend 2 plan
+        scripted.new_weekend();
+        scripted.ask("Lock weekend 2 plan.");
+        scripted.until("asked w2", |s| s.questions().len() == 3);
+        assert!(scripted.questions()[2].contains(NO_STRATEGY));
+        scripted
+            .strategy(serde_json::json!({"action": "set", "plan": "weekend 2 plan"}))
+            .unwrap();
+        scripted.finish(Act::Reply);
+        // Important #1: weekend 2 plan must not be dropped because progress lagged at weekend 1
+        assert_eq!(scripted.engineer.strategy(), Some("weekend 2 plan"));
+
+        // Important #2: subsequent tick clearing weekend 1's schedule must not wipe weekend 2's plan
+        scripted.tick();
+        assert_eq!(scripted.engineer.strategy(), Some("weekend 2 plan"));
+    }
+
+    #[test]
+    fn stale_in_flight_strategy_is_dropped_after_weekend_rollover() {
+        let mut scripted = Scripted::recorded();
+        scripted.tick();
+        scripted.ask("Lock weekend 1 plan.");
+        scripted.until("asked", |s| s.questions().len() == 1);
+        scripted
+            .strategy(serde_json::json!({"action": "set", "plan": "weekend 1 plan"}))
+            .unwrap();
+        // Roll over and tick progress into weekend 2 while the weekend 1 turn is still in flight
+        scripted.new_weekend();
+        scripted.tick();
+        scripted.finish(Act::Reply);
+        assert_eq!(scripted.engineer.strategy(), None);
+    }
+
+    #[test]
+    fn auto_session_off_new_weekend_without_progress_does_not_leak_old_strategy() {
+        use bono_sim::sql::{EpochReason, begin_epoch, clear_tables};
+
+        let mut scripted = Scripted::with_config(r#"{"auto_session": false}"#);
+        let db = scripted._dir.path().join("a.db");
+        // Seed weekend 1 in the pool's DB (`a.db`) with no telemetry so `progress` stays `None`
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            bono_sim::sql::create_tables(&conn).unwrap();
+            begin_epoch(&conn, 1, EpochReason::Session).unwrap();
+        }
+        assert!(scripted.engineer.progress.is_none());
+
+        scripted.ask("Lock weekend 1 plan.");
+        scripted.until("asked w1", |s| s.questions().len() == 1);
+        scripted
+            .strategy(serde_json::json!({"action": "set", "plan": "weekend 1 plan"}))
+            .unwrap();
+        scripted.finish(Act::Reply);
+        assert!(scripted.engineer.progress.is_none());
+        assert_eq!(scripted.engineer.strategy(), Some("weekend 1 plan"));
+
+        // Roll over to weekend 2 while `progress` is still `None` and `auto_session` is false
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            clear_tables(&conn, Some(2)).unwrap();
+        }
+        scripted.ask("Fuel check in weekend 2?");
+        scripted.until("asked w2", |s| s.questions().len() == 2);
+        let q2 = &scripted.questions()[1];
+        assert!(q2.contains(NO_STRATEGY), "leaked old strategy: {q2}");
+        assert!(!q2.contains("weekend 1 plan"), "leaked old strategy: {q2}");
+        scripted.finish(Act::Reply);
     }
 }
