@@ -79,6 +79,8 @@ pub struct Whisper {
     /// The joystick whose talk button started the recording: unplugging it means the release
     /// never comes
     talk_joystick: Option<JoystickId>,
+    /// The [talk settings](talk_settings) the recording started with
+    talk_settings: (Option<ConfigButton>, bool),
     catalog: MaybeDone<Option<Vec<Model>>>,
     pref_path: Arc<Utf8Path>,
     threads: NonZeroUsize,
@@ -141,6 +143,7 @@ impl Whisper {
             replace_since: None,
             stream: None,
             talk_joystick: None,
+            talk_settings: (None, false),
             catalog: Self::fetch_catalog(pref_path.clone(), client.clone(), 3),
             pref_path,
             threads,
@@ -313,9 +316,10 @@ impl Whisper {
         config: &Config,
         device: Option<&sdl3::audio::AudioDevice>,
     ) -> Result<JoinHandle<anyhow::Result<Heard>>, bool> {
-        let talk_button = config.get().talk_button().clone();
-        return match talk(talk_button.as_ref(), event, self.talking()) {
+        let (button, toggle) = talk_settings(config);
+        return match talk(button.as_ref(), event, self.talking(), toggle) {
             Talk::Begin => {
+                self.talk_settings = (button, toggle);
                 self.talk_joystick = match *event {
                     Event::JoyButtonDown { which, .. } => Some(which),
                     _ => None,
@@ -335,7 +339,8 @@ impl Whisper {
     /// Whether `event` ends the recording, so it must reach [`Self::event`] even when the UI used
     /// it (a text field with focus takes the talk key's release).
     pub fn ends_recording(&self, config: &Config, event: &Event) -> bool {
-        talk(config.get().talk_button().as_ref(), event, self.talking()) == Talk::Finish
+        let (button, toggle) = talk_settings(config);
+        talk(button.as_ref(), event, self.talking(), toggle) == Talk::Finish
     }
 
     /// What [`talk`] needs to know of the recording: whether there's one, and who started it.
@@ -351,7 +356,7 @@ impl Whisper {
         )
     }
 
-    /// The microphone is open, from the talk button's press until its release.
+    /// The microphone is open, from the talk button's press until its release (or next press).
     #[inline]
     pub fn recording(&self) -> bool {
         self.stream.is_some()
@@ -435,6 +440,11 @@ impl Whisper {
     /// Called every frame: loads the model picked once it changes, and sets up the recommended
     /// one if the setup guide asked for it.
     pub fn poll(&mut self, rt: &Handle, config: &Config) {
+        // What would have ended the recording may not any more
+        if self.recording() && self.talk_settings != talk_settings(config) {
+            self.cancel_recording();
+        }
+
         if let Some(ctx) = &mut self.ctx {
             ctx.update(rt);
         }
@@ -606,27 +616,38 @@ enum Talk {
     Ignore,
 }
 
-/// `recording` is `None` without a recording, or the joystick that started it.
+/// The talk button, and whether it's pressed again to stop talking rather than held.
+fn talk_settings(config: &Config) -> (Option<ConfigButton>, bool) {
+    let config = config.get();
+    (config.talk_button().clone(), *config.talk_toggle())
+}
+
+/// `recording` is `None` without a recording, or the joystick that started it. `toggle` is whether
+/// the button is pressed again to stop talking rather than held.
 fn talk(
     button: Option<&ConfigButton>,
     event: &Event,
     recording: Option<Option<JoystickId>>,
+    toggle: bool,
 ) -> Talk {
     let Some(button) = button else {
         return Talk::Ignore;
     };
     // The key held down repeats, but it's still the one press
     if button.pressed(event) {
-        return Talk::Begin;
+        return match toggle && recording.is_some() {
+            true => Talk::Finish,
+            false => Talk::Begin,
+        };
     }
     let Some(joystick) = recording else {
         return Talk::Ignore;
     };
-    if button.released(event) {
+    if !toggle && button.released(event) {
         return Talk::Finish;
     }
-    // A key's release goes to whichever window has focus, so once Bono loses it the release may
-    // never come. Joysticks are heard in the background, so their release still will
+    // A key's events go to whichever window has focus, so once Bono loses it the one that ends the
+    // recording may never come. Joysticks are heard in the background, so theirs still will
     if matches!(button, ConfigButton::Key(_))
         && matches!(
             event,
@@ -638,7 +659,7 @@ fn talk(
     {
         return Talk::Finish;
     }
-    // An unplugged joystick never sends its button's release
+    // An unplugged joystick never sends its button's events
     if let Event::JoyDeviceRemoved { which, .. } = *event
         && joystick == Some(which)
     {
@@ -1426,27 +1447,38 @@ mod tests {
         let button = ConfigButton::Key(Scancode::Space);
         let release = key(Scancode::Space, false);
         assert_eq!(
-            talk(Some(&button), &key(Scancode::Space, true), None),
+            talk(Some(&button), &key(Scancode::Space, true), None, false),
             Talk::Begin
         );
-        assert_eq!(talk(Some(&button), &release, Some(None)), Talk::Finish);
-        // Nothing to finish, so a text field may keep it
-        assert_eq!(talk(Some(&button), &release, None), Talk::Ignore);
         assert_eq!(
-            talk(Some(&button), &key(Scancode::A, false), Some(None)),
+            talk(Some(&button), &release, Some(None), false),
+            Talk::Finish
+        );
+        // Nothing to finish, so a text field may keep it
+        assert_eq!(talk(Some(&button), &release, None, false), Talk::Ignore);
+        assert_eq!(
+            talk(Some(&button), &key(Scancode::A, false), Some(None), false),
             Talk::Ignore
         );
-        assert_eq!(talk(None, &release, Some(None)), Talk::Ignore);
+        assert_eq!(talk(None, &release, Some(None), false), Talk::Ignore);
     }
 
     #[test]
     fn losing_focus_finishes_a_key_recording() {
         let key = ConfigButton::Key(Scancode::Space);
         let focus_lost = window(WindowEvent::FocusLost);
-        assert_eq!(talk(Some(&key), &focus_lost, Some(None)), Talk::Finish);
-        assert_eq!(talk(Some(&key), &focus_lost, None), Talk::Ignore);
         assert_eq!(
-            talk(Some(&key), &window(WindowEvent::FocusGained), Some(None)),
+            talk(Some(&key), &focus_lost, Some(None), false),
+            Talk::Finish
+        );
+        assert_eq!(talk(Some(&key), &focus_lost, None, false), Talk::Ignore);
+        assert_eq!(
+            talk(
+                Some(&key),
+                &window(WindowEvent::FocusGained),
+                Some(None),
+                false
+            ),
             Talk::Ignore
         );
 
@@ -1455,7 +1487,10 @@ mod tests {
             guid: unsafe { std::mem::zeroed() },
             button: 0,
         };
-        assert_eq!(talk(Some(&joystick), &focus_lost, Some(None)), Talk::Ignore);
+        assert_eq!(
+            talk(Some(&joystick), &focus_lost, Some(None), false),
+            Talk::Ignore
+        );
     }
 
     #[test]
@@ -1469,11 +1504,69 @@ mod tests {
             which: JoystickId::new(id),
         };
         let wheel = Some(JoystickId::new(7));
-        assert_eq!(talk(Some(&button), &removed(7), Some(wheel)), Talk::Finish);
+        assert_eq!(
+            talk(Some(&button), &removed(7), Some(wheel), false),
+            Talk::Finish
+        );
         // Another joystick, a key's recording, or no recording at all
-        assert_eq!(talk(Some(&button), &removed(8), Some(wheel)), Talk::Ignore);
-        assert_eq!(talk(Some(&button), &removed(7), Some(None)), Talk::Ignore);
-        assert_eq!(talk(Some(&button), &removed(7), None), Talk::Ignore);
+        assert_eq!(
+            talk(Some(&button), &removed(8), Some(wheel), false),
+            Talk::Ignore
+        );
+        assert_eq!(
+            talk(Some(&button), &removed(7), Some(None), false),
+            Talk::Ignore
+        );
+        assert_eq!(talk(Some(&button), &removed(7), None, false), Talk::Ignore);
+    }
+
+    #[test]
+    fn toggling_starts_on_one_press_and_finishes_on_the_next() {
+        let button = ConfigButton::Key(Scancode::Space);
+        let press = key(Scancode::Space, true);
+        let release = key(Scancode::Space, false);
+        let mut repeated = press.clone();
+        if let Event::KeyDown { repeat, .. } = &mut repeated {
+            *repeat = true;
+        }
+        let toggle = |event: &Event, recording| talk(Some(&button), event, recording, true);
+
+        assert_eq!(toggle(&press, None), Talk::Begin);
+        // Letting go, or keeping it held down, doesn't end it
+        assert_eq!(toggle(&release, Some(None)), Talk::Ignore);
+        assert_eq!(toggle(&repeated, Some(None)), Talk::Ignore);
+        assert_eq!(toggle(&key(Scancode::A, true), Some(None)), Talk::Ignore);
+        assert_eq!(toggle(&press, Some(None)), Talk::Finish);
+        assert_eq!(toggle(&release, None), Talk::Ignore);
+        assert_eq!(talk(None, &press, Some(None), true), Talk::Ignore);
+    }
+
+    #[test]
+    fn toggling_finishes_when_the_next_press_may_never_come() {
+        let key = ConfigButton::Key(Scancode::Space);
+        let focus_lost = window(WindowEvent::FocusLost);
+        assert_eq!(
+            talk(Some(&key), &focus_lost, Some(None), true),
+            Talk::Finish
+        );
+        assert_eq!(talk(Some(&key), &focus_lost, None, true), Talk::Ignore);
+
+        let joystick = ConfigButton::Joystick {
+            guid: unsafe { std::mem::zeroed() },
+            button: 0,
+        };
+        let toggle = |event: &Event| {
+            let wheel = Some(JoystickId::new(7));
+            talk(Some(&joystick), event, Some(wheel), true)
+        };
+        let removed = |id: u32| Event::JoyDeviceRemoved {
+            timestamp: 0,
+            which: JoystickId::new(id),
+        };
+        assert_eq!(toggle(&removed(7)), Talk::Finish);
+        assert_eq!(toggle(&removed(8)), Talk::Ignore);
+        // Joysticks are heard in the background
+        assert_eq!(toggle(&focus_lost), Talk::Ignore);
     }
 
     /// Sends the thread it's dropped on.

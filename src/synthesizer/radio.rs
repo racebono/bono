@@ -78,6 +78,21 @@ impl Radio {
         self.tones(&self.beep_tones, sample_rate)
     }
 
+    /// The radio's beep once the pilot stops talking: lower than [`Self::beep`], and shorter.
+    pub fn close_beep(&self, sample_rate: f32) -> Vec<f32> {
+        const TONES: [Tone; 2] = [
+            Tone {
+                frequency: 780.0,
+                seconds: 0.05,
+            },
+            Tone {
+                frequency: 760.0,
+                seconds: 0.06,
+            },
+        ];
+        self.tones(&TONES, sample_rate)
+    }
+
     /// The radio's low, falling double tone: the engineer can't answer.
     pub fn no_beep(&self, sample_rate: f32) -> Vec<f32> {
         const TONES: [Tone; 3] = [
@@ -497,6 +512,20 @@ fn sum_squares_4(samples: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_closing_beep_is_lower_and_shorter_than_the_opening_one() {
+        // How often the wave crosses zero tells its pitch
+        let pitch = |samples: &[f32]| {
+            let crossings = samples.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0);
+            crossings.count() as f32 / samples.len() as f32
+        };
+        let radio = Radio::default();
+        let (open, close) = (radio.beep(48000.0), radio.close_beep(48000.0));
+        assert_eq!(close.len(), 2400 + 2880);
+        assert!(close.len() < open.len());
+        assert!(pitch(&close) < 0.8 * pitch(&open));
+    }
 
     #[test]
     fn streams_the_effect_a_piece_at_a_time() {

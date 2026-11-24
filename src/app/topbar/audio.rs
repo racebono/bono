@@ -91,7 +91,7 @@ pub struct AudioTopbar {
     pub test: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Speech>>>,
     /// The test speech's stream, kept until it's done playing (dropping it stops playback)
     test_playback: Option<AudioStreamOwner>,
-    /// The beep when the talk button is pressed, kept until the next one (dropping it stops
+    /// The beep when the microphone opens or closes, kept until the next one (dropping it stops
     /// playback)
     beep_playback: Option<AudioStreamOwner>,
     /// What the pilot last said on the radio, being transcribed
@@ -191,7 +191,7 @@ impl AudioTopbar {
         self.test.is_some() || self.test_playback.is_some()
     }
 
-    /// Whether the microphone is open: the talk button is held.
+    /// Whether the microphone is open: the pilot is talking.
     pub fn recording(&self) -> bool {
         self.whisper.recording()
     }
@@ -350,8 +350,19 @@ impl AudioTopbar {
         let was_recording = self.whisper.recording();
         let microphone = self.microphone.get();
         let result = self.whisper.event(rt, &event, config, microphone);
-        if !was_recording && self.whisper.recording() {
-            self.beep(config);
+        match (was_recording, self.whisper.recording()) {
+            (false, true) => self.beep(config, Speech::talk_beep),
+            // Let go of, the button itself tells the pilot it closed
+            (true, false) => {
+                let close_beep = {
+                    let config = config.get();
+                    *config.talk_toggle() && *config.talk_close_beep()
+                };
+                if close_beep {
+                    self.beep(config, Speech::talk_close_beep);
+                }
+            }
+            _ => {}
         }
 
         return match result {
@@ -405,8 +416,8 @@ impl AudioTopbar {
         self.speaker.removed(which)
     }
 
-    /// Tells the pilot the microphone is open.
-    fn beep(&mut self, config: &Config) {
+    /// Tells the pilot the microphone opened or closed, with the `beep` made at the volume given.
+    fn beep(&mut self, config: &Config, beep: fn(f32) -> Speech) {
         let volume = {
             let config = config.get();
             config.master_volume() * config.beep_volume()
@@ -418,7 +429,7 @@ impl AudioTopbar {
         let Some(device) = self.speaker.get() else {
             return;
         };
-        match Speech::talk_beep(volume).play(device) {
+        match beep(volume).play(device) {
             Ok(stream) => self.beep_playback = Some(stream),
             Err(e) => log::warn!("Error playing the talk beep: {e}"),
         }
