@@ -13,7 +13,7 @@ use crate::{
     config::{ArrayStr, AudioDevice, Config, RawConfig},
     engineer::Heard,
     error,
-    synthesizer::{Speech, Synthesizer, VoiceLoad, plays_on},
+    synthesizer::{Drain, Drained, Speech, Synthesizer, VoiceLoad, plays_on},
     task::Task,
     updating,
 };
@@ -91,9 +91,9 @@ pub struct AudioTopbar {
     pub test: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Speech>>>,
     /// The test speech's stream, kept until it's done playing (dropping it stops playback)
     test_playback: Option<AudioStreamOwner>,
-    /// The beep when the microphone opens or closes, kept until the next one (dropping it stops
-    /// playback)
-    beep_playback: Option<AudioStreamOwner>,
+    /// The beep when the microphone opens or closes, kept until it's done playing (dropping it
+    /// stops playback)
+    beep_playback: Option<(AudioStreamOwner, Drain)>,
     /// What the pilot last said on the radio, being transcribed
     transcription: Option<Task<anyhow::Result<Heard>>>,
     /// Listening to the microphone for the setup guide: `None` until it's asked for, and
@@ -405,15 +405,24 @@ impl AudioTopbar {
     /// The speaker `which` is gone (unplugged): nothing plays on it any more, and if it's the one
     /// picked, nothing is played until it reconnects or another is picked. Returns whether it was.
     pub fn speaker_removed(&mut self, which: u32) -> bool {
-        for playback in [&mut self.test_playback, &mut self.beep_playback] {
-            if playback
-                .as_ref()
-                .is_some_and(|stream| plays_on(stream, which))
-            {
-                *playback = None;
+        self.test_playback.take_if(|stream| plays_on(stream, which));
+        self.beep_playback
+            .take_if(|(stream, _)| plays_on(stream, which));
+        self.speaker.removed(which)
+    }
+
+    /// Whether the beep when the microphone opens or closes is playing.
+    pub fn beeping(&mut self) -> bool {
+        let Some((stream, drain)) = &mut self.beep_playback else {
+            return false;
+        };
+        match drain.check(stream.queued_bytes().ok(), false, Instant::now()) {
+            Drained::Playing => true,
+            Drained::Done | Drained::Stalled => {
+                self.beep_playback = None;
+                false
             }
         }
-        self.speaker.removed(which)
     }
 
     /// Tells the pilot the microphone opened or closed, with the `beep` made at the volume given.
@@ -430,7 +439,7 @@ impl AudioTopbar {
             return;
         };
         match beep(volume).play(device) {
-            Ok(stream) => self.beep_playback = Some(stream),
+            Ok(stream) => self.beep_playback = Some((stream, Drain::new(Instant::now()))),
             Err(e) => log::warn!("Error playing the talk beep: {e}"),
         }
     }

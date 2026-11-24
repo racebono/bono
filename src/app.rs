@@ -334,8 +334,10 @@ impl AppState {
         self.engineer
             .follow_recording(rt, self.simulators.current_mut());
 
-        // Its answer waits while the pilot holds the talk button. Told before what was heard: a
-        // release is seen no later than what was said before it
+        // Its answer waits while the pilot talks, and for the closing beep after: told first, so the
+        // answer doesn't carry on in between. Both are told before what was heard: the pilot
+        // stopping is seen no later than what was said before it
+        self.engineer.beep(self.gui.topbar.audio.beeping());
         self.engineer.talk(self.gui.topbar.audio.recording());
         // What the pilot says on the radio goes to the engineer, and its answers come back
         if let Some(heard) = self.gui.topbar.audio.transcription(rt) {

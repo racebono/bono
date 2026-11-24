@@ -145,6 +145,8 @@ pub struct Engineer {
     spotter_held: bool,
     /// The talk button is held: the front answer waits, as for the spotter
     talking: bool,
+    /// The talk button's beep is playing: the front answer waits, as for the spotter
+    beeping: bool,
     /// When the talk button was let go, while what was said hasn't been heard: a question may be
     /// on its way, which would drop a scheduled turn started now. Waited for no longer than
     /// [`HEARING_WAIT`]
@@ -683,6 +685,7 @@ impl Engineer {
             line: VecDeque::new(),
             spotter_held: false,
             talking: false,
+            beeping: false,
             hearing: None,
             misheard: 0,
             schedule: Schedule::new(),
@@ -930,7 +933,7 @@ impl Engineer {
 
     /// Pauses the answer at the front of the line (and holds one about to start) while the
     /// talk button is held, as [`Self::hold`] does for the spotter, so it doesn't play over the
-    /// pilot. It stays paused until both let go.
+    /// pilot. It stays paused until nothing else holds it.
     ///
     /// Its release holds scheduled turns back until what was said is [heard](Self::hear), so one
     /// doesn't start just to be dropped by the question.
@@ -942,9 +945,22 @@ impl Engineer {
         self.hold_front();
     }
 
-    /// Whether the front of the line waits: the spotter is speaking or the pilot is talking.
+    /// Holds the answer at the front of the line while the talk button's beep plays, as
+    /// [`Self::hold`] does for the spotter. Only the spotter's urgent calls play over it.
+    pub fn beep(&mut self, beeping: bool) {
+        self.beeping = beeping;
+        self.hold_front();
+    }
+
+    /// Whether the talk button's beep is playing.
+    pub fn is_beeping(&self) -> bool {
+        self.beeping
+    }
+
+    /// Whether the front of the line waits: the spotter is speaking, the pilot is talking or the
+    /// talk button's beep is playing.
     fn held(&self) -> bool {
-        self.spotter_held || self.talking
+        self.spotter_held || self.talking || self.beeping
     }
 
     /// Holds the front of the line as [`Self::held`] says, whichever answer is there. Nothing
@@ -2120,7 +2136,7 @@ impl Engineer {
         if !self.held() {
             self.drop_stale_front();
         }
-        // Whichever answer is at the front waits while the spotter speaks or the pilot talks
+        // Whichever answer is at the front waits while something else is heard (see `held`)
         self.hold_front();
         let held = self.held();
         let Some(playback) = self.line.front_mut() else {
@@ -3409,6 +3425,21 @@ mod tests {
         engineer.talk(false);
         assert!(engineer.line[0].held);
         engineer.hold(false);
+        assert!(!engineer.line[0].held);
+    }
+
+    #[test]
+    fn an_answer_waits_for_the_talk_beep() {
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.line.push_back(Playback::tone());
+        engineer.talk(true);
+        // The closing beep starts as the pilot stops talking
+        engineer.beep(true);
+        engineer.talk(false);
+        assert!(engineer.line[0].held);
+        // What was said is waited for from then, not from the beep's end
+        assert!(engineer.hearing.is_some());
+        engineer.beep(false);
         assert!(!engineer.line[0].held);
     }
 
