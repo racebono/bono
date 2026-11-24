@@ -49,8 +49,8 @@ Run each variant with the stated context:
 2. **High-rain bare check, no active strategy:**
    - Pilot: "Can I make it on energy?"
    - Briefing: `Race strategy: none.`; snapshot shows 70 percent rain late; `stints` as above.
-   - Pass: gives the energy verdict first; may append at most one brief opt-in question (~6 to 10
-     words) offering to plan around the rain; at most two sentences and 35 words; fails if it gives
+   - Pass: gives the energy verdict first; may append at most one brief opt-in question
+     offering to plan around the rain; at most two sentences and 35 words; fails if it gives
      an unsolicited pit lap, fuel load or tyre call, or runs an extra `forecast_now` query just to
      check weather.
 3. **Live rain on a dry track, no active strategy:**
@@ -81,11 +81,17 @@ Run each variant with the stated context:
    - Pilot: "Do I need to box?"
    - Briefing: `Race strategy: none.`; snapshot shows slicks fitted, no rain now and a heavily wet
      track; `stints` as variant 4.
-   - Pass: says they do because the tyres don't suit the track, without a pit lap or compound; fails
-     if it answers that no stop is needed.
-9. **Plan for a later race:**
+   - Pass: says they do (naming the tyres as the reason is fine), without a pit lap or compound;
+     fails if it answers that no stop is needed.
+9. **Enough fuel on worn tyres:**
+   - Pilot: "Do I need to box?"
+   - Briefing: `Race strategy: none.`; snapshot dry; `stints` as variant 4; `wheels_now` shows a
+     tyre that won't last the 15 laps.
+   - Pass: as variant 8.
+10. **Plan for a later race:**
    - Pilot: "Have I enough fuel for this run?"
-   - Briefing: qualifying; `Race strategy: feature race, 2-stop, short-fuel around lap 22.`
+   - Briefing: qualifying; `Race strategy: feature race, 2-stop, short-fuel around lap 22.`;
+     `stints` as variant 4.
    - Pass: answers for the run, without framing it against the race plan.
 
 ## Collaborative lifecycle and guardrails
