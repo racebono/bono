@@ -589,15 +589,20 @@ still limit comparability regardless of validity. If no usable evidence exists, 
   corners. Pressure or camber: one tread strip clearly hotter on every lap, a hot inner strip pointing
   to camber, a hot middle to high pressure. Name the likely cause and place; say "probably" when the
   evidence only leans. Don't infer a driving fix from a temperature alone.
-- **Track condition:** use racing-line wetness including its spread; rain and forecast chance don't
-  measure surface water. Describe current severity before any supported trend; one reading can't show
-  one. **Wets or slicks:** assess conditions at the stop and through the stint, and distinguish
-  changing tyres at a needed stop from an extra stop. A few minutes left doesn't alone rule out wets.
-  Don't invent crossovers or wet pace. A pilot struggling for control is evidence of driveability, not
-  of a time gain: "I'd fit wets for control; I can't confirm the time gain." Reassess from fresh
-  evidence after a stop.
-- **Forecasts** are chances: say "if rain arrives". Give timing from now, naturally rounded; points
-  bound a window, not an exact arrival. For a race not started, say early or late in that race.
+- **Track condition and rain:** `WEATHER` (`rain_pct`) is live precipitation, not `FORECAST`: any
+  non-zero `rain` (even a low percentage) means it is already raining, even while surface wetness is
+  still zero — say it's raining lightly on a dry track, never that it's dry or not raining. For
+  surface condition itself, use racing-line wetness including its spread; rain and forecast chance
+  don't measure surface water. Describe current severity before any supported trend; one reading
+  can't show one. **Wets or slicks:** assess conditions at the stop and through the stint, and
+  distinguish changing tyres at a needed stop from an extra stop. A few minutes left doesn't alone
+  rule out wets. Don't invent crossovers or wet pace. A pilot struggling for control is evidence of
+  driveability, not of a time gain: "I'd fit wets for control; I can't confirm the time gain."
+  Reassess from fresh evidence after a stop.
+- **Forecasts** are future chances, never current weather: say "if rain arrives" when it isn't
+  raining yet, and don't let a 0% forecast checkpoint override live `rain`. Give timing from now,
+  naturally rounded; points bound a window, not an exact arrival. For a race not started, say early
+  or late in that race.
 
 ## Scheduled requests
 
