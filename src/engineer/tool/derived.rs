@@ -680,6 +680,7 @@ impl Data {
             "SELECT laps_completed FROM cars_now WHERE is_player = 1",
             [],
         )?;
+        let strategy = strategy_line(conn)?;
         let epoch = stream.epoch.id;
         let (weekend, new_epochs) = match epoch {
             // A recording without epochs: no weekend to tell from the next
@@ -761,6 +762,7 @@ impl Data {
             epoch,
             new_epochs,
             session_type,
+            strategy,
             clock_s: watch.counters.clock_s(),
             laps: watch.counters.laps(),
             conditions: watch
@@ -5297,6 +5299,80 @@ fn projection(
         ("energy_to_finish_pct", real(energy_to_finish)),
         ("energy_deficit_pct", real(energy_deficit)),
     ]
+}
+
+/// What the player's current stint is on course for, as `quick` shows it: use per lap and how long
+/// it lasts, the tank, and in a race what reaching the flag takes. `None` before any use is known.
+fn strategy_line(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    let Some(s) = row(
+        conn,
+        "SELECT s.* FROM stints s JOIN cars_now c ON c.current_stint_id = s.stint_id \
+         WHERE c.is_player = 1",
+        [],
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut parts = Vec::new();
+    for (name, unit, per_lap, left, out) in [
+        (
+            "fuel",
+            " L",
+            "fuel_per_lap_l",
+            "fuel_laps_left",
+            "fuel_runs_out_lap",
+        ),
+        (
+            "VE",
+            "%",
+            "energy_per_lap_pct",
+            "energy_laps_left",
+            "energy_runs_out_lap",
+        ),
+    ] {
+        if let (Some(per_lap), Some(left), Some(out)) = (s.f(per_lap), s.f(left), s.f(out)) {
+            parts.push(format!(
+                "{name} {per_lap:.2}{unit}/lap, {left:.1} laps left, out during lap {}",
+                out.floor()
+            ));
+        }
+    }
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    if s.s("baseline_source") == Some("any driver") && s.i("driver_id").is_some() {
+        parts.push("use partly another driver's".into());
+    }
+    if let Some(tank) = s.f("tank_capacity_l").filter(|tank| *tank > 0.0) {
+        parts.push(format!("tank {tank:.1} L"));
+    }
+    if let (Some(need), Some(margin)) = (s.f("laps_needed"), s.f("margin_laps")) {
+        let mut finish = format!("to the flag {need:.1} laps");
+        if let Some(fuel) = s.f("fuel_to_finish_l") {
+            finish.push_str(&format!(", {fuel:.1} L"));
+        }
+        if let Some(energy) = s.f("energy_to_finish_pct") {
+            finish.push_str(&format!(", {energy:.1}% VE"));
+        }
+        if margin < 0.0 {
+            let limit = s.s("limited_by").unwrap_or("-");
+            finish.push_str(&format!(": {:.1} laps short on {limit}", -margin));
+            if let Some(fuel) = s.f("fuel_deficit_l").filter(|fuel| *fuel > 0.0) {
+                finish.push_str(&format!(", {fuel:.1} L to add in total"));
+            }
+            if let Some(energy) = s.f("energy_deficit_pct").filter(|energy| *energy > 0.0) {
+                finish.push_str(&format!(", {energy:.1}% VE to add in total"));
+            }
+            if let Some(stops) = s.i("stops_needed") {
+                let plural = if stops == 1 { "" } else { "s" };
+                finish.push_str(&format!(", at least {stops} stop{plural}"));
+            }
+        } else {
+            finish.push_str(&format!(": enough, {margin:.1} laps spare"));
+        }
+        parts.push(finish);
+    }
+    Ok(Some(parts.join(" | ")))
 }
 
 /// The car's sector times as of its newest standing.
@@ -11308,6 +11384,24 @@ mod tests {
         );
         let full_stint = (cap / fuel_use).min(100.0 / energy_use);
         assert_eq!(stops, (-margin / full_stint).ceil() as i64, "{row:?}");
+        // `quick` shows the same figures, once the thread has published them
+        engineer.ask(Job::Progress).await.unwrap();
+        let quick = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        let line = quick
+            .lines()
+            .find(|line| line.starts_with("STRATEGY "))
+            .unwrap_or_else(|| panic!("{quick}"));
+        for part in [
+            format!("fuel {fuel_use:.2} L/lap"),
+            format!("VE {energy_use:.2}%/lap"),
+            format!("tank {cap:.1} L"),
+            format!("to the flag {need:.1} laps, {fuel_need:.1} L, {energy_need:.1}% VE"),
+            format!("{:.1} laps short on {}", -margin, row[0][0].trim_matches('"')),
+            format!("{fuel_def:.1} L to add in total, {energy_def:.1}% VE to add in total"),
+            format!("at least {stops} stop"),
+        ] {
+            assert!(line.contains(&part), "{part} not in {line}");
+        }
 
         // (b) Fuel-limited with tank_capacity_l = NULL and 0.0 when short: stops_needed is NULL
         drop(engineer);

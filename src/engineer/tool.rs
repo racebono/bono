@@ -2829,6 +2829,14 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         fmt(p.f("fuel"), 1, " L"),
         pct(p.f("battery_charge"))
     );
+    // As the data thread last published it, about once a second: nothing here waits for its tables
+    let strategy = lock(&ctx.shared.progress)
+        .as_ref()
+        .filter(|progress| progress.epoch == ctx.epoch.id)
+        .and_then(|progress| progress.strategy.clone());
+    if let Some(line) = strategy {
+        say!(out, "STRATEGY {line}");
+    }
 
     let optimal = wheels
         .values()
@@ -3435,6 +3443,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn every_question_attaches_the_exact_quick_output() {
         let (_dir, engineer) = race();
+        // Published once, so every `quick` below has the same `STRATEGY` line
+        engineer.publish_progress().await.unwrap();
         let quick = run(&engineer, serde_json::json!({"command": "quick"})).await;
         // Include non-urgent questions: deciding which extra tools are needed belongs
         // to the model, not a keyword filter that might omit useful current context.
