@@ -498,7 +498,8 @@ impl Gui {
         {
             self.onboarding.open();
         }
-        let question = self.chat.update(ui, engineer);
+        let talk_toggle = *config.get().talk_toggle();
+        let question = self.chat.update(ui, engineer, talk_toggle);
         self.onboarding.update(
             rt,
             ss,

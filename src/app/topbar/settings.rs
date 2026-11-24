@@ -52,6 +52,7 @@ impl SettingsTopbar {
             ),
             t!("settings.press_button"),
         );
+        talk_options(ui, config);
 
         let next_session = self.session_button.update(
             rt,
@@ -131,6 +132,31 @@ impl SettingsTopbar {
         }
         guide
     }
+}
+
+/// How the talk button works: held, or pressed to start and to stop.
+pub fn talk_options(ui: &mut egui::Ui, config: &Config) {
+    config.maybe_update(|raw| {
+        raw.talk_toggle.edit(*raw.talk_toggle(), |on| {
+            ui.checkbox(on, t!("settings.talk_toggle"))
+                .on_hover_text(t!("settings.talk_toggle_hover"))
+                .changed()
+        })
+    });
+
+    // Let go of, the button itself tells the pilot the microphone closed
+    if !*config.get().talk_toggle() {
+        return;
+    }
+    ui.indent("talk close beep", |ui| {
+        config.maybe_update(|raw| {
+            raw.talk_close_beep.edit(*raw.talk_close_beep(), |on| {
+                ui.checkbox(on, t!("settings.talk_close_beep"))
+                    .on_hover_text(t!("settings.talk_close_beep_hover"))
+                    .changed()
+            })
+        })
+    });
 }
 
 /// A button as the pilot reads it: the key, or the joystick's button.
