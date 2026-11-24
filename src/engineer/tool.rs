@@ -4541,9 +4541,15 @@ mod evals {
         if setup.batch.is_some() {
             // The pilot's reply language when nobody has spoken: the app's default
             let note: Arc<str> = language::reply_note(arrstr!("en")).into();
-            (briefed(head, &pending, Some(&note)), Some(note))
+            (
+                briefed(head, &pending, crate::engineer::strategy::NO_STRATEGY, Some(&note)),
+                Some(note),
+            )
         } else if eval.get("pending").is_some() {
-            (briefed(head, &pending, None), None)
+            (
+                briefed(head, &pending, crate::engineer::strategy::NO_STRATEGY, None),
+                None,
+            )
         } else {
             (head, None)
         }
@@ -4621,7 +4627,10 @@ mod evals {
         let prompt = asked["prompt"].as_str().unwrap();
         let (question, note) = brief(asked, &setup37, &progress, head(asked, &setup37));
         assert!(note.is_none());
-        assert_eq!(question, format!("{prompt}\n\n{pending}"));
+        assert_eq!(
+            question,
+            format!("{prompt}\n\n{pending}\n\n{}", crate::engineer::strategy::NO_STRATEGY)
+        );
         for entry in asked["pending"].as_array().unwrap() {
             let line = format!(
                 "- {}: {}",
@@ -4646,7 +4655,10 @@ mod evals {
         assert_eq!(note.as_deref(), Some(reply_note.as_str()));
         assert_eq!(
             message,
-            format!("{head41}\n\nScheduled requests: none.\n\n{reply_note}")
+            format!(
+                "{head41}\n\nScheduled requests: none.\n\n{}\n\n{reply_note}",
+                crate::engineer::strategy::NO_STRATEGY
+            )
         );
         let entry = &fired["scheduled"][0];
         for part in [
