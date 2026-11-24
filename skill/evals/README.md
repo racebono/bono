@@ -45,6 +45,12 @@ addition, a follow-up, two questions in one hand-back and a different language. 
 reply, no second acknowledgement and no answer to a corrected question. These are controlled
 manual/model scenarios, not executed results.
 
+`strategy.md` covers whole-picture race strategy: multi-stop rain-window synthesis, multi-stop
+fuel-saving using `save_pct_one_fewer_stop`, bare fuel-check scope boundaries (dry, high-rain
+opt-in, verdict-only, active plan), and the collaborative `strategy` tool lifecycle (save on
+agreement, revise, clear, opt-in watches, no unasked `schedule`/`pit`/scheduled-turn mutations).
+These are controlled manual/model scenarios, not executed results.
+
 These cases test the race engineer's answers, not the automatic spotter. Direct side/clear
 calls, immediate alerts and imminent-rain announcements are excluded. Rival pace, longer
 weather outlooks, strategy and driving advice remain in scope.
@@ -67,7 +73,7 @@ are correct. Check that the acknowledgement reaches speech before tool work fini
 For a standalone radio check or facts present in the attached snapshot, expect a direct
 answer with zero tool calls and no acknowledgement preamble. Scheduled turns never
 acknowledge, even before tool calls, and neither does a turn whose only call is `schedule`
-(`scheduled.md`) or `pit` (`pit-service.md`). Compare time to first text and first audible speech separately from total
+(`scheduled.md`), `strategy` (`strategy.md`) or `pit` (`pit-service.md`). Compare time to first text and first audible speech separately from total
 completion time, using the same model,
 effort and fixture for baseline and candidate. Record measured times; a transcript alone
 cannot establish improved latency.

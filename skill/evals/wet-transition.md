@@ -106,8 +106,9 @@ because little time remains; does not claim a proven time gain.
 ## Energy-only scope control
 
 Pilot: "¿Podemos llegar con la energía?"
-Evidence: range short by two laps, very wet track.
-Pass: answers the energy deficit without adding an unrequested wet-tyre or pit timing plan.
+Evidence: range short by two laps, very wet track, `Race strategy: none.`.
+Pass: answers the energy deficit directly; may append at most one brief opt-in offer in Spanish
+to plan around the wet track, and fails if it adds an unsolicited wet-tyre or pit timing plan.
 
 For all cases: Spanish spoken prose, at most 20 words for a simple question; no raw-data
 recital or unsupported precision. Compound questions retain every requested part.
