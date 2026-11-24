@@ -807,6 +807,33 @@ fn body_damage(p: &Row) -> Option<String> {
     }
 }
 
+/// Damage lines for `quick`'s `INFO`: damaged mechanical parts and bodywork zones when any are
+/// damaged (or nothing extra when only `detached` is set, since `ALERTS` already says
+/// `PARTS DETACHED`), `"damage none"` when damage is reported and clean, or `"damage not reported"`
+/// when no damage channel is reported.
+fn damage_info(p: &Row, detached: bool) -> Vec<String> {
+    let parts = damage_parts(p, 0.0);
+    let body = body_damage(p);
+    let damaged_body = body.as_deref().filter(|b| *b != "none");
+    if !parts.is_empty() || damaged_body.is_some() || detached || p.b("parts_detached") {
+        let mut out = Vec::new();
+        if !parts.is_empty() {
+            out.push(format!("damage {parts}"));
+        }
+        if let Some(body) = damaged_body {
+            out.push(format!("bodywork damage {body} (1 some, 2 more)"));
+        }
+        out
+    } else if body.as_deref() == Some("none")
+        || DAMAGE_PARTS.iter().any(|(key, _)| p.f(key).is_some())
+        || p.i("parts_detached") == Some(0)
+    {
+        vec!["damage none".into()]
+    } else {
+        vec!["damage not reported".into()]
+    }
+}
+
 /// The pit window and the player's mandatory stop (`None` when the simulator reports neither),
 /// and whether a stop still owed has to be made within about a lap.
 fn pit_window(ctx: &Ctx) -> anyhow::Result<(Option<String>, bool)> {
@@ -2881,7 +2908,8 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     if !flat.is_empty() {
         alerts.push(format!("FLAT {}", flat.join(",")));
     }
-    if wheels.values().any(|r| r.b("wheel_detached")) || p.b("parts_detached") {
+    let detached = wheels.values().any(|r| r.b("wheel_detached")) || p.b("parts_detached");
+    if detached {
         alerts.push("PARTS DETACHED".into());
     }
     if p.b("engine_overheating") {
@@ -2902,13 +2930,7 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
 
     let (more_alerts, mut info) = scoring_alerts(ctx)?;
     alerts.extend(more_alerts);
-    if let Some(body) = body_damage(p).filter(|body| body != "none") {
-        info.insert(0, format!("bodywork damage {body} (1 some, 2 more)"));
-    }
-    let parts = damage_parts(p, 0.0);
-    if !parts.is_empty() {
-        info.insert(0, format!("damage {parts}"));
-    }
+    info.splice(0..0, damage_info(p, detached));
     match pit_window(ctx)? {
         (Some(window), true) => alerts.push(format!(
             "PIT WINDOW CLOSING, mandatory stop not done ({window})"
@@ -3005,6 +3027,136 @@ mod tests {
         // An unreported zone isn't undamaged
         assert_eq!(body("0,0,0,0,0,0,0,NULL"), None);
         assert_eq!(body("0,1,0,0,0,0,0,NULL").as_deref(), Some("front_left 1"));
+    }
+
+    #[test]
+    fn quick_damage_info_distinguishes_clean_unreported_damaged_and_detached() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mk = |sql: &str| row(&conn, sql, []).unwrap().unwrap();
+
+        // 1. LMU-style clean car: aero & suspension 0, bodywork all 0, parts_detached 0, engine & gearbox NULL
+        let lmu_clean = mk(
+            "SELECT NULL AS engine_damage, NULL AS transmission_damage, \
+                    0.0 AS aerodynamics_damage, 0.0 AS suspension_damage, 0 AS parts_detached, \
+                    0 AS body_damage_front, 0 AS body_damage_front_left, 0 AS body_damage_front_right, \
+                    0 AS body_damage_left, 0 AS body_damage_right, 0 AS body_damage_rear_left, \
+                    0 AS body_damage_rear, 0 AS body_damage_rear_right",
+        );
+        assert_eq!(damage_info(&lmu_clean, false), vec!["damage none"]);
+
+        // 2. iRacing-style unreported: all mechanical, bodywork, and parts_detached NULL
+        let iracing_null = mk(
+            "SELECT NULL AS engine_damage, NULL AS transmission_damage, \
+                    NULL AS aerodynamics_damage, NULL AS suspension_damage, NULL AS parts_detached, \
+                    NULL AS body_damage_front, NULL AS body_damage_front_left, NULL AS body_damage_front_right, \
+                    NULL AS body_damage_left, NULL AS body_damage_right, NULL AS body_damage_rear_left, \
+                    NULL AS body_damage_rear, NULL AS body_damage_rear_right",
+        );
+        assert_eq!(damage_info(&iracing_null, false), vec!["damage not reported"]);
+
+        // 3. RaceRoom-style clean mechanical: all 4 DAMAGE_PARTS 0.0, bodywork & parts_detached NULL
+        let rrre_clean = mk(
+            "SELECT 0.0 AS engine_damage, 0.0 AS transmission_damage, \
+                    0.0 AS aerodynamics_damage, 0.0 AS suspension_damage, NULL AS parts_detached, \
+                    NULL AS body_damage_front, NULL AS body_damage_front_left, NULL AS body_damage_front_right, \
+                    NULL AS body_damage_left, NULL AS body_damage_right, NULL AS body_damage_rear_left, \
+                    NULL AS body_damage_rear, NULL AS body_damage_rear_right",
+        );
+        assert_eq!(damage_info(&rrre_clean, false), vec!["damage none"]);
+
+        // 4. Sub-0.5% reported damage rounds to 0% -> clean reported
+        let sub_percent = mk("SELECT 0.003 AS aerodynamics_damage");
+        assert_eq!(damage_info(&sub_percent, false), vec!["damage none"]);
+
+        // 5. Actual mechanical + bodywork damage -> existing detail strings, no "damage none" / "not reported"
+        let damaged = mk(
+            "SELECT 0.25 AS aerodynamics_damage, 2 AS body_damage_front, 0 AS body_damage_rear",
+        );
+        let expected_damaged = vec![
+            "damage aero 25%",
+            "bodywork damage front 2 (1 some, 2 more)",
+        ];
+        assert_eq!(damage_info(&damaged, false), expected_damaged);
+
+        // 6. Detached part alert: never emits contradictory "damage none" when clean,
+        //    but still emits mechanical/bodywork details when also damaged
+        assert!(damage_info(&lmu_clean, true).is_empty());
+        assert_eq!(damage_info(&damaged, true), expected_damaged);
+
+        // 7. parts_detached = Some(0) alone (all other damage columns NULL) -> clean reported
+        let detached_zero_only = mk(
+            "SELECT NULL AS engine_damage, NULL AS transmission_damage, \
+                    NULL AS aerodynamics_damage, NULL AS suspension_damage, 0 AS parts_detached, \
+                    NULL AS body_damage_front",
+        );
+        assert_eq!(damage_info(&detached_zero_only, false), vec!["damage none"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quick_snapshot_reports_damage_status_without_contradicting_detached() {
+        let (dir, engineer) = race();
+        let line_starting = |out: &str, prefix: &str| {
+            out.lines()
+                .find(|line| line.starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing {prefix:?} in:\n{out}"))
+                .to_owned()
+        };
+
+        // 1. All damage columns NULL in car_state -> INFO says "damage not reported"
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute("DELETE FROM car_state WHERE vehicle_id = 1", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO car_state (telemetry_id, vehicle_id, session_time) \
+             SELECT id, vehicle_id, session_time FROM telemetry \
+             WHERE vehicle_id = 1 ORDER BY id DESC LIMIT 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        let info = line_starting(&out, "INFO (only if it bears on the question)");
+        assert!(info.contains("damage not reported"), "{info}");
+        assert!(!info.contains("damage none"), "{info}");
+
+        // 2. Clean car reported -> INFO says "damage none"
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute(
+            "UPDATE car_state SET aerodynamics_damage = 0.0, suspension_damage = 0.0, \
+             parts_detached = 0, body_damage_front = 0, body_damage_front_left = 0, \
+             body_damage_front_right = 0, body_damage_left = 0, body_damage_right = 0, \
+             body_damage_rear_left = 0, body_damage_rear = 0, body_damage_rear_right = 0 \
+             WHERE vehicle_id = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        let info = line_starting(&out, "INFO (only if it bears on the question)");
+        assert!(info.contains("damage none"), "{info}");
+        assert!(!info.contains("damage not reported"), "{info}");
+
+        // 3. wheel_detached = 1 -> ALERTS has PARTS DETACHED and INFO does NOT say "damage none"
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute(
+            "UPDATE telemetry_wheel SET wheel_detached = 1 \
+             WHERE wheel = 0 AND telemetry_id = (SELECT MAX(id) FROM telemetry WHERE vehicle_id = 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        let alerts = line_starting(&out, "ALERTS (act now)");
+        let info = line_starting(&out, "INFO (only if it bears on the question)");
+        assert!(alerts.contains("PARTS DETACHED"), "{alerts}");
+        assert!(!info.contains("damage none"), "{info}");
+        assert!(!info.contains("damage not reported"), "{info}");
     }
 
     #[test]
