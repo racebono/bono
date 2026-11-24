@@ -809,8 +809,8 @@ fn body_damage(p: &Row) -> Option<String> {
 
 /// Damage lines for `quick`'s `INFO`: damaged mechanical parts and bodywork zones when any are
 /// damaged (or nothing extra when only `detached` is set, since `ALERTS` already says
-/// `PARTS DETACHED`), `"damage none"` when damage is reported and clean, or `"damage not reported"`
-/// when no damage channel is reported.
+/// `PARTS DETACHED`), `"damage none"` when damage is reported and clean (naming what isn't
+/// reported), or `"damage not reported"` when no damage channel is reported.
 fn damage_info(p: &Row, detached: bool) -> Vec<String> {
     let parts = damage_parts(p, 0.0);
     let body = body_damage(p);
@@ -828,7 +828,21 @@ fn damage_info(p: &Row, detached: bool) -> Vec<String> {
         || DAMAGE_PARTS.iter().any(|(key, _)| p.f(key).is_some())
         || p.i("parts_detached") == Some(0)
     {
-        vec!["damage none".into()]
+        let mut missing = DAMAGE_PARTS
+            .iter()
+            .filter(|(key, _)| p.f(key).is_none())
+            .map(|(_, name)| *name)
+            .collect::<Vec<_>>();
+        if body.is_none() {
+            missing.push("bodywork");
+        }
+        match missing.is_empty() {
+            true => vec!["damage none".into()],
+            false => vec![format!(
+                "damage none ({} not reported)",
+                missing.join(", ")
+            )],
+        }
     } else {
         vec!["damage not reported".into()]
     }
@@ -3042,7 +3056,10 @@ mod tests {
                     0 AS body_damage_left, 0 AS body_damage_right, 0 AS body_damage_rear_left, \
                     0 AS body_damage_rear, 0 AS body_damage_rear_right",
         );
-        assert_eq!(damage_info(&lmu_clean, false), vec!["damage none"]);
+        assert_eq!(
+            damage_info(&lmu_clean, false),
+            vec!["damage none (engine, gearbox not reported)"]
+        );
 
         // 2. iRacing-style unreported: all mechanical, bodywork, and parts_detached NULL
         let iracing_null = mk(
@@ -3062,11 +3079,17 @@ mod tests {
                     NULL AS body_damage_left, NULL AS body_damage_right, NULL AS body_damage_rear_left, \
                     NULL AS body_damage_rear, NULL AS body_damage_rear_right",
         );
-        assert_eq!(damage_info(&rrre_clean, false), vec!["damage none"]);
+        assert_eq!(
+            damage_info(&rrre_clean, false),
+            vec!["damage none (bodywork not reported)"]
+        );
 
         // 4. Sub-0.5% reported damage rounds to 0% -> clean reported
         let sub_percent = mk("SELECT 0.003 AS aerodynamics_damage");
-        assert_eq!(damage_info(&sub_percent, false), vec!["damage none"]);
+        assert_eq!(
+            damage_info(&sub_percent, false),
+            vec!["damage none (engine, gearbox, suspension, bodywork not reported)"]
+        );
 
         // 5. Actual mechanical + bodywork damage -> existing detail strings, no "damage none" / "not reported"
         let damaged = mk(
@@ -3089,7 +3112,20 @@ mod tests {
                     NULL AS aerodynamics_damage, NULL AS suspension_damage, 0 AS parts_detached, \
                     NULL AS body_damage_front",
         );
-        assert_eq!(damage_info(&detached_zero_only, false), vec!["damage none"]);
+        assert_eq!(
+            damage_info(&detached_zero_only, false),
+            vec!["damage none (engine, gearbox, aero, suspension, bodywork not reported)"]
+        );
+
+        // 8. Every part and zone reported and clean: nothing to caveat
+        let all_clean = mk(
+            "SELECT 0.0 AS engine_damage, 0.0 AS transmission_damage, \
+                    0.0 AS aerodynamics_damage, 0.0 AS suspension_damage, 0 AS parts_detached, \
+                    0 AS body_damage_front, 0 AS body_damage_front_left, 0 AS body_damage_front_right, \
+                    0 AS body_damage_left, 0 AS body_damage_right, 0 AS body_damage_rear_left, \
+                    0 AS body_damage_rear, 0 AS body_damage_rear_right",
+        );
+        assert_eq!(damage_info(&all_clean, false), vec!["damage none"]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
