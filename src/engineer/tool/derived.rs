@@ -189,7 +189,9 @@ CREATE TABLE stints (
     energy_left_pct REAL, energy_laps_left REAL, energy_runs_out_lap REAL,
     game_fuel_per_lap_l REAL, game_energy_per_lap_pct REAL,
     limited_by TEXT, laps_left REAL, last_full_lap INTEGER, laps_needed REAL,
-    laps_needed_source TEXT, margin_laps REAL, save_pct_needed REAL
+    laps_needed_source TEXT, margin_laps REAL, save_pct_needed REAL,
+    stops_needed INTEGER, fuel_to_finish_l REAL, fuel_deficit_l REAL,
+    energy_to_finish_pct REAL, energy_deficit_pct REAL
 );
 CREATE TABLE forecast_now (
     session_type TEXT, is_current_session INTEGER, session_fraction REAL, minutes_from_now REAL,
@@ -4941,6 +4943,12 @@ impl<'a> Stint<'a> {
             .collect::<Vec<_>>();
         (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
     }
+
+    fn energy_is_fraction(&self) -> bool {
+        self.baseline
+            .iter()
+            .any(|lap| lap.energy_start.is_some_and(|energy| energy <= 1.0))
+    }
 }
 
 /// How far into its lap the car is, by its stint's average lap.
@@ -5079,10 +5087,6 @@ fn stint_row(vehicle: i64, segment: &Segment, stint: &Stint) -> Columns {
         }
         _ => None,
     };
-    let energy_is_fraction = stint
-        .baseline
-        .iter()
-        .any(|lap| lap.energy_start.is_some_and(|energy| energy <= 1.0));
     let energy_use = stint.average_use(|lap| lap.energy_used);
     let start = &segment.start;
     vec![
@@ -5110,7 +5114,11 @@ fn stint_row(vehicle: i64, segment: &Segment, stint: &Stint) -> Columns {
         ),
         (
             "energy_per_lap_pct",
-            real(energy_use.filter(|_| energy_is_fraction).map(|e| e * 100.0)),
+            real(
+                energy_use
+                    .filter(|_| stint.energy_is_fraction())
+                    .map(|e| e * 100.0),
+            ),
         ),
     ]
 }
@@ -5139,12 +5147,54 @@ fn projection(
         (_, Some(fuel)) => Some(("fuel", fuel)),
         (None, None) => None,
     };
+    let limited_by = limit.map(|(which, _)| which);
     let (need, source) = race_need(sc, frame, vehicle, now, frac, stint.avg_time);
     let margin = limit.zip(need).map(|((_, left), need)| left - need);
     let save = margin
         .zip(need)
         .filter(|(margin, _)| *margin < 0.0)
         .map(|(margin, need)| -margin / need.max(0.1) * 100.0);
+    let tank_cap = p.f("fuel_capacity").filter(|c| c.is_finite() && *c > 0.0);
+    let energy_pct_use = energy_use
+        .filter(|_| stint.energy_is_fraction())
+        .map(|e| e * 100.0);
+    let energy_left = energy_percent(energy);
+    let fuel_to_finish = need.zip(fuel_use).map(|(n, u)| n * u);
+    let fuel_deficit = fuel_to_finish
+        .zip(fuel)
+        .map(|(req, have)| (req - have).max(0.0));
+    let energy_to_finish = need.zip(energy_pct_use).map(|(n, u)| n * u);
+    let energy_deficit = energy_to_finish
+        .zip(energy_left)
+        .map(|(req, have)| (req - have).max(0.0));
+    let fuel_full = tank_cap
+        .zip(fuel_use.filter(|u| u.is_finite() && *u > 0.0))
+        .map(|(cap, u)| cap / u)
+        .filter(|f| f.is_finite() && *f > 0.0);
+    let energy_full = energy_pct_use
+        .filter(|u| u.is_finite() && *u > 0.0)
+        .map(|u| 100.0 / u)
+        .filter(|f| f.is_finite() && *f > 0.0);
+    let full_stint_laps = match (limited_by, fuel_full, energy_full) {
+        (Some("fuel"), None, _) | (Some("energy"), _, None) => None,
+        (_, Some(f), Some(e)) => Some(f.min(e)),
+        (_, Some(f), None) => Some(f),
+        (_, None, Some(e)) => Some(e),
+        (_, None, None) => None,
+    };
+    let stops_needed = margin.and_then(|m| {
+        if !m.is_finite() {
+            None
+        } else if m >= 0.0 {
+            Some(0)
+        } else {
+            full_stint_laps
+                .filter(|f| *f > 0.0 && f.is_finite())
+                .map(|f| (-m / f).ceil())
+                .filter(|s| s.is_finite())
+                .map(|s| s as i64)
+        }
+    });
     vec![
         ("calculated_at_s", real(now)),
         ("lap_fraction", real(Some(frac))),
@@ -5152,7 +5202,7 @@ fn projection(
         ("fuel_laps_left", real(fuel_laps)),
         ("fuel_runs_out_lap", real(fuel_out)),
         ("tank_capacity_l", copy(p, "fuel_capacity")),
-        ("energy_left_pct", real(energy_percent(energy))),
+        ("energy_left_pct", real(energy_left)),
         ("energy_laps_left", real(energy_laps)),
         ("energy_runs_out_lap", real(energy_out)),
         ("game_fuel_per_lap_l", copy(p, "fuel_per_lap")),
@@ -5160,7 +5210,7 @@ fn projection(
             "game_energy_per_lap_pct",
             real(percent(p.f("virtual_energy_per_lap"))),
         ),
-        ("limited_by", text_or_null(limit.map(|(which, _)| which))),
+        ("limited_by", text_or_null(limited_by)),
         ("laps_left", real(limit.map(|(_, left)| left))),
         (
             "last_full_lap",
@@ -5175,6 +5225,11 @@ fn projection(
         ("laps_needed_source", Value::Text(source)),
         ("margin_laps", real(margin)),
         ("save_pct_needed", real(save)),
+        ("stops_needed", integer(stops_needed)),
+        ("fuel_to_finish_l", real(fuel_to_finish)),
+        ("fuel_deficit_l", real(fuel_deficit)),
+        ("energy_to_finish_pct", real(energy_to_finish)),
+        ("energy_deficit_pct", real(energy_deficit)),
     ]
 }
 
@@ -10699,6 +10754,230 @@ mod tests {
             );
             assert_eq!(value("last_full_lap"), Value::Integer(last), "{row:?}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stints_strategy_columns_handle_missing_capacity_and_dual_limits() {
+        let lookup = |row: &Columns, name: &str| {
+            row.iter()
+                .find(|(column, _)| *column == name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| panic!("missing column {name}: {row:?}"))
+        };
+        let assert_real_close = |row: &Columns, name: &str, expected: f64| {
+            let actual = lookup(row, name);
+            assert!(
+                matches!(actual, Value::Real(v) if (v - expected).abs() < 1e-6),
+                "{name}: expected {expected}, got {actual:?}"
+            );
+        };
+
+        // (a) Short on both fuel and VE: verify stops_needed, *_to_finish_*, and *_deficit_*
+        let (dir, engineer) = race();
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute("UPDATE session SET session_end_time = 5000.0", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO car_state (telemetry_id, vehicle_id, session_time, fuel_capacity) \
+             VALUES ((SELECT MIN(id) FROM telemetry WHERE vehicle_id = 1), 1, 0.0, 60.0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let row = query(
+            &engineer,
+            "SELECT s.limited_by, s.laps_needed, s.fuel_l, s.fuel_per_lap_l, s.tank_capacity_l, \
+                    s.energy_left_pct, s.energy_per_lap_pct, s.margin_laps, \
+                    s.stops_needed, s.fuel_to_finish_l, s.fuel_deficit_l, \
+                    s.energy_to_finish_pct, s.energy_deficit_pct \
+             FROM stints s JOIN cars_now c ON c.current_stint_id = s.stint_id WHERE c.is_player = 1",
+        )
+        .await;
+        assert_eq!(row.len(), 1, "{row:?}");
+        let need: f64 = row[0][1].parse().unwrap();
+        let fuel: f64 = row[0][2].parse().unwrap();
+        let fuel_use: f64 = row[0][3].parse().unwrap();
+        let cap: f64 = row[0][4].parse().unwrap();
+        let energy_left: f64 = row[0][5].parse().unwrap();
+        let energy_use: f64 = row[0][6].parse().unwrap();
+        let margin: f64 = row[0][7].parse().unwrap();
+        let stops: i64 = row[0][8].parse().unwrap();
+        let fuel_need: f64 = row[0][9].parse().unwrap();
+        let fuel_def: f64 = row[0][10].parse().unwrap();
+        let energy_need: f64 = row[0][11].parse().unwrap();
+        let energy_def: f64 = row[0][12].parse().unwrap();
+        assert!(margin < 0.0, "expected short stint, got margin {margin}");
+        assert!((fuel_need - need * fuel_use).abs() < 0.05, "{row:?}");
+        assert!(fuel_def > 0.0 && (fuel_def - (need * fuel_use - fuel)).abs() < 0.05, "{row:?}");
+        assert!((energy_need - need * energy_use).abs() < 0.05, "{row:?}");
+        assert!(
+            energy_def > 0.0 && (energy_def - (need * energy_use - energy_left)).abs() < 0.05,
+            "{row:?}"
+        );
+        let full_stint = (cap / fuel_use).min(100.0 / energy_use);
+        assert_eq!(stops, (-margin / full_stint).ceil() as i64, "{row:?}");
+
+        // (b) Fuel-limited with tank_capacity_l = NULL and 0.0 when short: stops_needed is NULL
+        drop(engineer);
+        for cap_sql in ["NULL", "0.0"] {
+            let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+            conn.execute(
+                "UPDATE telemetry SET virtual_energy = NULL WHERE vehicle_id = 1",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                &format!("UPDATE car_state SET fuel_capacity = {cap_sql} WHERE vehicle_id = 1"),
+                [],
+            )
+            .unwrap();
+            drop(conn);
+            let engineer = reopen(&dir);
+            let res = query(
+                &engineer,
+                "SELECT limited_by, margin_laps < 0, stops_needed, \
+                        fuel_to_finish_l IS NOT NULL, fuel_deficit_l > 0, \
+                        energy_to_finish_pct, energy_deficit_pct \
+                 FROM stints s JOIN cars_now c ON c.current_stint_id = s.stint_id WHERE c.is_player = 1",
+            )
+            .await;
+            assert_eq!(
+                res,
+                [["\"fuel\"", "1", "NULL", "1", "1", "NULL", "NULL"]],
+                "cap_sql={cap_sql}: {res:?}"
+            );
+        }
+
+        // (c) Enough fuel/VE to finish (margin_laps >= 0) even with tank_capacity_l = NULL:
+        // stops_needed = 0 and deficits = 0
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute("UPDATE session SET session_end_time = 1800.0", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE telemetry SET virtual_energy = 1.0 - session_time * 0.0005 WHERE vehicle_id = 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE car_state SET fuel_capacity = NULL WHERE vehicle_id = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let enough = query(
+            &engineer,
+            "SELECT margin_laps >= 0, tank_capacity_l, stops_needed, \
+                    fuel_deficit_l, energy_deficit_pct \
+             FROM stints s JOIN cars_now c ON c.current_stint_id = s.stint_id WHERE c.is_player = 1",
+        )
+        .await;
+        assert_eq!(enough, [["1", "NULL", "0", "0", "0"]], "{enough:?}");
+        drop(engineer);
+
+        // Direct projection() tests for (d) dual fuel+VE limits and (e) non-fraction VE > 1.0
+        let conn = Connection::open_in_memory().unwrap();
+        let sess = columns(&conn, "'race' AS session_type, 36 AS max_laps");
+        let me = columns(
+            &conn,
+            "1 AS vehicle_id, 1 AS position, 1 AS laps_completed, 0 AS laps_behind_leader",
+        );
+        let sc = Scoring {
+            session: Some(sess),
+            yellow_sectors: Vec::new(),
+            sector_yellows: false,
+            cars: BTreeMap::from([(1, me.clone())]),
+            player: Some(me),
+        };
+        let mut baseline_lap = lap_with(false, false, (1.0, 1.0));
+        baseline_lap.fuel_used = Some(2.0);
+        baseline_lap.energy_start = Some(1.0);
+        baseline_lap.energy_used = Some(0.05);
+        let stint = Stint {
+            own: vec![&baseline_lap],
+            baseline: vec![&baseline_lap],
+            baseline_source: Some("this stint"),
+            avg_time: Some(100.0),
+        };
+
+        // (d1) Dual fuel+VE: fuel_full = 30, energy_full = 20, margin_laps = -25.0 -> stops_needed = 2
+        let p_dual = columns(
+            &conn,
+            "2 AS lap, 30.0 AS fuel, 60.0 AS fuel_capacity, 0.50 AS virtual_energy",
+        );
+        let dual = projection(&sc, &BTreeMap::new(), 1, &p_dual, &stint, 0.0, Some(200.0));
+        assert_eq!(lookup(&dual, "limited_by"), Value::Text("energy".into()));
+        assert_real_close(&dual, "margin_laps", -25.0);
+        assert_eq!(lookup(&dual, "stops_needed"), Value::Integer(2));
+        assert_real_close(&dual, "fuel_to_finish_l", 70.0);
+        assert_real_close(&dual, "fuel_deficit_l", 40.0);
+        assert_real_close(&dual, "energy_to_finish_pct", 175.0);
+        assert_real_close(&dual, "energy_deficit_pct", 125.0);
+
+        // (d2) Fuel-limited with missing/zero tank_capacity_l while VE is present:
+        // stops_needed MUST be NULL (must NOT fall back to VE's 20-lap full stint)
+        for cap_sql in ["NULL", "0.0"] {
+            let p_fuel_no_cap = columns(
+                &conn,
+                &format!(
+                    "2 AS lap, 20.0 AS fuel, {cap_sql} AS fuel_capacity, 0.75 AS virtual_energy"
+                ),
+            );
+            let fuel_no_cap = projection(
+                &sc,
+                &BTreeMap::new(),
+                1,
+                &p_fuel_no_cap,
+                &stint,
+                0.0,
+                Some(200.0),
+            );
+            assert_eq!(lookup(&fuel_no_cap, "limited_by"), Value::Text("fuel".into()));
+            assert_real_close(&fuel_no_cap, "margin_laps", -25.0);
+            assert_eq!(
+                lookup(&fuel_no_cap, "stops_needed"),
+                Value::Null,
+                "cap_sql={cap_sql}: must not fall back to VE"
+            );
+            assert_real_close(&fuel_no_cap, "fuel_to_finish_l", 70.0);
+            assert_real_close(&fuel_no_cap, "fuel_deficit_l", 50.0);
+            assert_real_close(&fuel_no_cap, "energy_to_finish_pct", 175.0);
+            assert_real_close(&fuel_no_cap, "energy_deficit_pct", 100.0);
+        }
+
+        // (e) Non-fraction virtual_energy > 1.0 -> energy_to_finish_pct and energy_deficit_pct NULL
+        let mut non_frac_lap = lap_with(false, false, (1.0, 1.0));
+        non_frac_lap.fuel_used = Some(2.0);
+        non_frac_lap.energy_start = Some(100.0);
+        non_frac_lap.energy_used = Some(5.0);
+        let non_frac_stint = Stint {
+            own: vec![&non_frac_lap],
+            baseline: vec![&non_frac_lap],
+            baseline_source: Some("this stint"),
+            avg_time: Some(100.0),
+        };
+        let p_non_frac = columns(
+            &conn,
+            "2 AS lap, 40.0 AS fuel, 60.0 AS fuel_capacity, 50.0 AS virtual_energy",
+        );
+        let non_frac = projection(
+            &sc,
+            &BTreeMap::new(),
+            1,
+            &p_non_frac,
+            &non_frac_stint,
+            0.0,
+            Some(200.0),
+        );
+        assert_eq!(lookup(&non_frac, "limited_by"), Value::Text("energy".into()));
+        assert_eq!(lookup(&non_frac, "energy_left_pct"), Value::Null);
+        assert_eq!(lookup(&non_frac, "energy_to_finish_pct"), Value::Null);
+        assert_eq!(lookup(&non_frac, "energy_deficit_pct"), Value::Null);
+        assert_eq!(lookup(&non_frac, "stops_needed"), Value::Null);
+        assert_real_close(&non_frac, "fuel_to_finish_l", 70.0);
+        assert_real_close(&non_frac, "fuel_deficit_l", 30.0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
