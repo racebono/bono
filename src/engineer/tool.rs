@@ -181,10 +181,10 @@ impl Engineer {
     pub fn description() -> String {
         "Read-only queries over the live telemetry of the simulator the pilot is driving. \
          `command` picks the query: quick (the latest state, as in the question's snapshot), track \
-         (the circuit's description, as JSON), sql (one SELECT, WITH or PRAGMA statement over \
-         the tables the instructions describe) or schema (the raw recording tables' columns and \
-         caveats, optionally filtered by table). Answers are plain text for you to interpret, not \
-         to read out."
+         (the circuit's compact plain-text summary: length, pit losses, pit lane, sectors, turns \
+         and straights in metres), sql (one SELECT, WITH or PRAGMA statement over the tables the \
+         instructions describe) or schema (the raw recording tables' columns and caveats, optionally \
+         filtered by table). Answers are plain text for you to interpret, not to read out."
             .into()
     }
 
