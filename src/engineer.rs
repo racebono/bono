@@ -1239,14 +1239,15 @@ impl Engineer {
     /// session that is. Called every frame: asking the simulator for its recording doesn't block,
     /// and starting or dropping the tool does its work on other threads.
     pub fn follow_recording(&mut self, rt: &Handle, sim: Option<&mut Sim>) {
-        let pool = sim.and_then(|sim| sim.database());
+        let recording = sim.and_then(|sim| {
+            let id = sim.id();
+            sim.database().map(|pool| (id, pool))
+        });
         // Another simulator may still be running, or this recording may disappear and return
         // at the same path. Release its conversation now rather than at the next question.
-        if self
-            .session
-            .as_ref()
-            .is_some_and(|session| pool.is_none_or(|pool| session.db != pool.database().path()))
-        {
+        if self.session.as_ref().is_some_and(|session| {
+            recording.is_none_or(|(_, pool)| session.db != pool.database().path())
+        }) {
             let interrupted = self.turn.is_some();
             self.stop();
             self.drop_session(rt);
@@ -1255,23 +1256,26 @@ impl Engineer {
                 self.no_beep();
             }
         }
-        match pool {
-            Some(pool) => {
-                self.tool_for(rt, pool);
+        match recording {
+            Some((sim_id, pool)) => {
+                self.tool_for(rt, sim_id, pool);
             }
             None => self.drop_tool(rt),
         }
     }
 
     /// The tool for `pool`'s recording, started if it isn't the one being followed.
-    fn tool_for(&mut self, rt: &Handle, pool: &Pool) -> EngineerTool {
+    fn tool_for(&mut self, rt: &Handle, sim: &'static str, pool: &Pool) -> EngineerTool {
         if let Some(tool) = &self.tool
             && tool.path() == pool.database().path()
+            && tool.sim() == Some(sim)
         {
             return tool.clone();
         }
         self.drop_tool(rt);
-        self.tool.insert(EngineerTool::new(pool.clone())).clone()
+        self.tool
+            .insert(EngineerTool::new(pool.clone()).with_sim(sim))
+            .clone()
     }
 
     /// Lets go of the recording. Closing the last of its pool's connections joins their threads:
@@ -1472,7 +1476,7 @@ impl Engineer {
             || corners_changed
             || self.session.as_ref().is_none_or(|s| s.db != db)
         {
-            let tool = self.tool_for(rt, &pool);
+            let tool = self.tool_for(rt, sim, &pool);
             let session = self.start(config, sim, pool, tool, pit)?;
             self.drop_session(rt);
             self.session = Some(session);
@@ -3890,11 +3894,16 @@ mod tests {
         engineer.follow_recording(&rt, Some(&mut *sim));
         assert!(engineer.tool.as_ref().unwrap().is_same(&first));
         let same = pool("a.db");
-        assert!(engineer.tool_for(&rt, &same).is_same(&first));
+        assert!(engineer.tool_for(&rt, sim.id(), &same).is_same(&first));
+
+        // Another simulator on the same recording: another tool scoped to that simulator
+        let rescoped = engineer.tool_for(&rt, "lmu", &same);
+        assert!(!rescoped.is_same(&first));
+        assert_eq!(rescoped.sim(), Some("lmu"));
 
         // Another recording: another tool
-        let other = engineer.tool_for(&rt, &pool("b.db"));
-        assert!(!other.is_same(&first));
+        let other = engineer.tool_for(&rt, "lmu", &pool("b.db"));
+        assert!(!other.is_same(&rescoped));
 
         // The simulator gone: it lets go
         engineer.follow_recording(&rt, None);
@@ -3917,7 +3926,7 @@ mod tests {
         let one = NonZeroUsize::new(1).unwrap();
         let pool = Pool::new(Database::read_only(Arc::new(dir.path().join("a.db"))), one, one);
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
-        let tool = engineer.tool_for(&rt, &pool);
+        let tool = engineer.tool_for(&rt, "lmu", &pool);
         let schedule_tool = ScheduleTool::new(tool.clone());
         let names = |pit: Option<&PitTool>| {
             (session_tools(&tool, &schedule_tool, pit).definitions())
@@ -4010,7 +4019,7 @@ mod tests {
         let one = NonZeroUsize::new(1).unwrap();
         let pool = Pool::new(Database::read_only(Arc::new(dir.path().join("a.db"))), one, one);
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
-        let tool = engineer.tool_for(&rt, &pool);
+        let tool = engineer.tool_for(&rt, "lmu", &pool);
         let state = Arc::new(Mutex::new(SessionState {
             conversation: Box::new(RecordingModel(Arc::default())),
             pool: pool.clone(),

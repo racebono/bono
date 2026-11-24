@@ -34,6 +34,8 @@ use std::{
 
 /// The race engineer's instructions (`skill/SKILL.md`), for the system prompt.
 pub const SKILL: &str = include_str!("../../skill/SKILL.md");
+/// The compact raw recording table schema (`skill/raw-schema.md`), served on demand by `schema`.
+pub const RAW_SCHEMA: &str = include_str!("../../skill/raw-schema.md");
 const WHEELS: [&str; 4] = ["FL", "FR", "RL", "RR"];
 /// Max cars LMU maps (104) plus slack
 const FRAME_WINDOW: i64 = 110;
@@ -83,6 +85,7 @@ pub fn instructions(skill: String) -> String {
 #[derive(Clone)]
 pub struct Engineer {
     inner: Arc<Inner>,
+    sim: Option<&'static str>,
 }
 
 struct Inner {
@@ -121,7 +124,19 @@ impl Engineer {
         let data = derived::spawn(shared.clone());
         Self {
             inner: Arc::new(Inner { db, shared, data }),
+            sim: None,
         }
+    }
+
+    /// Scopes on-demand raw-table schema output to `sim` (e.g. `"lmu"`, `"iracing"`, `"rrre"`).
+    pub fn with_sim(mut self, sim: &'static str) -> Self {
+        self.sim = Some(sim);
+        self
+    }
+
+    /// The simulator this tool is scoped to, if any.
+    pub fn sim(&self) -> Option<&'static str> {
+        self.sim
     }
 
     /// The recording it reads.
@@ -132,14 +147,15 @@ impl Engineer {
     /// Whether it's the same tool, not just one for the same recording.
     #[cfg(test)]
     pub fn is_same(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
+        Arc::ptr_eq(&self.inner, &other.inner) && self.sim == other.sim
     }
 
     pub fn description() -> String {
         "Read-only queries over the live telemetry of the simulator the pilot is driving. \
          `command` picks the query: quick (the latest state, as in the question's snapshot), track \
-         (the circuit's description, as JSON) or sql (one SELECT, WITH or PRAGMA statement over \
-         the tables the instructions describe). Answers are plain text for you to interpret, not \
+         (the circuit's description, as JSON), sql (one SELECT, WITH or PRAGMA statement over \
+         the tables the instructions describe) or schema (the raw recording tables' columns and \
+         caveats, optionally filtered by table). Answers are plain text for you to interpret, not \
          to read out."
             .into()
     }
@@ -150,7 +166,7 @@ impl Engineer {
             "properties": {
                 "command": {
                     "type": "string",
-                    "enum": ["quick", "track", "sql"]
+                    "enum": ["quick", "track", "sql", "schema"]
                 },
                 "query": {
                     "type": "string",
@@ -159,6 +175,11 @@ impl Engineer {
                 "limit": {
                     "type": "integer",
                     "description": "sql: the most rows returned (default 60, maximum 200; output capped at 32 KiB)."
+                },
+                "table": {
+                    "type": "string",
+                    "enum": ["telemetry", "telemetry_wheel", "car_state", "scoring"],
+                    "description": "schema: return only this raw table section instead of all raw tables."
                 }
             },
             "required": ["command"]
@@ -326,6 +347,7 @@ impl Engineer {
                     .await
                     .and_then(derived::Answer::text)
             }
+            Command::Schema => Ok(render_raw_schema(self.sim, input.table)),
         }
         .map_err(busy_retry)
     }
@@ -391,6 +413,74 @@ pub enum Command {
     Quick,
     Track,
     Sql,
+    Schema,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaTable {
+    Telemetry,
+    TelemetryWheel,
+    CarState,
+    Scoring,
+}
+
+impl SchemaTable {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Telemetry => "telemetry",
+            Self::TelemetryWheel => "telemetry_wheel",
+            Self::CarState => "car_state",
+            Self::Scoring => "scoring",
+        }
+    }
+}
+
+/// Renders the compact raw-table catalog from [`RAW_SCHEMA`], scoped to `sim` (all sims when
+/// `None` or unrecognized) and optionally filtered to one [`SchemaTable`] section.
+pub fn render_raw_schema(sim: Option<&str>, table: Option<SchemaTable>) -> String {
+    const TAGS: [(&str, &str); 3] = [
+        ("lmu", "[lmu] "),
+        ("iracing", "[iracing] "),
+        ("rrre", "[rrre] "),
+    ];
+    let known_sim = sim.filter(|s| TAGS.iter().any(|(tag, _)| tag == s));
+    let wanted = table.map(SchemaTable::as_str);
+
+    let mut out = String::new();
+    let mut keep = false;
+
+    for line in RAW_SCHEMA.lines() {
+        if let Some(header) = line.strip_prefix("## ") {
+            let section = header.trim();
+            keep = section == "intro" || wanted.is_none() || wanted == Some(section);
+            if keep && section != "intro" {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str("## ");
+                out.push_str(section);
+            }
+            continue;
+        }
+        if !keep || line.trim().is_empty() {
+            continue;
+        }
+        let body = match TAGS.iter().find_map(|(tag, prefix)| {
+            line.strip_prefix(prefix).map(|rest| (*tag, rest))
+        }) {
+            Some((tag, rest)) => match known_sim {
+                Some(active) if active != tag => continue,
+                _ => rest,
+            },
+            None => line,
+        };
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(body);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -400,6 +490,8 @@ pub struct EngineerInput {
     query: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    table: Option<SchemaTable>,
 }
 
 impl EngineerInput {
@@ -408,6 +500,7 @@ impl EngineerInput {
             command,
             query: None,
             limit: None,
+            table: None,
         }
     }
 }
@@ -4072,6 +4165,7 @@ mod tests {
                 shared: engineer.inner.shared.clone(),
                 data,
             }),
+            sim: None,
         };
 
         let error = busy.check_condition("SELECT 1".into()).await.unwrap_err();
@@ -4309,6 +4403,103 @@ mod tests {
             "forecast_now",
         ] {
             assert!(skill.contains(&format!("`{table}`")), "{table}");
+        }
+    }
+
+    #[test]
+    fn input_schema_exposes_schema_command_and_table_filter() {
+        let schema = Engineer::input_schema();
+        assert_eq!(
+            schema["properties"]["command"]["enum"],
+            serde_json::json!(["quick", "track", "sql", "schema"])
+        );
+        assert_eq!(
+            schema["properties"]["table"]["enum"],
+            serde_json::json!(["telemetry", "telemetry_wheel", "car_state", "scoring"])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn schema_returns_compact_sim_scoped_catalog_and_filters_by_table() {
+        // Works with zero DB I/O even on an empty temp path with no recording file
+        let dir = tempfile::tempdir().unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+        let pool = Pool::new(
+            Database::read_only(Arc::new(dir.path().join("missing.db"))),
+            one,
+            one,
+        );
+        let lmu = Engineer::new(pool.clone()).with_sim("lmu");
+        let iracing = Engineer::new(pool.clone()).with_sim("iracing");
+        let rrre = Engineer::new(pool.clone()).with_sim("rrre");
+        let any = Engineer::new(pool);
+
+        for (name, tool) in [("lmu", &lmu), ("iracing", &iracing), ("rrre", &rrre)] {
+            let full = run(tool, serde_json::json!({"command": "schema"})).await;
+            assert!(
+                full.len() < 5120,
+                "{name} schema too large: {} B",
+                full.len()
+            );
+            assert!(
+                full.contains("`telemetry`") && full.contains("`car_state`"),
+                "{name}"
+            );
+            for table in ["telemetry", "telemetry_wheel", "car_state", "scoring"] {
+                let one_table = run(
+                    tool,
+                    serde_json::json!({"command": "schema", "table": table}),
+                )
+                .await;
+                assert!(
+                    one_table.len() < 2560,
+                    "{name}/{table} too large: {} B",
+                    one_table.len()
+                );
+                assert!(one_table.len() < full.len(), "{name}/{table}");
+            }
+        }
+
+        // Sim scoping strips other sims' tagged notes; sim=None keeps all
+        let lmu_full = run(&lmu, serde_json::json!({"command": "schema"})).await;
+        let ir_full = run(&iracing, serde_json::json!({"command": "schema"})).await;
+        let rrre_full = run(&rrre, serde_json::json!({"command": "schema"})).await;
+        let any_full = run(&any, serde_json::json!({"command": "schema"})).await;
+        for out in [&lmu_full, &ir_full, &rrre_full, &any_full] {
+            assert!(
+                !out.contains("[lmu]") && !out.contains("[iracing]") && !out.contains("[rrre]"),
+                "raw tag leaked: {out}"
+            );
+        }
+        assert!(!lmu_full.contains("iRacing") && !lmu_full.contains("RaceRoom"));
+        assert!(!ir_full.contains("LMU") && !ir_full.contains("RaceRoom"));
+        assert!(!rrre_full.contains("LMU") && !rrre_full.contains("iRacing"));
+        assert!(
+            any_full.len() >= lmu_full.len()
+                && any_full.len() >= ir_full.len()
+                && any_full.len() >= rrre_full.len()
+        );
+
+        // Schema documents every column of telemetry, telemetry_wheel, and car_state
+        let (_race_dir, race_tool) = race();
+        for table in ["telemetry", "telemetry_wheel", "car_state"] {
+            let out = run(
+                &race_tool,
+                serde_json::json!({
+                    "command": "sql",
+                    "query": format!("PRAGMA table_info({table})"),
+                    "limit": 200,
+                }),
+            )
+            .await;
+            let mut cols = 0;
+            for line in out.lines().skip(2) {
+                assert!(!line.starts_with("..."), "{table} truncated: {out}");
+                let name = line.split(" | ").nth(1).unwrap().trim_matches('"');
+                assert!(RAW_SCHEMA.contains(&format!("`{name}`")), "{table}.{name}");
+                cols += 1;
+            }
+            assert!(cols > 0, "{table} returned no columns");
         }
     }
 
