@@ -4432,8 +4432,10 @@ mod tests {
         let lmu = Engineer::new(pool.clone()).with_sim("lmu");
         let iracing = Engineer::new(pool.clone()).with_sim("iracing");
         let rrre = Engineer::new(pool.clone()).with_sim("rrre");
+        let other = Engineer::new(pool.clone()).with_sim("other");
         let any = Engineer::new(pool);
 
+        let all_tables = ["telemetry", "telemetry_wheel", "car_state", "scoring"];
         for (name, tool) in [("lmu", &lmu), ("iracing", &iracing), ("rrre", &rrre)] {
             let full = run(tool, serde_json::json!({"command": "schema"})).await;
             assert!(
@@ -4445,7 +4447,7 @@ mod tests {
                 full.contains("`telemetry`") && full.contains("`car_state`"),
                 "{name}"
             );
-            for table in ["telemetry", "telemetry_wheel", "car_state", "scoring"] {
+            for table in all_tables {
                 let one_table = run(
                     tool,
                     serde_json::json!({"command": "schema", "table": table}),
@@ -4457,14 +4459,26 @@ mod tests {
                     one_table.len()
                 );
                 assert!(one_table.len() < full.len(), "{name}/{table}");
+                assert!(
+                    one_table.contains(&format!("## {table}\n")),
+                    "{name}/{table} missing heading: {one_table}"
+                );
+                for excluded in all_tables.into_iter().filter(|t| *t != table) {
+                    assert!(
+                        !one_table.contains(&format!("## {excluded}\n")),
+                        "{name}/{table} leaked {excluded}"
+                    );
+                }
             }
         }
 
-        // Sim scoping strips other sims' tagged notes; sim=None keeps all
+        // Sim scoping strips other sims' tagged notes; sim=None and unknown sims keep all
         let lmu_full = run(&lmu, serde_json::json!({"command": "schema"})).await;
         let ir_full = run(&iracing, serde_json::json!({"command": "schema"})).await;
         let rrre_full = run(&rrre, serde_json::json!({"command": "schema"})).await;
+        let other_full = run(&other, serde_json::json!({"command": "schema"})).await;
         let any_full = run(&any, serde_json::json!({"command": "schema"})).await;
+        assert_eq!(other_full, any_full);
         for out in [&lmu_full, &ir_full, &rrre_full, &any_full] {
             assert!(
                 !out.contains("[lmu]") && !out.contains("[iracing]") && !out.contains("[rrre]"),
