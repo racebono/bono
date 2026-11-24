@@ -10744,13 +10744,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_skill_documents_every_column_and_its_queries_run() {
         let (_dir, engineer) = race();
-        let recording = ["telemetry", "telemetry_wheel", "car_state"];
-        for table in STREAM_TABLES.into_iter().chain(NOW_TABLES).chain(recording) {
+        for table in STREAM_TABLES.into_iter().chain(NOW_TABLES) {
             let columns = query(&engineer, &format!("PRAGMA table_info({table})")).await;
             assert!(!columns.is_empty(), "{table}");
             for column in columns {
                 let name = column[1].trim_matches('"');
                 assert!(SKILL.contains(&format!("`{name}`")), "{table}.{name}");
+            }
+        }
+        for table in ["telemetry", "telemetry_wheel", "car_state"] {
+            let columns = query(&engineer, &format!("PRAGMA table_info({table})")).await;
+            assert!(!columns.is_empty(), "{table}");
+            for column in columns {
+                let name = column[1].trim_matches('"');
+                assert!(RAW_SCHEMA.contains(&format!("`{name}`")), "{table}.{name}");
             }
         }
 

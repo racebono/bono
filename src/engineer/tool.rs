@@ -34,6 +34,12 @@ use std::{
 
 /// The race engineer's instructions (`skill/SKILL.md`), for the system prompt.
 pub const SKILL: &str = include_str!("../../skill/SKILL.md");
+/// Simulator-specific caveats appended to [`SKILL`] when assembling a session's system prompt.
+const SIM_LMU: &str = include_str!("../../skill/sim-lmu.md");
+const SIM_IRACING: &str = include_str!("../../skill/sim-iracing.md");
+const SIM_RRRE: &str = include_str!("../../skill/sim-rrre.md");
+/// Pit-service instructions appended only when the session has the `pit` tool.
+const PIT_SERVICE: &str = include_str!("../../skill/pit-service.md");
 /// The compact raw recording table schema (`skill/raw-schema.md`), served on demand by `schema`.
 pub const RAW_SCHEMA: &str = include_str!("../../skill/raw-schema.md");
 const WHEELS: [&str; 4] = ["FL", "FR", "RL", "RR"];
@@ -79,6 +85,28 @@ pub fn instructions(skill: String) -> String {
         Some((_, body)) => body.trim_start().to_owned(),
         None => skill,
     }
+}
+
+/// Assembles the race engineer's system instructions for `sim` and pit-tool availability: core
+/// [`SKILL`] (without front matter), the matching simulator caveats (or all three when `sim` is
+/// `None` or unrecognized), and `skill/pit-service.md` when `has_pit` is true.
+pub fn assemble_skill(sim: Option<&str>, has_pit: bool) -> String {
+    let mut parts = vec![instructions(SKILL.to_owned()).trim_end().to_owned()];
+    match sim {
+        Some("lmu") => parts.push(SIM_LMU.trim().to_owned()),
+        Some("iracing") => parts.push(SIM_IRACING.trim().to_owned()),
+        Some("rrre") => parts.push(SIM_RRRE.trim().to_owned()),
+        _ => {
+            parts.push(SIM_LMU.trim().to_owned());
+            parts.push(SIM_IRACING.trim().to_owned());
+            parts.push(SIM_RRRE.trim().to_owned());
+        }
+    }
+    if has_pit {
+        parts.push(PIT_SERVICE.trim().to_owned());
+    }
+    parts.retain(|part| !part.is_empty());
+    parts.join("\n\n")
 }
 
 /// The tool, for one database. Cheap to clone.
@@ -4386,24 +4414,76 @@ mod tests {
 
     #[test]
     fn skill_stays_within_what_the_tool_offers() {
-        let skill = instructions(SKILL.to_owned());
-        assert!(!skill.starts_with("---"));
-        assert!(skill.starts_with("# Race engineer"));
-        // Every table the skill tells the model about is one the query sees
-        for table in [
-            "lap_stats",
-            "lap_wheel_stats",
-            "corner_passes",
-            "corner_pass_wheels",
-            "race_state",
-            "cars_now",
-            "drivers_now",
-            "stints",
-            "wheels_now",
-            "forecast_now",
+        for skill in [
+            instructions(SKILL.to_owned()),
+            assemble_skill(Some("lmu"), true),
         ] {
-            assert!(skill.contains(&format!("`{table}`")), "{table}");
+            assert!(!skill.starts_with("---"));
+            assert!(skill.starts_with("# Race engineer"));
+            // Every table the skill tells the model about is one the query sees
+            for table in [
+                "lap_stats",
+                "lap_wheel_stats",
+                "lap_sector_stats",
+                "corner_passes",
+                "corner_pass_wheels",
+                "race_state",
+                "cars_now",
+                "drivers_now",
+                "stints",
+                "wheels_now",
+                "sectors_now",
+                "forecast_now",
+                "setup_now",
+                "setup_changes",
+            ] {
+                assert!(skill.contains(&format!("`{table}`")), "{table}");
+            }
         }
+    }
+
+    #[test]
+    fn assemble_skill_scopes_by_sim_and_pit_availability() {
+        let lmu_pit = assemble_skill(Some("lmu"), true);
+        let lmu_no_pit = assemble_skill(Some("lmu"), false);
+        let iracing = assemble_skill(Some("iracing"), false);
+        let rrre = assemble_skill(Some("rrre"), false);
+        let generic = assemble_skill(None, false);
+        let unknown = assemble_skill(Some("other"), false);
+
+        // Stripped of frontmatter and silent-check loops
+        assert!(lmu_pit.starts_with("# Race engineer"));
+        assert!(!lmu_pit.contains("## Final answer check"));
+        assert!(!lmu_pit.contains("First identify silently"));
+        assert!(lmu_pit.contains("command=\"schema\"") || lmu_pit.contains("`schema`"));
+
+        // Pit section included iff has_pit
+        assert!(lmu_pit.contains("## Pit service"));
+        assert!(!lmu_no_pit.contains("## Pit service"));
+
+        // Sim scoping isolates simulator-only caveats; None/unknown includes all three
+        assert!(lmu_no_pit.contains("VM_*"));
+        assert!(!lmu_no_pit.contains("iRacing"));
+        assert!(!lmu_no_pit.contains("RaceRoom"));
+
+        assert!(iracing.contains("iRacing"));
+        assert!(!iracing.contains("VM_*"));
+        assert!(!iracing.contains("RaceRoom"));
+
+        assert!(rrre.contains("RaceRoom"));
+        assert!(!rrre.contains("VM_*"));
+        assert!(!rrre.contains("iRacing"));
+
+        for all in [&generic, &unknown] {
+            assert!(all.contains("VM_*") && all.contains("iRacing") && all.contains("RaceRoom"));
+        }
+
+        // Core prompt diet check: active LMU+pit prompt significantly smaller than old ~60 KB monolith
+        assert!(
+            lmu_pit.len() < 42_000,
+            "prompt still {} bytes",
+            lmu_pit.len()
+        );
     }
 
     #[test]
@@ -4630,7 +4710,7 @@ mod tests {
 /// - `EVAL_DB`: the race's `telemetry.db` (kept looking fresh while the evals run)
 /// - `EVAL_OUT`: where each eval's reply goes, as `eval-<id>/<EVAL_CONFIG>/<EVAL_RUN>/`
 /// - `EVAL_CONFIG` (default `with_skill`), `EVAL_RUN` (default `run-1`), `EVAL_MODEL`,
-///   `EVAL_EFFORT`, `EVAL_IDS` (e.g. `1,5,9`)
+///   `EVAL_EFFORT`, `EVAL_SIM` (default `lmu`; `iracing`, `rrre`, or `all`), `EVAL_IDS` (e.g. `1,5,9`)
 ///
 /// The `schedule` tool is registered too. An eval's `pending` requests are added before its
 /// question, which then carries the pending list as the app's do; one with `scheduled` requests
@@ -4995,7 +5075,14 @@ mod evals {
         let run = var("EVAL_RUN").unwrap_or_else(|| "run-1".into());
         let model = var("EVAL_MODEL").unwrap_or_else(|| "claude-sonnet-5-5".into());
         let effort = var("EVAL_EFFORT").unwrap_or_else(|| "high".into());
-        let system = instructions(SKILL.to_owned());
+        let sim: Option<&'static str> = match var("EVAL_SIM").as_deref().unwrap_or("lmu") {
+            "lmu" => Some("lmu"),
+            "iracing" => Some("iracing"),
+            "rrre" => Some("rrre"),
+            "all" => None,
+            other => panic!("unknown EVAL_SIM: {other} (expected lmu, iracing, rrre, or all)"),
+        };
+        let system = assemble_skill(sim, false);
         let ids = var("EVAL_IDS").map(|ids| {
             ids.split(',')
                 .map(|id| id.trim().parse::<u64>().unwrap())
@@ -5025,7 +5112,10 @@ mod evals {
 
             let four = NonZeroUsize::new(4).unwrap();
             let pool = Pool::new(Database::read_only(Arc::new(db.clone())), four, four);
-            let tool = Engineer::new(pool);
+            let tool = match sim {
+                Some(sim) => Engineer::new(pool).with_sim(sim),
+                None => Engineer::new(pool),
+            };
             tool.sync().await.unwrap();
             // What the pending requests count from, and the `schedule` tool's adds: one snapshot,
             // as the recording doesn't move

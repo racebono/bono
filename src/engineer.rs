@@ -41,7 +41,7 @@ use tokio::{
     sync::{Mutex, mpsc},
 };
 use pit::PitTool;
-use tool::{ConditionId, Engineer as EngineerTool, Progress, SKILL, instructions};
+use tool::{ConditionId, Engineer as EngineerTool, Progress};
 
 mod acknowledgement;
 mod pit;
@@ -112,7 +112,6 @@ pub struct Engineer {
     client: reqwest::Client,
     /// Who Bono Cloud is used as
     account: Option<Account>,
-    skill: Arc<str>,
     /// Everything said, for the chat
     chat: Vec<ChatEntry>,
     /// The language the pilot last asked in: typed questions whose language is unclear are
@@ -626,6 +625,10 @@ struct Session {
     db: PathBuf,
     /// The model settings it was started with: changing them starts over
     model: ModelConfig,
+    /// The simulator the system prompt was assembled for: changing it starts over
+    sim: &'static str,
+    /// Whether the `pit` tool (and its prompt instructions) was enabled: changing it starts over
+    has_pit: bool,
     /// Whether corners are called by their names: the system prompt says how, so changing it
     /// starts over too
     corner_names: bool,
@@ -670,7 +673,6 @@ impl Engineer {
         Self {
             client,
             account,
-            skill: instructions(SKILL.to_owned()).into(),
             chat: Vec::new(),
             last_lang: arrstr!("en"),
             languages: LanguageDetector::new(),
@@ -1455,6 +1457,7 @@ impl Engineer {
         pit: Option<Arc<dyn PitService>>,
     ) -> anyhow::Result<()> {
         let db = pool.database().path().to_owned();
+        let has_pit = pit.is_some();
         let model_changed = self
             .session
             .as_ref()
@@ -1463,6 +1466,8 @@ impl Engineer {
             .session
             .as_ref()
             .is_some_and(|s| s.corner_names != *config.get().corner_names());
+        let sim_changed = self.session.as_ref().is_some_and(|s| s.sim != sim);
+        let pit_changed = self.session.as_ref().is_some_and(|s| s.has_pit != has_pit);
         // Once for each change, though the new model may fail to start again and again
         let model = &config.get().model;
         if !model_changed {
@@ -1474,6 +1479,8 @@ impl Engineer {
         if self.new_session
             || model_changed
             || corners_changed
+            || sim_changed
+            || pit_changed
             || self.session.as_ref().is_none_or(|s| s.db != db)
         {
             let tool = self.tool_for(rt, sim, &pool);
@@ -2286,6 +2293,8 @@ impl Engineer {
     fn conversation(
         &self,
         model: &ModelConfig,
+        sim: &'static str,
+        has_pit: bool,
         corner_names: bool,
         tools: Tools,
     ) -> anyhow::Result<Box<dyn Model>> {
@@ -2296,7 +2305,7 @@ impl Engineer {
         provider::conversation(
             model,
             self.account.as_ref(),
-            system_prompt(&self.skill, corner_names),
+            system_prompt(Some(sim), has_pit, corner_names),
             tools,
             self.client.clone(),
         )
@@ -2313,6 +2322,7 @@ impl Engineer {
         let schedule_tool = ScheduleTool::new(tool.clone());
         // Only for a game the engineer can change the pit menu in
         let pit_tool = pit.map(PitTool::new);
+        let has_pit = pit_tool.is_some();
         let tools = session_tools(&tool, &schedule_tool, pit_tool.as_ref());
         let model = config.get().model.clone();
         let corner_names = *config.get().corner_names();
@@ -2324,7 +2334,7 @@ impl Engineer {
             },
             ModelProvider::Claude | ModelProvider::Ollama | ModelProvider::OpenAi => None,
         };
-        let conversation = self.conversation(&model, corner_names, tools)?;
+        let conversation = self.conversation(&model, sim, has_pit, corner_names, tools)?;
 
         let db = pool.database().path().to_owned();
         log::info!("Engineer session started on {}", db.display());
@@ -2332,6 +2342,8 @@ impl Engineer {
         Ok(Session {
             db,
             model,
+            sim,
+            has_pit,
             corner_names,
             user,
             lease: conversation.lease(),
@@ -2495,8 +2507,9 @@ fn tokens_detail(reply: &Reply) -> String {
     )
 }
 
-/// The skill's instructions with how to call corners.
-fn system_prompt(skill: &str, corner_names: bool) -> Arc<str> {
+/// The skill's instructions for `sim` and pit-tool availability, with how to call corners.
+fn system_prompt(sim: Option<&str>, has_pit: bool, corner_names: bool) -> Arc<str> {
+    let skill = tool::assemble_skill(sim, has_pit);
     let corners = match corner_names {
         true => CORNERS_BY_NAME,
         false => CORNERS_BY_NUMBER,
@@ -3942,6 +3955,86 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn follow_session_restarts_when_sim_or_pit_availability_changes() {
+        struct NoMenu;
+        impl PitService for NoMenu {
+            fn read(&self) -> anyhow::Result<PitMenu> {
+                anyhow::bail!("no game")
+            }
+            fn write(&self, _: &PitMenu, _: &crate::sim::pit::Resolved) -> anyhow::Result<()> {
+                anyhow::bail!("no game")
+            }
+        }
+
+        let rt = tokio::runtime::Handle::current();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(&config_path, r#"{"model": {"provider": "ollama"}}"#).unwrap();
+        let config = Config::new(&config_path).await.unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+        let pool = Pool::new(
+            Database::read_only(Arc::new(dir.path().join("a.db"))),
+            one,
+            one,
+        );
+
+        let created = Arc::new(AtomicU32::new(0));
+        let created_in = created.clone();
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.conversations = Some(Box::new(move |_| {
+            created_in.fetch_add(1, atomic::Ordering::SeqCst);
+            Box::new(RecordingModel(Arc::default()))
+        }));
+
+        // Initial session on lmu without pit
+        engineer
+            .follow_session(&rt, &config, "lmu", pool.clone(), None)
+            .unwrap();
+        assert_eq!(created.load(atomic::Ordering::SeqCst), 1);
+        let s1 = engineer.session.as_ref().unwrap().state.clone();
+
+        // Same db, sim, and pit availability reuses the session
+        engineer
+            .follow_session(&rt, &config, "lmu", pool.clone(), None)
+            .unwrap();
+        assert_eq!(created.load(atomic::Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&engineer.session.as_ref().unwrap().state, &s1));
+
+        // Changing sim on the same db restarts the session
+        engineer
+            .follow_session(&rt, &config, "iracing", pool.clone(), None)
+            .unwrap();
+        assert_eq!(created.load(atomic::Ordering::SeqCst), 2);
+        let s2 = engineer.session.as_ref().unwrap().state.clone();
+        assert!(!Arc::ptr_eq(&s2, &s1));
+
+        // Enabling pit availability on the same db & sim restarts the session
+        let pit: Arc<dyn PitService> = Arc::new(NoMenu);
+        engineer
+            .follow_session(&rt, &config, "iracing", pool.clone(), Some(pit.clone()))
+            .unwrap();
+        assert_eq!(created.load(atomic::Ordering::SeqCst), 3);
+        let s3 = engineer.session.as_ref().unwrap().state.clone();
+        assert!(!Arc::ptr_eq(&s3, &s2));
+
+        // Same db, sim, and pit availability (Some) reuses the session
+        engineer
+            .follow_session(&rt, &config, "iracing", pool.clone(), Some(pit))
+            .unwrap();
+        assert_eq!(created.load(atomic::Ordering::SeqCst), 3);
+        assert!(Arc::ptr_eq(&engineer.session.as_ref().unwrap().state, &s3));
+
+        // Disabling pit availability restarts the session
+        engineer
+            .follow_session(&rt, &config, "iracing", pool.clone(), None)
+            .unwrap();
+        assert_eq!(created.load(atomic::Ordering::SeqCst), 4);
+        assert!(!Arc::ptr_eq(&engineer.session.as_ref().unwrap().state, &s3));
+
+        engineer.quit(&rt).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_conversation_ends_when_its_recording_is_lost_or_switched() {
         let rt = tokio::runtime::Handle::current();
         for switch in [false, true] {
@@ -3962,6 +4055,8 @@ mod tests {
             engineer.session = Some(Session {
                 db: original.database().path().to_owned(),
                 model: ModelConfig::default(),
+                sim: "lmu",
+                has_pit: false,
                 corner_names: false,
                 user: None,
                 lease: None,
@@ -4042,6 +4137,8 @@ mod tests {
         engineer.session = Some(Session {
             db: pool.database().path().to_owned(),
             model: ModelConfig::default(),
+            sim: "lmu",
+            has_pit: false,
             corner_names: false,
             user: None,
             lease: None,
@@ -4256,6 +4353,8 @@ mod tests {
             engineer.session = Some(Session {
                 db: pool.database().path().to_owned(),
                 model: config.get().model.clone(),
+                sim: "test",
+                has_pit: false,
                 corner_names: *config.get().corner_names(),
                 user: None,
                 lease: None,
