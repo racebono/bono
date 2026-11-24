@@ -277,6 +277,10 @@ settings! {
         pub width: NonZeroU32 = NonZeroU32::new(900).unwrap(),
         pub height: NonZeroU32 = NonZeroU32::new(600).unwrap(),
         pub talk_button: Option<ConfigButton> = None,
+        /// Whether the talk button starts and stops talking, rather than being held down
+        pub talk_toggle: bool = false,
+        /// Whether a beep tells the pilot the microphone closed, when the talk button toggles it
+        pub talk_close_beep: bool = true,
         pub session_button: Option<ConfigButton> = None,
         pub microphone: RawAudioDevice<true> = RawAudioDevice::default(),
         pub speaker: RawAudioDevice<false> = RawAudioDevice::default(),
@@ -944,6 +948,21 @@ mod tests {
             assert_eq!(released.model.ollama, data.model.ollama);
             assert_eq!(released.model.openai, data.model.openai);
         }
+    }
+
+    #[test]
+    fn talk_settings_default_to_hold_and_round_trip() {
+        let mut config = serde_json::from_str::<RawConfig>("{}").unwrap();
+        assert!(!*config.talk_toggle());
+        assert!(*config.talk_close_beep());
+        assert_eq!(serde_json::to_string(&config).unwrap(), "{}");
+
+        config.talk_toggle.set(true);
+        config.talk_close_beep.set(false);
+        let saved = serde_json::to_string(&config).unwrap();
+        let loaded = serde_json::from_str::<RawConfig>(&saved).unwrap();
+        assert!(*loaded.talk_toggle());
+        assert!(!*loaded.talk_close_beep());
     }
 
     #[test]
