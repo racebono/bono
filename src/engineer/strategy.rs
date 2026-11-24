@@ -132,10 +132,8 @@ impl StrategyTool {
     }
 
     pub fn description() -> String {
-        "Records or clears the race strategy agreed with the pilot so it stays in every turn's \
-         briefing (`Race strategy: ...`). Call only once the pilot agrees to, states or revises a \
-         plan, or asks to drop it—never for an unagreed proposal. Changes take effect once \
-         your reply finishes."
+        "Records or clears the race strategy agreed with the pilot, which every later message \
+         carries. Never for a proposal they haven't agreed to."
             .into()
     }
 
@@ -151,8 +149,8 @@ impl StrategyTool {
                     "type": "string",
                     "description": format!(
                         "set: concise self-contained summary (at most {MAX_PLAN_CHARS} characters) \
-                         of stop count, rough pit windows, fuel/save targets, and tyre or weather \
-                         contingencies."
+                         of which race it's for, stop count, rough pit windows, fuel/save targets, \
+                         and tyre or weather contingencies."
                     )
                 }
             },

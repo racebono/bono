@@ -30,6 +30,13 @@ Pass: reports the ~9 percent saving from `save_pct_one_fewer_stop` (not the 64 p
 `save_pct_needed`) and notes that likely late rain could force a tyre stop anyway; does not save
 a strategy unasked.
 
+## Pit plan without a forecast
+
+Pilot: "How should we play our pit stops from here?"
+Briefing: `Race strategy: none.`
+Evidence: `stints` as in the multi-stop case; `forecast_now` has no rows; surface damp in places.
+Pass: plans the stops and says no forecast is known; fails if it says or assumes it stays dry.
+
 ## Bare fuel-check scope matrix
 
 Run each variant with the stated context:
@@ -50,7 +57,7 @@ Run each variant with the stated context:
    - Pilot: "Do I need to box?"
    - Briefing: `Race strategy: none.`; snapshot shows live rain 15 percent, zero wetness and no
      forecast rain; `stints` as above.
-   - Pass: as variant 2, and an offer treats the rain as already falling, not as a forecast.
+   - Pass: as variant 2; an offer doesn't call the rain only a forecast.
 4. **High rain, no stop needed:**
    - Pilot: "Can I make it on energy?"
    - Briefing: `Race strategy: none.`; snapshot shows 70 percent rain late; `stints` shows
@@ -70,6 +77,16 @@ Run each variant with the stated context:
    - Pilot: "Can I make it on energy? Just the verdict."
    - Briefing and evidence as variant 6.
    - Pass: verdict only, at most 15 words, without restating the plan.
+8. **Enough fuel on the wrong tyres:**
+   - Pilot: "Do I need to box?"
+   - Briefing: `Race strategy: none.`; snapshot shows slicks fitted, no rain now and a heavily wet
+     track; `stints` as variant 4.
+   - Pass: says they do because the tyres don't suit the track, without a pit lap or compound; fails
+     if it answers that no stop is needed.
+9. **Plan for a later race:**
+   - Pilot: "Have I enough fuel for this run?"
+   - Briefing: qualifying; `Race strategy: feature race, 2-stop, short-fuel around lap 22.`
+   - Pass: answers for the run, without framing it against the race plan.
 
 ## Collaborative lifecycle and guardrails
 
@@ -87,8 +104,11 @@ Run each variant with the stated context:
 3. **Dropping the plan:**
    - Pilot says "Forget the strategy, we'll play it by ear."
    - Pass: calls `strategy` with `action: "clear"` and confirms briefly.
-4. **Scheduled turn while strategy is active:**
-   - Scheduled turn fires for a rain or pit-window trigger while `Race strategy:` is set.
-   - Pass: reports the fired watch concisely (opening with subject, no acknowledgement), gives no
-     plan advice the instruction didn't ask for, replies `[SILENCE]` when the watch has nothing to
-     say, and never calls `strategy` unasked.
+4. **Scheduled turn with news while strategy is active:**
+   - Briefing has an active `Race strategy:`; the fired request is "The pilot asked during the race
+     to be told when rain starts."; the snapshot shows light rain.
+   - Pass: reports the rain concisely (opening with the subject, no acknowledgement), gives no plan
+     advice, and never calls `strategy`.
+5. **Scheduled turn without news while strategy is active:**
+   - As case 4, but the request fires at the end of a lap and the snapshot shows no rain.
+   - Pass: replies exactly `[SILENCE]` and never calls `strategy`.

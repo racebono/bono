@@ -10998,38 +10998,51 @@ mod tests {
             "expected approx_lap near 19.0, got {approx} ({rows:?})"
         );
 
-        // 2) Practice session with no completed laps yet + future "race" forecast -> all NULL
-        let dir = tempfile::tempdir().unwrap();
-        let recorder = Recorder::new(dir.path(), None).unwrap();
-        let (mut session, standings) = scoring("practice", 60.0, 0);
-        session.session_end_time = Some(1800.0).into();
-        recorder.push_scoring(session, standings);
-        drive(&recorder, "practice", 60.0, 0);
-        drop(recorder);
-        {
+        // A point of this session and one of the race still to come, in a timed practice
+        let practice_forecast = |dir: &tempfile::TempDir, time: f64| {
             let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
-            let mut writer = ForecastWriter::new(&conn).unwrap();
-            let point = |kind: &str, frac: f64| {
+            conn.execute(
+                "UPDATE session SET session_type = 'practice', session_end_time = 1800.0",
+                [],
+            )
+            .unwrap();
+            let point = |kind: &str| {
                 let mut p = bono_forecast_point::default();
-                p.session_time = Some(60.0).into();
+                p.session_time = Some(time).into();
                 p.session_type = Some(kind.to_owned()).into();
-                p.session_fraction = Some(frac).into();
+                p.session_fraction = Some(0.5).into();
                 p.rain_chance = Some(0.7).into();
                 p
             };
-            writer
-                .write(vec![point("practice", 0.5), point("race", 0.5)])
+            ForecastWriter::new(&conn)
+                .unwrap()
+                .write(vec![point("practice"), point("race")])
                 .unwrap();
-        }
-        let engineer = reopen(&dir);
-        let rows = query(
-            &engineer,
-            "SELECT session_type, is_current_session, approx_lap FROM forecast_now ORDER BY session_type",
-        )
-        .await;
+        };
+        let sql = "SELECT session_type, is_current_session, minutes_from_now IS NOT NULL, \
+                   ROUND(approx_lap) FROM forecast_now ORDER BY session_type";
+
+        // 2) No completed laps yet: the time is known, but no pace to place it on a lap
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        drive(&recorder, "practice", 60.0, 0);
+        drop(recorder);
+        practice_forecast(&dir, 60.0);
+        let rows = query(&reopen(&dir), sql).await;
         assert_eq!(
             rows,
-            [["\"practice\"", "1", "NULL"], ["\"race\"", "0", "NULL"]],
+            [["\"practice\"", "1", "1", "NULL"], ["\"race\"", "0", "0", "NULL"]],
+            "{rows:?}"
+        );
+
+        // 3) The same with a pace (at t=310s, 590s ahead of lap 4.1 = lap 10): only this session's
+        let (dir, engineer) = race();
+        drop(engineer);
+        practice_forecast(&dir, 310.0);
+        let rows = query(&reopen(&dir), sql).await;
+        assert_eq!(
+            rows,
+            [["\"practice\"", "1", "1", "10"], ["\"race\"", "0", "0", "NULL"]],
             "{rows:?}"
         );
     }

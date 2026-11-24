@@ -184,9 +184,7 @@ impl Engineer {
             Ok(snapshot) => snapshot,
             Err(e) => {
                 log::warn!("Error attaching the engineer's telemetry snapshot: {e:#}");
-                return format!(
-                    "{question}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\nunavailable\n[END UNTRUSTED TELEMETRY SNAPSHOT]"
-                );
+                "unavailable".to_owned()
             }
         };
         let names = match self.setup_names().await {

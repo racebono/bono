@@ -6855,6 +6855,39 @@ mod tests {
     }
 
     #[test]
+    fn cut_off_and_scheduled_turns_change_strategy() {
+        let set = || serde_json::json!({"action": "set", "plan": "1-stop lap 25"});
+        for stop in [StopReason::MaxTokens, StopReason::ContextWindowExceeded] {
+            let mut scripted = Scripted::recorded();
+            scripted.ask("Agree to 1-stop lap 25.");
+            scripted.until("asked", |s| s.questions().len() == 1);
+            scripted.strategy(set()).unwrap();
+            scripted.finish(Act::End(stop, "Saved, and"));
+            assert_eq!(scripted.engineer.strategy(), Some("1-stop lap 25"), "{stop:?}");
+        }
+
+        let mut scripted = Scripted::recorded();
+        scripted.falls_due();
+        let turns = scripted.questions().len();
+        scripted.wait(schedule::GATHER);
+        scripted.scheduled_asked(turns);
+        scripted.strategy(set()).unwrap();
+        assert_eq!(scripted.engineer.strategy(), None);
+        scripted.finish_scheduled(Act::Reply);
+        assert_eq!(scripted.engineer.strategy(), Some("1-stop lap 25"));
+
+        // Another recording has none
+        let one = NonZeroUsize::new(1).unwrap();
+        let db = scripted._dir.path().join("other.db");
+        let pool = Pool::new(Database::read_only(Arc::new(db)), one, one);
+        let mut sim = crate::sim::recording(pool);
+        scripted
+            .engineer
+            .follow_recording(scripted.runtime.handle(), Some(&mut *sim));
+        assert_eq!(scripted.engineer.strategy(), None);
+    }
+
+    #[test]
     fn strategy_clears_on_new_session_sim_stop_and_new_weekend() {
         // 1) new_session clears strategy
         let mut scripted = Scripted::recorded();
