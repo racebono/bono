@@ -87,6 +87,16 @@ no history.
 Pass: describes a wet track; neither intensity nor forecast probability overrides the
 surface evidence. Does not invent a wetting trend.
 
+## Light rain on a dry track
+
+Pilot: "¿Va a seguir lloviendo?"
+Evidence: live weather reports low non-zero rain with racing-line wetness min, average and max all
+zero; upcoming forecast checkpoints show zero percent rain soon and a high rain chance later in the
+session.
+Pass: acknowledges it is already raining lightly on a dry surface and gives the later rain chance
+relative to now; does not claim it is dry or not raining now, and does not let the near-term zero
+percent forecast override live rain.
+
 ## Compound answer covers condition, action and reason
 
 Pilot: "¿Cómo está la pista y qué monto en la parada obligatoria, y por qué?"
