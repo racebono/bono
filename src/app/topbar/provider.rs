@@ -724,45 +724,16 @@ impl ProviderTopbar {
     }
 
     /// What's left of the account's allowance (this week's, or the trial's), warning when it
-    /// runs low.
+    /// runs low, or when access ended.
     fn show_allowance(&mut self, rt: &Handle, ui: &mut egui::Ui) {
-        let Some(entitlement) = self.allowance(rt) else {
+        let Some((text, warning)) = self.allowance(rt).and_then(allowance_text) else {
             return;
         };
-        let Some(hours) = entitlement.estimated_hours_left else {
-            return;
-        };
-        let hours_left = format!("{:.1}", hours.max(0.0));
-        // A trial's allowance never starts over, and is no more than a couple of hours in all:
-        // it's not "this week's", nor "running low" from the start
-        if entitlement.status == "trial" {
-            let text = t!("provider.bono_cloud_trial_hours_left", hours = hours_left);
-            if hours < TRIAL_LOW_HOURS {
-                let warn = ui.visuals().warn_fg_color;
-                ui.colored_label(warn, format!("{} {text}", egui_phosphor::bold::WARNING));
-            } else {
-                ui.weak(text);
-            }
-            return;
-        }
-        let resets = (entitlement.week.as_ref())
-            .and_then(|week| week.resets_at.as_deref())
-            .and_then(resets_in)
-            .unwrap_or_else(|| "?".into());
-        if hours < ALLOWANCE_LOW_HOURS {
-            let text = t!(
-                "provider.bono_cloud_allowance_low",
-                hours = hours_left,
-                resets = resets
-            );
+        if warning {
             let warn = ui.visuals().warn_fg_color;
             ui.colored_label(warn, format!("{} {text}", egui_phosphor::bold::WARNING));
         } else {
-            ui.weak(t!(
-                "provider.bono_cloud_hours_left",
-                hours = hours_left,
-                resets = resets
-            ));
+            ui.weak(text);
         }
     }
 
@@ -825,6 +796,41 @@ impl ProviderTopbar {
             ModelProvider::Ollama | ModelProvider::OpenAi => false,
         }
     }
+}
+
+/// What's said of what's left of the allowance, and whether it's a warning.
+fn allowance_text(entitlement: &Entitlement) -> Option<(String, bool)> {
+    // Access ended since it was checked ([`CloudAccess`]): nothing starts over each week
+    if entitlement.status == "none" {
+        return Some((t!("provider.bono_cloud_unavailable").into(), true));
+    }
+    let hours = entitlement.estimated_hours_left?;
+    let hours_left = format!("{:.1}", hours.max(0.0));
+    // A trial's allowance never starts over, and is no more than a couple of hours in all:
+    // it's not "this week's", nor "running low" from the start
+    if entitlement.status == "trial" {
+        let text = t!("provider.bono_cloud_trial_hours_left", hours = hours_left);
+        return Some((text, hours < TRIAL_LOW_HOURS));
+    }
+    let resets = (entitlement.week.as_ref())
+        .and_then(|week| week.resets_at.as_deref())
+        .and_then(resets_in)
+        .unwrap_or_else(|| "?".into());
+    let low = hours < ALLOWANCE_LOW_HOURS;
+    let text = if low {
+        t!(
+            "provider.bono_cloud_allowance_low",
+            hours = hours_left,
+            resets = resets
+        )
+    } else {
+        t!(
+            "provider.bono_cloud_hours_left",
+            hours = hours_left,
+            resets = resets
+        )
+    };
+    Some((text, low))
 }
 
 /// How long until `at` (RFC 3339), roughly, as the pilot reads it.
@@ -935,4 +941,50 @@ fn tokens(
         changed
     });
     response.unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The line shown for what the website answers.
+    fn text(answer: serde_json::Value) -> Option<(String, bool)> {
+        allowance_text(&serde_json::from_value(answer).unwrap())
+    }
+
+    #[test]
+    fn access_that_ended_is_not_a_weekly_allowance_running_low() {
+        let ended = Some((t!("provider.bono_cloud_unavailable").to_owned(), true));
+        assert_eq!(
+            text(json!({"status": "none", "week": null, "estimatedHoursLeft": 0})),
+            ended
+        );
+        assert_eq!(text(json!({"status": "none"})), ended);
+    }
+
+    #[test]
+    fn allowance_warns_only_when_it_runs_low() {
+        for status in ["active", "grace"] {
+            let week = |hours: f64| text(json!({"status": status, "estimatedHoursLeft": hours}));
+            let left = t!(
+                "provider.bono_cloud_hours_left",
+                hours = "8.0",
+                resets = "?"
+            );
+            assert_eq!(week(8.0), Some((left, false)));
+            let low = t!(
+                "provider.bono_cloud_allowance_low",
+                hours = "0.0",
+                resets = "?"
+            );
+            assert_eq!(week(0.0), Some((low, true)));
+            assert_eq!(text(json!({"status": status})), None);
+        }
+
+        let trial = |hours: f64| text(json!({"status": "trial", "estimatedHoursLeft": hours}));
+        let left = |hours| t!("provider.bono_cloud_trial_hours_left", hours = hours);
+        assert_eq!(trial(2.0), Some((left("2.0"), false)));
+        assert_eq!(trial(0.0), Some((left("0.0"), true)));
+    }
 }
