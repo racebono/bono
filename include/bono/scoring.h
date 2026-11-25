@@ -26,6 +26,7 @@
     X(string, phase, true)                   /* before_start, reconnaissance, grid_walk, formation_lap, countdown, green, full_course_yellow, stopped, over, paused */ \
     X(f64, session_end_time, true)           /* session time the session ends */                          \
     X(i64, max_laps, true)                                                                                \
+    X(boolean, extra_lap, true)              /* the race goes on for an extra lap once its time has run out */ \
     X(f64, event_start_time_of_day, true)    /* seconds since midnight */                                 \
     X(i64, vehicle_count, true)                                                                           \
     X(i64, max_vehicles, true)                                                                            \
