@@ -233,6 +233,8 @@ struct Briefing {
     pending: Vec<RequestId>,
     next_id: RequestId,
     pending_text: String,
+    /// The weekend the pending requests are from
+    pending_weekend: Option<i64>,
     /// The [`Told`] notes: the message has those about its conversation as it is once the turn
     /// has the lock on it (see [`Note::conversation`])
     notes: Vec<Note>,
@@ -1495,6 +1497,7 @@ impl Engineer {
             pending: self.schedule.pending_ids(),
             next_id: self.schedule.next_id(),
             pending_text: self.schedule.pending_text(&progress),
+            pending_weekend: self.schedule.weekend(),
             notes: told.notes.clone(),
             state,
             note,
@@ -2497,21 +2500,20 @@ impl SessionState {
     /// then the setup outline (when shown), the telemetry snapshot, the pending requests and the
     /// reply-language note. Once per turn: the `schedule` tool stages its changes from here.
     async fn brief(&mut self, message: String, briefing: Briefing) -> String {
-        // Started over, it's a new weekend, which clears the requests: the briefing, taken before
-        // the engineer saw it, still has the last weekend's, and its notes are about the
-        // conversation that's over. The next progress clears the requests too.
         let started_over = self.follow_game_session(briefing.auto_session).await;
-        let pending_text = match started_over {
-            true => {
-                (briefing.started_over).store(true, atomic::Ordering::Relaxed);
-                self.schedule_tool.begin(Vec::new(), briefing.next_id);
-                NO_REQUESTS.to_owned()
-            }
-            false => {
-                self.schedule_tool.begin(briefing.pending, briefing.next_id);
-                briefing.pending_text
-            }
+        if started_over {
+            // Its notes are about the conversation that's over
+            (briefing.started_over).store(true, atomic::Ordering::Relaxed);
+        }
+        // A new weekend clears the requests, whether or not the conversation starts over for it:
+        // the briefing, taken before the engineer saw it, still has the last weekend's. The next
+        // progress clears them too. Weekends' ids only grow: the requests are the last weekend's
+        // only if theirs is older (the conversation's lags if its read failed)
+        let (pending, pending_text) = match briefing.pending_weekend < self.weekend {
+            true => (Vec::new(), NO_REQUESTS.to_owned()),
+            false => (briefing.pending, briefing.pending_text),
         };
+        self.schedule_tool.begin(pending, briefing.next_id);
         // Only those about this conversation as it is now: one that's started over, here or
         // since a note was made, never had what it's about
         let starts = self.starts.load(atomic::Ordering::Relaxed);
@@ -5051,30 +5053,100 @@ mod tests {
 
     #[test]
     fn a_new_weekends_conversation_is_not_told_the_last_ones_requests() {
-        let mut scripted = Scripted::recorded();
-        scripted.add("Fuel every lap, please.", fuel_every_lap());
-        // Only the snapshots asked for from here on: the turn starts before the engineer steps
-        // through the new weekend, and its briefing still has the request
+        // Started over for it (`auto_session`), kept through it, or only started in it
+        for how in ["started over", "kept", "fresh"] {
+            let raw = serde_json::json!({ "auto_session": how != "kept" }).to_string();
+            let mut scripted = Scripted::recorded_with(&raw);
+            scripted.add("Fuel every lap, please.", fuel_every_lap());
+            // Only the snapshots asked for from here on: the turns start before the engineer steps
+            // through the new weekend, and their briefings still have the request
+            scripted.tick();
+            assert_eq!(scripted.pending(), [RequestId(1)]);
+            scripted.new_weekend();
+            if how == "fresh" {
+                let state = scripted.engineer.session.as_ref().unwrap().state.clone();
+                state.blocking_lock().weekend = None;
+            }
+            // The first turn in it, and the next, which never starts the conversation over
+            for _ in 0..2 {
+                let turns = scripted.questions().len();
+                scripted.ask("How are the tyres?");
+                scripted.until("asked", |s| s.questions().len() > turns);
+                let question = &scripted.questions()[turns];
+                assert!(question.contains(NO_REQUESTS), "{how}: {question}");
+                assert!(
+                    !question.contains("Tell the pilot the fuel left."),
+                    "{how}: {question}"
+                );
+                // Nor can it change it
+                let error = scripted.schedule(cancel(RequestId(1))).unwrap_err();
+                assert!(error.contains("none are pending"), "{how}: {error}");
+                scripted.finish(Act::Reply);
+            }
+            assert_eq!(scripted.pending(), [RequestId(1)], "{how}");
+
+            // The next progress clears it, but not one the turn running then makes
+            let turns = scripted.questions().len();
+            scripted.ask("Fuel every lap, please.");
+            scripted.until("asked", |s| s.questions().len() > turns);
+            scripted.tick();
+            assert!(scripted.pending().is_empty(), "{how}");
+            let added = scripted.schedule(fuel_every_lap()).unwrap();
+            assert!(added.contains("#2"), "{how}: {added}");
+            scripted.finish(Act::Reply);
+            assert_eq!(scripted.pending(), [RequestId(2)], "{how}");
+            assert!(scripted.notes().is_empty(), "{how}: {:?}", scripted.notes());
+        }
+    }
+
+    #[test]
+    fn a_kept_conversation_is_told_its_notes_in_a_new_weekend() {
+        // Without `auto_session` it isn't started over: the notes are still about it, and told
+        // again when the exchange is forgotten
+        let mut scripted = Scripted::recorded_with(r#"{"auto_session": false}"#);
+        let note = scripted.missed_change();
         scripted.tick();
-        assert_eq!(scripted.pending(), [RequestId(1)]);
         scripted.new_weekend();
         let turns = scripted.questions().len();
-        scripted.ask("How are the tyres?");
+        scripted.ask("Anything else?");
         scripted.until("asked", |s| s.questions().len() > turns);
-        let question = &scripted.questions()[turns];
-        assert!(question.contains(NO_REQUESTS), "{question}");
+        assert!(scripted.questions()[turns].contains(&note));
+        scripted.finish(Act::Fail);
+        assert_eq!(scripted.notes(), [note]);
+    }
+
+    #[test]
+    fn a_new_weekends_requests_are_told_before_its_progress_is_seen() {
+        // Made at a snapshot that was gone before the engineer stepped through it (the tables
+        // catching up): the progress kept is still the last weekend's, but the requests aren't
+        let mut scripted = Scripted::recorded();
+        scripted.tick();
+        scripted.new_weekend();
+        let tool = scripted.engineer.tool.clone().unwrap();
+        scripted.runtime.block_on(tool.publish_progress()).unwrap();
+        let made = tool.take_progress().unwrap();
+        let seen = scripted.engineer.progress.as_ref().unwrap().weekend;
+        assert!(seen < made.weekend);
+        let request = schedule::NewRequest {
+            instruction: "Tell the pilot the fuel left.".into(),
+            trigger: schedule::Trigger::Laps { count: 1 },
+            repeat: schedule::Repeat::Once,
+            stale_after: None,
+            made,
+            checked: Default::default(),
+        };
+        let add = Change::Add(RequestId(1), request);
+        scripted.engineer.apply(vec![add], &[]);
+        scripted.ask("How are the tyres?");
+        scripted.until("asked", |s| !s.questions().is_empty());
+        let question = &scripted.questions()[0];
         assert!(
-            !question.contains("Tell the pilot the fuel left."),
+            question.contains("Tell the pilot the fuel left."),
             "{question}"
         );
-        // Nor can it change it
-        let error = scripted.schedule(cancel(RequestId(1))).unwrap_err();
-        assert!(error.contains("none are pending"), "{error}");
+        // And can be changed
+        scripted.schedule(cancel(RequestId(1))).unwrap();
         scripted.finish(Act::Reply);
-
-        // The next progress clears it
-        scripted.tick();
-        assert!(scripted.pending().is_empty());
     }
 
     #[test]
