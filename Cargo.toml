@@ -97,6 +97,7 @@ zip = { version = "9.3.0", default-features = false, features = [
     "deflate-flate2-zlib-rs",
 ] }
 semver = "1.0.28"
+parakeet-rs = { version = "=0.4.4", default-features = false, features = ["cpu"] }
 
 [target.'cfg(windows)'.dependencies]
 # ONNX Runtime with DirectML, to run voices on the GPU when the pilot turns it on
