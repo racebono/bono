@@ -47,7 +47,7 @@ use std::{
 };
 use tokio::{runtime::Handle, sync::oneshot::error::TryRecvError};
 
-mod engine;
+pub(in crate::app) mod engine;
 mod parakeet;
 mod voice;
 mod whisper;

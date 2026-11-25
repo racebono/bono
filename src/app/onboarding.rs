@@ -7,20 +7,23 @@ use crate::{
         Subsystems,
         topbar::{
             Topbar,
-            audio::{AudioTopbar, SetupItem, SetupState, app_language},
+            audio::{AudioTopbar, SetupItem, SetupState, app_language, engine},
             settings::{self, ChangeButton, button_name},
             setup_label,
             simulators::SimulatorsTopbar,
             volume::{MAX_VOLUME, volume},
         },
     },
-    config::{Config, RawConfig},
+    arrstr,
+    config::{ArrayStr, Config, RawConfig},
     engineer::{Engineer, Speaker},
+    language,
     sim::ActiveSimulator,
     synthesizer::Synthesizer,
 };
 use bono_i18n::t;
 use egui::{RichText, Widget};
+use std::collections::BTreeSet;
 use tokio::runtime::Handle;
 
 /// The guide's version: bumped when it gains a step, so pilots who went through it see it again.
@@ -667,4 +670,160 @@ fn downloads(ui: &mut egui::Ui, items: &[(&str, SetupItem)]) -> bool {
         )
     });
     failed && ui.button(t!("onboarding.retry")).clicked()
+}
+
+/// The languages ticked in "I speak" when the guide opens: `voices` are those with a voice, and `app`
+/// is the app's.
+fn ticked_at_first(
+    heard: Option<ArrayStr<2>>,
+    voices: &[ArrayStr<2>],
+    app: ArrayStr<2>,
+) -> BTreeSet<ArrayStr<2>> {
+    match heard {
+        Some(heard) => BTreeSet::from([language::voice_code(heard)]),
+        None if voices.is_empty() => BTreeSet::from([app]),
+        None => voices.iter().copied().collect(),
+    }
+}
+
+/// What "I speak" changes.
+#[derive(Debug, PartialEq, Eq)]
+struct Answer {
+    /// The Heard language: `None` for automatic
+    heard: Option<ArrayStr<2>>,
+    /// The languages to get a voice for
+    get: Vec<ArrayStr<2>>,
+    /// The languages whose voice is taken out of the settings (its files stay)
+    remove: Vec<ArrayStr<2>>,
+}
+
+/// `voices`: the languages with a voice. `reply`: the fixed reply language, if it's usable.
+fn answer(
+    ticked: &BTreeSet<ArrayStr<2>>,
+    voices: &[ArrayStr<2>],
+    reply: Option<ArrayStr<2>>,
+) -> Answer {
+    let heard = match ticked.len() {
+        1 => ticked.first().copied(),
+        _ => None,
+    };
+    // The engineer only speaks the reply language then
+    if reply.is_some() {
+        return Answer {
+            heard,
+            get: Vec::new(),
+            remove: Vec::new(),
+        };
+    }
+    let get = ticked.iter().filter(|lang| !voices.contains(lang));
+    // With one language heard, the other voices don't count
+    let remove = (voices.iter()).filter(|lang| heard.is_none() && !ticked.contains(*lang));
+    Answer {
+        heard,
+        get: get.copied().collect(),
+        remove: remove.copied().collect(),
+    }
+}
+
+/// The speech to text model picked.
+#[derive(Debug, Clone, Copy)]
+enum Picked {
+    None,
+    /// The one the guide always picked
+    Turbo,
+    Parakeet,
+    Other {
+        english: bool,
+    },
+}
+
+/// Whether the guide makes speech to text automatic. `usable`: the model picked is on disk, and
+/// didn't fail to load.
+fn becomes_automatic(picked: Picked, usable: bool, ticked: &BTreeSet<ArrayStr<2>>) -> bool {
+    !usable
+        || match picked {
+            Picked::None | Picked::Turbo => true,
+            Picked::Parakeet => !ticked.iter().all(|&lang| engine::parakeet_knows(lang)),
+            Picked::Other { english } => english && ticked.iter().any(|&lang| lang != arrstr!("en")),
+        }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EN: ArrayStr<2> = arrstr!("en");
+    const ES: ArrayStr<2> = arrstr!("es");
+    const FR: ArrayStr<2> = arrstr!("fr");
+    const CA: ArrayStr<2> = arrstr!("ca");
+    const EU: ArrayStr<2> = arrstr!("eu");
+
+    #[test]
+    fn starts_from_what_the_pilot_has() {
+        let first = |heard, voices: &[_], app| {
+            ticked_at_first(heard, voices, app).into_iter().collect::<Vec<_>>()
+        };
+        assert_eq!(first(Some(ES), &[CA, ES], EN), [ES]);
+        assert_eq!(first(None, &[CA, ES], EN), [CA, ES]);
+        assert_eq!(first(None, &[], FR), [FR]);
+        assert_eq!(first(Some(arrstr!("nn")), &[], EN), [arrstr!("no")]);
+    }
+
+    fn answered(ticked: &[ArrayStr<2>], voices: &[ArrayStr<2>], reply: Option<ArrayStr<2>>) -> Answer {
+        answer(&ticked.iter().copied().collect(), voices, reply)
+    }
+
+    #[test]
+    fn one_language_is_heard_alone() {
+        let expected = Answer {
+            heard: Some(FR),
+            get: vec![FR],
+            remove: vec![],
+        };
+        assert_eq!(answered(&[FR], &[ES], None), expected);
+        // It has a voice already
+        assert_eq!(answered(&[ES], &[CA, ES], None).get, []);
+        assert_eq!(answered(&[ES], &[CA, ES], None).remove, []);
+    }
+
+    #[test]
+    fn several_languages_are_the_ones_with_a_voice() {
+        let expected = Answer {
+            heard: None,
+            get: vec![CA],
+            remove: vec![EU],
+        };
+        assert_eq!(answered(&[ES, CA], &[ES, EU], None), expected);
+    }
+
+    #[test]
+    fn a_fixed_reply_needs_no_other_voice_and_keeps_its_own() {
+        for ticked in [&[ES, FR][..], &[FR]] {
+            let answer = answered(ticked, &[EN, ES], Some(EN));
+            assert_eq!((answer.get, answer.remove), (vec![], vec![]));
+        }
+        assert_eq!(answered(&[FR], &[EN], Some(EN)).heard, Some(FR));
+    }
+
+    #[test]
+    fn next_unpicks_what_the_guide_picked() {
+        let unpicked = |picked, usable, ticked: &[ArrayStr<2>]| {
+            becomes_automatic(picked, usable, &ticked.iter().copied().collect())
+        };
+        let (english, multilingual) = (Picked::Other { english: true }, Picked::Other { english: false });
+        assert!(unpicked(Picked::None, false, &[ES]));
+        assert!(unpicked(Picked::Turbo, true, &[ES]));
+        // Missing, or it couldn't be loaded
+        assert!(unpicked(multilingual, false, &[ES]));
+        assert!(unpicked(Picked::Parakeet, false, &[ES]));
+        // It doesn't know the pilot's language
+        assert!(unpicked(english, true, &[ES]));
+        assert!(unpicked(english, true, &[EN, ES]));
+        assert!(unpicked(Picked::Parakeet, true, &[CA]));
+        assert!(unpicked(Picked::Parakeet, true, &[ES, CA]));
+        // Chosen by the pilot, and fine
+        assert!(!unpicked(multilingual, true, &[ES, CA]));
+        assert!(!unpicked(english, true, &[EN]));
+        assert!(!unpicked(Picked::Parakeet, true, &[ES]));
+    }
 }
