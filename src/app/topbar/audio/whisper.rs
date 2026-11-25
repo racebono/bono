@@ -598,9 +598,14 @@ impl Whisper {
                         threads,
                     });
                     if flash {
-                        let model = model.clone();
-                        // Not part of loading, as questions are refused until that's done
-                        Handle::current().spawn_blocking(move || model.warm_up());
+                        let model = Arc::downgrade(&model);
+                        // Not part of loading, as questions are refused until that's done. Nor for
+                        // a model that was replaced while it loaded
+                        Handle::current().spawn_blocking(move || {
+                            if let Some(model) = model.upgrade() {
+                                model.warm_up();
+                            }
+                        });
                     }
                     Some(model)
                 }

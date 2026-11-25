@@ -336,8 +336,8 @@ impl Staging {
         Ok(())
     }
 
-    /// Removes every download but `latest`'s unpacked one, returning whether that one's there, and what
-    /// older versions left in the installation. Blocks.
+    /// Removes what older versions left in the installation, and every download but `latest`'s unpacked
+    /// one, returning whether that one's there. Blocks.
     pub fn tidy(&self, latest: Option<&Release>) -> bool {
         for name in CUDA_RUNTIMES {
             let path = self.install.join(name);

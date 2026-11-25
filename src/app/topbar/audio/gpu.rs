@@ -3,13 +3,14 @@
 use std::ffi::{CStr, c_char, c_int};
 use whisper_rs::whisper_rs_sys::{
     ggml_backend_dev_count, ggml_backend_dev_get, ggml_backend_dev_get_props,
-    ggml_backend_dev_props, ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU as GPU,
+    ggml_backend_dev_props, ggml_backend_dev_type,
+    ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU as GPU,
     ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU as INTEGRATED_GPU,
 };
 
 pub struct Gpu {
-    /// Whisper's `gpu_device`. Its header doesn't say so, but it counts GPUs as [`devices`] does. If
-    /// that changed, whisper would run on another GPU: slower, but not wrong.
+    /// Whisper's `gpu_device`. Its header doesn't say so, but it counts GPUs in ggml's order, as
+    /// [`choose`] does. If that changed, whisper would run on another GPU: slower, but not wrong.
     pub device: c_int,
     pub name: String,
     /// Whether flash attention is fast: much less work for the GPU, which the simulator is using too.
@@ -19,9 +20,27 @@ pub struct Gpu {
 /// The GPU for speech to text, if there's one: the graphics card rather than the integrated GPU.
 /// Loads the GPUs' drivers, so it's only called on workers.
 pub fn choose() -> Option<Gpu> {
-    let mut devices = devices();
-    let device = best(&devices)?;
-    let Device { name, pci, .. } = devices.swap_remove(device);
+    // SAFETY: there's a device for every index under the count.
+    let gpus = (0..unsafe { ggml_backend_dev_count() })
+        .map(|index| unsafe { ggml_backend_dev_get(index) })
+        .map(|device| (device, unsafe { ggml_backend_dev_type(device) }))
+        .filter(|(_, kind)| [GPU, INTEGRATED_GPU].contains(kind))
+        .collect::<Vec<_>>();
+    let best = best(&gpus.iter().map(|(_, kind)| *kind).collect::<Vec<_>>())?;
+
+    // SAFETY: all zeros is valid for the properties (numbers, booleans and pointers), which are then
+    // filled in. Their texts are null or C strings, copied at once.
+    let (name, pci) = unsafe {
+        let mut props: ggml_backend_dev_props = std::mem::zeroed();
+        ggml_backend_dev_get_props(gpus[best].0, &mut props);
+        let text = |text: *const c_char| {
+            (!text.is_null()).then(|| CStr::from_ptr(text).to_string_lossy().into_owned())
+        };
+        (
+            text(props.description).unwrap_or_default(),
+            text(props.device_id),
+        )
+    };
     #[cfg(feature = "vulkan")]
     let flash = pci.is_some_and(|pci| {
         fast_flash_attention(&pci).unwrap_or_else(|e| {
@@ -36,50 +55,15 @@ pub fn choose() -> Option<Gpu> {
         false
     };
     Some(Gpu {
-        device: c_int::try_from(device).ok()?,
+        device: c_int::try_from(best).ok()?,
         name,
         flash,
     })
 }
 
-struct Device {
-    integrated: bool,
-    name: String,
-    /// Its PCI address, if it's known: "0000:01:00.0"
-    pci: Option<String>,
-}
-
-/// The GPUs that ggml knows, in its order.
-fn devices() -> Vec<Device> {
-    // SAFETY: null, or a C string that's copied at once.
-    let text = |text: *const c_char| {
-        (!text.is_null()).then(|| {
-            unsafe { CStr::from_ptr(text) }
-                .to_string_lossy()
-                .into_owned()
-        })
-    };
-    // SAFETY: there's a device for every index under the count, and all zeros is valid for the
-    // properties (numbers, booleans and pointers), which are then filled in.
-    (0..unsafe { ggml_backend_dev_count() })
-        .map(|index| unsafe {
-            let mut props: ggml_backend_dev_props = std::mem::zeroed();
-            ggml_backend_dev_get_props(ggml_backend_dev_get(index), &mut props);
-            props
-        })
-        .filter(|props| [GPU, INTEGRATED_GPU].contains(&props.type_))
-        .map(|props| Device {
-            integrated: props.type_ == INTEGRATED_GPU,
-            name: text(props.description).unwrap_or_default(),
-            pci: text(props.device_id),
-        })
-        .collect()
-}
-
-/// Which of `devices` to use.
-fn best(devices: &[Device]) -> Option<usize> {
-    (devices.iter().position(|device| !device.integrated))
-        .or_else(|| (!devices.is_empty()).then_some(0))
+/// Which of the GPUs to use.
+fn best(kinds: &[ggml_backend_dev_type]) -> Option<usize> {
+    (kinds.iter().position(|kind| *kind == GPU)).or((!kinds.is_empty()).then_some(0))
 }
 
 /// Whether flash attention is fast on the GPU with this PCI address: ggml uses its matrix cores through
@@ -98,7 +82,10 @@ fn fast_flash_attention(pci: &str) -> anyhow::Result<bool> {
         let fast = instance.enumerate_physical_devices().and_then(|devices| {
             for device in devices {
                 let version = instance.get_physical_device_properties(device).api_version;
-                let extensions = instance.enumerate_device_extension_properties(device)?;
+                // One that fails isn't the one asked about, or isn't known to be fast
+                let Ok(extensions) = instance.enumerate_device_extension_properties(device) else {
+                    continue;
+                };
                 let has =
                     |name| (extensions.iter()).any(|ext| ext.extension_name_as_c_str() == Ok(name));
                 if version < vk::API_VERSION_1_1
@@ -116,7 +103,7 @@ fn fast_flash_attention(pci: &str) -> anyhow::Result<bool> {
                     bus.pci_device,
                     bus.pci_function,
                 );
-                if address == pci {
+                if address.eq_ignore_ascii_case(pci) {
                     return Ok(true);
                 }
             }
@@ -139,14 +126,9 @@ mod tests {
 
     #[test]
     fn the_graphics_card_comes_before_the_integrated_gpu() {
-        let device = |integrated| Device {
-            integrated,
-            name: String::new(),
-            pci: None,
-        };
-        assert_eq!(best(&[device(true), device(false), device(false)]), Some(1));
-        assert_eq!(best(&[device(false), device(true)]), Some(0));
-        assert_eq!(best(&[device(true)]), Some(0));
+        assert_eq!(best(&[INTEGRATED_GPU, GPU, GPU]), Some(1));
+        assert_eq!(best(&[GPU, INTEGRATED_GPU]), Some(0));
+        assert_eq!(best(&[INTEGRATED_GPU]), Some(0));
         assert_eq!(best(&[]), None);
     }
 
