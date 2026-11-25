@@ -175,7 +175,8 @@ impl Conversation {
         }));
 
         let mut turn_usage = Usage::default();
-        for _ in 0..self.max_requests.get() {
+        // How many requests are left after this one
+        for left in (0..self.max_requests.get()).rev() {
             sink.start_response();
             let response = self.post(sink).await?;
             sink.end_block();
@@ -231,6 +232,11 @@ impl Conversation {
                     usage: turn_usage,
                     model,
                 });
+            }
+
+            // No request is left to take these calls' results back: they don't run
+            if left == 0 {
+                break;
             }
 
             // The spoken text so far is all said before the tools run
@@ -1350,6 +1356,27 @@ mod tests {
             assert_eq!(compatible["max_tokens"], 1024, "{url}");
             assert!(compatible.get("max_completion_tokens").is_none(), "{url}");
         }
+    }
+
+    #[tokio::test]
+    async fn calls_with_no_request_left_for_their_results_are_not_run() {
+        let call = || {
+            stream(vec![
+                json!({"choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "id": "call_1", "function": {"name": "lookup", "arguments": "{}"}}
+                ]}}]}),
+                finish("tool_calls"),
+            ])
+        };
+        let (url, requests) = mock(vec![call(), call()]).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut conversation = builder(&url, &calls).build(reqwest::Client::new()).unwrap();
+        conversation.max_requests = NonZeroU32::new(2).unwrap();
+        let error = send_streaming(&mut conversation, "Gap?").await.unwrap_err();
+        assert!(error.to_string().contains("didn't finish"), "{error}");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(conversation.body.messages.len(), conversation.kept);
     }
 
     #[tokio::test]
