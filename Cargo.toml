@@ -45,6 +45,11 @@ whisper-rs = { git = "https://github.com/Aandreba/whisper-rs", branch = "master"
     "log_backend",
     "raw-api",
 ] }
+# Asks Vulkan about the GPU that speech to text runs on
+ash = { version = "0.38", default-features = false, features = [
+    "std",
+    "loaded",
+], optional = true }
 oneshot = { version = "0.2.1", features = ["std"] }
 reqwest = { version = "0.13.5", features = ["json"] }
 tempfile = "3.27.0"
@@ -137,7 +142,7 @@ intel-sycl = ["whisper-rs/intel-sycl"]
 # Windows, Linux. Needs OpenBLAS (`BLAS_INCLUDE_DIRS`, optionally `OPENBLAS_PATH`)
 openblas = ["whisper-rs/openblas"]
 # Windows, Linux. Needs the Vulkan SDK (`VULKAN_SDK`)
-vulkan = ["whisper-rs/vulkan"]
+vulkan = ["whisper-rs/vulkan", "dep:ash"]
 # Detects typed questions in every language there are voices for (about 180 MB more)
 all-languages = [
     "lingua/albanian",
