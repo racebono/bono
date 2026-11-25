@@ -39,6 +39,7 @@ use tokio::runtime::Handle;
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
     get_lang_str,
+    whisper_rs_sys::{ggml_backend_reg_by_name, ggml_backend_reg_dev_count},
 };
 
 pub const RECORDING_SPEC: AudioSpec = AudioSpec {
@@ -55,6 +56,16 @@ const GPU_BACKEND: bool = cfg!(any(
     feature = "vulkan",
     target_vendor = "apple"
 ));
+
+/// Whether there's a GPU that whisper runs on with CUDA. Loads CUDA, so it's only called on workers.
+fn has_cuda() -> bool {
+    // `CUDA` is the backend's name in ggml's header (`GGML_CUDA_NAME`): null in builds without it.
+    // SAFETY: the name is a C string, and backends are never unloaded.
+    unsafe {
+        let cuda = ggml_backend_reg_by_name(c"CUDA".as_ptr());
+        !cuda.is_null() && ggml_backend_reg_dev_count(cuda) > 0
+    }
+}
 
 /// The model the setup guide downloads: it understands every language, and is quick on a GPU
 const RECOMMENDED: &str = "ggml-large-v3-turbo-q5_0.bin";
@@ -127,8 +138,10 @@ impl Whisper {
         files: super::ModelFiles,
     ) -> Self {
         let pref_path = pref_path.clone();
+        // Half the logical cores. Whisper's threads wait for each other at every step, so once there
+        // are too few cores for them and the simulator, transcribing takes many times longer
         let threads = threads
-            .or_else(|| std::thread::available_parallelism().ok())
+            .or_else(|| NonZeroUsize::new(std::thread::available_parallelism().ok()?.get() / 2))
             .unwrap_or(NonZeroUsize::MIN);
 
         let mut this = Self {
@@ -579,9 +592,15 @@ impl Whisper {
         self.ctx = Some(MaybeDone::spawn_blocking(move || {
             let mut params = WhisperContextParameters::default();
             params.use_gpu(gpu);
+            // Much less work for the GPU, which the simulator is using too. Only with CUDA, as it can
+            // be several times slower on other GPUs, and is a little slower on the CPU
+            let flash = gpu && has_cuda();
+            params.flash_attn(flash);
             match WhisperContext::new_with_params(path.as_os_str(), params) {
                 Ok(ctx) => {
-                    log::info!("Loaded {path} for speech to text (GPU: {gpu})");
+                    log::info!(
+                        "Loaded {path} for speech to text (GPU: {gpu}, flash attention: {flash})"
+                    );
                     Some(Arc::new(WhisperModel {
                         ctx,
                         session: SessionCache::default(),
@@ -1483,6 +1502,12 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.0.send(std::thread::current().id());
         }
+    }
+
+    #[test]
+    fn builds_without_cuda_have_no_cuda_gpu() {
+        // Must also not crash in builds with it, whether or not there's a GPU
+        assert!(cfg!(feature = "cuda") || !has_cuda());
     }
 
     #[test]
