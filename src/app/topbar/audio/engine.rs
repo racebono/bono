@@ -89,6 +89,48 @@ pub fn used(wanted: Engine, parakeet: Option<bool>, whisper: Option<bool>) -> Us
     }
 }
 
+/// What the menu says about Automatic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Note {
+    Using(Engine, Why),
+    /// Whisper is used because of the `unknown` languages, but `lang` is the only one with a voice
+    /// that Parakeet knows: hearing only that one is offered
+    HearOnly {
+        lang: ArrayStr<2>,
+        unknown: Vec<ArrayStr<2>>,
+    },
+    /// The one wanted isn't on disk. `used`: the one that hears meanwhile, if any
+    Missing {
+        wanted: Engine,
+        used: Option<Engine>,
+        why: Why,
+    },
+    /// It's on disk, but couldn't be loaded
+    Failed(Engine),
+}
+
+/// `wanted`: from [`wanted`]. `used`: the engine in use, and `failed`: whether it couldn't be loaded.
+pub fn note(
+    wanted: (Engine, Why),
+    used: Option<Engine>,
+    failed: bool,
+    heard: Option<ArrayStr<2>>,
+    voices: &[ArrayStr<2>],
+) -> Note {
+    let (wanted, why) = wanted;
+    match used {
+        Some(used) if failed => Note::Failed(used),
+        Some(used) if used == wanted => {
+            let mut known = (voices.iter().copied()).filter(|&lang| parakeet_knows(lang));
+            match (why, heard, known.next(), known.next()) {
+                (Why::Unknown(unknown), None, Some(lang), None) => Note::HearOnly { lang, unknown },
+                (why, ..) => Note::Using(used, why),
+            }
+        }
+        used => Note::Missing { wanted, used, why },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +231,87 @@ mod tests {
         assert_eq!(used(Whisper, Some(false), Some(false)), Used::Nothing);
         assert_eq!(used(Parakeet, None, Some(true)), Used::Wait);
         assert_eq!(used(Parakeet, Some(false), None), Used::Wait);
+    }
+
+    #[test]
+    fn offers_the_only_language_parakeet_hears() {
+        let voices = [CA, ES, EU];
+        assert_eq!(
+            note(
+                wanted(None, &voices, None, EN),
+                Some(Engine::Whisper),
+                false,
+                None,
+                &voices
+            ),
+            Note::HearOnly {
+                lang: ES,
+                unknown: vec![CA, EU]
+            }
+        );
+    }
+
+    #[test]
+    fn points_to_heard_language_with_several() {
+        let voices = [CA, ES, FR];
+        assert_eq!(
+            note(
+                wanted(None, &voices, None, EN),
+                Some(Engine::Whisper),
+                false,
+                None,
+                &voices
+            ),
+            Note::Using(Engine::Whisper, Why::Unknown(vec![CA]))
+        );
+    }
+
+    #[test]
+    fn a_fixed_heard_language_is_not_offered_again() {
+        let voices = [CA, ES];
+        assert_eq!(
+            note(
+                wanted(Some(CA), &voices, None, EN),
+                Some(Engine::Whisper),
+                false,
+                Some(CA),
+                &voices
+            ),
+            Note::Using(Engine::Whisper, Why::Unknown(vec![CA]))
+        );
+    }
+
+    #[test]
+    fn says_what_is_still_used() {
+        for used in [Some(Engine::Parakeet), None] {
+            assert_eq!(
+                note(
+                    wanted(Some(CA), &[ES], None, EN),
+                    used,
+                    false,
+                    Some(CA),
+                    &[ES]
+                ),
+                Note::Missing {
+                    wanted: Engine::Whisper,
+                    used,
+                    why: Why::Unknown(vec![CA])
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn an_engine_that_failed_is_said_first() {
+        assert_eq!(
+            note(
+                wanted(Some(CA), &[ES], None, EN),
+                Some(Engine::Parakeet),
+                true,
+                Some(CA),
+                &[ES]
+            ),
+            Note::Failed(Engine::Parakeet)
+        );
     }
 }
