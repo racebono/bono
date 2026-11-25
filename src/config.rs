@@ -593,6 +593,8 @@ settings! {
         /// Below this speed (m/s: the garage, the grid, a spin) it stays quiet
         pub min_speed: f64 = 8.0,
 
+        /// Whether a car closing from behind in a race is called
+        pub gap_behind: bool = true,
         /// A car this many seconds behind or closer is called...
         pub gap_behind_on: f64 = 1.0,
         /// ...again only once the gap has opened to at least this
