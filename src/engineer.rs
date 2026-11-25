@@ -348,11 +348,22 @@ struct Turn {
     steered: Option<(Option<ArrayStr<2>>, Option<Instant>)>,
     /// The notes its question carries
     told: Told,
-    /// The low tone already sounded for it, as its speech failed: it ends without another
-    toned: bool,
+    /// The low tone already sounded for it, as its speech failed, with this many questions asked
+    /// since: it only ends with another for those it took (see [`Self::ends_with_tone`])
+    toned: Option<usize>,
 }
 
 impl Turn {
+    /// Whether it ends with the low tone, going by whether that leaves it `unanswered`. Once its
+    /// speech failed, nothing it writes is heard: the tone that sounded then is all that's heard
+    /// for the questions asked before it, and a question asked since gets its own.
+    fn ends_with_tone(&self, unanswered: bool) -> bool {
+        match self.toned {
+            Some(asked_since) => asked_since > 0,
+            None => unanswered,
+        }
+    }
+
     /// Writes the answer so far into its entry in `chat`.
     fn write_into(&mut self, chat: &mut Vec<ChatEntry>) {
         while let Ok(text) = self.text.try_recv() {
@@ -1234,6 +1245,18 @@ impl Engineer {
         }
     }
 
+    /// Whether interrupting the pilot turn now, clearing the line, calls for the low tone: not if
+    /// the one for its failed speech was already heard, and is all it [owes](Turn::ends_with_tone).
+    fn interruption_owes_tone(&self) -> bool {
+        let Some(turn) = &self.turn else {
+            return false;
+        };
+        // A tone (or "say again") still to be played is cleared with the line
+        let unheard = (self.incoming.iter().chain(&self.line))
+            .any(|playback| playback.complete && playback.scheduled.is_none() && !playback.started);
+        turn.ends_with_tone(true) || unheard
+    }
+
     /// Follows the running simulator's recording, as soon as it has one and however far into a
     /// session that is. Called every frame: asking the simulator for its recording doesn't block,
     /// and starting or dropping the tool does its work on other threads.
@@ -1246,11 +1269,11 @@ impl Engineer {
             .as_ref()
             .is_some_and(|session| pool.is_none_or(|pool| session.db != pool.database().path()))
         {
-            let interrupted = self.turn.is_some();
+            let tone = self.interruption_owes_tone();
             self.stop();
             self.drop_session(rt);
             self.notice(t!("engineer.sim_stopped"));
-            if interrupted {
+            if tone {
                 self.no_beep();
             }
         }
@@ -1377,7 +1400,9 @@ impl Engineer {
         if let Some(turn) = &mut self.turn {
             turn.steer.push(question);
             // A tone that already sounded doesn't answer a question asked after it
-            turn.toned = false;
+            if let Some(asked_since) = &mut turn.toned {
+                *asked_since += 1;
+            }
             let first = turn.steered.map_or(released, |(_, first)| first);
             turn.steered = Some((lang, first));
             return;
@@ -1615,7 +1640,7 @@ impl Engineer {
             steer,
             steered: None,
             told,
-            toned: false,
+            toned: None,
         });
     }
 
@@ -1804,6 +1829,7 @@ impl Engineer {
         self.languages.update(rt, config.get().voices());
         // The game stopped: the conversation lets go of the database, so the plugin can delete it
         if sim.is_none() && self.session.is_some() {
+            let tone = self.interruption_owes_tone();
             let turn = self.turn.take();
             let interrupted = turn.is_some();
             if let Some(turn) = turn {
@@ -1816,6 +1842,8 @@ impl Engineer {
             if interrupted {
                 // What it was saying goes with the turn, which the conversation forgot
                 self.clear_line();
+            }
+            if tone {
                 self.no_beep();
             }
         }
@@ -1846,6 +1874,10 @@ impl Engineer {
                     Ok((reply, ..)) if reply.stop != StopReason::Refusal => turn.steer.take(),
                     Ok(_) | Err(_) => Vec::new(),
                 };
+                // Those, the last asked, get their own turn's tone
+                if let Some(asked_since) = &mut turn.toned {
+                    *asked_since = asked_since.saturating_sub(missed.len());
+                }
                 let (lang, released) = turn.steered.unwrap_or_default();
                 match result {
                     // The conversation kept the exchange: what it changed counts
@@ -1868,7 +1900,7 @@ impl Engineer {
                         }
                         self.notice(t!("engineer.error_asking", error = format!("{e:#}")));
                         // What it said before failing plays out first
-                        if !turn.toned {
+                        if turn.ends_with_tone(true) {
                             self.incomplete_beep();
                         }
                     }
@@ -1896,11 +1928,11 @@ impl Engineer {
         // kept their exchanges, and the requests outlive it, so what they changed counts rather
         // than being dropped as if they never ran
         if self.session.as_ref().is_some_and(|s| !self.signed_in_as(s)) {
-            let interrupted = self.turn.is_some();
+            let tone = self.interruption_owes_tone();
             self.stop();
             self.drop_session(rt);
             self.notice(t!("engineer.signed_out"));
-            if interrupted {
+            if tone {
                 self.no_beep();
             }
         }
@@ -1934,7 +1966,7 @@ impl Engineer {
                 self.drop_answers(|playback| playback.writing);
                 let say_again = t!("engineer.say_again": &turn.lang);
                 // A voice that failed this turn would fail again, sounding a second tone
-                if !turn.toned {
+                if turn.ends_with_tone(true) {
                     self.say(rt, config, synth, say_again, turn.lang, None);
                     if self.voice(config, turn.lang).is_none() {
                         self.no_beep();
@@ -1944,7 +1976,7 @@ impl Engineer {
             }
             StopReason::MaxTokens => {
                 detail = format!("{detail} | {}", t!("engineer.detail_cut_off"));
-                if !turn.toned {
+                if turn.ends_with_tone(true) {
                     self.incomplete_beep();
                 }
                 shown
@@ -1953,7 +1985,7 @@ impl Engineer {
             StopReason::ContextWindowExceeded => {
                 self.new_session = true;
                 detail = format!("{detail} | {}", t!("engineer.detail_full"));
-                if !turn.toned {
+                if turn.ends_with_tone(true) {
                     self.incomplete_beep();
                 }
                 shown
@@ -1964,7 +1996,7 @@ impl Engineer {
                 // came before acknowledged)
                 let answered = !reply.text.trim().is_empty() && !acknowledgement.unanswered();
                 // After what's still on its way (the acknowledgement, or nothing at all)
-                if !answered && !turn.toned {
+                if turn.ends_with_tone(!answered) {
                     self.incomplete_beep();
                 }
                 shown
@@ -2060,7 +2092,7 @@ impl Engineer {
                         self.no_beep();
                         // Its pilot turn ends without another
                         if writing && let Some(turn) = &mut self.turn {
-                            turn.toned = true;
+                            turn.toned = Some(0);
                         }
                     }
                 }
@@ -2140,7 +2172,7 @@ impl Engineer {
                         self.no_beep();
                         // Its pilot turn ends without another
                         if writing && let Some(turn) = &mut self.turn {
-                            turn.toned = true;
+                            turn.toned = Some(0);
                         }
                     }
                     return;
@@ -3226,7 +3258,7 @@ mod tests {
                     steer: Steer::default(),
                     steered: None,
                     told: Told::default(),
-                    toned: false,
+                    toned: None,
                 },
             );
             assert!(engineer.line.is_empty(), "spoken: {spoken}");
@@ -3456,7 +3488,7 @@ mod tests {
             steer: Steer::default(),
             steered: None,
             told: Told::default(),
-            toned: false,
+            toned: None,
         });
         let deadline = Instant::now() + Duration::from_secs(10);
         while engineer.is_thinking() {
@@ -3523,7 +3555,7 @@ mod tests {
                     steer: Steer::default(),
                     steered: None,
                     told: Told::default(),
-                    toned: false,
+                    toned: None,
                 },
             );
             assert_eq!(engineer.line.len(), 1, "{stop:?}");
@@ -3575,7 +3607,7 @@ mod tests {
             steer: Steer::default(),
             steered: None,
             told: Told::default(),
-            toned: false,
+            toned: None,
         };
         let reply = Reply {
             text: String::new(),
@@ -3644,7 +3676,7 @@ mod tests {
                 steer: Steer::default(),
                 steered: None,
                 told: Told::default(),
-                toned: false,
+                toned: None,
             };
             engineer.answer(
                 rt,
@@ -3699,7 +3731,7 @@ mod tests {
                 steer: Steer::default(),
                 steered: None,
                 told: Told::default(),
-                toned: false,
+                toned: None,
             });
             if fails_first {
                 speech.send(Err(anyhow::anyhow!("no voice"))).unwrap();
@@ -3746,7 +3778,7 @@ mod tests {
             steer: Steer::default(),
             steered: None,
             told: Told::default(),
-            toned: false,
+            toned: None,
         });
         speech.send(Err(anyhow::anyhow!("no voice"))).unwrap();
         engineer.admit(1.0);
@@ -4063,7 +4095,7 @@ mod tests {
             steer: Steer::default(),
             steered: None,
             told: Told::default(),
-            toned: false,
+            toned: None,
         });
 
         // The game stopped
@@ -6528,6 +6560,163 @@ mod tests {
         assert!(scripted.engineer.is_thinking());
         assert_eq!(scripted.engineer.incoming.len(), 2);
         assert!(!scripted.cancelled());
+    }
+
+    /// A scripted engineer whose first question's speech failed, the tone for it waiting in the
+    /// line (held, so whatever is to be played stays there).
+    fn speech_failed() -> Scripted {
+        let mut scripted = Scripted::new();
+        scripted.engineer.spotter_held = true;
+        scripted.ask("How are the fronts?");
+        scripted.until("asked", |s| s.questions().len() == 1);
+        fail_speech(&mut scripted);
+        scripted
+    }
+
+    /// Fails the running turn's speech: the tone for it waits in the line.
+    fn fail_speech(scripted: &mut Scripted) {
+        let (speech, answer) = being_written();
+        scripted.engineer.queue(answer);
+        speech.send(Err(anyhow::anyhow!("no voice"))).unwrap();
+        scripted.frame();
+        assert_eq!(waiting(scripted), 1);
+        assert!(scripted.engineer.line[0].complete);
+    }
+
+    /// How many answers and tones are to be played.
+    fn waiting(scripted: &Scripted) -> usize {
+        scripted.engineer.incoming.len() + scripted.engineer.line.len()
+    }
+
+    /// Has the running turn take the questions steering it.
+    fn take_steer(scripted: &mut Scripted) {
+        scripted.acts.send(Act::TakeSteer).unwrap();
+        scripted.until("taken", |s| !s.asked.lock().unwrap().steered.is_empty());
+    }
+
+    #[test]
+    fn a_question_taken_after_the_failed_speech_tone_gets_a_tone() {
+        for end in [
+            Act::End(StopReason::EndTurn, "All fine."),
+            Act::End(StopReason::EndTurn, ""),
+            Act::End(StopReason::MaxTokens, "All"),
+            Act::Refuse,
+            Act::Fail,
+        ] {
+            let mut scripted = speech_failed();
+            // Played
+            scripted.engineer.line.clear();
+            scripted.ask("And the rears?");
+            take_steer(&mut scripted);
+            scripted.finish(end);
+            assert_eq!(waiting(&scripted), 1);
+        }
+
+        // Another one it missed is asked next
+        let mut scripted = speech_failed();
+        scripted.engineer.line.clear();
+        scripted.ask("And the rears?");
+        take_steer(&mut scripted);
+        scripted.ask("And the brakes?");
+        scripted.acts.send(Act::Reply).unwrap();
+        scripted.until("asked again", |s| s.questions().len() == 2);
+        assert_eq!(waiting(&scripted), 1);
+
+        // One asked before the tone heard it, whenever it's taken
+        let mut scripted = Scripted::new();
+        scripted.engineer.spotter_held = true;
+        scripted.ask("How are the fronts?");
+        scripted.until("asked", |s| s.questions().len() == 1);
+        scripted.ask("And the rears?");
+        fail_speech(&mut scripted);
+        scripted.engineer.line.clear();
+        take_steer(&mut scripted);
+        scripted.finish(Act::Reply);
+        assert_eq!(waiting(&scripted), 0);
+    }
+
+    #[test]
+    fn a_question_missed_after_the_failed_speech_tone_hears_one_tone() {
+        for (end, questions) in [
+            (Act::End(StopReason::EndTurn, ""), 1),
+            (Act::End(StopReason::EndTurn, ""), 2),
+            (Act::End(StopReason::EndTurn, "Fine."), 1),
+            (Act::End(StopReason::MaxTokens, "Fi"), 1),
+        ] {
+            let mut scripted = speech_failed();
+            // Played
+            scripted.engineer.line.clear();
+            for _ in 0..questions {
+                scripted.ask("And the rears?");
+            }
+            scripted.acts.send(end).unwrap();
+            scripted.until("asked again", |s| s.questions().len() == 2);
+            assert_eq!(waiting(&scripted), 0);
+            // Its own turn's
+            scripted.finish(Act::End(StopReason::EndTurn, ""));
+            assert_eq!(waiting(&scripted), 1);
+        }
+
+        // Asked in no turn of its own, as the one it joined is forgotten
+        for end in [Act::Refuse, Act::Fail] {
+            let mut scripted = speech_failed();
+            scripted.engineer.line.clear();
+            scripted.ask("And the rears?");
+            scripted.finish(end);
+            assert_eq!(waiting(&scripted), 1);
+        }
+    }
+
+    #[test]
+    fn an_interrupted_turn_whose_speech_failed_sounds_no_second_tone() {
+        let interruptions: [fn(&mut Scripted); 3] = [
+            // The recording's gone
+            |s| {
+                let _entered = s.runtime.enter();
+                s.engineer.follow_recording(s.runtime.handle(), None);
+            },
+            // The game stopped
+            |s| {
+                let _entered = s.runtime.enter();
+                let (config, synth) = (&s.config, &mut s.synth);
+                (s.engineer).update(s.runtime.handle(), None, config, synth, None);
+            },
+            // The account signed out
+            |s| {
+                s.engineer.session.as_mut().unwrap().user = Some("pilot".into());
+                s.frame();
+            },
+        ];
+        for (i, interrupt) in interruptions.into_iter().enumerate() {
+            let mut scripted = speech_failed();
+            scripted.engineer.line.clear();
+            interrupt(&mut scripted);
+            assert!(!scripted.engineer.is_thinking(), "interruption {i}");
+            assert_eq!(waiting(&scripted), 0, "played, interruption {i}");
+
+            let mut scripted = speech_failed();
+            scripted.engineer.line[0].started = true;
+            interrupt(&mut scripted);
+            assert_eq!(waiting(&scripted), 0, "playing, interruption {i}");
+
+            // Cleared from the line before it played
+            let mut scripted = speech_failed();
+            interrupt(&mut scripted);
+            assert_eq!(waiting(&scripted), 1, "not played, interruption {i}");
+
+            let mut scripted = speech_failed();
+            scripted.engineer.line.clear();
+            scripted.ask("And the rears?");
+            interrupt(&mut scripted);
+            assert_eq!(waiting(&scripted), 1, "asked again, interruption {i}");
+
+            // Nothing failed
+            let mut scripted = Scripted::new();
+            scripted.engineer.spotter_held = true;
+            scripted.ask("How are the fronts?");
+            interrupt(&mut scripted);
+            assert_eq!(waiting(&scripted), 1, "not failed, interruption {i}");
+        }
     }
 
     #[test]
