@@ -1,14 +1,15 @@
 //! Parakeet TDT 0.6B v3: speech to text on the processor, so it costs the simulator no frames. It
 //! can't be told which language to expect, and doesn't say which it heard.
 
-use super::ModelFiles;
-use crate::{Download, DownloadDigest, synthesizer};
+use super::{Deletion, ModelFiles};
+use crate::{Download, DownloadDigest, synthesizer, synthesizer::phonemizer};
 use camino::{Utf8Path, Utf8PathBuf};
 use parakeet_rs::{ExecutionConfig, ParakeetTDT, Transcriber};
 use std::{
     num::NonZeroUsize,
     sync::{Arc, Mutex},
 };
+use tokio::runtime::Handle;
 
 /// The model's name, as the menu and the setup guide show it.
 pub const NAME: &str = "Parakeet v3";
@@ -52,6 +53,7 @@ pub struct Files {
     files: [File; 3],
     /// `None` for those that were on disk when the downloads started
     downloads: Option<[Option<Download>; 3]>,
+    deletion: Deletion,
 }
 
 impl Files {
@@ -66,6 +68,7 @@ impl Files {
             folder,
             files,
             downloads: None,
+            deletion: Deletion::default(),
         }
     }
 
@@ -89,6 +92,35 @@ impl Files {
         // Every one is asked about, so they're all checked from now on
         let [a, b, c] = self.paths().map(|path| files.checked(&path));
         Some(a? && b? && c?)
+    }
+
+    /// Like [`Self::on_disk`], as the menu shows it: also `None` while they're deleted, and then
+    /// until they're checked again.
+    pub fn shown_on_disk(&mut self, rt: &Handle, files: &ModelFiles) -> Option<bool> {
+        let [a, b, c] = self.paths().map(|path| files.found(&path));
+        let found = match (a, b, c) {
+            (Some(a), Some(b), Some(c)) => Some((a.0 && b.0 && c.0, a.1.min(b.1).min(c.1))),
+            _ => None,
+        };
+        self.deletion.on_disk(rt, found)
+    }
+
+    /// Deletes them in the background.
+    pub fn delete(&mut self) {
+        self.downloads = None;
+        let paths = self.paths().map(Utf8PathBuf::into_std_path_buf);
+        // The phonemizer inherited them if it was started while they were open, and keeps them
+        self.deletion.start(phonemizer::stop, paths.into());
+    }
+
+    /// Whether they're being deleted, and it isn't known yet how that went.
+    pub fn deleting(&self) -> bool {
+        self.deletion.pending()
+    }
+
+    /// Whether they're still being deleted.
+    pub fn deletion_running(&self) -> bool {
+        self.deletion.running()
     }
 
     /// Download progress of all of them, weighted by size: `None` if they aren't downloading, or

@@ -50,14 +50,7 @@ pub fn wanted(
     reply: Option<ArrayStr<2>>,
     app: ArrayStr<2>,
 ) -> (Engine, Why) {
-    let languages = match heard {
-        Some(heard) => vec![heard],
-        None if voices.is_empty() => vec![app],
-        None => voices.to_vec(),
-    };
-    let languages = (languages.into_iter())
-        .map(language::voice_code)
-        .collect::<Vec<_>>();
+    let languages = in_use(heard, voices, app);
     // Whisper hears every language then, not only those with a voice
     if languages.len() > 1 && reply.is_some() {
         return (Engine::Whisper, Why::AnyLanguage);
@@ -72,6 +65,17 @@ pub fn wanted(
         return (Engine::Whisper, Why::Ambiguous(languages));
     }
     (Engine::Parakeet, Why::Known(languages))
+}
+
+/// The languages the pilot is heard in: the Heard language, or else those with a voice, or else the
+/// app's. As [`language::voice_code`] has them.
+pub fn in_use(heard: Option<ArrayStr<2>>, voices: &[ArrayStr<2>], app: ArrayStr<2>) -> Vec<ArrayStr<2>> {
+    let languages = match heard {
+        Some(heard) => vec![heard],
+        None if voices.is_empty() => vec![app],
+        None => voices.to_vec(),
+    };
+    languages.into_iter().map(language::voice_code).collect()
 }
 
 /// The engine Automatic uses, from the one wanted and whether each one's files are on disk (`None`:

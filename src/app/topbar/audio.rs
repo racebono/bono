@@ -1042,11 +1042,15 @@ impl ModelFiles {
 
     /// Like [`Self::checked`], but `None` until a check that started at or after `since`.
     pub fn checked_since(&self, path: &Utf8Path, since: Option<Instant>) -> Option<bool> {
-        if let Some(&(file, started)) = self.found.borrow().get(path) {
-            if since.is_none_or(|since| started >= since) {
-                return Some(file);
-            }
-            return None;
+        let (file, started) = self.found(path)?;
+        since.is_none_or(|since| started >= since).then_some(file)
+    }
+
+    /// Whether `path` is a file, and when the check that found out started: `None` until it's been
+    /// checked.
+    pub fn found(&self, path: &Utf8Path) -> Option<(bool, Instant)> {
+        if let Some(&found) = self.found.borrow().get(path) {
+            return Some(found);
         }
         self.asked.lock().unwrap().insert(path.to_path_buf());
         None

@@ -885,6 +885,96 @@
         "es": "Está en uso: Bono dejará de hablar {language}",
         "ca": "Està en ús: Bono deixarà de parlar {language}"
     },
+    "audio.stt_automatic": {
+        "en": "Automatic",
+        "es": "Automático",
+        "ca": "Automàtic"
+    },
+    "audio.stt_recommended": {
+        "en": "recommended",
+        "es": "recomendado",
+        "ca": "recomanat"
+    },
+    "audio.stt_choose": {
+        "en": "Choose a model",
+        "es": "Elegir un modelo",
+        "ca": "Tria un model"
+    },
+    "audio.stt_using": {
+        "en": "Using {engine}",
+        "es": "Usando {engine}",
+        "ca": "Fent servir {engine}"
+    },
+    "audio.stt_parakeet": {
+        "en": "It hears {languages}, and runs on the processor, so it doesn't slow the simulator down.",
+        "es": "Entiende {languages}, y se ejecuta en el procesador, así que no ralentiza el simulador.",
+        "ca": "Entén {languages}, i s'executa al processador, així que no alenteix el simulador."
+    },
+    "audio.stt_doesnt_hear": {
+        "en": "{engine} doesn't hear {languages}.",
+        "es": "{engine} no entiende {languages}.",
+        "ca": "{engine} no entén {languages}."
+    },
+    "audio.stt_hear_only_question": {
+        "en": "Only speak {language}?",
+        "es": "¿Solo hablas {language}?",
+        "ca": "Només parles {language}?"
+    },
+    "audio.stt_hear_only": {
+        "en": "Hear {language} only",
+        "es": "Entender solo {language}",
+        "ca": "Entén només {language}"
+    },
+    "audio.stt_point": {
+        "en": "Choose one in {menu} › {setting} to use Parakeet.",
+        "es": "Elige uno en {menu} › {setting} para usar Parakeet.",
+        "ca": "Tria'n un a {menu} › {setting} per fer servir Parakeet."
+    },
+    "audio.stt_ambiguous": {
+        "en": "{languages} can't be told apart from the text Parakeet writes.",
+        "es": "{languages} no se pueden distinguir por el texto que escribe Parakeet.",
+        "ca": "{languages} no es poden distingir pel text que escriu Parakeet."
+    },
+    "audio.stt_any": {
+        "en": "Replies are always in one language, so any language may be spoken.",
+        "es": "Las respuestas son siempre en un idioma, así que se puede hablar en cualquiera.",
+        "ca": "Les respostes són sempre en un idioma, així que es pot parlar en qualsevol."
+    },
+    "audio.stt_still": {
+        "en": "Still using {engine}",
+        "es": "Aún se usa {engine}",
+        "ca": "Encara es fa servir {engine}"
+    },
+    "audio.stt_none": {
+        "en": "Nothing can hear you yet.",
+        "es": "Aún no hay nada que te entienda.",
+        "ca": "Encara no hi ha res que t'entengui."
+    },
+    "audio.stt_whisper_does": {
+        "en": "Whisper does:",
+        "es": "Whisper sí:",
+        "ca": "Whisper sí:"
+    },
+    "audio.stt_download": {
+        "en": "Download, {size}",
+        "es": "Descargar, {size}",
+        "ca": "Baixa, {size}"
+    },
+    "audio.stt_failed": {
+        "en": "{engine} couldn't be loaded.",
+        "es": "No se pudo cargar {engine}.",
+        "ca": "No s'ha pogut carregar {engine}."
+    },
+    "audio.stt_credit": {
+        "en": "Parakeet TDT 0.6B v3 by NVIDIA, CC-BY-4.0. ONNX conversion by istupakov.",
+        "es": "Parakeet TDT 0.6B v3 de NVIDIA, CC-BY-4.0. Conversión a ONNX de istupakov.",
+        "ca": "Parakeet TDT 0.6B v3 de NVIDIA, CC-BY-4.0. Conversió a ONNX d'istupakov."
+    },
+    "audio.stt_european": {
+        "en": "25 European",
+        "es": "25 europeos",
+        "ca": "25 europeus"
+    },
     "audio.voice": {
         "en": "Voice",
         "es": "Voz",

@@ -3,18 +3,18 @@ use crate::{
     app::topbar::{
         audio::{
             Deletion, RecordingStream, SetupItem, SetupState, app_language,
-            engine::{self, Engine, Used, Why},
+            engine::{self, Engine, Note, Used, Why},
             gpu,
             parakeet::{self, Parakeet},
             scroll_bar_beside,
         },
-        setup_label, size_text,
+        SETUP_COLOR, setup_label, size_text,
     },
     arrstr,
     button::ConfigButton,
     config::{ArrayStr, Config, RawConfig},
     engineer::{Heard, NotListening},
-    error,
+    error, language,
     synthesizer::phonemizer,
     task::{JoinHandle, MaybeDone, spawn, spawn_blocking},
     updating,
@@ -72,6 +72,9 @@ pub struct Whisper {
     ctx: Option<MaybeDone<Option<Arc<LoadedModel>>>>,
     /// The model `ctx` is loaded from: Parakeet's encoder for Parakeet
     loaded: Option<Arc<Utf8Path>>,
+    /// "Choose a model" was clicked with nothing in use: the models are shown, and Automatic
+    /// goes on until one is picked
+    choosing: bool,
     /// Whether `ctx` was loaded to run on the GPU
     loaded_gpu: bool,
     /// The setup guide asked for the recommended model: it's downloaded, then used once it's on
@@ -147,6 +150,7 @@ impl Whisper {
             client: client.clone(),
             ctx: None,
             loaded: None,
+            choosing: false,
             loaded_gpu: *config.whisper_gpu(),
             setup: false,
             setup_started: false,
@@ -162,152 +166,303 @@ impl Whisper {
     }
 
     pub fn update(&mut self, rt: &Handle, config: &mut Config, ui: &mut egui::Ui) {
-        let client = self.client.clone();
-        let failed = self.failed();
         let label = setup_label(self.missing(&config.get(), &[]), t!("audio.speech_to_text"));
-        let pending = self.catalog.update(rt).is_none();
-        let unavailable = matches!(self.catalog, MaybeDone::Done(None));
-        if pending || unavailable {
-            ui.menu_button(label, |ui| {
-                if ui
-                    .add_enabled(unavailable, egui::Button::new(t!("onboarding.retry")))
-                    .clicked()
-                {
-                    self.retry_catalog();
+        ui.menu_button(label, |ui| {
+            let automatic = config.get().whisper_model().is_none() && !self.choosing;
+            ui.horizontal(|ui| {
+                if ui.radio(automatic, t!("audio.stt_automatic")).clicked() && !automatic {
+                    self.choosing = false;
+                    // It would pick the model it downloads
+                    self.setup = false;
+                    config.update(|raw| raw.whisper_model.set(None));
                 }
-                if pending {
-                    ui.spinner();
-                }
+                ui.weak(t!("audio.stt_recommended"));
             });
+            // It starts from the model in use, which stays loaded
+            if ui.radio(!automatic, t!("audio.stt_choose")).clicked() && automatic {
+                match self.loaded.clone() {
+                    Some(path) => config.update(|raw| raw.whisper_model.set(Some(path))),
+                    None => self.choosing = true,
+                }
+            }
+            ui.separator();
+            if automatic {
+                self.note(rt, config, ui);
+            }
+            if self.engine() == Some(Engine::Whisper) {
+                if automatic {
+                    ui.separator();
+                }
+                whisper_settings(ui, config);
+            }
+            if !automatic {
+                if self.engine() == Some(Engine::Whisper) {
+                    ui.separator();
+                }
+                self.models(rt, config, ui);
+            }
+        });
+    }
+
+    /// What Automatic uses, and why, with what it needs.
+    fn note(&mut self, rt: &Handle, config: &Config, ui: &mut egui::Ui) {
+        let (wanted, heard, voices) = {
+            let raw = config.get();
+            let voices = raw.voices().keys().copied().collect::<Vec<_>>();
+            (self.wanted(&raw, &[]), *raw.heard_language(), voices)
+        };
+        match engine::note(wanted, self.engine(), self.failed(), heard, &voices) {
+            Note::Using(engine, why) => {
+                ui.strong(t!("audio.stt_using", engine = engine_name(engine)));
+                why_text(ui, &why, heard, &voices, false);
+            }
+            Note::HearOnly { lang, unknown } => {
+                ui.strong(t!("audio.stt_using", engine = engine_name(Engine::Whisper)));
+                let language = language::ui_name(lang);
+                ui.label(format!(
+                    "{} {}",
+                    doesnt_hear(parakeet::NAME, &unknown),
+                    t!("audio.stt_hear_only_question", language = &language),
+                ));
+                if ui.button(t!("audio.stt_hear_only", language = &language)).clicked() {
+                    config.update(|raw| raw.heard_language.set(Some(lang)));
+                }
+            }
+            Note::Missing { wanted, used, why } => {
+                match used {
+                    Some(used) => warning(ui, t!("audio.stt_still", engine = engine_name(used))),
+                    None => warning(ui, t!("audio.stt_none").into()),
+                }
+                why_text(ui, &why, heard, &voices, wanted == Engine::Whisper);
+                self.download(rt, ui, wanted);
+            }
+            Note::Failed(engine) => {
+                warning(ui, t!("audio.stt_failed", engine = engine_name(engine)));
+                if ui.button(t!("onboarding.retry")).clicked()
+                    && let Some(path) = self.loaded.clone()
+                {
+                    self.set_model(path, *config.get().whisper_gpu());
+                }
+            }
+        }
+    }
+
+    /// The button to download `engine`'s model, or how far its download is.
+    fn download(&mut self, rt: &Handle, ui: &mut egui::Ui, engine: Engine) {
+        let client = self.client.clone();
+        let (progress, size) = match engine {
+            Engine::Parakeet => (self.parakeet.progress(), Some(parakeet::SIZE)),
+            Engine::Whisper => match self.recommended(rt) {
+                Some(model) => (model.download().map(Download::progress), model.size),
+                None => {
+                    // Whisper's model is only downloaded with the catalog's size and hash
+                    if matches!(self.catalog, MaybeDone::Done(None)) {
+                        if ui.button(t!("onboarding.retry")).clicked() {
+                            self.retry_catalog();
+                        }
+                    } else {
+                        ui.spinner();
+                    }
+                    return;
+                }
+            },
+        };
+        if let Some(progress) = progress {
+            egui::ProgressBar::new(progress as f32).show_percentage().ui(ui);
             return;
         }
+        let size = size.map_or("?".into(), size_text);
+        if ui.button(t!("audio.stt_download", size = size)).clicked() {
+            match engine {
+                Engine::Parakeet => self.parakeet.start_download(&client, &self.files),
+                Engine::Whisper => {
+                    if let Some(model) = self.recommended(rt) {
+                        model.start_download(&client);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The models to choose from: Parakeet, then Whisper's catalog.
+    fn models(&mut self, rt: &Handle, config: &mut Config, ui: &mut egui::Ui) {
+        let picked = config.get().whisper_model().clone();
+        let failed = self.failed();
+        let languages = {
+            let raw = config.get();
+            let voices = raw.voices().keys().copied().collect::<Vec<_>>();
+            engine::in_use(*raw.heard_language(), &voices, app_language(raw.locale()))
+        };
+        let parakeet_path = self.parakeet.model().clone();
+        // The model picked doesn't hear a language in use
+        let english_only = match &picked {
+            Some(picked) => (self.catalog(rt).unwrap_or_default().iter())
+                .find(|model| model.path == *picked && model.english_only)
+                .map(|model| model.name.clone()),
+            None => None,
+        };
+        let unheard = |name: &str, hears: fn(ArrayStr<2>) -> bool| {
+            let unheard = languages.iter().copied().filter(|&lang| !hears(lang));
+            Some((name.to_owned(), unheard.collect::<Vec<_>>()))
+        };
+        let unheard = match english_only {
+            _ if picked.as_ref() == Some(&parakeet_path) => {
+                unheard(parakeet::NAME, engine::parakeet_knows)
+            }
+            Some(name) => unheard(&name, |lang| lang == arrstr!("en")),
+            None => None,
+        };
+        if let Some((name, unheard)) = unheard.filter(|(_, unheard)| !unheard.is_empty()) {
+            warning(ui, doesnt_hear(&name, &unheard));
+        }
+
         let mut reload = None;
+        let mut retry = false;
         let mut deleted_recommended = false;
-        let catalog = self.catalog_mut(rt);
-        ui.add_enabled_ui(catalog.is_some(), |ui| {
-            ui.menu_button(label, |ui| {
-                config.maybe_update(|raw| {
-                    raw.min_confidence
-                        .edit(*raw.min_confidence(), |confidence| {
-                            ui.add(
-                                egui::Slider::new(confidence, 0.0..=1.0)
-                                    .text(t!("audio.language_confidence"))
-                                    .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
-                                    .custom_parser(|text| {
-                                        let text = text.trim().trim_end_matches('%').trim();
-                                        text.parse::<f64>().ok().map(|percent| percent / 100.0)
-                                    }),
-                            )
-                            .on_hover_text(t!("audio.language_confidence_hover"))
-                            .changed()
-                        })
-                });
-                // Without a GPU backend built in, it runs on the CPU either way
-                if GPU_BACKEND {
-                    // Changing it reloads the model, in `poll`
-                    config.maybe_update(|raw| {
-                        raw.whisper_gpu.edit(*raw.whisper_gpu(), |gpu| {
-                            ui.checkbox(gpu, t!("audio.whisper_gpu"))
-                                .on_hover_text(t!("audio.whisper_gpu_hover"))
-                                .changed()
-                        })
+        let client = self.client.clone();
+        scroll_bar_beside(ui);
+        egui_extras::TableBuilder::new(ui)
+            .id_salt("whisper-models")
+            .striped(true)
+            .columns(Column::auto(), 4)
+            .column(Column::remainder())
+            .header(20.0, |mut header| {
+                for title in [
+                    t!("audio.model"),
+                    t!("audio.quantization"),
+                    t!("audio.languages"),
+                    t!("audio.size"),
+                ] {
+                    header.col(|ui| {
+                        ui.strong(title);
                     });
                 }
-                ui.separator();
-
-                scroll_bar_beside(ui);
-                egui_extras::TableBuilder::new(ui)
-                    .id_salt("whisper-models")
-                    .striped(true)
-                    .columns(Column::auto(), 4)
-                    .column(Column::remainder())
-                    .header(20.0, |mut header| {
-                        header.col(|ui| {
-                            ui.strong(t!("audio.model"));
-                        });
-                        header.col(|ui| {
-                            ui.strong(t!("audio.quantization"));
-                        });
-                        header.col(|ui| {
-                            ui.strong(t!("audio.languages"));
-                        });
-                        header.col(|ui| {
-                            ui.strong(t!("audio.size"));
-                        });
-                    })
-                    .body(|mut body| {
-                        config.maybe_update(|config| {
-                            let mut updated = false;
-                            for model in catalog.unwrap_or_default() {
-                                body.row(18.0, |mut row| {
-                                    row.col(|ui| {
-                                        ui.label(&model.name);
-                                    });
-
-                                    row.col(|ui| {
-                                        if let Some(ref q) = model.quantization {
-                                            ui.label(q);
-                                        }
-                                    });
-
-                                    row.col(|ui| {
-                                        ui.label(if model.english_only {
-                                            t!("audio.english_only")
-                                        } else {
-                                            t!("audio.all_languages")
-                                        });
-                                    });
-
-                                    row.col(|ui| {
-                                        if let Some(size) = model.size {
-                                            ui.label(size_text(size));
-                                        }
-                                    });
-
-                                    let on_disk = model.on_disk(rt);
-                                    if model.deletion.pending() {
-                                        row.col(|ui| {
-                                            ui.spinner();
-                                        });
-                                    } else if let Some(on_disk) = on_disk {
-                                        row.col(|ui| {
-                                            if on_disk && model.download().is_none() {
-                                                let used = config.whisper_model().as_ref()
-                                                    == Some(&model.path);
-                                                ui.horizontal(|ui| {
-                                                    ui.add_enabled_ui(!used || failed, |ui| {
-                                                        if ui.button(t!("audio.use")).clicked() {
-                                                            config
-                                                                .whisper_model
-                                                                .set(Some(model.path.clone()));
-                                                            reload = Some(model.path.clone());
-                                                            updated = true;
-                                                        }
-                                                    });
-                                                    if model.delete_button(ui, used) {
-                                                        deleted_recommended |=
-                                                            model.file == RECOMMENDED;
-                                                    }
-                                                });
-                                            } else if let Some(download) = model.download() {
-                                                egui::ProgressBar::new(download.progress() as f32)
-                                                    .show_percentage()
-                                                    .ui(ui);
-                                            } else if ui
-                                                .button(egui_phosphor::bold::CLOUD_ARROW_DOWN)
-                                                .clicked()
-                                            {
-                                                model.start_download(&client);
-                                            }
-                                        });
+            })
+            .body(|mut body| {
+                body.row(18.0, |mut row| {
+                    row.col(|ui| {
+                        ui.label(parakeet::NAME);
+                    });
+                    row.col(|ui| {
+                        ui.label("int8");
+                    });
+                    row.col(|ui| {
+                        ui.label(t!("audio.stt_european"))
+                            .on_hover_text(t!("audio.stt_credit"));
+                    });
+                    row.col(|ui| {
+                        ui.label(size_text(parakeet::SIZE));
+                    });
+                    let on_disk = self.parakeet.shown_on_disk(rt, &self.files);
+                    row.col(|ui| {
+                        if self.parakeet.deleting() {
+                            ui.spinner();
+                            return;
+                        }
+                        let used = picked.as_ref() == Some(&parakeet_path);
+                        match (on_disk, self.parakeet.progress()) {
+                            (Some(true), None) => {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(!used || failed, egui::Button::new(t!("audio.use")))
+                                        .clicked()
+                                    {
+                                        reload = Some(parakeet_path.clone());
+                                    }
+                                    if delete_button(ui, Some(parakeet::SIZE), used) {
+                                        self.parakeet.delete();
                                     }
                                 });
                             }
-                            return updated;
-                        });
+                            (_, Some(progress)) => {
+                                egui::ProgressBar::new(progress as f32).show_percentage().ui(ui);
+                            }
+                            (Some(false), None) => {
+                                if ui.button(egui_phosphor::bold::CLOUD_ARROW_DOWN).clicked() {
+                                    self.parakeet.start_download(&client, &self.files);
+                                }
+                            }
+                            (None, None) => {}
+                        }
                     });
+                });
+
+                let catalog = match self.catalog.update(rt) {
+                    Some(Some(catalog)) => catalog,
+                    unavailable => {
+                        let unavailable = unavailable.is_some();
+                        body.row(18.0, |mut row| {
+                            row.col(|ui| {
+                                if !unavailable {
+                                    ui.spinner();
+                                } else if ui.button(t!("onboarding.retry")).clicked() {
+                                    retry = true;
+                                }
+                            });
+                        });
+                        return;
+                    }
+                };
+                for model in catalog {
+                    body.row(18.0, |mut row| {
+                        row.col(|ui| {
+                            ui.label(&model.name);
+                        });
+                        row.col(|ui| {
+                            if let Some(ref q) = model.quantization {
+                                ui.label(q);
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(if model.english_only {
+                                t!("audio.english_only")
+                            } else {
+                                t!("audio.all_languages")
+                            });
+                        });
+                        row.col(|ui| {
+                            if let Some(size) = model.size {
+                                ui.label(size_text(size));
+                            }
+                        });
+
+                        let on_disk = model.on_disk(rt);
+                        if model.deletion.pending() {
+                            row.col(|ui| {
+                                ui.spinner();
+                            });
+                        } else if let Some(on_disk) = on_disk {
+                            row.col(|ui| {
+                                if on_disk && model.download().is_none() {
+                                    let used = picked.as_ref() == Some(&model.path);
+                                    ui.horizontal(|ui| {
+                                        ui.add_enabled_ui(!used || failed, |ui| {
+                                            if ui.button(t!("audio.use")).clicked() {
+                                                reload = Some(model.path.clone());
+                                            }
+                                        });
+                                        if model.delete_button(ui, used) {
+                                            deleted_recommended |= model.file == RECOMMENDED;
+                                        }
+                                    });
+                                } else if let Some(download) = model.download() {
+                                    egui::ProgressBar::new(download.progress() as f32)
+                                        .show_percentage()
+                                        .ui(ui);
+                                } else if ui
+                                    .button(egui_phosphor::bold::CLOUD_ARROW_DOWN)
+                                    .clicked()
+                                {
+                                    model.start_download(&client);
+                                }
+                            });
+                        }
+                    });
+                }
             });
-        });
+        if retry {
+            self.retry_catalog();
+        }
         // Setup doesn't get it again
         if deleted_recommended {
             self.setup = false;
@@ -315,6 +470,7 @@ impl Whisper {
         if let Some(path) = reload {
             // A model picked by hand is what's used, whatever setup was getting
             self.setup = false;
+            config.update(|raw| raw.whisper_model.set(Some(path.clone())));
             self.set_model(path, *config.get().whisper_gpu());
         }
     }
@@ -641,8 +797,18 @@ impl Whisper {
 
     /// Whether a model is still being deleted.
     pub fn deleting(&self) -> bool {
-        matches!(&self.catalog, MaybeDone::Done(Some(catalog))
-            if catalog.iter().any(|model| model.deletion.running()))
+        self.parakeet.deletion_running()
+            || matches!(&self.catalog, MaybeDone::Done(Some(catalog))
+                if catalog.iter().any(|model| model.deletion.running()))
+    }
+
+    /// The engine in use: `None` if nothing is.
+    pub fn engine(&self) -> Option<Engine> {
+        let loaded = self.loaded.as_ref()?;
+        Some(match loaded == self.parakeet.model() {
+            true => Engine::Parakeet,
+            false => Engine::Whisper,
+        })
     }
 
     fn loading(&self) -> bool {
@@ -713,6 +879,116 @@ impl Whisper {
             }
         }));
     }
+}
+
+/// Automatic's Whisper, as the menu names it.
+const TURBO_NAME: &str = "Whisper large-v3-turbo";
+
+/// The engine Automatic uses, as the menu names it.
+fn engine_name(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Parakeet => parakeet::NAME,
+        Engine::Whisper => TURBO_NAME,
+    }
+}
+
+/// `langs` as the app names them.
+fn language_names(langs: &[ArrayStr<2>]) -> String {
+    let names = langs.iter().map(|&lang| language::ui_name(lang));
+    names.collect::<Vec<_>>().join(", ")
+}
+
+/// That the model `name` doesn't hear `langs`.
+fn doesnt_hear(name: &str, langs: &[ArrayStr<2>]) -> String {
+    t!("audio.stt_doesnt_hear", engine = name, languages = language_names(langs))
+}
+
+/// Why Automatic wants the engine it does. `whisper_does`: Whisper is wanted and not downloaded.
+fn why_text(
+    ui: &mut egui::Ui,
+    why: &Why,
+    heard: Option<ArrayStr<2>>,
+    voices: &[ArrayStr<2>],
+    whisper_does: bool,
+) {
+    let point = || {
+        t!(
+            "audio.stt_point",
+            menu = t!("engineer"),
+            setting = t!("engineer.heard_language")
+        )
+    };
+    let text = match why {
+        Why::Known(langs) => t!("audio.stt_parakeet", languages = language_names(langs)),
+        Why::Unknown(langs) => {
+            let mut text = doesnt_hear(parakeet::NAME, langs);
+            // Several voices in languages Parakeet knows: one of them can be the one heard
+            let known = voices.iter().filter(|&&lang| engine::parakeet_knows(lang));
+            if heard.is_none() && known.count() > 1 {
+                text = format!("{text} {}", point());
+            }
+            if whisper_does {
+                text = format!("{text} {}", t!("audio.stt_whisper_does"));
+            }
+            text
+        }
+        Why::Ambiguous(langs) => format!(
+            "{} {}",
+            t!("audio.stt_ambiguous", languages = language_names(langs)),
+            point()
+        ),
+        Why::AnyLanguage => t!("audio.stt_any").into(),
+    };
+    ui.label(text);
+}
+
+/// The settings that only apply to Whisper.
+fn whisper_settings(ui: &mut egui::Ui, config: &mut Config) {
+    config.maybe_update(|raw| {
+        raw.min_confidence
+            .edit(*raw.min_confidence(), |confidence| {
+                ui.add(
+                    egui::Slider::new(confidence, 0.0..=1.0)
+                        .text(t!("audio.language_confidence"))
+                        .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
+                        .custom_parser(|text| {
+                            let text = text.trim().trim_end_matches('%').trim();
+                            text.parse::<f64>().ok().map(|percent| percent / 100.0)
+                        }),
+                )
+                .on_hover_text(t!("audio.language_confidence_hover"))
+                .changed()
+            })
+    });
+    // Without a GPU backend built in, it runs on the CPU either way
+    if GPU_BACKEND {
+        // Changing it reloads the model, in `poll`
+        config.maybe_update(|raw| {
+            raw.whisper_gpu.edit(*raw.whisper_gpu(), |gpu| {
+                ui.checkbox(gpu, t!("audio.whisper_gpu"))
+                    .on_hover_text(t!("audio.whisper_gpu_hover"))
+                    .changed()
+            })
+        });
+    }
+}
+
+/// `text`, with the sign of something to set up.
+fn warning(ui: &mut egui::Ui, text: String) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new(egui_phosphor::bold::WARNING).color(SETUP_COLOR));
+        ui.label(text);
+    });
+}
+
+/// The button to delete a model of `size` bytes, unless it's `used`. Returns whether it was
+/// clicked.
+fn delete_button(ui: &mut egui::Ui, size: Option<u64>, used: bool) -> bool {
+    let size = size.map_or("?".into(), size_text);
+    ui.add_enabled(!used, egui::Button::new(egui_phosphor::bold::TRASH))
+        .on_hover_text(t!("audio.delete", size = size))
+        .on_disabled_hover_text(t!("audio.delete_in_use"))
+        .clicked()
 }
 
 /// What an event does to the talk button's recording.
@@ -1479,12 +1755,7 @@ impl Model {
 
     /// The button to delete it, unless it's `used`. Returns whether it was clicked.
     fn delete_button(&mut self, ui: &mut egui::Ui, used: bool) -> bool {
-        let size = self.size.map_or("?".into(), size_text);
-        let clicked = ui
-            .add_enabled(!used, egui::Button::new(egui_phosphor::bold::TRASH))
-            .on_hover_text(t!("audio.delete", size = size))
-            .on_disabled_hover_text(t!("audio.delete_in_use"))
-            .clicked();
+        let clicked = delete_button(ui, self.size, used);
         if clicked {
             self.download = None;
             let path = self.path.as_std_path().to_path_buf();
@@ -2022,6 +2293,7 @@ mod tests {
         Whisper {
             ctx: None,
             loaded: None,
+            choosing: false,
             loaded_gpu: false,
             setup: false,
             setup_started: false,
