@@ -399,6 +399,13 @@ impl Recorder {
             session.session_number.get(),
         );
 
+        // A dropped update doesn't say which car is the player's: telemetry would be flagged as theirs
+        // with no scoring to go with it. The epoch it may have started stays, with no player yet
+        let mut queue = lock(&self.shared.queue);
+        if queue.scoring.len() >= MAX_QUEUED_SCORING {
+            return;
+        }
+
         // No car is the player's (spectating, a replay): no telemetry is flagged as theirs, rather
         // than the car that has the player's last id
         if !standings.is_empty() {
@@ -410,10 +417,6 @@ impl Recorder {
             self.shared.player_id.store(player, Ordering::Relaxed);
         }
 
-        let mut queue = lock(&self.shared.queue);
-        if queue.scoring.len() >= MAX_QUEUED_SCORING {
-            return;
-        }
         let epoch = queue.epoch;
         queue.scoring.push((epoch, session, standings));
         drop(queue);
@@ -1447,6 +1450,54 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(flags, [false, false]);
+    }
+
+    /// With the queue full, an update is dropped: it doesn't change whose telemetry is the player's,
+    /// even if it starts an epoch, until one is queued.
+    #[test]
+    fn a_dropped_scoring_update_does_not_set_the_player() {
+        let dir = tempfile::tempdir().unwrap();
+        // The writer asks for the forecast after its first write, and waits there until told to go
+        let (asked_tx, asked) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let forecast: ForecastSource = Box::new(move |_| {
+            let _ = asked_tx.send(());
+            let _ = wait.recv();
+            None
+        });
+        let recorder = Recorder::new(dir.path(), Some(forecast)).unwrap();
+        let score = |kind: &str, time: f64, player: i64| {
+            recorder.push_scoring(
+                session("Spa", kind, time),
+                vec![standing(player, true, 0.0)],
+            );
+        };
+        score("practice", 100.0, 1);
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        while recorder.queued_scoring() < MAX_QUEUED_SCORING {
+            score("practice", 100.0, 1);
+        }
+
+        // Dropped, in the same epoch and starting another
+        score("practice", 100.0, 2);
+        let same_epoch = recorder.player();
+        score("qualifying", 200.0, 1);
+        let new_epoch = recorder.player();
+        record(&recorder, &telemetry(1, 200.0));
+
+        go.send(()).unwrap();
+        written(&recorder);
+        score("qualifying", 201.0, 1);
+        record(&recorder, &telemetry(1, 201.0));
+        let epoch = recorder.epoch();
+        drop(recorder);
+
+        // Checked once the writer isn't held: a failure before would wait for it forever
+        assert_eq!(same_epoch, Some(1));
+        assert_eq!(new_epoch, None);
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        assert_eq!(reasons(&conn), ["start", "session"]);
+        assert_eq!(telemetry_rows(&conn), [(epoch, 1, false), (epoch, 1, true)]);
     }
 
     #[test]
