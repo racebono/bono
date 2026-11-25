@@ -5363,7 +5363,7 @@ fn strategy_line(conn: &Connection, race: bool) -> rusqlite::Result<Option<(i64,
             }
             if let Some(stops) = s.i("stops_needed") {
                 let plural = if stops == 1 { "" } else { "s" };
-                finish.push_str(&format!(", about {stops} stop{plural}"));
+                finish.push_str(&format!(", {stops} stop{plural} needed"));
             }
             // More than this isn't driven
             if let Some(save) = s.f("save_pct_needed").filter(|save| *save < 10.0) {
@@ -11273,7 +11273,7 @@ mod tests {
             format!("to the flag {need:.1} laps, {fuel_need:.1} L, {energy_need:.1}% VE"),
             format!("{:.1} laps short on {}", -margin, row[0][0].trim_matches('"')),
             format!("{fuel_def:.1} L to add in total, {energy_def:.1}% VE to add in total"),
-            format!("about {stops} stop"),
+            format!(", {stops} stop"),
             "lap 4 ".to_owned(),
         ] {
             assert!(line.contains(&part), "{part} not in {line}");
