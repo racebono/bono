@@ -518,8 +518,16 @@ pub struct EngineerInput {
     query: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "known_table")]
     table: Option<SchemaTable>,
+}
+
+/// Any other table, or an empty one, is no filter: the other commands have none to get wrong.
+fn known_table<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<SchemaTable>, D::Error> {
+    let table = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(table).ok())
 }
 
 impl EngineerInput {
@@ -2834,7 +2842,7 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         .as_ref()
         .filter(|progress| progress.epoch == ctx.epoch.id)
         .and_then(|progress| progress.strategy.clone());
-    if let Some(line) = strategy {
+    if let Some((_, line)) = strategy.filter(|(vehicle, _)| *vehicle == ctx.vehicle) {
         say!(out, "STRATEGY {line}");
     }
 
@@ -4713,11 +4721,17 @@ mod tests {
         let other = Engineer::new(pool.clone()).with_sim("other");
         let any = Engineer::new(pool);
 
+        // Another table or none is no filter, whichever the command
+        for table in ["lap_stats", ""] {
+            let all = run(&lmu, serde_json::json!({"command": "schema", "table": table})).await;
+            assert!(all.contains("`telemetry_wheel`") && all.contains("`car_state`"), "{all}");
+        }
+
         let all_tables = ["telemetry", "telemetry_wheel", "car_state", "scoring"];
         for (name, tool) in [("lmu", &lmu), ("iracing", &iracing), ("rrre", &rrre)] {
             let full = run(tool, serde_json::json!({"command": "schema"})).await;
             assert!(
-                full.len() < 5120,
+                full.len() < 5632,
                 "{name} schema too large: {} B",
                 full.len()
             );

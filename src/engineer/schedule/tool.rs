@@ -111,7 +111,7 @@ impl ScheduleTool {
                 "repeat": {
                     "type": "string",
                     "enum": ["once", "every"],
-                    "description": "add, replace: answered once (the default), or every time it fires."
+                    "description": "add, replace: answered once (the default), or every time it fires. Needed with `until`."
                 },
                 "until": trigger_schema(
                     "add, replace: when the request stops (repeating or one-shot expiry), counted \
@@ -511,6 +511,18 @@ impl ScheduleInput {
         };
         let trigger = trigger.parse("trigger")?;
         let until = self.until.map(|until| until.parse("until")).transpose()?;
+        // Left out, "every lap for five laps" would be answered once
+        if until.is_some() && self.repeat.is_none() {
+            bail!("`until` needs `repeat`: every to stop repeating, or once to expire unanswered");
+        }
+        let ends_first = match (&trigger, &until) {
+            (Trigger::Time { seconds }, Some(Trigger::Time { seconds: until })) => until < seconds,
+            (Trigger::Laps { count }, Some(Trigger::Laps { count: until })) => until < count,
+            _ => false,
+        };
+        if ends_first {
+            bail!("`until` ends it before its `trigger` can fire: they count from the same start");
+        }
         let repeat = match self.repeat.unwrap_or(RepeatInput::Once) {
             RepeatInput::Once => Repeat::Once,
             RepeatInput::Every => Repeat::Every,
@@ -1267,7 +1279,8 @@ mod tests {
     async fn once_with_until_is_accepted_and_checks_until_condition() {
         let (_dir, _engineer, tool) = recorded().await;
 
-        // 1. `add` with explicit `repeat: "once"` and with `repeat` omitted + `until`
+        // 1. `add` with `repeat: "once"` + `until`; with `repeat` omitted, or an `until` before the
+        // trigger, it's refused
         let mut explicit = add(condition(FALSE));
         explicit["repeat"] = json!("once");
         explicit["until"] = laps(5);
@@ -1279,13 +1292,24 @@ mod tests {
 
         let mut omitted = add(condition(FALSE));
         omitted["until"] = laps(5);
-        let reply2 = call(&tool, omitted).await.unwrap();
-        assert!(!reply2.contains('\n'), "one line: {reply2}");
-        assert!(!reply2.contains("Tell the pilot the fuel left."), "{reply2}");
-        assert!(reply2.contains("Added #2"), "{reply2}");
+        let error = format!("{:#}", call(&tool, omitted).await.unwrap_err());
+        assert!(error.contains("`until` needs `repeat`"), "{error}");
+        for (trigger, until) in [
+            (laps(5), laps(1)),
+            (
+                json!({"kind": "time", "seconds": 600}),
+                json!({"kind": "time", "seconds": 30}),
+            ),
+        ] {
+            let mut never = add(trigger);
+            never["repeat"] = json!("once");
+            never["until"] = until;
+            let error = format!("{:#}", call(&tool, never).await.unwrap_err());
+            assert!(error.contains("before its `trigger` can fire"), "{error}");
+        }
 
         let changes = tool.take();
-        assert_eq!(changes.len(), 2);
+        assert_eq!(changes.len(), 1);
         for change in changes {
             let Change::Add(_, new) = change else {
                 panic!("{change:?}");

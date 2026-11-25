@@ -19,6 +19,8 @@ parser.add_argument('--no-pit', action='store_true',
                     help='Omit skill/pit-service.md (sims without pit-menu control)')
 parser.add_argument('--model', default='claude-sonnet-5-5')
 args = parser.parse_args()
+# RaceRoom has no pit menu control
+args.no_pit |= args.sim == 'rrre'
 root = Path(__file__).resolve().parent.parent
 
 

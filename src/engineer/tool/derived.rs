@@ -85,7 +85,6 @@ CREATE TABLE lap_stats (
     fuel_start_l REAL, fuel_end_l REAL, fuel_used_l REAL,
     energy_start_pct REAL, energy_end_pct REAL, energy_used_pct REAL,
     gap_ahead_end_s REAL, gap_behind_end_s REAL,
-    gap_ahead_delta_s REAL, gap_behind_delta_s REAL,
     PRIMARY KEY (vehicle_id, lap)
 ) WITHOUT ROWID;
 CREATE TABLE lap_wheel_stats (
@@ -680,7 +679,7 @@ impl Data {
             "SELECT laps_completed FROM cars_now WHERE is_player = 1",
             [],
         )?;
-        let strategy = strategy_line(conn)?;
+        let strategy = strategy_line(conn, session_type.as_deref() == Some("race"))?;
         let epoch = stream.epoch.id;
         let (weekend, new_epochs) = match epoch {
             // A recording without epochs: no weekend to tell from the next
@@ -888,22 +887,23 @@ fn real_text(x: f64) -> String {
     }
 }
 
-/// Result column names whose values are lap times in seconds and receive an inline `m:ss.t`
-/// annotation in SQL text output when finite and at least a minute.
-const LAP_TIME_COLUMNS: [&str; 5] = [
-    "time_s",
-    "official_time_s",
-    "last_lap_s",
-    "best_lap_s",
-    "avg_lap_s",
+/// The columns (table, column) with lap times in seconds, which receive an inline `m:ss.t`
+/// annotation in SQL text output when they round to at least a minute.
+const LAP_TIME_COLUMNS: [(&str, &str); 5] = [
+    ("lap_stats", "time_s"),
+    ("lap_stats", "official_time_s"),
+    ("cars_now", "last_lap_s"),
+    ("cars_now", "best_lap_s"),
+    ("stints", "avg_lap_s"),
 ];
 
-/// Formats a lap-time column value for SQL text output, appending `(m:ss.t)` when finite and
-/// `>= 60.0` so the model does not divide seconds by 60 mentally. Rounds tenths before splitting
-/// minutes and seconds so values like `119.96` format as `2:00.0` rather than `1:60.0`.
+/// Formats a lap-time column value for SQL text output, appending `(m:ss.t)` when it rounds to at
+/// least a minute so the model does not divide seconds by 60 mentally. Rounds tenths before
+/// splitting minutes and seconds so values like `119.96` format as `2:00.0` rather than `1:60.0`.
 fn format_lap_time(x: f64) -> String {
-    if x.is_finite() && x >= 60.0 && x * 10.0 < u64::MAX as f64 {
-        let tenths = (x * 10.0).round() as u64;
+    let tenths = (x * 10.0).round();
+    if tenths >= 600.0 && tenths < u64::MAX as f64 {
+        let tenths = tenths as u64;
         let mins = tenths / 600;
         let secs = (tenths % 600) as f64 / 10.0;
         format!("{} ({mins}:{secs:04.1})", real_text(x))
@@ -967,12 +967,17 @@ fn run_query(
         Some(move || abandoned() || Instant::now() > deadline),
     )?;
     let result = (|| -> rusqlite::Result<()> {
-        let raw_names = stmt.column_names();
-        let annotate: Vec<bool> = raw_names
+        // By where a value comes from, whatever the query calls it
+        let annotate = stmt
+            .columns_with_metadata()
             .iter()
-            .map(|name| LAP_TIME_COLUMNS.contains(name))
-            .collect();
-        let names = raw_names
+            .map(|column| {
+                (column.table_name().zip(column.origin_name()))
+                    .is_some_and(|origin| LAP_TIME_COLUMNS.contains(&origin))
+            })
+            .collect::<Vec<_>>();
+        let names = stmt
+            .column_names()
             .into_iter()
             .map(telemetry_text)
             .collect::<Vec<_>>();
@@ -2747,11 +2752,7 @@ impl Writer<'_> {
                 [vehicle],
             )?;
         }
-        let prev = lap
-            .lap
-            .checked_sub(1)
-            .and_then(|prev| car.finished.iter().rev().find(|l| l.lap == prev));
-        self.write_lap(vehicle, car, &lap, prev, true)?;
+        self.write_lap(vehicle, car, &lap, true)?;
 
         if let Some(layout) = self.layout {
             let trace = Trace::build(&build.samples, build.start, lap.time, layout.length);
@@ -2771,14 +2772,7 @@ impl Writer<'_> {
     }
 
     /// `heat`: whether to add what the tyres did over the lap, which takes a scan of its rows.
-    fn write_lap(
-        &self,
-        vehicle: i64,
-        car: &Car,
-        lap: &Lap,
-        prev: Option<&Lap>,
-        heat: bool,
-    ) -> rusqlite::Result<()> {
+    fn write_lap(&self, vehicle: i64, car: &Car, lap: &Lap, heat: bool) -> rusqlite::Result<()> {
         let end = lap.start.zip(lap.time).map(|(start, time)| start + time);
         let official = end.and_then(|end| {
             self.official
@@ -2793,14 +2787,6 @@ impl Writer<'_> {
                 })
         });
         let [stint_id, boundary] = stint_columns(&car.stints, lap.lap, lap.start, lap.end);
-        let gap_ahead_delta = lap
-            .gap_ahead_end
-            .zip(prev.and_then(|p| p.gap_ahead_end))
-            .map(|(now, before)| now - before);
-        let gap_behind_delta = lap
-            .gap_behind_end
-            .zip(prev.and_then(|p| p.gap_behind_end))
-            .map(|(now, before)| now - before);
         insert(
             self.conn,
             "lap_stats",
@@ -2837,8 +2823,6 @@ impl Writer<'_> {
                 ),
                 ("gap_ahead_end_s", real(lap.gap_ahead_end)),
                 ("gap_behind_end_s", real(lap.gap_behind_end)),
-                ("gap_ahead_delta_s", real(gap_ahead_delta)),
-                ("gap_behind_delta_s", real(gap_behind_delta)),
             ],
         )?;
         let sectors = official.map_or(&[][..], |o| &o.sectors[..]);
@@ -4197,11 +4181,7 @@ impl Stream {
                 player: self.player,
             };
             for lap in laps.iter().skip(car.finished.len()) {
-                let prev = lap
-                    .lap
-                    .checked_sub(1)
-                    .and_then(|prev| laps.iter().rev().find(|l| l.lap == prev));
-                writer.write_lap(vehicle, car, lap, prev, vehicle == ctx.vehicle)?;
+                writer.write_lap(vehicle, car, lap, vehicle == ctx.vehicle)?;
             }
         }
         Ok(projection)
@@ -5211,14 +5191,18 @@ fn projection(
     };
     let limited_by = limit.map(|(which, _)| which);
     let (need, source) = race_need(sc, frame, vehicle, now, frac, stint.avg_time);
-    let margin = limit.zip(need).map(|((_, left), need)| left - need);
+    // Exactly enough isn't short by a rounding error
+    let margin = limit
+        .zip(need)
+        .map(|((_, left), need)| left - need)
+        .map(|margin| if margin.abs() < 1e-6 { 0.0 } else { margin });
     let save = margin
         .zip(need)
         .filter(|(margin, _)| *margin < 0.0)
         .map(|(margin, need)| -margin / need.max(0.1) * 100.0);
     let tank_cap = p.f("fuel_capacity").filter(|c| c.is_finite() && *c > 0.0);
     let energy_pct_use = energy_use
-        .filter(|_| stint.energy_is_fraction())
+        .filter(|_| energy.is_some() && stint.energy_is_fraction())
         .map(|e| e * 100.0);
     let energy_left = energy_percent(energy);
     let fuel_to_finish = need
@@ -5258,7 +5242,7 @@ fn projection(
         } else {
             full_stint_laps
                 .filter(|f| *f > 0.0 && f.is_finite())
-                .map(|f| (-m / f).ceil())
+                .map(|f| (-m / f - 1e-6).ceil())
                 .filter(|s| s.is_finite())
                 .map(|s| s as i64)
         }
@@ -5303,7 +5287,7 @@ fn projection(
 
 /// What the player's current stint is on course for, as `quick` shows it: use per lap and how long
 /// it lasts, the tank, and in a race what reaching the flag takes. `None` before any use is known.
-fn strategy_line(conn: &Connection) -> rusqlite::Result<Option<String>> {
+fn strategy_line(conn: &Connection, race: bool) -> rusqlite::Result<Option<(i64, String)>> {
     let Some(s) = row(
         conn,
         "SELECT s.* FROM stints s JOIN cars_now c ON c.current_stint_id = s.stint_id \
@@ -5311,6 +5295,9 @@ fn strategy_line(conn: &Connection) -> rusqlite::Result<Option<String>> {
         [],
     )?
     else {
+        return Ok(None);
+    };
+    let Some(vehicle) = s.i("vehicle_id") else {
         return Ok(None);
     };
     let mut parts = Vec::new();
@@ -5346,7 +5333,11 @@ fn strategy_line(conn: &Connection) -> rusqlite::Result<Option<String>> {
     if let Some(tank) = s.f("tank_capacity_l").filter(|tank| *tank > 0.0) {
         parts.push(format!("tank {tank:.1} L"));
     }
-    if let (Some(need), Some(margin)) = (s.f("laps_needed"), s.f("margin_laps")) {
+    if let Some(done) = s.f("lap_fraction") {
+        parts.push(format!("this lap {:.0}% done", done * 100.0));
+    }
+    // Outside races, a need is only for running the session's clock out
+    if let (true, Some(need), Some(margin)) = (race, s.f("laps_needed"), s.f("margin_laps")) {
         let mut finish = format!("to the flag {need:.1} laps");
         if let Some(fuel) = s.f("fuel_to_finish_l") {
             finish.push_str(&format!(", {fuel:.1} L"));
@@ -5367,12 +5358,16 @@ fn strategy_line(conn: &Connection) -> rusqlite::Result<Option<String>> {
                 let plural = if stops == 1 { "" } else { "s" };
                 finish.push_str(&format!(", at least {stops} stop{plural}"));
             }
+            // More than this isn't driven
+            if let Some(save) = s.f("save_pct_needed").filter(|save| *save < 10.0) {
+                finish.push_str(&format!(", or {save:.1}% less use a lap"));
+            }
         } else {
             finish.push_str(&format!(": enough, {margin:.1} laps spare"));
         }
         parts.push(finish);
     }
-    Ok(Some(parts.join(" | ")))
+    Ok(Some((vehicle, parts.join(" | "))))
 }
 
 /// The car's sector times as of its newest standing.
@@ -6055,16 +6050,14 @@ fn track_range(start: f64, end: f64, length: Option<f64>) -> String {
     }
 }
 
+/// The longest class, loss or turn name shown unquoted: the track data has none longer.
+const TRACK_TOKEN_CHARS: usize = 16;
+
 /// Emits a short plain ASCII label unquoted; escapes anything else via `telemetry_text`.
-fn safe_track_token(text: &str, allow_spaces: bool) -> Cow<'_, str> {
+fn safe_track_token(text: &str) -> Cow<'_, str> {
     if !text.is_empty()
-        && text.trim() == text
-        && text.len() <= TELEMETRY_TEXT_CHARS
-        && text.chars().all(|c| {
-            c.is_ascii_alphanumeric()
-                || matches!(c, '_' | '-' | '.' | '/')
-                || (allow_spaces && c == ' ')
-        })
+        && text.len() <= TRACK_TOKEN_CHARS
+        && (text.chars()).all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
     {
         Cow::Borrowed(text)
     } else {
@@ -6104,7 +6097,7 @@ fn format_pit_losses(track: &Json) -> Option<String> {
                     let secs = finite_secs(item.get("time")?)?;
                     Some(format!(
                         "{} {}s",
-                        safe_track_token(name, true),
+                        safe_track_token(name),
                         real_text(secs)
                     ))
                 })
@@ -6112,7 +6105,7 @@ fn format_pit_losses(track: &Json) -> Option<String> {
             if !entries.is_empty() {
                 groups.push(format!(
                     "{}: {}",
-                    safe_track_token(class, true),
+                    safe_track_token(class),
                     entries.join(", ")
                 ));
             }
@@ -6126,20 +6119,20 @@ fn format_pit_losses(track: &Json) -> Option<String> {
                         return None;
                     }
                     let secs = finite_secs(&map[k])?;
-                    Some(format!("{} {}s", safe_track_token(k, true), real_text(secs)))
+                    Some(format!("{} {}s", safe_track_token(k), real_text(secs)))
                 })
                 .collect();
             if !entries.is_empty() {
                 groups.push(format!(
                     "{}: {}",
-                    safe_track_token(class, true),
+                    safe_track_token(class),
                     entries.join(", ")
                 ));
             }
         } else if let Some(secs) = finite_secs(val) {
             flat.push(format!(
                 "{} {}s",
-                safe_track_token(class, true),
+                safe_track_token(class),
                 real_text(secs)
             ));
         }
@@ -6163,7 +6156,7 @@ fn format_turn_line(turn: &Json, length: Option<f64>) -> Option<String> {
         } else {
             n.as_str()
                 .filter(|s| !s.is_empty())
-                .map(|s| format!("T{}", safe_track_token(s, false)))
+                .map(|s| format!("T{}", safe_track_token(s)))
         };
         if let Some(number) = number {
             parts.push(number);
@@ -8206,131 +8199,6 @@ mod tests {
             .await,
             [["99.8 (1:39.8)"]]
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn lap_stats_gap_deltas_track_adjacent_and_in_progress_laps() {
-        let (dir, engineer) = race();
-        drop(engineer);
-        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
-        // Vehicle 1: distinct end-of-lap gaps across laps 1..4 (lap 4 in-progress)
-        //   lap 1: ahead 5.0, behind 2.0 -> deltas NULL, NULL
-        //   lap 2: ahead 4.2, behind 2.5 -> deltas -0.8 (closing), +0.5 (pulling away)
-        //   lap 3: ahead 4.5, behind 1.9 -> deltas +0.3 (falling back), -0.6 (rival closing)
-        //   lap 4: ahead 3.9, behind 2.1 -> deltas -0.6 (closing), +0.2 (pulling away)
-        // Vehicle 2: missing gaps (NULL on previous lap and/or current lap, complete & in-progress)
-        //   lap 1: ahead 5.0, behind NULL -> deltas NULL, NULL
-        //   lap 2: ahead NULL, behind 2.5 -> deltas NULL, NULL
-        //   lap 3: ahead 4.5, behind 1.9 -> deltas NULL, -0.6
-        //   lap 4: ahead 4.0, behind NULL -> deltas -0.5, NULL
-        conn.execute_batch(
-            "UPDATE telemetry SET gap_to_place_ahead = 5.0, gap_to_place_behind = 2.0 WHERE vehicle_id = 1 AND lap = 1;
-             UPDATE telemetry SET gap_to_place_ahead = 4.2, gap_to_place_behind = 2.5 WHERE vehicle_id = 1 AND lap = 2;
-             UPDATE telemetry SET gap_to_place_ahead = 4.5, gap_to_place_behind = 1.9 WHERE vehicle_id = 1 AND lap = 3;
-             UPDATE telemetry SET gap_to_place_ahead = 3.9, gap_to_place_behind = 2.1 WHERE vehicle_id = 1 AND lap = 4;
-             UPDATE telemetry SET gap_to_place_ahead = 5.0, gap_to_place_behind = NULL WHERE vehicle_id = 2 AND lap = 1;
-             UPDATE telemetry SET gap_to_place_ahead = NULL, gap_to_place_behind = 2.5 WHERE vehicle_id = 2 AND lap = 2;
-             UPDATE telemetry SET gap_to_place_ahead = 4.5, gap_to_place_behind = 1.9 WHERE vehicle_id = 2 AND lap = 3;
-             UPDATE telemetry SET gap_to_place_ahead = 4.0, gap_to_place_behind = NULL WHERE vehicle_id = 2 AND lap = 4;",
-        )
-        .unwrap();
-        drop(conn);
-        let engineer = reopen(&dir);
-        let rows = query(
-            &engineer,
-            "SELECT lap, complete, ROUND(gap_ahead_delta_s, 1), ROUND(gap_behind_delta_s, 1) \
-             FROM lap_stats WHERE vehicle_id = 1 ORDER BY lap",
-        )
-        .await;
-        assert_eq!(
-            rows,
-            [
-                ["1", "1", "NULL", "NULL"],
-                ["2", "1", "-0.8", "0.5"],
-                ["3", "1", "0.3", "-0.6"],
-                ["4", "0", "-0.6", "0.2"],
-            ]
-        );
-        let missing = query(
-            &engineer,
-            "SELECT lap, complete, ROUND(gap_ahead_delta_s, 1), ROUND(gap_behind_delta_s, 1) \
-             FROM lap_stats WHERE vehicle_id = 2 ORDER BY lap",
-        )
-        .await;
-        assert_eq!(
-            missing,
-            [
-                ["1", "1", "NULL", "NULL"],
-                ["2", "1", "NULL", "NULL"],
-                ["3", "1", "NULL", "-0.6"],
-                ["4", "0", "-0.5", "NULL"],
-            ]
-        );
-
-        // Overlap case: lap 4 has no lap_start_time yet, so lap 3 stays in car.waiting (not
-        // car.finished) while lap 4 is car.current. Both must still compute deltas against lap - 1.
-        drop(engineer);
-        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
-        conn.execute(
-            "UPDATE telemetry SET lap_start_time = NULL WHERE vehicle_id = 1 AND lap = 4",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-        let engineer = reopen(&dir);
-        let overlap = query(
-            &engineer,
-            "SELECT lap, complete, time_s, ROUND(gap_ahead_delta_s, 1), ROUND(gap_behind_delta_s, 1) \
-             FROM lap_stats WHERE vehicle_id = 1 ORDER BY lap",
-        )
-        .await;
-        assert_eq!(
-            overlap,
-            [
-                ["1", "1", "100 (1:40.0)", "NULL", "NULL"],
-                ["2", "1", "100 (1:40.0)", "-0.8", "0.5"],
-                ["3", "1", "NULL", "0.3", "-0.6"],
-                ["4", "0", "NULL", "-0.6", "0.2"],
-            ]
-        );
-
-        // Non-adjacent lap jumps (both finished and in-progress): never subtract a non-adjacent lap.
-        drop(engineer);
-        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
-        conn.execute_batch(
-            "UPDATE telemetry SET lap_start_time = 300.0 WHERE vehicle_id = 1 AND lap = 4;
-             UPDATE telemetry SET gap_to_place_ahead = 4.0, gap_to_place_behind = 2.0 WHERE vehicle_id = 2 AND lap = 4;
-             DELETE FROM telemetry_wheel WHERE telemetry_id IN (
-                 SELECT id FROM telemetry WHERE (vehicle_id = 1 AND lap = 2) OR (vehicle_id = 2 AND lap = 3)
-             );
-             DELETE FROM car_state WHERE telemetry_id IN (
-                 SELECT id FROM telemetry WHERE (vehicle_id = 1 AND lap = 2) OR (vehicle_id = 2 AND lap = 3)
-             );
-             DELETE FROM telemetry WHERE (vehicle_id = 1 AND lap = 2) OR (vehicle_id = 2 AND lap = 3);",
-        )
-        .unwrap();
-        drop(conn);
-        let engineer = reopen(&dir);
-        let skipped_finished = query(
-            &engineer,
-            "SELECT lap, complete, ROUND(gap_ahead_delta_s, 1), ROUND(gap_behind_delta_s, 1) \
-             FROM lap_stats WHERE vehicle_id = 1 AND lap IN (3, 4) ORDER BY lap",
-        )
-        .await;
-        assert_eq!(
-            skipped_finished,
-            [
-                ["3", "1", "NULL", "NULL"],
-                ["4", "0", "-0.6", "0.2"],
-            ]
-        );
-        let skipped_in_progress = query(
-            &engineer,
-            "SELECT lap, complete, gap_ahead_delta_s, gap_behind_delta_s \
-             FROM lap_stats WHERE vehicle_id = 2 AND lap = 4",
-        )
-        .await;
-        assert_eq!(skipped_in_progress, [["4", "0", "NULL", "NULL"]]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -11402,6 +11270,34 @@ mod tests {
         ] {
             assert!(line.contains(&part), "{part} not in {line}");
         }
+        // Not for another car the player has since been put in
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute(
+            "INSERT INTO telemetry (epoch, vehicle_id, is_player, session_time) \
+             SELECT epoch, 2, 1, session_time FROM telemetry ORDER BY id DESC LIMIT 1",
+            [],
+        )
+        .unwrap();
+        let quick = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(!quick.contains("STRATEGY"), "{quick}");
+        conn.execute(
+            "DELETE FROM telemetry WHERE id = (SELECT MAX(id) FROM telemetry)",
+            [],
+        )
+        .unwrap();
+        // Nothing to reach outside races: the use and the tank are still there
+        conn.execute("UPDATE session SET session_type = 'practice'", [])
+            .unwrap();
+        drop(engineer);
+        let engineer = reopen(&dir);
+        engineer.ask(Job::Progress).await.unwrap();
+        let quick = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(quick.contains("STRATEGY fuel "), "{quick}");
+        assert!(quick.contains("| tank 60.0 L"), "{quick}");
+        assert!(!quick.contains("to the flag"), "{quick}");
+        conn.execute("UPDATE session SET session_type = 'race'", [])
+            .unwrap();
+        drop(conn);
 
         // (b) Fuel-limited with tank_capacity_l = NULL and 0.0 when short: stops_needed is NULL
         drop(engineer);
@@ -11574,7 +11470,14 @@ mod tests {
         }
 
         // (d4) Exact ceil boundaries (margin = 0 -> 0, -20/20 -> 1, -20.01/20 -> 2) & NULL session
-        for (ve, expected_stops) in [(1.75, 0), (0.75, 1), (0.7495, 2)] {
+        for (ve, expected_stops) in [
+            (1.75, 0),
+            (0.75, 1),
+            (0.7495, 2),
+            // Short by a rounding error
+            (1.75 - 1e-12, 0),
+            (0.75 - 1e-12, 1),
+        ] {
             let p_bound = columns(
                 &conn,
                 &format!("2 AS lap, 80.0 AS fuel, 60.0 AS fuel_capacity, {ve} AS virtual_energy"),
@@ -12798,8 +12701,8 @@ mod tests {
 
     #[test]
     fn format_lap_time_annotates_minutes_with_clean_rollover() {
-        assert_eq!(format_lap_time(59.99), "59.99");
-        assert_eq!(format_lap_time(59.96), "59.96");
+        assert_eq!(format_lap_time(59.94), "59.94");
+        assert_eq!(format_lap_time(59.96), "59.96 (1:00.0)");
         assert_eq!(format_lap_time(60.0), "60 (1:00.0)");
         assert_eq!(format_lap_time(99.284), "99.284 (1:39.3)");
         assert_eq!(format_lap_time(119.96), "119.96 (2:00.0)");
@@ -12810,59 +12713,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn run_query_annotates_lap_times_at_or_above_60s_with_clean_rollover() {
+    async fn run_query_annotates_lap_times_by_their_origin() {
         let (_dir, engineer) = race();
-        // All 5 target columns >= 60s get annotated; < 60s, NULL, and non-lap-time *_s columns
-        // stay plain numbers.
+        // Whatever the query calls it, also through a join, a subquery or a CTE; not a computed
+        // value, nor another column by the same name
         let rows = query(
             &engineer,
-            "SELECT 99.284 AS time_s, 119.96 AS official_time_s, 60.0 AS last_lap_s, \
-                    85.0 AS best_lap_s, 100.0 AS avg_lap_s, \
-                    125.5 AS session_time_s, 72.4 AS gap_ahead_end_s, 61.2 AS entry_s",
-        )
-        .await;
-        assert_eq!(
-            rows,
-            [[
-                "99.284 (1:39.3)",
-                "119.96 (2:00.0)",
-                "60 (1:00.0)",
-                "85 (1:25.0)",
-                "100 (1:40.0)",
-                "125.5",
-                "72.4",
-                "61.2",
-            ]]
-        );
-
-        let below_and_null = query(
-            &engineer,
-            "SELECT 59.96 AS time_s, 35.0 AS official_time_s, 59.4 AS last_lap_s, \
-                    NULL AS best_lap_s, NULL AS avg_lap_s, NULL AS gap_ahead_end_s",
-        )
-        .await;
-        assert_eq!(
-            below_and_null,
-            [["59.96", "35", "59.4", "NULL", "NULL", "NULL"]]
-        );
-
-        // Qualified table alias still exposes the unqualified column name in SQLite and gets
-        // annotated on real table rows, while real non-lap-time *_s columns stay plain.
-        let aliased = query(
-            &engineer,
-            "SELECT l.time_s, l.official_time_s, s.avg_lap_s, r.session_time_s \
+            "SELECT l.time_s, l.official_time_s AS t, s.avg_lap_s, r.session_time_s, \
+                    time_s + 0.0 AS time_s, MIN(l.time_s) AS best_lap_s, 99.5 AS last_lap_s \
              FROM lap_stats l \
              JOIN stints s ON s.stint_id = l.stint_id \
              CROSS JOIN race_state r \
              WHERE l.vehicle_id = 2 AND l.lap = 1",
         )
         .await;
-        assert_eq!(aliased.len(), 1);
-        assert_eq!(aliased[0][0], "100 (1:40.0)");
-        assert_eq!(aliased[0][1], "99.8 (1:39.8)");
-        assert_eq!(aliased[0][2], "100 (1:40.0)");
-        assert!(!aliased[0][3].contains('('), "{aliased:?}");
-        assert!(aliased[0][3].parse::<f64>().unwrap() >= 60.0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0][..3],
+            ["100 (1:40.0)", "99.8 (1:39.8)", "100 (1:40.0)"]
+        );
+        assert!(rows[0][3].parse::<f64>().unwrap() >= 60.0, "{rows:?}");
+        assert_eq!(rows[0][4..], ["100", "100", "99.5"]);
+        assert_eq!(
+            query(
+                &engineer,
+                "WITH laps AS (SELECT lap, time_s AS t FROM lap_stats WHERE vehicle_id = 2) \
+                 SELECT t FROM (SELECT * FROM laps) WHERE lap = 1",
+            )
+            .await,
+            [["100 (1:40.0)"]]
+        );
 
         // Underlying SQL column remains numeric for arithmetic and sorting
         assert_eq!(
