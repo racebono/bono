@@ -10,7 +10,8 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::{Mutex, PoisonError},
+    sync::{Mutex, PoisonError, TryLockError},
+    time::{Duration, Instant},
 };
 
 const EXE_NAME: &str = "bono-phonemizer";
@@ -50,13 +51,24 @@ pub fn phonemize(text: &str, voice: &str) -> anyhow::Result<Vec<String>> {
     }
 }
 
-/// Stops the phonemizer, after the request it's answering. The next one starts it again. Until it
-/// stops, the files that were open to be inherited when it started can't be deleted on Windows.
+/// Stops the phonemizer, after the request it's answering (unless that takes over 10 seconds).
+/// The next one starts it again. Until it stops, the files that were open to be inherited when it
+/// started can't be deleted on Windows.
 pub fn stop() {
-    PROCESS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match PROCESS.try_lock() {
+            Ok(mut process) => return drop(process.take()),
+            Err(TryLockError::Poisoned(e)) => return drop(e.into_inner().take()),
+            // A request that never ends doesn't get what waits for it stuck too
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(TryLockError::WouldBlock) => {
+                return log::warn!("The phonemizer is busy, so it wasn't stopped");
+            }
+        }
+    }
 }
 
 struct Process {

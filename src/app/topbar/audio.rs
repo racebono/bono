@@ -1077,38 +1077,55 @@ impl ModelFiles {
 
 /// Deletes a downloaded model's files in the background.
 #[derive(Default)]
-struct Deletion(Option<MaybeDone<bool>>);
+struct Deletion {
+    task: Option<MaybeDone<bool>>,
+    /// When the deletion was seen done: checks from before then may still find the files
+    deleted: Option<Instant>,
+}
 
 impl Deletion {
-    /// Deletes `files`, after `release` closes what may have them open. Those already missing
-    /// count as deleted, and the rest are still deleted if one can't be (its error is shown).
+    /// How long after a deletion files found on disk are taken to be from an earlier check. The
+    /// checks run a little over a second apart.
+    const EARLIER_CHECKS: Duration = Duration::from_secs(5);
+
+    /// Deletes `files` in order, after `release` closes what may have them open. Those already
+    /// missing count as deleted. It stops at the first that can't be deleted (its error is shown),
+    /// so the rest are still there to use it: a voice's model goes before its config.
     fn start(&mut self, release: impl FnOnce() + Send + 'static, files: Vec<PathBuf>) {
-        self.0 = Some(MaybeDone::spawn_blocking(move || {
+        self.deleted = None;
+        self.task = Some(MaybeDone::spawn_blocking(move || {
             release();
-            let mut deleted = true;
             for file in files {
                 match std::fs::remove_file(&file) {
                     Ok(()) => log::info!("Deleted {}", file.display()),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => {
                         error(t!("error.deleting"), format!("{}: {e}", file.display()));
-                        deleted = false;
+                        return false;
                     }
                 }
             }
-            deleted
+            true
         }));
     }
 
     /// Whether the model is on disk, given what the last check `found`. `None` if it's not known:
-    /// also while it's deleted, and then until a check finds it gone.
+    /// also while it's deleted, and then until a check finds it gone (or long enough for one to).
     fn on_disk(&mut self, rt: &Handle, found: Option<bool>) -> Option<bool> {
-        if let Some(deletion) = &mut self.0 {
-            match deletion.update(rt) {
+        if let Some(task) = &mut self.task {
+            match task.update(rt) {
                 None => return None,
-                // From a check made before it was deleted
-                Some(true) if found == Some(true) => return None,
-                Some(_) => self.0 = None,
+                Some(true) => self.deleted = Some(Instant::now()),
+                Some(false) => {}
+            }
+            self.task = None;
+        }
+        if let Some(deleted) = self.deleted {
+            if found == Some(true) && deleted.elapsed() < Self::EARLIER_CHECKS {
+                return None;
+            }
+            if found.is_some() {
+                self.deleted = None;
             }
         }
         found
@@ -1116,12 +1133,12 @@ impl Deletion {
 
     /// Whether it was started, and [`Self::on_disk`] doesn't know how it went yet.
     fn pending(&self) -> bool {
-        self.0.is_some()
+        self.task.is_some() || self.deleted.is_some()
     }
 
     /// Whether the files are still being deleted.
     fn running(&self) -> bool {
-        matches!(&self.0, Some(MaybeDone::Task(task)) if !task.is_finished())
+        matches!(&self.task, Some(MaybeDone::Task(task)) if !task.is_finished())
     }
 }
 
@@ -1196,6 +1213,20 @@ mod deletion_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn files_back_since_the_deletion_are_found_in_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deletion = Deletion::default();
+        deletion.start(|| (), vec![dir.path().join("model.bin")]);
+        assert_eq!(after(&mut deletion, Some(true)).await, None);
+        // No check found them gone before they were back
+        deletion.deleted = deletion
+            .deleted
+            .map(|deleted| deleted - Deletion::EARLIER_CHECKS);
+        assert_eq!(after(&mut deletion, Some(true)).await, Some(true));
+        assert!(!deletion.pending());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn files_already_gone_count_as_deleted() {
         let dir = tempfile::tempdir().unwrap();
         let mut deletion = Deletion::default();
@@ -1216,8 +1247,10 @@ mod deletion_tests {
         let mut deletion = Deletion::default();
         deletion.start(|| (), vec![stuck.clone(), file.clone()]);
         assert_eq!(after(&mut deletion, Some(true)).await, Some(true));
+        assert!(!deletion.pending());
+        // The files after it are kept, so it can still be used
         assert!(stuck.exists());
-        assert!(!file.exists());
+        assert!(file.exists());
     }
 }
 

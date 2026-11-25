@@ -9,6 +9,7 @@ use crate::{
     },
     config::{ArrayStr, Config, RawConfig},
     error, language,
+    synthesizer::phonemizer,
     synthesizer::{Synthesizer, VoiceLoad},
     task::MaybeDone,
     updating,
@@ -605,9 +606,14 @@ impl Language {
                                     {
                                         voice.start_download(client);
                                     }
-                                    // Without its files too, the voice in use can be removed
-                                    if (on_disk || used)
-                                        && voice.delete_button(ui, code, on_disk, used)
+                                    // Deleting it removes every language it's the voice of
+                                    let speaks = (config.voices().iter())
+                                        .filter(|(_, path)| path.as_path() == &*voice.path)
+                                        .map(|(&lang, _)| lang)
+                                        .collect::<Vec<_>>();
+                                    // Without its files too, a voice in use can be removed
+                                    if (on_disk || !speaks.is_empty())
+                                        && voice.delete_button(ui, &speaks, on_disk)
                                     {
                                         voice.delete(config, synth);
                                         // Setup doesn't get it again
@@ -658,24 +664,20 @@ impl Voice {
         self.deletion.on_disk(rt, found)
     }
 
-    /// The button to [`Self::delete`] it. Returns whether it was clicked.
-    fn delete_button(
-        &self,
-        ui: &mut egui::Ui,
-        lang: ArrayStr<2>,
-        on_disk: bool,
-        used: bool,
-    ) -> bool {
+    /// The button to [`Self::delete`] it, the voice of the languages it `speaks`. Returns whether
+    /// it was clicked.
+    fn delete_button(&self, ui: &mut egui::Ui, speaks: &[ArrayStr<2>], on_disk: bool) -> bool {
         let size = on_disk.then(|| {
             t!(
                 "audio.delete",
                 size = size_text(self.model_size + self.config_size)
             )
         });
-        let stops = used.then(|| {
+        let stops = (!speaks.is_empty()).then(|| {
+            let languages = speaks.iter().map(|&lang| language::ui_name(lang));
             t!(
                 "audio.delete_voice_in_use",
-                language = language::ui_name(lang)
+                language = languages.collect::<Vec<_>>().join(", ")
             )
         });
         ui.button(egui_phosphor::bold::TRASH)
@@ -689,8 +691,12 @@ impl Voice {
         let workers = config.remove_voice(&self.path, synth);
         let model = self.path.as_std_path().to_path_buf();
         let json = model.with_added_extension("json");
-        self.deletion
-            .start(move || drop(workers), vec![model, json]);
+        let release = move || {
+            drop(workers);
+            // It may have inherited the files, if it was started while they were open
+            phonemizer::stop();
+        };
+        self.deletion.start(release, vec![model, json]);
     }
 
     /// Download progress of both files, weighted by size: `None` if they aren't downloading, or
