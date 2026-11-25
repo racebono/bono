@@ -40,7 +40,7 @@ use super::{
     sdk::{Frame, UNLIMITED_LAPS, UNLIMITED_TIME},
     session::{PlayerSetup, SessionInfo},
 };
-use crate::sim::memory::{SCORING_EVERY, Update};
+use crate::sim::memory::{SCORING_EVERY, Update, round_ms, session_end};
 use bono_sim::{
     setup::{Setting, Setup, SetupSource},
     sys::{bono_session_info, bono_standing, bono_telemetry},
@@ -1599,30 +1599,6 @@ fn race_laps(frame: &Frame<'_>) -> Option<i64> {
 /// `irsdk_TrackWetness` (1 dry to 7 extremely wet) as the recording's 0-1.
 fn wetness(level: i32) -> Option<f64> {
     (1..=7).contains(&level).then(|| f64::from(level - 1) / 6.0)
-}
-
-/// How far the clock and the time left can disagree about when the session ends (s): they're
-/// read a frame apart.
-const SESSION_END_JITTER: f64 = 0.1;
-
-/// When the session's clock runs out, held steady: `last`, unless the time left at `time` moves
-/// it. Run out, it stays when it ran out.
-fn session_end(last: Option<f64>, time: f64, remaining: Option<f64>) -> Option<f64> {
-    let Some(remaining) = remaining else {
-        return last.filter(|end| *end <= time);
-    };
-    let end = round_ms(time + remaining);
-    match last {
-        Some(last) if remaining <= 0.0 && last <= time => Some(last),
-        Some(last) if (end - last).abs() <= SESSION_END_JITTER => Some(last),
-        _ => Some(end),
-    }
-}
-
-/// Derived times mix the clock with the game's f32 values: their sub-millisecond noise would make
-/// every scoring row differ.
-fn round_ms(time: f64) -> f64 {
-    (time * 1000.0).round() / 1000.0
 }
 
 fn round_tenth(value: f64) -> f64 {

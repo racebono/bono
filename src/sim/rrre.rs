@@ -5,7 +5,7 @@
 use crate::{
     sim::{
         Simulator, SimulatorInfo, SimulatorSettings,
-        memory::{Read, Recording, SCORING_EVERY, Source, Update},
+        memory::{Read, Recording, SCORING_EVERY, Source, Update, session_end},
         steam_install_dir,
     },
     sqlite::pool::Pool,
@@ -179,6 +179,8 @@ struct Converter {
     /// the player controls it. Kept while the camera is on another car (spectating, or while
     /// something else controls it), so watching a car never makes it the player's
     owner: Option<i32>,
+    /// When the session's clock runs out, kept once it has
+    session_end: Option<f64>,
     /// A replay played since the last update
     replayed: bool,
 }
@@ -313,6 +315,7 @@ impl Converter {
         if new_event || new_epoch.is_some() {
             // Slots are handed out again: whoever drives one now isn't known yet
             self.owner = None;
+            self.session_end = None;
             // The new epoch's scoring comes first, saying whose car is whose
             self.last_scoring = None;
         }
@@ -403,7 +406,13 @@ impl Converter {
             Some(last) if now.duration_since(last) < SCORING_EVERY => None,
             _ => {
                 self.last_scoring = Some(now);
-                let (session, mut standings) = scoring(shared, drivers, time, self.owner);
+                let (mut session, mut standings) = scoring(shared, drivers, time, self.owner);
+                // What the game gives as the time left once it has run out isn't documented
+                self.session_end = match shared.session_length_format {
+                    R3E_SESSION_LENGTH_LAP_BASED => None,
+                    _ => session_end(self.session_end, time, session.time_remaining.get()),
+                };
+                session.session_end_time = self.session_end.into();
                 // The lap starts the telemetry has, held steady across the line
                 for standing in &mut standings {
                     let slot = standing.vehicle_id.get().map(|slot| slot as i32);
@@ -691,9 +700,12 @@ fn scoring(
     session.session_end_time = remaining
         .map(|remaining| scoring_time(time + remaining))
         .into();
-    if shared.session_length_format != R3E_SESSION_LENGTH_TIME_BASED {
+    // What the number of laps holds in the other formats isn't documented
+    if shared.session_length_format == R3E_SESSION_LENGTH_LAP_BASED {
         session.max_laps = setting(shared.number_of_laps).into();
     }
+    session.extra_lap =
+        Some(shared.session_length_format == R3E_SESSION_LENGTH_TIME_AND_LAP_BASED).into();
     session.vehicle_count = Some(drivers.len() as i64).into();
     session.start_light = setting(shared.start_lights).into();
     session.in_realtime =
@@ -1627,6 +1639,51 @@ mod tests {
         writer.write(1, session, standings).unwrap();
         assert_eq!(count("session"), 2);
         assert_eq!(count("standings"), 3);
+    }
+
+    #[test]
+    fn the_session_length_says_how_the_race_ends() {
+        for (format, max_laps, extra_lap) in [
+            (R3E_SESSION_LENGTH_TIME_BASED, None, false),
+            (R3E_SESSION_LENGTH_LAP_BASED, Some(12), false),
+            (R3E_SESSION_LENGTH_TIME_AND_LAP_BASED, None, true),
+        ] {
+            let mut shared = shared(500.0, 0.0);
+            shared.session_length_format = format;
+            shared.number_of_laps = 12;
+            let update = Converter::default()
+                .convert(&shared, Instant::now())
+                .unwrap();
+            let (session, _) = update.scoring.unwrap();
+            assert_eq!(session.max_laps.get(), max_laps, "{format}");
+            assert_eq!(session.extra_lap.get(), Some(extra_lap), "{format}");
+        }
+    }
+
+    #[test]
+    fn the_session_end_stays_once_the_clock_has_run_out() {
+        let timed = R3E_SESSION_LENGTH_TIME_AND_LAP_BASED;
+        // Whatever the game gives as the time left from then on
+        for remaining in [0.0, -1.0, -12.5] {
+            let mut converter = Converter::default();
+            let start = Instant::now();
+            let mut end = |time: f64, remaining: f32, iteration: i32, format: i32| {
+                let mut shared = shared(time, 0.0);
+                shared.session_time_remaining = remaining;
+                shared.session_iteration = iteration;
+                shared.session_length_format = format;
+                let now = start + Duration::from_secs_f64(time);
+                let update = converter.convert(&shared, now).unwrap();
+                update.scoring.unwrap().0.session_end_time.get()
+            };
+            assert_eq!(end(3599.5, 0.5, 1, timed), Some(3600.0));
+            assert_eq!(end(3600.5, remaining, 1, timed), Some(3600.0));
+            assert_eq!(end(3700.0, remaining, 1, timed), Some(3600.0));
+            // Not another session's, nor a race to laps'
+            assert_eq!(end(3701.0, -1.0, 2, timed), None);
+            assert_eq!(end(3702.0, 0.0, 2, timed), Some(3702.0));
+            assert_eq!(end(3703.0, -1.0, 2, R3E_SESSION_LENGTH_LAP_BASED), None);
+        }
     }
 
     #[test]
