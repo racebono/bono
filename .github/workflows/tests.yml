@@ -24,6 +24,9 @@ jobs:
                 shell: pwsh
         env:
             CARGO_TERM_COLOR: always
+            # The build is cached and restored on runners with other CPUs, so ggml mustn't use the
+            # instructions of the CPU that built it (such as AVX-512): elsewhere they crash the tests.
+            GGML_NATIVE: "OFF"
         steps:
             - uses: actions/checkout@v6
               with:
@@ -94,6 +97,9 @@ jobs:
             - name: Cache Cargo dependencies
               uses: Swatinem/rust-cache@v2
               with:
+                  # A new prefix starts a new cache: v0's hold ggml builds tuned for the runner's CPU,
+                  # and Cargo doesn't rebuild them when GGML_NATIVE changes.
+                  prefix-key: v1-rust
                   cache-on-failure: true
                   # PR caches can't be restored by other PRs; only master's are shared.
                   save-if: ${{ github.ref == 'refs/heads/master' }}
