@@ -72,13 +72,12 @@ pub enum Trigger {
 }
 
 /// Whether a request is answered once or again and again
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Repeat {
     /// Answered, then removed
     Once,
-    /// Answered, then armed again, until this trigger fires (counted from when the request was
-    /// made)
-    Every { until: Option<Trigger> },
+    /// Answered, then armed again
+    Every,
 }
 
 /// A request as the model asks for it
@@ -88,6 +87,8 @@ pub struct NewRequest {
     pub instruction: String,
     pub trigger: Trigger,
     pub repeat: Repeat,
+    /// When the request stops (repeating or one-shot expiry), counted from `made`
+    pub until: Option<Trigger>,
     /// When its answer stops being worth saying, counted from its firing ([`DEFAULT_STALE`] if
     /// not given)
     pub stale_after: Option<Trigger>,
@@ -209,6 +210,7 @@ struct Request {
     made: Progress,
     trigger: Trigger,
     repeat: Repeat,
+    until: Option<Trigger>,
     stale_after: Trigger,
     /// The conditions of its trigger, its `until` and its `stale_after`, where those are
     /// conditions
@@ -375,10 +377,7 @@ impl Request {
     }
 
     fn until(&self) -> Option<&Trigger> {
-        match &self.repeat {
-            Repeat::Every { until } => until.as_ref(),
-            Repeat::Once => None,
-        }
+        self.until.as_ref()
     }
 
     /// Whether an answer for its firing at `fired` is out of date at `progress`
@@ -529,12 +528,7 @@ impl Schedule {
                     // this turn answered it (a follow-up to its last answer). Not when its
                     // `until` ended it and the replace keeps that `until`: it's reached already
                     let current = &self.requests[index];
-                    let until_reached = current.ending
-                        && current.until()
-                            == match &new.repeat {
-                                Repeat::Every { until } => until.as_ref(),
-                                Repeat::Once => None,
-                            };
+                    let until_reached = current.ending && current.until() == new.until.as_ref();
                     // Its `until`, kept by the replace, reached while it waited due or its turn
                     // ran: its firing waiting is its last, and it stays as it was, whatever the
                     // replace changes
@@ -546,7 +540,7 @@ impl Schedule {
                         continue;
                     }
                     let old = self.requests.remove(index);
-                    let old_until = old.until().cloned();
+                    let old_until = old.until.clone();
                     // Counting carries on from the last firing, if it has fired since it was armed
                     let since = match &old.state {
                         State::Armed { since } => since.clone(),
@@ -566,11 +560,7 @@ impl Schedule {
                                 _ => None,
                             });
                     // The same `until` keeps a start it missed (the old one made before it)
-                    let same_until = old_until.as_ref()
-                        == match &new.repeat {
-                            Repeat::Every { until } => until.as_ref(),
-                            Repeat::Once => None,
-                        };
+                    let same_until = old_until.as_ref() == new.until.as_ref();
                     let until_missed = self
                         .until_missed_start(&new)
                         .or(old.until_missed_start.filter(|_| same_until));
@@ -731,14 +721,12 @@ impl Schedule {
                     starts,
                 )
             });
-            let until = match &request.repeat {
-                Repeat::Every {
-                    until: Some(trigger),
-                } => {
+            let until = match &request.until {
+                Some(trigger) => {
                     self.missed_start_counts(trigger, &mut request.until_missed_start, progress)
                         || until
                 }
-                _ => until,
+                None => until,
             };
             // Whether its firing waiting is its last, as of before this step: an `until` reached
             // now still lets this step's own firing count, if the one waiting goes stale
@@ -1003,10 +991,14 @@ impl Schedule {
                     describe(&request.trigger)
                 ),
             };
-            let repeat = match &request.repeat {
-                Repeat::Once => "once".to_string(),
-                Repeat::Every { until: None } => "every time".to_string(),
-                Repeat::Every { until: Some(until) } => format!(
+            let repeat = match (&request.repeat, &request.until) {
+                (Repeat::Once, None) => "once".to_string(),
+                (Repeat::Once, Some(until)) => format!(
+                    "once, until {} from when it was made",
+                    with_count(until, &request.made, progress)
+                ),
+                (Repeat::Every, None) => "every time".to_string(),
+                (Repeat::Every, Some(until)) => format!(
                     "every time, until {} from when it was made",
                     with_count(until, &request.made, progress)
                 ),
@@ -1030,6 +1022,11 @@ impl Schedule {
     /// Pending requests, for the cap
     pub fn len(&self) -> usize {
         self.requests.iter().filter(|r| r.pending()).count()
+    }
+
+    /// The weekend the requests are from: the last progress's seen, if it had one
+    pub fn weekend(&self) -> Option<i64> {
+        self.weekend.flatten()
     }
 
     /// The pending requests' ids, the ones [`len`](Self::len) counts, in the order they were made
@@ -1064,12 +1061,10 @@ impl Schedule {
             false => Checked::default(),
         };
         let stale_after = new.stale_after.unwrap_or(DEFAULT_STALE);
-        let until = match &new.repeat {
-            Repeat::Every { until: Some(until) } => {
-                self.slot(until, checked.until, checked.until_seq, made_epoch)
-            }
-            _ => None,
-        };
+        let until_slot = new
+            .until
+            .as_ref()
+            .and_then(|until| self.slot(until, checked.until, checked.until_seq, made_epoch));
         Request {
             id,
             instruction: new.instruction,
@@ -1079,7 +1074,7 @@ impl Schedule {
                 checked.trigger_seq,
                 made_epoch,
             ),
-            until_slot: until,
+            until_slot,
             stale_slot: self.slot(
                 &stale_after,
                 checked.stale_after,
@@ -1089,6 +1084,7 @@ impl Schedule {
             made: new.made,
             trigger: new.trigger,
             repeat: new.repeat,
+            until: new.until,
             stale_after,
             state: State::Armed { since },
             ending: false,
@@ -1103,10 +1099,9 @@ impl Schedule {
     /// The session start a session `until` missed while the turn adding it ran (see
     /// [`Self::missed_start`])
     fn until_missed_start(&self, new: &NewRequest) -> Option<i64> {
-        match &new.repeat {
-            Repeat::Every { until: Some(until) } => self.missed_start(until, &new.made, &new.made),
-            _ => None,
-        }
+        new.until
+            .as_ref()
+            .and_then(|until| self.missed_start(until, &new.made, &new.made))
     }
 
     /// The epoch of the last session start, if a session trigger made at `made`, counting from
@@ -1244,10 +1239,10 @@ fn why_text(request: &Request, fired: &Progress) -> String {
         },
         Trigger::Condition { query } => format!("this query started returning a row: {query}"),
     };
-    match &request.repeat {
+    match request.repeat {
         Repeat::Once => why,
-        Repeat::Every { .. } if request.ending => format!("{why}; this is its last time"),
-        Repeat::Every { .. } => format!("{why}; it repeats"),
+        Repeat::Every if request.ending => format!("{why}; this is its last time"),
+        Repeat::Every => format!("{why}; it repeats"),
     }
 }
 
@@ -1350,6 +1345,7 @@ mod tests {
             instruction: "Tell the pilot the fuel left.".into(),
             trigger,
             repeat,
+            until: None,
             stale_after: None,
             made: made.clone(),
             checked: Checked::default(),
@@ -1357,7 +1353,12 @@ mod tests {
     }
 
     fn every() -> Repeat {
-        Repeat::Every { until: None }
+        Repeat::Every
+    }
+
+    fn with_until(mut new: NewRequest, until: Trigger) -> NewRequest {
+        new.until = Some(until);
+        new
     }
 
     fn condition(query: &str) -> Trigger {
@@ -1493,12 +1494,9 @@ mod tests {
     #[test]
     fn until_counts_from_creation_and_lets_the_last_firing_count() {
         let mut run = Run::new();
-        let id = run.add(request(
-            Trigger::Laps { count: 1 },
-            Repeat::Every {
-                until: Some(Trigger::Laps { count: 5 }),
-            },
-            &laps(0),
+        let id = run.add(with_until(
+            request(Trigger::Laps { count: 1 }, Repeat::Every, &laps(0)),
+            Trigger::Laps { count: 5 },
         ));
         let mut answers = 0;
         for lap in 1..=5 {
@@ -2020,12 +2018,9 @@ mod tests {
     fn replace_keeps_made_and_armed_baseline() {
         // For the next five laps, every lap
         let mut run = Run::new();
-        let id = run.add(request(
-            Trigger::Laps { count: 1 },
-            Repeat::Every {
-                until: Some(Trigger::Laps { count: 5 }),
-            },
-            &laps(10),
+        let id = run.add(with_until(
+            request(Trigger::Laps { count: 1 }, Repeat::Every, &laps(10)),
+            Trigger::Laps { count: 5 },
         ));
         for lap in [11, 12] {
             run.tick(laps(lap));
@@ -2033,12 +2028,9 @@ mod tests {
         }
 
         // Two laps in: make that every two laps
-        let replacement = request(
-            Trigger::Laps { count: 2 },
-            Repeat::Every {
-                until: Some(Trigger::Laps { count: 5 }),
-            },
-            &laps(12),
+        let replacement = with_until(
+            request(Trigger::Laps { count: 2 }, Repeat::Every, &laps(12)),
+            Trigger::Laps { count: 5 },
         );
         let ids = run
             .schedule
@@ -2218,12 +2210,9 @@ mod tests {
     #[test]
     fn conditions_lists_every_slot() {
         let mut run = Run::new();
-        let mut new = request(
-            condition("SELECT 'trigger'"),
-            Repeat::Every {
-                until: Some(condition("SELECT 'until'")),
-            },
-            &laps(0),
+        let mut new = with_until(
+            request(condition("SELECT 'trigger'"), Repeat::Every, &laps(0)),
+            condition("SELECT 'until'"),
         );
         new.stale_after = Some(condition("SELECT 'stale'"));
         let id = run.add(new.clone());
@@ -2305,12 +2294,9 @@ mod tests {
         // Every minute for five minutes, the snapshots 1.3 s of game clock apart: each firing is a
         // little late, which mustn't push the next one back
         let mut run = Run::new();
-        let id = run.add(request(
-            Trigger::Time { seconds: 60.0 },
-            Repeat::Every {
-                until: Some(Trigger::Time { seconds: 300.0 }),
-            },
-            &at(0.0, 0),
+        let id = run.add(with_until(
+            request(Trigger::Time { seconds: 60.0 }, Repeat::Every, &at(0.0, 0)),
+            Trigger::Time { seconds: 300.0 },
         ));
         let mut answers = 0;
         for step in 1..=300 {
@@ -2375,12 +2361,9 @@ mod tests {
     fn ended_repeat_waits_for_its_answer() {
         // Every two laps for three laps: the answer at lap 2 still waits when lap 3 ends it
         let mut run = Run::new();
-        let id = run.add(request(
-            Trigger::Laps { count: 2 },
-            Repeat::Every {
-                until: Some(Trigger::Laps { count: 3 }),
-            },
-            &laps(0),
+        let id = run.add(with_until(
+            request(Trigger::Laps { count: 2 }, Repeat::Every, &laps(0)),
+            Trigger::Laps { count: 3 },
         ));
         run.tick(laps(2));
         let batch = run.take();
@@ -2430,9 +2413,7 @@ mod tests {
         // Dropped, its condition failing
         let mut run = Run::new();
         let mut failing = lap();
-        failing.repeat = Repeat::Every {
-            until: Some(condition("SELECT nope")),
-        };
+        failing.until = Some(condition("SELECT nope"));
         let (_, fired) = waiting(&mut run, failing);
         let [cond] = run.condition_ids()[..] else {
             panic!("one condition")
@@ -2513,12 +2494,9 @@ mod tests {
 
         // A repeating one, cancelled by the turn that answered it
         let mut run = Run::new();
-        let mut new = request(
-            condition("SELECT 'trigger'"),
-            Repeat::Every {
-                until: Some(condition("SELECT 'until'")),
-            },
-            &laps(0),
+        let mut new = with_until(
+            request(condition("SELECT 'trigger'"), Repeat::Every, &laps(0)),
+            condition("SELECT 'until'"),
         );
         new.stale_after = Some(condition("SELECT 'stale'"));
         let id = run.add(new);
@@ -2628,11 +2606,10 @@ mod tests {
         // Made before the race's start, applied after it
         let made = laps(0);
         run.tick(new_epoch(laps(0), 2, &["session"]));
-        let until = Some(Trigger::Session { kind: None });
-        run.add(request(
-            Trigger::Time { seconds: 10.0 },
-            Repeat::Every { until },
-            &made,
+        let until = Trigger::Session { kind: None };
+        run.add(with_until(
+            request(Trigger::Time { seconds: 10.0 }, Repeat::Every, &made),
+            until,
         ));
         run.tick(new_epoch(at(5.0, 0), 2, &[]));
         assert_eq!(run.schedule.len(), 0);
@@ -2921,10 +2898,13 @@ mod tests {
     #[test]
     fn its_own_turn_replacing_it_after_its_until_doesnt_bring_it_back() {
         let mut run = Run::new();
-        let repeat = || Repeat::Every {
-            until: Some(condition("SELECT 1")),
+        let make = |made: &Progress| {
+            with_until(
+                request(Trigger::Laps { count: 1 }, Repeat::Every, made),
+                condition("SELECT 1"),
+            )
         };
-        let id = run.add(request(Trigger::Laps { count: 1 }, repeat(), &laps(0)));
+        let id = run.add(make(&laps(0)));
         let [cond] = run.condition_ids()[..] else {
             panic!("one condition")
         };
@@ -2935,7 +2915,7 @@ mod tests {
         // Its `until` while the turn answering it runs; the turn rewords it, the same `until`
         run.tick(with(laps(1), cond, ConditionState::True));
         run.schedule.answered(&batch.fired);
-        let replacing = request(Trigger::Laps { count: 1 }, repeat(), &laps(1));
+        let replacing = make(&laps(1));
         let applied = run.schedule.apply_answering(
             vec![Change::Replace(id, replacing)],
             &laps(1),
@@ -2948,12 +2928,9 @@ mod tests {
     #[test]
     fn a_stale_firing_on_the_step_its_until_is_reached_still_fires_the_last() {
         let mut run = Run::new();
-        let mut new = request(
-            Trigger::Laps { count: 1 },
-            Repeat::Every {
-                until: Some(Trigger::Laps { count: 5 }),
-            },
-            &laps(0),
+        let mut new = with_until(
+            request(Trigger::Laps { count: 1 }, Repeat::Every, &laps(0)),
+            Trigger::Laps { count: 5 },
         );
         new.stale_after = Some(Trigger::Laps { count: 1 });
         let id = run.add(new);
@@ -2970,12 +2947,9 @@ mod tests {
     #[test]
     fn a_last_firing_stale_at_once_ends_it() {
         let mut run = Run::new();
-        let mut new = request(
-            Trigger::Laps { count: 1 },
-            Repeat::Every {
-                until: Some(condition("SELECT 1")),
-            },
-            &laps(0),
+        let mut new = with_until(
+            request(Trigger::Laps { count: 1 }, Repeat::Every, &laps(0)),
+            condition("SELECT 1"),
         );
         new.stale_after = Some(condition("SELECT 2"));
         run.add(new);
@@ -2993,10 +2967,13 @@ mod tests {
     #[test]
     fn a_replace_after_its_until_was_reached_while_due_leaves_it_as_it_was() {
         let mut run = Run::new();
-        let repeat = || Repeat::Every {
-            until: Some(condition("SELECT 1")),
+        let make = |count, made: &Progress| {
+            with_until(
+                request(Trigger::Laps { count }, Repeat::Every, made),
+                condition("SELECT 1"),
+            )
         };
-        let id = run.add(request(Trigger::Laps { count: 1 }, repeat(), &laps(0)));
+        let id = run.add(make(1, &laps(0)));
         let [cond] = run.condition_ids()[..] else {
             panic!("one condition")
         };
@@ -3005,7 +2982,7 @@ mod tests {
         assert_eq!(run.due(), [id]);
         // Its `until` while the pilot's turn runs, which makes it every two laps
         run.tick(with(laps(1), cond, ConditionState::True));
-        let replacing = request(Trigger::Laps { count: 2 }, repeat(), &laps(1));
+        let replacing = make(2, &laps(1));
         let applied = run
             .schedule
             .apply(vec![Change::Replace(id, replacing)], &laps(1));
@@ -3203,12 +3180,9 @@ mod tests {
     #[test]
     fn pending_text_lists_requests_and_their_progress() {
         let mut run = Run::new();
-        let id = run.add(request(
-            Trigger::Laps { count: 1 },
-            Repeat::Every {
-                until: Some(Trigger::Laps { count: 5 }),
-            },
-            &laps(0),
+        let id = run.add(with_until(
+            request(Trigger::Laps { count: 1 }, Repeat::Every, &laps(0)),
+            Trigger::Laps { count: 5 },
         ));
         for lap in [1, 2] {
             run.tick(laps(lap));
@@ -3220,5 +3194,78 @@ mod tests {
         assert!(text.contains("2 of 5 laps"), "{text}");
         assert!(text.contains("every"), "{text}");
         assert_eq!(id.to_string(), format!("#{}", id.0));
+    }
+
+    #[test]
+    fn once_with_until_expires_silently_fires_before_until_and_counts_same_step() {
+        // 1. Expires silently when `until` triggers before `trigger`, and `pending_text` shows it
+        let mut run = Run::new();
+        let mut new = request(condition("SELECT 'rain'"), Repeat::Once, &laps(10));
+        new.until = Some(Trigger::Laps { count: 3 });
+        let id = run.add(new);
+        run.tick(laps(12));
+        assert!(run.schedule.pending_ids().contains(&id));
+        let text = run.schedule.pending_text(&laps(12));
+        assert!(text.contains("once, until after 3 laps"), "{text}");
+        assert!(text.contains("2 of 3 laps"), "{text}");
+        run.tick(laps(13));
+        assert!(run.schedule.pending_ids().is_empty());
+        assert!(run.due().is_empty());
+        assert!(run.schedule.take_batch(run.now + GATHER).is_none());
+
+        // 2. Fires once when `trigger` triggers before `until`
+        let mut run = Run::new();
+        let mut new = request(Trigger::Laps { count: 2 }, Repeat::Once, &laps(10));
+        new.until = Some(Trigger::Laps { count: 5 });
+        let id = run.add(new);
+        run.tick(laps(12));
+        assert_eq!(run.due(), [id]);
+        assert_eq!(run.answer(), [id]);
+        assert!(run.schedule.pending_ids().is_empty());
+        run.tick(laps(15));
+        assert!(run.due().is_empty());
+
+        // 3. Same-snapshot tie: both trigger and until reached together -> firing still counts
+        let mut run = Run::new();
+        let mut new = request(Trigger::Laps { count: 3 }, Repeat::Once, &laps(10));
+        new.until = Some(Trigger::Laps { count: 3 });
+        let id = run.add(new);
+        run.tick(laps(13));
+        assert_eq!(run.due(), [id]);
+        let batch = run.take();
+        assert_eq!(batch.requests.len(), 1);
+        run.schedule.answered(&batch.fired);
+        run.schedule.resolved(&batch.fired);
+        assert!(run.schedule.pending_ids().is_empty());
+
+        // 4a. Session `until` that missed a start ends cleanly on `Repeat::Once`
+        let mut run = Run::new();
+        run.tick(laps(0));
+        let made = laps(0);
+        run.tick(new_epoch(laps(0), 2, &["session"]));
+        let mut new = request(Trigger::Time { seconds: 10.0 }, Repeat::Once, &made);
+        new.until = Some(Trigger::Session { kind: None });
+        run.add(new);
+        run.tick(new_epoch(at(5.0, 0), 2, &[]));
+        assert_eq!(run.schedule.len(), 0);
+        assert!(run.due().is_empty());
+
+        // 4b. `Replace` keeping `until` on `Repeat::Once` preserves `made` baseline
+        let mut run = Run::new();
+        let mut new = request(condition("SELECT 'rain'"), Repeat::Once, &laps(10));
+        new.until = Some(Trigger::Laps { count: 5 });
+        let id = run.add(new);
+        run.tick(laps(12));
+        let mut replacement = request(condition("SELECT 'wet'"), Repeat::Once, &laps(12));
+        replacement.until = Some(Trigger::Laps { count: 5 });
+        let applied = run
+            .schedule
+            .apply(vec![Change::Replace(id, replacement)], &laps(12));
+        assert_eq!(applied.ids, [id]);
+        run.tick(laps(14));
+        assert_eq!(run.schedule.pending_ids(), [id]);
+        run.tick(laps(15));
+        assert!(run.schedule.pending_ids().is_empty());
+        assert!(run.due().is_empty());
     }
 }
