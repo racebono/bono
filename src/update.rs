@@ -220,6 +220,9 @@ pub async fn check(client: &reqwest::Client) -> anyhow::Result<Option<Release>> 
     pick_nightly(&releases, commit)
 }
 
+/// What versions up to 0.2.0 ran speech to text with. Updates leave files that the new version doesn't
+/// have, so they're removed here. It can go once nobody updates from a version with them.
+const CUDA_RUNTIMES: [&str; 3] = ["cudart64_13.dll", "cublas64_13.dll", "cublasLt64_13.dll"];
 /// Held by the app updating an installation, so another one running from it leaves its
 /// downloads alone.
 const LOCK: &str = "lock";
@@ -333,9 +336,18 @@ impl Staging {
         Ok(())
     }
 
-    /// Removes every download but `latest`'s unpacked one, returning whether that one's there.
-    /// Blocks.
+    /// Removes every download but `latest`'s unpacked one, returning whether that one's there, and what
+    /// older versions left in the installation. Blocks.
     pub fn tidy(&self, latest: Option<&Release>) -> bool {
+        for name in CUDA_RUNTIMES {
+            let path = self.install.join(name);
+            match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    log::warn!("Unable to remove {}: {e}", path.display());
+                }
+                _ => {}
+            }
+        }
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
@@ -700,6 +712,26 @@ mod tests {
         assert!(!staging.tidy(Some(&staged("v0.3.0"))));
         assert_eq!(std::fs::read_dir(&staging.dir).unwrap().count(), 1);
         assert!(!staging.tidy(None));
+    }
+
+    #[test]
+    fn tidying_removes_the_cuda_runtimes_of_older_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = Staging::at(dir.path());
+        staging.claim().unwrap();
+        let others = ["DirectML.dll", "cublas64_12.dll"];
+        for name in CUDA_RUNTIMES.iter().chain(&others) {
+            std::fs::write(dir.path().join(name), name).unwrap();
+        }
+        staging.tidy(None);
+        for name in CUDA_RUNTIMES {
+            assert!(!dir.path().join(name).exists(), "{name}");
+        }
+        for name in others {
+            assert!(dir.path().join(name).exists(), "{name}");
+        }
+        // And again, with none left
+        staging.tidy(None);
     }
 
     #[test]
