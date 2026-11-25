@@ -48,21 +48,19 @@ test run. Report which tests you ran.
 
 ## Test features
 
-Run tests with the `cuda` and `vulkan` features disabled unless the changes
-involve those features or their backend behavior. Both are enabled by default,
-so use `just test` for ordinary application tests: it builds the phonemizer and
-runs `cargo test -p bono --no-default-features`, passing any extra arguments on
-(for example `just test synthesizer -- --nocapture`). Prefer it over other
-commands, so every worktree builds the same dependencies and the build slots
-(below) stay warm.
+Run tests with the `vulkan` feature disabled unless the changes involve that
+feature or its backend behavior. It's enabled by default, so use `just test` for
+ordinary application tests: it builds the phonemizer and runs
+`cargo test -p bono --no-default-features`, passing any extra arguments on (for
+example `just test synthesizer -- --nocapture`). Prefer it over other commands,
+so every worktree builds the same dependencies and the build slots (below) stay
+warm.
 If other features are needed, enable them explicitly with `--features` while
-keeping CUDA and Vulkan disabled.
+keeping Vulkan disabled.
 
-When changes involve CUDA or Vulkan, also run relevant tests with the affected
-feature explicitly enabled, for example
-`just slot cargo test -p bono --no-default-features --features vulkan` (or
-`cuda`, or `cuda,vulkan` when both are involved). Report any missing SDK or
-hardware that prevents the relevant validation.
+When changes involve Vulkan, also run relevant tests with it explicitly enabled,
+for example `just slot cargo test -p bono --no-default-features --features vulkan`.
+Report any missing SDK or hardware that prevents the relevant validation.
 
 ## Windows build and test paths
 

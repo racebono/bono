@@ -1,7 +1,7 @@
 use crate::{
     Download,
     app::topbar::{
-        audio::{RecordingStream, SetupItem, SetupState},
+        audio::{Deletion, RecordingStream, SetupItem, SetupState, gpu, scroll_bar_beside},
         setup_label, size_text,
     },
     arrstr,
@@ -9,6 +9,7 @@ use crate::{
     config::{ArrayStr, Config, RawConfig},
     engineer::{Heard, NotListening},
     error,
+    synthesizer::phonemizer,
     task::{JoinHandle, MaybeDone, spawn, spawn_blocking},
     updating,
 };
@@ -48,8 +49,7 @@ pub const RECORDING_SPEC: AudioSpec = AudioSpec {
 };
 
 /// Whether Bono was built with a backend that runs whisper on a GPU
-const GPU_BACKEND: bool = cfg!(any(
-    feature = "cuda",
+pub(super) const GPU_BACKEND: bool = cfg!(any(
     feature = "hipblas",
     feature = "intel-sycl",
     feature = "vulkan",
@@ -127,8 +127,10 @@ impl Whisper {
         files: super::ModelFiles,
     ) -> Self {
         let pref_path = pref_path.clone();
+        // Half the logical cores. Whisper's threads wait for each other at every step, so once there
+        // are too few cores for them and the simulator, transcribing takes many times longer
         let threads = threads
-            .or_else(|| std::thread::available_parallelism().ok())
+            .or_else(|| NonZeroUsize::new(std::thread::available_parallelism().ok()?.get() / 2))
             .unwrap_or(NonZeroUsize::MIN);
 
         let mut this = Self {
@@ -183,6 +185,7 @@ impl Whisper {
             return;
         }
         let mut reload = None;
+        let mut deleted_recommended = false;
         let catalog = self.catalog_mut(rt);
         ui.add_enabled_ui(catalog.is_some(), |ui| {
             ui.menu_button(label, |ui| {
@@ -215,6 +218,7 @@ impl Whisper {
                 }
                 ui.separator();
 
+                scroll_bar_beside(ui);
                 egui_extras::TableBuilder::new(ui)
                     .id_salt("whisper-models")
                     .striped(true)
@@ -263,14 +267,18 @@ impl Whisper {
                                         }
                                     });
 
-                                    if let Some(on_disk) = model.on_disk() {
+                                    let on_disk = model.on_disk(rt);
+                                    if model.deletion.pending() {
                                         row.col(|ui| {
-                                            if on_disk {
-                                                ui.add_enabled_ui(
-                                                    config.whisper_model().as_ref()
-                                                        != Some(&model.path)
-                                                        || failed,
-                                                    |ui| {
+                                            ui.spinner();
+                                        });
+                                    } else if let Some(on_disk) = on_disk {
+                                        row.col(|ui| {
+                                            if on_disk && model.download().is_none() {
+                                                let used = config.whisper_model().as_ref()
+                                                    == Some(&model.path);
+                                                ui.horizontal(|ui| {
+                                                    ui.add_enabled_ui(!used || failed, |ui| {
                                                         if ui.button(t!("audio.use")).clicked() {
                                                             config
                                                                 .whisper_model
@@ -278,8 +286,12 @@ impl Whisper {
                                                             reload = Some(model.path.clone());
                                                             updated = true;
                                                         }
-                                                    },
-                                                );
+                                                    });
+                                                    if model.delete_button(ui, used) {
+                                                        deleted_recommended |=
+                                                            model.file == RECOMMENDED;
+                                                    }
+                                                });
                                             } else if let Some(download) = model.download() {
                                                 egui::ProgressBar::new(download.progress() as f32)
                                                     .show_percentage()
@@ -299,6 +311,10 @@ impl Whisper {
                     });
             });
         });
+        // Setup doesn't get it again
+        if deleted_recommended {
+            self.setup = false;
+        }
         if let Some(path) = reload {
             // A model picked by hand is what's used, whatever setup was getting
             self.setup = false;
@@ -472,7 +488,7 @@ impl Whisper {
             self.setup = false;
             return;
         }
-        match model.on_disk() {
+        match model.on_disk(rt) {
             Some(true) => {
                 let path = model.path.clone();
                 if let Some(picked) = picked.as_ref().filter(|picked| **picked != path) {
@@ -523,7 +539,7 @@ impl Whisper {
         let model = match self.catalog.update(rt) {
             None => return unusable.then_some(SetupItem::Loading),
             Some(None) => return unusable.then_some(SetupItem::Unavailable),
-            Some(Some(catalog)) => catalog.iter().find(|model| model.file == RECOMMENDED)?,
+            Some(Some(catalog)) => (catalog.iter_mut()).find(|model| model.file == RECOMMENDED)?,
         };
         if !setup
             && !failed
@@ -534,7 +550,7 @@ impl Whisper {
             return None;
         }
 
-        let state = match (model.on_disk(), model.download()) {
+        let state = match (model.on_disk(rt), model.download()) {
             (Some(true), _) if failed && picked.as_ref() == Some(&model.path) => {
                 SetupState::LoadFailed
             }
@@ -565,6 +581,12 @@ impl Whisper {
         matches!(self.ctx, Some(MaybeDone::Done(None)))
     }
 
+    /// Whether a model is still being deleted.
+    pub fn deleting(&self) -> bool {
+        matches!(&self.catalog, MaybeDone::Done(Some(catalog))
+            if catalog.iter().any(|model| model.deletion.running()))
+    }
+
     fn loading(&self) -> bool {
         matches!(self.ctx, Some(MaybeDone::Task(_)))
     }
@@ -579,15 +601,34 @@ impl Whisper {
         self.ctx = Some(MaybeDone::spawn_blocking(move || {
             let mut params = WhisperContextParameters::default();
             params.use_gpu(gpu);
+            let gpu = if gpu { gpu::choose() } else { None };
+            params.gpu_device(gpu.as_ref().map_or(0, |gpu| gpu.device));
+            // Off on the CPU, where it's a little slower
+            let flash = gpu.as_ref().is_some_and(|gpu| gpu.flash);
+            params.flash_attn(flash);
             match WhisperContext::new_with_params(path.as_os_str(), params) {
                 Ok(ctx) => {
-                    log::info!("Loaded {path} for speech to text (GPU: {gpu})");
-                    Some(Arc::new(WhisperModel {
+                    let gpu = gpu.map_or("none".to_owned(), |gpu| gpu.name);
+                    log::info!(
+                        "Loaded {path} for speech to text (GPU: {gpu}, flash attention: {flash})"
+                    );
+                    let model = Arc::new(WhisperModel {
                         ctx,
                         session: SessionCache::default(),
                         latest: AtomicU64::new(0),
                         threads,
-                    }))
+                    });
+                    if flash {
+                        let model = Arc::downgrade(&model);
+                        // Not part of loading, as questions are refused until that's done. Nor for
+                        // a model that was replaced while it loaded
+                        Handle::current().spawn_blocking(move || {
+                            if let Some(model) = model.upgrade() {
+                                model.warm_up();
+                            }
+                        });
+                    }
+                    Some(model)
                 }
                 Err(e) => {
                     error(t!("error.stt_model"), e);
@@ -703,6 +744,33 @@ struct WhisperModel {
     session: SessionCache<WhisperSession>,
     latest: AtomicU64,
     threads: NonZeroUsize,
+}
+
+impl WhisperModel {
+    /// Transcribes a second of silence. The driver builds its shaders the first time after installing
+    /// Bono or the driver, which takes seconds that the first question would wait for.
+    fn warm_up(&self) {
+        let start = Instant::now();
+        let silence = self.session.run(
+            || self.new_session(),
+            |session| session.speech_to_text(arrstr!("en"), &[0.0; 16000]),
+        );
+        match silence {
+            Ok(_) => log::debug!("Warmed up speech to text in {:?}", start.elapsed()),
+            Err(e) => log::warn!("Unable to warm up speech to text: {e}"),
+        }
+    }
+
+    fn new_session(&self) -> anyhow::Result<WhisperSession> {
+        let start = Instant::now();
+        let state = self.ctx.create_state()?;
+        log::debug!("Created whisper's state in {:?}", start.elapsed());
+        Ok(WhisperSession {
+            state,
+            threads: self.threads,
+            multilingual: self.ctx.is_multilingual(),
+        })
+    }
 }
 
 /// Access only on blocking workers: initialization, use and destruction can all be expensive.
@@ -830,14 +898,7 @@ impl PendingSession {
             model.session.run(
                 || {
                     anyhow::ensure!(model.latest.load(Ordering::Relaxed) == ticket, "Superseded recording");
-                    let start = Instant::now();
-                    let state = model.ctx.create_state()?;
-                    log::debug!("Created whisper's state in {:?}", start.elapsed());
-                    Ok(WhisperSession {
-                        state,
-                        threads: model.threads,
-                        multilingual: model.ctx.is_multilingual(),
-                    })
+                    model.new_session()
                 },
                 |session| {
                     if model.latest.load(Ordering::Relaxed) != ticket {
@@ -913,7 +974,7 @@ impl WhisperSession {
     /// What was said in `lang`: empty if it's no words.
     fn speech_to_text(&mut self, lang: ArrayStr<2>, samples: &[f32]) -> anyhow::Result<String> {
         // Use greedy decoding on both CPU and GPU, keeping the default full audio
-        // context and temperature fallback.
+        // context and temperature fallback. A shorter context makes turbo repeat what was said.
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
         params.set_n_threads(c_int::try_from(self.threads.get()).unwrap_or(c_int::MAX));
@@ -1240,14 +1301,35 @@ pub struct Model {
     pub sha256: Option<String>,
     pub file: String,
     pub path: Arc<Utf8Path>,
-    on_disk: tokio::sync::watch::Receiver<Option<bool>>,
+    /// Whether it's on disk, and when that check started
+    on_disk: tokio::sync::watch::Receiver<Option<(bool, Instant)>>,
     download: Option<Download>,
+    deletion: Deletion,
 }
 
 impl Model {
-    #[inline]
-    pub fn on_disk(&self) -> Option<bool> {
-        *self.on_disk.borrow()
+    /// Whether it's on disk: `None` until it's been checked, and while it's deleted.
+    pub fn on_disk(&mut self, rt: &Handle) -> Option<bool> {
+        let found = *self.on_disk.borrow();
+        self.deletion.on_disk(rt, found)
+    }
+
+    /// The button to delete it, unless it's `used`. Returns whether it was clicked.
+    fn delete_button(&mut self, ui: &mut egui::Ui, used: bool) -> bool {
+        let size = self.size.map_or("?".into(), size_text);
+        let clicked = ui
+            .add_enabled(!used, egui::Button::new(egui_phosphor::bold::TRASH))
+            .on_hover_text(t!("audio.delete", size = size))
+            .on_disabled_hover_text(t!("audio.delete_in_use"))
+            .clicked();
+        if clicked {
+            self.download = None;
+            let path = self.path.as_std_path().to_path_buf();
+            // The phonemizer inherited the file if it was started while whisper was reading it, and
+            // keeps it open
+            self.deletion.start(phonemizer::stop, vec![path]);
+        }
+        clicked
     }
 
     /// The download under way: `None` if there's none, it failed, or it's done.
@@ -1328,7 +1410,8 @@ impl Model {
                 continue;
             };
 
-            if name.contains('/') {
+            // Only files in its own folder
+            if name.contains(['/', '\\']) {
                 continue;
             }
 
@@ -1365,9 +1448,11 @@ impl Model {
                 path: path.clone(),
                 on_disk: updating(Duration::from_millis(1234), None, move |_| {
                     let path = path.clone();
-                    async move { tokio::fs::try_exists(&*path).await.ok() }
+                    let started = Instant::now();
+                    async move { Some((tokio::fs::try_exists(&*path).await.ok()?, started)) }
                 }),
                 download: None,
+                deletion: Deletion::default(),
             });
         }
 
