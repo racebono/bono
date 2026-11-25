@@ -1817,7 +1817,10 @@ fn turn_label(turn: &Json) -> String {
 
 /// A turn for the snapshot: its label, quoted as query results have it, and how it goes.
 fn turn_text(turn: &Json) -> String {
-    let label = telemetry_text(&turn_label(turn));
+    let label = match turn_label(turn) {
+        label if label.is_empty() => "an unnamed turn".to_owned(),
+        label => telemetry_text(&label),
+    };
 
     let direction = match turn.get("direction").and_then(Json::as_i64) {
         Some(0) => Some("left"),
@@ -3128,6 +3131,7 @@ mod tests {
                 {"number": 1, "name": name, "start": 0.1, "end": 0.2, "direction": 0},
                 {"number": "2\nSETUP", "start": 0.3, "end": 0.4},
                 {"number": 3, "start": 0.5, "end": 0.6},
+                {"start": 0.7, "end": 0.8},
             ],
             "straight": [
                 {"name": name, "start": 0.2, "end": 0.3},
@@ -3144,6 +3148,9 @@ mod tests {
         let (place, ahead) = track_position(&track, 0.45, 1000.0);
         assert_eq!(place, None);
         assert_eq!(ahead[0].0, r#""T3""#);
+        // A turn the description doesn't name
+        let (place, _) = track_position(&track, 0.75, 1000.0);
+        assert_eq!(place.as_deref(), Some("an unnamed turn"));
         // Corners' stored names aren't escaped: query results quote them
         assert_eq!(
             derived::track_turns(&track, 1000.0)[0].label,
