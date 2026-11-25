@@ -129,7 +129,7 @@ FROM telemetry WHERE vehicle_id = :P AND id > (SELECT MAX(session_first_id - 1, 
 
 ### Raw recording tables
 
-For sample-by-sample detail, or anything the tables above lack (push to pass, DRS, control maximums) before saying it isn't reported, beyond the 20-second incident query above (`telemetry`: `session_time`, `lap_distance`, `speed`, `throttle`, `brake`, `steering`, `yaw_rate`, `velocity_lateral`), call `engineer(command="schema")` — optionally filtered by `table` (`telemetry`, `telemetry_wheel`, `car_state`, or `scoring`) — before querying. Filter `telemetry` by `id` (`first_id..last_id` or `id > MAX(session_first_id - 1, latest_telemetry_id - N)`) and `vehicle_id`; `schema` says how for `telemetry_wheel` and `car_state`. Other tables number their rows separately: start from the ids in the comment above each SQL result.
+For sample-by-sample detail, or anything the tables above lack (push to pass, DRS, control maximums, when a cockpit setting changed) before saying it isn't reported, beyond the 20-second incident query above (`telemetry`: `session_time`, `lap_distance`, `speed`, `throttle`, `brake`, `steering`, `yaw_rate`, `velocity_lateral`), call `engineer(command="schema")` — optionally filtered by `table` (`telemetry`, `telemetry_wheel`, `car_state`, or `scoring`) — before querying. Filter `telemetry` by `id` (`first_id..last_id` or `id > MAX(session_first_id - 1, latest_telemetry_id - N)`) and `vehicle_id`; `schema` says how for `telemetry_wheel` and `car_state`. Other tables number their rows separately: start from the ids in the comment above each SQL result.
 
 ## Evidence that fits the question
 
