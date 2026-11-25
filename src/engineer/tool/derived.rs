@@ -1264,6 +1264,8 @@ struct LapBuild {
     start: Option<f64>,
     invalid: bool,
     pit: bool,
+    /// Under a full course yellow at some point, known once it's over
+    caution: bool,
     top_speed: Option<f64>,
     fuel_start: Option<f64>,
     energy_start: Option<f64>,
@@ -1310,6 +1312,7 @@ impl LapBuild {
             start: None,
             invalid: false,
             pit: false,
+            caution: false,
             top_speed: None,
             fuel_start: sample.fuel,
             energy_start: sample.energy,
@@ -1412,6 +1415,18 @@ impl LapBuild {
                 self.top = self.top.max(d);
             }
         }
+    }
+
+    /// Whether any of it was driven during one of `cautions` (see `Stream::cautions`).
+    fn overlaps(&self, cautions: &[(f64, f64)]) -> bool {
+        let mut times = self.samples.iter().filter_map(|s| s.session_time);
+        let Some(first) = times.next() else {
+            return false;
+        };
+        let last = times.next_back().unwrap_or(first);
+        cautions
+            .iter()
+            .any(|(from, until)| *from < last && *until > first)
     }
 
     /// How long it took, when it ended and what it used, `next` being the lap after it (if it's
@@ -1653,7 +1668,12 @@ impl LapBuild {
             refuelled,
             contact: impact.is_some_and(|impact| impact > 0.0) && impact != previous_impact,
             // A pit lap is an in or out lap: the pit lane flag was set at some point during the lap
-            green: next_lap && seen_from_the_start && !extended && !self.pit && !refuelled,
+            green: next_lap
+                && seen_from_the_start
+                && !extended
+                && !self.pit
+                && !self.caution
+                && !refuelled,
             impact,
             track_limit_steps: state
                 .as_ref()
@@ -2932,8 +2952,12 @@ pub(super) struct Stream {
     /// How many laps the player had when braking zones were last looked for (car and laps)
     zones_from: Option<(i64, usize)>,
     /// The braking zones are a fallback, from a lap that isn't a pace reference (invalidated,
-    /// or a run to the line and a circuit): replaced when a clean green lap's are available.
+    /// under caution, or a run to the line and a circuit): replaced when a clean green lap's are
+    /// available.
     zones_from_fallback: bool,
+    session_cursor: i64,
+    /// The epoch's full course yellows: from when until when, the one still on until infinity
+    cautions: Vec<(f64, f64)>,
     standings_cursor: i64,
     standings_t: Option<f64>,
     /// The standings' laps completed, by car, and when that last changed
@@ -2971,6 +2995,7 @@ impl Stream {
         let epoch = active_epoch(conn)?;
         if !self.started {
             self.epoch = epoch;
+            self.session_cursor = epoch.session_from - 1;
             self.standings_cursor = epoch.standings_from - 1;
             self.session_start = session_start(conn, epoch.telemetry_from)?;
             self.cursor = self.session_start - 1;
@@ -3003,6 +3028,7 @@ impl Stream {
             ))?
             .query_map(params![self.cursor, CHUNK], sample)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        self.read_cautions(conn)?;
         let standings_from = self.standings_cursor;
         let standings_behind = match self.read_standings(conn) {
             Ok(behind) => behind,
@@ -3132,6 +3158,8 @@ impl Stream {
         // Read before anything changes: failing, it's tried again next tick
         let start = session_start(conn, epoch.telemetry_from)?;
         self.epoch = epoch;
+        self.session_cursor = epoch.session_from - 1;
+        self.cautions.clear();
         self.standings_cursor = epoch.standings_from - 1;
         self.standings_t = None;
         self.laps_completed.clear();
@@ -3147,6 +3175,32 @@ impl Stream {
         self.checked_layout = None;
         self.timing = None;
         self.start_session(conn, start)
+    }
+
+    /// Reads the session's new rows for when the full course yellows were. All of them at once (a
+    /// row only comes as something changes): the telemetry's laps can be told with them.
+    fn read_cautions(&mut self, conn: &Connection) -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, session_time, full_course_yellow <> 'none' OR phase = 'full_course_yellow' \
+             FROM session WHERE id > ? AND session_time IS NOT NULL ORDER BY id",
+        )?;
+        let mut rows = stmt.query([self.session_cursor])?;
+        while let Some(row) = rows.next()? {
+            let t = row.get::<_, f64>(1)?;
+            // NULL: the simulator doesn't say
+            let caution = row.get::<_, Option<bool>>(2)?.unwrap_or(false);
+            self.session_cursor = row.get(0)?;
+            // The clock going back: another session's
+            if self.cautions.last().is_some_and(|(from, _)| t < from - 1.0) {
+                self.cautions.clear();
+            }
+            match self.cautions.last_mut().filter(|last| last.1.is_infinite()) {
+                Some(on) if !caution => on.1 = t,
+                None if caution => self.cautions.push((t, f64::INFINITY)),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Reads the standings' new rows for official lap times and who's driving. Whether there are
@@ -3462,6 +3516,7 @@ impl Stream {
             drivers,
             stint_ids,
             opening_lap,
+            cautions,
             ..
         } = self;
         let writer = Writer {
@@ -3507,7 +3562,10 @@ impl Stream {
                 .as_ref()
                 .is_none_or(|current| current.lap != lap)
             {
-                let current = car.current.take();
+                let mut current = car.current.take();
+                if let Some(ended) = &mut current {
+                    ended.caution = ended.overlaps(cautions);
+                }
                 // Its lap 1 over, nothing can replay it now: what it showed of the session's counting
                 // holds for good
                 if let Some(current) = current
@@ -9857,6 +9915,126 @@ mod tests {
         let mut stale = whole.clone();
         stale[0].lap_distance = Some(1999.0);
         assert!(lap(2, 3, &stale).green);
+    }
+
+    /// Which of three laps of 33.3 s are green, with the session's rows (time,
+    /// `full_course_yellow`, `phase`).
+    fn green_laps(session: &[(f64, Option<&str>, &str)]) -> Vec<bool> {
+        let samples = driven(
+            0.0,
+            &[
+                (1, 1995.0, &|_, _| Some(0.0)),
+                (2, 3995.0, &|_, _| Some(2000.0 / 60.0)),
+                (3, 5995.0, &|_, _| Some(4000.0 / 60.0)),
+                (4, 6300.0, &|_, _| Some(6000.0 / 60.0)),
+            ],
+        );
+        let (conn, mut stream) = stream_with(vec![]);
+        for row in session {
+            conn.execute(
+                "INSERT INTO session (session_time, full_course_yellow, phase) VALUES (?, ?, ?)",
+                params![row.0, row.1, row.2],
+            )
+            .unwrap();
+        }
+        stream.read_cautions(&conn).unwrap();
+        for chunk in samples.chunks(100) {
+            stream.apply_telemetry(&conn, chunk).unwrap();
+        }
+        let laps = stream.cars[&1].laps(&conn, 1).unwrap();
+        laps[..3].iter().map(|lap| lap.green).collect()
+    }
+
+    #[test]
+    fn a_lap_under_a_full_course_yellow_is_not_green() {
+        let none = (0.0, Some("none"), "green");
+        assert_eq!(green_laps(&[]), [true; 3]);
+        assert_eq!(green_laps(&[none]), [true; 3]);
+        // A simulator that doesn't say
+        assert_eq!(green_laps(&[(0.0, None, "green")]), [true; 3]);
+        let on = |t, state| (t, Some(state), "green");
+        // Within a lap, whatever its state
+        for state in ["pending", "pits_closed", "resume", "race_halt"] {
+            let rows = [none, on(50.0, state), on(60.0, "none")];
+            assert_eq!(green_laps(&rows), [true, false, true], "{state}");
+        }
+        // Through its states, and other changes meanwhile, into the next lap
+        let rows = [
+            none,
+            on(50.0, "pending"),
+            on(55.0, "pits_open"),
+            on(60.0, "pits_open"),
+            on(80.0, "resume"),
+            on(85.0, "none"),
+            on(90.0, "none"),
+        ];
+        assert_eq!(green_laps(&rows), [true, false, false]);
+        // Still on, without a row during the laps after it's called
+        assert_eq!(green_laps(&[none, on(30.0, "pending")]), [false; 3]);
+        // Two: one over as lap 2 starts, the other from when lap 3 does
+        let rows = [
+            on(10.0, "pending"),
+            on(2000.0 / 60.0, "none"),
+            on(4000.0 / 60.0, "pending"),
+        ];
+        assert_eq!(green_laps(&rows), [false, true, false]);
+        // Only the phase says
+        let rows = [
+            (0.0, None, "green"),
+            (50.0, None, "full_course_yellow"),
+            (60.0, None, "green"),
+        ];
+        assert_eq!(green_laps(&rows), [true, false, true]);
+        // An earlier session's, in a recording without epochs
+        assert_eq!(green_laps(&[none, on(50.0, "pending"), none]), [true; 3]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn caution_laps_are_left_out_of_the_stints_baseline() {
+        use bono_sim::sql::{EpochReason, begin_epoch};
+        let (dir, engineer) = race();
+        let mut conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        let session = |conn: &Connection, t: f64, yellow: &str| {
+            conn.execute(
+                "INSERT INTO session (session_time, session_type, full_course_yellow) \
+                 VALUES (?, 'race', ?)",
+                params![t, yellow],
+            )
+            .unwrap();
+        };
+        let green = "SELECT lap, green FROM lap_stats WHERE vehicle_id = 1 AND complete = 1";
+        // Called after its last lap, and still on as its epoch ends
+        session(&conn, 305.0, "pending");
+        assert_eq!(
+            query(&engineer, green).await,
+            [["1", "1"], ["2", "1"], ["3", "1"]]
+        );
+
+        // The same laps in the next one, at 2 L each but the second, under caution, at 1 L
+        let tx = conn.transaction().unwrap();
+        begin_epoch(&tx, i64::MAX, EpochReason::Session).unwrap();
+        session(&tx, 0.0, "none");
+        session(&tx, 110.0, "pending");
+        session(&tx, 190.0, "none");
+        tx.execute_batch(
+            "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, lap_start_time, \
+                 lap_distance, speed, fuel) \
+             SELECT vehicle_id, vehicle_id = 1, session_time, lap, lap_start_time, lap_distance, \
+                 speed, 60 - 0.02 * session_time \
+                     + 0.01 * max(0, min(session_time, 200) - 100) \
+             FROM telemetry ORDER BY id;
+             INSERT INTO standings (session_time, vehicle_id, is_player, position, laps_completed) \
+             VALUES (310, 1, 1, 1, 3);",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            query(&engineer, green).await,
+            [["1", "1"], ["2", "0"], ["3", "1"]]
+        );
+        let baseline =
+            "SELECT baseline_laps, round(fuel_per_lap_l, 6) FROM stints WHERE vehicle_id = 1";
+        assert_eq!(query(&engineer, baseline).await, [["2", "2"]]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
