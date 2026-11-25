@@ -77,15 +77,12 @@ pub struct Whisper {
     choosing: bool,
     /// Whether `ctx` was loaded to run on the GPU
     loaded_gpu: bool,
-    /// The setup guide asked for the recommended model: it's downloaded, then used once it's on
-    /// disk (unless another was picked meanwhile)
+    /// The setup guide asked for the model Automatic wants: it's downloaded, unless a model is
+    /// picked, and used by Automatic once it's on disk
     setup: bool,
-    /// The setup's download was started: one that fails isn't started again until it's asked
-    /// for again
-    setup_started: bool,
-    /// When setup first found the recommended model ready to replace the picked one: it waits for
-    /// a check of the picked one's file started since, so a stale result doesn't replace it
-    replace_since: Option<Instant>,
+    /// The engine whose download setup started: one that fails isn't started again until it's
+    /// asked for again
+    setup_started: Option<Engine>,
     stream: Option<WhisperStream>,
     /// The joystick whose talk button started the recording: unplugging it means the release
     /// never comes
@@ -153,8 +150,7 @@ impl Whisper {
             choosing: false,
             loaded_gpu: *config.whisper_gpu(),
             setup: false,
-            setup_started: false,
-            replace_since: None,
+            setup_started: None,
             stream: None,
             talk_joystick: None,
             catalog: Self::fetch_catalog(pref_path.clone(), client.clone(), 3),
@@ -625,44 +621,34 @@ impl Whisper {
         if !self.setup {
             return;
         }
-        let picked = config.get().whisper_model().clone();
-        // Wait until the picked model's file is checked before deciding to keep it
-        let on_disk = match picked.as_ref().map(|path| self.files.checked(path)) {
-            Some(None) => return,
-            Some(Some(on_disk)) => on_disk,
-            None => false,
-        };
-        let usable = on_disk && !self.failed();
-        let client = self.client.clone();
-        let started = self.setup_started;
-        let Some(model) = self.recommended(rt) else {
-            return;
-        };
-        if usable && (!started || picked.as_ref() != Some(&model.path)) {
+        // A model picked by hand is what's used: the guide unpicks the ones it shouldn't keep
+        if config.get().whisper_model().is_some() {
             self.setup = false;
             return;
         }
-        match model.on_disk(rt) {
-            Some(true) => {
-                let path = model.path.clone();
-                if let Some(picked) = picked.as_ref().filter(|picked| **picked != path) {
-                    let since = *self.replace_since.get_or_insert_with(Instant::now);
-                    match self.files.checked_since(picked, Some(since)) {
-                        None => return,
-                        Some(true) if !self.failed() => {
-                            self.setup = false;
-                            return;
+        let wanted = self.wanted(&config.get(), getting).0;
+        let start = self.setup_started != Some(wanted);
+        let client = self.client.clone();
+        let on_disk = match wanted {
+            Engine::Parakeet => self.parakeet.on_disk(&self.files),
+            Engine::Whisper => match self.recommended(rt) {
+                Some(model) => model.on_disk(rt),
+                None => return,
+            },
+        };
+        match on_disk {
+            // Automatic uses it
+            Some(true) => self.setup = false,
+            Some(false) if start => {
+                match wanted {
+                    Engine::Parakeet => self.parakeet.start_download(&client, &self.files),
+                    Engine::Whisper => {
+                        if let Some(model) = self.recommended(rt) {
+                            model.start_download(&client);
                         }
-                        Some(_) => {}
                     }
                 }
-                config.update(|raw| raw.whisper_model.set(Some(path.clone())));
-                self.set_model(path, *config.get().whisper_gpu());
-                self.setup = false;
-            }
-            Some(false) if !started => {
-                model.start_download(&client);
-                self.setup_started = true;
+                self.setup_started = Some(wanted);
             }
             Some(false) => {}
             // Not looked for yet
@@ -670,59 +656,72 @@ impl Whisper {
         }
     }
 
-    /// Downloads the recommended model (again, if it failed), and uses it once it's on disk, if
-    /// none is usable by then.
+    /// Downloads the model Automatic wants (again, if it failed), unless a model is picked.
     pub fn setup(&mut self) {
         self.retry_catalog();
         self.setup = true;
-        self.setup_started = false;
-        self.replace_since = None;
+        self.setup_started = None;
     }
 
-    /// The recommended model, as the setup guide shows it: `None` if another is picked.
-    pub fn setup_item(&mut self, rt: &Handle, config: &Config) -> Option<SetupItem> {
-        let picked = config.get().whisper_model().clone();
-        let setup = self.setup;
-        let failed = self.failed();
-        // The model being loaded
-        let loading = self.loaded.clone().filter(|_| self.loading());
-        let unusable = failed
-            || picked
-                .as_ref()
-                .is_none_or(|picked| !self.files.is_file(picked));
-        let model = match self.catalog.update(rt) {
-            None => return unusable.then_some(SetupItem::Loading),
-            Some(None) => return unusable.then_some(SetupItem::Unavailable),
-            Some(Some(catalog)) => (catalog.iter_mut()).find(|model| model.file == RECOMMENDED)?,
+    /// The model of `engine`, as the setup guide shows it: `None` for none, when the model picked
+    /// stays.
+    pub fn setup_item(&mut self, rt: &Handle, engine: Option<Engine>) -> Option<SetupItem> {
+        let engine = engine?;
+        let (failed, loading, loaded) = (self.failed(), self.loading(), self.loaded.clone());
+        let state = |path: &Arc<Utf8Path>, on_disk, progress, download_failed| {
+            let used = loaded.as_ref() == Some(path);
+            match (on_disk, progress) {
+                (Some(true), _) if used && failed => SetupState::LoadFailed,
+                (Some(true), _) if used && loading => SetupState::Loading,
+                (Some(true), _) => SetupState::Ready,
+                (_, Some(progress)) => SetupState::Downloading(progress),
+                _ if download_failed => SetupState::Failed,
+                _ => SetupState::Missing,
+            }
         };
-        if !setup
-            && !failed
-            && picked
-                .as_ref()
-                .is_some_and(|picked| *picked != model.path && self.files.is_file(picked))
-        {
-            return None;
-        }
-
-        let state = match (model.on_disk(rt), model.download()) {
-            (Some(true), _) if failed && picked.as_ref() == Some(&model.path) => {
-                SetupState::LoadFailed
+        let (name, size, state) = match engine {
+            Engine::Parakeet => {
+                let on_disk = self.parakeet.on_disk(&self.files);
+                let (progress, download_failed) = (self.parakeet.progress(), self.parakeet.failed());
+                let state = state(self.parakeet.model(), on_disk, progress, download_failed);
+                (parakeet::NAME, Some(parakeet::SIZE), state)
             }
-            // On disk but not used, and setup isn't going to: retrying uses it
-            (Some(true), _) if !setup && picked.as_ref() != Some(&model.path) => {
-                SetupState::Missing
+            Engine::Whisper => {
+                let path = self.turbo();
+                let on_disk = self.files.checked(&path);
+                match self.catalog.update(rt) {
+                    Some(Some(catalog)) => {
+                        let model = (catalog.iter_mut()).find(|model| model.file == RECOMMENDED)?;
+                        let progress = model.download().map(Download::progress);
+                        let state = state(&path, model.on_disk(rt), progress, model.failed());
+                        (TURBO_NAME, model.size, state)
+                    }
+                    // It's only downloaded with the catalog's size and hash
+                    _ if on_disk != Some(true) => {
+                        return Some(match self.catalog.update(rt) {
+                            None => SetupItem::Loading,
+                            Some(_) => SetupItem::Unavailable,
+                        });
+                    }
+                    _ => (TURBO_NAME, None, state(&path, on_disk, None, false)),
+                }
             }
-            (Some(true), _) if loading.as_ref() == Some(&model.path) => SetupState::Loading,
-            (Some(true), _) => SetupState::Ready,
-            (_, Some(download)) => SetupState::Downloading(download.progress()),
-            _ if model.failed() => SetupState::Failed,
-            _ => SetupState::Missing,
         };
         Some(SetupItem::Found {
-            name: model.name.clone(),
-            size: model.size,
+            name: name.to_owned(),
+            size,
             state,
         })
+    }
+
+    /// Where the recommended Whisper model is, known without the catalog.
+    pub fn turbo(&self) -> Arc<Utf8Path> {
+        self.pref_path.join("whisper").join(RECOMMENDED).into()
+    }
+
+    /// Where Parakeet is, as the model picked has it.
+    pub fn parakeet_path(&self) -> &Arc<Utf8Path> {
+        self.parakeet.model()
     }
 
     /// What Automatic wants now, and why. `getting`: the languages whose voice is being set up,
@@ -778,11 +777,6 @@ impl Whisper {
             Used::Nothing => Some(None),
             Used::Wait => None,
         }
-    }
-
-    /// Where the recommended Whisper model is, known without the catalog.
-    fn turbo(&self) -> Arc<Utf8Path> {
-        self.pref_path.join("whisper").join(RECOMMENDED).into()
     }
 
     fn recommended(&mut self, rt: &Handle) -> Option<&mut Model> {
@@ -2296,8 +2290,7 @@ mod tests {
             choosing: false,
             loaded_gpu: false,
             setup: false,
-            setup_started: false,
-            replace_since: None,
+            setup_started: None,
             stream: None,
             talk_joystick: None,
             catalog: MaybeDone::Done(None),

@@ -1879,6 +1879,26 @@
         "es": "Reintentar",
         "ca": "Torna-ho a provar"
     },
+    "onboarding.app_language": {
+        "en": "App language",
+        "es": "Idioma de la aplicación",
+        "ca": "Idioma de l'aplicació"
+    },
+    "onboarding.i_speak": {
+        "en": "I speak",
+        "es": "Hablo",
+        "ca": "Parlo"
+    },
+    "onboarding.search_languages": {
+        "en": "Search {count} languages",
+        "es": "Buscar entre {count} idiomas",
+        "ca": "Cerca entre {count} idiomes"
+    },
+    "onboarding.total": {
+        "en": "Total",
+        "es": "Total",
+        "ca": "Total"
+    },
     "onboarding.account_title": {
         "en": "Your Bono account",
         "es": "Tu cuenta de Bono",

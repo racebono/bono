@@ -51,7 +51,7 @@ use tokio::{runtime::Handle, sync::oneshot::error::TryRecvError};
 pub(in crate::app) mod engine;
 mod gpu;
 mod parakeet;
-mod voice;
+pub(in crate::app) mod voice;
 mod whisper;
 
 const DELAY: Duration = Duration::from_secs(1);
@@ -291,15 +291,17 @@ impl AudioTopbar {
         self.voices.setup(langs);
     }
 
-    /// What `setup` downloads for `langs`, as the setup guide shows it: each with what it's for.
+    /// What `setup` downloads for `langs`, and `engine`'s model (`None`: the model picked stays),
+    /// as the setup guide shows it: each with what it's for.
     pub fn setup_items(
         &mut self,
         rt: &Handle,
         config: &Config,
         synth: &Synthesizer,
         langs: &[ArrayStr<2>],
+        engine: Option<engine::Engine>,
     ) -> Vec<(&'static str, SetupItem)> {
-        let whisper = self.whisper.setup_item(rt, config);
+        let whisper = self.whisper.setup_item(rt, engine);
         let voices = self.voices.setup_items(rt, config, synth, langs);
         let voices = voices.into_iter().map(|voice| (t!("audio.voice"), Some(voice)));
         std::iter::once((t!("audio.speech_to_text"), whisper))

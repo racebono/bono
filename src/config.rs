@@ -370,6 +370,19 @@ impl RawConfig {
         inner.set_model(Some(model), *self.voice_gpu());
     }
 
+    /// Takes `lang`'s voice out of the settings. Returns what spoke it: dropping it waits until the
+    /// voice is unloaded, so it's done off the UI thread.
+    pub fn remove_language(
+        &mut self,
+        lang: ArrayStr<2>,
+        synth: &mut Synthesizer,
+    ) -> Option<SynthesizerInner> {
+        let mut voices = self.voices().clone();
+        voices.remove(&lang)?;
+        self.voices.set(voices);
+        synth.inner.remove(&lang)
+    }
+
     /// Removes the languages whose voice is `model`. Returns what spoke them: dropping it waits
     /// until the voice is unloaded, so it's done off the UI thread.
     pub fn remove_voice(
