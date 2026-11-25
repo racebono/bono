@@ -34,6 +34,14 @@ use std::{
 
 /// The race engineer's instructions (`skill/SKILL.md`), for the system prompt.
 pub const SKILL: &str = include_str!("../../skill/SKILL.md");
+/// Simulator-specific caveats appended to [`SKILL`] when assembling a session's system prompt.
+const SIM_LMU: &str = include_str!("../../skill/sim-lmu.md");
+const SIM_IRACING: &str = include_str!("../../skill/sim-iracing.md");
+const SIM_RRRE: &str = include_str!("../../skill/sim-rrre.md");
+/// Pit-service instructions appended only when the session has the `pit` tool.
+const PIT_SERVICE: &str = include_str!("../../skill/pit-service.md");
+/// The compact raw recording table schema (`skill/raw-schema.md`), served on demand by `schema`.
+pub const RAW_SCHEMA: &str = include_str!("../../skill/raw-schema.md");
 const WHEELS: [&str; 4] = ["FL", "FR", "RL", "RR"];
 /// Max cars LMU maps (104) plus slack
 const FRAME_WINDOW: i64 = 110;
@@ -79,10 +87,33 @@ pub fn instructions(skill: String) -> String {
     }
 }
 
+/// Assembles the race engineer's system instructions for `sim` and pit-tool availability: core
+/// [`SKILL`] (without front matter), the matching simulator caveats (or all three when `sim` is
+/// `None` or unrecognized), and `skill/pit-service.md` when `has_pit` is true.
+pub fn assemble_skill(sim: Option<&str>, has_pit: bool) -> String {
+    let mut parts = vec![instructions(SKILL.to_owned()).trim_end().to_owned()];
+    match sim {
+        Some("lmu") => parts.push(SIM_LMU.trim().to_owned()),
+        Some("iracing") => parts.push(SIM_IRACING.trim().to_owned()),
+        Some("rrre") => parts.push(SIM_RRRE.trim().to_owned()),
+        _ => {
+            parts.push(SIM_LMU.trim().to_owned());
+            parts.push(SIM_IRACING.trim().to_owned());
+            parts.push(SIM_RRRE.trim().to_owned());
+        }
+    }
+    if has_pit {
+        parts.push(PIT_SERVICE.trim().to_owned());
+    }
+    parts.retain(|part| !part.is_empty());
+    parts.join("\n\n")
+}
+
 /// The tool, for one database. Cheap to clone.
 #[derive(Clone)]
 pub struct Engineer {
     inner: Arc<Inner>,
+    sim: Option<&'static str>,
 }
 
 struct Inner {
@@ -121,7 +152,19 @@ impl Engineer {
         let data = derived::spawn(shared.clone());
         Self {
             inner: Arc::new(Inner { db, shared, data }),
+            sim: None,
         }
+    }
+
+    /// Scopes on-demand raw-table schema output to `sim` (e.g. `"lmu"`, `"iracing"`, `"rrre"`).
+    pub fn with_sim(mut self, sim: &'static str) -> Self {
+        self.sim = Some(sim);
+        self
+    }
+
+    /// The simulator this tool is scoped to, if any.
+    pub fn sim(&self) -> Option<&'static str> {
+        self.sim
     }
 
     /// The recording it reads.
@@ -132,15 +175,16 @@ impl Engineer {
     /// Whether it's the same tool, not just one for the same recording.
     #[cfg(test)]
     pub fn is_same(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
+        Arc::ptr_eq(&self.inner, &other.inner) && self.sim == other.sim
     }
 
     pub fn description() -> String {
         "Read-only queries over the live telemetry of the simulator the pilot is driving. \
          `command` picks the query: quick (the latest state, as in the question's snapshot), track \
-         (the circuit's description, as JSON) or sql (one SELECT, WITH or PRAGMA statement over \
-         the tables the instructions describe). Answers are plain text for you to interpret, not \
-         to read out."
+         (the circuit's compact plain-text summary: length, pit losses, pit lane, sectors, turns \
+         and straights in metres), sql (one SELECT, WITH or PRAGMA statement over the tables the \
+         instructions describe) or schema (the raw recording tables' columns and caveats, optionally \
+         filtered by table). Answers are plain text for you to interpret, not to read out."
             .into()
     }
 
@@ -150,7 +194,7 @@ impl Engineer {
             "properties": {
                 "command": {
                     "type": "string",
-                    "enum": ["quick", "track", "sql"]
+                    "enum": ["quick", "track", "sql", "schema"]
                 },
                 "query": {
                     "type": "string",
@@ -159,6 +203,11 @@ impl Engineer {
                 "limit": {
                     "type": "integer",
                     "description": "sql: the most rows returned (default 60, maximum 200; output capped at 32 KiB)."
+                },
+                "table": {
+                    "type": "string",
+                    "enum": ["telemetry", "telemetry_wheel", "car_state", "scoring"],
+                    "description": "schema: return only this raw table section instead of all raw tables."
                 }
             },
             "required": ["command"]
@@ -326,6 +375,7 @@ impl Engineer {
                     .await
                     .and_then(derived::Answer::text)
             }
+            Command::Schema => Ok(render_raw_schema(self.sim, input.table)),
         }
         .map_err(busy_retry)
     }
@@ -391,6 +441,74 @@ pub enum Command {
     Quick,
     Track,
     Sql,
+    Schema,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaTable {
+    Telemetry,
+    TelemetryWheel,
+    CarState,
+    Scoring,
+}
+
+impl SchemaTable {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Telemetry => "telemetry",
+            Self::TelemetryWheel => "telemetry_wheel",
+            Self::CarState => "car_state",
+            Self::Scoring => "scoring",
+        }
+    }
+}
+
+/// Renders the compact raw-table catalog from [`RAW_SCHEMA`], scoped to `sim` (all sims when
+/// `None` or unrecognized) and optionally filtered to one [`SchemaTable`] section.
+pub fn render_raw_schema(sim: Option<&str>, table: Option<SchemaTable>) -> String {
+    const TAGS: [(&str, &str); 3] = [
+        ("lmu", "[lmu] "),
+        ("iracing", "[iracing] "),
+        ("rrre", "[rrre] "),
+    ];
+    let known_sim = sim.filter(|s| TAGS.iter().any(|(tag, _)| tag == s));
+    let wanted = table.map(SchemaTable::as_str);
+
+    let mut out = String::new();
+    let mut keep = false;
+
+    for line in RAW_SCHEMA.lines() {
+        if let Some(header) = line.strip_prefix("## ") {
+            let section = header.trim();
+            keep = section == "intro" || wanted.is_none() || wanted == Some(section);
+            if keep && section != "intro" {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str("## ");
+                out.push_str(section);
+            }
+            continue;
+        }
+        if !keep || line.trim().is_empty() {
+            continue;
+        }
+        let body = match TAGS.iter().find_map(|(tag, prefix)| {
+            line.strip_prefix(prefix).map(|rest| (*tag, rest))
+        }) {
+            Some((tag, rest)) => match known_sim {
+                Some(active) if active != tag => continue,
+                _ => rest,
+            },
+            None => line,
+        };
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(body);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -400,6 +518,16 @@ pub struct EngineerInput {
     query: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default, deserialize_with = "known_table")]
+    table: Option<SchemaTable>,
+}
+
+/// Any other table, or an empty one, is no filter: the other commands have none to get wrong.
+fn known_table<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<SchemaTable>, D::Error> {
+    let table = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(table).ok())
 }
 
 impl EngineerInput {
@@ -408,6 +536,7 @@ impl EngineerInput {
             command,
             query: None,
             limit: None,
+            table: None,
         }
     }
 }
@@ -683,6 +812,47 @@ fn body_damage(p: &Row) -> Option<String> {
             .iter()
             .all(|(_, level)| *level == Some(0))
             .then(|| "none".into()),
+    }
+}
+
+/// Damage lines for `quick`'s `INFO`: damaged mechanical parts and bodywork zones when any are
+/// damaged (or nothing extra when only `detached` is set, since `ALERTS` already says
+/// `PARTS DETACHED` or `FLAT`), `"damage none"` when damage is reported and clean (naming what isn't
+/// reported), or `"damage not reported"` when no damage channel is reported.
+fn damage_info(p: &Row, detached: bool) -> Vec<String> {
+    let parts = damage_parts(p, 0.0);
+    let body = body_damage(p);
+    let damaged_body = body.as_deref().filter(|b| *b != "none");
+    if !parts.is_empty() || damaged_body.is_some() || detached || p.b("parts_detached") {
+        let mut out = Vec::new();
+        if !parts.is_empty() {
+            out.push(format!("damage {parts}"));
+        }
+        if let Some(body) = damaged_body {
+            out.push(format!("bodywork damage {body} (1 some, 2 more)"));
+        }
+        out
+    } else if body.as_deref() == Some("none")
+        || DAMAGE_PARTS.iter().any(|(key, _)| p.f(key).is_some())
+        || p.i("parts_detached") == Some(0)
+    {
+        let mut missing = DAMAGE_PARTS
+            .iter()
+            .filter(|(key, _)| p.f(key).is_none())
+            .map(|(_, name)| *name)
+            .collect::<Vec<_>>();
+        if body.is_none() {
+            missing.push("bodywork");
+        }
+        match missing.is_empty() {
+            true => vec!["damage none".into()],
+            false => vec![format!(
+                "damage none ({} not reported)",
+                missing.join(", ")
+            )],
+        }
+    } else {
+        vec!["damage not reported".into()]
     }
 }
 
@@ -2683,6 +2853,14 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
         fmt(p.f("fuel"), 1, " L"),
         pct(p.f("battery_charge"))
     );
+    // As the data thread last published it, about once a second: nothing here waits for its tables
+    let strategy = lock(&ctx.shared.progress)
+        .as_ref()
+        .filter(|progress| progress.epoch == ctx.epoch.id)
+        .and_then(|progress| progress.strategy.clone());
+    if let Some((_, line)) = strategy.filter(|(vehicle, _)| *vehicle == ctx.vehicle) {
+        say!(out, "STRATEGY {line}");
+    }
 
     let optimal = wheels
         .values()
@@ -2776,7 +2954,8 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     if !flat.is_empty() {
         alerts.push(format!("FLAT {}", flat.join(",")));
     }
-    if wheels.values().any(|r| r.b("wheel_detached")) || p.b("parts_detached") {
+    let detached = wheels.values().any(|r| r.b("wheel_detached")) || p.b("parts_detached");
+    if detached {
         alerts.push("PARTS DETACHED".into());
     }
     if p.b("engine_overheating") {
@@ -2797,13 +2976,7 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
 
     let (more_alerts, mut info) = scoring_alerts(ctx)?;
     alerts.extend(more_alerts);
-    if let Some(body) = body_damage(p).filter(|body| body != "none") {
-        info.insert(0, format!("bodywork damage {body} (1 some, 2 more)"));
-    }
-    let parts = damage_parts(p, 0.0);
-    if !parts.is_empty() {
-        info.insert(0, format!("damage {parts}"));
-    }
+    info.splice(0..0, damage_info(p, detached || !flat.is_empty()));
     match pit_window(ctx)? {
         (Some(window), true) => alerts.push(format!(
             "PIT WINDOW CLOSING, mandatory stop not done ({window})"
@@ -2900,6 +3073,170 @@ mod tests {
         // An unreported zone isn't undamaged
         assert_eq!(body("0,0,0,0,0,0,0,NULL"), None);
         assert_eq!(body("0,1,0,0,0,0,0,NULL").as_deref(), Some("front_left 1"));
+    }
+
+    #[test]
+    fn quick_damage_info_distinguishes_clean_unreported_damaged_and_detached() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mk = |sql: &str| row(&conn, sql, []).unwrap().unwrap();
+
+        // 1. LMU-style clean car: aero & suspension 0, bodywork all 0, parts_detached 0, engine & gearbox NULL
+        let lmu_clean = mk(
+            "SELECT NULL AS engine_damage, NULL AS transmission_damage, \
+                    0.0 AS aerodynamics_damage, 0.0 AS suspension_damage, 0 AS parts_detached, \
+                    0 AS body_damage_front, 0 AS body_damage_front_left, 0 AS body_damage_front_right, \
+                    0 AS body_damage_left, 0 AS body_damage_right, 0 AS body_damage_rear_left, \
+                    0 AS body_damage_rear, 0 AS body_damage_rear_right",
+        );
+        assert_eq!(
+            damage_info(&lmu_clean, false),
+            vec!["damage none (engine, gearbox not reported)"]
+        );
+
+        // 2. iRacing-style unreported: all mechanical, bodywork, and parts_detached NULL
+        let iracing_null = mk(
+            "SELECT NULL AS engine_damage, NULL AS transmission_damage, \
+                    NULL AS aerodynamics_damage, NULL AS suspension_damage, NULL AS parts_detached, \
+                    NULL AS body_damage_front, NULL AS body_damage_front_left, NULL AS body_damage_front_right, \
+                    NULL AS body_damage_left, NULL AS body_damage_right, NULL AS body_damage_rear_left, \
+                    NULL AS body_damage_rear, NULL AS body_damage_rear_right",
+        );
+        assert_eq!(damage_info(&iracing_null, false), vec!["damage not reported"]);
+
+        // 3. RaceRoom-style clean mechanical: all 4 DAMAGE_PARTS 0.0, bodywork & parts_detached NULL
+        let rrre_clean = mk(
+            "SELECT 0.0 AS engine_damage, 0.0 AS transmission_damage, \
+                    0.0 AS aerodynamics_damage, 0.0 AS suspension_damage, NULL AS parts_detached, \
+                    NULL AS body_damage_front, NULL AS body_damage_front_left, NULL AS body_damage_front_right, \
+                    NULL AS body_damage_left, NULL AS body_damage_right, NULL AS body_damage_rear_left, \
+                    NULL AS body_damage_rear, NULL AS body_damage_rear_right",
+        );
+        assert_eq!(
+            damage_info(&rrre_clean, false),
+            vec!["damage none (bodywork not reported)"]
+        );
+
+        // 4. Sub-0.5% reported damage rounds to 0% -> clean reported
+        let sub_percent = mk("SELECT 0.003 AS aerodynamics_damage");
+        assert_eq!(
+            damage_info(&sub_percent, false),
+            vec!["damage none (engine, gearbox, suspension, bodywork not reported)"]
+        );
+
+        // 5. Actual mechanical + bodywork damage -> existing detail strings, no "damage none" / "not reported"
+        let damaged = mk(
+            "SELECT 0.25 AS aerodynamics_damage, 2 AS body_damage_front, 0 AS body_damage_rear",
+        );
+        let expected_damaged = vec![
+            "damage aero 25%",
+            "bodywork damage front 2 (1 some, 2 more)",
+        ];
+        assert_eq!(damage_info(&damaged, false), expected_damaged);
+
+        // 6. Detached part alert: never emits contradictory "damage none" when clean,
+        //    but still emits mechanical/bodywork details when also damaged
+        assert!(damage_info(&lmu_clean, true).is_empty());
+        assert_eq!(damage_info(&damaged, true), expected_damaged);
+
+        // 7. parts_detached = Some(0) alone (all other damage columns NULL) -> clean reported
+        let detached_zero_only = mk(
+            "SELECT NULL AS engine_damage, NULL AS transmission_damage, \
+                    NULL AS aerodynamics_damage, NULL AS suspension_damage, 0 AS parts_detached, \
+                    NULL AS body_damage_front",
+        );
+        assert_eq!(
+            damage_info(&detached_zero_only, false),
+            vec!["damage none (engine, gearbox, aero, suspension, bodywork not reported)"]
+        );
+
+        // 8. Every part and zone reported and clean: nothing to caveat
+        let all_clean = mk(
+            "SELECT 0.0 AS engine_damage, 0.0 AS transmission_damage, \
+                    0.0 AS aerodynamics_damage, 0.0 AS suspension_damage, 0 AS parts_detached, \
+                    0 AS body_damage_front, 0 AS body_damage_front_left, 0 AS body_damage_front_right, \
+                    0 AS body_damage_left, 0 AS body_damage_right, 0 AS body_damage_rear_left, \
+                    0 AS body_damage_rear, 0 AS body_damage_rear_right",
+        );
+        assert_eq!(damage_info(&all_clean, false), vec!["damage none"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quick_snapshot_reports_damage_status_without_contradicting_detached() {
+        let (dir, engineer) = race();
+        let line_starting = |out: &str, prefix: &str| {
+            out.lines()
+                .find(|line| line.starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing {prefix:?} in:\n{out}"))
+                .to_owned()
+        };
+
+        // 1. All damage columns NULL in car_state -> INFO says "damage not reported"
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute("DELETE FROM car_state WHERE vehicle_id = 1", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO car_state (telemetry_id, vehicle_id, session_time) \
+             SELECT id, vehicle_id, session_time FROM telemetry \
+             WHERE vehicle_id = 1 ORDER BY id DESC LIMIT 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        let info = line_starting(&out, "INFO (only if it bears on the question)");
+        assert!(info.contains("damage not reported"), "{info}");
+        assert!(!info.contains("damage none"), "{info}");
+
+        // 2. Clean car reported -> INFO says "damage none"
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute(
+            "UPDATE car_state SET aerodynamics_damage = 0.0, suspension_damage = 0.0, \
+             parts_detached = 0, body_damage_front = 0, body_damage_front_left = 0, \
+             body_damage_front_right = 0, body_damage_left = 0, body_damage_right = 0, \
+             body_damage_rear_left = 0, body_damage_rear = 0, body_damage_rear_right = 0 \
+             WHERE vehicle_id = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        let info = line_starting(&out, "INFO (only if it bears on the question)");
+        assert!(info.contains("damage none"), "{info}");
+        assert!(!info.contains("damage not reported"), "{info}");
+
+        // 3. A flat, or wheel_detached = 1 -> ALERTS has it and INFO does NOT say "damage none"
+        drop(engineer);
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute(
+            "UPDATE telemetry_wheel SET tire_flat = 1              WHERE wheel = 0 AND telemetry_id = (SELECT MAX(id) FROM telemetry WHERE vehicle_id = 1)",
+            [],
+        )
+        .unwrap();
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(out.contains("FLAT FL"), "{out}");
+        assert!(!out.contains("damage none"), "{out}");
+        drop(engineer);
+        conn.execute("UPDATE telemetry_wheel SET tire_flat = NULL", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE telemetry_wheel SET wheel_detached = 1 \
+             WHERE wheel = 0 AND telemetry_id = (SELECT MAX(id) FROM telemetry WHERE vehicle_id = 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        let alerts = line_starting(&out, "ALERTS (act now)");
+        let info = line_starting(&out, "INFO (only if it bears on the question)");
+        assert!(alerts.contains("PARTS DETACHED"), "{alerts}");
+        assert!(!info.contains("damage none"), "{info}");
+        assert!(!info.contains("damage not reported"), "{info}");
     }
 
     #[test]
@@ -3244,6 +3581,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn every_question_attaches_the_exact_quick_output() {
         let (_dir, engineer) = race();
+        // Published once, so every `quick` below has the same `STRATEGY` line
+        engineer.publish_progress().await.unwrap();
         let quick = run(&engineer, serde_json::json!({"command": "quick"})).await;
         // Include non-urgent questions: deciding which extra tools are needed belongs
         // to the model, not a keyword filter that might omit useful current context.
@@ -4190,6 +4529,7 @@ mod tests {
                 shared: engineer.inner.shared.clone(),
                 data,
             }),
+            sim: None,
         };
 
         let error = busy.check_condition("SELECT 1".into()).await.unwrap_err();
@@ -4410,23 +4750,192 @@ mod tests {
 
     #[test]
     fn skill_stays_within_what_the_tool_offers() {
-        let skill = instructions(SKILL.to_owned());
-        assert!(!skill.starts_with("---"));
-        assert!(skill.starts_with("# Race engineer"));
-        // Every table the skill tells the model about is one the query sees
-        for table in [
-            "lap_stats",
-            "lap_wheel_stats",
-            "corner_passes",
-            "corner_pass_wheels",
-            "race_state",
-            "cars_now",
-            "drivers_now",
-            "stints",
-            "wheels_now",
-            "forecast_now",
+        for skill in [
+            instructions(SKILL.to_owned()),
+            assemble_skill(Some("lmu"), true),
         ] {
-            assert!(skill.contains(&format!("`{table}`")), "{table}");
+            assert!(!skill.starts_with("---"));
+            assert!(skill.starts_with("# Race engineer"));
+            // Every table the skill tells the model about is one the query sees
+            for table in [
+                "lap_stats",
+                "lap_wheel_stats",
+                "lap_sector_stats",
+                "corner_passes",
+                "corner_pass_wheels",
+                "race_state",
+                "cars_now",
+                "drivers_now",
+                "stints",
+                "wheels_now",
+                "sectors_now",
+                "forecast_now",
+                "setup_now",
+                "setup_changes",
+            ] {
+                assert!(skill.contains(&format!("`{table}`")), "{table}");
+            }
+        }
+    }
+
+    #[test]
+    fn assemble_skill_scopes_by_sim_and_pit_availability() {
+        let lmu_pit = assemble_skill(Some("lmu"), true);
+        let lmu_no_pit = assemble_skill(Some("lmu"), false);
+        let iracing = assemble_skill(Some("iracing"), false);
+        let rrre = assemble_skill(Some("rrre"), false);
+        let generic = assemble_skill(None, false);
+        let unknown = assemble_skill(Some("other"), false);
+
+        // Stripped of frontmatter and silent-check loops
+        assert!(lmu_pit.starts_with("# Race engineer"));
+        assert!(!lmu_pit.contains("## Final answer check"));
+        assert!(!lmu_pit.contains("First identify silently"));
+        assert!(lmu_pit.contains("command=\"schema\"") || lmu_pit.contains("`schema`"));
+
+        // Pit section included iff has_pit
+        assert!(lmu_pit.contains("## Pit service"));
+        assert!(!lmu_no_pit.contains("## Pit service"));
+
+        // Sim scoping isolates simulator-only caveats; None/unknown includes all three
+        assert!(lmu_no_pit.contains("VM_*"));
+        assert!(!lmu_no_pit.contains("iRacing"));
+        assert!(!lmu_no_pit.contains("RaceRoom"));
+
+        assert!(iracing.contains("iRacing"));
+        assert!(!iracing.contains("VM_*"));
+        assert!(!iracing.contains("RaceRoom"));
+
+        assert!(rrre.contains("RaceRoom"));
+        assert!(!rrre.contains("VM_*"));
+        assert!(!rrre.contains("iRacing"));
+
+        for all in [&generic, &unknown] {
+            assert!(all.contains("VM_*") && all.contains("iRacing") && all.contains("RaceRoom"));
+        }
+
+        // Core prompt diet check: active LMU+pit prompt significantly smaller than old ~60 KB monolith
+        assert!(
+            lmu_pit.len() < 42_000,
+            "prompt still {} bytes",
+            lmu_pit.len()
+        );
+    }
+
+    #[test]
+    fn input_schema_exposes_schema_command_and_table_filter() {
+        let schema = Engineer::input_schema();
+        assert_eq!(
+            schema["properties"]["command"]["enum"],
+            serde_json::json!(["quick", "track", "sql", "schema"])
+        );
+        assert_eq!(
+            schema["properties"]["table"]["enum"],
+            serde_json::json!(["telemetry", "telemetry_wheel", "car_state", "scoring"])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn schema_returns_compact_sim_scoped_catalog_and_filters_by_table() {
+        // Works with zero DB I/O even on an empty temp path with no recording file
+        let dir = tempfile::tempdir().unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+        let pool = Pool::new(
+            Database::read_only(Arc::new(dir.path().join("missing.db"))),
+            one,
+            one,
+        );
+        let lmu = Engineer::new(pool.clone()).with_sim("lmu");
+        let iracing = Engineer::new(pool.clone()).with_sim("iracing");
+        let rrre = Engineer::new(pool.clone()).with_sim("rrre");
+        let other = Engineer::new(pool.clone()).with_sim("other");
+        let any = Engineer::new(pool);
+
+        // Another table or none is no filter, whichever the command
+        for table in ["lap_stats", ""] {
+            let all = run(&lmu, serde_json::json!({"command": "schema", "table": table})).await;
+            assert!(all.contains("`telemetry_wheel`") && all.contains("`car_state`"), "{all}");
+        }
+
+        let all_tables = ["telemetry", "telemetry_wheel", "car_state", "scoring"];
+        for (name, tool) in [("lmu", &lmu), ("iracing", &iracing), ("rrre", &rrre)] {
+            let full = run(tool, serde_json::json!({"command": "schema"})).await;
+            assert!(
+                full.len() < 5632,
+                "{name} schema too large: {} B",
+                full.len()
+            );
+            assert!(
+                full.contains("`telemetry`") && full.contains("`car_state`"),
+                "{name}"
+            );
+            for table in all_tables {
+                let one_table = run(
+                    tool,
+                    serde_json::json!({"command": "schema", "table": table}),
+                )
+                .await;
+                assert!(
+                    one_table.len() < 2560,
+                    "{name}/{table} too large: {} B",
+                    one_table.len()
+                );
+                assert!(one_table.len() < full.len(), "{name}/{table}");
+                assert!(
+                    one_table.contains(&format!("## {table}\n")),
+                    "{name}/{table} missing heading: {one_table}"
+                );
+                for excluded in all_tables.into_iter().filter(|t| *t != table) {
+                    assert!(
+                        !one_table.contains(&format!("## {excluded}\n")),
+                        "{name}/{table} leaked {excluded}"
+                    );
+                }
+            }
+        }
+
+        // Sim scoping strips other sims' tagged notes; sim=None and unknown sims keep all
+        let lmu_full = run(&lmu, serde_json::json!({"command": "schema"})).await;
+        let ir_full = run(&iracing, serde_json::json!({"command": "schema"})).await;
+        let rrre_full = run(&rrre, serde_json::json!({"command": "schema"})).await;
+        let other_full = run(&other, serde_json::json!({"command": "schema"})).await;
+        let any_full = run(&any, serde_json::json!({"command": "schema"})).await;
+        assert_eq!(other_full, any_full);
+        for out in [&lmu_full, &ir_full, &rrre_full, &any_full] {
+            assert!(
+                !out.contains("[lmu]") && !out.contains("[iracing]") && !out.contains("[rrre]"),
+                "raw tag leaked: {out}"
+            );
+        }
+        assert!(!lmu_full.contains("iRacing") && !lmu_full.contains("RaceRoom"));
+        assert!(!ir_full.contains("LMU") && !ir_full.contains("RaceRoom"));
+        assert!(!rrre_full.contains("LMU") && !rrre_full.contains("iRacing"));
+        assert!(
+            any_full.len() >= lmu_full.len()
+                && any_full.len() >= ir_full.len()
+                && any_full.len() >= rrre_full.len()
+        );
+
+        // Schema documents every column of telemetry, telemetry_wheel, and car_state
+        let (_race_dir, race_tool) = race();
+        for table in ["telemetry", "telemetry_wheel", "car_state"] {
+            let out = run(
+                &race_tool,
+                serde_json::json!({
+                    "command": "sql",
+                    "query": format!("PRAGMA table_info({table})"),
+                    "limit": 200,
+                }),
+            )
+            .await;
+            let mut cols = 0;
+            for line in out.lines().skip(2) {
+                assert!(!line.starts_with("..."), "{table} truncated: {out}");
+                let name = line.split(" | ").nth(1).unwrap().trim_matches('"');
+                assert!(RAW_SCHEMA.contains(&format!("`{name}`")), "{table}.{name}");
+                cols += 1;
+            }
+            assert!(cols > 0, "{table} returned no columns");
         }
     }
 
@@ -4543,7 +5052,7 @@ mod tests {
 /// - `EVAL_DB`: the race's `telemetry.db` (kept looking fresh while the evals run)
 /// - `EVAL_OUT`: where each eval's reply goes, as `eval-<id>/<EVAL_CONFIG>/<EVAL_RUN>/`
 /// - `EVAL_CONFIG` (default `with_skill`), `EVAL_RUN` (default `run-1`), `EVAL_MODEL`,
-///   `EVAL_EFFORT`, `EVAL_IDS` (e.g. `1,5,9`)
+///   `EVAL_EFFORT`, `EVAL_SIM` (default `lmu`; `iracing`, `rrre`, or `all`), `EVAL_IDS` (e.g. `1,5,9`)
 ///
 /// The `schedule` tool is registered too. An eval's `pending` requests are added before its
 /// question, which then carries the pending list as the app's do; one with `scheduled` requests
@@ -4643,7 +5152,7 @@ mod evals {
                 "eval {eval_id}: pending ids number from #1 in order"
             );
             fields.insert("action".into(), "add".into());
-            let (instruction, trigger, repeat, stale_after) =
+            let (instruction, trigger, repeat, until, stale_after) =
                 serde_json::from_value::<ScheduleInput>(input)
                     .map_err(anyhow::Error::from)
                     .and_then(ScheduleInput::request)
@@ -4652,6 +5161,7 @@ mod evals {
                 instruction,
                 trigger,
                 repeat,
+                until,
                 stale_after,
                 made: progress.clone(),
                 checked: Default::default(),
@@ -4749,14 +5259,14 @@ mod evals {
         };
         let mut json = serde_json::json!({"action": action, "id": id.to_string()});
         if let Some(new) = new {
-            let (repeat, until) = match &new.repeat {
-                Repeat::Once => ("once", None),
-                Repeat::Every { until } => ("every", until.as_ref()),
+            let repeat = match new.repeat {
+                Repeat::Once => "once",
+                Repeat::Every => "every",
             };
             json["instruction"] = new.instruction.clone().into();
             json["trigger"] = trigger(&new.trigger);
             json["repeat"] = repeat.into();
-            json["until"] = until.map_or(serde_json::Value::Null, trigger);
+            json["until"] = new.until.as_ref().map_or(serde_json::Value::Null, trigger);
             json["stale_after"] =
                 (new.stale_after.as_ref()).map_or(serde_json::Value::Null, trigger);
         }
@@ -4908,7 +5418,14 @@ mod evals {
         let run = var("EVAL_RUN").unwrap_or_else(|| "run-1".into());
         let model = var("EVAL_MODEL").unwrap_or_else(|| "claude-sonnet-5-5".into());
         let effort = var("EVAL_EFFORT").unwrap_or_else(|| "high".into());
-        let system = instructions(SKILL.to_owned());
+        let sim: Option<&'static str> = match var("EVAL_SIM").as_deref().unwrap_or("lmu") {
+            "lmu" => Some("lmu"),
+            "iracing" => Some("iracing"),
+            "rrre" => Some("rrre"),
+            "all" => None,
+            other => panic!("unknown EVAL_SIM: {other} (expected lmu, iracing, rrre, or all)"),
+        };
+        let system = assemble_skill(sim, false);
         let ids = var("EVAL_IDS").map(|ids| {
             ids.split(',')
                 .map(|id| id.trim().parse::<u64>().unwrap())
@@ -4938,7 +5455,10 @@ mod evals {
 
             let four = NonZeroUsize::new(4).unwrap();
             let pool = Pool::new(Database::read_only(Arc::new(db.clone())), four, four);
-            let tool = Engineer::new(pool);
+            let tool = match sim {
+                Some(sim) => Engineer::new(pool).with_sim(sim),
+                None => Engineer::new(pool),
+            };
             tool.sync().await.unwrap();
             // What the pending requests count from, and the `schedule` tool's adds: one snapshot,
             // as the recording doesn't move

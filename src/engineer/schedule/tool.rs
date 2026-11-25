@@ -79,13 +79,10 @@ impl ScheduleTool {
     }
 
     pub fn description() -> String {
-        "Schedules what the pilot asks you to do later: a check at the end of the lap, a number \
-         every lap for a stint, a heads-up when something happens. When a request fires you get a \
-         turn of your own, with fresh telemetry, to answer it. `action` picks the change: add a \
-         request, cancel one, or replace one to change it. A replace keeps what's been counted: \
-         its `until` counts from when the request was first made, and its next firing counts on \
-         from its last. To count from now, cancel it and add a new one. Changes take effect once \
-         your reply is finished. Every question lists the pending requests and their ids."
+        "Adds, cancels or replaces scheduled pilot requests that fire in a future turn with fresh \
+         telemetry. A replace keeps what's been counted: its `until` counts from when the request \
+         was first made, and its next firing counts on from its last. To count from now, cancel it \
+         and add a new one. Changes apply when your reply finishes."
             .into()
     }
 
@@ -103,7 +100,7 @@ impl ScheduleTool {
                 },
                 "instruction": {
                     "type": "string",
-                    "description": "add, replace: what to do when it fires, complete in itself for a conversation that never heard it asked: who asked, when, and what for."
+                    "description": "add, replace: short self-contained note of what to check or say when it fires, with session context only if it matters."
                 },
                 "trigger": trigger_schema(
                     "add, replace: when it fires. time and laps count from now (and, when it \
@@ -114,12 +111,11 @@ impl ScheduleTool {
                 "repeat": {
                     "type": "string",
                     "enum": ["once", "every"],
-                    "description": "add, replace: answered once (the default), or every time it fires."
+                    "description": "add, replace: answered once (the default), or every time it fires. Needed with `until`."
                 },
                 "until": trigger_schema(
-                    "add, replace, with repeat every: when it stops, counted from when it was \
-                     made. A firing on the same check still counts. Without it, it repeats until \
-                     cancelled."
+                    "add, replace: when the request stops (repeating or one-shot expiry), counted \
+                     from when it was made. A firing on the same check still counts."
                 ),
                 "stale_after": trigger_schema(&format!(
                     "add, replace: when an answer stops being worth saying, counted from its \
@@ -179,14 +175,12 @@ impl ScheduleTool {
                     staging.changes.push(Change::Cancel(id));
                     Ok(())
                 })?;
-                return Ok(format!(
-                    "Cancelled {id}. Confirm it to the pilot in one sentence."
-                ));
+                return Ok(format!("Cancelled {id}."));
             }
             Action::Add => None,
             Action::Replace => Some(input.id()?),
         };
-        let (instruction, trigger, repeat, stale_after) = input.request()?;
+        let (instruction, trigger, repeat, until, stale_after) = input.request()?;
         // What can be checked at once, before waiting for progress or running conditions. Checked
         // again when it's staged: another call may have changed the staging meanwhile.
         self.stage(turn, |staging| match replacing {
@@ -198,6 +192,7 @@ impl ScheduleTool {
             instruction,
             trigger,
             repeat,
+            until,
             stale_after,
             made,
             checked: Checked::default(),
@@ -222,13 +217,8 @@ impl ScheduleTool {
             }
         })?;
         Ok(match replacing {
-            Some(_) => format!(
-                "Replaced {id}: {summary}.{kept}{notes} Confirm the change to the pilot in one \
-                 sentence."
-            ),
-            None => {
-                format!("Added {id}: {summary}.{notes} Confirm it to the pilot in one sentence.")
-            }
+            Some(_) => format!("Replaced {id}: {summary}.{kept}{notes}"),
+            None => format!("Added {id}: {summary}.{notes}"),
         })
     }
 
@@ -256,10 +246,7 @@ impl ScheduleTool {
     /// already true.
     /// Notes each result in `new.checked`.
     async fn check_conditions(&self, new: &mut NewRequest) -> anyhow::Result<String> {
-        let until = match &new.repeat {
-            Repeat::Every { until } => until.as_ref(),
-            Repeat::Once => None,
-        };
+        let until = new.until.as_ref();
         let mut notes = String::new();
         let mut checked = Checked::default();
         // The snapshot when each was checked: one after it was measured after that check
@@ -406,7 +393,7 @@ fn kept(new: &NewRequest) -> String {
              yet.",
         );
     }
-    if let Repeat::Every { until: Some(_) } = new.repeat {
+    if new.until.is_some() {
         kept.push_str(" Its `until` still counts from when it was first made.");
     }
     kept
@@ -414,17 +401,19 @@ fn kept(new: &NewRequest) -> String {
 
 /// A request in one line, for the model to confirm
 fn summary(new: &NewRequest) -> String {
-    let repeat = match &new.repeat {
-        Repeat::Once => "once".to_string(),
-        Repeat::Every { until: None } => "every time, until cancelled".to_string(),
-        Repeat::Every { until: Some(until) } => format!(
+    let repeat = match (&new.repeat, &new.until) {
+        (Repeat::Once, None) => "once".to_string(),
+        (Repeat::Once, Some(until)) => {
+            format!("once, until {} from when it was made", describe(until))
+        }
+        (Repeat::Every, None) => "every time, until cancelled".to_string(),
+        (Repeat::Every, Some(until)) => format!(
             "every time, until {} from when it was made",
             describe(until)
         ),
     };
     format!(
-        "\"{}\" It fires {}, {repeat}; its answer is out of date {}",
-        new.instruction,
+        "fires {}, {repeat}; stale {}",
         describe(&new.trigger),
         describe_stale(new.stale_after.as_ref().unwrap_or(&DEFAULT_STALE)),
     )
@@ -508,8 +497,11 @@ impl ScheduleInput {
         }
     }
 
-    /// The request to add or replace with: its instruction, trigger, repeat and `stale_after`
-    pub(crate) fn request(self) -> anyhow::Result<(String, Trigger, Repeat, Option<Trigger>)> {
+    /// The request to add or replace with: its instruction, trigger, repeat, `until` and
+    /// `stale_after`
+    pub(crate) fn request(
+        self,
+    ) -> anyhow::Result<(String, Trigger, Repeat, Option<Trigger>, Option<Trigger>)> {
         let instruction = self.instruction.as_deref().map(str::trim).unwrap_or("");
         if instruction.is_empty() {
             bail!("`instruction` is needed: what to do when it fires");
@@ -519,14 +511,23 @@ impl ScheduleInput {
         };
         let trigger = trigger.parse("trigger")?;
         let until = self.until.map(|until| until.parse("until")).transpose()?;
-        let repeat = match (self.repeat.unwrap_or(RepeatInput::Once), until) {
-            (RepeatInput::Every, until) => Repeat::Every { until },
-            (RepeatInput::Once, None) => Repeat::Once,
-            (RepeatInput::Once, Some(_)) => {
-                bail!("`until` ends a repeating request: set `repeat` to every, or leave it out")
-            }
+        // Left out, "every lap for five laps" would be answered once
+        if until.is_some() && self.repeat.is_none() {
+            bail!("`until` needs `repeat`: every to stop repeating, or once to expire unanswered");
+        }
+        let ends_first = match (&trigger, &until) {
+            (Trigger::Time { seconds }, Some(Trigger::Time { seconds: until })) => until < seconds,
+            (Trigger::Laps { count }, Some(Trigger::Laps { count: until })) => until < count,
+            _ => false,
         };
-        if let (Repeat::Every { .. }, Trigger::Time { seconds }) = (&repeat, &trigger)
+        if ends_first {
+            bail!("`until` ends it before its `trigger` can fire: they count from the same start");
+        }
+        let repeat = match self.repeat.unwrap_or(RepeatInput::Once) {
+            RepeatInput::Once => Repeat::Once,
+            RepeatInput::Every => Repeat::Every,
+        };
+        if let (Repeat::Every, Trigger::Time { seconds }) = (repeat, &trigger)
             && *seconds < MIN_REPEAT_S
         {
             bail!(
@@ -538,7 +539,7 @@ impl ScheduleInput {
             .stale_after
             .map(|stale| stale.parse("stale_after"))
             .transpose()?;
-        Ok((instruction.to_owned(), trigger, repeat, stale_after))
+        Ok((instruction.to_owned(), trigger, repeat, until, stale_after))
     }
 }
 
@@ -745,13 +746,12 @@ mod tests {
         .unwrap();
         let after = engineer.progress().unwrap();
         assert!(reply.contains("#1"), "{reply}");
-        assert!(reply.contains("Tell the pilot the fuel left."), "{reply}");
+        assert!(!reply.contains("Tell the pilot the fuel left."), "{reply}");
         assert!(!reply.contains('\n'), "one line: {reply}");
         assert_eq!(
             reply,
-            "Added #1: \"Tell the pilot the fuel left.\" It fires after 1 lap, every time, until \
-             after 5 laps from when it was made; its answer is out of date 0:20 of game clock \
-             after it fires. Confirm it to the pilot in one sentence."
+            "Added #1: fires after 1 lap, every time, until after 5 laps from when it was made; \
+             stale 0:20 of game clock after it fires."
         );
 
         let changes = tool.take();
@@ -761,12 +761,8 @@ mod tests {
         assert_eq!(*id, RequestId(1));
         assert_eq!(new.instruction, "Tell the pilot the fuel left.");
         assert_eq!(new.trigger, Trigger::Laps { count: 1 });
-        assert_eq!(
-            new.repeat,
-            Repeat::Every {
-                until: Some(Trigger::Laps { count: 5 })
-            }
-        );
+        assert_eq!(new.repeat, Repeat::Every);
+        assert_eq!(new.until, Some(Trigger::Laps { count: 5 }));
         assert_eq!(new.stale_after, Some(Trigger::Time { seconds: 20.0 }));
         assert!((before.seq..=after.seq).contains(&new.made.seq), "{new:?}");
         assert_eq!(
@@ -1043,10 +1039,8 @@ mod tests {
         replace["id"] = json!(2);
         assert_eq!(
             call(&tool, replace.clone()).await.unwrap(),
-            "Replaced #2: \"Tell the pilot the fuel left.\" It fires after 2 laps, once; its \
-             answer is out of date 0:30 of game clock after it fires. It counts from its last \
-             firing, or from when it was first made if it hasn't fired yet. Confirm the change \
-             to the pilot in one sentence."
+            "Replaced #2: fires after 2 laps, once; stale 0:30 of game clock after it fires. \
+             It counts from its last firing, or from when it was first made if it hasn't fired yet."
         );
         // A session trigger counts nothing; its `until` still counts from when it was made
         replace["trigger"] = json!({"kind": "session"});
@@ -1054,10 +1048,9 @@ mod tests {
         replace["until"] = laps(5);
         assert_eq!(
             call(&tool, replace).await.unwrap(),
-            "Replaced #2: \"Tell the pilot the fuel left.\" It fires when the next session \
-             starts, every time, until after 5 laps from when it was made; its answer is out of \
-             date 0:30 of game clock after it fires. Its `until` still counts from when it was \
-             first made. Confirm the change to the pilot in one sentence."
+            "Replaced #2: fires when the next session starts, every time, until after 5 laps from \
+             when it was made; stale 0:30 of game clock after it fires. Its `until` still counts \
+             from when it was first made."
         );
         assert_eq!(
             ids(&tool.take()),
@@ -1228,13 +1221,6 @@ mod tests {
         ] {
             call(&tool, input.clone()).await.unwrap_err();
         }
-        // `until` ends a repeating request only
-        let mut once = add(laps(1));
-        once["until"] = laps(5);
-        let error = call(&tool, once.clone()).await.unwrap_err();
-        assert!(format!("{error:#}").contains("every"), "{error:#}");
-        once["repeat"] = json!("once");
-        call(&tool, once).await.unwrap_err();
         assert!(tool.take().is_empty());
 
         // A session trigger, of any session or of one type
@@ -1287,5 +1273,78 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn once_with_until_is_accepted_and_checks_until_condition() {
+        let (_dir, _engineer, tool) = recorded().await;
+
+        // 1. `add` with `repeat: "once"` + `until`; with `repeat` omitted, or an `until` before the
+        // trigger, it's refused
+        let mut explicit = add(condition(FALSE));
+        explicit["repeat"] = json!("once");
+        explicit["until"] = laps(5);
+        let reply = call(&tool, explicit).await.unwrap();
+        assert!(!reply.contains('\n'), "one line: {reply}");
+        assert!(!reply.contains("Tell the pilot the fuel left."), "{reply}");
+        assert!(reply.contains("Added #1"), "{reply}");
+        assert!(reply.contains("once, until after 5 laps"), "{reply}");
+
+        let mut omitted = add(condition(FALSE));
+        omitted["until"] = laps(5);
+        let error = format!("{:#}", call(&tool, omitted).await.unwrap_err());
+        assert!(error.contains("`until` needs `repeat`"), "{error}");
+        for (trigger, until) in [
+            (laps(5), laps(1)),
+            (
+                json!({"kind": "time", "seconds": 600}),
+                json!({"kind": "time", "seconds": 30}),
+            ),
+        ] {
+            let mut never = add(trigger);
+            never["repeat"] = json!("once");
+            never["until"] = until;
+            let error = format!("{:#}", call(&tool, never).await.unwrap_err());
+            assert!(error.contains("before its `trigger` can fire"), "{error}");
+        }
+
+        let changes = tool.take();
+        assert_eq!(changes.len(), 1);
+        for change in changes {
+            let Change::Add(_, new) = change else {
+                panic!("{change:?}");
+            };
+            assert_eq!(new.repeat, Repeat::Once);
+            assert_eq!(new.until, Some(Trigger::Laps { count: 5 }));
+        }
+
+        // 2. `add` with `repeat: "once"` + broken `until` condition fails clearly
+        let mut broken = add(laps(1));
+        broken["repeat"] = json!("once");
+        broken["until"] = condition(BROKEN);
+        let error = format!("{:#}", call(&tool, broken).await.unwrap_err());
+        assert!(error.contains("the `until` condition failed"), "{error}");
+
+        // 3. `add` with `repeat: "once"` + already-true `until` condition notes it
+        let mut already_true = add(laps(1));
+        already_true["repeat"] = json!("once");
+        already_true["until"] = condition(TRUE);
+        let reply = call(&tool, already_true).await.unwrap();
+        assert!(reply.contains("already true"), "{reply}");
+        let _ = tool.take();
+
+        // 4. `replace` with `repeat: "once"` + `until` reports kept `until` baseline
+        tool.begin(vec![RequestId(2)], RequestId(3));
+        let mut replace = add(json!({"kind": "session"}));
+        replace["action"] = json!("replace");
+        replace["id"] = json!("#2");
+        replace["repeat"] = json!("once");
+        replace["until"] = laps(5);
+        let reply = call(&tool, replace).await.unwrap();
+        assert!(
+            reply.contains("Its `until` still counts from when it was first made."),
+            "{reply}"
+        );
+        assert!(!reply.contains("Tell the pilot the fuel left."), "{reply}");
     }
 }

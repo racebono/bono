@@ -31,6 +31,9 @@ pub struct Progress {
     pub new_epochs: Vec<String>,
     /// The current session's type
     pub session_type: Option<String>,
+    /// The pilot's fuel and virtual energy outlook, for `quick`, with the car it's of (see
+    /// `derived::strategy_line`)
+    pub strategy: Option<(i64, String)>,
     /// Seconds of game clock, added up across sessions (see [`Counters`])
     pub clock_s: f64,
     /// Laps the pilot completed, added up across sessions (see [`Counters`])
