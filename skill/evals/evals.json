@@ -6,13 +6,14 @@
       "prompt": "radio check, can I make it to the end on energy or do I need to box again?",
       "expected_output": "",
       "files": [],
+      "pending": [],
       "assertions": [
         "Gives the verdict that the pilot can't make it to the end on energy and needs one more stop",
         "Uses the race length from the session data without asking the pilot for it",
         "Does not read back values shown on the game UI (virtual energy %, fuel litres, per-lap usage, lap times, time left)",
-        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
-        "Briefly confirms the radio check and also answers the energy question; no extra advice or topics",
-        "Answers all requested parts without unrelated topics or a raw-data recital; at most 45 words excluding a brief acknowledgement"
+        "At most 3 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
+        "Briefly confirms the radio check and also answers the energy question; may append one brief opt-in offer to plan around late rain, but no unsolicited pit lap, fuel load, tyre call or extra topics",
+        "Answers all requested parts without unsolicited plans or a raw-data recital; at most 45 words excluding a brief acknowledgement"
       ],
       "session": "race"
     },
@@ -124,11 +125,12 @@
       "prompt": "can we make it to the end on energy or do we need to box?",
       "expected_output": "",
       "files": [],
+      "pending": [],
       "assertions": [
         "Says we cannot make it on energy as things are (short by about three laps) so a stop is needed",
-        "Does not bring in the weather, tyres or other topics the pilot didn't ask about",
+        "May append at most one brief opt-in offer to plan around the late rain forecast, but gives no unsolicited pit timing, fuel load, tyre call or other topics",
         "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
-        "At most 30 words excluding a brief acknowledgement; gives all requested information"
+        "At most 35 words excluding a brief acknowledgement; gives all requested information"
       ],
       "session": "race"
     },
@@ -167,12 +169,13 @@
       "prompt": "can we make it to the end on energy? if not tell me when to box and why",
       "expected_output": "",
       "files": [],
+      "pending": [],
       "assertions": [
         "Says we cannot make it to the end on energy",
         "Says when to box (a lap or a number of laps from now)",
-        "Gives a reason for that timing, since the pilot asked why",
-        "At most 3 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
-        "Answers all requested parts without unrelated topics or a raw-data recital; at most 45 words excluding a brief acknowledgement"
+        "Gives a reason for that timing, since the pilot asked why (factoring the late rain forecast into timing/flexibility is welcomed when framed as a chance, not a certainty)",
+        "At most 4 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it",
+        "Answers all requested parts without unrelated topics or a raw-data recital; at most 75 words excluding a brief acknowledgement"
       ],
       "session": "race"
     },
@@ -248,12 +251,13 @@
       "prompt": "Can we make it on energy? If not, when should I box and why, and should I fit wets at that stop?",
       "expected_output": "Controlled synthetic fixture; concise but complete advice",
       "files": [],
+      "pending": [],
       "session": "race",
       "assertions": [
         "Says energy is insufficient and gives an actual pit lap or time within the available range",
         "Gives a supported reason for that timing",
         "Gives a tyre recommendation for the stop, conditional on actual rain/wetness rather than assuming the forecast is certain",
-        "Answers all FOUR requested parts in at most 60 words excluding a brief acknowledgement",
+        "Answers all FOUR requested parts in at most 75 words excluding a brief acknowledgement",
         "Does not recite current fuel, energy percentages, tyre measurements or lap times"
       ]
     },
@@ -302,6 +306,7 @@
       "prompt": "Can I make it on energy? Just the verdict.",
       "expected_output": "Controlled synthetic fixture; concise but complete advice",
       "files": [],
+      "pending": [],
       "session": "race",
       "assertions": [
         "Says no / cannot make it, optionally giving the approximately three-lap deficit",

@@ -215,7 +215,9 @@ impl Engineer {
     }
 
     /// Attach current telemetry once, before the question enters provider history.
-    /// Use the same query and quoting as the tool; a failed read leaves the question intact.
+    /// Use the same query and quoting as the tool; a failed read says it's unavailable, in the same
+    /// marked block, so what follows it is still sent again with every question (see
+    /// `claude::question_message`).
     ///
     /// The setup's setting names come too, and what `pit` (the pit menu, in games the engineer can
     /// change it in) can take, when they aren't the ones `outline_shown` (a hash of both) says this
@@ -231,7 +233,7 @@ impl Engineer {
             Ok(snapshot) => snapshot,
             Err(e) => {
                 log::warn!("Error attaching the engineer's telemetry snapshot: {e:#}");
-                return question;
+                "unavailable".to_owned()
             }
         };
         let names = match self.setup_names().await {
@@ -3971,7 +3973,7 @@ mod tests {
         let failed = engineer
             .question_with_snapshot("Gap?".into(), &mut None, None)
             .await;
-        assert_eq!(failed, "Gap?");
+        assert!(failed.contains("\nunavailable\n"), "{failed}");
         conn.execute("ALTER TABLE unavailable RENAME TO telemetry", [])
             .unwrap();
         let recovered = engineer
@@ -3979,7 +3981,6 @@ mod tests {
             .await;
         assert!(recovered.starts_with("And now?\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]"));
         assert!(recovered.contains("Fischer"), "{recovered}");
-        assert_eq!(failed, "Gap?");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3997,7 +3998,9 @@ mod tests {
             engineer
                 .question_with_snapshot(question.into(), &mut None, None)
                 .await,
-            question
+            format!(
+                "{question}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\nunavailable\n[END UNTRUSTED TELEMETRY SNAPSHOT]"
+            )
         );
         // And a query says it can't be answered
         let error = engineer
@@ -5228,9 +5231,15 @@ mod evals {
         if setup.batch.is_some() {
             // The pilot's reply language when nobody has spoken: the app's default
             let note: Arc<str> = language::reply_note(arrstr!("en")).into();
-            (briefed(head, &pending, Some(&note)), Some(note))
+            (
+                briefed(head, &pending, crate::engineer::strategy::NO_STRATEGY, Some(&note)),
+                Some(note),
+            )
         } else if eval.get("pending").is_some() {
-            (briefed(head, &pending, None), None)
+            (
+                briefed(head, &pending, crate::engineer::strategy::NO_STRATEGY, None),
+                None,
+            )
         } else {
             (head, None)
         }
@@ -5308,7 +5317,10 @@ mod evals {
         let prompt = asked["prompt"].as_str().unwrap();
         let (question, note) = brief(asked, &setup37, &progress, head(asked, &setup37));
         assert!(note.is_none());
-        assert_eq!(question, format!("{prompt}\n\n{pending}"));
+        assert_eq!(
+            question,
+            format!("{prompt}\n\n{pending}\n\n{}", crate::engineer::strategy::NO_STRATEGY)
+        );
         for entry in asked["pending"].as_array().unwrap() {
             let line = format!(
                 "- {}: {}",
@@ -5333,7 +5345,10 @@ mod evals {
         assert_eq!(note.as_deref(), Some(reply_note.as_str()));
         assert_eq!(
             message,
-            format!("{head41}\n\nScheduled requests: none.\n\n{reply_note}")
+            format!(
+                "{head41}\n\nScheduled requests: none.\n\n{}\n\n{reply_note}",
+                crate::engineer::strategy::NO_STRATEGY
+            )
         );
         let entry = &fired["scheduled"][0];
         for part in [

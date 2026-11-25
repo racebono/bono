@@ -23,6 +23,7 @@ use bono_i18n::t;
 use schedule::{
     Batch, Change, Fired, NO_REQUESTS, RequestId, SILENCE, Schedule, tool::ScheduleTool,
 };
+use strategy::{NO_STRATEGY, Strategy, StrategyChange, StrategyTool};
 use sdl3::audio::{AudioDevice, AudioStreamOwner};
 use std::{
     collections::VecDeque,
@@ -46,6 +47,7 @@ use tool::{ConditionId, Engineer as EngineerTool, Progress};
 mod acknowledgement;
 mod pit;
 mod schedule;
+mod strategy;
 mod timeline;
 mod tool;
 
@@ -154,6 +156,8 @@ pub struct Engineer {
     /// new-session button, the simulator stopping, the recording going away or being switched for
     /// another, and quitting clear them
     schedule: Schedule,
+    /// The agreed race strategy for this weekend, with the same lifecycle as `schedule`
+    strategy: Strategy,
     /// The newest progress the followed tool published: what the schedule last stepped through,
     /// and what a turn's changes are applied at. Kept while the tool has none (its tables
     /// catching up): applied at an older one, the schedule would see the weekend change back
@@ -234,6 +238,9 @@ struct Briefing {
     pending_text: String,
     /// The weekend the pending requests are from
     pending_weekend: Option<i64>,
+    /// The active race strategy line (`Race strategy: ...`) and weekend when the turn started
+    strategy_text: String,
+    weekend: Option<i64>,
     /// The [`Told`] notes: the message has those about its conversation as it is once the turn
     /// has the lock on it (see [`Note::conversation`])
     notes: Vec<Note>,
@@ -245,11 +252,17 @@ struct Briefing {
     started_over: Arc<AtomicBool>,
 }
 
+/// The changes a finished turn staged for the engineer to apply.
+struct TurnChanges {
+    schedule: Vec<Change>,
+    strategy: Option<StrategyChange>,
+}
+
 /// The engineer's own turn, answering requests that fired. It's never the pilot's: a question
 /// asked while it runs drops it rather than steering it, and its text is only had once it's done.
 struct ScheduledTurn {
-    /// The reply, with the changes to the requests the turn staged
-    task: Task<anyhow::Result<(Reply, Vec<Change>)>>,
+    /// The reply, with the changes the turn staged
+    task: Task<anyhow::Result<(Reply, TurnChanges)>>,
     /// The requests it answers
     batch: Batch,
     /// The language it's answered in
@@ -333,8 +346,8 @@ impl<T: Send + 'static> AbortedTurn for Task<T> {
 
 /// A question being answered.
 struct Turn {
-    /// The reply, with the changes to the requests the turn staged, and what was said of it
-    task: Task<anyhow::Result<(Reply, Vec<Change>, Acknowledgement)>>,
+    /// The reply, with the changes the turn staged, and what was said of it
+    task: Task<anyhow::Result<(Reply, TurnChanges, Acknowledgement)>>,
     /// The language it's answered in
     lang: ArrayStr<2>,
     /// The answer as the model writes it, for the chat
@@ -662,6 +675,8 @@ struct SessionState {
     tool: EngineerTool,
     /// Stages the turn's changes to the requests, for the engineer to apply once it finishes
     schedule_tool: ScheduleTool,
+    /// Stages the turn's update to the agreed race strategy, applied once the turn finishes
+    strategy_tool: StrategyTool,
     /// Reads and changes the game's pit menu, in games the engineer can change it in
     pit_tool: Option<PitTool>,
     /// The weekend the conversation is about, for `auto_session`: the recording's oldest epoch,
@@ -700,6 +715,7 @@ impl Engineer {
             hearing: None,
             misheard: 0,
             schedule: Schedule::new(),
+            strategy: Strategy::new(),
             progress: None,
             registered: Vec::new(),
             unheard: Vec::new(),
@@ -745,6 +761,12 @@ impl Engineer {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn schedule(&self) -> &Schedule {
         &self.schedule
+    }
+
+    /// The agreed race strategy for the current weekend, if any.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn strategy(&self) -> Option<&str> {
+        self.strategy.plan()
     }
 
     /// Everything said so far, oldest first.
@@ -1009,6 +1031,7 @@ impl Engineer {
         }
         self.new_session = true;
         self.clear_requests();
+        self.strategy.clear();
         // About the conversation that's over
         self.unheard.clear();
         self.notice(t!("engineer.new_session"));
@@ -1075,6 +1098,7 @@ impl Engineer {
             return;
         };
         let advance = self.schedule.advance(&progress, self.now());
+        self.strategy.follow_weekend(progress.weekend);
         self.progress = Some(progress);
         if advance.skipped_stale > 0 {
             log::debug!(
@@ -1100,6 +1124,15 @@ impl Engineer {
             ));
         }
         self.sync_conditions();
+    }
+
+    /// Applies a finished turn's staged race strategy change, unless it's from an earlier weekend.
+    fn apply_strategy(&mut self, change: Option<StrategyChange>) {
+        if let Some(change) = change
+            && !self.strategy.apply(change)
+        {
+            log::debug!("Dropped race strategy update staged in an earlier weekend");
+        }
     }
 
     /// Applies a finished turn's changes to the requests, at the newest progress. Those that
@@ -1313,6 +1346,7 @@ impl Engineer {
             self.registered.clear();
             self.progress = None;
             self.clear_requests();
+            self.strategy.clear();
         }
     }
 
@@ -1534,6 +1568,9 @@ impl Engineer {
             next_id: self.schedule.next_id(),
             pending_text: self.schedule.pending_text(&progress),
             pending_weekend: self.schedule.weekend(),
+            strategy_text: self.strategy.briefing_text(),
+            // The newest seen: a strategy saved in a new weekend knows it before the progress does
+            weekend: progress.weekend.max(self.strategy.weekend()),
             notes: told.notes.clone(),
             state,
             note,
@@ -1595,11 +1632,14 @@ impl Engineer {
                             timeline.first_text();
                             acknowledgement.text(text)
                         }
-                        // Not a query: a `schedule` or `pit` call is confirmed once made, and
-                        // needs no acknowledgement first (see the skill)
+                        // Not a query: a `schedule`, `strategy`, or `pit` call is confirmed once
+                        // made, and needs no acknowledgement first (see the skill)
                         Streamed::Tools(names) => {
-                            let queried = (names.iter())
-                                .any(|&name| name != ScheduleTool::NAME && name != PitTool::NAME);
+                            let queried = (names.iter()).any(|&name| {
+                                name != ScheduleTool::NAME
+                                    && name != StrategyTool::NAME
+                                    && name != PitTool::NAME
+                            });
                             acknowledgement.tools(queried)
                         }
                     }
@@ -1616,7 +1656,10 @@ impl Engineer {
                     timeline.answered();
                 }
                 state.keep_outline(&reply);
-                let changes = state.schedule_tool.take();
+                let changes = TurnChanges {
+                    schedule: state.schedule_tool.take(),
+                    strategy: state.strategy_tool.take(),
+                };
                 reply.map(|reply| (reply, changes))
             };
             // From when the question is asked (the conversation's wait and the briefing included),
@@ -1707,7 +1750,10 @@ impl Engineer {
             state.conversation.set_steer(None);
             let reply = state.conversation.send(message).await;
             state.keep_outline(&reply);
-            let changes = state.schedule_tool.take();
+            let changes = TurnChanges {
+                schedule: state.schedule_tool.take(),
+                strategy: state.strategy_tool.take(),
+            };
             reply.map(|reply| (reply, changes))
         });
         self.scheduled = Some(ScheduledTurn {
@@ -1736,7 +1782,7 @@ impl Engineer {
         config: &Config,
         synth: &mut Synthesizer,
         scheduled: ScheduledTurn,
-        result: anyhow::Result<(Reply, Vec<Change>)>,
+        result: anyhow::Result<(Reply, TurnChanges)>,
     ) {
         let ScheduledTurn {
             batch,
@@ -1773,7 +1819,8 @@ impl Engineer {
             // Due again first: a request it replaced stays due, as replaced
             let now = self.now();
             self.schedule.batch_failed(now);
-            self.apply(changes, &[]);
+            self.apply(changes.schedule, &[]);
+            self.apply_strategy(changes.strategy);
             return;
         }
         let what = what_fired(
@@ -1794,7 +1841,8 @@ impl Engineer {
                 if stop == StopReason::ContextWindowExceeded {
                     self.new_session = true;
                 }
-                self.apply(changes, &batch.fired);
+                self.apply(changes.schedule, &batch.fired);
+                self.apply_strategy(changes.strategy);
                 // Empty: it ended its turn with nothing to say (a cut-off one went above)
                 reply.text.contains(SILENCE) || reply.text.trim().is_empty()
             }
@@ -1853,6 +1901,7 @@ impl Engineer {
             self.notice(t!("engineer.sim_stopped"));
             // The recording goes with the game
             self.clear_requests();
+            self.strategy.clear();
             if interrupted {
                 // What it was saying goes with the turn, which the conversation forgot
                 self.clear_line();
@@ -1899,7 +1948,8 @@ impl Engineer {
                         // The model's reachable: a scheduled turn failing next is another outage
                         self.scheduled_failing = false;
                         self.answer(rt, config, synth, reply, acknowledgement, turn);
-                        self.apply(changes, &[]);
+                        self.apply(changes.schedule, &[]);
+                        self.apply_strategy(changes.strategy);
                     }
                     // Forgotten, and what it changed with it
                     Ok((reply, _, acknowledgement)) => {
@@ -2347,10 +2397,11 @@ impl Engineer {
         pit: Option<Arc<dyn PitService>>,
     ) -> anyhow::Result<Session> {
         let schedule_tool = ScheduleTool::new(tool.clone());
+        let strategy_tool = StrategyTool::new();
         // Only for a game the engineer can change the pit menu in
         let pit_tool = pit.map(PitTool::new);
         let has_pit = pit_tool.is_some();
-        let tools = session_tools(&tool, &schedule_tool, pit_tool.as_ref());
+        let tools = session_tools(&tool, &schedule_tool, &strategy_tool, pit_tool.as_ref());
         let model = config.get().model.clone();
         let corner_names = *config.get().corner_names();
         // Taken before the conversation: if the account signs out meanwhile, it ends next frame
@@ -2378,6 +2429,7 @@ impl Engineer {
                 conversation,
                 tool,
                 schedule_tool,
+                strategy_tool,
                 pit_tool,
                 pool,
                 sim,
@@ -2399,6 +2451,7 @@ impl Engineer {
 
         self.stop();
         self.schedule.clear();
+        self.strategy.clear();
         let session = self.session.take();
         let tool = self.tool.take();
         let aborted = std::mem::take(&mut self.aborted);
@@ -2492,9 +2545,14 @@ pub(crate) fn scheduled_message(batch: &Batch) -> String {
 }
 
 /// A turn's `message`, its telemetry snapshot attached, with what follows it: the pending
-/// requests and the reply-language `note`, last.
-pub(crate) fn briefed(message: String, pending_text: &str, note: Option<&str>) -> String {
-    let message = format!("{message}\n\n{pending_text}");
+/// requests, the agreed race strategy, and the reply-language `note`, last.
+pub(crate) fn briefed(
+    message: String,
+    pending_text: &str,
+    strategy_text: &str,
+    note: Option<&str>,
+) -> String {
+    let message = format!("{message}\n\n{pending_text}\n\n{strategy_text}");
     match note {
         Some(note) => format!("{message}\n\n{note}"),
         None => message,
@@ -2546,8 +2604,9 @@ fn system_prompt(sim: Option<&str>, has_pit: bool, corner_names: bool) -> Arc<st
 
 impl SessionState {
     /// Readies the conversation for a turn, and writes its `message` out with `briefing`'s notes,
-    /// then the setup outline (when shown), the telemetry snapshot, the pending requests and the
-    /// reply-language note. Once per turn: the `schedule` tool stages its changes from here.
+    /// then the setup outline (when shown), the telemetry snapshot, the pending requests, the race
+    /// strategy and the reply-language note. Once per turn: the `schedule` and `strategy` tools
+    /// stage their changes from here.
     async fn brief(&mut self, message: String, briefing: Briefing) -> String {
         let started_over = self.follow_game_session(briefing.auto_session).await;
         if started_over {
@@ -2563,6 +2622,14 @@ impl SessionState {
             false => (briefing.pending, briefing.pending_text),
         };
         self.schedule_tool.begin(pending, briefing.next_id);
+        // Weekends' ids only grow, so the newer of what this conversation and the engineer have
+        // seen is the one it is (either can lag). A strategy from before it is the last weekend's
+        let weekend = self.weekend.max(briefing.weekend);
+        self.strategy_tool.begin(weekend);
+        let strategy_text = match briefing.weekend.is_some() && briefing.weekend < weekend {
+            true => NO_STRATEGY.to_owned(),
+            false => briefing.strategy_text,
+        };
         // Only those about this conversation as it is now: one that's started over, here or
         // since a note was made, never had what it's about
         let starts = self.starts.load(atomic::Ordering::Relaxed);
@@ -2588,7 +2655,12 @@ impl SessionState {
             .question_with_snapshot(message + &notes, &mut shown, pit.as_ref())
             .await;
         self.outline_offered = shown;
-        let message = briefed(message, &pending_text, briefing.note.as_deref());
+        let message = briefed(
+            message,
+            &pending_text,
+            &strategy_text,
+            briefing.note.as_deref(),
+        );
         self.conversation.set_tool_result_note(briefing.note);
         message
     }
@@ -2647,11 +2719,12 @@ impl SessionState {
     }
 }
 
-/// A conversation's tools: the engineer's, the schedule's, and the pit menu's in a game the
-/// engineer can change it in.
+/// A conversation's tools: the engineer's, the schedule's, the race strategy's, and the pit
+/// menu's in a game the engineer can change it in.
 fn session_tools(
     tool: &EngineerTool,
     schedule_tool: &ScheduleTool,
+    strategy_tool: &StrategyTool,
     pit_tool: Option<&PitTool>,
 ) -> Tools {
     let mut tools = Tools::default();
@@ -2666,6 +2739,12 @@ fn session_tools(
         Some(ScheduleTool::description()),
         ScheduleTool::input_schema(),
         schedule_tool.clone(),
+    );
+    tools.insert(
+        StrategyTool::NAME,
+        Some(StrategyTool::description()),
+        StrategyTool::input_schema(),
+        strategy_tool.clone(),
     );
     if let Some(pit_tool) = pit_tool {
         tools.insert(
@@ -3987,16 +4066,25 @@ mod tests {
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
         let tool = engineer.tool_for(&rt, "lmu", &pool);
         let schedule_tool = ScheduleTool::new(tool.clone());
+        let strategy_tool = StrategyTool::new();
         let names = |pit: Option<&PitTool>| {
-            (session_tools(&tool, &schedule_tool, pit).definitions())
+            (session_tools(&tool, &schedule_tool, &strategy_tool, pit).definitions())
                 .map(|definition| definition.name)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names(None), [EngineerTool::NAME, ScheduleTool::NAME]);
+        assert_eq!(
+            names(None),
+            [EngineerTool::NAME, ScheduleTool::NAME, StrategyTool::NAME]
+        );
         let pit = PitTool::new(Arc::new(NoMenu));
         assert_eq!(
             names(Some(&pit)),
-            [EngineerTool::NAME, ScheduleTool::NAME, PitTool::NAME]
+            [
+                EngineerTool::NAME,
+                ScheduleTool::NAME,
+                StrategyTool::NAME,
+                PitTool::NAME,
+            ]
         );
     }
 
@@ -4113,6 +4201,7 @@ mod tests {
                     pool: original,
                     tool: first.clone(),
                     schedule_tool: ScheduleTool::new(first.clone()),
+                    strategy_tool: StrategyTool::new(),
                     pit_tool: None,
                     sim: "lmu",
                     weekend: None,
@@ -4166,6 +4255,7 @@ mod tests {
             pool: pool.clone(),
             tool: tool.clone(),
             schedule_tool: ScheduleTool::new(tool),
+            strategy_tool: StrategyTool::new(),
             pit_tool: None,
             sim: "lmu",
             weekend: None,
@@ -4228,6 +4318,8 @@ mod tests {
         TakeSteer,
         /// It calls the `schedule` tool with this input, and carries on
         Schedule(serde_json::Value),
+        /// It calls the `strategy` tool with this input, and carries on
+        Strategy(serde_json::Value),
         /// It writes this text, and carries on
         Write(&'static str),
         /// It's about to run these tools, and carries on
@@ -4285,6 +4377,11 @@ mod tests {
                         }
                         Some(Act::Schedule(input)) => {
                             let result = self.tools.handle(ScheduleTool::NAME, &input).await;
+                            let result = result.map_err(|e| format!("{e:#}"));
+                            self.asked.lock().unwrap().calls.push(result);
+                        }
+                        Some(Act::Strategy(input)) => {
+                            let result = self.tools.handle(StrategyTool::NAME, &input).await;
                             let result = result.map_err(|e| format!("{e:#}"));
                             self.asked.lock().unwrap().calls.push(result);
                         }
@@ -4388,11 +4485,18 @@ mod tests {
             let tool = engineer.tool.clone().unwrap();
             let schedule_tool = ScheduleTool::new(tool.clone());
             let mut tools = Tools::default();
+            let strategy_tool = StrategyTool::new();
             tools.insert(
                 ScheduleTool::NAME,
                 Some(ScheduleTool::description()),
                 ScheduleTool::input_schema(),
                 schedule_tool.clone(),
+            );
+            tools.insert(
+                StrategyTool::NAME,
+                Some(StrategyTool::description()),
+                StrategyTool::input_schema(),
+                strategy_tool.clone(),
             );
             // As `ask` would start it, so it keeps it
             let starts = Arc::<AtomicU32>::default();
@@ -4413,6 +4517,7 @@ mod tests {
                     }),
                     tool: tool.clone(),
                     schedule_tool,
+                    strategy_tool,
                     pit_tool: None,
                     pool,
                     sim: "test",
@@ -4502,6 +4607,17 @@ mod tests {
             let calls = self.asked.lock().unwrap().calls.len();
             self.acts.send(Act::Schedule(input)).unwrap();
             self.until("called the tool", |s| {
+                s.asked.lock().unwrap().calls.len() > calls
+            });
+            self.asked.lock().unwrap().calls[calls].clone()
+        }
+
+        /// Has the running turn call the `strategy` tool with `input`, and returns what the call
+        /// returned.
+        fn strategy(&mut self, input: serde_json::Value) -> Result<String, String> {
+            let calls = self.asked.lock().unwrap().calls.len();
+            self.acts.send(Act::Strategy(input)).unwrap();
+            self.until("called strategy tool", |s| {
                 s.asked.lock().unwrap().calls.len() > calls
             });
             self.asked.lock().unwrap().calls[calls].clone()
@@ -6133,6 +6249,7 @@ mod tests {
                 sim: state.sim,
                 tool: state.tool.clone(),
                 schedule_tool: state.schedule_tool.clone(),
+                strategy_tool: state.strategy_tool.clone(),
                 pit_tool: None,
                 weekend: None,
                 starts: Arc::default(),
@@ -6522,8 +6639,9 @@ mod tests {
     #[test]
     fn keeps_an_answer_written_before_a_schedule_or_pit_call() {
         // What came before tools that only act answered; before any query, it acknowledged
-        let groups: [(&'static [&'static str], &str); 4] = [
+        let groups: [(&'static [&'static str], &str); 5] = [
             (&[ScheduleTool::NAME], "Copiado, lo miro.\nDelanteros bien.\nHecho."),
+            (&[StrategyTool::NAME], "Copiado, lo miro.\nDelanteros bien.\nHecho."),
             (&[PitTool::NAME], "Copiado, lo miro.\nDelanteros bien.\nHecho."),
             (&[PitTool::NAME, ScheduleTool::NAME], "Copiado, lo miro.\nDelanteros bien.\nHecho."),
             (&[ScheduleTool::NAME, EngineerTool::NAME], "Copiado, lo miro.\nHecho."),
@@ -6986,6 +7104,7 @@ mod tests {
             let mut state = SessionState {
                 conversation: Box::new(RecordingModel(recorded.clone())),
                 schedule_tool: ScheduleTool::new(tool.clone()),
+                strategy_tool: StrategyTool::new(),
                 pit_tool: None,
                 tool,
                 pool,
@@ -7070,5 +7189,276 @@ mod tests {
             // Only auto sessions start the conversation over, once
             assert_eq!(recorded.lock().unwrap().resets, usize::from(auto_session));
         }
+    }
+
+    #[test]
+    fn strategy_persists_in_briefing_and_updates_across_turns() {
+        let mut scripted = Scripted::recorded();
+        assert_eq!(scripted.engineer.strategy(), None);
+
+        // Turn 1: initial briefing has NO_STRATEGY; model calls strategy(set)
+        scripted.ask("Let's do a two-stop and short-fuel stop one for rain.");
+        scripted.until("asked turn 1", |s| s.questions().len() == 1);
+        let q1 = scripted.questions()[0].clone();
+        assert!(q1.contains(NO_STRATEGY), "{q1}");
+        let res = scripted
+            .strategy(serde_json::json!({
+                "action": "set",
+                "plan": "2-stop: short-fuel lap 20, box for wets around lap 42 if rain hits"
+            }))
+            .unwrap();
+        assert_eq!(res, "Saved.");
+        // Not applied until the turn finishes
+        assert_eq!(scripted.engineer.strategy(), None);
+        scripted.finish(Act::Reply);
+        assert_eq!(
+            scripted.engineer.strategy(),
+            Some("2-stop: short-fuel lap 20, box for wets around lap 42 if rain hits")
+        );
+
+        // Turn 2: briefing carries active Race strategy after snapshot; model calls strategy(clear)
+        scripted.ask("Drop the plan, we'll play it by ear.");
+        scripted.until("asked turn 2", |s| s.questions().len() == 2);
+        let q2 = scripted.questions()[1].clone();
+        let snap_end = q2
+            .find("[END UNTRUSTED TELEMETRY SNAPSHOT]")
+            .expect("snapshot marker present");
+        let strat_pos = q2
+            .find("Race strategy: 2-stop: short-fuel lap 20, box for wets around lap 42 if rain hits")
+            .expect("active strategy present in briefing");
+        assert!(strat_pos > snap_end, "strategy must appear after snapshot: {q2}");
+        assert_eq!(
+            scripted.strategy(serde_json::json!({"action": "clear"})).unwrap(),
+            "Cleared."
+        );
+        scripted.finish(Act::Reply);
+        assert_eq!(scripted.engineer.strategy(), None);
+
+        // Turn 3: back to NO_STRATEGY
+        scripted.ask("Fuel check?");
+        scripted.until("asked turn 3", |s| s.questions().len() == 3);
+        assert!(scripted.questions()[2].contains(NO_STRATEGY));
+        scripted.finish(Act::Reply);
+    }
+
+    #[test]
+    fn failed_and_refused_turns_do_not_change_strategy() {
+        let mut scripted = Scripted::recorded();
+        scripted.ask("Agree to 1-stop lap 25.");
+        scripted.until("asked 1", |s| s.questions().len() == 1);
+        scripted
+            .strategy(serde_json::json!({"action": "set", "plan": "1-stop lap 25"}))
+            .unwrap();
+        scripted.finish(Act::Reply);
+        assert_eq!(scripted.engineer.strategy(), Some("1-stop lap 25"));
+
+        // Failed turn calling set must not overwrite strategy
+        scripted.ask("Change to 2-stop.");
+        scripted.until("asked 2", |s| s.questions().len() == 2);
+        scripted
+            .strategy(serde_json::json!({"action": "set", "plan": "2-stop"}))
+            .unwrap();
+        scripted.finish(Act::Fail);
+        assert_eq!(scripted.engineer.strategy(), Some("1-stop lap 25"));
+
+        // Refused turn calling clear must not clear strategy
+        scripted.ask("Clear strategy.");
+        scripted.until("asked 3", |s| s.questions().len() == 3);
+        scripted
+            .strategy(serde_json::json!({"action": "clear"}))
+            .unwrap();
+        scripted.finish(Act::Refuse);
+        assert_eq!(scripted.engineer.strategy(), Some("1-stop lap 25"));
+    }
+
+    #[test]
+    fn cut_off_and_scheduled_turns_change_strategy() {
+        let set = || serde_json::json!({"action": "set", "plan": "1-stop lap 25"});
+        for stop in [StopReason::MaxTokens, StopReason::ContextWindowExceeded] {
+            let mut scripted = Scripted::recorded();
+            scripted.ask("Agree to 1-stop lap 25.");
+            scripted.until("asked", |s| s.questions().len() == 1);
+            scripted.strategy(set()).unwrap();
+            scripted.finish(Act::End(stop, "Saved, and"));
+            assert_eq!(scripted.engineer.strategy(), Some("1-stop lap 25"), "{stop:?}");
+        }
+
+        let mut scripted = Scripted::recorded();
+        scripted.falls_due();
+        let turns = scripted.questions().len();
+        scripted.wait(schedule::GATHER);
+        scripted.scheduled_asked(turns);
+        scripted.strategy(set()).unwrap();
+        assert_eq!(scripted.engineer.strategy(), None);
+        scripted.finish_scheduled(Act::Reply);
+        assert_eq!(scripted.engineer.strategy(), Some("1-stop lap 25"));
+
+        // Another recording has none
+        let one = NonZeroUsize::new(1).unwrap();
+        let db = scripted._dir.path().join("other.db");
+        let pool = Pool::new(Database::read_only(Arc::new(db)), one, one);
+        let mut sim = crate::sim::recording(pool);
+        scripted
+            .engineer
+            .follow_recording(scripted.runtime.handle(), Some(&mut *sim));
+        assert_eq!(scripted.engineer.strategy(), None);
+    }
+
+    #[test]
+    fn strategy_clears_on_new_session_sim_stop_and_new_weekend() {
+        // 1) new_session clears strategy
+        let mut scripted = Scripted::recorded();
+        scripted.ask("Lock 1-stop.");
+        scripted.until("asked", |s| s.questions().len() == 1);
+        scripted
+            .strategy(serde_json::json!({"action": "set", "plan": "1-stop lap 25"}))
+            .unwrap();
+        scripted.finish(Act::Reply);
+        assert_eq!(scripted.engineer.strategy(), Some("1-stop lap 25"));
+        scripted.engineer.new_session();
+        assert_eq!(scripted.engineer.strategy(), None);
+
+        // 2) sim stop clears strategy
+        let mut scripted = Scripted::recorded();
+        scripted.ask("Lock 2-stop.");
+        scripted.until("asked", |s| s.questions().len() == 1);
+        scripted
+            .strategy(serde_json::json!({"action": "set", "plan": "2-stop"}))
+            .unwrap();
+        scripted.finish(Act::Reply);
+        assert_eq!(scripted.engineer.strategy(), Some("2-stop"));
+        {
+            let _entered = scripted.runtime.enter();
+            scripted.engineer.update(
+                scripted.runtime.handle(),
+                None,
+                &scripted.config,
+                &mut scripted.synth,
+                None,
+            );
+        }
+        assert_eq!(scripted.engineer.strategy(), None);
+
+        // 3) weekend rollover clears strategy, and a turn starting before follow_progress sees
+        //    the new weekend receives NO_STRATEGY instead of the previous weekend's plan
+        let mut scripted = Scripted::recorded();
+        scripted.tick();
+        scripted.ask("Lock weekend 1 plan.");
+        scripted.until("asked 1", |s| s.questions().len() == 1);
+        scripted
+            .strategy(serde_json::json!({"action": "set", "plan": "weekend 1 plan"}))
+            .unwrap();
+        scripted.finish(Act::Reply);
+        assert_eq!(scripted.engineer.strategy(), Some("weekend 1 plan"));
+
+        scripted.new_weekend();
+        // Ask a question right after weekend rolls over (before follow_progress runs):
+        // SessionState::brief sees the new weekend and sends NO_STRATEGY.
+        scripted.ask("Fuel check in new weekend?");
+        scripted.until("asked 2", |s| s.questions().len() == 2);
+        assert!(
+            scripted.questions()[1].contains(NO_STRATEGY),
+            "new weekend turn must not see old strategy: {}",
+            scripted.questions()[1]
+        );
+        assert!(
+            !scripted.questions()[1].contains("weekend 1 plan"),
+            "{}",
+            scripted.questions()[1]
+        );
+        scripted.finish(Act::Reply);
+
+        // Next progress tick clears the weekend 1 strategy on Engineer
+        scripted.tick();
+        assert_eq!(scripted.engineer.strategy(), None);
+    }
+
+    #[test]
+    fn new_weekend_strategy_saved_before_progress_tick_survives_deferred_schedule_clear() {
+        let mut scripted = Scripted::recorded();
+        // Weekend 1 has both a pending request and a saved strategy
+        scripted.add("Fuel every lap, please.", fuel_every_lap());
+        scripted.tick();
+        scripted.ask("Lock weekend 1 plan.");
+        scripted.until("asked w1", |s| s.questions().len() == 2);
+        scripted
+            .strategy(serde_json::json!({"action": "set", "plan": "weekend 1 plan"}))
+            .unwrap();
+        scripted.finish(Act::Reply);
+        assert_eq!(scripted.engineer.strategy(), Some("weekend 1 plan"));
+
+        // Roll over to weekend 2 before follow_progress ticks, then save a weekend 2 plan
+        scripted.new_weekend();
+        scripted.ask("Lock weekend 2 plan.");
+        scripted.until("asked w2", |s| s.questions().len() == 3);
+        assert!(scripted.questions()[2].contains(NO_STRATEGY));
+        scripted
+            .strategy(serde_json::json!({"action": "set", "plan": "weekend 2 plan"}))
+            .unwrap();
+        scripted.finish(Act::Reply);
+        // The weekend 2 plan must not be dropped because progress lagged at weekend 1
+        assert_eq!(scripted.engineer.strategy(), Some("weekend 2 plan"));
+
+        // The next question is told it, while progress still lags
+        scripted.ask("What's the plan?");
+        scripted.until("asked w2 again", |s| s.questions().len() == 4);
+        let question = scripted.questions()[3].clone();
+        assert!(question.contains("Race strategy: weekend 2 plan"), "{question}");
+        scripted.finish(Act::Reply);
+
+        // The tick clearing weekend 1's schedule must not wipe weekend 2's plan
+        scripted.tick();
+        assert_eq!(scripted.engineer.strategy(), Some("weekend 2 plan"));
+    }
+
+    #[test]
+    fn stale_in_flight_strategy_is_dropped_after_weekend_rollover() {
+        let mut scripted = Scripted::recorded();
+        scripted.tick();
+        scripted.ask("Lock weekend 1 plan.");
+        scripted.until("asked", |s| s.questions().len() == 1);
+        scripted
+            .strategy(serde_json::json!({"action": "set", "plan": "weekend 1 plan"}))
+            .unwrap();
+        // Roll over and tick progress into weekend 2 while the weekend 1 turn is still in flight
+        scripted.new_weekend();
+        scripted.tick();
+        scripted.finish(Act::Reply);
+        assert_eq!(scripted.engineer.strategy(), None);
+    }
+
+    #[test]
+    fn auto_session_off_new_weekend_without_progress_does_not_leak_old_strategy() {
+        use bono_sim::sql::{EpochReason, begin_epoch, clear_tables};
+
+        let mut scripted = Scripted::with_config(r#"{"auto_session": false}"#);
+        let db = scripted._dir.path().join("a.db");
+        // Seed weekend 1 in the pool's DB (`a.db`) with no telemetry so `progress` stays `None`
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            bono_sim::sql::create_tables(&conn).unwrap();
+            begin_epoch(&conn, 1, EpochReason::Session).unwrap();
+        }
+        assert!(scripted.engineer.progress.is_none());
+
+        scripted.ask("Lock weekend 1 plan.");
+        scripted.until("asked w1", |s| s.questions().len() == 1);
+        scripted
+            .strategy(serde_json::json!({"action": "set", "plan": "weekend 1 plan"}))
+            .unwrap();
+        scripted.finish(Act::Reply);
+        assert_eq!(scripted.engineer.strategy(), Some("weekend 1 plan"));
+
+        // Roll over to weekend 2 while `progress` is still `None` and `auto_session` is false
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            clear_tables(&conn, Some(2)).unwrap();
+        }
+        scripted.ask("Fuel check in weekend 2?");
+        scripted.until("asked w2", |s| s.questions().len() == 2);
+        let q2 = &scripted.questions()[1];
+        assert!(q2.contains(NO_STRATEGY), "leaked old strategy: {q2}");
+        assert!(!q2.contains("weekend 1 plan"), "leaked old strategy: {q2}");
+        scripted.finish(Act::Reply);
     }
 }
