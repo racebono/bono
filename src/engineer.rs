@@ -43,7 +43,7 @@ use tokio::{
 use pit::PitTool;
 use tool::{ConditionId, Engineer as EngineerTool, Progress};
 
-mod acknowledgement;
+pub(crate) mod acknowledgement;
 mod pit;
 mod schedule;
 mod timeline;

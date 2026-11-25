@@ -233,7 +233,8 @@ impl Onboarding {
             Some(Action::Next) => {
                 // The language is picked: what it needs can start downloading
                 if step == Step::Welcome {
-                    topbar.audio.setup(config);
+                    let langs = [topbar.audio.guide_language(&config.get())];
+                    topbar.audio.setup(&langs);
                 }
                 self.step = step.next(&steps);
                 if self.step == Some(Step::RadioCheck) {
@@ -459,13 +460,14 @@ fn welcome(
     ui.strong(t!("language"));
     config.maybe_update(|raw| settings::languages(ui, raw));
 
-    let items = audio.setup_items(rt, config, synth);
+    let langs = [audio.guide_language(&config.get())];
+    let items = audio.setup_items(rt, config, synth, &langs);
     if !items.is_empty() {
         ui.add_space(8.0);
         ui.strong(t!("onboarding.downloads_title"));
         ui.label(t!("onboarding.downloads_body"));
         if downloads(ui, &items) {
-            audio.setup(config);
+            audio.setup(&langs);
         }
     }
 }
@@ -585,12 +587,13 @@ fn still_downloading(
     audio: &mut AudioTopbar,
     synth: &Synthesizer,
 ) {
-    let items = audio.setup_items(rt, config, synth);
+    let langs = [audio.guide_language(&config.get())];
+    let items = audio.setup_items(rt, config, synth, &langs);
     if !items.is_empty() {
         ui.add_space(8.0);
         ui.strong(t!("onboarding.downloads_title"));
         if downloads(ui, &items) {
-            audio.setup(config);
+            audio.setup(&langs);
         }
         ui.weak(t!("onboarding.downloads_continue"));
     }
