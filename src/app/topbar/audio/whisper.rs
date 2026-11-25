@@ -862,7 +862,7 @@ impl PendingSession {
                             text if text.is_empty() => Heard::Nothing,
                             text => Heard::Question {
                                 text,
-                                lang,
+                                lang: Some(lang),
                                 released,
                             },
                         },

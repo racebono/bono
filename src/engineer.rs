@@ -63,7 +63,8 @@ pub enum Heard {
     /// `released`: when the talk button was let go.
     Question {
         text: String,
-        lang: ArrayStr<2>,
+        /// `None` if the engine didn't say: it's told by the text
+        lang: Option<ArrayStr<2>>,
         released: Instant,
     },
     /// Something said in a language without a voice
@@ -114,9 +115,9 @@ pub struct Engineer {
     account: Option<Account>,
     /// Everything said, for the chat
     chat: Vec<ChatEntry>,
-    /// The language the pilot last asked in: typed questions whose language is unclear are
+    /// The language the pilot last asked in, if they have: questions whose language is unclear are
     /// answered in it
-    last_lang: ArrayStr<2>,
+    last_lang: Option<ArrayStr<2>>,
     /// Which language typed questions are in (the model answers in the pilot's language)
     languages: LanguageDetector,
     /// The tool for the recording the running simulator has, from the moment it has one: its
@@ -686,7 +687,7 @@ impl Engineer {
             client,
             account,
             chat: Vec::new(),
-            last_lang: arrstr!("en"),
+            last_lang: None,
             languages: LanguageDetector::new(),
             tool: None,
             session: None,
@@ -931,7 +932,27 @@ impl Engineer {
             .get()
             .heard_language()
             .map(language::voice_code)
-            .unwrap_or(self.last_lang)
+            .unwrap_or_else(|| self.last_lang(config))
+    }
+
+    /// The language the pilot last asked in. Until they have: the app's, if it has a voice, or else
+    /// any voice's.
+    fn last_lang(&self, config: &Config) -> ArrayStr<2> {
+        let app = || ArrayStr::from_str(config.get().locale().split('-').next()?);
+        (self.last_lang.or_else(app))
+            .and_then(|lang| self.voice(config, lang))
+            .unwrap_or(arrstr!("en"))
+    }
+
+    /// The language `question` is in, when it isn't known from how it was asked: `None` if nothing
+    /// tells languages apart, so the model goes by the question.
+    fn question_language(&self, config: &Config, question: &str) -> Option<ArrayStr<2>> {
+        match self.languages.detect(question) {
+            Some(lang) => Some(lang),
+            // Too short or ambiguous for any language in particular ("Positions."): the one the
+            // pilot was speaking
+            None => (self.languages.is_ready()).then(|| self.last_lang(config)),
+        }
     }
 
     /// Pauses the answer at the front of the line (and holds one about to start) while the
@@ -1161,7 +1182,8 @@ impl Engineer {
                 released,
             } => {
                 self.misheard = 0;
-                self.ask(rt, sim, config, synth, text, Some(lang), Some(released));
+                let lang = lang.or_else(|| self.question_language(config, &text));
+                self.ask(rt, sim, config, synth, text, lang, Some(released));
             }
             Heard::TooShort => {}
             Heard::Unvoiced { text, lang } => {
@@ -1348,14 +1370,7 @@ impl Engineer {
         question: String,
     ) {
         let heard = *config.get().heard_language();
-        let lang = match heard.or_else(|| self.languages.detect(&question)) {
-            Some(lang) => Some(lang),
-            // Too short or ambiguous for any language in particular ("Positions."): the one the
-            // pilot was speaking
-            None if self.languages.is_ready() => Some(self.last_lang),
-            // Nothing to tell languages apart with: the model goes by the question
-            None => None,
-        };
+        let lang = heard.or_else(|| self.question_language(config, &question));
         self.ask(rt, sim, config, synth, question, lang, None);
     }
 
@@ -1397,7 +1412,7 @@ impl Engineer {
         }
         self.drop_scheduled();
         if let Some(lang) = lang {
-            self.last_lang = language::voice_code(lang);
+            self.last_lang = Some(language::voice_code(lang));
         }
         self.chat.push(ChatEntry {
             speaker: Speaker::Pilot,
@@ -1437,7 +1452,7 @@ impl Engineer {
         let lang = lang.map(language::voice_code);
         let spoken = config.get().engineer_reply_language();
         let known = lang.is_some() || spoken.is_some();
-        let lang = spoken.unwrap_or(lang.unwrap_or(self.last_lang));
+        let lang = spoken.or(lang).unwrap_or_else(|| self.last_lang(config));
         let timeline = Arc::new(Timeline::new(released, Instant::now()));
         let mut sim = sim;
         let database = sim
@@ -1696,7 +1711,8 @@ impl Engineer {
         };
         let state = session.state.clone();
         // The pilot's current reply language: the selected one, or the last they used
-        let lang = (config.get().engineer_reply_language()).unwrap_or(self.last_lang);
+        let spoken = config.get().engineer_reply_language();
+        let lang = spoken.unwrap_or_else(|| self.last_lang(config));
         let lang = self.voice(config, lang).unwrap_or(lang);
         let message = scheduled_message(&batch);
         let (briefing, told) = self.briefing(config, Some(language::reply_note(lang).into()));
@@ -2054,7 +2070,7 @@ impl Engineer {
         let config = config.get();
         let voices = config.voices();
         let app = ArrayStr::from_str(config.locale().split('-').next().unwrap_or_default());
-        [Some(lang), Some(self.last_lang), app]
+        [Some(lang), self.last_lang, app]
             .into_iter()
             .flatten()
             .find(|lang| voices.contains_key(lang))
@@ -2800,7 +2816,7 @@ mod tests {
         let config = runtime.block_on(Config::new(&path)).unwrap();
         let mut synth = Synthesizer::new(rt, &crate::config::RawConfig::default());
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
-        assert_eq!(engineer.last_lang, arrstr!("en"));
+        assert_eq!(engineer.last_lang, None);
         engineer.hear(rt, None, &config, &mut synth, Heard::Nothing);
         assert_eq!(engineer.language(&config), arrstr!("es"));
         assert!(synth.inner.contains_key(&arrstr!("es")));
@@ -2808,6 +2824,95 @@ mod tests {
         config.update(|raw| raw.heard_language.set(Some(arrstr!("en"))));
         assert_eq!(engineer.language(&config), arrstr!("en"));
         engineer.stop();
+    }
+
+    /// Asks each of `questions` on the radio (with the language it was heard in, if known) or in the
+    /// chat (`None`), with `voices` and the app in `locale`: the language each was taken to be in.
+    fn languages_asked(
+        voices: &[&str],
+        locale: &str,
+        questions: &[(&str, Option<Option<ArrayStr<2>>>)],
+    ) -> Vec<Option<ArrayStr<2>>> {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let rt = runtime.handle();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let voices = (voices.iter())
+            .map(|lang| (lang.to_string(), format!("{lang}.onnx")))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let json = serde_json::json!({"locale": locale, "voices": voices});
+        std::fs::write(&path, json.to_string()).unwrap();
+        let config = runtime.block_on(Config::new(&path)).unwrap();
+        let mut synth = Synthesizer::new(rt, &crate::config::RawConfig::default());
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        let start = Instant::now();
+        while !engineer.languages.is_ready() {
+            assert!(start.elapsed() < Duration::from_secs(60));
+            engineer.languages.update(rt, config.get().voices());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let asked = (questions.iter())
+            .map(|&(text, heard)| {
+                let text = text.to_owned();
+                match heard {
+                    Some(lang) => {
+                        let released = Instant::now();
+                        let heard = Heard::Question {
+                            text,
+                            lang,
+                            released,
+                        };
+                        engineer.hear(rt, None, &config, &mut synth, heard);
+                    }
+                    None => engineer.ask_text(rt, None, &config, &mut synth, text),
+                }
+                engineer.last_lang
+            })
+            .collect();
+        engineer.stop();
+        asked
+    }
+
+    const SPANISH: &str = "¿Cuánto combustible me queda y cuándo tengo que parar?";
+    const FRENCH: &str = "Combien de carburant me reste-t-il et quand dois-je m'arrêter ?";
+    const UNCLEAR: &str = "33?";
+
+    #[test]
+    fn a_radio_question_without_a_language_is_told_by_its_text() {
+        assert_eq!(
+            languages_asked(&["es", "fr"], "en", &[(SPANISH, Some(None)), (FRENCH, Some(None))]),
+            [Some(arrstr!("es")), Some(arrstr!("fr"))]
+        );
+    }
+
+    #[test]
+    fn a_language_heard_is_not_told_by_the_text() {
+        assert_eq!(
+            languages_asked(&["es", "fr"], "en", &[(SPANISH, Some(Some(arrstr!("fr"))))]),
+            [Some(arrstr!("fr"))]
+        );
+    }
+
+    #[test]
+    fn an_unclear_first_question_is_in_the_apps_language_or_a_voices() {
+        for how in [Some(None), None] {
+            let asked = |voices: &[&str], locale| languages_asked(voices, locale, &[(UNCLEAR, how)]);
+            assert_eq!(asked(&["es", "fr"], "fr"), [Some(arrstr!("fr"))]);
+            assert_eq!(asked(&["en", "es"], "es-ES"), [Some(arrstr!("es"))]);
+            // There's no English voice
+            assert_eq!(asked(&["es", "fr"], "en"), [Some(arrstr!("es"))]);
+        }
+    }
+
+    #[test]
+    fn an_unclear_question_is_in_the_last_language_spoken() {
+        for how in [Some(None), None] {
+            assert_eq!(
+                languages_asked(&["es", "fr"], "es", &[(FRENCH, Some(None)), (UNCLEAR, how)])[1],
+                Some(arrstr!("fr"))
+            );
+        }
     }
 
     #[test]
@@ -2838,7 +2943,7 @@ mod tests {
                     &mut synth,
                     Heard::Question {
                         text,
-                        lang: arrstr!("nn"),
+                        lang: Some(arrstr!("nn")),
                         released: Instant::now(),
                     },
                 );
@@ -4482,7 +4587,7 @@ mod tests {
         fn hear_ago(&mut self, text: &str, ago: Duration) {
             self.hear(Heard::Question {
                 text: text.into(),
-                lang: arrstr!("es"),
+                lang: Some(arrstr!("es")),
                 released: Instant::now().checked_sub(ago).unwrap(),
             });
         }
@@ -5037,7 +5142,7 @@ mod tests {
         // Heard on the radio: the model is told which language to reply in, last
         scripted.hear(Heard::Question {
             text: "What have you got scheduled?".into(),
-            lang: arrstr!("en"),
+            lang: Some(arrstr!("en")),
             released: Instant::now(),
         });
         scripted.until("asked", |s| s.questions().len() == 2);
@@ -6185,7 +6290,7 @@ mod tests {
         let mut scripted = Scripted::recorded_with(voices);
         // Asked for in English
         scripted.falls_due();
-        assert_eq!(scripted.engineer.last_lang, arrstr!("en"));
+        assert_eq!(scripted.engineer.last_lang, None);
         // Spanish replies picked since
         let es = Some(arrstr!("es"));
         (scripted.config).update(|raw| raw.spoken_language.set(es));
@@ -6712,7 +6817,7 @@ mod tests {
             Scripted::with_config(r#"{"voices": {"en": "en.onnx", "es": "es.onnx"}}"#);
         let heard = |text: &str, lang| Heard::Question {
             text: text.into(),
-            lang,
+            lang: Some(lang),
             released: Instant::now(),
         };
         scripted.hear(heard("How are the fronts?", arrstr!("en")));

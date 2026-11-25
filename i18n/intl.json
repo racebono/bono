@@ -1470,9 +1470,9 @@
         "ca": "El model de veu a text encara s'està carregant: torna-ho a provar d'aquí a un moment"
     },
     "engineer.stt_unsupported_language": {
-        "en": "The selected speech to text model only understands English and cannot hear {language}: pick a multilingual model in Audio › Speech To Text, or choose English in Engineer › Heard language",
-        "es": "El modelo de voz a texto seleccionado solo entiende inglés y no puede escuchar {language}: elige un modelo multilingüe en Audio › Voz a texto, o elige inglés en Ingeniero › Idioma de entrada",
-        "ca": "El model de veu a text seleccionat només entén anglès i no pot escoltar {language}: tria un model multilingüe a Àudio › Veu a text, o tria anglès a Enginyer › Idioma d'entrada"
+        "en": "The speech to text model in use can't hear {language}: get one that can in Audio › Speech To Text, or change Engineer › Heard language",
+        "es": "El modelo de voz a texto en uso no puede escuchar {language}: consigue uno que sí en Audio › Voz a texto, o cambia Ingeniero › Idioma de entrada",
+        "ca": "El model de veu a text en ús no pot escoltar {language}: aconsegueix-ne un que sí a Àudio › Veu a text, o canvia Enginyer › Idioma d'entrada"
     },
     "engineer.no_voice_for": {
         "en": "Heard in {language}: \"{text}\". There's no voice to answer in {language}: get one in Audio › Text To Speech",

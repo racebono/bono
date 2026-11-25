@@ -313,7 +313,10 @@ impl AudioTopbar {
         // Errors go to the engineer, who tells the pilot: a dialog could hide the game
         let heard = result.unwrap_or_else(Heard::Failed);
         match &heard {
-            Heard::Question { text, lang, .. } => log::info!("Pilot ({lang}): {text}"),
+            Heard::Question { text, lang, .. } => {
+                let lang = lang.as_deref().unwrap_or("language not said");
+                log::info!("Pilot ({lang}): {text}")
+            }
             Heard::Unvoiced { text, lang } => {
                 log::info!("Pilot ({lang}, without a voice): {text}")
             }
