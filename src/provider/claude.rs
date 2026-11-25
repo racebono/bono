@@ -1624,8 +1624,8 @@ struct RequestBody {
     messages: Vec<RequestMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<RequestTool>,
-    /// `{"type": "none"}` for a request that has no room left for another round of tool results
-    /// (see `run_turn`): the model answers with what it has. Unset otherwise.
+    /// `{"type": "none"}` for a request with no room, or no request, left for another round of tool
+    /// results (see `run_turn`): the model answers with what it has. Unset otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
