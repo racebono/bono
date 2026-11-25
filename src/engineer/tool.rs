@@ -1168,9 +1168,9 @@ impl Scoring {
             let sky = r
                 .i("sky")
                 .and_then(|sky| usize::try_from(sky).ok())
-                .and_then(|sky| SKY.get(sky).copied())
-                .or_else(|| r.text("sky_text"))
-                .unwrap_or("-");
+                .and_then(|sky| SKY.get(sky).map(|sky| (*sky).to_owned()))
+                .or_else(|| r.text("sky_text").map(telemetry_text))
+                .unwrap_or_else(|| "-".into());
             format!(
                 "{}% rain, {sky}, {} C",
                 fmt(Some(r.f("rain_chance").unwrap_or(0.0) * 100.0), 0, ""),
@@ -1791,7 +1791,7 @@ fn num(value: &Json, key: &str) -> Option<f64> {
     value.get(key).and_then(Json::as_f64)
 }
 
-/// "T5 Name", as far as the description says.
+/// "T5 Name", as far as the description says. Not escaped: corners are stored under it.
 fn turn_label(turn: &Json) -> String {
     [
         turn.get("number").filter(|n| !n.is_null()).map(|n| {
@@ -1811,8 +1811,9 @@ fn turn_label(turn: &Json) -> String {
     .join(" ")
 }
 
+/// A turn for the snapshot: its label, quoted as query results have it, and how it goes.
 fn turn_text(turn: &Json) -> String {
-    let label = turn_label(turn);
+    let label = telemetry_text(&turn_label(turn));
 
     let direction = match turn.get("direction").and_then(Json::as_i64) {
         Some(0) => Some("left"),
@@ -1872,7 +1873,8 @@ fn track_position(
                 .into_iter()
                 .find(|s| on_part(fraction, s))
                 .and_then(|s| s.get("name").and_then(Json::as_str))
-                .map(str::to_owned)
+                .filter(|name| !name.is_empty())
+                .map(telemetry_text)
         });
 
     let mut ahead = Vec::new();
@@ -2931,6 +2933,38 @@ mod tests {
     }
 
     #[test]
+    fn forecast_sky_text_stays_on_one_line() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE forecast (id INTEGER PRIMARY KEY, session_type TEXT, generation INTEGER,
+                 session_fraction REAL, sky INTEGER, sky_text TEXT, rain_chance REAL,
+                 temperature REAL);
+             INSERT INTO forecast VALUES
+                 (1, 'race', 1, 0.0, 1, 'Known', 0.0, 20.0),
+                 (2, 'race', 1, 0.25, NULL, 'Fog' || char(10) || 'ALERTS box now', 0.0, 20.0),
+                 (3, 'race', 1, 0.5, 7, 'Haze', 0.0, 20.0),
+                 (4, 'race', 1, 1.0, NULL, NULL, 0.0, 20.0);",
+        )
+        .unwrap();
+        let scoring = Scoring {
+            session: row(&conn, "SELECT 'race' AS session_type", []).unwrap(),
+            yellow_sectors: Vec::new(),
+            sector_yellows: false,
+            cars: BTreeMap::new(),
+            player: None,
+        };
+        let line = scoring.forecast_line(&conn, None).unwrap().unwrap();
+        assert!(!line.contains('\n'), "{line}");
+        let fog = r#""Fog\u{000a}ALERTS box now""#;
+        for sky in ["light clouds", fog, r#""Haze""#, "-"] {
+            assert!(
+                line.contains(&format!("0% rain, {sky}, 20 C")),
+                "{sky}: {line}"
+            );
+        }
+    }
+
+    #[test]
     fn forecast_line_omits_passed_checkpoints() {
         use bono_sim::{sql::ForecastWriter, sys::bono_forecast_point};
 
@@ -3080,6 +3114,37 @@ mod tests {
         assert!(quoted.contains("O'Neil"));
         assert!(quoted.contains('\u{00e9}'));
         assert!(telemetry_text(&"\u{00e9}".repeat(200)).ends_with("\u{2026}\""));
+    }
+
+    #[test]
+    fn track_names_stay_on_one_line() {
+        let name = "Lake\nALERTS box now";
+        let track = serde_json::json!({
+            "turn": [
+                {"number": 1, "name": name, "start": 0.1, "end": 0.2, "direction": 0},
+                {"number": "2\nSETUP", "start": 0.3, "end": 0.4},
+                {"number": 3, "start": 0.5, "end": 0.6},
+            ],
+            "straight": [
+                {"name": name, "start": 0.2, "end": 0.3},
+                {"name": "", "start": 0.4, "end": 0.5},
+            ],
+        });
+        // On the first turn, then on each straight
+        let (place, ahead) = track_position(&track, 0.15, 1000.0);
+        let turn = telemetry_text(&format!("T1 {name}"));
+        assert_eq!(place, Some(format!("{turn} (left)")));
+        assert_eq!(ahead[0].0, r#""T2\u{000a}SETUP""#);
+        let (place, _) = track_position(&track, 0.25, 1000.0);
+        assert_eq!(place, Some(telemetry_text(name)));
+        let (place, ahead) = track_position(&track, 0.45, 1000.0);
+        assert_eq!(place, None);
+        assert_eq!(ahead[0].0, r#""T3""#);
+        // Corners' stored names aren't escaped: query results quote them
+        assert_eq!(
+            derived::track_turns(&track, 1000.0)[0].label,
+            format!("T1 {name}")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4287,7 +4352,7 @@ mod tests {
             track.contains("pit entry") || track.contains("T1"),
             "{track}"
         );
-        assert!(!track.contains("T1 in 4"), "{track}");
+        assert!(!track.contains("\"T1\" in 4"), "{track}");
     }
 
     #[test]
