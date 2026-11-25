@@ -133,6 +133,14 @@ pub fn voice_code(code: ArrayStr<2>) -> ArrayStr<2> {
     }
 }
 
+/// Whether text in `code` (as the voices have it) can be told from text in other languages: whether
+/// it's one of the languages built in.
+pub fn told_apart(code: ArrayStr<2>) -> bool {
+    Language::all()
+        .into_iter()
+        .any(|language| voice_language(language) == Some(code))
+}
+
 fn voice_language(language: Language) -> Option<ArrayStr<2>> {
     let code = language.iso_code_639_1().to_string();
     ArrayStr::from_str(&code).map(voice_code)
@@ -177,6 +185,13 @@ mod tests {
         let one = BTreeMap::from([(arrstr!("en"), Utf8PathBuf::from("en.onnx"))]);
         detector.update(rt, &one);
         assert_eq!(detector.detect("¿Cuánto combustible me queda?"), None);
+    }
+
+    #[test]
+    fn tells_the_languages_built_in_apart() {
+        assert!(told_apart(arrstr!("es")) && told_apart(arrstr!("fr")));
+        #[cfg(not(feature = "all-languages"))]
+        assert!(!told_apart(arrstr!("pl")));
     }
 
     #[test]

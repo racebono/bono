@@ -47,6 +47,7 @@ use std::{
 };
 use tokio::{runtime::Handle, sync::oneshot::error::TryRecvError};
 
+mod engine;
 mod voice;
 mod whisper;
 
