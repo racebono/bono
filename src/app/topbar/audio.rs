@@ -168,6 +168,11 @@ impl AudioTopbar {
         }
         self.speaker.poll(Kind::Playback);
         self.whisper.poll(rt, config);
+        if self.whisper.forgotten() {
+            log::info!("The microphone was left open: what it recorded is discarded");
+            self.whisper.cancel_recording();
+            self.close_beep(config);
+        }
         self.voices.poll(rt, config, synth);
         self.play_test(config);
     }
@@ -352,16 +357,7 @@ impl AudioTopbar {
         let result = self.whisper.event(rt, &event, config, microphone);
         match (was_recording, self.whisper.recording()) {
             (false, true) => self.beep(config, Speech::talk_beep),
-            // Let go of, the button itself tells the pilot it closed
-            (true, false) => {
-                let close_beep = {
-                    let config = config.get();
-                    *config.talk_toggle() && *config.talk_close_beep()
-                };
-                if close_beep {
-                    self.beep(config, Speech::talk_close_beep);
-                }
-            }
+            (true, false) => self.close_beep(config),
             _ => {}
         }
 
@@ -422,6 +418,18 @@ impl AudioTopbar {
                 self.beep_playback = None;
                 false
             }
+        }
+    }
+
+    /// Tells the pilot the microphone closed, if they want it to. Let go of, a held button tells
+    /// them itself.
+    fn close_beep(&mut self, config: &Config) {
+        let wanted = {
+            let config = config.get();
+            *config.talk_toggle() && *config.talk_close_beep()
+        };
+        if wanted {
+            self.beep(config, Speech::talk_close_beep);
         }
     }
 

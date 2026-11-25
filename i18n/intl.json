@@ -386,9 +386,9 @@
         "ca": "Prem per activar i desactivar el micròfon"
     },
     "settings.talk_toggle_hover": {
-        "en": "Press the talk button once to start talking and press it again to stop, instead of holding it down",
-        "es": "Pulsa el botón de hablar una vez para empezar a hablar y vuélvelo a pulsar para parar, en lugar de mantenerlo pulsado",
-        "ca": "Prem el botó de parlar un cop per començar a parlar i torna'l a prémer per parar, en comptes de mantenir-lo premut"
+        "en": "Press the talk button once to start talking and press it again to stop, instead of holding it down. After a minute the microphone closes by itself, and what you said is discarded",
+        "es": "Pulsa el botón de hablar una vez para empezar a hablar y vuélvelo a pulsar para parar, en lugar de mantenerlo pulsado. Pasado un minuto, el micrófono se cierra solo y lo que hayas dicho se descarta",
+        "ca": "Prem el botó de parlar un cop per començar a parlar i torna'l a prémer per parar, en comptes de mantenir-lo premut. Passat un minut, el micròfon es tanca sol i el que hagis dit es descarta"
     },
     "settings.talk_close_beep": {
         "en": "Beep when you stop talking",

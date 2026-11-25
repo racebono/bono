@@ -59,6 +59,9 @@ const GPU_BACKEND: bool = cfg!(any(
 /// The model the setup guide downloads: it understands every language, and is quick on a GPU
 const RECOMMENDED: &str = "ggml-large-v3-turbo-q5_0.bin";
 
+/// How long a toggled microphone stays open before the pilot is taken to have [forgotten] it
+const TALK_LIMIT: Duration = Duration::from_secs(60);
+
 pub struct Whisper {
     /// Model and reusable session, shared with workers and only freed on one.
     ctx: Option<MaybeDone<Option<Arc<WhisperModel>>>>,
@@ -76,6 +79,8 @@ pub struct Whisper {
     /// a check of the picked one's file started since, so a stale result doesn't replace it
     replace_since: Option<Instant>,
     stream: Option<WhisperStream>,
+    /// When the recording started
+    talk_started: Instant,
     /// The joystick whose talk button started the recording: unplugging it means the release
     /// never comes
     talk_joystick: Option<JoystickId>,
@@ -142,6 +147,7 @@ impl Whisper {
             setup_started: false,
             replace_since: None,
             stream: None,
+            talk_started: Instant::now(),
             talk_joystick: None,
             talk_settings: (None, false),
             catalog: Self::fetch_catalog(pref_path.clone(), client.clone(), 3),
@@ -320,6 +326,7 @@ impl Whisper {
         return match talk(button.as_ref(), event, self.talking(), toggle) {
             Talk::Begin => {
                 self.talk_settings = (button, toggle);
+                self.talk_started = Instant::now();
                 self.talk_joystick = match *event {
                     Event::JoyButtonDown { which, .. } => Some(which),
                     _ => None,
@@ -360,6 +367,12 @@ impl Whisper {
     #[inline]
     pub fn recording(&self) -> bool {
         self.stream.is_some()
+    }
+
+    /// Whether the pilot seems to have left the microphone open.
+    pub fn forgotten(&self) -> bool {
+        let (_, toggle) = self.talk_settings;
+        self.recording() && forgotten(toggle, self.talk_started.elapsed())
     }
 
     /// Opens the microphone. When it can't be, what's heard right away says why.
@@ -666,6 +679,12 @@ fn talk(
         return Talk::Finish;
     }
     Talk::Ignore
+}
+
+/// Whether a recording this long was left open: only a toggled one can be, as a held one ends once
+/// the button is let go.
+fn forgotten(toggle: bool, recorded: Duration) -> bool {
+    toggle && recorded >= TALK_LIMIT
 }
 
 struct WhisperStream {
@@ -1567,6 +1586,15 @@ mod tests {
         assert_eq!(toggle(&removed(8)), Talk::Ignore);
         // Joysticks are heard in the background
         assert_eq!(toggle(&focus_lost), Talk::Ignore);
+    }
+
+    #[test]
+    fn a_toggled_microphone_left_open_is_forgotten() {
+        let almost = TALK_LIMIT - Duration::from_millis(1);
+        assert!(!forgotten(true, almost));
+        assert!(forgotten(true, TALK_LIMIT));
+        // Held, the button can't be forgotten
+        assert!(!forgotten(false, TALK_LIMIT));
     }
 
     /// Sends the thread it's dropped on.
