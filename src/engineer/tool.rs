@@ -817,7 +817,7 @@ fn body_damage(p: &Row) -> Option<String> {
 
 /// Damage lines for `quick`'s `INFO`: damaged mechanical parts and bodywork zones when any are
 /// damaged (or nothing extra when only `detached` is set, since `ALERTS` already says
-/// `PARTS DETACHED`), `"damage none"` when damage is reported and clean (naming what isn't
+/// `PARTS DETACHED` or `FLAT`), `"damage none"` when damage is reported and clean (naming what isn't
 /// reported), or `"damage not reported"` when no damage channel is reported.
 fn damage_info(p: &Row, detached: bool) -> Vec<String> {
     let parts = damage_parts(p, 0.0);
@@ -2960,7 +2960,7 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
 
     let (more_alerts, mut info) = scoring_alerts(ctx)?;
     alerts.extend(more_alerts);
-    info.splice(0..0, damage_info(p, detached));
+    info.splice(0..0, damage_info(p, detached || !flat.is_empty()));
     match pit_window(ctx)? {
         (Some(window), true) => alerts.push(format!(
             "PIT WINDOW CLOSING, mandatory stop not done ({window})"
@@ -3192,9 +3192,21 @@ mod tests {
         assert!(info.contains("damage none"), "{info}");
         assert!(!info.contains("damage not reported"), "{info}");
 
-        // 3. wheel_detached = 1 -> ALERTS has PARTS DETACHED and INFO does NOT say "damage none"
+        // 3. A flat, or wheel_detached = 1 -> ALERTS has it and INFO does NOT say "damage none"
         drop(engineer);
         let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute(
+            "UPDATE telemetry_wheel SET tire_flat = 1              WHERE wheel = 0 AND telemetry_id = (SELECT MAX(id) FROM telemetry WHERE vehicle_id = 1)",
+            [],
+        )
+        .unwrap();
+        let engineer = reopen(&dir);
+        let out = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(out.contains("FLAT FL"), "{out}");
+        assert!(!out.contains("damage none"), "{out}");
+        drop(engineer);
+        conn.execute("UPDATE telemetry_wheel SET tire_flat = NULL", [])
+            .unwrap();
         conn.execute(
             "UPDATE telemetry_wheel SET wheel_detached = 1 \
              WHERE wheel = 0 AND telemetry_id = (SELECT MAX(id) FROM telemetry WHERE vehicle_id = 1)",

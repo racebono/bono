@@ -1,8 +1,8 @@
 ## intro
-Raw tables (prefer derived). Filter `telemetry` by `id` (only index: `first_id..last_id` or `id > latest_telemetry_id - N`, `>= session_first_id`) + `vehicle_id`; `telemetry_wheel`/`car_state` by `telemetry_id`, a `telemetry` id (their own ids aren't). `standings`/`session` from `standings_first_id`/`session_row_first_id` (comment above each SQL result). Ignore prior `epoch` ids.
+Raw tables (prefer derived). Filter `telemetry` by `id` (only index: `first_id..last_id` or `id > latest_telemetry_id - N`, `>= session_first_id`) + `vehicle_id`; `telemetry_wheel`/`car_state` by `telemetry_id`, a `telemetry` id (see each). `standings`/`session` from `standings_first_id`/`session_row_first_id` (comment above each SQL result). Ignore prior `epoch` ids.
 [lmu] LMU fills nearly all cols; 0 (not NULL) for absent controls or unknown AI.
-[iracing] iRacing: rivals' telemetry=timing/gaps/speed/gear/engine_rpm only; no garage rows; wheel/car_state NULL except incident_points/P2P.
-[rrre] RaceRoom: rivals' telemetry=timing/gaps/speed/pos/heading/course/virtual_energy; wheel/car_state NULL.
+[iracing] iRacing: rivals' telemetry=timing/gaps/speed/gear/engine_rpm only; no garage rows; rivals' wheel/car_state NULL except incident_points/P2P.
+[rrre] RaceRoom: rivals' telemetry=timing/gaps/speed/pos/heading/course/virtual_energy; rivals' wheel/car_state NULL.
 
 ## telemetry
 `telemetry` (SI, temps C; player every tick, rivals sparser):
@@ -15,7 +15,7 @@ Raw tables (prefer derived). Filter `telemetry` by `id` (only index: `first_id..
 [rrre] - RaceRoom: `push_to_pass_active_time_left` `push_to_pass_cooldown_left`(s) `total_downforce`. lap_invalidated NULL <0.5s; delta_best player; rivals heading=travel; pitch/roll/rates game signs; turbo bar; shaft_torque undoc; ride heights axle avg; NULL: gap_to_car_*,engine_overheating,regeneration_power,electric_motor_*,abs_active.
 
 ## telemetry_wheel
-`telemetry_wheel` (4/tick: `telemetry_id` `wheel` 0 FL..3 RR):
+`telemetry_wheel` (4 per `telemetry` row, no `vehicle_id`: join `telemetry` on `telemetry_id`; `wheel` 0 FL..3 RR):
 - `suspension_deflection` `ride_height` `camber`(rad) `brake_temperature` `brake_pressure` `rotation_speed`(rad/s) `tire_load` `surface_type`(0 dry,1 wet,2 grass,3 dirt,4 gravel,5 kerb,6 special)
 - `tire_pressure`(running) `tire_surface_temperature_left` `tire_surface_temperature_center` `tire_surface_temperature_right`(behind:in=R on L,L on R) `tire_inner_temperature_left` `tire_inner_temperature_center` `tire_inner_temperature_right`(under tread) `tire_carcass_temperature` `tire_optimal_temperature`(>200 K) `tire_wear`(falls=life left) `tire_compound`(names in cars_now)
 [lmu] - LMU: `suspension_force` `wheel_vertical_position` `toe` `lateral_patch_velocity` `longitudinal_patch_velocity` `lateral_ground_velocity` `longitudinal_ground_velocity` `lateral_force` `longitudinal_force` `sliding_fraction` `tire_compound_type`(undoc) `tire_vertical_deflection` `tire_flat` `wheel_detached`. brake_pressure 0-1(pedal+bias); tire_compound=car idx.
@@ -23,16 +23,16 @@ Raw tables (prefer derived). Filter `telemetry` by `id` (only index: `first_id..
 [rrre] - RaceRoom: `brake_optimal_temperature`. surface_type 0=paved(wetness unknown); compound 0 pri/1 alt/2 soft/3 med/4 hard; NULL: brake_pressure,tire_inner_*,tire_carcass_temperature.
 
 ## car_state
-`car_state` (on change; at X use latest `telemetry_id <= X`, idx `(vehicle_id,telemetry_id)`): `id` `telemetry_id` `vehicle_id` `session_time`.
+`car_state` (only on change: at X, `vehicle_id` latest `telemetry_id <= X`, never a recent range): `id` `telemetry_id` `vehicle_id` `session_time`.
 - `traction_control` `abs` `engine_map`(own step numbers) `front_anti_roll_bar` `rear_anti_roll_bar` `rear_brake_bias`(rear share) `speed_limiter_on`(switch) `headlights` `steering_wheel_range`(deg L2L) `engine_max_rpm`(rev limit) `max_gears` `push_to_pass_engaged` `push_to_pass_activations_left`(NULL unlim/unk) `fuel_capacity`(L) `fuel_per_lap`(sim est; use stints) `incident_points` `aerodynamics_damage` `suspension_damage`(0-1)
 [lmu] - LMU: `traction_control_slip` `traction_control_cut` `brake_migration` `ignition`(0 off/1 on/2 start) `wipers`(undoc) `scheduled_pit_stops` `traction_control_max` `traction_control_slip_max` `traction_control_cut_max` `abs_max` `engine_map_max` `brake_migration_max` `front_anti_roll_bar_max` `rear_anti_roll_bar_max`(NULL absent/AI) `rear_flap_status`(0 no/1 det/2 ok) `track_limits_steps` `parts_detached` `body_damage_front_left` `body_damage_front` `body_damage_front_right` `body_damage_left` `body_damage_right` `body_damage_rear_left` `body_damage_rear` `body_damage_rear_right`(0 none/1 some/2 more) `last_impact_time`(session time) `last_impact_magnitude` `last_impact_position_x` `last_impact_position_y` `last_impact_position_z`(frame undoc). wheel_range undoc(NULL/setup); incident_points=track limits; aero(all)/susp(worst wheel) player ~1Hz; NULL: push_to_pass_*,fuel_per_lap.
 [iracing] - iRacing: engine_map=fuel mix; wheel_range span undoc; fuel_capacity=session limit; fuel_per_lap last lap; incident_points rivals if shared; NULL: rear_brake_bias,headlights,aerodynamics_damage,suspension_damage.
-[rrre] - RaceRoom: `drs_equipped` `drs_available`(act left, not usable here) `drs_activations_left`(lap; NULL unlim) `drs_activations_unlimited` `drs_activations_total` `push_to_pass_equipped` `push_to_pass_charged`(NULL no cycle, 0 charging) `push_to_pass_activations_total` `virtual_energy_per_lap`(frac; use stints) `engine_damage` `transmission_damage`(0-1). NULL: front/rear_anti_roll_bar.
+[rrre] - RaceRoom: `drs_equipped` `drs_available`(act left; doesn't say usable here) `drs_activations_left`(lap; NULL unlim) `drs_activations_unlimited` `drs_activations_total` `push_to_pass_equipped` `push_to_pass_charged`(NULL no cycle, 0 charging) `push_to_pass_activations_total` `virtual_energy_per_lap`(frac; use stints) `engine_damage` `transmission_damage`(0-1). NULL: front/rear_anti_roll_bar.
 
 ## scoring
 Prefer derived (setup_now,setup_changes,race_state,cars_now,sectors_now,forecast_now).
 - `setup_set` `setup`: garage setup (diffs per change).
-- `session` `standings` `forecast`: on change (columns: `PRAGMA table_info`); `standings.sector` 0-based; `session_sector` `standing_sector` (by `session_id`/`standing_id`; 0-based; session_sector yellows use sim order, don't join to car sector).
+- `session` `standings` `forecast`: on change (columns: `PRAGMA table_info`, `limit` 200); `standings.sector` 0-based; `session_sector` `standing_sector` (by `session_id`/`standing_id`; 0-based; session_sector yellows use sim order, don't join to car sector).
 [lmu] - LMU: setup has step/min_step/max_step/saved_value; forecast populated.
 [iracing] - iRacing: no sector yellows(use cars_now.under_yellow); laps_completed=-1 until first line crossing(lap=1 on out lap and next); rivals' timing from lap progress; forecast empty.
 [rrre] - RaceRoom: forecast empty.

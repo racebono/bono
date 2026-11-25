@@ -967,13 +967,16 @@ fn run_query(
         Some(move || abandoned() || Instant::now() > deadline),
     )?;
     let result = (|| -> rusqlite::Result<()> {
-        // By where a value comes from, whatever the query calls it
+        // By where a value comes from, whatever the query calls it. A union's column can have
+        // several origins: none is annotated
+        let union = query.to_lowercase().contains("union");
         let annotate = stmt
             .columns_with_metadata()
             .iter()
             .map(|column| {
-                (column.table_name().zip(column.origin_name()))
-                    .is_some_and(|origin| LAP_TIME_COLUMNS.contains(&origin))
+                !union
+                    && (column.table_name().zip(column.origin_name()))
+                        .is_some_and(|origin| LAP_TIME_COLUMNS.contains(&origin))
             })
             .collect::<Vec<_>>();
         let names = stmt
@@ -5205,14 +5208,16 @@ fn projection(
         .filter(|_| energy.is_some() && stint.energy_is_fraction())
         .map(|e| e * 100.0);
     let energy_left = energy_percent(energy);
-    let fuel_to_finish = need
+    // Outside races, a need is only for running the session's clock out
+    let race_need = need.filter(|_| sc.session.as_ref().is_some_and(is_race));
+    let fuel_to_finish = race_need
         .zip(fuel_use)
         .map(|(n, u)| n * u)
         .filter(|v| v.is_finite());
     let fuel_deficit = fuel_to_finish
         .zip(fuel.filter(|v| v.is_finite()))
         .map(|(req, have)| (req - have).max(0.0));
-    let energy_to_finish = need
+    let energy_to_finish = race_need
         .zip(energy_pct_use)
         .map(|(n, u)| n * u)
         .filter(|v| v.is_finite());
@@ -5234,7 +5239,7 @@ fn projection(
         (_, None, Some(e)) => Some(e),
         (_, None, None) => None,
     };
-    let stops_needed = margin.and_then(|m| {
+    let stops_needed = margin.filter(|_| race_need.is_some()).and_then(|m| {
         if !m.is_finite() {
             None
         } else if m >= 0.0 {
@@ -5249,7 +5254,10 @@ fn projection(
     });
     vec![
         ("calculated_at_s", real(now)),
-        ("lap_fraction", real(Some(frac))),
+        (
+            "lap_fraction",
+            real(p.f("lap_start_time").map(|_| frac)),
+        ),
         ("fuel_l", real(fuel)),
         ("fuel_laps_left", real(fuel_laps)),
         ("fuel_runs_out_lap", real(fuel_out)),
@@ -5290,7 +5298,7 @@ fn projection(
 fn strategy_line(conn: &Connection, race: bool) -> rusqlite::Result<Option<(i64, String)>> {
     let Some(s) = row(
         conn,
-        "SELECT s.* FROM stints s JOIN cars_now c ON c.current_stint_id = s.stint_id \
+        "SELECT s.*, c.lap FROM stints s JOIN cars_now c ON c.current_stint_id = s.stint_id \
          WHERE c.is_player = 1",
         [],
     )?
@@ -5333,10 +5341,9 @@ fn strategy_line(conn: &Connection, race: bool) -> rusqlite::Result<Option<(i64,
     if let Some(tank) = s.f("tank_capacity_l").filter(|tank| *tank > 0.0) {
         parts.push(format!("tank {tank:.1} L"));
     }
-    if let Some(done) = s.f("lap_fraction") {
-        parts.push(format!("this lap {:.0}% done", done * 100.0));
+    if let (Some(lap), Some(done)) = (s.i("lap"), s.f("lap_fraction")) {
+        parts.push(format!("lap {lap} {:.0}% done", done * 100.0));
     }
-    // Outside races, a need is only for running the session's clock out
     if let (true, Some(need), Some(margin)) = (race, s.f("laps_needed"), s.f("margin_laps")) {
         let mut finish = format!("to the flag {need:.1} laps");
         if let Some(fuel) = s.f("fuel_to_finish_l") {
@@ -5356,7 +5363,7 @@ fn strategy_line(conn: &Connection, race: bool) -> rusqlite::Result<Option<(i64,
             }
             if let Some(stops) = s.i("stops_needed") {
                 let plural = if stops == 1 { "" } else { "s" };
-                finish.push_str(&format!(", at least {stops} stop{plural}"));
+                finish.push_str(&format!(", about {stops} stop{plural}"));
             }
             // More than this isn't driven
             if let Some(save) = s.f("save_pct_needed").filter(|save| *save < 10.0) {
@@ -11266,7 +11273,8 @@ mod tests {
             format!("to the flag {need:.1} laps, {fuel_need:.1} L, {energy_need:.1}% VE"),
             format!("{:.1} laps short on {}", -margin, row[0][0].trim_matches('"')),
             format!("{fuel_def:.1} L to add in total, {energy_def:.1}% VE to add in total"),
-            format!("at least {stops} stop"),
+            format!("about {stops} stop"),
+            "lap 4 ".to_owned(),
         ] {
             assert!(line.contains(&part), "{part} not in {line}");
         }
@@ -11295,6 +11303,14 @@ mod tests {
         assert!(quick.contains("STRATEGY fuel "), "{quick}");
         assert!(quick.contains("| tank 60.0 L"), "{quick}");
         assert!(!quick.contains("to the flag"), "{quick}");
+        assert_eq!(
+            query(
+                &engineer,
+                "SELECT stops_needed, fuel_to_finish_l, fuel_deficit_l, energy_to_finish_pct,                         energy_deficit_pct                  FROM stints s JOIN cars_now c ON c.current_stint_id = s.stint_id                  WHERE c.is_player = 1",
+            )
+            .await,
+            [["NULL"; 5]]
+        );
         conn.execute("UPDATE session SET session_type = 'race'", [])
             .unwrap();
         drop(conn);
@@ -12742,6 +12758,15 @@ mod tests {
             )
             .await,
             [["100 (1:40.0)"]]
+        );
+        assert_eq!(
+            query(
+                &engineer,
+                "SELECT 'lap' AS k, time_s AS v FROM lap_stats WHERE vehicle_id = 2 AND lap = 1 \
+                 UNION ALL SELECT 'speed', 182.5",
+            )
+            .await,
+            [["\"lap\"", "100"], ["\"speed\"", "182.5"]]
         );
 
         // Underlying SQL column remains numeric for arithmetic and sorting
