@@ -1069,7 +1069,11 @@ impl Scoring {
             ));
         }
         if let Some(left) = self.time_left(now) {
-            parts.push(format!("{} left", clock(left)));
+            let extra_lap = match s.b("extra_lap") {
+                true => " (plus an extra lap)",
+                false => "",
+            };
+            parts.push(format!("{} left{extra_lap}", clock(left)));
         }
         if let Some(fcy) = s.text("full_course_yellow").filter(|f| *f != "none") {
             parts.push(format!("FULL COURSE YELLOW ({fcy})"));

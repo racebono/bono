@@ -4998,29 +4998,37 @@ fn race_need(
         .filter(|t| t.is_finite() && *t <= MAX_RACE_TIME_LEFT);
     let lap_ok = |t: &f64| t.is_finite() && *t > 0.0;
     if let (Some(time_left), Some(avg), Some(now)) = (time_left, avg_time.filter(lap_ok), now) {
-        // The flag falls when the leader crosses the line after the clock runs out; you then
-        // finish your lap
+        // The flag falls when the leader crosses the line after the clock runs out, or a lap later
+        // in a race with an extra lap; you then finish your lap
+        let extra_lap = s.b("extra_lap");
+        let clock_end = s.f("session_end_time").unwrap_or(now + time_left);
+        let lap_start = |car: Option<i64>| {
+            let start = frame.get(&car?)?.f("lap_start_time")?;
+            start.is_finite().then_some(start)
+        };
         let mut t_flag = now + time_left;
         match sc.order().first().copied() {
             Some(leader) if leader.i("vehicle_id") != Some(vehicle) => {
-                let leader_row = leader.i("vehicle_id").and_then(|v| frame.get(&v));
                 let leader_lap = leader
                     .f("last_lap_time")
                     .filter(lap_ok)
                     .or_else(|| leader.f("estimated_lap_time").filter(lap_ok))
                     .unwrap_or(avg);
-                if let Some(start) = leader_row
-                    .and_then(|r| r.f("lap_start_time"))
-                    .filter(|t| t.is_finite())
-                {
-                    let clock_end = s.f("session_end_time").unwrap_or(now + time_left);
+                let extra = match extra_lap && leader.text("finish_status") != Some("finished") {
+                    true => leader_lap,
+                    false => 0.0,
+                };
+                t_flag += extra;
+                if let Some(start) = lap_start(leader.i("vehicle_id")) {
                     t_flag = match start >= clock_end {
-                        // Started this lap with the clock run out: that was the flag
-                        true => start,
+                        // Started this lap with the clock run out: that was the flag, or this is
+                        // the extra lap
+                        true => start + extra,
                         false => {
                             // Overdue, they still can't cross the line before now
                             let first = (start + leader_lap).max(now);
-                            first + steps_to(first, leader_lap, now + time_left) * leader_lap
+                            let steps = steps_to(first, leader_lap, now + time_left);
+                            first + steps * leader_lap + extra
                         }
                     };
                 }
@@ -5028,6 +5036,10 @@ fn race_need(
             _ => {
                 let first = now + (1.0 - frac) * avg;
                 t_flag = first + steps_to(first, avg, now + time_left) * avg;
+                // Unless this is the extra lap already
+                if extra_lap && lap_start(Some(vehicle)).is_none_or(|start| start < clock_end) {
+                    t_flag += avg;
+                }
             }
         }
 
@@ -5035,8 +5047,12 @@ fn race_need(
         needs.push((
             n,
             format!(
-                "{} on the clock, plus the lap to the flag",
-                clock(time_left)
+                "{} on the clock, plus the lap to the flag{}",
+                clock(time_left),
+                match extra_lap {
+                    true => " (at the end of an extra lap)",
+                    false => "",
+                }
             ),
         ));
     }
@@ -6101,6 +6117,75 @@ mod tests {
             assert!(
                 (need - expected).abs() < 1e-9,
                 "{session}, {start} to {now}: {need}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_extra_lap_puts_the_flag_a_lap_later() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Laps needed half into a 100 s lap, with and without an extra lap after the clock runs
+        // out at 1800
+        let need = |cars: &[&str], starts: &[(i64, f64)], now: f64| {
+            let cars = cars
+                .iter()
+                .map(|car| columns(&conn, &format!("{car}, 100.0 AS last_lap_time")))
+                .map(|car| (car.i("vehicle_id").unwrap(), car))
+                .collect::<BTreeMap<_, _>>();
+            let frame = starts
+                .iter()
+                .map(|(id, start)| (*id, columns(&conn, &format!("{start:?} AS lap_start_time"))))
+                .collect();
+            [1, 0].map(|extra_lap| {
+                let session = format!(
+                    "'race' AS session_type, 1800.0 AS session_end_time, {extra_lap} AS extra_lap"
+                );
+                let sc = Scoring {
+                    session: Some(columns(&conn, &session)),
+                    yellow_sectors: Vec::new(),
+                    sector_yellows: false,
+                    player: cars.get(&1).cloned(),
+                    cars: cars.clone(),
+                };
+                let (need, source) = race_need(&sc, &frame, 1, Some(now), 0.5, Some(100.0));
+                assert_eq!(source.contains("extra lap"), extra_lap == 1, "{source}");
+                let line = sc.session_line(Some(now)).unwrap();
+                assert_eq!(line.contains("extra lap"), extra_lap == 1, "{line}");
+                need.unwrap()
+            })
+        };
+        let leading = ["1 AS vehicle_id, 1 AS position"];
+        let behind = [
+            "1 AS vehicle_id, 2 AS position",
+            "2 AS vehicle_id, 1 AS position, 'none' AS finish_status",
+        ];
+        let finished = [
+            "1 AS vehicle_id, 2 AS position",
+            "2 AS vehicle_id, 1 AS position, 'finished' AS finish_status",
+        ];
+        for (cars, starts, now, expected) in [
+            // Leading: before the clock's last lap, as it's run out on this one, on the extra lap
+            (&leading[..], &[(1, 1520.0)][..], 1570.0, [3.5, 2.5]),
+            (&leading, &[(1, 1760.0)], 1810.0, [1.5, 0.5]),
+            (&leading, &[(1, 1860.0)], 1910.0, [0.5, 0.5]),
+            // Without the lap's start, it may not be the extra lap yet
+            (&leading, &[], 1910.0, [1.5, 0.5]),
+            // The same behind the leader
+            (&behind, &[(1, 1520.0), (2, 1510.0)], 1570.0, [3.5, 2.5]),
+            (&behind, &[(1, 1760.0), (2, 1750.0)], 1810.0, [1.5, 0.5]),
+            (&behind, &[(1, 1860.0), (2, 1850.0)], 1910.0, [0.5, 0.5]),
+            (&behind, &[], 1810.0, [1.5, 0.5]),
+            // The leader's extra lap began during this one, and ends during the next
+            (&behind, &[(1, 1760.0), (2, 1805.0)], 1810.0, [1.5, 0.5]),
+            // The leader's overdue on the extra lap
+            (&behind, &[(1, 1925.0), (2, 1805.0)], 1975.0, [0.5, 0.5]),
+            // The flag has fallen
+            (&finished, &[(1, 1910.0), (2, 1950.0)], 1960.0, [0.5, 0.5]),
+        ] {
+            let need = need(cars, starts, now);
+            assert!(
+                need.iter().zip(expected).all(|(n, e)| (n - e).abs() < 1e-9),
+                "{cars:?}, {starts:?} at {now}: {need:?}, not {expected:?}"
             );
         }
     }
