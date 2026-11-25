@@ -4,11 +4,11 @@
 use crate::{
     Download,
     app::topbar::{
-        audio::{SetupItem, SetupState},
-        setup_label,
+        audio::{Deletion, SetupItem, SetupState, scroll_bar_beside},
+        setup_label, size_text,
     },
-    config::{ArrayStr, Config},
-    error,
+    config::{ArrayStr, Config, RawConfig},
+    error, language,
     synthesizer::{Synthesizer, VoiceLoad},
     task::MaybeDone,
     updating,
@@ -141,8 +141,7 @@ impl Voices {
             return;
         }
 
-        let on_disk = (catalog.on_disk.borrow().as_ref())
-            .and_then(|on_disk| on_disk.get(voice.index).copied());
+        let on_disk = voice.on_disk(rt, catalog.on_disk.borrow().as_deref());
         match on_disk {
             Some(true) => {
                 let path = voice.path.to_path_buf();
@@ -157,7 +156,7 @@ impl Voices {
                         Some(_) => {}
                     }
                 }
-                config.update(|raw| raw.set_voice(rt, lang, Some(path), synth));
+                config.update(|raw| raw.set_voice(rt, lang, path, synth));
                 self.setup = None;
             }
             Some(false) if !self.setup_started => {
@@ -210,8 +209,7 @@ impl Voices {
             return None;
         }
 
-        let on_disk = (catalog.on_disk.borrow().as_ref())
-            .and_then(|on_disk| on_disk.get(voice.index).copied());
+        let on_disk = voice.on_disk(rt, catalog.on_disk.borrow().as_deref());
         let used = (picked.as_ref()).is_some_and(|picked| *picked == *voice.path);
         let state = match (on_disk, voice.progress()) {
             (Some(true), _) if used && failed => SetupState::LoadFailed,
@@ -283,7 +281,7 @@ impl Voices {
         let locale = config.get().locale().clone();
         let suggested = ArrayStr::<2>::from_str(locale.split('-').next().unwrap_or_default());
 
-        let mut picked = None;
+        let setup = &mut self.setup;
         ui.add_enabled_ui(catalog.is_some(), |ui| {
             let label = setup_label(
                 missing || !load_failed.is_empty(),
@@ -318,37 +316,38 @@ impl Voices {
                                 label,
                             );
                             ui.menu_button(label, |ui| {
-                                if language.update(
+                                language.update(
                                     rt,
                                     ui,
                                     client,
                                     config,
                                     on_disk.as_deref(),
                                     synth,
-                                ) {
-                                    picked = Some(language.code);
-                                }
+                                    setup,
+                                );
                             });
                         }
                     });
             });
         });
-        // A voice picked by hand is what's used, whatever setup was getting for its language
-        if picked.is_some_and(|lang| self.setup.is_some_and(|(setup, _)| setup == lang)) {
-            self.setup = None;
-        }
+    }
+
+    /// Whether a voice is still being deleted.
+    pub fn deleting(&self) -> bool {
+        matches!(&self.catalog, MaybeDone::Done(Some(catalog))
+            if (catalog.languages.iter().flat_map(|language| &language.voices))
+                .any(|voice| voice.deletion.running()))
     }
 }
 
 /// The voice of language `lang` named `name` in the catalog (e.g. `en_US-mike-medium`).
 fn find<'a>(languages: &'a mut [Language], lang: ArrayStr<2>, name: &str) -> Option<&'a mut Voice> {
-    let file = format!("/{name}.onnx");
     languages
         .iter_mut()
         .find(|language| language.code == lang)?
         .voices
         .iter_mut()
-        .find(|voice| voice.model_file.ends_with(&file))
+        .find(|voice| voice.is_named(name))
 }
 
 /// Whether voices run on the GPU, whether or not the catalog could be fetched. DirectML is Windows
@@ -457,6 +456,7 @@ impl Catalog {
                 model_md5,
                 config_md5,
                 downloads: None,
+                deletion: Deletion::default(),
             });
         }
 
@@ -512,11 +512,12 @@ impl Language {
         config: &mut Config,
         on_disk: Option<&[bool]>,
         synth: &mut Synthesizer,
-    ) -> bool {
+        setup: &mut Option<(ArrayStr<2>, &'static str)>,
+    ) {
         let code = self.code;
         let voices = &mut self.voices;
-        let mut picked = false;
 
+        scroll_bar_beside(ui);
         egui_extras::TableBuilder::new(ui)
             .id_salt(("piper-voices", code))
             .striped(true)
@@ -563,47 +564,63 @@ impl Language {
                                 ));
                             });
 
-                            let Some(&on_disk) =
-                                on_disk.and_then(|on_disk| on_disk.get(voice.index))
-                            else {
+                            let on_disk = voice.on_disk(rt, on_disk);
+                            if voice.deletion.pending() {
+                                row.col(|ui| {
+                                    ui.spinner();
+                                });
+                                return;
+                            }
+                            let Some(on_disk) = on_disk else {
                                 return;
                             };
 
                             row.col(|ui| {
-                                if on_disk {
-                                    let used =
-                                        config.voices().get(&code).map(|path| path.as_path())
-                                            == Some(&*voice.path);
-                                    // The voice in use can be picked again only if it failed to
-                                    // load, to retry
-                                    let usable = !used || synth.failed(code, &voice.path);
-                                    ui.add_enabled_ui(usable, |ui| {
-                                        if ui.button(t!("audio.use")).clicked() {
-                                            config.set_voice(
-                                                rt,
-                                                code,
-                                                Some(voice.path.to_path_buf()),
-                                                synth,
-                                            );
-                                            picked = true;
-                                            updated = true;
-                                        }
-                                    });
-                                } else if let Some(progress) = voice.progress() {
+                                if let Some(progress) = voice.progress() {
                                     egui::ProgressBar::new(progress as f32)
                                         .show_percentage()
                                         .ui(ui);
-                                } else if ui.button(egui_phosphor::bold::CLOUD_ARROW_DOWN).clicked()
-                                {
-                                    voice.start_download(client);
+                                    return;
                                 }
+                                let used = config.voices().get(&code).map(|path| path.as_path())
+                                    == Some(&*voice.path);
+                                ui.horizontal(|ui| {
+                                    if on_disk {
+                                        // The voice in use can be picked again only if it failed
+                                        // to load, to retry
+                                        let usable = !used || synth.failed(code, &voice.path);
+                                        ui.add_enabled_ui(usable, |ui| {
+                                            if ui.button(t!("audio.use")).clicked() {
+                                                let path = voice.path.to_path_buf();
+                                                config.set_voice(rt, code, path, synth);
+                                                // A voice picked by hand is what's used, whatever
+                                                // setup was getting for its language
+                                                setup.take_if(|(lang, _)| *lang == code);
+                                                updated = true;
+                                            }
+                                        });
+                                    } else if ui
+                                        .button(egui_phosphor::bold::CLOUD_ARROW_DOWN)
+                                        .clicked()
+                                    {
+                                        voice.start_download(client);
+                                    }
+                                    // Without its files too, the voice in use can be removed
+                                    if (on_disk || used)
+                                        && voice.delete_button(ui, code, on_disk, used)
+                                    {
+                                        voice.delete(config, synth);
+                                        // Setup doesn't get it again
+                                        setup.take_if(|(_, name)| voice.is_named(name));
+                                        updated = true;
+                                    }
+                                });
                             });
                         });
                     }
                     return updated;
                 });
             });
-        picked
     }
 }
 
@@ -625,9 +642,57 @@ struct Voice {
     config_md5: Option<String>,
     /// The model's and the config's
     downloads: Option<[Download; 2]>,
+    deletion: Deletion,
 }
 
 impl Voice {
+    /// Whether it's the voice named `name` in the catalog (e.g. `en_US-mike-medium`).
+    fn is_named(&self, name: &str) -> bool {
+        self.model_file.ends_with(&format!("/{name}.onnx"))
+    }
+
+    /// Whether its files are on disk, as [`Catalog::on_disk`] found: `None` until it's been
+    /// checked, and while they're deleted.
+    fn on_disk(&mut self, rt: &Handle, found: Option<&[bool]>) -> Option<bool> {
+        let found = found.and_then(|found| found.get(self.index).copied());
+        self.deletion.on_disk(rt, found)
+    }
+
+    /// The button to [`Self::delete`] it. Returns whether it was clicked.
+    fn delete_button(
+        &self,
+        ui: &mut egui::Ui,
+        lang: ArrayStr<2>,
+        on_disk: bool,
+        used: bool,
+    ) -> bool {
+        let size = on_disk.then(|| {
+            t!(
+                "audio.delete",
+                size = size_text(self.model_size + self.config_size)
+            )
+        });
+        let stops = used.then(|| {
+            t!(
+                "audio.delete_voice_in_use",
+                language = language::ui_name(lang)
+            )
+        });
+        ui.button(egui_phosphor::bold::TRASH)
+            .on_hover_text(size.into_iter().chain(stops).collect::<Vec<_>>().join("\n"))
+            .clicked()
+    }
+
+    /// Deletes its files once it's unloaded, removing the languages it's the voice of.
+    fn delete(&mut self, config: &mut RawConfig, synth: &mut Synthesizer) {
+        self.downloads = None;
+        let workers = config.remove_voice(&self.path, synth);
+        let model = self.path.as_std_path().to_path_buf();
+        let json = model.with_added_extension("json");
+        self.deletion
+            .start(move || drop(workers), vec![model, json]);
+    }
+
     /// Download progress of both files, weighted by size: `None` if they aren't downloading, or
     /// either failed.
     fn progress(&self) -> Option<f64> {
@@ -709,4 +774,95 @@ fn is_relative_path(path: &str) -> bool {
     Utf8Path::new(path)
         .components()
         .all(|component| matches!(component, Utf8Component::Normal(_)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arrstr;
+    use camino::Utf8PathBuf;
+
+    fn voice(path: &Utf8Path) -> Voice {
+        Voice {
+            index: 0,
+            name: "mike".into(),
+            country: "United States".into(),
+            quality: Quality::Medium,
+            speakers: 1,
+            path: path.into(),
+            model_file: "en/en_US/mike/medium/en_US-mike-medium.onnx".into(),
+            model_size: 0,
+            config_size: 0,
+            model_md5: None,
+            config_md5: None,
+            downloads: None,
+            deletion: Deletion::default(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_voice_in_use_removes_its_language_and_both_files() {
+        let rt = Handle::current();
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| Utf8PathBuf::try_from(dir.path().join(name)).unwrap();
+        let (deleted, kept) = (path("en.onnx"), path("es.onnx"));
+        let files = |model: &Utf8Path| [model.to_owned(), model.with_added_extension("json")];
+        for file in [&deleted, &kept].into_iter().flat_map(|model| files(model)) {
+            std::fs::write(file, []).unwrap();
+        }
+
+        let (mut config, mut synth) = (
+            RawConfig::default(),
+            Synthesizer::new(&rt, &RawConfig::default()),
+        );
+        config.set_voice(&rt, arrstr!("en"), deleted.clone(), &mut synth);
+        config.set_voice(&rt, arrstr!("es"), kept.clone(), &mut synth);
+
+        let mut voice = voice(&deleted);
+        assert_eq!(voice.on_disk(&rt, Some(&[true])), Some(true));
+        voice.delete(&mut config, &mut synth);
+        assert_eq!(
+            *config.voices(),
+            BTreeMap::from([(arrstr!("es"), kept.clone())])
+        );
+        assert_eq!(synth.load(arrstr!("en")), None);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while voice.deletion.running() {
+            assert!(Instant::now() < deadline, "timed out");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let on_disk = |voice: &mut Voice, found| {
+            tokio::task::block_in_place(|| voice.on_disk(&rt, Some(&[found])))
+        };
+        // Not used (by the row, nor setup) until it's checked again
+        assert_eq!(on_disk(&mut voice, true), None);
+        assert_eq!(on_disk(&mut voice, false), Some(false));
+        assert!(files(&deleted).iter().all(|file| !file.exists()));
+        assert!(files(&kept).iter().all(|file| file.exists()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_voice_keeps_the_one_in_use() {
+        let rt = Handle::current();
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| Utf8PathBuf::try_from(dir.path().join(name)).unwrap();
+        let (deleted, used) = (path("deleted.onnx"), path("used.onnx"));
+        let (mut config, mut synth) = (
+            RawConfig::default(),
+            Synthesizer::new(&rt, &RawConfig::default()),
+        );
+        config.set_voice(&rt, arrstr!("en"), used.clone(), &mut synth);
+
+        voice(&deleted).delete(&mut config, &mut synth);
+        assert_eq!(*config.voices(), BTreeMap::from([(arrstr!("en"), used)]));
+        assert!(synth.load(arrstr!("en")).is_some());
+    }
+
+    #[test]
+    fn a_voice_is_named_as_in_the_catalog() {
+        let voice = voice("en.onnx".into());
+        assert!(voice.is_named("en_US-mike-medium"));
+        assert!(!voice.is_named("mike-medium"));
+    }
 }

@@ -50,6 +50,15 @@ pub fn phonemize(text: &str, voice: &str) -> anyhow::Result<Vec<String>> {
     }
 }
 
+/// Stops the phonemizer, after the request it's answering. The next one starts it again. Until it
+/// stops, the files that were open to be inherited when it started can't be deleted on Windows.
+pub fn stop() {
+    PROCESS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+}
+
 struct Process {
     child: Child,
     stdin: ChildStdin,
@@ -156,6 +165,46 @@ mod tests {
         assert!(phonemize("", "en-us").unwrap().is_empty());
         assert!(phonemize("Hello.", "not-a-voice").is_err());
         // Its errors don't stop it
+        assert_eq!(phonemize("Hello.", "en-us").unwrap().len(), 1);
+    }
+
+    /// Needs the phonemizer: `cargo build -p bono-phonemizer` first.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn a_file_it_inherited_can_be_deleted_once_its_stopped() {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::{
+            Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation},
+            Storage::FileSystem::FILE_SHARE_READ,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.bin");
+        std::fs::write(&path, []).unwrap();
+        // As whisper.cpp opens models: inherited, and not shared for deletion
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .unwrap();
+        // SAFETY: the handle is open
+        let inherited = unsafe {
+            SetHandleInformation(
+                file.as_raw_handle(),
+                HANDLE_FLAG_INHERIT,
+                HANDLE_FLAG_INHERIT,
+            )
+        };
+        assert_ne!(inherited, 0);
+
+        stop();
+        phonemize("", "en-us").unwrap();
+        drop(file);
+        assert!(std::fs::remove_file(&path).is_err());
+        stop();
+        std::fs::remove_file(&path).unwrap();
+        // It starts again
         assert_eq!(phonemize("Hello.", "en-us").unwrap().len(), 1);
     }
 }
