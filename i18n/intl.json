@@ -525,6 +525,16 @@
         "es": "Dice \"verde, verde, verde\" cuando empieza la carrera, y cuando vuelve a verde justo después de una bandera roja",
         "ca": "Diu \"verd, verd, verd\" quan comença la cursa, i quan torna a verd just després d'una bandera vermella"
     },
+    "spotter.gap_behind": {
+        "en": "Car behind",
+        "es": "Coche detrás",
+        "ca": "Cotxe al darrere"
+    },
+    "spotter.gap_behind_hover": {
+        "en": "In races, says when a car closes to within a second behind. Doesn't affect the calls for cars alongside",
+        "es": "En carrera, avisa cuando un coche se acerca a menos de un segundo por detrás. No afecta a los avisos de coches a tu lado",
+        "ca": "En cursa, avisa quan un cotxe s'acosta a menys d'un segon per darrere. No afecta els avisos de cotxes al teu costat"
+    },
     "spotter.qualifying_lap_times": {
         "en": "Lap times in qualifying",
         "es": "Tiempos de vuelta en clasificación",
