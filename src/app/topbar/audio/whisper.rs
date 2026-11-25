@@ -1,7 +1,7 @@
 use crate::{
     Download,
     app::topbar::{
-        audio::{RecordingStream, SetupItem, SetupState},
+        audio::{RecordingStream, SetupItem, SetupState, gpu},
         setup_label, size_text,
     },
     arrstr,
@@ -39,7 +39,6 @@ use tokio::runtime::Handle;
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
     get_lang_str,
-    whisper_rs_sys::{ggml_backend_reg_by_name, ggml_backend_reg_dev_count},
 };
 
 pub const RECORDING_SPEC: AudioSpec = AudioSpec {
@@ -49,23 +48,12 @@ pub const RECORDING_SPEC: AudioSpec = AudioSpec {
 };
 
 /// Whether Bono was built with a backend that runs whisper on a GPU
-const GPU_BACKEND: bool = cfg!(any(
-    feature = "cuda",
+pub(super) const GPU_BACKEND: bool = cfg!(any(
     feature = "hipblas",
     feature = "intel-sycl",
     feature = "vulkan",
     target_vendor = "apple"
 ));
-
-/// Whether there's a GPU that whisper runs on with CUDA. Loads CUDA, so it's only called on workers.
-fn has_cuda() -> bool {
-    // `CUDA` is the backend's name in ggml's header (`GGML_CUDA_NAME`): null in builds without it.
-    // SAFETY: the name is a C string, and backends are never unloaded.
-    unsafe {
-        let cuda = ggml_backend_reg_by_name(c"CUDA".as_ptr());
-        !cuda.is_null() && ggml_backend_reg_dev_count(cuda) > 0
-    }
-}
 
 /// The model the setup guide downloads: it understands every language, and is quick on a GPU
 const RECOMMENDED: &str = "ggml-large-v3-turbo-q5_0.bin";
@@ -592,21 +580,34 @@ impl Whisper {
         self.ctx = Some(MaybeDone::spawn_blocking(move || {
             let mut params = WhisperContextParameters::default();
             params.use_gpu(gpu);
-            // Much less work for the GPU, which the simulator is using too. Only with CUDA, as it can
-            // be several times slower on other GPUs, and is a little slower on the CPU
-            let flash = gpu && has_cuda();
+            let gpu = if gpu { gpu::choose() } else { None };
+            params.gpu_device(gpu.as_ref().map_or(0, |gpu| gpu.device));
+            // Off on the CPU, where it's a little slower
+            let flash = gpu.as_ref().is_some_and(|gpu| gpu.flash);
             params.flash_attn(flash);
             match WhisperContext::new_with_params(path.as_os_str(), params) {
                 Ok(ctx) => {
+                    let gpu = gpu.map_or("none".to_owned(), |gpu| gpu.name);
                     log::info!(
                         "Loaded {path} for speech to text (GPU: {gpu}, flash attention: {flash})"
                     );
-                    Some(Arc::new(WhisperModel {
+                    let model = Arc::new(WhisperModel {
                         ctx,
                         session: SessionCache::default(),
                         latest: AtomicU64::new(0),
                         threads,
-                    }))
+                    });
+                    if flash {
+                        let model = Arc::downgrade(&model);
+                        // Not part of loading, as questions are refused until that's done. Nor for
+                        // a model that was replaced while it loaded
+                        Handle::current().spawn_blocking(move || {
+                            if let Some(model) = model.upgrade() {
+                                model.warm_up();
+                            }
+                        });
+                    }
+                    Some(model)
                 }
                 Err(e) => {
                     error(t!("error.stt_model"), e);
@@ -722,6 +723,33 @@ struct WhisperModel {
     session: SessionCache<WhisperSession>,
     latest: AtomicU64,
     threads: NonZeroUsize,
+}
+
+impl WhisperModel {
+    /// Transcribes a second of silence. The driver builds its shaders the first time after installing
+    /// Bono or the driver, which takes seconds that the first question would wait for.
+    fn warm_up(&self) {
+        let start = Instant::now();
+        let silence = self.session.run(
+            || self.new_session(),
+            |session| session.speech_to_text(arrstr!("en"), &[0.0; 16000]),
+        );
+        match silence {
+            Ok(_) => log::debug!("Warmed up speech to text in {:?}", start.elapsed()),
+            Err(e) => log::warn!("Unable to warm up speech to text: {e}"),
+        }
+    }
+
+    fn new_session(&self) -> anyhow::Result<WhisperSession> {
+        let start = Instant::now();
+        let state = self.ctx.create_state()?;
+        log::debug!("Created whisper's state in {:?}", start.elapsed());
+        Ok(WhisperSession {
+            state,
+            threads: self.threads,
+            multilingual: self.ctx.is_multilingual(),
+        })
+    }
 }
 
 /// Access only on blocking workers: initialization, use and destruction can all be expensive.
@@ -849,14 +877,7 @@ impl PendingSession {
             model.session.run(
                 || {
                     anyhow::ensure!(model.latest.load(Ordering::Relaxed) == ticket, "Superseded recording");
-                    let start = Instant::now();
-                    let state = model.ctx.create_state()?;
-                    log::debug!("Created whisper's state in {:?}", start.elapsed());
-                    Ok(WhisperSession {
-                        state,
-                        threads: model.threads,
-                        multilingual: model.ctx.is_multilingual(),
-                    })
+                    model.new_session()
                 },
                 |session| {
                     if model.latest.load(Ordering::Relaxed) != ticket {
@@ -1502,13 +1523,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.0.send(std::thread::current().id());
         }
-    }
-
-    #[test]
-    fn builds_without_cuda_have_no_cuda_gpu() {
-        // Called in every build: it must also not crash in those with CUDA, whether or not there's a GPU
-        let cuda = has_cuda();
-        assert!(cfg!(feature = "cuda") || !cuda);
     }
 
     #[test]

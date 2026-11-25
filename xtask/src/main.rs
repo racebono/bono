@@ -92,10 +92,7 @@ async fn dist() -> anyhow::Result<()> {
 
     // 6. Windows app-local runtimes and the LMU plugin (for the game's Plugins folder)
     if cfg!(windows) {
-        let cuda = env::var_os("CUDA_PATH")
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("CUDA_PATH is required to package CUDA runtime DLLs"))?;
-        runtime::copy_windows_runtimes(&release, &cuda, &dist).await?;
+        runtime::copy_windows_runtimes(&release, &dist).await?;
         tokio::fs::create_dir_all(dist.join("plugins")).await?;
         tokio::fs::copy(
             release.join("bono_lmu.dll"),

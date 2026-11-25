@@ -71,11 +71,6 @@ jobs:
             CARGO_TERM_COLOR: always
             # Distribution builds must also run on CPUs other than the runner's CPU.
             GGML_NATIVE: "OFF"
-            # whisper-rs otherwise passes the Unix-only -fPIC flag to MSVC via nvcc.
-            CMAKE_CUDA_FLAGS: ""
-            # Native code for RTX 30/40 (sm_86 also runs on 8.9) and RTX 50; Turing and newer
-            # GPUs JIT-compile the compute_75 PTX on first launch. Fewer targets, faster builds.
-            CMAKE_CUDA_ARCHITECTURES: "75-virtual;86-real;120-real"
             CMAKE_BUILD_PARALLEL_LEVEL: "2"
             # Nightlies carry their commit in the version (`0.1.0+abc1234`); releases don't.
             BONO_COMMIT: ${{ (github.event_name == 'schedule' || inputs.nightly) && needs.changes.outputs.ref || '' }}
@@ -162,25 +157,12 @@ jobs:
                   Write-Host "Using libclang from $libclang"
                   "LIBCLANG_PATH=$libclang" >> $env:GITHUB_ENV
 
-            # setup-cuda.ps1 skips the installer when the cached toolkit has nvcc.
-            - name: Cache CUDA toolkit
-              uses: actions/cache@v6
-              with:
-                  path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4
-                  key: cuda-${{ runner.os }}-${{ hashFiles('.github/scripts/setup-cuda.ps1') }}
-
-            - name: Set up CUDA
-              run: ./.github/scripts/setup-cuda.ps1
-
             - name: Set up Vulkan
               run: ./.github/scripts/setup-vulkan.ps1
 
             - name: Cache Cargo dependencies
               uses: Swatinem/rust-cache@v2
               with:
-                  # Cargo doesn't rebuild whisper.cpp when the CMake settings in .cargo/config.toml change,
-                  # so a cache from before such a change can't be reused, not even as a fallback.
-                  key: ${{ hashFiles('.cargo/config.toml') }}
                   cache-on-failure: true
                   # Release runs are scoped to refs/tags/*, so caches they save can never be restored.
                   save-if: ${{ github.event_name != 'release' }}

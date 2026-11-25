@@ -104,7 +104,7 @@ jobs:
                   cargo build --locked -p bono-phonemizer
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-            # CPU-only: the tests don't exercise the CUDA or Vulkan Whisper backends.
+            # CPU-only: the tests don't exercise the Vulkan Whisper backend.
             - name: Run tests
               env:
                   LMU_SDK: ${{ steps.lmu-sdk.outputs.available }}

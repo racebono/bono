@@ -36,7 +36,7 @@ Reopen the guide from Settings at any time. Start your simulator, enter a sessio
 
 Packaged Windows builds update themselves from this repository's GitHub releases. A stable build follows stable releases; a nightly build follows nightlies. The **Update** menu shows the running version and whether a newer one is available. At launch, a newer version is offered in a popup.
 
-Downloading and installing are separate steps. **Download** fetches the release's `bono-windows-x86_64.zip`, checks its size and SHA-256, and unpacks it into the installation's `update/` folder. The Update menu then shows a sign. **Install and restart** closes Bono, puts the new version in place and opens it again. Each file and folder at the top of the new version replaces the installation's by renaming, after moving the old one to `update/backup/`. If anything can't be replaced, everything moved goes back, the old version opens, and the Update menu says what went wrong. Other files in the installation folder stay. Settings, Whisper models and Piper voices live in the per-user preference directory, so every version keeps them. The installation folder must be writable, and only one running Bono per installation can update it. Installing needs Bono to be able to start an installer that outlives it, which some programs that launch others prevent; start Bono by itself then. Development builds don't update themselves.
+Downloading and installing are separate steps. **Download** fetches the release's `bono-windows-x86_64.zip`, checks its size and SHA-256, and unpacks it into the installation's `update/` folder. The Update menu then shows a sign. **Install and restart** closes Bono, puts the new version in place and opens it again. Each file and folder at the top of the new version replaces the installation's by renaming, after moving the old one to `update/backup/`. If anything can't be replaced, everything moved goes back, the old version opens, and the Update menu says what went wrong. Other files in the installation folder stay, except the CUDA libraries of older versions, which the new version removes. Settings, Whisper models and Piper voices live in the per-user preference directory, so every version keeps them. The installation folder must be writable, and only one running Bono per installation can update it. Installing needs Bono to be able to start an installer that outlives it, which some programs that launch others prevent; start Bono by itself then. Development builds don't update themselves.
 
 A stable build is newer when its release tag (`v0.2.0` or `0.2.0`) is a higher version than the running app's Cargo version. Releasing therefore requires bumping `version` in `Cargo.toml` first, and the release workflow refuses tags that don't match it. A nightly is the most recently published `nightly-*` prerelease that has its zip, unless the running app's own nightly was published at the same time or later. A release whose zip is still uploading, or whose zip has no SHA-256 digest on GitHub, isn't offered.
 
@@ -61,7 +61,7 @@ In the **Engineer** menu, **Spoken language** fixes the language of replies usin
 
 ### Speech recognition is very slow while driving
 
-Whisper runs on the same GPU as your simulator. With VSync off (or no frame-rate cap), the simulator renders as many frames as it can and keeps the GPU fully busy, so transcribing a question can take many seconds instead of less than one. Enable VSync or cap the frame rate in the simulator to leave the GPU some headroom: it helps the most, and the simulator loses fewer frames too. On NVIDIA cards, in builds with CUDA, Whisper uses flash attention, which is much less work for the GPU. Alternatively, untick **Use the GPU** in the Speech To Text menu to run Whisper on the CPU instead, preferably with a smaller model. It uses half of the CPU's threads, and slows down when the simulator leaves it too few.
+Whisper runs on the same GPU as your simulator. With VSync off (or no frame-rate cap), the simulator renders as many frames as it can and keeps the GPU fully busy, so transcribing a question can take many seconds instead of less than one. Enable VSync or cap the frame rate in the simulator to leave the GPU some headroom: it helps the most, and the simulator loses fewer frames too. On NVIDIA RTX cards, Whisper uses flash attention, which is much less work for the GPU. Alternatively, untick **Use the GPU** in the Speech To Text menu to run Whisper on the CPU instead, preferably with a smaller model. It uses half of the CPU's threads, and slows down when the simulator leaves it too few.
 
 The log (`%APPDATA%\bono\bono\output.log` on Windows) records how long each transcription stage took.
 
@@ -144,7 +144,7 @@ remains necessary for the authorization-code exchange.
 - A recent Rust toolchain with Cargo and Rust 2024 edition support. The project does not currently pin a Rust version.
 - A C/C++ build toolchain, CMake, and Clang/libclang for generated bindings and native dependencies.
 - On Windows: Visual Studio Build Tools with C++ tools and the Windows SDK, plus Ninja on `PATH`. The repository configures CMake to use Ninja for `x86_64-pc-windows-msvc`.
-- For the default build: the CUDA toolkit and Vulkan SDK. A CPU-only build is available below.
+- For the default build: the Vulkan SDK (CI uses 1.4.341.1). An older one may leave out what makes flash attention fast on RTX cards. A CPU-only build is available below.
 - Internet access to fetch Cargo dependencies and build-time resources. The Windows build downloads the RaceRoom API header.
 
 SDL3 and SQLite are built from source through Cargo dependencies.
@@ -158,7 +158,7 @@ cargo build -p bono-phonemizer
 cargo run -p bono
 ```
 
-Without the CUDA and Vulkan SDKs, use the CPU-only build:
+Without the Vulkan SDK, use the CPU-only build:
 
 ```sh
 cargo build -p bono-phonemizer
@@ -182,7 +182,7 @@ With Just installed, `just lmu` runs the same build. The resulting `target/debug
 
 Cargo features control Whisper acceleration:
 
-- `cuda` and `vulkan` are enabled by default; they require their respective SDKs (`CUDA_PATH` on Windows and `VULKAN_SDK`).
+- `vulkan` is enabled by default; it requires the Vulkan SDK (`VULKAN_SDK`).
 - `hipblas` enables ROCm on Linux (`HIP_PATH`).
 - `intel-sycl` enables Intel oneAPI (`icx`/`icpx`).
 - `openblas` enables OpenBLAS (`BLAS_INCLUDE_DIRS`, optionally `OPENBLAS_PATH`).
@@ -201,7 +201,7 @@ Apple targets enable Metal automatically. The optional `all-languages` feature e
 cargo xtask dist
 ```
 
-This builds release binaries and recreates `dist/` with the application, assets, phonemizer, espeak-ng data and license, and (on Windows) the LMU plugin. Windows packaging therefore requires the LMU installation and SDK headers. The task uses the application's default CUDA and Vulkan features; it does not forward extra Cargo feature flags.
+This builds release binaries and recreates `dist/` with the application, assets, phonemizer, espeak-ng data and license, and (on Windows) the LMU plugin. Windows packaging therefore requires the LMU installation and SDK headers. The task uses the application's default Vulkan feature; it does not forward extra Cargo feature flags.
 
 Windows packaging also includes DirectML, the Vulkan loader, and app-local x64 Visual C++ runtime DLLs for the application and phonemizer. Visual C++ redistributables are located through `VCToolsRedistDir` or Visual Studio (`vswhere`); the Vulkan loader comes from `VULKAN_SDK/Bin` or the installed Windows runtime. Missing required runtimes stop packaging. The Visual C++ installer is included in `dist/prerequisites`: run it before using the LMU plugin, which is loaded by the game process. Windows and compatible GPU drivers remain prerequisites; Whisper and Piper models are downloaded by the application.
 
