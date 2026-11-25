@@ -5018,7 +5018,8 @@ fn race_need(
                         // Started this lap with the clock run out: that was the flag
                         true => start,
                         false => {
-                            let first = start + leader_lap;
+                            // Overdue, they still can't cross the line before now
+                            let first = (start + leader_lap).max(now);
                             first + steps_to(first, leader_lap, now + time_left) * leader_lap
                         }
                     };
@@ -6058,6 +6059,50 @@ mod tests {
         // Before the clock's end, that lap's end is the flag: one more for us after this one
         let (need, _) = race_need(&sc, &at(960.0), 1, Some(1007.0), 0.92, Some(100.0));
         assert!((need.unwrap() - 1.08).abs() < 1e-9, "{need:?}");
+    }
+
+    #[test]
+    fn an_overdue_leader_still_brings_the_flag_at_the_end_of_their_lap() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Laps needed, 0.91 into a 100 s lap, with the leader on one since `start` after a 100 s one
+        let need = |session: &str, start: f64, now: f64| {
+            let me = columns(&conn, "1 AS vehicle_id, 2 AS position");
+            let leader = columns(
+                &conn,
+                "2 AS vehicle_id, 1 AS position, 100.0 AS last_lap_time",
+            );
+            let sc = Scoring {
+                session: Some(columns(&conn, session)),
+                yellow_sectors: Vec::new(),
+                sector_yellows: false,
+                cars: BTreeMap::from([(1, me.clone()), (2, leader)]),
+                player: Some(me),
+            };
+            let frame =
+                BTreeMap::from([(2, columns(&conn, &format!("{start:?} AS lap_start_time")))]);
+            let (need, _) = race_need(&sc, &frame, 1, Some(now), 0.91, Some(100.0));
+            need.unwrap()
+        };
+        let ends_at_1800 = "'race' AS session_type, 1800.0 AS session_end_time";
+        let run_out = "'race' AS session_type, 0.0 AS time_remaining, 1806.0 AS session_time";
+        for (session, start, now, expected) in [
+            // The clock ran out during their lap: due at 1805, a second ago
+            (ends_at_1800, 1705.0, 1806.0, 0.09),
+            // Due before the clock ran out, but they didn't make it
+            (ends_at_1800, 1605.0, 1806.0, 0.09),
+            // Not known when the clock ran out
+            (run_out, 1705.0, 1806.0, 0.09),
+            // Not due yet
+            (ends_at_1800, 1720.0, 1806.0, 1.09),
+            // Overdue with the clock still running, another lap may well follow
+            (ends_at_1800, 1660.0, 1790.0, 1.09),
+        ] {
+            let need = need(session, start, now);
+            assert!(
+                (need - expected).abs() < 1e-9,
+                "{session}, {start} to {now}: {need}"
+            );
+        }
     }
 
     /// One row of the given columns, as `SELECT ... AS ...` reads them.
