@@ -16,6 +16,8 @@ pub struct Acknowledgement {
     held: String,
     /// Everything said since the app acknowledged, the acknowledgement included
     heard: Option<String>,
+    /// The model looked something up, and wrote nothing since
+    unanswered: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -37,6 +39,9 @@ impl Acknowledgement {
 
     /// The model wrote `text`.
     pub fn text(&mut self, text: &str) -> Option<String> {
+        if !text.trim().is_empty() {
+            self.unanswered = false;
+        }
         match self.state {
             State::Waiting => {
                 self.state = State::Passed;
@@ -61,6 +66,7 @@ impl Acknowledgement {
     /// What it wrote before a query is its acknowledgement; what it wrote before tools that only
     /// act (a `schedule` or `pit` call, confirmed once made) answered.
     pub fn tools(&mut self, queried: bool) -> Option<String> {
+        self.unanswered |= queried;
         match self.state {
             State::Waiting => {
                 self.tools_ran = true;
@@ -106,6 +112,12 @@ impl Acknowledgement {
     /// Everything the pilot heard, if the app acknowledged: what the chat shows.
     pub fn heard(&self) -> Option<&str> {
         self.heard.as_deref()
+    }
+
+    /// Whether the model's last query has no answer: it wrote nothing after it, so what it wrote
+    /// before only acknowledged.
+    pub fn unanswered(&self) -> bool {
+        self.unanswered
     }
 
     fn say(&mut self, text: String) -> Option<String> {
@@ -215,6 +227,35 @@ mod tests {
         assert_eq!(ack.end(), None);
         assert_eq!(ack.fire("Copiado."), None);
         assert_eq!(ack.heard(), None);
+    }
+
+    #[test]
+    fn only_text_after_the_last_query_answers() {
+        // Whether the app acknowledged first or not
+        for fires in [true, false] {
+            let mut ack = Acknowledgement::new();
+            if fires {
+                ack.fire("Copiado.");
+            }
+            ack.text("Copio, lo compruebo.\n");
+            assert!(!ack.unanswered(), "it looked nothing up");
+            ack.tools(true);
+            assert!(ack.unanswered());
+            // Nothing to say: only whitespace, and tools that only act
+            ack.text("\n\n");
+            ack.tools(false);
+            assert!(ack.unanswered());
+            ack.text("Delanteros bien.");
+            assert!(!ack.unanswered());
+            ack.tools(false);
+            assert!(!ack.unanswered(), "what came before tools that only act answered");
+            // It looks up more
+            ack.tools(true);
+            assert!(ack.unanswered());
+            ack.text("Traseros también.");
+            ack.end();
+            assert!(!ack.unanswered());
+        }
     }
 
     #[test]
