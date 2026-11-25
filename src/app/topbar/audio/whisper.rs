@@ -932,7 +932,7 @@ impl WhisperSession {
     /// What was said in `lang`: empty if it's no words.
     fn speech_to_text(&mut self, lang: ArrayStr<2>, samples: &[f32]) -> anyhow::Result<String> {
         // Use greedy decoding on both CPU and GPU, keeping the default full audio
-        // context and temperature fallback.
+        // context and temperature fallback. A shorter context makes turbo repeat what was said.
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
         params.set_n_threads(c_int::try_from(self.threads.get()).unwrap_or(c_int::MAX));
