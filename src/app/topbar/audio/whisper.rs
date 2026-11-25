@@ -591,23 +591,18 @@ impl Whisper {
                     log::info!(
                         "Loaded {path} for speech to text (GPU: {gpu}, flash attention: {flash})"
                     );
-                    let model = WhisperModel {
+                    let model = Arc::new(WhisperModel {
                         ctx,
                         session: SessionCache::default(),
                         latest: AtomicU64::new(0),
                         threads,
-                    };
-                    // The driver builds its shaders the first time, after installing Bono or the
-                    // driver. That takes seconds, so a second of silence goes before the first question
-                    if flash
-                        && let Err(e) = model.session.run(
-                            || model.new_session(),
-                            |session| session.speech_to_text(arrstr!("en"), &[0.0; 16000]),
-                        )
-                    {
-                        log::warn!("Unable to warm up speech to text: {e}");
+                    });
+                    if flash {
+                        let model = model.clone();
+                        // Not part of loading, as questions are refused until that's done
+                        Handle::current().spawn_blocking(move || model.warm_up());
                     }
-                    Some(Arc::new(model))
+                    Some(model)
                 }
                 Err(e) => {
                     error(t!("error.stt_model"), e);
@@ -726,6 +721,20 @@ struct WhisperModel {
 }
 
 impl WhisperModel {
+    /// Transcribes a second of silence. The driver builds its shaders the first time after installing
+    /// Bono or the driver, which takes seconds that the first question would wait for.
+    fn warm_up(&self) {
+        let start = Instant::now();
+        let silence = self.session.run(
+            || self.new_session(),
+            |session| session.speech_to_text(arrstr!("en"), &[0.0; 16000]),
+        );
+        match silence {
+            Ok(_) => log::debug!("Warmed up speech to text in {:?}", start.elapsed()),
+            Err(e) => log::warn!("Unable to warm up speech to text: {e}"),
+        }
+    }
+
     fn new_session(&self) -> anyhow::Result<WhisperSession> {
         let start = Instant::now();
         let state = self.ctx.create_state()?;
