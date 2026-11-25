@@ -178,6 +178,9 @@ jobs:
             - name: Cache Cargo dependencies
               uses: Swatinem/rust-cache@v2
               with:
+                  # Cargo doesn't rebuild whisper.cpp when the CMake settings in .cargo/config.toml change,
+                  # so a cache from before such a change can't be reused, not even as a fallback.
+                  key: ${{ hashFiles('.cargo/config.toml') }}
                   cache-on-failure: true
                   # Release runs are scoped to refs/tags/*, so caches they save can never be restored.
                   save-if: ${{ github.event_name != 'release' }}

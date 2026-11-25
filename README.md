@@ -61,7 +61,7 @@ In the **Engineer** menu, **Spoken language** fixes the language of replies usin
 
 ### Speech recognition is very slow while driving
 
-Whisper runs on the same GPU as your simulator. With VSync off (or no frame-rate cap), the simulator renders as many frames as it can and keeps the GPU fully busy, so transcribing a question can take 10–30 seconds instead of about one. Enable VSync or cap the frame rate in the simulator to leave the GPU some headroom. Alternatively, untick **Use the GPU** in the Speech To Text menu to run Whisper on the CPU instead.
+Whisper runs on the same GPU as your simulator. With VSync off (or no frame-rate cap), the simulator renders as many frames as it can and keeps the GPU fully busy, so transcribing a question can take many seconds instead of less than one. Enable VSync or cap the frame rate in the simulator to leave the GPU some headroom: it helps the most, and the simulator loses fewer frames too. On NVIDIA cards, in builds with CUDA, Whisper uses flash attention, which is much less work for the GPU. Alternatively, untick **Use the GPU** in the Speech To Text menu to run Whisper on the CPU instead, preferably with a smaller model. It uses half of the CPU's threads, and slows down when the simulator leaves it too few.
 
 The log (`%APPDATA%\bono\bono\output.log` on Windows) records how long each transcription stage took.
 
