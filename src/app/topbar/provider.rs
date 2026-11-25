@@ -724,9 +724,21 @@ impl ProviderTopbar {
     }
 
     /// What's left of the account's allowance (this week's, or the trial's), warning when it
-    /// runs low, or when access ended.
+    /// runs low.
     fn show_allowance(&mut self, rt: &Handle, ui: &mut egui::Ui) {
-        let Some((text, warning)) = self.allowance(rt).and_then(allowance_text) else {
+        let Some(entitlement) = self.allowance(rt) else {
+            return;
+        };
+        // Access ended since it was checked: it's without access from now on, until checked again
+        if entitlement.status == "none" {
+            if let Some(cloud) = &mut self.cloud {
+                cloud.authorized = MaybeDone::Done(Ok(false));
+            }
+            self.models = None;
+            self.allowance = None;
+            return;
+        }
+        let Some((text, warning)) = allowance_text(entitlement) else {
             return;
         };
         if warning {
@@ -800,10 +812,6 @@ impl ProviderTopbar {
 
 /// What's said of what's left of the allowance, and whether it's a warning.
 fn allowance_text(entitlement: &Entitlement) -> Option<(String, bool)> {
-    // Access ended since it was checked ([`CloudAccess`]): nothing starts over each week
-    if entitlement.status == "none" {
-        return Some((t!("provider.bono_cloud_unavailable").into(), true));
-    }
     let hours = entitlement.estimated_hours_left?;
     let hours_left = format!("{:.1}", hours.max(0.0));
     // A trial's allowance never starts over, and is no more than a couple of hours in all:
@@ -951,16 +959,6 @@ mod tests {
     /// The line shown for what the website answers.
     fn text(answer: serde_json::Value) -> Option<(String, bool)> {
         allowance_text(&serde_json::from_value(answer).unwrap())
-    }
-
-    #[test]
-    fn access_that_ended_is_not_a_weekly_allowance_running_low() {
-        let ended = Some((t!("provider.bono_cloud_unavailable").to_owned(), true));
-        assert_eq!(
-            text(json!({"status": "none", "week": null, "estimatedHoursLeft": 0})),
-            ended
-        );
-        assert_eq!(text(json!({"status": "none"})), ended);
     }
 
     #[test]
