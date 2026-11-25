@@ -870,6 +870,21 @@
         "es": "Usar",
         "ca": "Fes servir"
     },
+    "audio.delete": {
+        "en": "Delete ({size})",
+        "es": "Borrar ({size})",
+        "ca": "Esborra ({size})"
+    },
+    "audio.delete_in_use": {
+        "en": "It's in use: use another model to delete this one",
+        "es": "Está en uso: usa otro modelo para borrar este",
+        "ca": "Està en ús: fes servir un altre model per esborrar aquest"
+    },
+    "audio.delete_voice_in_use": {
+        "en": "It's in use: Bono will no longer speak {language}",
+        "es": "Está en uso: Bono dejará de hablar {language}",
+        "ca": "Està en ús: Bono deixarà de parlar {language}"
+    },
     "audio.voice": {
         "en": "Voice",
         "es": "Voz",
@@ -984,6 +999,11 @@
         "en": "Unexpected error handling event",
         "es": "Error inesperado al gestionar un evento",
         "ca": "Error inesperat en gestionar un esdeveniment"
+    },
+    "error.deleting": {
+        "en": "Error deleting file",
+        "es": "Error al borrar un archivo",
+        "ca": "Error en esborrar un fitxer"
     },
     "error.removing_temporary": {
         "en": "Error removing temporary file",

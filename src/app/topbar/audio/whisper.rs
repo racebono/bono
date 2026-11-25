@@ -1,7 +1,7 @@
 use crate::{
     Download,
     app::topbar::{
-        audio::{RecordingStream, SetupItem, SetupState, gpu},
+        audio::{Deletion, RecordingStream, SetupItem, SetupState, gpu, scroll_bar_beside},
         setup_label, size_text,
     },
     arrstr,
@@ -9,6 +9,7 @@ use crate::{
     config::{ArrayStr, Config, RawConfig},
     engineer::{Heard, NotListening},
     error,
+    synthesizer::phonemizer,
     task::{JoinHandle, MaybeDone, spawn, spawn_blocking},
     updating,
 };
@@ -184,6 +185,7 @@ impl Whisper {
             return;
         }
         let mut reload = None;
+        let mut deleted_recommended = false;
         let catalog = self.catalog_mut(rt);
         ui.add_enabled_ui(catalog.is_some(), |ui| {
             ui.menu_button(label, |ui| {
@@ -216,6 +218,7 @@ impl Whisper {
                 }
                 ui.separator();
 
+                scroll_bar_beside(ui);
                 egui_extras::TableBuilder::new(ui)
                     .id_salt("whisper-models")
                     .striped(true)
@@ -264,14 +267,18 @@ impl Whisper {
                                         }
                                     });
 
-                                    if let Some(on_disk) = model.on_disk() {
+                                    let on_disk = model.on_disk(rt);
+                                    if model.deletion.pending() {
                                         row.col(|ui| {
-                                            if on_disk {
-                                                ui.add_enabled_ui(
-                                                    config.whisper_model().as_ref()
-                                                        != Some(&model.path)
-                                                        || failed,
-                                                    |ui| {
+                                            ui.spinner();
+                                        });
+                                    } else if let Some(on_disk) = on_disk {
+                                        row.col(|ui| {
+                                            if on_disk && model.download().is_none() {
+                                                let used = config.whisper_model().as_ref()
+                                                    == Some(&model.path);
+                                                ui.horizontal(|ui| {
+                                                    ui.add_enabled_ui(!used || failed, |ui| {
                                                         if ui.button(t!("audio.use")).clicked() {
                                                             config
                                                                 .whisper_model
@@ -279,8 +286,12 @@ impl Whisper {
                                                             reload = Some(model.path.clone());
                                                             updated = true;
                                                         }
-                                                    },
-                                                );
+                                                    });
+                                                    if model.delete_button(ui, used) {
+                                                        deleted_recommended |=
+                                                            model.file == RECOMMENDED;
+                                                    }
+                                                });
                                             } else if let Some(download) = model.download() {
                                                 egui::ProgressBar::new(download.progress() as f32)
                                                     .show_percentage()
@@ -300,6 +311,10 @@ impl Whisper {
                     });
             });
         });
+        // Setup doesn't get it again
+        if deleted_recommended {
+            self.setup = false;
+        }
         if let Some(path) = reload {
             // A model picked by hand is what's used, whatever setup was getting
             self.setup = false;
@@ -473,7 +488,7 @@ impl Whisper {
             self.setup = false;
             return;
         }
-        match model.on_disk() {
+        match model.on_disk(rt) {
             Some(true) => {
                 let path = model.path.clone();
                 if let Some(picked) = picked.as_ref().filter(|picked| **picked != path) {
@@ -524,7 +539,7 @@ impl Whisper {
         let model = match self.catalog.update(rt) {
             None => return unusable.then_some(SetupItem::Loading),
             Some(None) => return unusable.then_some(SetupItem::Unavailable),
-            Some(Some(catalog)) => catalog.iter().find(|model| model.file == RECOMMENDED)?,
+            Some(Some(catalog)) => (catalog.iter_mut()).find(|model| model.file == RECOMMENDED)?,
         };
         if !setup
             && !failed
@@ -535,7 +550,7 @@ impl Whisper {
             return None;
         }
 
-        let state = match (model.on_disk(), model.download()) {
+        let state = match (model.on_disk(rt), model.download()) {
             (Some(true), _) if failed && picked.as_ref() == Some(&model.path) => {
                 SetupState::LoadFailed
             }
@@ -564,6 +579,12 @@ impl Whisper {
 
     pub fn failed(&self) -> bool {
         matches!(self.ctx, Some(MaybeDone::Done(None)))
+    }
+
+    /// Whether a model is still being deleted.
+    pub fn deleting(&self) -> bool {
+        matches!(&self.catalog, MaybeDone::Done(Some(catalog))
+            if catalog.iter().any(|model| model.deletion.running()))
     }
 
     fn loading(&self) -> bool {
@@ -1280,14 +1301,35 @@ pub struct Model {
     pub sha256: Option<String>,
     pub file: String,
     pub path: Arc<Utf8Path>,
-    on_disk: tokio::sync::watch::Receiver<Option<bool>>,
+    /// Whether it's on disk, and when that check started
+    on_disk: tokio::sync::watch::Receiver<Option<(bool, Instant)>>,
     download: Option<Download>,
+    deletion: Deletion,
 }
 
 impl Model {
-    #[inline]
-    pub fn on_disk(&self) -> Option<bool> {
-        *self.on_disk.borrow()
+    /// Whether it's on disk: `None` until it's been checked, and while it's deleted.
+    pub fn on_disk(&mut self, rt: &Handle) -> Option<bool> {
+        let found = *self.on_disk.borrow();
+        self.deletion.on_disk(rt, found)
+    }
+
+    /// The button to delete it, unless it's `used`. Returns whether it was clicked.
+    fn delete_button(&mut self, ui: &mut egui::Ui, used: bool) -> bool {
+        let size = self.size.map_or("?".into(), size_text);
+        let clicked = ui
+            .add_enabled(!used, egui::Button::new(egui_phosphor::bold::TRASH))
+            .on_hover_text(t!("audio.delete", size = size))
+            .on_disabled_hover_text(t!("audio.delete_in_use"))
+            .clicked();
+        if clicked {
+            self.download = None;
+            let path = self.path.as_std_path().to_path_buf();
+            // The phonemizer inherited the file if it was started while whisper was reading it, and
+            // keeps it open
+            self.deletion.start(phonemizer::stop, vec![path]);
+        }
+        clicked
     }
 
     /// The download under way: `None` if there's none, it failed, or it's done.
@@ -1368,7 +1410,8 @@ impl Model {
                 continue;
             };
 
-            if name.contains('/') {
+            // Only files in its own folder
+            if name.contains(['/', '\\']) {
                 continue;
             }
 
@@ -1405,9 +1448,11 @@ impl Model {
                 path: path.clone(),
                 on_disk: updating(Duration::from_millis(1234), None, move |_| {
                     let path = path.clone();
-                    async move { tokio::fs::try_exists(&*path).await.ok() }
+                    let started = Instant::now();
+                    async move { Some((tokio::fs::try_exists(&*path).await.ok()?, started)) }
                 }),
                 download: None,
+                deletion: Deletion::default(),
             });
         }
 

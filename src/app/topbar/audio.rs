@@ -14,7 +14,7 @@ use crate::{
     engineer::Heard,
     error,
     synthesizer::{Speech, Synthesizer, VoiceLoad, plays_on},
-    task::Task,
+    task::{MaybeDone, Task},
     updating,
 };
 use bono_i18n::t;
@@ -39,6 +39,7 @@ use sdl3::{
 use std::{
     collections::{HashMap, HashSet},
     ops::{Deref, DerefMut},
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, AtomicUsize, Ordering},
@@ -121,6 +122,8 @@ impl AudioTopbar {
         DEVICE_WORKERS.load(Ordering::Acquire) == 0
             && self.microphone.retiring.is_empty()
             && self.speaker.retiring.is_empty()
+            && !self.whisper.deleting()
+            && !self.voices.deleting()
     }
 
     pub fn new(
@@ -1070,6 +1073,167 @@ impl ModelFiles {
     /// Whether a voice's files are on disk, assumed to be until they've been checked.
     pub fn voice(&self, path: &Utf8Path) -> bool {
         self.voice_checked(path).unwrap_or(true)
+    }
+}
+
+/// Deletes a downloaded model's files in the background. Its result is when it ended: checks of
+/// the files that started before then may have found them still there.
+#[derive(Default)]
+struct Deletion(Option<MaybeDone<Instant>>);
+
+impl Deletion {
+    /// Deletes `files` in order, after `release` closes what may have them open. Those already
+    /// missing count as deleted. It stops at the first that can't be deleted (its error is shown),
+    /// so the rest are still there to use it: a voice's model goes before its config.
+    fn start(&mut self, release: impl FnOnce() + Send + 'static, files: Vec<PathBuf>) {
+        self.0 = Some(MaybeDone::spawn_blocking(move || {
+            release();
+            for file in files {
+                match std::fs::remove_file(&file) {
+                    Ok(()) => log::info!("Deleted {}", file.display()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        error(t!("error.deleting"), format!("{}: {e}", file.display()));
+                        break;
+                    }
+                }
+            }
+            Instant::now()
+        }));
+    }
+
+    /// Whether the model is on disk, given what the last check `found` and when that check
+    /// started. `None` if it's not known: also while it's deleted, and then until a check that
+    /// started since tells.
+    fn on_disk(&mut self, rt: &Handle, found: Option<(bool, Instant)>) -> Option<bool> {
+        if let Some(task) = &mut self.0 {
+            let ended = *task.update(rt)?;
+            if found.is_none_or(|(_, started)| started < ended) {
+                return None;
+            }
+            self.0 = None;
+        }
+        found.map(|(on_disk, _)| on_disk)
+    }
+
+    /// Whether it was started, and [`Self::on_disk`] doesn't know how it went yet.
+    fn pending(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Whether the files are still being deleted.
+    fn running(&self) -> bool {
+        matches!(&self.0, Some(MaybeDone::Task(task)) if !task.is_finished())
+    }
+}
+
+/// Leaves room for a list's scroll bar, which otherwise widens over the buttons at its rows' ends.
+fn scroll_bar_beside(ui: &mut egui::Ui) {
+    let scroll = &mut ui.spacing_mut().scroll;
+    scroll.floating_allocated_width = scroll.bar_width;
+}
+
+#[cfg(test)]
+mod deletion_tests {
+    use super::*;
+
+    /// What the row goes by once the deletion is done, given a check that `found` the files and
+    /// started at `started` (now if `None`).
+    async fn after(
+        deletion: &mut Deletion,
+        found: Option<bool>,
+        started: Option<Instant>,
+    ) -> Option<bool> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while deletion.running() {
+            assert!(Instant::now() < deadline, "timed out");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let found = found.map(|found| (found, started.unwrap_or_else(Instant::now)));
+        tokio::task::block_in_place(|| deletion.on_disk(&Handle::current(), found))
+    }
+
+    /// Takes a while to let go of a file, as a voice's worker does, and notes whether it was still
+    /// there.
+    struct User(PathBuf, Arc<AtomicU32>);
+
+    impl Drop for User {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(50));
+            self.1.store(1 + self.0.exists() as u32, Ordering::Release);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deletes_every_file_once_nothing_uses_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = ["voice.onnx", "voice.onnx.json"].map(|file| dir.path().join(file));
+        for file in &files {
+            std::fs::write(file, []).unwrap();
+        }
+        let other = dir.path().join("other.onnx");
+        std::fs::write(&other, []).unwrap();
+
+        let dropped = Arc::new(AtomicU32::new(0));
+        let mut deletion = Deletion::default();
+        let user = User(files[0].clone(), dropped.clone());
+        deletion.start(move || drop(user), files.to_vec());
+        assert!(deletion.pending());
+        assert_eq!(after(&mut deletion, Some(false), None).await, Some(false));
+        assert!(!deletion.pending());
+        assert_eq!(dropped.load(Ordering::Acquire), 2);
+        assert!(files.iter().all(|file| !file.exists()));
+        assert!(other.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_check_started_since_the_deletion_is_believed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("model.bin");
+        std::fs::write(&file, []).unwrap();
+        let mut deletion = Deletion::default();
+        assert_eq!(after(&mut deletion, Some(true), None).await, Some(true));
+
+        let before = Instant::now();
+        deletion.start(|| (), vec![file]);
+        for _ in 0..2 {
+            assert_eq!(after(&mut deletion, Some(true), Some(before)).await, None);
+        }
+        // Not checked (successfully) since
+        assert_eq!(after(&mut deletion, None, None).await, None);
+        // Back already, e.g. downloaded by another program
+        assert_eq!(after(&mut deletion, Some(true), None).await, Some(true));
+        assert!(!deletion.pending());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn files_already_gone_count_as_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deletion = Deletion::default();
+        let before = Instant::now();
+        deletion.start(|| (), vec![dir.path().join("missing.bin")]);
+        assert_eq!(after(&mut deletion, Some(true), Some(before)).await, None);
+        assert_eq!(after(&mut deletion, Some(false), None).await, Some(false));
+        // Downloaded again
+        assert_eq!(after(&mut deletion, Some(true), None).await, Some(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_cant_be_deleted_stays_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        // A folder can't be deleted as a file
+        let stuck = dir.path().join("stuck.bin");
+        std::fs::create_dir(&stuck).unwrap();
+        let file = dir.path().join("file.bin");
+        std::fs::write(&file, []).unwrap();
+
+        let mut deletion = Deletion::default();
+        deletion.start(|| (), vec![stuck.clone(), file.clone()]);
+        assert_eq!(after(&mut deletion, Some(true), None).await, Some(true));
+        assert!(!deletion.pending());
+        // The files after it are kept, so it can still be used
+        assert!(stuck.exists());
+        assert!(file.exists());
     }
 }
 
