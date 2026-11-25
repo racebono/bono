@@ -1,10 +1,11 @@
 $ErrorActionPreference = 'Stop'
-$version = '1.4.304.1'
+$version = '1.4.341.1'
 $root = Join-Path $env:RUNNER_TEMP "VulkanSDK/$version"
-$installer = Join-Path $env:RUNNER_TEMP "VulkanSDK-$version-Installer.exe"
+$name = "vulkansdk-windows-X64-$version.exe"
+$installer = Join-Path $env:RUNNER_TEMP $name
 
 # The full prebuilt SDK includes glslc, which Whisper's Vulkan backend requires.
-Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe" -OutFile $installer
+Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/$version/windows/$name" -OutFile $installer
 $signature = Get-AuthenticodeSignature -LiteralPath $installer
 if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '(^|,\s*)CN="?LunarG, Inc\."?(,|$)') {
     throw 'Vulkan SDK installer does not have a valid LunarG signature'
@@ -21,7 +22,15 @@ foreach ($file in @('Include/vulkan/vulkan.h', 'Lib/vulkan-1.lib', 'Bin/glslc.ex
         throw "Missing Vulkan SDK file: $file"
     }
 }
-& (Join-Path $root 'Bin/glslc.exe') --version
+$glslc = Join-Path $root 'Bin/glslc.exe'
+& $glslc --version
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# Without it, ggml leaves out what makes flash attention fast on RTX cards, and only says so in its
+# build's output, which Cargo hides.
+$shader = Join-Path $env:RUNNER_TEMP 'coopmat2.comp'
+"#version 460`n#extension GL_NV_cooperative_matrix2 : require`nvoid main() {}" | Set-Content -LiteralPath $shader
+& $glslc --target-env=vulkan1.3 -o "$shader.spv" $shader
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 "VULKAN_SDK=$root" >> $env:GITHUB_ENV

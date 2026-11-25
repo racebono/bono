@@ -48,6 +48,7 @@ use std::{
 };
 use tokio::{runtime::Handle, sync::oneshot::error::TryRecvError};
 
+mod gpu;
 mod voice;
 mod whisper;
 
