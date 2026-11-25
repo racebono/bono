@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$version = '1.4.304.1'
+$version = '1.4.341.1'
 $root = Join-Path $env:RUNNER_TEMP "VulkanSDK/$version"
 $installer = Join-Path $env:RUNNER_TEMP "VulkanSDK-$version-Installer.exe"
 

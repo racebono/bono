@@ -49,7 +49,6 @@ pub const RECORDING_SPEC: AudioSpec = AudioSpec {
 
 /// Whether Bono was built with a backend that runs whisper on a GPU
 pub(super) const GPU_BACKEND: bool = cfg!(any(
-    feature = "cuda",
     feature = "hipblas",
     feature = "intel-sycl",
     feature = "vulkan",
