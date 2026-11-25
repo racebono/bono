@@ -161,8 +161,19 @@ impl Whisper {
         }
     }
 
-    pub fn update(&mut self, rt: &Handle, config: &mut Config, ui: &mut egui::Ui) {
-        let label = setup_label(self.missing(&config.get(), &[]), t!("audio.speech_to_text"));
+    /// The Speech To Text menu. `getting`: the languages whose voice is being set up.
+    pub fn update(
+        &mut self,
+        rt: &Handle,
+        config: &mut Config,
+        ui: &mut egui::Ui,
+        getting: &[ArrayStr<2>],
+    ) {
+        // Chosen by hand, then made automatic (by the setup guide)
+        if config.get().whisper_model().is_some() {
+            self.choosing = false;
+        }
+        let label = setup_label(self.missing(&config.get(), getting), t!("audio.speech_to_text"));
         ui.menu_button(label, |ui| {
             let automatic = config.get().whisper_model().is_none() && !self.choosing;
             ui.horizontal(|ui| {
@@ -183,7 +194,7 @@ impl Whisper {
             }
             ui.separator();
             if automatic {
-                self.note(rt, config, ui);
+                self.note(rt, config, ui, getting);
             }
             if self.engine() == Some(Engine::Whisper) {
                 if automatic {
@@ -201,11 +212,11 @@ impl Whisper {
     }
 
     /// What Automatic uses, and why, with what it needs.
-    fn note(&mut self, rt: &Handle, config: &Config, ui: &mut egui::Ui) {
+    fn note(&mut self, rt: &Handle, config: &Config, ui: &mut egui::Ui, getting: &[ArrayStr<2>]) {
         let (wanted, heard, voices) = {
             let raw = config.get();
             let voices = raw.voices().keys().copied().collect::<Vec<_>>();
-            (self.wanted(&raw, &[]), *raw.heard_language(), voices)
+            (self.wanted(&raw, getting), *raw.heard_language(), voices)
         };
         match engine::note(wanted, self.engine(), self.failed(), heard, &voices) {
             Note::Using(engine, why) => {
@@ -290,6 +301,8 @@ impl Whisper {
             engine::in_use(*raw.heard_language(), &voices, app_language(raw.locale()))
         };
         let parakeet_path = self.parakeet.model().clone();
+        // What Automatic loaded is in use too, while one is chosen
+        let loaded = self.loaded.clone();
         // The model picked doesn't hear a language in use
         let english_only = match &picked {
             Some(picked) => (self.catalog(rt).unwrap_or_default().iter())
@@ -355,12 +368,13 @@ impl Whisper {
                             ui.spinner();
                             return;
                         }
-                        let used = picked.as_ref() == Some(&parakeet_path);
+                        let picked = picked.as_ref() == Some(&parakeet_path);
+                        let used = picked || loaded.as_ref() == Some(&parakeet_path);
                         match (on_disk, self.parakeet.progress()) {
                             (Some(true), None) => {
                                 ui.horizontal(|ui| {
                                     if ui
-                                        .add_enabled(!used || failed, egui::Button::new(t!("audio.use")))
+                                        .add_enabled(!picked || failed, egui::Button::new(t!("audio.use")))
                                         .clicked()
                                     {
                                         reload = Some(parakeet_path.clone());
@@ -430,9 +444,10 @@ impl Whisper {
                         } else if let Some(on_disk) = on_disk {
                             row.col(|ui| {
                                 if on_disk && model.download().is_none() {
-                                    let used = picked.as_ref() == Some(&model.path);
+                                    let picked = picked.as_ref() == Some(&model.path);
+                                    let used = picked || loaded.as_ref() == Some(&model.path);
                                     ui.horizontal(|ui| {
-                                        ui.add_enabled_ui(!used || failed, |ui| {
+                                        ui.add_enabled_ui(!picked || failed, |ui| {
                                             if ui.button(t!("audio.use")).clicked() {
                                                 reload = Some(model.path.clone());
                                             }

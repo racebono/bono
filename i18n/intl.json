@@ -906,9 +906,9 @@
         "ca": "Fent servir {engine}"
     },
     "audio.stt_parakeet": {
-        "en": "It hears {languages}, and runs on the processor, so it doesn't slow the simulator down.",
-        "es": "Entiende {languages}, y se ejecuta en el procesador, así que no ralentiza el simulador.",
-        "ca": "Entén {languages}, i s'executa al processador, així que no alenteix el simulador."
+        "en": "Parakeet hears {languages}, and runs on the processor, so it doesn't slow the simulator down.",
+        "es": "Parakeet entiende {languages} y se ejecuta en el procesador, así que no ralentiza el simulador.",
+        "ca": "Parakeet entén {languages} i s'executa al processador, així que no alenteix el simulador."
     },
     "audio.stt_doesnt_hear": {
         "en": "{engine} doesn't hear {languages}.",
@@ -936,9 +936,9 @@
         "ca": "{languages} no es poden distingir pel text que escriu Parakeet."
     },
     "audio.stt_any": {
-        "en": "Replies are always in one language, so any language may be spoken.",
-        "es": "Las respuestas son siempre en un idioma, así que se puede hablar en cualquiera.",
-        "ca": "Les respostes són sempre en un idioma, així que es pot parlar en qualsevol."
+        "en": "Replies are always in the same language, so any language may be spoken.",
+        "es": "Las respuestas están siempre en el mismo idioma, así que se puede hablar en cualquiera.",
+        "ca": "Les respostes són sempre en el mateix idioma, així que es pot parlar en qualsevol."
     },
     "audio.stt_still": {
         "en": "Still using {engine}",

@@ -7,6 +7,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use parakeet_rs::{ExecutionConfig, ParakeetTDT, Transcriber};
 use std::{
     num::NonZeroUsize,
+    panic::AssertUnwindSafe,
     sync::{Arc, Mutex},
 };
 use tokio::runtime::Handle;
@@ -23,7 +24,10 @@ const FOLDER: &str = "parakeet/parakeet-tdt-0.6b-v3-int8";
 const URL: &str = "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/";
 
 struct File {
+    /// Its name in the repository
     name: &'static str,
+    /// Its name on disk: the int8 files go under the names `ParakeetTDT::from_pretrained` documents
+    local: &'static str,
     size: u64,
     sha256: &'static str,
 }
@@ -31,16 +35,19 @@ struct File {
 const FILES: [File; 3] = [
     File {
         name: "encoder-model.int8.onnx",
+        local: "encoder-model.onnx",
         size: 652_183_999,
         sha256: "6139d2fa7e1b086097b277c7149725edbab89cc7c7ae64b23c741be4055aff09",
     },
     File {
         name: "decoder_joint-model.int8.onnx",
+        local: "decoder_joint-model.onnx",
         size: 18_202_004,
         sha256: "eea7483ee3d1a30375daedc8ed83e3960c91b098812127a0d99d1c8977667a70",
     },
     File {
         name: "vocab.txt",
+        local: "vocab.txt",
         size: 93_939,
         sha256: "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d",
     },
@@ -64,7 +71,7 @@ impl Files {
     fn with(pref_path: &Utf8Path, files: [File; 3]) -> Self {
         let folder = pref_path.join(FOLDER);
         Self {
-            model: folder.join(files[0].name).into(),
+            model: folder.join(files[0].local).into(),
             folder,
             files,
             downloads: None,
@@ -84,7 +91,7 @@ impl Files {
     pub fn paths(&self) -> [Utf8PathBuf; 3] {
         (self.files)
             .each_ref()
-            .map(|file| self.folder.join(file.name))
+            .map(|file| self.folder.join(file.local))
     }
 
     /// Whether all of them are on disk, as of the last check: `None` until they've been checked.
@@ -144,7 +151,8 @@ impl Files {
         (self.downloads.iter().flatten().flatten()).any(Download::failed)
     }
 
-    /// Downloads those that aren't on disk, unless they're being downloaded.
+    /// Downloads those that aren't on disk, unless they're being downloaded. One that failed starts
+    /// over; the others go on.
     pub fn start_download(&mut self, client: &reqwest::Client, files: &ModelFiles) {
         self.start(client, files, |_| URL.to_owned());
     }
@@ -160,8 +168,13 @@ impl Files {
             return;
         }
         let paths = self.paths();
+        let mut downloads = self.downloads.take().unwrap_or_default();
         self.downloads = Some(std::array::from_fn(|i| {
             let file = &self.files[i];
+            // One still going, or done, isn't started over
+            if let Some(download) = downloads[i].take_if(|download| !download.failed()) {
+                return Some(download);
+            }
             // Only whole, checked files are ever put in place
             (files.checked(&paths[i]) != Some(true)).then(|| {
                 Download::new(
@@ -207,6 +220,13 @@ impl Parakeet {
 
     /// What was said in `samples` (16 kHz, mono): empty if nothing.
     pub fn transcribe(&self, samples: &[f32]) -> anyhow::Result<String> {
+        // A panic in the crate fails this recording, not the app. It poisons the lock, so the next
+        // one loads the model again
+        std::panic::catch_unwind(AssertUnwindSafe(|| self.hear(samples)))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("Parakeet panicked hearing the recording")))
+    }
+
+    fn hear(&self, samples: &[f32]) -> anyhow::Result<String> {
         let mut model = match self.model.lock() {
             Ok(model) => model,
             // Hearing a recording panicked: what that left isn't known, so it's loaded again
@@ -284,16 +304,19 @@ pub(super) mod tests {
     const SMALL: [File; 3] = [
         File {
             name: "a",
+            local: "a",
             size: 3,
             sha256: ABC,
         },
         File {
             name: "b",
+            local: "b",
             size: 3,
             sha256: ABC,
         },
         File {
             name: "c",
+            local: "c",
             size: 3,
             sha256: ABC,
         },

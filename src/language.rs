@@ -103,7 +103,8 @@ pub fn name(code: ArrayStr<2>) -> Option<String> {
 }
 
 /// The name of the language with `code` (as the voices have it), in the app's language: in
-/// English for those the app hasn't translated, or its code if it isn't built in either.
+/// English for those the app hasn't translated, or its code if neither `lingua` nor Whisper knows
+/// it.
 pub fn ui_name(code: ArrayStr<2>) -> String {
     use bono_i18n::t;
 
@@ -119,7 +120,14 @@ pub fn ui_name(code: ArrayStr<2>) -> String {
         "zh" => t!("lang.zh"),
         "ja" => t!("lang.ja"),
         "ko" => t!("lang.ko"),
-        _ => return name(code).unwrap_or_else(|| code.to_string()),
+        _ => {
+            let whisper = || {
+                let name = whisper_rs::get_lang_str_full(whisper_rs::get_lang_id(&code)?)?;
+                let mut chars = name.chars();
+                Some(chars.next()?.to_uppercase().collect::<String>() + chars.as_str())
+            };
+            return name(code).or_else(whisper).unwrap_or_else(|| code.to_string());
+        }
     };
     name.to_owned()
 }
@@ -150,6 +158,15 @@ fn voice_language(language: Language) -> Option<ArrayStr<2>> {
 mod tests {
     use super::*;
     use crate::arrstr;
+
+    #[test]
+    fn names_languages_that_are_not_built_in() {
+        assert_eq!(ui_name(arrstr!("eu")), "Basque");
+        // `lingua` names it after Bokmål, when it's built in
+        #[cfg(not(feature = "all-languages"))]
+        assert_eq!(ui_name(arrstr!("no")), "Norwegian");
+        assert_eq!(ui_name(arrstr!("xx")), "xx");
+    }
 
     // Driven like the app does, from outside the runtime
     #[test]

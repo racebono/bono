@@ -327,7 +327,7 @@ impl AudioTopbar {
             Heard::Nothing => log::info!("Nothing understood on the radio"),
             Heard::NoVoice(_) => log::info!("No voice to answer the radio with"),
             Heard::UnsupportedLanguage(lang) => {
-                log::info!("The English-only speech model cannot hear {lang}")
+                log::info!("The speech to text model in use cannot hear {lang}")
             }
             Heard::TooShort => log::debug!("The talk button was let go too soon"),
             Heard::NotListening(why) => log::info!("Not listening to the radio: {why:?}"),
@@ -350,7 +350,7 @@ impl AudioTopbar {
             self.test_voice(rt, config, synth);
         }
 
-        self.whisper.update(rt, config, ui);
+        self.whisper.update(rt, config, ui, &self.voices.getting());
         self.voices.update(rt, config, ui, synth);
     }
 
@@ -653,7 +653,6 @@ impl DeviceSelector {
     }
 }
 
-/// The language the app is in (`locale`, e.g. `en-US`): `en` if it's none.
 /// The language the setup guide speaks in: the fixed reply language's, if it has a voice; or else
 /// the Heard language; or else the `app`'s, if it has a voice or is `getting` one; or else the
 /// first that has or is; or else the app's.
@@ -678,6 +677,7 @@ fn test_phrase(lang: ArrayStr<2>) -> &'static str {
     }
 }
 
+/// The language the app is in (`locale`, e.g. `en-US`): `en` if it's none.
 pub fn app_language(locale: &str) -> ArrayStr<2> {
     ArrayStr::from_str(locale.split('-').next().unwrap_or_default()).unwrap_or(arrstr!("en"))
 }
