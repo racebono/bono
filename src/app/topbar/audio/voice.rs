@@ -28,17 +28,83 @@ use tokio::runtime::Handle;
 const CATALOG_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/voices.json";
 const FILE_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/";
 
-/// The voice the setup guide downloads for the app's language (`locale`, e.g. `en-US`): its
-/// language, and its name in the catalog.
+/// The voice the setup guide downloads for a language.
+pub struct Recommended {
+    pub lang: &'static str,
+    /// The language's own name
+    pub native: &'static str,
+    /// Its name in the catalog
+    pub voice: &'static str,
+}
+
+const fn voice(lang: &'static str, native: &'static str, voice: &'static str) -> Recommended {
+    Recommended {
+        lang,
+        native,
+        voice,
+    }
+}
+
+/// Every language with a voice Bono can speak: Piper also has Hebrew, Japanese, Lithuanian and Thai
+/// voices, whose phonemes aren't espeak's.
+pub const RECOMMENDED: &[Recommended] = &[
+    voice("ar", "العربية", "ar_JO-kareem-medium"),
+    voice("bg", "Български", "bg_BG-dimitar-medium"),
+    voice("bn", "বাংলা", "bn_BD-google-medium"),
+    voice("ca", "Català", "ca_ES-upc_ona-medium"),
+    voice("cs", "Čeština", "cs_CZ-jirka-medium"),
+    voice("cy", "Cymraeg", "cy_GB-gwryw_gogleddol-medium"),
+    voice("da", "Dansk", "da_DK-talesyntese-medium"),
+    voice("de", "Deutsch", "de_DE-thorsten-medium"),
+    voice("el", "Ελληνικά", "el_GR-joy-medium"),
+    voice("en", "English", "en_US-mike-medium"),
+    voice("es", "Español", "es_ES-davefx-medium"),
+    voice("et", "Eesti", "et_EE-news-medium"),
+    voice("eu", "Euskara", "eu_ES-antton-medium"),
+    voice("fa", "فارسی", "fa_IR-amir-medium"),
+    voice("fi", "Suomi", "fi_FI-harri-medium"),
+    voice("fr", "Français", "fr_FR-siwis-medium"),
+    voice("hi", "हिन्दी", "hi_IN-pratham-medium"),
+    voice("hu", "Magyar", "hu_HU-anna-medium"),
+    voice("hy", "Հայերեն", "hy_AM-gor-medium"),
+    voice("id", "Bahasa Indonesia", "id_ID-news_tts-medium"),
+    voice("is", "Íslenska", "is_IS-bui-medium"),
+    voice("it", "Italiano", "it_IT-paola-medium"),
+    voice("ka", "ქართული", "ka_GE-natia-medium"),
+    voice("kk", "Қазақша", "kk_KZ-issai-high"),
+    voice("ko", "한국어", "ko_KR-kss-medium"),
+    voice("ku", "Kurdî", "ku_TR-berfin_renas-medium"),
+    voice("lb", "Lëtzebuergesch", "lb_LU-marylux-medium"),
+    voice("lv", "Latviešu", "lv_LV-aivars-medium"),
+    voice("ml", "മലയാളം", "ml_IN-arjun-medium"),
+    voice("mr", "मराठी", "mr_IN-google-medium"),
+    voice("ne", "नेपाली", "ne_NP-chitwan-medium"),
+    voice("nl", "Nederlands", "nl_NL-alex-medium"),
+    voice("no", "Norsk", "no_NO-talesyntese-medium"),
+    voice("pl", "Polski", "pl_PL-darkman-medium"),
+    voice("pt", "Português", "pt_BR-faber-medium"),
+    voice("ro", "Română", "ro_RO-mihai-medium"),
+    voice("ru", "Русский", "ru_RU-denis-medium"),
+    voice("sk", "Slovenčina", "sk_SK-lili-medium"),
+    voice("sl", "Slovenščina", "sl_SI-artur-medium"),
+    voice("sq", "Shqip", "sq_AL-edon-medium"),
+    voice("sr", "Srpski", "sr_RS-serbski_institut-medium"),
+    voice("sv", "Svenska", "sv_SE-lisa-medium"),
+    voice("sw", "Kiswahili", "sw_CD-lanfrica-medium"),
+    voice("te", "తెలుగు", "te_IN-maya-medium"),
+    voice("tr", "Türkçe", "tr_TR-dfki-medium"),
+    voice("uk", "Українська", "uk_UA-mykyta-high"),
+    voice("ur", "اردو", "ur_PK-aegis_female-medium"),
+    voice("vi", "Tiếng Việt", "vi_VN-vais1000-medium"),
+    voice("zh", "中文", "zh_CN-huayan-medium"),
+];
+
+/// The recommended voice for the app's language (`locale`, e.g. `en-US`): its language, and its name
+/// in the catalog.
 fn recommended(locale: &str) -> Option<(ArrayStr<2>, &'static str)> {
     let lang = locale.split('-').next()?;
-    let voice = match lang {
-        "en" => "en_US-mike-medium",
-        "es" => "es_ES-davefx-medium",
-        "ca" => "ca_ES-upc_ona-medium",
-        _ => return None,
-    };
-    Some((ArrayStr::from_str(lang)?, voice))
+    let recommended = RECOMMENDED.iter().find(|other| other.lang == lang)?;
+    Some((ArrayStr::from_str(lang)?, recommended.voice))
 }
 
 pub struct Voices {
@@ -709,4 +775,76 @@ fn is_relative_path(path: &str) -> bool {
     Utf8Path::new(path)
         .components()
         .all(|component| matches!(component, Utf8Component::Normal(_)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        app::topbar::audio::engine,
+        synthesizer::{Effects, Voice as Loaded},
+    };
+    use std::{collections::BTreeSet, num::NonZeroUsize};
+
+    #[test]
+    fn recommends_one_voice_per_language() {
+        let langs = RECOMMENDED.iter().map(|voice| voice.lang).collect::<BTreeSet<_>>();
+        assert_eq!(langs.len(), RECOMMENDED.len());
+        for voice in RECOMMENDED {
+            assert!(voice.voice.starts_with(&format!("{}_", voice.lang)), "{}", voice.voice);
+            assert!(ArrayStr::<2>::from_str(voice.lang).is_some());
+        }
+        assert_eq!(recommended("en-US").unwrap().1, "en_US-mike-medium");
+        assert_eq!(recommended("es").unwrap().1, "es_ES-davefx-medium");
+        assert_eq!(recommended("ca-ES").unwrap().1, "ca_ES-upc_ona-medium");
+        // All Parakeet knows, but those without a voice Bono can speak
+        let known = (langs.iter())
+            .filter(|lang| engine::parakeet_knows(ArrayStr::from_str(lang).unwrap()))
+            .count();
+        assert_eq!(known, 25 - 3);
+        assert!(["hr", "lt", "mt"].iter().all(|lang| !langs.contains(lang)));
+    }
+
+    /// Downloads every one of them (3 GB, one at a time), and says something. `BONO_VOICES`, if set,
+    /// has the languages to check, such as `fr,de`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn recommended_voices_are_in_the_catalog_and_speak() {
+        let client = reqwest::Client::new();
+        let only = std::env::var("BONO_VOICES").ok();
+        let mut failed = Vec::new();
+        for recommended in RECOMMENDED {
+            if (only.as_ref()).is_some_and(|only| !only.split(',').any(|lang| lang == recommended.lang)) {
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let mut catalog = Catalog::fetch(Utf8Path::from_path(dir.path()).unwrap(), &client).await.unwrap();
+            let lang = ArrayStr::from_str(recommended.lang).unwrap();
+            let Some(voice) = find(&mut catalog.languages, lang, recommended.voice) else {
+                failed.push(format!("{}: not in the catalog", recommended.voice));
+                continue;
+            };
+            voice.start_download(&client);
+            while !voice.failed() && voice.progress().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            let path = voice.path.clone();
+            let spoken = tokio::task::spawn_blocking(move || -> anyhow::Result<f32> {
+                let mut voice = Loaded::load(&path, NonZeroUsize::new(4).unwrap(), false)?;
+                let effects = Effects {
+                    radio: 0.0,
+                    beep_volume: 0.0,
+                    speed: 1.0,
+                };
+                let speech = voice.synthesize("1, 2, 3.", effects)?;
+                Ok(speech.samples.len() as f32 / speech.sample_rate as f32)
+            });
+            match spoken.await.unwrap() {
+                Ok(seconds) if seconds > 0.3 => println!("{}: {seconds:.1} s", recommended.voice),
+                Ok(seconds) => failed.push(format!("{}: only {seconds} s", recommended.voice)),
+                Err(e) => failed.push(format!("{}: {e:#}", recommended.voice)),
+            }
+        }
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
 }
