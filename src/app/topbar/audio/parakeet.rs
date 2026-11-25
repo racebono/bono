@@ -191,14 +191,14 @@ impl Parakeet {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::synthesizer::{Effects, Voice};
 
     const FOUR: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
     /// `text` spoken by the voice in the environment variable `voice`, as a recording.
-    fn spoken(voice: &str, text: &str) -> Vec<f32> {
+    pub(in crate::app::topbar::audio) fn spoken(voice: &str, text: &str) -> Vec<f32> {
         let path = Utf8PathBuf::from(std::env::var(voice).unwrap());
         let effects = Effects {
             radio: 0.0,
@@ -213,7 +213,8 @@ mod tests {
             .collect()
     }
 
-    fn load() -> Parakeet {
+    /// The model in `BONO_PARAKEET`.
+    pub(in crate::app::topbar::audio) fn load() -> Parakeet {
         let dir = std::env::var("BONO_PARAKEET").unwrap();
         Parakeet::load(Utf8Path::new(&dir), FOUR).unwrap()
     }

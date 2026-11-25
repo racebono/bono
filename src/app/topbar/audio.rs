@@ -155,11 +155,7 @@ impl AudioTopbar {
         let config = config.get();
         self.microphone.missing()
             || self.speaker.missing()
-            || config
-                .whisper_model()
-                .as_ref()
-                .is_none_or(|path| !self.files.is_file(path))
-            || self.whisper.failed()
+            || self.whisper.missing(&config, &[])
             || config.voices().is_empty()
             || config.voices().values().any(|path| !self.files.voice(path))
             || (config.voices().keys()).any(|&lang| synth.load(lang) == Some(VoiceLoad::Failed))
@@ -173,7 +169,7 @@ impl AudioTopbar {
             self.meter = None;
         }
         self.speaker.poll(Kind::Playback);
-        self.whisper.poll(rt, config);
+        self.whisper.poll(rt, config, &[]);
         self.voices.poll(rt, config, synth);
         self.play_test(config);
     }
