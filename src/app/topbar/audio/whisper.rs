@@ -591,12 +591,23 @@ impl Whisper {
                     log::info!(
                         "Loaded {path} for speech to text (GPU: {gpu}, flash attention: {flash})"
                     );
-                    Some(Arc::new(WhisperModel {
+                    let model = WhisperModel {
                         ctx,
                         session: SessionCache::default(),
                         latest: AtomicU64::new(0),
                         threads,
-                    }))
+                    };
+                    // The driver builds its shaders the first time, after installing Bono or the
+                    // driver. That takes seconds, so a second of silence goes before the first question
+                    if flash
+                        && let Err(e) = model.session.run(
+                            || model.new_session(),
+                            |session| session.speech_to_text(arrstr!("en"), &[0.0; 16000]),
+                        )
+                    {
+                        log::warn!("Unable to warm up speech to text: {e}");
+                    }
+                    Some(Arc::new(model))
                 }
                 Err(e) => {
                     error(t!("error.stt_model"), e);
@@ -712,6 +723,19 @@ struct WhisperModel {
     session: SessionCache<WhisperSession>,
     latest: AtomicU64,
     threads: NonZeroUsize,
+}
+
+impl WhisperModel {
+    fn new_session(&self) -> anyhow::Result<WhisperSession> {
+        let start = Instant::now();
+        let state = self.ctx.create_state()?;
+        log::debug!("Created whisper's state in {:?}", start.elapsed());
+        Ok(WhisperSession {
+            state,
+            threads: self.threads,
+            multilingual: self.ctx.is_multilingual(),
+        })
+    }
 }
 
 /// Access only on blocking workers: initialization, use and destruction can all be expensive.
@@ -839,14 +863,7 @@ impl PendingSession {
             model.session.run(
                 || {
                     anyhow::ensure!(model.latest.load(Ordering::Relaxed) == ticket, "Superseded recording");
-                    let start = Instant::now();
-                    let state = model.ctx.create_state()?;
-                    log::debug!("Created whisper's state in {:?}", start.elapsed());
-                    Ok(WhisperSession {
-                        state,
-                        threads: model.threads,
-                        multilingual: model.ctx.is_multilingual(),
-                    })
+                    model.new_session()
                 },
                 |session| {
                     if model.latest.load(Ordering::Relaxed) != ticket {
