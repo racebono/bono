@@ -1506,8 +1506,9 @@ mod tests {
 
     #[test]
     fn builds_without_cuda_have_no_cuda_gpu() {
-        // Must also not crash in builds with it, whether or not there's a GPU
-        assert!(cfg!(feature = "cuda") || !has_cuda());
+        // Called in every build: it must also not crash in those with CUDA, whether or not there's a GPU
+        let cuda = has_cuda();
+        assert!(cfg!(feature = "cuda") || !cuda);
     }
 
     #[test]
