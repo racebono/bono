@@ -362,7 +362,7 @@
       "session": "race",
       "assertions": [
         "Calls `schedule` with action add: a `laps` trigger of 1, repeat `every`, and `until` 5 laps",
-        "The instruction is self-contained: it says the pilot asked during the race for their fuel at the end of each lap for five laps, without referring back to the conversation",
+        "The instruction is a concise, self-contained note saying to give the pilot's fuel at the end of each lap for five laps, without referring back to the conversation",
         "Sets `stale_after` so a lap's figure isn't said after the next lap ends (about one lap, or a shorter time)",
         "Makes no `engineer` call and gives no fuel figure now",
         "The reply is one short confirmation sentence that says what and when; no separate \"checking\" acknowledgement before the call"
@@ -378,7 +378,7 @@
       "assertions": [
         "Calls `schedule` with action add: a `time` trigger of 600 seconds, with `repeat` once or left out (the default)",
         "Doesn't work out a target clock time or lap itself",
-        "The instruction is self-contained: who asked, when, and that it's a reminder to check the brake bias",
+        "The instruction is a concise, self-contained note saying to remind the pilot to check their brake bias, without referring back to the conversation",
         "The reply is one short confirmation sentence that says what and when; no separate \"checking\" acknowledgement before the call"
       ]
     },
@@ -405,7 +405,7 @@
       "assertions": [
         "Calls `schedule` with action add and a `condition` trigger whose query returns a row only while the gap to the car one place behind in the standings (`gap_place_behind_s`, or the car `place_behind_vehicle_id` names) is under a second, not the nearest car on track (`gap_car_behind_s`)",
         "The query finds the player with `is_player = 1` or `race_state.player_vehicle_id`, never a literal `vehicle_id` number",
-        "The instruction is self-contained: who asked, when, and what to tell them",
+        "The instruction is a concise, self-contained note saying to alert the pilot when the car one place behind gets within a second, without referring back to the conversation",
         "The reply is one short confirmation sentence that says what and when; no separate \"checking\" acknowledgement before the call",
         "The tool reports the condition already true (the fixture's gap behind is about six tenths): the confirmation says so and that it'll call when the car drops back and closes again"
       ]
@@ -433,7 +433,7 @@
       "assertions": [
         "Calls `schedule` with action add: a `laps` trigger of 1, repeat `every`, and an `until` condition that returns a row once the player is in the pit lane",
         "The query finds the player with `is_player = 1` or `race_state.player_vehicle_id`, never a literal `vehicle_id` number, and names Ruiz in the instruction rather than by vehicle id",
-        "The instruction is self-contained: who asked, when, the gap to Ruiz each lap, until they pit",
+        "The instruction is a concise, self-contained note saying to give the gap to Ruiz each lap until the pilot pits, naming Ruiz rather than a vehicle id, without referring back to the conversation",
         "The reply is one short confirmation sentence that says what and when; no separate \"checking\" acknowledgement before the call"
       ]
     },

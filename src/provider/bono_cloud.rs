@@ -995,7 +995,7 @@ mod tests {
         tools.insert("gap", None, json!({"type": "object"}), Gap);
         let mut conversation = Conversation::new(
             Some(&account),
-            "x".repeat(71_500).into(),
+            "x".repeat(66_000).into(),
             tools,
             reqwest::Client::new(),
         )

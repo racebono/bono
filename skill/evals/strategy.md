@@ -91,7 +91,7 @@ Run each variant with the stated context:
 10. **Plan for a later race:**
    - Pilot: "Have I enough fuel for this run?"
    - Briefing: qualifying; `Race strategy: feature race, 2-stop, short-fuel around lap 22.`;
-     `stints` as variant 4.
+     `stints` shows `laps_left` 18, `laps_needed` 15 and no `stops_needed`.
    - Pass: answers for the run, without framing it against the race plan.
 
 ## Collaborative lifecycle and guardrails

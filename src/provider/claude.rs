@@ -277,6 +277,10 @@ impl Model for Conversation {
         on_event: &'a mut (dyn FnMut(Streamed<'_>) + Send),
     ) -> BoxFuture<'a, anyhow::Result<Reply>> {
         Box::pin(async move {
+            // Before the turn's start is counted: an answer that's only thinking goes altogether
+            if let Some(index) = drop_last_round(&mut self.body.messages) {
+                clear_thinking(&mut self.body.messages, index);
+            }
             let original = self.history_limits.map(|_| self.body.messages.clone());
             let mut turn = Turn {
                 start: self.body.messages.len(),
@@ -442,7 +446,8 @@ impl Conversation {
         let mut turn_usage = Usage::default();
         // Set for one request at most (see below), and not left over from a turn cut off
         self.body.tool_choice = None;
-        for _ in 0..self.max_requests.get() {
+        // How many requests are left after this one
+        for left in (0..self.max_requests.get()).rev() {
             // What this request takes, to tell what the round it starts adds to the next
             let sent = match self.history_limits {
                 Some(_) => self.request_size()?,
@@ -526,6 +531,11 @@ impl Conversation {
 
             if paused {
                 continue;
+            }
+
+            // No request is left to take these calls' results back: they don't run
+            if left == 0 {
+                break;
             }
 
             // Not even these calls' results cut to nothing would fit (see below): they don't
@@ -635,7 +645,8 @@ impl Conversation {
                 .map(|questions| steer_text(&questions));
             // Together, too: the request that carries them back (steer included) must still fit
             let note = self.result_note.clone();
-            let mut last = false;
+            // No request is left after the one these results go back in: this round is the last
+            let mut last = left == 1;
             if let Some(limits) = self.history_limits {
                 let mut contents = results
                     .iter_mut()
@@ -654,17 +665,19 @@ impl Conversation {
                 let room = limits.max_bytes.saturating_sub(size);
                 let round = size.saturating_sub(sent);
                 let wanted: usize = contents.iter().map(|content| json_len(content)).sum();
-                last = wanted + round + limits.max_bytes / 50 > room;
+                last |= wanted + round + limits.max_bytes / 50 > room;
                 if last {
                     // The note saying so, as a text block (`,{"type":"text","text":"…"}`), and
                     // `,"tool_choice":{"type":"none"}`
                     let told = json_len(LAST_ROUND) + 28 + 30;
                     fit_results(&mut contents, room.saturating_sub(told));
-                    self.body.tool_choice = Some(serde_json::json!({"type": "none"}));
                 }
                 for (result, content) in results.iter_mut().zip(contents) {
                     result.content = content;
                 }
+            }
+            if last {
+                self.body.tool_choice = Some(serde_json::json!({"type": "none"}));
             }
 
             self.body.messages.push(RequestMessage {
@@ -880,8 +893,9 @@ impl Conversation {
     }
 }
 
-/// What the last round of a turn with no room for more says after its results (see `run_turn`).
-const LAST_ROUND: &str = "[No room for more tool calls in this turn: answer now with what you \
+/// What the last round of a turn with no room, or no requests, for more says after its results (see
+/// `run_turn`).
+const LAST_ROUND: &str = "[No more tool calls can run in this turn: answer now with what you \
      have, without acknowledging again. Nothing beyond what's above was looked up, changed or \
      scheduled, so don't say it was. If something asked for or due can't be done now, say so \
      briefly, and that it needs asking again, instead of staying silent.]";
@@ -1163,7 +1177,8 @@ fn is_question(message: &RequestMessage) -> bool {
 const OLD_RESULT: &str = "[old tool result omitted]";
 
 /// Takes from the turns in `messages` what was only for their own answer: each question's
-/// snapshot onward (its second block, see `question_message`) and each tool result's content.
+/// snapshot onward (its second block, see `question_message`, with the last round's note if it's
+/// there) and each tool result's content.
 /// What was said stays: the questions, the answers, the tool calls, the pilot's words alongside
 /// the results. Returns the first message changed, if any.
 fn strip_turns(messages: &mut [RequestMessage]) -> Option<usize> {
@@ -1187,14 +1202,28 @@ fn strip_turns(messages: &mut [RequestMessage]) -> Option<usize> {
                 changed = true;
             }
         }
-        // That a round was its turn's last says nothing about later turns (a question's copy
-        // went with its second block; its first, the pilot's, is never touched)
-        if !question {
-            let before = blocks.len();
-            blocks.retain(|block| block["text"] != LAST_ROUND);
-            changed |= blocks.len() != before;
-        }
         if changed {
+            first.get_or_insert(index);
+        }
+    }
+    first
+}
+
+/// Takes the last round's note from the tool results in `messages`: that a round was its turn's
+/// last says nothing about later turns. Questions are never touched: a copy there goes with the
+/// rest (see `strip_turns`). Returns the first message changed, if any.
+fn drop_last_round(messages: &mut [RequestMessage]) -> Option<usize> {
+    let mut first = None;
+    for (index, message) in messages.iter_mut().enumerate() {
+        if message.role != "user" || is_question(message) {
+            continue;
+        }
+        let Some(blocks) = message.content.as_array_mut() else {
+            continue;
+        };
+        let before = blocks.len();
+        blocks.retain(|block| block["text"] != LAST_ROUND);
+        if blocks.len() != before {
             first.get_or_insert(index);
         }
     }
@@ -1595,8 +1624,8 @@ struct RequestBody {
     messages: Vec<RequestMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<RequestTool>,
-    /// `{"type": "none"}` for a request that has no room left for another round of tool results
-    /// (see `run_turn`): the model answers with what it has. Unset otherwise.
+    /// `{"type": "none"}` for a request with no room, or no request, left for another round of tool
+    /// results (see `run_turn`): the model answers with what it has. Unset otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2838,6 +2867,7 @@ mod tests {
                 content: json!([{"type": "text", "text": "Two seconds."}]),
             },
         ];
+        assert_eq!(drop_last_round(&mut messages), Some(2));
         assert_eq!(strip_turns(&mut messages), Some(0));
         // What was only for that turn's answer goes, the last round's note too
         assert_eq!(messages[0].content.as_array().unwrap().len(), 1);
@@ -2860,6 +2890,7 @@ mod tests {
         let mut messages = vec![question_message(LAST_ROUND)];
         drop_breakpoints(&mut messages);
         let original = serde_json::to_value(&messages).unwrap();
+        assert_eq!(drop_last_round(&mut messages), None);
         assert_eq!(strip_turns(&mut messages), None);
         assert_eq!(serde_json::to_value(&messages).unwrap(), original);
     }
@@ -4137,6 +4168,107 @@ mod tests {
         let blocks = requests[1]["messages"][2]["content"].as_array().unwrap();
         assert!(blocks[9..].iter().any(|block| block["text"] == steered.as_str()));
         assert!(serde_json::to_vec(&requests[1]).unwrap().len() <= 10_000);
+    }
+
+    #[tokio::test]
+    async fn the_last_request_answers_with_what_it_has() {
+        let round = |id: &str| {
+            message(
+                "tool_use",
+                json!([
+                    {"type": "thinking", "thinking": "", "signature": "round"},
+                    {"type": "tool_use", "id": id, "name": "lookup", "input": {"what": "gap"}}
+                ]),
+            )
+        };
+        let limits = HistoryLimits {
+            max_bytes: 100_000,
+            max_messages: 100,
+            target: 0.5,
+        };
+        for limits in [None, Some(limits)] {
+            let (url, requests) = mock(vec![
+                round("t1"),
+                round("t2"),
+                message(
+                    "end_turn",
+                    json!([
+                        {"type": "thinking", "thinking": "", "signature": "answer"},
+                        {"type": "text", "text": "Two seconds."}
+                    ]),
+                ),
+                message("end_turn", json!([{"type": "text", "text": "Same."}])),
+            ])
+            .await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut conversation = conversation(&url, &calls);
+            conversation.max_requests = NonZeroU32::new(3).unwrap();
+            conversation.history_limits = limits;
+            let note = "[Reply in Spanish.]";
+            conversation.set_tool_result_note(Some(note.into()));
+            let reply = send(&mut conversation, "Gap?").await.unwrap();
+            assert_eq!(reply.text, "Two seconds.");
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+            send(&mut conversation, "And now?").await.unwrap();
+
+            // Only the last request says so, after its results, and takes no calls
+            let requests = requests.lock().unwrap();
+            let content = &requests[2]["messages"][4]["content"];
+            assert_eq!(content[0]["content"], "looked up \"gap\"");
+            assert_eq!(content[1], json!({"type": "text", "text": LAST_ROUND}));
+            assert_eq!(content[2], json!({"type": "text", "text": note}));
+            assert_eq!(requests[2]["tool_choice"], json!({"type": "none"}));
+            for index in [0, 1, 3] {
+                assert!(requests[index].get("tool_choice").is_none());
+                let messages = requests[index]["messages"].to_string();
+                assert!(!messages.contains(LAST_ROUND), "{index}");
+            }
+            // The next turn forgets it, with the thinking that came after it
+            let messages = &requests[3]["messages"];
+            assert_eq!(
+                messages[4]["content"][1],
+                json!({"type": "text", "text": note})
+            );
+            assert_eq!(
+                messages[5]["content"],
+                json!([{"type": "text", "text": "Two seconds."}])
+            );
+            // What came before it stays as it was, when no limits strip the whole turn
+            if limits.is_none() {
+                for index in 0..4 {
+                    assert_eq!(messages[index], requests[2]["messages"][index]);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn calls_with_no_request_left_for_their_results_are_not_run() {
+        let call = || {
+            message(
+                "tool_use",
+                json!([{"type": "tool_use", "id": "t1", "name": "lookup", "input": {}}]),
+            )
+        };
+        let pause = || message("pause_turn", json!([{"type": "text", "text": "Checking."}]));
+        // The responses to every request a turn is allowed, and how many of their calls run
+        for (responses, run) in [
+            (vec![call()], 0),
+            (vec![pause(), call()], 0),
+            (vec![call(), call()], 1),
+            (vec![call(), pause()], 1),
+        ] {
+            let allowed = responses.len();
+            let (url, requests) = mock(responses).await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut conversation = conversation(&url, &calls);
+            conversation.max_requests = NonZeroU32::new(allowed as u32).unwrap();
+            let error = send(&mut conversation, "Gap?").await.unwrap_err();
+            assert!(error.to_string().contains("didn't finish"), "{error}");
+            assert_eq!(calls.load(Ordering::Relaxed), run);
+            assert_eq!(requests.lock().unwrap().len(), allowed);
+            assert!(conversation.body.messages.is_empty());
+        }
     }
 
     #[tokio::test]
