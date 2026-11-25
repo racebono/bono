@@ -1280,7 +1280,8 @@ pub struct Model {
     pub sha256: Option<String>,
     pub file: String,
     pub path: Arc<Utf8Path>,
-    on_disk: tokio::sync::watch::Receiver<Option<bool>>,
+    /// Whether it's on disk, and when that check started
+    on_disk: tokio::sync::watch::Receiver<Option<(bool, Instant)>>,
     download: Option<Download>,
     deletion: Deletion,
 }
@@ -1388,7 +1389,8 @@ impl Model {
                 continue;
             };
 
-            if name.contains('/') {
+            // Only files in its own folder
+            if name.contains(['/', '\\']) {
                 continue;
             }
 
@@ -1425,7 +1427,8 @@ impl Model {
                 path: path.clone(),
                 on_disk: updating(Duration::from_millis(1234), None, move |_| {
                     let path = path.clone();
-                    async move { tokio::fs::try_exists(&*path).await.ok() }
+                    let started = Instant::now();
+                    async move { Some((tokio::fs::try_exists(&*path).await.ok()?, started)) }
                 }),
                 download: None,
                 deletion: Deletion::default(),

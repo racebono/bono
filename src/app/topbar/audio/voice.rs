@@ -142,7 +142,7 @@ impl Voices {
             return;
         }
 
-        let on_disk = voice.on_disk(rt, catalog.on_disk.borrow().as_deref());
+        let on_disk = voice.on_disk(rt, catalog.on_disk.borrow().as_ref());
         match on_disk {
             Some(true) => {
                 let path = voice.path.to_path_buf();
@@ -210,7 +210,7 @@ impl Voices {
             return None;
         }
 
-        let on_disk = voice.on_disk(rt, catalog.on_disk.borrow().as_deref());
+        let on_disk = voice.on_disk(rt, catalog.on_disk.borrow().as_ref());
         let used = (picked.as_ref()).is_some_and(|picked| *picked == *voice.path);
         let state = match (on_disk, voice.progress()) {
             (Some(true), _) if used && failed => SetupState::LoadFailed,
@@ -322,7 +322,7 @@ impl Voices {
                                     ui,
                                     client,
                                     config,
-                                    on_disk.as_deref(),
+                                    on_disk.as_ref(),
                                     synth,
                                     setup,
                                 );
@@ -374,8 +374,9 @@ fn gpu_checkbox(ui: &mut egui::Ui, config: &mut Config, synth: &Synthesizer) {
 
 struct Catalog {
     languages: Vec<Language>,
-    /// Whether each voice's files are on disk, indexed by [`Voice::index`]
-    on_disk: tokio::sync::watch::Receiver<Option<Vec<bool>>>,
+    /// Whether each voice's files are on disk, indexed by [`Voice::index`], and when that check
+    /// started
+    on_disk: tokio::sync::watch::Receiver<Option<(Vec<bool>, Instant)>>,
 }
 
 impl Catalog {
@@ -480,6 +481,7 @@ impl Catalog {
         let paths = Arc::<[Arc<Utf8Path>]>::from(paths);
         let on_disk = updating(Duration::from_millis(1234), None, move |_| {
             let paths = paths.clone();
+            let started = Instant::now();
             async move {
                 let mut on_disk = Vec::with_capacity(paths.len());
                 for path in paths.iter() {
@@ -489,7 +491,7 @@ impl Catalog {
                             && exists(path.as_std_path().with_added_extension("json")).await,
                     );
                 }
-                Some(on_disk)
+                Some((on_disk, started))
             }
         });
 
@@ -511,7 +513,7 @@ impl Language {
         ui: &mut egui::Ui,
         client: &reqwest::Client,
         config: &mut Config,
-        on_disk: Option<&[bool]>,
+        on_disk: Option<&(Vec<bool>, Instant)>,
         synth: &mut Synthesizer,
         setup: &mut Option<(ArrayStr<2>, &'static str)>,
     ) {
@@ -659,8 +661,8 @@ impl Voice {
 
     /// Whether its files are on disk, as [`Catalog::on_disk`] found: `None` until it's been
     /// checked, and while they're deleted.
-    fn on_disk(&mut self, rt: &Handle, found: Option<&[bool]>) -> Option<bool> {
-        let found = found.and_then(|found| found.get(self.index).copied());
+    fn on_disk(&mut self, rt: &Handle, checked: Option<&(Vec<bool>, Instant)>) -> Option<bool> {
+        let found = checked.and_then(|(found, started)| Some((*found.get(self.index)?, *started)));
         self.deletion.on_disk(rt, found)
     }
 
@@ -825,7 +827,11 @@ mod tests {
         config.set_voice(&rt, arrstr!("es"), kept.clone(), &mut synth);
 
         let mut voice = voice(&deleted);
-        assert_eq!(voice.on_disk(&rt, Some(&[true])), Some(true));
+        assert_eq!(
+            voice.on_disk(&rt, Some(&(vec![true], Instant::now()))),
+            Some(true)
+        );
+        let before = Instant::now();
         voice.delete(&mut config, &mut synth);
         assert_eq!(
             *config.voices(),
@@ -838,12 +844,12 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let on_disk = |voice: &mut Voice, found| {
-            tokio::task::block_in_place(|| voice.on_disk(&rt, Some(&[found])))
+        let on_disk = |voice: &mut Voice, found, started| {
+            tokio::task::block_in_place(|| voice.on_disk(&rt, Some(&(vec![found], started))))
         };
         // Not used (by the row, nor setup) until it's checked again
-        assert_eq!(on_disk(&mut voice, true), None);
-        assert_eq!(on_disk(&mut voice, false), Some(false));
+        assert_eq!(on_disk(&mut voice, true, before), None);
+        assert_eq!(on_disk(&mut voice, false, Instant::now()), Some(false));
         assert!(files(&deleted).iter().all(|file| !file.exists()));
         assert!(files(&kept).iter().all(|file| file.exists()));
     }
