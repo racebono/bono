@@ -33,6 +33,19 @@ details, or source code that is not part of the documented interface. If the
 required behavior is not documented, handle it explicitly in our own code or
 choose a documented alternative.
 
+## Run only the relevant tests
+
+Run only the tests that exercise the code you are trying to validate. Pass a
+module or test name as a filter (for example `just test synthesizer`), and
+start with the narrowest filter that covers the change. This applies to every
+test command in this file.
+
+Do not run the full test suite by default, as a final check, or to be safe: CI
+already runs it on pull requests to `master`. Run it locally only when the user asks
+or when a change reaches so widely that no set of filters covers it, and say
+why when you do. Changes that touch no code, such as documentation, need no
+test run. Report which tests you ran.
+
 ## Test features
 
 Run tests with the `cuda` and `vulkan` features disabled unless the changes

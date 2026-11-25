@@ -232,6 +232,8 @@ struct Briefing {
     pending: Vec<RequestId>,
     next_id: RequestId,
     pending_text: String,
+    /// The weekend the pending requests are from
+    pending_weekend: Option<i64>,
     /// The [`Told`] notes: the message has those about its conversation as it is once the turn
     /// has the lock on it (see [`Note::conversation`])
     notes: Vec<Note>,
@@ -331,9 +333,8 @@ impl<T: Send + 'static> AbortedTurn for Task<T> {
 
 /// A question being answered.
 struct Turn {
-    /// The reply, with the changes to the requests the turn staged, and everything the pilot
-    /// heard of it if the app acknowledged it (see [`Acknowledgement::heard`])
-    task: Task<anyhow::Result<(Reply, Vec<Change>, Option<String>)>>,
+    /// The reply, with the changes to the requests the turn staged, and what was said of it
+    task: Task<anyhow::Result<(Reply, Vec<Change>, Acknowledgement)>>,
     /// The language it's answered in
     lang: ArrayStr<2>,
     /// The answer as the model writes it, for the chat
@@ -348,11 +349,22 @@ struct Turn {
     steered: Option<(Option<ArrayStr<2>>, Option<Instant>)>,
     /// The notes its question carries
     told: Told,
-    /// The low tone already sounded for it, as its speech failed: it ends without another
-    toned: bool,
+    /// The low tone already sounded for it, as its speech failed, with this many questions asked
+    /// since: it only ends with another for those it took (see [`Self::ends_with_tone`])
+    toned: Option<usize>,
 }
 
 impl Turn {
+    /// Whether it ends with the low tone, going by whether that leaves it `unanswered`. Once its
+    /// speech failed, nothing it writes is heard: the tone that sounded then is all that's heard
+    /// for the questions asked before it, and a question asked since gets its own.
+    fn ends_with_tone(&self, unanswered: bool) -> bool {
+        match self.toned {
+            Some(asked_since) => asked_since > 0,
+            None => unanswered,
+        }
+    }
+
     /// Writes the answer so far into its entry in `chat`.
     fn write_into(&mut self, chat: &mut Vec<ChatEntry>) {
         while let Ok(text) = self.text.try_recv() {
@@ -1237,6 +1249,18 @@ impl Engineer {
         }
     }
 
+    /// Whether interrupting the pilot turn now, clearing the line, calls for the low tone: not if
+    /// the one for its failed speech was already heard, and is all it [owes](Turn::ends_with_tone).
+    fn interruption_owes_tone(&self) -> bool {
+        let Some(turn) = &self.turn else {
+            return false;
+        };
+        // A tone (or "say again") still to be played is cleared with the line
+        let unheard = (self.incoming.iter().chain(&self.line))
+            .any(|playback| playback.complete && playback.scheduled.is_none() && !playback.started);
+        turn.ends_with_tone(true) || unheard
+    }
+
     /// Follows the running simulator's recording, as soon as it has one and however far into a
     /// session that is. Called every frame: asking the simulator for its recording doesn't block,
     /// and starting or dropping the tool does its work on other threads.
@@ -1250,11 +1274,11 @@ impl Engineer {
         if self.session.as_ref().is_some_and(|session| {
             recording.is_none_or(|(_, pool)| session.db != pool.database().path())
         }) {
-            let interrupted = self.turn.is_some();
+            let tone = self.interruption_owes_tone();
             self.stop();
             self.drop_session(rt);
             self.notice(t!("engineer.sim_stopped"));
-            if interrupted {
+            if tone {
                 self.no_beep();
             }
         }
@@ -1384,7 +1408,9 @@ impl Engineer {
         if let Some(turn) = &mut self.turn {
             turn.steer.push(question);
             // A tone that already sounded doesn't answer a question asked after it
-            turn.toned = false;
+            if let Some(asked_since) = &mut turn.toned {
+                *asked_since += 1;
+            }
             let first = turn.steered.map_or(released, |(_, first)| first);
             turn.steered = Some((lang, first));
             return;
@@ -1507,6 +1533,7 @@ impl Engineer {
             pending: self.schedule.pending_ids(),
             next_id: self.schedule.next_id(),
             pending_text: self.schedule.pending_text(&progress),
+            pending_weekend: self.schedule.weekend(),
             notes: told.notes.clone(),
             state,
             note,
@@ -1613,11 +1640,9 @@ impl Engineer {
                 result = turn => result,
                 () = acknowledge => unreachable!("never ends"),
             };
-            let end = acknowledgement.lock().unwrap().end();
-            say(end);
-            // For the chat, which shows what the pilot heard
-            let heard = (acknowledgement.lock().unwrap().heard()).map(str::to_owned);
-            result.map(|(reply, changes)| (reply, changes, heard))
+            let mut acknowledgement = acknowledgement.into_inner().unwrap();
+            say(acknowledgement.end());
+            result.map(|(reply, changes)| (reply, changes, acknowledgement))
             // The speech's text ends here, with the turn
         });
 
@@ -1629,7 +1654,7 @@ impl Engineer {
             steer,
             steered: None,
             told,
-            toned: false,
+            toned: None,
         });
     }
 
@@ -1818,6 +1843,7 @@ impl Engineer {
         self.languages.update(rt, config.get().voices());
         // The game stopped: the conversation lets go of the database, so the plugin can delete it
         if sim.is_none() && self.session.is_some() {
+            let tone = self.interruption_owes_tone();
             let turn = self.turn.take();
             let interrupted = turn.is_some();
             if let Some(turn) = turn {
@@ -1830,6 +1856,8 @@ impl Engineer {
             if interrupted {
                 // What it was saying goes with the turn, which the conversation forgot
                 self.clear_line();
+            }
+            if tone {
                 self.no_beep();
             }
         }
@@ -1860,20 +1888,24 @@ impl Engineer {
                     Ok((reply, ..)) if reply.stop != StopReason::Refusal => turn.steer.take(),
                     Ok(_) | Err(_) => Vec::new(),
                 };
+                // Those, the last asked, get their own turn's tone
+                if let Some(asked_since) = &mut turn.toned {
+                    *asked_since = asked_since.saturating_sub(missed.len());
+                }
                 let (lang, released) = turn.steered.unwrap_or_default();
                 match result {
                     // The conversation kept the exchange: what it changed counts
-                    Ok((reply, changes, heard)) if reply.stop != StopReason::Refusal => {
+                    Ok((reply, changes, acknowledgement)) if reply.stop != StopReason::Refusal => {
                         // The model's reachable: a scheduled turn failing next is another outage
                         self.scheduled_failing = false;
-                        self.answer(rt, config, synth, reply, heard, turn);
+                        self.answer(rt, config, synth, reply, acknowledgement, turn);
                         self.apply(changes, &[]);
                     }
                     // Forgotten, and what it changed with it
-                    Ok((reply, _, heard)) => {
+                    Ok((reply, _, acknowledgement)) => {
                         self.scheduled_failing = false;
                         self.unheard.splice(0..0, turn.told.untold());
-                        self.answer(rt, config, synth, reply, heard, turn);
+                        self.answer(rt, config, synth, reply, acknowledgement, turn);
                     }
                     Err(e) => {
                         self.unheard.splice(0..0, turn.told.untold());
@@ -1882,7 +1914,7 @@ impl Engineer {
                         }
                         self.notice(t!("engineer.error_asking", error = format!("{e:#}")));
                         // What it said before failing plays out first
-                        if !turn.toned {
+                        if turn.ends_with_tone(true) {
                             self.incomplete_beep();
                         }
                     }
@@ -1910,11 +1942,11 @@ impl Engineer {
         // kept their exchanges, and the requests outlive it, so what they changed counts rather
         // than being dropped as if they never ran
         if self.session.as_ref().is_some_and(|s| !self.signed_in_as(s)) {
-            let interrupted = self.turn.is_some();
+            let tone = self.interruption_owes_tone();
             self.stop();
             self.drop_session(rt);
             self.notice(t!("engineer.signed_out"));
-            if interrupted {
+            if tone {
                 self.no_beep();
             }
         }
@@ -1923,24 +1955,22 @@ impl Engineer {
         self.play(config, speaker);
     }
 
-    /// Shows the turn's `reply` in the chat, and sounds what its end calls for. `heard`: everything
-    /// the pilot heard of it, if the app acknowledged it, shown instead of the model's text.
+    /// Shows the turn's `reply` in the chat, and sounds what its end calls for. If the app
+    /// acknowledged it (see `acknowledgement`), everything the pilot heard of it is shown instead
+    /// of the model's text.
     fn answer(
         &mut self,
         rt: &Handle,
         config: &Config,
         synth: &mut Synthesizer,
         reply: Reply,
-        heard: Option<String>,
+        acknowledgement: Acknowledgement,
         turn: Turn,
     ) {
         log_reply(&reply);
         let mut detail = tokens_detail(&reply);
-        // What the pilot heard after the app's acknowledgement, if it acknowledged
-        let heard_after = (heard.as_deref())
-            .map(|heard| heard.split_once('\n').map_or("", |(_, after)| after).to_owned());
         // The model's text, unless the pilot heard something else
-        let shown = heard.unwrap_or_else(|| reply.text.clone());
+        let shown = acknowledgement.heard().unwrap_or(&reply.text).to_owned();
 
         let text = match reply.stop {
             // The exchange was forgotten, and whatever was said with it: the pilot can ask again
@@ -1950,7 +1980,7 @@ impl Engineer {
                 self.drop_answers(|playback| playback.writing);
                 let say_again = t!("engineer.say_again": &turn.lang);
                 // A voice that failed this turn would fail again, sounding a second tone
-                if !turn.toned {
+                if turn.ends_with_tone(true) {
                     self.say(rt, config, synth, say_again, turn.lang, None);
                     if self.voice(config, turn.lang).is_none() {
                         self.no_beep();
@@ -1960,7 +1990,7 @@ impl Engineer {
             }
             StopReason::MaxTokens => {
                 detail = format!("{detail} | {}", t!("engineer.detail_cut_off"));
-                if !turn.toned {
+                if turn.ends_with_tone(true) {
                     self.incomplete_beep();
                 }
                 shown
@@ -1969,21 +1999,18 @@ impl Engineer {
             StopReason::ContextWindowExceeded => {
                 self.new_session = true;
                 detail = format!("{detail} | {}", t!("engineer.detail_full"));
-                if !turn.toned {
+                if turn.ends_with_tone(true) {
                     self.incomplete_beep();
                 }
                 shown
             }
             // Its speech may still fail after this, sounding the tone: it's the one tone then
             StopReason::EndTurn | StopReason::StopSequence => {
-                // Nothing answered: the pilot heard nothing after the app's acknowledgement (its
-                // phrase is one line), or the model wrote nothing
-                let answered = match &heard_after {
-                    Some(after) => !after.trim().is_empty(),
-                    None => !reply.text.trim().is_empty(),
-                };
+                // Nothing answered: the model wrote nothing, or nothing after its last query (what
+                // came before acknowledged)
+                let answered = !reply.text.trim().is_empty() && !acknowledgement.unanswered();
                 // After what's still on its way (the acknowledgement, or nothing at all)
-                if !answered && !turn.toned {
+                if turn.ends_with_tone(!answered) {
                     self.incomplete_beep();
                 }
                 shown
@@ -2079,7 +2106,7 @@ impl Engineer {
                         self.no_beep();
                         // Its pilot turn ends without another
                         if writing && let Some(turn) = &mut self.turn {
-                            turn.toned = true;
+                            turn.toned = Some(0);
                         }
                     }
                 }
@@ -2159,7 +2186,7 @@ impl Engineer {
                         self.no_beep();
                         // Its pilot turn ends without another
                         if writing && let Some(turn) = &mut self.turn {
-                            turn.toned = true;
+                            turn.toned = Some(0);
                         }
                     }
                     return;
@@ -2522,21 +2549,20 @@ impl SessionState {
     /// then the setup outline (when shown), the telemetry snapshot, the pending requests and the
     /// reply-language note. Once per turn: the `schedule` tool stages its changes from here.
     async fn brief(&mut self, message: String, briefing: Briefing) -> String {
-        // Started over, it's a new weekend, which clears the requests: the briefing, taken before
-        // the engineer saw it, still has the last weekend's, and its notes are about the
-        // conversation that's over. The next progress clears the requests too.
         let started_over = self.follow_game_session(briefing.auto_session).await;
-        let pending_text = match started_over {
-            true => {
-                (briefing.started_over).store(true, atomic::Ordering::Relaxed);
-                self.schedule_tool.begin(Vec::new(), briefing.next_id);
-                NO_REQUESTS.to_owned()
-            }
-            false => {
-                self.schedule_tool.begin(briefing.pending, briefing.next_id);
-                briefing.pending_text
-            }
+        if started_over {
+            // Its notes are about the conversation that's over
+            (briefing.started_over).store(true, atomic::Ordering::Relaxed);
+        }
+        // A new weekend clears the requests, whether or not the conversation starts over for it:
+        // the briefing, taken before the engineer saw it, still has the last weekend's. The next
+        // progress clears them too. Weekends' ids only grow: the requests are the last weekend's
+        // only if theirs is older (the conversation's lags if its read failed)
+        let (pending, pending_text) = match briefing.pending_weekend < self.weekend {
+            true => (Vec::new(), NO_REQUESTS.to_owned()),
+            false => (briefing.pending, briefing.pending_text),
         };
+        self.schedule_tool.begin(pending, briefing.next_id);
         // Only those about this conversation as it is now: one that's started over, here or
         // since a note was made, never had what it's about
         let starts = self.starts.load(atomic::Ordering::Relaxed);
@@ -3242,7 +3268,7 @@ mod tests {
                     usage: Default::default(),
                     model: "test".into(),
                 },
-                None,
+                Acknowledgement::new(),
                 Turn {
                     task: Task::spawn(std::future::pending()),
                     lang: arrstr!("en"),
@@ -3251,7 +3277,7 @@ mod tests {
                     steer: Steer::default(),
                     steered: None,
                     told: Told::default(),
-                    toned: false,
+                    toned: None,
                 },
             );
             assert!(engineer.line.is_empty(), "spoken: {spoken}");
@@ -3481,7 +3507,7 @@ mod tests {
             steer: Steer::default(),
             steered: None,
             told: Told::default(),
-            toned: false,
+            toned: None,
         });
         let deadline = Instant::now() + Duration::from_secs(10);
         while engineer.is_thinking() {
@@ -3539,7 +3565,7 @@ mod tests {
                     usage: Default::default(),
                     model: "test".into(),
                 },
-                None,
+                Acknowledgement::new(),
                 Turn {
                     task: Task::spawn(std::future::pending()),
                     lang: arrstr!("en"),
@@ -3548,7 +3574,7 @@ mod tests {
                     steer: Steer::default(),
                     steered: None,
                     told: Told::default(),
-                    toned: false,
+                    toned: None,
                 },
             );
             assert_eq!(engineer.line.len(), 1, "{stop:?}");
@@ -3600,7 +3626,7 @@ mod tests {
             steer: Steer::default(),
             steered: None,
             told: Told::default(),
-            toned: false,
+            toned: None,
         };
         let reply = Reply {
             text: String::new(),
@@ -3608,7 +3634,9 @@ mod tests {
             usage: Default::default(),
             model: "test".into(),
         };
-        engineer.answer(rt, &config, &mut synth, reply, Some("Copiado, lo miro.\n".into()), turn);
+        let mut acknowledgement = Acknowledgement::new();
+        acknowledgement.fire("Copiado, lo miro.");
+        engineer.answer(rt, &config, &mut synth, reply, acknowledgement, turn);
         // After it, not ahead of it
         assert_eq!(engineer.incoming.len(), 1);
         assert!(engineer.incoming[0].tone_after_drain);
@@ -3626,18 +3654,36 @@ mod tests {
         let mut synth = Synthesizer::new(rt, &config.get());
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
 
-        for (stop, text, heard, tone) in [
-            (StopReason::MaxTokens, "Partial answer", None, true),
-            (StopReason::ContextWindowExceeded, "Partial answer", None, true),
-            (StopReason::Refusal, "", None, true),
-            (StopReason::EndTurn, "", None, true),
+        let silent = Acknowledgement::new;
+        // The app acknowledged
+        let fired = || {
+            let mut acknowledgement = Acknowledgement::new();
+            acknowledgement.fire("Copiado, lo miro.");
+            acknowledgement
+        };
+        // Then the model did, looked something up and wrote `after`
+        let queried = |mut acknowledgement: Acknowledgement, after: &str| {
+            acknowledgement.text("Copio.\n\n");
+            acknowledgement.tools(true);
+            acknowledgement.text(after);
+            acknowledgement
+        };
+        for (stop, text, acknowledgement, tone) in [
+            (StopReason::MaxTokens, "Partial answer", silent(), true),
+            (StopReason::ContextWindowExceeded, "Partial answer", silent(), true),
+            (StopReason::Refusal, "", silent(), true),
+            (StopReason::EndTurn, "", silent(), true),
             // The app acknowledged, and the model said nothing after it
-            (StopReason::EndTurn, "", Some("Copiado, lo miro.\n"), true),
+            (StopReason::EndTurn, "", fired(), true),
             // Nor after its own acknowledgement, dropped
-            (StopReason::EndTurn, "Copio, miro.\n\n", Some("Copiado, lo miro.\n"), true),
-            (StopReason::EndTurn, "Copio.\n\nBien.", Some("Copiado, lo miro.\nBien."), false),
-            (StopReason::EndTurn, "Complete answer", None, false),
-            (StopReason::StopSequence, "Complete answer", None, false),
+            (StopReason::EndTurn, "Copio.\n\n", queried(fired(), ""), true),
+            (StopReason::EndTurn, "Copio.\n\nBien.", queried(fired(), "Bien."), false),
+            // The app didn't: only the model's acknowledgement was heard
+            (StopReason::EndTurn, "Copio.\n\n", queried(silent(), ""), true),
+            (StopReason::StopSequence, "Copio.\n\n", queried(silent(), ""), true),
+            (StopReason::EndTurn, "Copio.\n\nBien.", queried(silent(), "Bien."), false),
+            (StopReason::EndTurn, "Complete answer", silent(), false),
+            (StopReason::StopSequence, "Complete answer", silent(), false),
         ] {
             engineer.stop();
             let (_, receiver) = mpsc::unbounded_channel();
@@ -3649,7 +3695,7 @@ mod tests {
                 steer: Steer::default(),
                 steered: None,
                 told: Told::default(),
-                toned: false,
+                toned: None,
             };
             engineer.answer(
                 rt,
@@ -3661,7 +3707,7 @@ mod tests {
                     usage: Default::default(),
                     model: "test".into(),
                 },
-                heard.map(str::to_owned),
+                acknowledgement,
                 turn,
             );
             assert!(engineer.line.is_empty(), "{stop:?}");
@@ -3704,7 +3750,7 @@ mod tests {
                 steer: Steer::default(),
                 steered: None,
                 told: Told::default(),
-                toned: false,
+                toned: None,
             });
             if fails_first {
                 speech.send(Err(anyhow::anyhow!("no voice"))).unwrap();
@@ -3721,7 +3767,7 @@ mod tests {
                     usage: Default::default(),
                     model: "test".into(),
                 },
-                None,
+                Acknowledgement::new(),
                 turn,
             );
             for playback in engineer.incoming.iter_mut().chain(&mut engineer.line) {
@@ -3751,7 +3797,7 @@ mod tests {
             steer: Steer::default(),
             steered: None,
             told: Told::default(),
-            toned: false,
+            toned: None,
         });
         speech.send(Err(anyhow::anyhow!("no voice"))).unwrap();
         engineer.admit(1.0);
@@ -3766,7 +3812,7 @@ mod tests {
                 usage: Default::default(),
                 model: "test".into(),
             },
-            None,
+            Acknowledgement::new(),
             turn,
         );
         let waiting = engineer.incoming.len() + engineer.line.len();
@@ -4157,7 +4203,7 @@ mod tests {
             steer: Steer::default(),
             steered: None,
             told: Told::default(),
-            toned: false,
+            toned: None,
         });
 
         // The game stopped
@@ -5147,30 +5193,101 @@ mod tests {
 
     #[test]
     fn a_new_weekends_conversation_is_not_told_the_last_ones_requests() {
-        let mut scripted = Scripted::recorded();
-        scripted.add("Fuel every lap, please.", fuel_every_lap());
-        // Only the snapshots asked for from here on: the turn starts before the engineer steps
-        // through the new weekend, and its briefing still has the request
+        // Started over for it (`auto_session`), kept through it, or only started in it
+        for how in ["started over", "kept", "fresh"] {
+            let raw = serde_json::json!({ "auto_session": how != "kept" }).to_string();
+            let mut scripted = Scripted::recorded_with(&raw);
+            scripted.add("Fuel every lap, please.", fuel_every_lap());
+            // Only the snapshots asked for from here on: the turns start before the engineer steps
+            // through the new weekend, and their briefings still have the request
+            scripted.tick();
+            assert_eq!(scripted.pending(), [RequestId(1)]);
+            scripted.new_weekend();
+            if how == "fresh" {
+                let state = scripted.engineer.session.as_ref().unwrap().state.clone();
+                state.blocking_lock().weekend = None;
+            }
+            // The first turn in it, and the next, which never starts the conversation over
+            for _ in 0..2 {
+                let turns = scripted.questions().len();
+                scripted.ask("How are the tyres?");
+                scripted.until("asked", |s| s.questions().len() > turns);
+                let question = &scripted.questions()[turns];
+                assert!(question.contains(NO_REQUESTS), "{how}: {question}");
+                assert!(
+                    !question.contains("Tell the pilot the fuel left."),
+                    "{how}: {question}"
+                );
+                // Nor can it change it
+                let error = scripted.schedule(cancel(RequestId(1))).unwrap_err();
+                assert!(error.contains("none are pending"), "{how}: {error}");
+                scripted.finish(Act::Reply);
+            }
+            assert_eq!(scripted.pending(), [RequestId(1)], "{how}");
+
+            // The next progress clears it, but not one the turn running then makes
+            let turns = scripted.questions().len();
+            scripted.ask("Fuel every lap, please.");
+            scripted.until("asked", |s| s.questions().len() > turns);
+            scripted.tick();
+            assert!(scripted.pending().is_empty(), "{how}");
+            let added = scripted.schedule(fuel_every_lap()).unwrap();
+            assert!(added.contains("#2"), "{how}: {added}");
+            scripted.finish(Act::Reply);
+            assert_eq!(scripted.pending(), [RequestId(2)], "{how}");
+            assert!(scripted.notes().is_empty(), "{how}: {:?}", scripted.notes());
+        }
+    }
+
+    #[test]
+    fn a_kept_conversation_is_told_its_notes_in_a_new_weekend() {
+        // Without `auto_session` it isn't started over: the notes are still about it, and told
+        // again when the exchange is forgotten
+        let mut scripted = Scripted::recorded_with(r#"{"auto_session": false}"#);
+        let note = scripted.missed_change();
         scripted.tick();
-        assert_eq!(scripted.pending(), [RequestId(1)]);
         scripted.new_weekend();
         let turns = scripted.questions().len();
-        scripted.ask("How are the tyres?");
+        scripted.ask("Anything else?");
         scripted.until("asked", |s| s.questions().len() > turns);
-        let question = &scripted.questions()[turns];
-        assert!(question.contains(NO_REQUESTS), "{question}");
+        assert!(scripted.questions()[turns].contains(&note));
+        scripted.finish(Act::Fail);
+        assert_eq!(scripted.notes(), [note]);
+    }
+
+    #[test]
+    fn a_new_weekends_requests_are_told_before_its_progress_is_seen() {
+        // Made at a snapshot that was gone before the engineer stepped through it (the tables
+        // catching up): the progress kept is still the last weekend's, but the requests aren't
+        let mut scripted = Scripted::recorded();
+        scripted.tick();
+        scripted.new_weekend();
+        let tool = scripted.engineer.tool.clone().unwrap();
+        scripted.runtime.block_on(tool.publish_progress()).unwrap();
+        let made = tool.take_progress().unwrap();
+        let seen = scripted.engineer.progress.as_ref().unwrap().weekend;
+        assert!(seen < made.weekend);
+        let request = schedule::NewRequest {
+            instruction: "Tell the pilot the fuel left.".into(),
+            trigger: schedule::Trigger::Laps { count: 1 },
+            repeat: schedule::Repeat::Once,
+            until: None,
+            stale_after: None,
+            made,
+            checked: Default::default(),
+        };
+        let add = Change::Add(RequestId(1), request);
+        scripted.engineer.apply(vec![add], &[]);
+        scripted.ask("How are the tyres?");
+        scripted.until("asked", |s| !s.questions().is_empty());
+        let question = &scripted.questions()[0];
         assert!(
-            !question.contains("Tell the pilot the fuel left."),
+            question.contains("Tell the pilot the fuel left."),
             "{question}"
         );
-        // Nor can it change it
-        let error = scripted.schedule(cancel(RequestId(1))).unwrap_err();
-        assert!(error.contains("none are pending"), "{error}");
+        // And can be changed
+        scripted.schedule(cancel(RequestId(1))).unwrap();
         scripted.finish(Act::Reply);
-
-        // The next progress clears it
-        scripted.tick();
-        assert!(scripted.pending().is_empty());
     }
 
     #[test]
@@ -6448,6 +6565,41 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_that_only_acknowledged_sounds_the_tone() {
+        const QUERY: Act = Act::Tools(&[EngineerTool::NAME]);
+        const ACTS: Act = Act::Tools(&[PitTool::NAME, ScheduleTool::NAME]);
+        let scripts = [
+            (vec![QUERY], true),
+            (vec![QUERY, QUERY], true),
+            (vec![Act::Tools(&[ScheduleTool::NAME, EngineerTool::NAME])], true),
+            // What came before tools that only act answered
+            (vec![ACTS], false),
+            (vec![QUERY, Act::Write("Todos bien.\n"), ACTS], false),
+            (vec![QUERY, Act::Write("Delanteros bien.\n"), QUERY], true),
+            // A question joined it
+            (vec![QUERY, Act::TakeSteer], true),
+            (vec![QUERY, Act::TakeSteer, Act::Write("Todos bien.")], false),
+        ];
+        for (i, (acts, tone)) in scripts.into_iter().enumerate() {
+            let mut scripted = Scripted::new();
+            // Whatever is to be played stays in line
+            scripted.engineer.spotter_held = true;
+            scripted.hear_ago("¿Cómo van los neumáticos?", Duration::ZERO);
+            scripted.acts.send(Act::Write("Copio, lo miro.\n\n")).unwrap();
+            scripted.until("acknowledged", |s| s.answer().is_some());
+            if acts.iter().any(|act| matches!(act, Act::TakeSteer)) {
+                scripted.hear_ago("¿Y los traseros?", Duration::ZERO);
+            }
+            for act in acts {
+                scripted.acts.send(act).unwrap();
+            }
+            scripted.finish(Act::End(StopReason::EndTurn, "Copio, lo miro.\n\n"));
+            let tones = scripted.engineer.incoming.len() + scripted.engineer.line.len();
+            assert_eq!(tones, usize::from(tone), "script {i}");
+        }
+    }
+
+    #[test]
     fn a_failed_turn_keeps_what_it_held() {
         let mut scripted = acknowledging_immediately();
         scripted.hear_ago("¿Cómo van los neumáticos?", Duration::ZERO);
@@ -6589,6 +6741,163 @@ mod tests {
         assert!(scripted.engineer.is_thinking());
         assert_eq!(scripted.engineer.incoming.len(), 2);
         assert!(!scripted.cancelled());
+    }
+
+    /// A scripted engineer whose first question's speech failed, the tone for it waiting in the
+    /// line (held, so whatever is to be played stays there).
+    fn speech_failed() -> Scripted {
+        let mut scripted = Scripted::new();
+        scripted.engineer.spotter_held = true;
+        scripted.ask("How are the fronts?");
+        scripted.until("asked", |s| s.questions().len() == 1);
+        fail_speech(&mut scripted);
+        scripted
+    }
+
+    /// Fails the running turn's speech: the tone for it waits in the line.
+    fn fail_speech(scripted: &mut Scripted) {
+        let (speech, answer) = being_written();
+        scripted.engineer.queue(answer);
+        speech.send(Err(anyhow::anyhow!("no voice"))).unwrap();
+        scripted.frame();
+        assert_eq!(waiting(scripted), 1);
+        assert!(scripted.engineer.line[0].complete);
+    }
+
+    /// How many answers and tones are to be played.
+    fn waiting(scripted: &Scripted) -> usize {
+        scripted.engineer.incoming.len() + scripted.engineer.line.len()
+    }
+
+    /// Has the running turn take the questions steering it.
+    fn take_steer(scripted: &mut Scripted) {
+        scripted.acts.send(Act::TakeSteer).unwrap();
+        scripted.until("taken", |s| !s.asked.lock().unwrap().steered.is_empty());
+    }
+
+    #[test]
+    fn a_question_taken_after_the_failed_speech_tone_gets_a_tone() {
+        for end in [
+            Act::End(StopReason::EndTurn, "All fine."),
+            Act::End(StopReason::EndTurn, ""),
+            Act::End(StopReason::MaxTokens, "All"),
+            Act::Refuse,
+            Act::Fail,
+        ] {
+            let mut scripted = speech_failed();
+            // Played
+            scripted.engineer.line.clear();
+            scripted.ask("And the rears?");
+            take_steer(&mut scripted);
+            scripted.finish(end);
+            assert_eq!(waiting(&scripted), 1);
+        }
+
+        // Another one it missed is asked next
+        let mut scripted = speech_failed();
+        scripted.engineer.line.clear();
+        scripted.ask("And the rears?");
+        take_steer(&mut scripted);
+        scripted.ask("And the brakes?");
+        scripted.acts.send(Act::Reply).unwrap();
+        scripted.until("asked again", |s| s.questions().len() == 2);
+        assert_eq!(waiting(&scripted), 1);
+
+        // One asked before the tone heard it, whenever it's taken
+        let mut scripted = Scripted::new();
+        scripted.engineer.spotter_held = true;
+        scripted.ask("How are the fronts?");
+        scripted.until("asked", |s| s.questions().len() == 1);
+        scripted.ask("And the rears?");
+        fail_speech(&mut scripted);
+        scripted.engineer.line.clear();
+        take_steer(&mut scripted);
+        scripted.finish(Act::Reply);
+        assert_eq!(waiting(&scripted), 0);
+    }
+
+    #[test]
+    fn a_question_missed_after_the_failed_speech_tone_hears_one_tone() {
+        for (end, questions) in [
+            (Act::End(StopReason::EndTurn, ""), 1),
+            (Act::End(StopReason::EndTurn, ""), 2),
+            (Act::End(StopReason::EndTurn, "Fine."), 1),
+            (Act::End(StopReason::MaxTokens, "Fi"), 1),
+        ] {
+            let mut scripted = speech_failed();
+            // Played
+            scripted.engineer.line.clear();
+            for _ in 0..questions {
+                scripted.ask("And the rears?");
+            }
+            scripted.acts.send(end).unwrap();
+            scripted.until("asked again", |s| s.questions().len() == 2);
+            assert_eq!(waiting(&scripted), 0);
+            // Its own turn's
+            scripted.finish(Act::End(StopReason::EndTurn, ""));
+            assert_eq!(waiting(&scripted), 1);
+        }
+
+        // Asked in no turn of its own, as the one it joined is forgotten
+        for end in [Act::Refuse, Act::Fail] {
+            let mut scripted = speech_failed();
+            scripted.engineer.line.clear();
+            scripted.ask("And the rears?");
+            scripted.finish(end);
+            assert_eq!(waiting(&scripted), 1);
+        }
+    }
+
+    #[test]
+    fn an_interrupted_turn_whose_speech_failed_sounds_no_second_tone() {
+        let interruptions: [fn(&mut Scripted); 3] = [
+            // The recording's gone
+            |s| {
+                let _entered = s.runtime.enter();
+                s.engineer.follow_recording(s.runtime.handle(), None);
+            },
+            // The game stopped
+            |s| {
+                let _entered = s.runtime.enter();
+                let (config, synth) = (&s.config, &mut s.synth);
+                (s.engineer).update(s.runtime.handle(), None, config, synth, None);
+            },
+            // The account signed out
+            |s| {
+                s.engineer.session.as_mut().unwrap().user = Some("pilot".into());
+                s.frame();
+            },
+        ];
+        for (i, interrupt) in interruptions.into_iter().enumerate() {
+            let mut scripted = speech_failed();
+            scripted.engineer.line.clear();
+            interrupt(&mut scripted);
+            assert!(!scripted.engineer.is_thinking(), "interruption {i}");
+            assert_eq!(waiting(&scripted), 0, "played, interruption {i}");
+
+            let mut scripted = speech_failed();
+            scripted.engineer.line[0].started = true;
+            interrupt(&mut scripted);
+            assert_eq!(waiting(&scripted), 0, "playing, interruption {i}");
+
+            // Cleared from the line before it played
+            let mut scripted = speech_failed();
+            interrupt(&mut scripted);
+            assert_eq!(waiting(&scripted), 1, "not played, interruption {i}");
+
+            let mut scripted = speech_failed();
+            scripted.engineer.line.clear();
+            scripted.ask("And the rears?");
+            interrupt(&mut scripted);
+            assert_eq!(waiting(&scripted), 1, "asked again, interruption {i}");
+
+            // Nothing failed
+            let mut scripted = Scripted::new();
+            scripted.engineer.spotter_held = true;
+            scripted.ask("How are the fronts?");
+            interrupt(&mut scripted);
+            assert_eq!(waiting(&scripted), 1, "not failed, interruption {i}");
+        }
     }
 
     #[test]

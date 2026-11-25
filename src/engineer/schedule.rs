@@ -1024,6 +1024,11 @@ impl Schedule {
         self.requests.iter().filter(|r| r.pending()).count()
     }
 
+    /// The weekend the requests are from: the last progress's seen, if it had one
+    pub fn weekend(&self) -> Option<i64> {
+        self.weekend.flatten()
+    }
+
     /// The pending requests' ids, the ones [`len`](Self::len) counts, in the order they were made
     pub fn pending_ids(&self) -> Vec<RequestId> {
         self.requests
