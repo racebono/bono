@@ -5787,6 +5787,7 @@ mod tests {
         assert_eq!(session_end(end, 200.0, Some(800.033)), end);
         assert_eq!(session_end(end, 1001.0, Some(0.0)), end);
         assert_eq!(session_end(end, 1001.0, None), end);
+        assert_eq!(session_end(Some(1000.05), 1000.01, None), Some(1000.05));
         // Moved by more: the session was lengthened
         assert_eq!(session_end(end, 200.0, Some(1000.0)), Some(1200.0));
         // No time left given before it ends: none

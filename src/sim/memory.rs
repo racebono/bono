@@ -68,7 +68,8 @@ const SESSION_END_JITTER: f64 = 0.1;
 /// it. Run out, it stays when it ran out.
 pub(super) fn session_end(last: Option<f64>, time: f64, remaining: Option<f64>) -> Option<f64> {
     let Some(remaining) = remaining else {
-        return last.filter(|end| *end <= time);
+        // It may have run out a moment before the end held
+        return last.filter(|end| *end <= time + SESSION_END_JITTER);
     };
     let end = round_ms(time + remaining);
     match last {
