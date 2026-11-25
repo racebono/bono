@@ -1069,9 +1069,16 @@ impl Scoring {
             ));
         }
         if let Some(left) = self.time_left(now) {
-            let extra_lap = match s.b("extra_lap") {
-                true => " (plus an extra lap)",
-                false => "",
+            let leader = self.order().first().copied();
+            let finished = leader.is_some_and(|r| r.text("finish_status") == Some("finished"));
+            let begun = leader
+                .and_then(|r| r.f("lap_start_time"))
+                .zip(s.f("session_end_time"))
+                .is_some_and(|(start, end)| start >= end);
+            let extra_lap = match (s.b("extra_lap") && !finished, begun) {
+                (true, true) => " (the leader is on the extra lap)",
+                (true, false) => " (plus an extra lap)",
+                (false, _) => "",
             };
             parts.push(format!("{} left{extra_lap}", clock(left)));
         }
@@ -2968,6 +2975,41 @@ mod tests {
                 line.contains(&format!("0% rain, {sky}, 20 C")),
                 "{sky}: {line}"
             );
+        }
+    }
+
+    #[test]
+    fn the_session_line_says_where_the_extra_lap_is() {
+        let conn = Connection::open_in_memory().unwrap();
+        let columns = |columns: &str| row(&conn, &format!("SELECT {columns}"), []).unwrap();
+        for (extra_lap, leader, expected) in [
+            (1, "1750.0 AS lap_start_time", "0:00 left (plus an extra lap)"),
+            (1, "NULL AS lap_start_time", "0:00 left (plus an extra lap)"),
+            (
+                1,
+                "1860.0 AS lap_start_time",
+                "0:00 left (the leader is on the extra lap)",
+            ),
+            (
+                1,
+                "1960.0 AS lap_start_time, 'finished' AS finish_status",
+                "0:00 left",
+            ),
+            (0, "1860.0 AS lap_start_time", "0:00 left"),
+        ] {
+            let session = format!(
+                "'race' AS session_type, 1800.0 AS session_end_time, {extra_lap} AS extra_lap"
+            );
+            let leader = columns(&format!("2 AS vehicle_id, 1 AS position, {leader}")).unwrap();
+            let scoring = Scoring {
+                session: columns(&session),
+                yellow_sectors: Vec::new(),
+                sector_yellows: false,
+                cars: BTreeMap::from([(2, leader)]),
+                player: None,
+            };
+            let line = scoring.session_line(Some(1970.0)).unwrap();
+            assert!(line.split(" | ").any(|part| part == expected), "{line}");
         }
     }
 

@@ -6207,8 +6207,6 @@ mod tests {
                 };
                 let (need, source) = race_need(&sc, &frame, 1, Some(now), 0.5, Some(100.0));
                 assert_eq!(source.contains("extra lap"), extra_lap == 1, "{source}");
-                let line = sc.session_line(Some(now)).unwrap();
-                assert_eq!(line.contains("extra lap"), extra_lap == 1, "{line}");
                 need.unwrap()
             })
         };
