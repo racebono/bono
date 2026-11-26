@@ -2,7 +2,10 @@
 //! event's sessions, the cars and their drivers, and the player's car. Keys and their units are
 //! the ones the session info writes, e.g. `TrackLength: 4.0569 km`.
 
-use super::yaml::{Node, number};
+use super::{
+    sdk::UNLIMITED_TIME,
+    yaml::{Node, number},
+};
 use bono_sim::{
     sql::Event,
     sys::{bono_event_rule, bono_event_session},
@@ -229,8 +232,10 @@ impl SessionInfo {
                     ))
                 })
                 .collect();
-            // "unlimited" isn't a number
-            let length_time = session.number("SessionTime").filter(|t| *t > 0.0);
+            // "unlimited" isn't a number, and nor is a limit as long as the SDK's unlimited
+            let length_time = session
+                .number("SessionTime")
+                .filter(|t| *t > 0.0 && *t < UNLIMITED_TIME);
             let length_laps = session.int("SessionLaps").filter(|n| *n > 0);
             let flag = |key: &str| session.int(key).map(|v| v != 0);
             info.sessions.push(Session {
@@ -586,6 +591,9 @@ SessionInfo:
    SessionName: RACE
    SessionTrackRubberState: moderate usage
    SessionEnforceTireCompoundChange: 1
+ - SessionNum: 3
+   SessionTime: 604800.0000 sec
+   SessionType: Something New
 QualifyResultsInfo:
  Results:
  - Position: 1
@@ -638,7 +646,8 @@ SplitTimeInfo:
             [
                 (Some("practice"), 1),
                 (Some("practice"), 2),
-                (Some("race"), 1)
+                (Some("race"), 1),
+                (None, 1)
             ]
         );
         assert_eq!(info.sessions[0].results[&3].incidents, Some(4));
@@ -657,7 +666,7 @@ SplitTimeInfo:
     #[test]
     fn the_event_lists_every_session_with_its_length() {
         let event = SessionInfo::new(&parse(WEEKEND)).event(12.5);
-        assert_eq!(event.sessions.len(), 3);
+        assert_eq!(event.sessions.len(), 4);
         let practice = &event.sessions[0];
         assert_eq!(practice.session_time.get(), Some(12.5));
         assert_eq!(practice.name.as_deref(), Some("PRACTICE"));
@@ -677,6 +686,11 @@ SplitTimeInfo:
         assert_eq!(race.track_rubber.as_deref(), Some("moderate usage"));
         // The time of day is the event's, which `session` records
         assert_eq!(race.start_time_of_day.get(), None);
+
+        // As long as the SDK's unlimited time: no limit
+        let unlimited = &event.sessions[3];
+        assert_eq!(unlimited.length_time.get(), None);
+        assert_eq!(unlimited.finish.as_deref(), Some("unknown"));
     }
 
     #[test]
@@ -689,9 +703,18 @@ SplitTimeInfo:
                 .iter()
                 .find(|row| row.event_order.get() == Some(session.num))
                 .unwrap();
+            // As `convert` writes `session`: a number only with a type
             assert_eq!(row.session_type.as_deref(), session.kind);
-            assert_eq!(row.session_number.get(), Some(session.number));
+            assert_eq!(
+                row.session_number.get(),
+                session.kind.map(|_| session.number)
+            );
         }
+        // A type it doesn't know has neither
+        let unknown = &event.sessions[3];
+        assert_eq!(unknown.event_order.get(), Some(3));
+        assert_eq!(unknown.session_type.as_deref(), None);
+        assert_eq!(unknown.session_number.get(), None);
     }
 
     #[test]
