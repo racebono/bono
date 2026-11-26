@@ -811,6 +811,8 @@ impl Converter {
         };
 
         Some(Update {
+            // With every scoring update: the recorder writes it only when it changes
+            event: scoring.as_ref().map(|_| info.event(time)),
             telemetry,
             scoring,
             new_event,
@@ -2743,6 +2745,7 @@ mod tests {
                 kind: Some("race"),
                 number: 1,
                 results: HashMap::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -2867,6 +2870,7 @@ mod tests {
                 kind: Some("race"),
                 number: 1,
                 results: HashMap::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -3138,6 +3142,7 @@ mod tests {
                 kind: Some("race"),
                 number: 1,
                 results: HashMap::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -3248,6 +3253,7 @@ mod tests {
                 kind: Some("race"),
                 number: 1,
                 results: HashMap::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -3371,6 +3377,7 @@ mod tests {
                 kind: Some("race"),
                 number: 1,
                 results: HashMap::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -3497,6 +3504,7 @@ mod tests {
                 kind: Some("race"),
                 number: 1,
                 results: HashMap::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -4667,6 +4675,7 @@ mod tests {
                 kind: Some("race"),
                 number: 1,
                 results: HashMap::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -4730,6 +4739,7 @@ mod tests {
                 kind: Some("race"),
                 number: 1,
                 results: HashMap::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -4817,6 +4827,7 @@ mod tests {
                 kind: Some("race"),
                 number: 1,
                 results: HashMap::new(),
+                ..Default::default()
             }],
             qualifying: HashMap::from([(2, 1), (0, 2), (1, 3)]),
             ..Default::default()
@@ -4890,6 +4901,7 @@ mod tests {
             kind: Some("race"),
             number: 2,
             results: HashMap::new(),
+            ..Default::default()
         });
         let heat = update(&info, STATE_PARADE_LAPS, [0; 3], [0.0; 3], 0);
         assert_eq!(standing(&heat, 2), (None, None, None));
@@ -4965,6 +4977,7 @@ mod tests {
                 kind: Some("race"),
                 number: 1,
                 results: HashMap::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -5013,6 +5026,7 @@ mod tests {
                 kind: Some("race"),
                 number: 1,
                 results: HashMap::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -5055,6 +5069,7 @@ mod tests {
                 kind: Some("race"),
                 number: 1,
                 results: HashMap::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -5329,6 +5344,7 @@ mod tests {
                 kind: Some("qualifying"),
                 number: 1,
                 results: HashMap::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -5519,6 +5535,7 @@ mod tests {
                 kind: Some(kind),
                 number: 1,
                 results: HashMap::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };

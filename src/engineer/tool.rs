@@ -11,7 +11,7 @@ use crate::{
     sqlite::pool::Pool,
 };
 use anyhow::{Context as _, bail};
-use bono_sim::sql::{Epoch, active_epoch};
+use bono_sim::sql::{Epoch, active_epoch, newest_event_generation};
 use rusqlite::{
     Connection, Params, params,
     types::{FromSql, Value},
@@ -1045,6 +1045,10 @@ struct Scoring {
     sector_yellows: bool,
     cars: BTreeMap<i64, Row>,
     player: Option<Row>,
+    /// The newest `event_session` set: every session of the event, in order
+    event: Vec<Row>,
+    /// The newest `event_rule` set
+    rules: Vec<Row>,
 }
 
 /// The game's sky numbers; anything else is described with the game's own text.
@@ -1063,11 +1067,15 @@ impl Scoring {
     const MAX_ROWS: i64 = 60000;
 
     fn new(ctx: &Ctx) -> anyhow::Result<Self> {
-        let conn = ctx.conn;
+        Self::load(ctx.conn, ctx.epoch, Some(ctx.vehicle))
+    }
+
+    /// The scoring of `epoch`, `vehicle`'s standings as the player's (else the is_player car's).
+    fn load(conn: &Connection, epoch: Epoch, vehicle: Option<i64>) -> anyhow::Result<Self> {
         let session = row(
             conn,
             "SELECT * FROM session WHERE id >= ? ORDER BY id DESC LIMIT 1",
-            [ctx.epoch.session_from],
+            [epoch.session_from],
         )?;
         let (yellow_sectors, sector_yellows) = match session.as_ref().and_then(|s| s.i("id")) {
             Some(id) => {
@@ -1093,7 +1101,7 @@ impl Scoring {
 
         // Walk back from the newest standings row until every car is found or the session starts:
         // the epoch's first row, or the clock going back before it in recordings without epochs
-        let first = ctx.epoch.standings_from.max(1);
+        let first = epoch.standings_from.max(1);
         let mut cars = BTreeMap::new();
         let mut hi = scalar::<i64>(conn, "SELECT MAX(id) FROM standings", [])?.unwrap_or(0);
         let (mut newer_t, mut scanned) = (None::<f64>, 0);
@@ -1128,16 +1136,53 @@ impl Scoring {
         }
 
         // ctx.vehicle is the is_player car unless `vehicle` chose another one
-        let player = cars
-            .get(&ctx.vehicle)
+        let player = vehicle
+            .and_then(|vehicle| cars.get(&vehicle))
             .or_else(|| cars.values().find(|r| r.b("is_player")))
             .cloned();
+        let (event, rules) = Self::event(conn)?;
         Ok(Self {
             session,
             yellow_sectors,
             sector_yellows,
             cars,
             player,
+            event,
+            rules,
+        })
+    }
+
+    /// The newest event set: its sessions in order, and its rules. None in a recording from before
+    /// they were recorded.
+    fn event(conn: &Connection) -> rusqlite::Result<(Vec<Row>, Vec<Row>)> {
+        if !conn.table_exists(None::<&str>, "event_session")?
+            || !conn.table_exists(None::<&str>, "event_rule")?
+        {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let Some(generation) = newest_event_generation(conn)? else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        Ok((
+            rows(
+                conn,
+                "SELECT * FROM event_session WHERE generation = ? ORDER BY event_order, id",
+                [generation],
+            )?,
+            rows(
+                conn,
+                "SELECT * FROM event_rule WHERE generation = ? ORDER BY id",
+                [generation],
+            )?,
+        ))
+    }
+
+    /// The event's row for this session: the same type and number (both maybe NULL).
+    fn current_event(&self) -> Option<&Row> {
+        let s = self.session.as_ref()?;
+        let kind = s.text("session_type")?;
+        self.event.iter().find(|r| {
+            r.text("session_type") == Some(kind) && r.i("session_number") == s.i("session_number")
         })
     }
 
@@ -2751,6 +2796,14 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     if let Some(line) = sc.forecast_line(ctx.conn, now)? {
         say!(out, "FORECAST {line}");
     }
+    // As the data thread last published it, as `STRATEGY` is below
+    let sessions = lock(&ctx.shared.progress)
+        .as_ref()
+        .filter(|progress| progress.epoch == ctx.epoch.id)
+        .and_then(|progress| progress.sessions.clone());
+    if let Some(line) = sessions {
+        say!(out, "SESSIONS {line}");
+    }
     if let Some(line) = track_line(ctx, sc) {
         say!(out, "TRACK {line}");
     }
@@ -3301,6 +3354,8 @@ mod tests {
             sector_yellows: false,
             cars: BTreeMap::new(),
             player: None,
+            event: Vec::new(),
+            rules: Vec::new(),
         };
         let line = scoring.forecast_line(&conn, None).unwrap().unwrap();
         assert!(!line.contains('\n'), "{line}");
@@ -3342,6 +3397,8 @@ mod tests {
                 sector_yellows: false,
                 cars: BTreeMap::from([(2, leader)]),
                 player: None,
+                event: Vec::new(),
+                rules: Vec::new(),
             };
             let line = scoring.session_line(Some(1970.0)).unwrap();
             assert!(line.split(" | ").any(|part| part == expected), "{line}");
@@ -3387,6 +3444,8 @@ mod tests {
             sector_yellows: false,
             cars: BTreeMap::new(),
             player: None,
+            event: Vec::new(),
+            rules: Vec::new(),
         };
 
         let line = scoring.forecast_line(&conn, Some(2520.0)).unwrap().unwrap();
@@ -3595,6 +3654,23 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quick_shows_the_sessions_line() {
+        let (_dir, engineer) = race();
+        engineer.publish_progress().await.unwrap();
+        let quick = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(!quick.contains("SESSIONS"), "{quick}");
+        lock(&engineer.inner.shared.progress)
+            .as_mut()
+            .unwrap()
+            .sessions = Some("race 1 next: 72 min (time); no green laps yet".into());
+        let quick = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(
+            quick.contains("\nSESSIONS race 1 next: 72 min (time); no green laps yet\n"),
+            "{quick}"
+        );
     }
 
     fn names(names: &[&str]) -> Vec<String> {

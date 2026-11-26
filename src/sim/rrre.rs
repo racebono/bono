@@ -11,8 +11,8 @@ use crate::{
     sqlite::pool::Pool,
 };
 use bono_sim::{
-    sql::EpochReason,
-    sys::{bono_session_info, bono_standing, bono_telemetry},
+    sql::{EpochReason, Event},
+    sys::{bono_event_rule, bono_event_session, bono_session_info, bono_standing, bono_telemetry},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -276,11 +276,11 @@ impl Converter {
             && shared.session_type != R3E_SESSION_UNAVAILABLE
             && shared.layout_length > 0.0;
         // The same physics frame, unless it's another session's (whose boundary goes now)
-        let event = (shared.track_id, shared.layout_id, shared.event_index);
+        let event_ids = (shared.track_id, shared.layout_id, shared.event_index);
         let session = (shared.session_type, shared.session_iteration);
         if !in_session
             || (self.last_time == Some(time)
-                && self.event == Some(event)
+                && self.event == Some(event_ids)
                 && self.session == Some(session))
         {
             return None;
@@ -294,8 +294,8 @@ impl Converter {
         let went_back = self.last_time.is_some_and(|last| time < last - 1.0);
         self.last_time = Some(time);
 
-        let new_event = self.event.is_some_and(|last| last != event);
-        self.event = Some(event);
+        let new_event = self.event.is_some_and(|last| last != event_ids);
+        self.event = Some(event_ids);
         // Another session, or its clock went back (a restart): its laps start over. Back in the
         // same session with its clock moving on (from menus, a pause or a replay), it carries on
         let replayed = std::mem::take(&mut self.replayed);
@@ -425,6 +425,7 @@ impl Converter {
 
         Some(Update {
             telemetry,
+            event: scoring.as_ref().map(|_| event(shared, time)),
             scoring,
             new_event,
             setup: None,
@@ -766,6 +767,59 @@ fn scoring(
         })
         .collect();
     (session, standings)
+}
+
+/// The event as the game gives it at `session_time`: only its races (up to three), and how fast
+/// fuel and tyres wear. In `r3e.h`, -1 is "not available" throughout; a race with both minutes and
+/// laps runs its minutes, then adds the laps.
+fn event(shared: &r3e_shared, session_time: f64) -> Event {
+    let (minutes, laps) = (shared.race_session_minutes, shared.race_session_laps);
+    let sessions = minutes
+        .into_iter()
+        .zip(laps)
+        .enumerate()
+        .filter_map(|(i, (minutes, laps))| {
+            let minutes = (minutes > 0).then_some(minutes);
+            let laps = (laps > 0).then_some(laps);
+            let finish = match (minutes, laps) {
+                (Some(_), Some(_)) => "time_then_laps",
+                (Some(_), None) => "time",
+                (None, Some(_)) => "laps",
+                (None, None) => return None,
+            };
+            let mut race = bono_event_session::default();
+            race.session_time = Some(session_time).into();
+            race.event_order = Some(i as i64).into();
+            race.session_type = Some("race".to_owned()).into();
+            // As `session_iteration` numbers the race, from 1
+            race.session_number = Some(i as i64 + 1).into();
+            race.length_time = minutes.map(|minutes| minutes as f64 * 60.0).into();
+            race.length_laps = laps.map(i64::from).into();
+            race.finish = Some(finish.to_owned()).into();
+            Some(race)
+        })
+        .collect();
+
+    // 0 is off, 1 to 4 the multiplier
+    let multiplier = |value: i32| match value {
+        0 => Some("off".to_owned()),
+        1..=4 => Some(format!("×{value}")),
+        _ => None,
+    };
+    let rules = [
+        ("fuel_use_multiplier", shared.fuel_use_active),
+        ("tire_wear_multiplier", shared.tire_wear_active),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| {
+        let mut rule = bono_event_rule::default();
+        rule.session_time = Some(session_time).into();
+        rule.name = Some(name.to_owned()).into();
+        rule.value = Some(multiplier(value)?).into();
+        Some(rule)
+    })
+    .collect();
+    Event { sessions, rules }
 }
 
 /// Derived scoring timestamps mix the f64 clock with f32 durations. Discard their
@@ -1639,6 +1693,95 @@ mod tests {
         writer.write(1, session, standings).unwrap();
         assert_eq!(count("session"), 2);
         assert_eq!(count("standings"), 3);
+    }
+
+    #[test]
+    fn the_event_lists_the_races() {
+        let mut shared = shared(500.0, 0.0);
+        shared.race_session_minutes = [100, -1, -1];
+        shared.race_session_laps = [-1, -1, -1];
+        let sessions = event(&shared, 500.0).sessions;
+        assert_eq!(sessions.len(), 1);
+        let race = &sessions[0];
+        assert_eq!(race.session_time.get(), Some(500.0));
+        assert_eq!(race.event_order.get(), Some(0));
+        assert_eq!(race.session_type.as_deref(), Some("race"));
+        assert_eq!(race.session_number.get(), Some(1));
+        assert_eq!(race.length_time.get(), Some(6000.0));
+        assert_eq!(race.length_laps.get(), None);
+        assert_eq!(race.finish.as_deref(), Some("time"));
+        assert_eq!(race.name.as_deref(), None);
+
+        // The first race runs its minutes, then a lap more; the second only its minutes
+        shared.race_session_minutes = [20, 15, -1];
+        shared.race_session_laps = [1, -1, -1];
+        let sessions = event(&shared, 500.0).sessions;
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].finish.as_deref(), Some("time_then_laps"));
+        assert_eq!(sessions[0].length_time.get(), Some(1200.0));
+        assert_eq!(sessions[0].length_laps.get(), Some(1));
+        assert_eq!(sessions[1].finish.as_deref(), Some("time"));
+        assert_eq!(sessions[1].length_time.get(), Some(900.0));
+        assert_eq!(sessions[1].session_number.get(), Some(2));
+        assert_eq!(sessions[1].event_order.get(), Some(1));
+
+        // A race to laps only
+        shared.race_session_minutes = [-1, -1, -1];
+        shared.race_session_laps = [12, -1, -1];
+        let sessions = event(&shared, 500.0).sessions;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].finish.as_deref(), Some("laps"));
+        assert_eq!(sessions[0].length_time.get(), None);
+        assert_eq!(sessions[0].length_laps.get(), Some(12));
+    }
+
+    #[test]
+    fn the_event_rules_say_the_multipliers() {
+        let rule = |fuel: i32, tires: i32, name: &str| -> Option<String> {
+            let mut shared = shared(500.0, 0.0);
+            shared.fuel_use_active = fuel;
+            shared.tire_wear_active = tires;
+            let event = event(&shared, 500.0);
+            let rule = event
+                .rules
+                .iter()
+                .find(|rule| rule.name.as_deref() == Some(name))?;
+            assert_eq!(rule.session_type.as_deref(), None);
+            assert_eq!(rule.session_time.get(), Some(500.0));
+            rule.value.clone().into()
+        };
+        assert_eq!(rule(2, 1, "fuel_use_multiplier").as_deref(), Some("×2"));
+        assert_eq!(rule(2, 1, "tire_wear_multiplier").as_deref(), Some("×1"));
+        assert_eq!(rule(0, 4, "fuel_use_multiplier").as_deref(), Some("off"));
+        assert_eq!(rule(0, 4, "tire_wear_multiplier").as_deref(), Some("×4"));
+        // Not available, or not documented: not recorded
+        assert_eq!(rule(2, -1, "tire_wear_multiplier"), None);
+        assert_eq!(rule(5, 1, "fuel_use_multiplier"), None);
+    }
+
+    /// RaceRoom lists only the races: practice sees them too.
+    #[test]
+    fn practice_scoring_carries_the_races() {
+        let mut shared = shared(500.0, 0.0);
+        shared.session_type = R3E_SESSION_PRACTICE;
+        shared.race_session_minutes = [30, -1, -1];
+        shared.race_session_laps = [-1, -1, -1];
+        let mut converter = Converter::default();
+        let start = Instant::now();
+        let update = converter.convert(&shared, start).unwrap();
+        assert!(update.scoring.is_some());
+        let event = update.event.unwrap();
+        assert_eq!(event.sessions.len(), 1);
+        assert_eq!(event.sessions[0].session_type.as_deref(), Some("race"));
+        assert_eq!(event.sessions[0].length_time.get(), Some(1800.0));
+
+        // Between scoring updates, no event either
+        shared.player.game_simulation_time = 500.1;
+        let update = converter
+            .convert(&shared, start + Duration::from_millis(100))
+            .unwrap();
+        assert!(update.scoring.is_none());
+        assert!(update.event.is_none());
     }
 
     #[test]

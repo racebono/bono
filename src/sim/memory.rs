@@ -13,7 +13,7 @@ use crate::{
 use bono_sim::{
     recorder::{DATABASE, Recorder, SETTINGS, try_remove_database},
     setup::Setup,
-    sql::EpochReason,
+    sql::{EpochReason, Event},
     sys::{bono_session_info, bono_standing, bono_telemetry},
 };
 use serde_json::{Map, Value};
@@ -99,6 +99,9 @@ pub(super) struct Update {
     /// end where the live session left off. Not set with `new_event`, which starts afresh anyway.
     /// The recorder also starts epochs itself, from the scoring
     pub new_epoch: Option<EpochReason>,
+    /// The event's sessions and rules, with every scoring update (the recorder writes them only
+    /// when they change)
+    pub event: Option<Event>,
 }
 
 /// A game recorded from its shared memory, while it runs.
@@ -469,6 +472,9 @@ pub(super) fn record(recorder: &Recorder, update: Update) {
     if let Some((session, standings)) = update.scoring {
         recorder.push_scoring(session, standings);
     }
+    if let Some(event) = update.event {
+        recorder.push_event(event);
+    }
     for telemetry in &update.telemetry {
         let vehicle = telemetry.vehicle_id.get().unwrap_or(-1);
         let time = telemetry.session_time.get().unwrap_or(0.0);
@@ -647,6 +653,7 @@ mod tests {
                 new_event: false,
                 setup,
                 new_epoch: None,
+                event: None,
             })
         }
     }
@@ -686,6 +693,39 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn record_hands_the_event_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        let mut race = bono_sim::sys::bono_event_session::default();
+        race.session_type = Some("race".to_owned()).into();
+        race.session_number = Some(1).into();
+        let mut standing = bono_standing::default();
+        standing.vehicle_id = Some(1).into();
+        standing.is_player = Some(true).into();
+        record(
+            &recorder,
+            Update {
+                telemetry: Vec::new(),
+                scoring: Some((bono_session_info::default(), vec![standing])),
+                new_event: false,
+                setup: None,
+                new_epoch: None,
+                event: Some(Event {
+                    sessions: vec![race],
+                    rules: Vec::new(),
+                }),
+            },
+        );
+        drop(recorder);
+
+        let conn = rusqlite::Connection::open(dir.path().join(DATABASE)).unwrap();
+        let sessions: i64 = conn
+            .query_row("SELECT count(*) FROM event_session", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sessions, 1);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! The database the simulator plugins record into, with one table per struct in `include/bono`
 //! and a column per field: `telemetry`, `telemetry_wheel`, `car_state`, `session`,
-//! `session_sector`, `standings`, `standing_sector` and `forecast`. The columns come from the
+//! `session_sector`, `standings`, `standing_sector`, `forecast`, `event_session` and
+//! `event_rule`. The columns come from the
 //! headers' column lists (see `build.rs`).
 //!
 //! A recording is split into epochs (the `epoch` table): a session, a restart or anything else that
@@ -13,8 +14,9 @@
 use crate::{
     setup::{Setting, Setup},
     sys::{
-        bono_car_state, bono_forecast_point, bono_session_info, bono_session_sector, bono_standing,
-        bono_standing_sector, bono_telemetry, bono_wheel_telemetry,
+        bono_car_state, bono_event_rule, bono_event_session, bono_forecast_point,
+        bono_session_info, bono_session_sector, bono_standing, bono_standing_sector, bono_telemetry,
+        bono_wheel_telemetry,
     },
 };
 use rusqlite::{Connection, PrepFlags, Statement};
@@ -75,6 +77,8 @@ macro_rules! columns {
 }
 
 sim_forecast_columns!(columns!(bono_forecast_point));
+sim_event_session_columns!(columns!(bono_event_session));
+sim_event_rule_columns!(columns!(bono_event_rule));
 sim_session_columns!(columns!(bono_session_info));
 sim_standing_columns!(columns!(bono_standing));
 sim_session_sector_columns!(columns!(bono_session_sector));
@@ -118,6 +122,10 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS forecast (id INTEGER PRIMARY KEY, generation INTEGER{forecast});
 
+        -- The event's sessions and rules (see event.h): a set of both at a time, sharing a generation
+        CREATE TABLE IF NOT EXISTS event_session (id INTEGER PRIMARY KEY, generation INTEGER{event_session});
+        CREATE TABLE IF NOT EXISTS event_rule (id INTEGER PRIMARY KEY, generation INTEGER{event_rule});
+
         -- The player's garage setup (see setup.rs): a set each time it changes, with only the
         -- settings that differ from the car's last set (all of them in its first). value NULL: the
         -- setting is gone. step to saved_value are LMU's only. telemetry_id is the latest row of
@@ -142,6 +150,8 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         standing = bono_standing::DEFINITIONS,
         standing_sector = bono_standing_sector::DEFINITIONS,
         forecast = bono_forecast_point::DEFINITIONS,
+        event_session = bono_event_session::DEFINITIONS,
+        event_rule = bono_event_rule::DEFINITIONS,
     ))?;
     Ok(())
 }
@@ -584,6 +594,75 @@ impl<'conn> ForecastWriter<'conn> {
     }
 }
 
+/// The event's sessions and rules, written together as one set.
+#[derive(Clone, Debug, Default)]
+pub struct Event {
+    pub sessions: Vec<bono_event_session>,
+    pub rules: Vec<bono_event_rule>,
+}
+
+/// Writes the whole event whenever it changes: both tables' rows, with one generation.
+pub struct EventWriter<'conn> {
+    conn: &'conn Connection,
+    insert_session: Statement<'conn>,
+    insert_rule: Statement<'conn>,
+    last: Event,
+}
+
+impl<'conn> EventWriter<'conn> {
+    pub fn new(conn: &'conn Connection) -> rusqlite::Result<Self> {
+        Ok(Self {
+            conn,
+            insert_session: prepare_insert::<bono_event_session>(
+                conn,
+                "event_session",
+                &["generation"],
+            )?,
+            insert_rule: prepare_insert::<bono_event_rule>(conn, "event_rule", &["generation"])?,
+            last: Event::default(),
+        })
+    }
+
+    pub fn reset(&mut self) {
+        self.last = Event::default();
+    }
+
+    /// Returns whether the event changed, and so was written.
+    pub fn write(&mut self, event: Event) -> rusqlite::Result<bool> {
+        if (event.sessions.is_empty() && event.rules.is_empty()) || same_event(&event, &self.last) {
+            return Ok(false);
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        // Counted over both tables, so a set with no rows in one of them still has its own
+        let generation = newest_event_generation(&tx)?.unwrap_or(0) + 1;
+        for session in &event.sessions {
+            self.insert_session.raw_bind_parameter(1, generation)?;
+            session.bind(&mut self.insert_session, 2)?;
+            self.insert_session.raw_execute()?;
+        }
+        for rule in &event.rules {
+            self.insert_rule.raw_bind_parameter(1, generation)?;
+            rule.bind(&mut self.insert_rule, 2)?;
+            self.insert_rule.raw_execute()?;
+        }
+        tx.commit()?;
+
+        self.last = event;
+        Ok(true)
+    }
+}
+
+/// The newest event set's generation, over both tables; `None` if none was written.
+pub fn newest_event_generation(conn: &Connection) -> rusqlite::Result<Option<i64>> {
+    // The aggregate max, which skips NULL (an empty table); the two-argument one would return it
+    conn.prepare_cached(
+        "SELECT max(generation) FROM (SELECT max(generation) AS generation FROM event_session \
+         UNION ALL SELECT max(generation) FROM event_rule)",
+    )?
+    .query_row([], |row| row.get(0))
+}
+
 /// When a set is written: the latest row of any car's and of the player's, and the session as the
 /// last scoring update gave it.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -720,6 +799,20 @@ fn same_forecast(a: &[bono_forecast_point], b: &[bono_forecast_point]) -> bool {
             a.session_time = b.session_time;
             !a.changed(b)
         })
+}
+
+/// The same event, whenever it was read.
+fn same_event(a: &Event, b: &Event) -> bool {
+    fn same<T: Columns + Clone>(a: &[T], b: &[T], read_at: impl Fn(&mut T, &T)) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(a, b)| {
+                let mut a = a.clone();
+                read_at(&mut a, b);
+                !a.changed(b)
+            })
+    }
+    same(&a.sessions, &b.sessions, |a, b| a.session_time = b.session_time)
+        && same(&a.rules, &b.rules, |a, b| a.session_time = b.session_time)
 }
 
 #[cfg(test)]
@@ -937,6 +1030,102 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 0, "{table}");
         }
+    }
+
+    /// An event of a practice and a race, and a rule if `rule`, read at `session_time`.
+    fn event(session_time: f64, rule: bool) -> Event {
+        let session = |order: i64, kind: &str| {
+            let mut session = bono_event_session::default();
+            session.session_time = Some(session_time).into();
+            session.event_order = Some(order).into();
+            session.session_type = Some(kind.to_owned()).into();
+            session.session_number = Some(1).into();
+            session.length_time = Some(1200.0).into();
+            session.finish = Some("time".to_owned()).into();
+            session
+        };
+        let mut rules = Vec::new();
+        if rule {
+            let mut rule = bono_event_rule::default();
+            rule.session_time = Some(session_time).into();
+            rule.name = Some("fuel_use_multiplier".to_owned()).into();
+            rule.value = Some("x2".to_owned()).into();
+            rules.push(rule);
+        }
+        Event {
+            sessions: vec![session(0, "practice"), session(1, "race")],
+            rules,
+        }
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn event_writer_writes_a_set_with_one_generation() {
+        let conn = setup_writer();
+        let mut writer = EventWriter::new(&conn).unwrap();
+        assert_eq!(newest_event_generation(&conn).unwrap(), None);
+        assert!(writer.write(event(10.0, true)).unwrap());
+
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM event_session WHERE generation = 1"),
+            2
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM event_rule WHERE generation = 1"),
+            1
+        );
+        assert_eq!(newest_event_generation(&conn).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn event_writer_skips_an_unchanged_set() {
+        let conn = setup_writer();
+        let mut writer = EventWriter::new(&conn).unwrap();
+        assert!(writer.write(event(10.0, true)).unwrap());
+        assert!(!writer.write(event(20.0, true)).unwrap());
+
+        assert_eq!(count(&conn, "SELECT count(*) FROM event_session"), 2);
+        assert_eq!(count(&conn, "SELECT count(*) FROM event_rule"), 1);
+    }
+
+    #[test]
+    fn event_generation_is_shared_when_a_set_has_no_rules() {
+        let conn = setup_writer();
+        let mut writer = EventWriter::new(&conn).unwrap();
+        assert!(writer.write(event(10.0, true)).unwrap());
+        assert!(writer.write(event(10.0, false)).unwrap());
+
+        assert_eq!(newest_event_generation(&conn).unwrap(), Some(2));
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM event_session WHERE generation = 2"),
+            2
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM event_rule WHERE generation = 2"),
+            0
+        );
+    }
+
+    #[test]
+    fn event_writer_writes_again_after_reset() {
+        let conn = setup_writer();
+        let mut writer = EventWriter::new(&conn).unwrap();
+        assert!(writer.write(event(10.0, true)).unwrap());
+        writer.reset();
+        assert!(writer.write(event(10.0, true)).unwrap());
+
+        assert_eq!(newest_event_generation(&conn).unwrap(), Some(2));
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM event_session WHERE generation = 2"),
+            2
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM event_rule WHERE generation = 2"),
+            1
+        );
     }
 
     fn setting(name: &str, value: &str) -> Setting {
