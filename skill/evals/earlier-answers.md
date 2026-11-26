@@ -13,7 +13,7 @@ is gone.
 
 | Case | Pass criteria |
 |---|---|
-| The same value asked again a few minutes later, after it has changed (fuel, then tyre temperatures) | Gives the current value. Doesn't say "correction", "I was wrong" or anything like it about the earlier figure. May say how much it changed, in one short clause, only when that's useful. |
+| The same value asked again a few minutes later, after it has changed (fuel, then tyre temperatures) | Answers from the current data. Doesn't say "correction", "I was wrong" or anything like it about the earlier figure. May say how much it changed, in one short clause, only when that's useful. |
 | The same question asked twice within half a minute, with the value drifting a little | As above: the small drift isn't treated as an error, and the second answer is no longer than the first. |
 | A follow-up after an earlier answer that used data it shouldn't have, such as a braking point taken from an invalidated lap | Still says the earlier answer was wrong, and why, in one sentence. |
 | A follow-up after the session changed, such as from practice to the race | Treats values from the earlier session as earlier readings, not mistakes. |

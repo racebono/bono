@@ -3029,7 +3029,7 @@ mod tests {
 
     #[test]
     fn asked_at_is_utc_to_the_second() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(1_795_716_274_900);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_795_716_274);
         assert_eq!(asked_at(now), "[Asked at 2026-11-26T18:04:34Z]");
     }
 
