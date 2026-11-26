@@ -23,7 +23,7 @@ use crate::{
     engineer::{Engineer, Speaker},
     language,
     sim::ActiveSimulator,
-    synthesizer::Synthesizer,
+    synthesizer::{Synthesizer, VoiceLoad},
 };
 use bono_i18n::t;
 use egui::{RichText, Widget};
@@ -312,8 +312,11 @@ impl Onboarding {
         ui.add_space(8.0);
         ui.strong(t!("onboarding.i_speak"));
         let mut ticked = self.ticked(&config.get());
-        let heard = *config.get().heard_language();
-        if languages_spoken(ui, &mut self.search, heard, &mut ticked) {
+        let (heard, voices) = {
+            let raw = config.get();
+            (*raw.heard_language(), raw.voices().keys().copied().collect::<Vec<_>>())
+        };
+        if languages_spoken(ui, &mut self.search, heard, &voices, &mut ticked) {
             self.ticked = Some(ticked.clone());
         }
 
@@ -639,10 +642,17 @@ fn still_downloading(
 ) {
     let (langs, engine) = {
         let raw = config.get();
-        let getting = audio.voices.getting();
+        let mut langs = audio.voices.asked();
+        // A voice that was set up, and then didn't load
+        for (&lang, _) in raw.voices() {
+            if synth.load(lang) == Some(VoiceLoad::Failed) && !langs.contains(&lang) {
+                langs.push(lang);
+            }
+        }
         let automatic = raw.whisper_model().is_none();
-        let engine = automatic.then(|| audio.whisper.wanted(&raw, &getting).0);
-        (getting, engine)
+        let wanted = || audio.whisper.wanted(&raw, &audio.voices.getting()).0;
+        let engine = automatic.then(|| audio.whisper.setting_up().unwrap_or_else(wanted));
+        (langs, engine)
     };
     let items = audio.setup_items(rt, config, synth, &langs, engine);
     if !items.is_empty() {
@@ -754,6 +764,7 @@ fn languages_spoken(
     ui: &mut egui::Ui,
     search: &mut String,
     heard: Option<ArrayStr<2>>,
+    voices: &[ArrayStr<2>],
     ticked: &mut BTreeSet<ArrayStr<2>>,
 ) -> bool {
     let mut langs = (RECOMMENDED.iter())
@@ -763,7 +774,8 @@ fn languages_spoken(
             engine::parakeet_knows(lang) || whisper_rs::get_lang_id(&lang).is_some()
         })
         .collect::<Vec<_>>();
-    for lang in heard.map(language::voice_code).into_iter().chain(ticked.iter().copied()) {
+    let others = heard.map(language::voice_code).into_iter().chain(voices.iter().copied());
+    for lang in others.chain(ticked.iter().copied()) {
         if !langs.iter().any(|(other, _)| *other == lang) {
             langs.push((lang, language::ui_name(lang)));
         }
@@ -830,8 +842,7 @@ fn plan(
 ) -> (Answer, Option<Engine>) {
     let voices = config.voices().keys().copied().collect::<Vec<_>>();
     let usable = audio.usable_voices(config, synth);
-    let reply = config.engineer_reply_language().filter(|lang| usable.contains(lang));
-    let answer = answer(ticked, &voices, &usable, reply);
+    let answer = answer(ticked, &voices, &usable, config.engineer_reply_language());
     let whisper = &audio.whisper;
     let picked = match config.whisper_model() {
         None => Picked::None,
@@ -887,7 +898,7 @@ struct Answer {
 }
 
 /// `voices`: the languages with a voice, and `usable` those whose voice is on disk and loads (the
-/// others are set up again). `reply`: the fixed reply language, if it's usable.
+/// others are set up again). `reply`: the fixed reply language, if it has a voice.
 fn answer(
     ticked: &BTreeSet<ArrayStr<2>>,
     voices: &[ArrayStr<2>],
@@ -898,11 +909,11 @@ fn answer(
         1 => ticked.first().copied(),
         _ => None,
     };
-    // The engineer only speaks the reply language then
-    if reply.is_some() {
+    // The engineer only speaks the reply language then: its voice is all it needs
+    if let Some(reply) = reply {
         return Answer {
             heard,
-            get: Vec::new(),
+            get: (!usable.contains(&reply)).then_some(reply).into_iter().collect(),
             remove: Vec::new(),
         };
     }
@@ -962,6 +973,12 @@ mod tests {
 
     fn answered(ticked: &[ArrayStr<2>], voices: &[ArrayStr<2>], reply: Option<ArrayStr<2>>) -> Answer {
         answer(&ticked.iter().copied().collect(), voices, voices, reply)
+    }
+
+    #[test]
+    fn a_broken_reply_voice_is_set_up_again_and_kept() {
+        let answer = answer(&BTreeSet::from([EN, FR]), &[ES], &[], Some(ES));
+        assert_eq!((answer.get, answer.remove), (vec![ES], vec![]));
     }
 
     #[test]

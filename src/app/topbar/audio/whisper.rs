@@ -267,12 +267,17 @@ impl Whisper {
                 ),
                 None => {
                     // Whisper's model is only downloaded with the catalog's size and hash
-                    if matches!(self.catalog, MaybeDone::Done(None)) {
-                        if ui.button(t!("onboarding.retry")).clicked() {
-                            self.retry_catalog();
+                    match &self.catalog {
+                        MaybeDone::Task(_) => {
+                            ui.spinner();
                         }
-                    } else {
-                        ui.spinner();
+                        MaybeDone::Done(None) => {
+                            if ui.button(t!("onboarding.retry")).clicked() {
+                                self.retry_catalog();
+                            }
+                        }
+                        // It isn't in the catalog
+                        MaybeDone::Done(Some(_)) => warning(ui, t!("onboarding.unavailable").into()),
                     }
                     return;
                 }
@@ -319,12 +324,12 @@ impl Whisper {
         // What Automatic loaded is in use too, while one is chosen
         let loaded = self.loaded.clone();
         // The model picked doesn't hear a language in use
-        let english_only = match &picked {
-            Some(picked) => (self.catalog(rt).unwrap_or_default().iter())
-                .find(|model| model.path == *picked && model.english_only)
-                .map(|model| model.name.clone()),
-            None => None,
-        };
+        // As whisper.cpp names its English-only models (`ggml-small.en-q5_1.bin`): known without the
+        // catalog
+        let english_only = (picked.as_ref())
+            .and_then(|picked| picked.file_name())
+            .filter(|name| name.contains(".en"))
+            .map(ToOwned::to_owned);
         let unheard = |name: &str, hears: fn(ArrayStr<2>) -> bool| {
             let unheard = languages.iter().copied().filter(|&lang| !hears(lang));
             Some((name.to_owned(), unheard.collect::<Vec<_>>()))
@@ -384,7 +389,7 @@ impl Whisper {
                             return;
                         }
                         let picked = picked.as_ref() == Some(&parakeet_path);
-                        let used = picked || loaded.as_ref() == Some(&parakeet_path);
+                        let used = (picked || loaded.as_ref() == Some(&parakeet_path)) && !failed;
                         match (on_disk, self.parakeet.progress()) {
                             (Some(true), None) => {
                                 ui.horizontal(|ui| {
@@ -468,7 +473,8 @@ impl Whisper {
                             row.col(|ui| {
                                 if on_disk && model.download().is_none() {
                                     let picked = picked.as_ref() == Some(&model.path);
-                                    let used = picked || loaded.as_ref() == Some(&model.path);
+                                    let used =
+                                        (picked || loaded.as_ref() == Some(&model.path)) && !failed;
                                     ui.horizontal(|ui| {
                                         ui.add_enabled_ui(!picked || failed, |ui| {
                                             if ui.button(t!("audio.use")).clicked() {
@@ -647,10 +653,9 @@ impl Whisper {
         let gpu = *config.get().whisper_gpu();
         // While a model is deleted, a check from before may still find it: what's loaded stays
         self.parakeet.shown_on_disk(rt, &self.files);
-        let turbo_deleted = (self.recommended(rt)).is_some_and(|model| {
-            model.on_disk(rt);
-            model.deletion.pending()
-        });
+        let files = self.files.clone();
+        let turbo_deleted = (self.recommended(rt))
+            .is_some_and(|model| model.deletion.stale(rt, files.found(&model.path)));
         let deleting = self.parakeet.deleting() || turbo_deleted;
         let target = self.target(&config.get(), getting).filter(|_| !deleting);
         if let Some(target) = target {
@@ -707,8 +712,32 @@ impl Whisper {
     /// `None` sets up nothing.
     pub fn setup(&mut self, engine: Option<Engine>) {
         self.retry_catalog();
+        // Another engine than the one asked for before: that one's download isn't wanted now
+        if let Some(before) = self.setup.filter(|&before| Some(before) != engine) {
+            match before {
+                Engine::Parakeet => self.parakeet.stop_downloads(),
+                Engine::Whisper => {
+                    if let MaybeDone::Done(Some(catalog)) = &mut self.catalog
+                        && let Some(model) = catalog.iter_mut().find(|model| model.file == RECOMMENDED)
+                    {
+                        model.download = None;
+                    }
+                }
+            }
+        }
         self.setup = engine;
         self.setup_started = false;
+        // One that couldn't be loaded is tried again
+        if self.failed()
+            && let Some(path) = self.loaded.clone()
+        {
+            self.set_model(path, self.loaded_gpu);
+        }
+    }
+
+    /// The engine whose model setup is getting.
+    pub fn setting_up(&self) -> Option<Engine> {
+        self.setup
     }
 
     /// The model of `engine`, as the setup guide shows it: `None` for none, when the model picked
@@ -739,7 +768,10 @@ impl Whisper {
                 let on_disk = self.files.checked(&path);
                 match self.catalog.update(rt) {
                     Some(Some(catalog)) => {
-                        let model = (catalog.iter_mut()).find(|model| model.file == RECOMMENDED)?;
+                        let Some(model) = (catalog.iter_mut()).find(|model| model.file == RECOMMENDED)
+                        else {
+                            return Some(SetupItem::Unavailable);
+                        };
                         let progress = model.download().map(Download::progress);
                         let state = state(&path, model.on_disk(rt), progress, model.failed());
                         (TURBO_NAME, model.size, state)

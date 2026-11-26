@@ -112,6 +112,11 @@ impl Files {
         self.deletion.on_disk(rt, found)
     }
 
+    /// Stops their downloads.
+    pub fn stop_downloads(&mut self) {
+        self.downloads = None;
+    }
+
     /// Deletes them in the background.
     pub fn delete(&mut self) {
         self.downloads = None;

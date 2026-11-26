@@ -208,8 +208,23 @@ impl Voices {
             .collect();
     }
 
-    /// The languages whose voice is being set up.
+    /// The languages whose voice is being set up, and is coming: not those whose download failed.
     pub fn getting(&self) -> Vec<ArrayStr<2>> {
+        let failed = |setup: &Setup| match &self.catalog {
+            MaybeDone::Done(Some(catalog)) => (catalog.languages.iter())
+                .filter(|language| language.code == setup.lang)
+                .flat_map(|language| &language.voices)
+                .any(|voice| voice.is_named(setup.name) && voice.failed()),
+            _ => false,
+        };
+        (self.setup.iter())
+            .filter(|setup| !failed(setup))
+            .map(|setup| setup.lang)
+            .collect()
+    }
+
+    /// The languages whose voice the setup guide asked for and isn't used yet, failed ones too.
+    pub fn asked(&self) -> Vec<ArrayStr<2>> {
         self.setup.iter().map(|setup| setup.lang).collect()
     }
 
@@ -253,7 +268,9 @@ impl Voices {
             Some(None) => return unusable.then_some(SetupItem::Unavailable),
             Some(Some(catalog)) => catalog,
         };
-        let voice = find(&mut catalog.languages, lang, name)?;
+        let Some(voice) = find(&mut catalog.languages, lang, name) else {
+            return Some(SetupItem::Unavailable);
+        };
         if !in_setup
             && !failed
             && (picked.as_ref())
@@ -407,9 +424,9 @@ fn set_up(
     let picked = config.get().voices().get(&lang).cloned();
     // A picked voice that didn't load is replaced (or loaded again, if it's the recommended)
     let failed = synth.load(lang) == Some(VoiceLoad::Failed);
+    // It stays asked for (the guide says it's unavailable), so what Automatic wants doesn't change
     let Some(voice) = find(&mut catalog.languages, lang, name) else {
-        log::warn!("The recommended voice '{name}' isn't in the catalog");
-        return true;
+        return false;
     };
 
     // Wait until the picked voice's files are checked before deciding to keep it

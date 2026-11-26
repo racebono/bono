@@ -947,12 +947,6 @@ impl Engineer {
     /// The language `question` is in, when it isn't known from how it was asked: `None` if nothing
     /// tells languages apart, so the model goes by the question.
     fn question_language(&self, config: &Config, question: &str) -> Option<ArrayStr<2>> {
-        // Detection only chooses among the languages it has: with a voice's language among those it
-        // hasn't, it would name the wrong one, so the model goes by the question
-        let voices = config.get().voices().keys().copied().collect::<Vec<_>>();
-        if voices.len() > 1 && !voices.iter().all(|&lang| crate::language::told_apart(lang)) {
-            return None;
-        }
         match self.languages.detect(question) {
             Some(lang) => Some(lang),
             // Too short or ambiguous for any language in particular ("Positions."): the one the
