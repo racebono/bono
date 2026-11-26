@@ -550,6 +550,16 @@
         "es": "Dice \"verde, verde, verde\" cuando empieza la carrera, y cuando vuelve a verde justo después de una bandera roja",
         "ca": "Diu \"verd, verd, verd\" quan comença la cursa, i quan torna a verd just després d'una bandera vermella"
     },
+    "spotter.gap_behind": {
+        "en": "Car behind",
+        "es": "Coche detrás",
+        "ca": "Cotxe al darrere"
+    },
+    "spotter.gap_behind_hover": {
+        "en": "In races, says when a car closes to within a second behind. Doesn't affect the calls for cars alongside",
+        "es": "En carrera, avisa cuando un coche se acerca a menos de un segundo por detrás. No afecta a los avisos de coches a tu lado",
+        "ca": "En cursa, avisa quan un cotxe s'acosta a menys d'un segon per darrere. No afecta els avisos de cotxes al teu costat"
+    },
     "spotter.qualifying_lap_times": {
         "en": "Lap times in qualifying",
         "es": "Tiempos de vuelta en clasificación",
@@ -885,6 +895,116 @@
         "es": "Usar",
         "ca": "Fes servir"
     },
+    "audio.delete": {
+        "en": "Delete ({size})",
+        "es": "Borrar ({size})",
+        "ca": "Esborra ({size})"
+    },
+    "audio.delete_in_use": {
+        "en": "It's in use: use another model to delete this one",
+        "es": "Está en uso: usa otro modelo para borrar este",
+        "ca": "Està en ús: fes servir un altre model per esborrar aquest"
+    },
+    "audio.delete_voice_in_use": {
+        "en": "It's in use: Bono will no longer speak {language}",
+        "es": "Está en uso: Bono dejará de hablar {language}",
+        "ca": "Està en ús: Bono deixarà de parlar {language}"
+    },
+    "audio.stt_automatic": {
+        "en": "Automatic",
+        "es": "Automático",
+        "ca": "Automàtic"
+    },
+    "audio.stt_recommended": {
+        "en": "recommended",
+        "es": "recomendado",
+        "ca": "recomanat"
+    },
+    "audio.stt_choose": {
+        "en": "Choose a model",
+        "es": "Elegir un modelo",
+        "ca": "Tria un model"
+    },
+    "audio.stt_using": {
+        "en": "Using {engine}",
+        "es": "Usando {engine}",
+        "ca": "Fent servir {engine}"
+    },
+    "audio.stt_parakeet": {
+        "en": "Parakeet hears {languages}, and runs on the processor, so it doesn't slow the simulator down.",
+        "es": "Parakeet entiende {languages} y se ejecuta en el procesador, así que no ralentiza el simulador.",
+        "ca": "Parakeet entén {languages} i s'executa al processador, així que no alenteix el simulador."
+    },
+    "audio.stt_doesnt_hear": {
+        "en": "{engine} doesn't hear {languages}.",
+        "es": "{engine} no entiende {languages}.",
+        "ca": "{engine} no entén {languages}."
+    },
+    "audio.stt_hear_only_question": {
+        "en": "Only speak {language}?",
+        "es": "¿Solo hablas {language}?",
+        "ca": "Només parles {language}?"
+    },
+    "audio.stt_hear_only": {
+        "en": "Hear {language} only",
+        "es": "Entender solo {language}",
+        "ca": "Entén només {language}"
+    },
+    "audio.stt_point": {
+        "en": "Choose one in {menu} › {setting} to use Parakeet.",
+        "es": "Elige uno en {menu} › {setting} para usar Parakeet.",
+        "ca": "Tria'n un a {menu} › {setting} per fer servir Parakeet."
+    },
+    "audio.stt_ambiguous": {
+        "en": "{languages} can't be told apart from the text Parakeet writes.",
+        "es": "{languages} no se pueden distinguir por el texto que escribe Parakeet.",
+        "ca": "{languages} no es poden distingir pel text que escriu Parakeet."
+    },
+    "audio.stt_any": {
+        "en": "Replies are always in the same language, so any language may be spoken.",
+        "es": "Las respuestas están siempre en el mismo idioma, así que se puede hablar en cualquiera.",
+        "ca": "Les respostes són sempre en el mateix idioma, així que es pot parlar en qualsevol."
+    },
+    "audio.stt_still": {
+        "en": "Still using {engine}",
+        "es": "Aún se usa {engine}",
+        "ca": "Encara es fa servir {engine}"
+    },
+    "audio.stt_none": {
+        "en": "Nothing can hear you yet.",
+        "es": "Aún no hay nada que te entienda.",
+        "ca": "Encara no hi ha res que t'entengui."
+    },
+    "audio.stt_whisper_does": {
+        "en": "Whisper does:",
+        "es": "Whisper sí:",
+        "ca": "Whisper sí:"
+    },
+    "audio.stt_download": {
+        "en": "Download, {size}",
+        "es": "Descargar, {size}",
+        "ca": "Baixa, {size}"
+    },
+    "audio.stt_failed": {
+        "en": "{engine} couldn't be loaded.",
+        "es": "No se pudo cargar {engine}.",
+        "ca": "No s'ha pogut carregar {engine}."
+    },
+    "audio.stt_credit": {
+        "en": "Parakeet TDT 0.6B v3 by NVIDIA, CC-BY-4.0. ONNX conversion by istupakov.",
+        "es": "Parakeet TDT 0.6B v3 de NVIDIA, CC-BY-4.0. Conversión a ONNX de istupakov.",
+        "ca": "Parakeet TDT 0.6B v3 de NVIDIA, CC-BY-4.0. Conversió a ONNX d'istupakov."
+    },
+    "audio.stt_unavailable": {
+        "en": "Whisper large-v3-turbo can't be found to download.",
+        "es": "No se encuentra Whisper large-v3-turbo para descargarlo.",
+        "ca": "No es troba Whisper large-v3-turbo per baixar-lo."
+    },
+    "audio.stt_european": {
+        "en": "25 European",
+        "es": "25 europeos",
+        "ca": "25 europeus"
+    },
     "audio.voice": {
         "en": "Voice",
         "es": "Voz",
@@ -999,6 +1119,11 @@
         "en": "Unexpected error handling event",
         "es": "Error inesperado al gestionar un evento",
         "ca": "Error inesperat en gestionar un esdeveniment"
+    },
+    "error.deleting": {
+        "en": "Error deleting file",
+        "es": "Error al borrar un archivo",
+        "ca": "Error en esborrar un fitxer"
     },
     "error.removing_temporary": {
         "en": "Error removing temporary file",
@@ -1485,9 +1610,9 @@
         "ca": "El model de veu a text encara s'està carregant: torna-ho a provar d'aquí a un moment"
     },
     "engineer.stt_unsupported_language": {
-        "en": "The selected speech to text model only understands English and cannot hear {language}: pick a multilingual model in Audio › Speech To Text, or choose English in Engineer › Heard language",
-        "es": "El modelo de voz a texto seleccionado solo entiende inglés y no puede escuchar {language}: elige un modelo multilingüe en Audio › Voz a texto, o elige inglés en Ingeniero › Idioma de entrada",
-        "ca": "El model de veu a text seleccionat només entén anglès i no pot escoltar {language}: tria un model multilingüe a Àudio › Veu a text, o tria anglès a Enginyer › Idioma d'entrada"
+        "en": "The speech to text model in use can't hear {language}: get one that can in Audio › Speech To Text, or change Engineer › Heard language",
+        "es": "El modelo de voz a texto en uso no puede escuchar {language}: consigue uno que sí en Audio › Voz a texto, o cambia Ingeniero › Idioma de entrada",
+        "ca": "El model de veu a text en ús no pot escoltar {language}: aconsegueix-ne un que sí a Àudio › Veu a text, o canvia Enginyer › Idioma d'entrada"
     },
     "engineer.no_voice_for": {
         "en": "Heard in {language}: \"{text}\". There's no voice to answer in {language}: get one in Audio › Text To Speech",
@@ -1783,6 +1908,26 @@
         "en": "Retry",
         "es": "Reintentar",
         "ca": "Torna-ho a provar"
+    },
+    "onboarding.app_language": {
+        "en": "App language",
+        "es": "Idioma de la aplicación",
+        "ca": "Idioma de l'aplicació"
+    },
+    "onboarding.i_speak": {
+        "en": "I speak",
+        "es": "Hablo",
+        "ca": "Parlo"
+    },
+    "onboarding.search_languages": {
+        "en": "Search {count} languages",
+        "es": "Buscar entre {count} idiomas",
+        "ca": "Cerca entre {count} idiomes"
+    },
+    "onboarding.total": {
+        "en": "Total",
+        "es": "Total",
+        "ca": "Total"
     },
     "onboarding.account_title": {
         "en": "Your Bono account",

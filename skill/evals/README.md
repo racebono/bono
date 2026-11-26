@@ -16,7 +16,7 @@ are controlled manual/model scenarios; adding them does not establish a pass.
 choice at a required stop, and reconsidering slicks late in a wet race. These require
 their stated evidence; do not run them against the existing dry database unchanged.
 
-`language.md` covers answering in the pilot's language across tool calls, earlier answers in English and ambiguous short questions. Run it
+`language.md` covers answering in the pilot's language across tool calls, earlier answers in English, ambiguous short questions and misheard words. Run it
 with `EVAL_LANG`. These are controlled manual/model scenarios, not executed results.
 
 `invalidated-corners.md` covers informational use of invalidated passes, clean-first improvement

@@ -1,16 +1,22 @@
 use crate::{
     Download,
     app::topbar::{
-        audio::{RecordingStream, SetupItem, SetupState},
-        setup_label, size_text,
+        audio::{
+            Deletion, RecordingStream, SetupItem, SetupState, app_language,
+            engine::{self, Engine, Note, Used, Why},
+            gpu,
+            parakeet::{self, Parakeet},
+            scroll_bar_beside,
+        },
+        SETUP_COLOR, setup_label, size_text,
     },
     arrstr,
     button::ConfigButton,
     config::{ArrayStr, Config, RawConfig},
     engineer::{Heard, NotListening},
-    error,
+    error, language,
+    synthesizer::phonemizer,
     task::{JoinHandle, MaybeDone, spawn, spawn_blocking},
-    updating,
 };
 use bono_i18n::t;
 use camino::Utf8Path;
@@ -48,36 +54,36 @@ pub const RECORDING_SPEC: AudioSpec = AudioSpec {
 };
 
 /// Whether Bono was built with a backend that runs whisper on a GPU
-const GPU_BACKEND: bool = cfg!(any(
-    feature = "cuda",
+pub(super) const GPU_BACKEND: bool = cfg!(any(
     feature = "hipblas",
     feature = "intel-sycl",
     feature = "vulkan",
     target_vendor = "apple"
 ));
 
-/// The model the setup guide downloads: it understands every language, and is quick on a GPU
+/// The Whisper model the setup guide downloads, and Automatic uses: it understands every language,
+/// and is quick on a GPU
 const RECOMMENDED: &str = "ggml-large-v3-turbo-q5_0.bin";
 
 /// How long a toggled microphone stays open before the pilot is taken to have [forgotten] it
 const TALK_LIMIT: Duration = Duration::from_secs(60);
 
+/// Hears the pilot with Whisper, or Parakeet (see [`engine`]).
 pub struct Whisper {
     /// Model and reusable session, shared with workers and only freed on one.
-    ctx: Option<MaybeDone<Option<Arc<WhisperModel>>>>,
-    /// The model `ctx` is loaded from
+    ctx: Option<MaybeDone<Option<Arc<LoadedModel>>>>,
+    /// The model `ctx` is loaded from: Parakeet's encoder for Parakeet
     loaded: Option<Arc<Utf8Path>>,
+    /// "Choose a model" was clicked with nothing in use: the models are shown, and Automatic
+    /// goes on until one is picked
+    choosing: bool,
     /// Whether `ctx` was loaded to run on the GPU
     loaded_gpu: bool,
-    /// The setup guide asked for the recommended model: it's downloaded, then used once it's on
-    /// disk (unless another was picked meanwhile)
-    setup: bool,
-    /// The setup's download was started: one that fails isn't started again until it's asked
-    /// for again
+    /// The setup guide asked for this engine's model, for Automatic: it's downloaded, unless a
+    /// model is picked, and used by Automatic once it's on disk
+    setup: Option<Engine>,
+    /// Setup's download was started: one that fails isn't started again until it's asked for again
     setup_started: bool,
-    /// When setup first found the recommended model ready to replace the picked one: it waits for
-    /// a check of the picked one's file started since, so a stale result doesn't replace it
-    replace_since: Option<Instant>,
     stream: Option<WhisperStream>,
     /// When the recording started
     talk_started: Instant,
@@ -91,6 +97,7 @@ pub struct Whisper {
     threads: NonZeroUsize,
     client: reqwest::Client,
     files: super::ModelFiles,
+    parakeet: parakeet::Files,
 }
 
 impl Whisper {
@@ -134,184 +141,390 @@ impl Whisper {
         files: super::ModelFiles,
     ) -> Self {
         let pref_path = pref_path.clone();
+        // Half the logical cores. Whisper's threads wait for each other at every step, so once there
+        // are too few cores for them and the simulator, transcribing takes many times longer
         let threads = threads
-            .or_else(|| std::thread::available_parallelism().ok())
+            .or_else(|| NonZeroUsize::new(std::thread::available_parallelism().ok()?.get() / 2))
             .unwrap_or(NonZeroUsize::MIN);
 
-        let mut this = Self {
+        // What's used is loaded by `poll`, once the files it needs have been checked
+        Self {
             client: client.clone(),
             ctx: None,
             loaded: None,
+            choosing: false,
             loaded_gpu: *config.whisper_gpu(),
-            setup: false,
+            setup: None,
             setup_started: false,
-            replace_since: None,
             stream: None,
             talk_started: Instant::now(),
             talk_joystick: None,
             talk_settings: (None, false),
             catalog: Self::fetch_catalog(pref_path.clone(), client.clone(), 3),
+            parakeet: parakeet::Files::new(&pref_path),
             pref_path,
             threads,
             files,
-        };
-
-        if let Some(model) = config.whisper_model().clone() {
-            this.set_model(model, *config.whisper_gpu());
         }
-
-        return this;
     }
 
-    pub fn update(&mut self, rt: &Handle, config: &mut Config, ui: &mut egui::Ui) {
-        let client = self.client.clone();
-        let failed = self.failed();
-        let label = setup_label(
-            config
-                .get()
-                .whisper_model()
-                .as_ref()
-                .is_none_or(|path| !self.files.is_file(path))
-                || failed,
-            t!("audio.speech_to_text"),
-        );
-        let pending = self.catalog.update(rt).is_none();
-        let unavailable = matches!(self.catalog, MaybeDone::Done(None));
-        if pending || unavailable {
-            ui.menu_button(label, |ui| {
-                if ui
-                    .add_enabled(unavailable, egui::Button::new(t!("onboarding.retry")))
-                    .clicked()
-                {
-                    self.retry_catalog();
+    /// The Speech To Text menu. `getting`: the languages whose voice is being set up.
+    pub fn update(
+        &mut self,
+        rt: &Handle,
+        config: &mut Config,
+        ui: &mut egui::Ui,
+        getting: &[ArrayStr<2>],
+    ) {
+        // Chosen by hand, then made automatic (by the setup guide)
+        if config.get().whisper_model().is_some() {
+            self.choosing = false;
+        }
+        let label = setup_label(self.missing(&config.get(), getting), t!("audio.speech_to_text"));
+        ui.menu_button(label, |ui| {
+            let automatic = config.get().whisper_model().is_none() && !self.choosing;
+            ui.horizontal(|ui| {
+                if ui.radio(automatic, t!("audio.stt_automatic")).clicked() && !automatic {
+                    self.choosing = false;
+                    config.update(|raw| raw.whisper_model.set(None));
                 }
-                if pending {
-                    ui.spinner();
-                }
+                ui.weak(t!("audio.stt_recommended"));
             });
+            // It starts from the model in use, which stays loaded
+            if ui.radio(!automatic, t!("audio.stt_choose")).clicked() && automatic {
+                match self.loaded.clone() {
+                    Some(path) => config.update(|raw| raw.whisper_model.set(Some(path))),
+                    None => self.choosing = true,
+                }
+            }
+            ui.separator();
+            if automatic {
+                self.note(rt, config, ui, getting);
+            }
+            if self.engine() == Some(Engine::Whisper) {
+                if automatic {
+                    ui.separator();
+                }
+                whisper_settings(ui, config);
+            }
+            if !automatic {
+                if self.engine() == Some(Engine::Whisper) {
+                    ui.separator();
+                }
+                self.models(rt, config, ui, getting);
+            }
+        });
+    }
+
+    /// What Automatic uses, and why, with what it needs.
+    fn note(&mut self, rt: &Handle, config: &Config, ui: &mut egui::Ui, getting: &[ArrayStr<2>]) {
+        let (wanted, heard, voices) = {
+            let raw = config.get();
+            (self.wanted(&raw, getting), *raw.heard_language(), voices(&raw, getting))
+        };
+        match engine::note(wanted, self.engine(), self.failed(), heard, &voices) {
+            Note::Using(engine, why) => {
+                ui.strong(t!("audio.stt_using", engine = engine_name(engine)));
+                why_text(ui, &why, heard, &voices, false);
+            }
+            Note::HearOnly { lang, unknown } => {
+                ui.strong(t!("audio.stt_using", engine = engine_name(Engine::Whisper)));
+                let language = language::ui_name(lang);
+                ui.label(format!(
+                    "{} {}",
+                    doesnt_hear(parakeet::NAME, &unknown),
+                    t!("audio.stt_hear_only_question", language = &language),
+                ));
+                if ui.button(t!("audio.stt_hear_only", language = &language)).clicked() {
+                    config.update(|raw| raw.heard_language.set(Some(lang)));
+                }
+            }
+            Note::Missing { wanted, used, why } => {
+                match used {
+                    Some(used) => warning(ui, t!("audio.stt_still", engine = engine_name(used))),
+                    None => warning(ui, t!("audio.stt_none").into()),
+                }
+                why_text(ui, &why, heard, &voices, wanted == Engine::Whisper);
+                self.download(rt, ui, wanted);
+            }
+            Note::Failed(engine) => {
+                warning(ui, t!("audio.stt_failed", engine = engine_name(engine)));
+                if ui.button(t!("onboarding.retry")).clicked()
+                    && let Some(path) = self.loaded.clone()
+                {
+                    self.set_model(path, *config.get().whisper_gpu());
+                }
+            }
+        }
+    }
+
+    /// The button to download `engine`'s model, or how far its download is.
+    fn download(&mut self, rt: &Handle, ui: &mut egui::Ui, engine: Engine) {
+        let client = self.client.clone();
+        let files = self.files.clone();
+        let (on_disk, progress, size) = match engine {
+            Engine::Parakeet => (
+                self.parakeet.on_disk(&self.files),
+                self.parakeet.progress(),
+                Some(parakeet::SIZE),
+            ),
+            Engine::Whisper => match self.recommended(rt) {
+                Some(model) => (
+                    model.on_disk(rt, &files),
+                    model.download().map(Download::progress),
+                    model.size,
+                ),
+                None => {
+                    // Whisper's model is only downloaded with the catalog's size and hash
+                    match &self.catalog {
+                        MaybeDone::Task(_) => {
+                            ui.spinner();
+                        }
+                        MaybeDone::Done(None) => {
+                            if ui.button(t!("onboarding.retry")).clicked() {
+                                self.retry_catalog();
+                            }
+                        }
+                        // It isn't in the catalog
+                        MaybeDone::Done(Some(_)) => warning(ui, t!("audio.stt_unavailable").into()),
+                    }
+                    return;
+                }
+            },
+        };
+        if let Some(progress) = progress {
+            egui::ProgressBar::new(progress as f32).show_percentage().ui(ui);
             return;
         }
+        // Not checked yet: it may be there
+        if on_disk != Some(false) {
+            ui.spinner();
+            return;
+        }
+        let size = size.map_or("?".into(), size_text);
+        if ui.button(t!("audio.stt_download", size = size)).clicked() {
+            match engine {
+                Engine::Parakeet => self.parakeet.start_download(&client, &self.files),
+                Engine::Whisper => {
+                    if let Some(model) = self.recommended(rt) {
+                        model.start_download(&client);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The models to choose from: Parakeet, then Whisper's catalog.
+    fn models(
+        &mut self,
+        rt: &Handle,
+        config: &mut Config,
+        ui: &mut egui::Ui,
+        getting: &[ArrayStr<2>],
+    ) {
+        let picked = config.get().whisper_model().clone();
+        let failed = self.failed();
+        let languages = {
+            let raw = config.get();
+            let voices = voices(&raw, getting);
+            engine::in_use(*raw.heard_language(), &voices, app_language(raw.locale()))
+        };
+        let parakeet_path = self.parakeet.model().clone();
+        // What Automatic loaded is in use too, while one is chosen
+        let loaded = self.loaded.clone();
+        // The model picked doesn't hear a language in use
+        // As whisper.cpp names its English-only models (`ggml-small.en-q5_1.bin`): known without the
+        // catalog
+        let english_only = (picked.as_ref())
+            .and_then(|picked| picked.file_name())
+            .filter(|name| name.contains(".en"))
+            .map(ToOwned::to_owned);
+        let unheard = |name: &str, hears: fn(ArrayStr<2>) -> bool| {
+            let unheard = languages.iter().copied().filter(|&lang| !hears(lang));
+            Some((name.to_owned(), unheard.collect::<Vec<_>>()))
+        };
+        let unheard = match english_only {
+            _ if picked.as_ref() == Some(&parakeet_path) => {
+                unheard(parakeet::NAME, engine::parakeet_knows)
+            }
+            Some(name) => unheard(&name, |lang| lang == arrstr!("en")),
+            None => None,
+        };
+        if let Some((name, unheard)) = unheard.filter(|(_, unheard)| !unheard.is_empty()) {
+            warning(ui, doesnt_hear(&name, &unheard));
+        }
+
         let mut reload = None;
-        let catalog = self.catalog_mut(rt);
-        ui.add_enabled_ui(catalog.is_some(), |ui| {
-            ui.menu_button(label, |ui| {
-                config.maybe_update(|raw| {
-                    raw.min_confidence
-                        .edit(*raw.min_confidence(), |confidence| {
-                            ui.add(
-                                egui::Slider::new(confidence, 0.0..=1.0)
-                                    .text(t!("audio.language_confidence"))
-                                    .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
-                                    .custom_parser(|text| {
-                                        let text = text.trim().trim_end_matches('%').trim();
-                                        text.parse::<f64>().ok().map(|percent| percent / 100.0)
-                                    }),
-                            )
-                            .on_hover_text(t!("audio.language_confidence_hover"))
-                            .changed()
-                        })
-                });
-                // Without a GPU backend built in, it runs on the CPU either way
-                if GPU_BACKEND {
-                    // Changing it reloads the model, in `poll`
-                    config.maybe_update(|raw| {
-                        raw.whisper_gpu.edit(*raw.whisper_gpu(), |gpu| {
-                            ui.checkbox(gpu, t!("audio.whisper_gpu"))
-                                .on_hover_text(t!("audio.whisper_gpu_hover"))
-                                .changed()
-                        })
+        let mut retry = false;
+        let mut deleted_recommended = false;
+        let client = self.client.clone();
+        let files = self.files.clone();
+        scroll_bar_beside(ui);
+        egui_extras::TableBuilder::new(ui)
+            .id_salt("whisper-models")
+            .striped(true)
+            .columns(Column::auto(), 4)
+            .column(Column::remainder())
+            .header(20.0, |mut header| {
+                for title in [
+                    t!("audio.model"),
+                    t!("audio.quantization"),
+                    t!("audio.languages"),
+                    t!("audio.size"),
+                ] {
+                    header.col(|ui| {
+                        ui.strong(title);
                     });
                 }
-                ui.separator();
-
-                egui_extras::TableBuilder::new(ui)
-                    .id_salt("whisper-models")
-                    .striped(true)
-                    .columns(Column::auto(), 4)
-                    .column(Column::remainder())
-                    .header(20.0, |mut header| {
-                        header.col(|ui| {
-                            ui.strong(t!("audio.model"));
-                        });
-                        header.col(|ui| {
-                            ui.strong(t!("audio.quantization"));
-                        });
-                        header.col(|ui| {
-                            ui.strong(t!("audio.languages"));
-                        });
-                        header.col(|ui| {
-                            ui.strong(t!("audio.size"));
-                        });
-                    })
-                    .body(|mut body| {
-                        config.maybe_update(|config| {
-                            let mut updated = false;
-                            for model in catalog.unwrap_or_default() {
-                                body.row(18.0, |mut row| {
-                                    row.col(|ui| {
-                                        ui.label(&model.name);
-                                    });
-
-                                    row.col(|ui| {
-                                        if let Some(ref q) = model.quantization {
-                                            ui.label(q);
-                                        }
-                                    });
-
-                                    row.col(|ui| {
-                                        ui.label(if model.english_only {
-                                            t!("audio.english_only")
-                                        } else {
-                                            t!("audio.all_languages")
-                                        });
-                                    });
-
-                                    row.col(|ui| {
-                                        if let Some(size) = model.size {
-                                            ui.label(size_text(size));
-                                        }
-                                    });
-
-                                    if let Some(on_disk) = model.on_disk() {
-                                        row.col(|ui| {
-                                            if on_disk {
-                                                ui.add_enabled_ui(
-                                                    config.whisper_model().as_ref()
-                                                        != Some(&model.path)
-                                                        || failed,
-                                                    |ui| {
-                                                        if ui.button(t!("audio.use")).clicked() {
-                                                            config
-                                                                .whisper_model
-                                                                .set(Some(model.path.clone()));
-                                                            reload = Some(model.path.clone());
-                                                            updated = true;
-                                                        }
-                                                    },
-                                                );
-                                            } else if let Some(download) = model.download() {
-                                                egui::ProgressBar::new(download.progress() as f32)
-                                                    .show_percentage()
-                                                    .ui(ui);
-                                            } else if ui
-                                                .button(egui_phosphor::bold::CLOUD_ARROW_DOWN)
-                                                .clicked()
-                                            {
-                                                model.start_download(&client);
-                                            }
-                                        });
+            })
+            .body(|mut body| {
+                body.row(18.0, |mut row| {
+                    row.col(|ui| {
+                        ui.label(parakeet::NAME);
+                    });
+                    row.col(|ui| {
+                        ui.label("int8");
+                    });
+                    row.col(|ui| {
+                        ui.label(t!("audio.stt_european"))
+                            .on_hover_text(t!("audio.stt_credit"));
+                    });
+                    row.col(|ui| {
+                        ui.label(size_text(parakeet::SIZE));
+                    });
+                    let on_disk = self.parakeet.shown_on_disk(rt, &self.files);
+                    row.col(|ui| {
+                        if self.parakeet.deleting() {
+                            ui.spinner();
+                            return;
+                        }
+                        let picked = picked.as_ref() == Some(&parakeet_path);
+                        let used = (picked || loaded.as_ref() == Some(&parakeet_path)) && !failed;
+                        match (on_disk, self.parakeet.progress()) {
+                            (Some(true), None) => {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(!picked || failed, egui::Button::new(t!("audio.use")))
+                                        .clicked()
+                                    {
+                                        reload = Some(parakeet_path.clone());
+                                    }
+                                    if delete_button(ui, Some(parakeet::SIZE), used) {
+                                        self.parakeet.delete();
                                     }
                                 });
                             }
-                            return updated;
-                        });
+                            (_, Some(progress)) => {
+                                egui::ProgressBar::new(progress as f32).show_percentage().ui(ui);
+                            }
+                            (Some(false), None) => {
+                                let partly = (self.parakeet.paths().iter())
+                                    .any(|path| self.files.checked(path) == Some(true));
+                                ui.horizontal(|ui| {
+                                    if ui.button(egui_phosphor::bold::CLOUD_ARROW_DOWN).clicked() {
+                                        self.parakeet.start_download(&client, &self.files);
+                                    }
+                                    // What an unfinished download left
+                                    if partly && delete_button(ui, Some(parakeet::SIZE), false) {
+                                        self.parakeet.delete();
+                                    }
+                                });
+                            }
+                            (None, None) => {}
+                        }
                     });
+                });
+
+                let catalog = match self.catalog.update(rt) {
+                    Some(Some(catalog)) => catalog,
+                    unavailable => {
+                        let unavailable = unavailable.is_some();
+                        body.row(18.0, |mut row| {
+                            row.col(|ui| {
+                                if !unavailable {
+                                    ui.spinner();
+                                } else if ui.button(t!("onboarding.retry")).clicked() {
+                                    retry = true;
+                                }
+                            });
+                        });
+                        return;
+                    }
+                };
+                for model in catalog {
+                    body.row(18.0, |mut row| {
+                        row.col(|ui| {
+                            ui.label(&model.name);
+                        });
+                        row.col(|ui| {
+                            if let Some(ref q) = model.quantization {
+                                ui.label(q);
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(if model.english_only {
+                                t!("audio.english_only")
+                            } else {
+                                t!("audio.all_languages")
+                            });
+                        });
+                        row.col(|ui| {
+                            if let Some(size) = model.size {
+                                ui.label(size_text(size));
+                            }
+                        });
+
+                        let on_disk = model.on_disk(rt, &files);
+                        if model.deletion.pending() {
+                            row.col(|ui| {
+                                ui.spinner();
+                            });
+                        } else if let Some(on_disk) = on_disk {
+                            row.col(|ui| {
+                                if on_disk && model.download().is_none() {
+                                    let picked = picked.as_ref() == Some(&model.path);
+                                    let used =
+                                        (picked || loaded.as_ref() == Some(&model.path)) && !failed;
+                                    ui.horizontal(|ui| {
+                                        ui.add_enabled_ui(!picked || failed, |ui| {
+                                            if ui.button(t!("audio.use")).clicked() {
+                                                reload = Some(model.path.clone());
+                                            }
+                                        });
+                                        if model.delete_button(ui, used) {
+                                            deleted_recommended |= model.file == RECOMMENDED;
+                                        }
+                                    });
+                                } else if let Some(download) = model.download() {
+                                    egui::ProgressBar::new(download.progress() as f32)
+                                        .show_percentage()
+                                        .ui(ui);
+                                } else if ui
+                                    .button(egui_phosphor::bold::CLOUD_ARROW_DOWN)
+                                    .clicked()
+                                {
+                                    model.start_download(&client);
+                                }
+                            });
+                        }
+                    });
+                }
             });
-        });
+        if retry {
+            self.retry_catalog();
+        }
+        // Setup doesn't get it again
+        if deleted_recommended && self.setup == Some(Engine::Whisper) {
+            self.setup = None;
+        }
         if let Some(path) = reload {
             // A model picked by hand is what's used, whatever setup was getting
-            self.setup = false;
-            self.set_model(path, *config.get().whisper_gpu());
+            self.setup = None;
+            config.update(|raw| raw.whisper_model.set(Some(path.clone())));
+            // The one Automatic loaded is only loaded again if it failed
+            if self.loaded.as_ref() != Some(&path) || self.failed() {
+                self.set_model(path, *config.get().whisper_gpu());
+            }
         }
     }
 
@@ -355,7 +568,7 @@ impl Whisper {
         self.recording().then_some(self.talk_joystick)
     }
 
-    /// Whether the model picked is loaded, and can listen.
+    /// Whether the model used is loaded, and can listen.
     pub fn ready(&mut self, rt: &Handle) -> bool {
         matches!(
             self.ctx.as_mut().and_then(|ctx| ctx.update(rt)),
@@ -450,9 +663,9 @@ impl Whisper {
         }
     }
 
-    /// Called every frame: loads the model picked once it changes, and sets up the recommended
-    /// one if the setup guide asked for it.
-    pub fn poll(&mut self, rt: &Handle, config: &Config) {
+    /// Called every frame: loads the model to use once it changes, and sets up the recommended
+    /// one if the setup guide asked for it. `getting`: the languages whose voice is being set up.
+    pub fn poll(&mut self, rt: &Handle, config: &Config, getting: &[ArrayStr<2>]) {
         // What would have ended the recording may not any more
         if self.recording() && self.talk_settings != talk_settings(config) {
             self.cancel_recording();
@@ -461,60 +674,59 @@ impl Whisper {
         if let Some(ctx) = &mut self.ctx {
             ctx.update(rt);
         }
-        let (picked, gpu) = {
-            let config = config.get();
-            (config.whisper_model().clone(), *config.whisper_gpu())
-        };
-        if picked != self.loaded || (picked.is_some() && gpu != self.loaded_gpu) {
-            match picked {
-                Some(path) => self.set_model(path, gpu),
-                None => {
-                    drop_in_background(self.ctx.take());
-                    self.loaded = None;
+        let gpu = *config.get().whisper_gpu();
+        // While a model is deleted, a check from before may still find it: what's loaded stays
+        self.parakeet.shown_on_disk(rt, &self.files);
+        let files = self.files.clone();
+        let turbo_deleted = (self.recommended(rt)).is_some_and(|model| {
+            model.on_disk(rt, &files);
+            model.deletion.pending()
+        });
+        let deleting = self.parakeet.deleting() || turbo_deleted;
+        let target = self.target(&config.get(), getting).filter(|_| !deleting);
+        if let Some(target) = target {
+            let whisper = target.as_ref().is_some_and(|path| path != self.parakeet.model());
+            if target != self.loaded || (whisper && gpu != self.loaded_gpu) {
+                match target {
+                    Some(path) => self.set_model(path, gpu),
+                    None => {
+                        drop_in_background(self.ctx.take());
+                        self.loaded = None;
+                    }
                 }
             }
         }
 
-        if !self.setup {
+        let Some(wanted) = self.setup else {
+            return;
+        };
+        // A model picked by hand is what's used: the guide unpicks the ones it shouldn't keep
+        if config.get().whisper_model().is_some() {
+            self.setup = None;
             return;
         }
-        let picked = config.get().whisper_model().clone();
-        // Wait until the picked model's file is checked before deciding to keep it
-        let on_disk = match picked.as_ref().map(|path| self.files.checked(path)) {
-            Some(None) => return,
-            Some(Some(on_disk)) => on_disk,
-            None => false,
-        };
-        let usable = on_disk && !self.failed();
+        let start = !self.setup_started;
         let client = self.client.clone();
-        let started = self.setup_started;
-        let Some(model) = self.recommended(rt) else {
-            return;
+        let files = self.files.clone();
+        let on_disk = match wanted {
+            Engine::Parakeet => self.parakeet.on_disk(&self.files),
+            Engine::Whisper => match self.recommended(rt) {
+                Some(model) => model.on_disk(rt, &files),
+                None => return,
+            },
         };
-        if usable && (!started || picked.as_ref() != Some(&model.path)) {
-            self.setup = false;
-            return;
-        }
-        match model.on_disk() {
-            Some(true) => {
-                let path = model.path.clone();
-                if let Some(picked) = picked.as_ref().filter(|picked| **picked != path) {
-                    let since = *self.replace_since.get_or_insert_with(Instant::now);
-                    match self.files.checked_since(picked, Some(since)) {
-                        None => return,
-                        Some(true) if !self.failed() => {
-                            self.setup = false;
-                            return;
+        match on_disk {
+            // Automatic uses it
+            Some(true) => self.setup = None,
+            Some(false) if start => {
+                match wanted {
+                    Engine::Parakeet => self.parakeet.start_download(&client, &self.files),
+                    Engine::Whisper => {
+                        if let Some(model) = self.recommended(rt) {
+                            model.start_download(&client);
                         }
-                        Some(_) => {}
                     }
                 }
-                config.update(|raw| raw.whisper_model.set(Some(path.clone())));
-                self.set_model(path, *config.get().whisper_gpu());
-                self.setup = false;
-            }
-            Some(false) if !started => {
-                model.start_download(&client);
                 self.setup_started = true;
             }
             Some(false) => {}
@@ -523,59 +735,151 @@ impl Whisper {
         }
     }
 
-    /// Downloads the recommended model (again, if it failed), and uses it once it's on disk, if
-    /// none is usable by then.
-    pub fn setup(&mut self) {
+    /// Downloads `engine`'s model for Automatic (again, if it failed), unless a model is picked.
+    /// `None` sets up nothing.
+    pub fn setup(&mut self, engine: Option<Engine>) {
         self.retry_catalog();
-        self.setup = true;
+        // Another engine than the one asked for before: that one's download isn't wanted now
+        if let Some(before) = self.setup.filter(|&before| Some(before) != engine) {
+            match before {
+                Engine::Parakeet => self.parakeet.stop_downloads(),
+                Engine::Whisper => {
+                    if let MaybeDone::Done(Some(catalog)) = &mut self.catalog
+                        && let Some(model) = catalog.iter_mut().find(|model| model.file == RECOMMENDED)
+                    {
+                        model.download = None;
+                    }
+                }
+            }
+        }
+        self.setup = engine;
         self.setup_started = false;
-        self.replace_since = None;
+        // One that couldn't be loaded is forgotten: `poll` loads what's wanted now, it too if it is
+        if self.failed() {
+            drop_in_background(self.ctx.take());
+            self.loaded = None;
+        }
     }
 
-    /// The recommended model, as the setup guide shows it: `None` if another is picked.
-    pub fn setup_item(&mut self, rt: &Handle, config: &Config) -> Option<SetupItem> {
-        let picked = config.get().whisper_model().clone();
-        let setup = self.setup;
-        let failed = self.failed();
-        // The model being loaded
-        let loading = self.loaded.clone().filter(|_| self.loading());
-        let unusable = failed
-            || picked
-                .as_ref()
-                .is_none_or(|picked| !self.files.is_file(picked));
-        let model = match self.catalog.update(rt) {
-            None => return unusable.then_some(SetupItem::Loading),
-            Some(None) => return unusable.then_some(SetupItem::Unavailable),
-            Some(Some(catalog)) => catalog.iter().find(|model| model.file == RECOMMENDED)?,
-        };
-        if !setup
-            && !failed
-            && picked
-                .as_ref()
-                .is_some_and(|picked| *picked != model.path && self.files.is_file(picked))
-        {
-            return None;
-        }
+    /// The engine whose model setup is getting.
+    pub fn setting_up(&self) -> Option<Engine> {
+        self.setup
+    }
 
-        let state = match (model.on_disk(), model.download()) {
-            (Some(true), _) if failed && picked.as_ref() == Some(&model.path) => {
-                SetupState::LoadFailed
+    /// The model of `engine`, as the setup guide shows it: `None` for none, when the model picked
+    /// stays.
+    pub fn setup_item(&mut self, rt: &Handle, engine: Option<Engine>) -> Option<SetupItem> {
+        let engine = engine?;
+        let (failed, loading, loaded) = (self.failed(), self.loading(), self.loaded.clone());
+        let state = |path: &Arc<Utf8Path>, on_disk, progress, download_failed| {
+            let used = loaded.as_ref() == Some(path);
+            match (on_disk, progress) {
+                (Some(true), _) if used && failed => SetupState::LoadFailed,
+                (Some(true), _) if used && loading => SetupState::Loading,
+                (Some(true), _) => SetupState::Ready,
+                (_, Some(progress)) => SetupState::Downloading(progress),
+                _ if download_failed => SetupState::Failed,
+                _ => SetupState::Missing,
             }
-            // On disk but not used, and setup isn't going to: retrying uses it
-            (Some(true), _) if !setup && picked.as_ref() != Some(&model.path) => {
-                SetupState::Missing
+        };
+        let (name, size, state) = match engine {
+            Engine::Parakeet => {
+                let on_disk = self.parakeet.on_disk(&self.files);
+                let (progress, download_failed) = (self.parakeet.progress(), self.parakeet.failed());
+                let state = state(self.parakeet.model(), on_disk, progress, download_failed);
+                (parakeet::NAME, Some(parakeet::SIZE), state)
             }
-            (Some(true), _) if loading.as_ref() == Some(&model.path) => SetupState::Loading,
-            (Some(true), _) => SetupState::Ready,
-            (_, Some(download)) => SetupState::Downloading(download.progress()),
-            _ if model.failed() => SetupState::Failed,
-            _ => SetupState::Missing,
+            Engine::Whisper => {
+                let path = self.turbo();
+                let on_disk = self.files.checked(&path);
+                match self.catalog.update(rt) {
+                    Some(Some(catalog)) => {
+                        match (catalog.iter_mut()).find(|model| model.file == RECOMMENDED) {
+                            Some(model) => {
+                                let progress = model.download().map(Download::progress);
+                                let on_disk = model.on_disk(rt, &self.files);
+                                let state = state(&path, on_disk, progress, model.failed());
+                                (TURBO_NAME, model.size, state)
+                            }
+                            // Not in the catalog: only what's on disk can be used
+                            None if on_disk == Some(true) => {
+                                (TURBO_NAME, None, state(&path, on_disk, None, false))
+                            }
+                            None => return Some(SetupItem::Unavailable),
+                        }
+                    }
+                    // It's only downloaded with the catalog's size and hash
+                    _ if on_disk != Some(true) => {
+                        return Some(match self.catalog.update(rt) {
+                            None => SetupItem::Loading,
+                            Some(_) => SetupItem::Unavailable,
+                        });
+                    }
+                    _ => (TURBO_NAME, None, state(&path, on_disk, None, false)),
+                }
+            }
         };
         Some(SetupItem::Found {
-            name: model.name.clone(),
-            size: model.size,
+            name: name.to_owned(),
+            size,
             state,
         })
+    }
+
+    /// Where the recommended Whisper model is, known without the catalog.
+    pub fn turbo(&self) -> Arc<Utf8Path> {
+        self.pref_path.join("whisper").join(RECOMMENDED).into()
+    }
+
+    /// Where Parakeet is, as the model picked has it.
+    pub fn parakeet_path(&self) -> &Arc<Utf8Path> {
+        self.parakeet.model()
+    }
+
+    /// What Automatic wants now, and why. `getting`: the languages whose voice is being set up,
+    /// which count as having one.
+    pub fn wanted(&self, config: &RawConfig, getting: &[ArrayStr<2>]) -> (Engine, Why) {
+        let voices = voices(config, getting);
+        let reply = config.spoken_language().filter(|lang| voices.contains(lang));
+        engine::wanted(*config.heard_language(), &voices, reply, app_language(config.locale()))
+    }
+
+    /// Whether the model is missing, or didn't load: the menu and setup guide have their sign.
+    pub fn missing(&self, config: &RawConfig, getting: &[ArrayStr<2>]) -> bool {
+        let parakeet_missing = || self.parakeet.on_disk(&self.files) == Some(false);
+        self.failed()
+            || match config.whisper_model() {
+                Some(path) if path == self.parakeet.model() => parakeet_missing(),
+                Some(path) => !self.files.is_file(path),
+                None => match self.wanted(config, getting).0 {
+                    Engine::Parakeet => parakeet_missing(),
+                    Engine::Whisper => !self.files.is_file(&self.turbo()),
+                },
+            }
+    }
+
+    /// The model to load: `Some(None)` for none, and `None` while that isn't known yet (what's
+    /// loaded stays).
+    fn target(&self, config: &RawConfig, getting: &[ArrayStr<2>]) -> Option<Option<Arc<Utf8Path>>> {
+        let parakeet = self.parakeet.model();
+        let used = match config.whisper_model() {
+            // Only with all its files: one of them alone doesn't load
+            Some(path) if path == parakeet => {
+                return Some(self.parakeet.on_disk(&self.files)?.then(|| path.clone()));
+            }
+            Some(path) => return Some(self.files.checked(path)?.then(|| path.clone())),
+            None => engine::used(
+                self.wanted(config, getting).0,
+                self.parakeet.on_disk(&self.files),
+                self.files.checked(&self.turbo()),
+            ),
+        };
+        match used {
+            Used::Engine(Engine::Parakeet) => Some(Some(parakeet.clone())),
+            Used::Engine(Engine::Whisper) => Some(Some(self.turbo())),
+            Used::Nothing => Some(None),
+            Used::Wait => None,
+        }
     }
 
     fn recommended(&mut self, rt: &Handle) -> Option<&mut Model> {
@@ -588,29 +892,82 @@ impl Whisper {
         matches!(self.ctx, Some(MaybeDone::Done(None)))
     }
 
+    /// Whether a model is still being deleted.
+    pub fn deleting(&self) -> bool {
+        self.parakeet.deletion_running()
+            || matches!(&self.catalog, MaybeDone::Done(Some(catalog))
+                if catalog.iter().any(|model| model.deletion.running()))
+    }
+
+    /// The engine in use: `None` if nothing is.
+    pub fn engine(&self) -> Option<Engine> {
+        let loaded = self.loaded.as_ref()?;
+        Some(match loaded == self.parakeet.model() {
+            true => Engine::Parakeet,
+            false => Engine::Whisper,
+        })
+    }
+
     fn loading(&self) -> bool {
         matches!(self.ctx, Some(MaybeDone::Task(_)))
     }
 
-    /// Loads `path`, to run on the GPU if `gpu` (and there's one).
+    /// Loads `path`, Parakeet's encoder or a Whisper model, the latter to run on the GPU if `gpu`
+    /// (and there's one).
     pub fn set_model(&mut self, path: Arc<Utf8Path>, gpu: bool) {
         self.loaded = Some(path.clone());
         self.loaded_gpu = gpu;
         // The model replaced (or still loading) is freed on a worker
         drop_in_background(self.ctx.take());
         let threads = self.threads;
+        if path == *self.parakeet.model() {
+            let dir = self.parakeet.folder().to_owned();
+            self.ctx = Some(MaybeDone::spawn_blocking(move || {
+                match Parakeet::load(&dir, threads) {
+                    Ok(parakeet) => {
+                        log::info!("Loaded {dir} for speech to text");
+                        Some(Arc::new(LoadedModel::new(LoadedEngine::Parakeet(parakeet))))
+                    }
+                    Err(e) => {
+                        error(t!("error.stt_model"), format!("{e:#}"));
+                        None
+                    }
+                }
+            }));
+            return;
+        }
         self.ctx = Some(MaybeDone::spawn_blocking(move || {
             let mut params = WhisperContextParameters::default();
             params.use_gpu(gpu);
+            let gpu = if gpu { gpu::choose() } else { None };
+            params.gpu_device(gpu.as_ref().map_or(0, |gpu| gpu.device));
+            // Off on the CPU, where it's a little slower
+            let flash = gpu.as_ref().is_some_and(|gpu| gpu.flash);
+            params.flash_attn(flash);
             match WhisperContext::new_with_params(path.as_os_str(), params) {
                 Ok(ctx) => {
-                    log::info!("Loaded {path} for speech to text (GPU: {gpu})");
-                    Some(Arc::new(WhisperModel {
+                    let gpu = gpu.map_or("none".to_owned(), |gpu| gpu.name);
+                    log::info!(
+                        "Loaded {path} for speech to text (GPU: {gpu}, flash attention: {flash})"
+                    );
+                    let model = Arc::new(LoadedModel::new(LoadedEngine::Whisper(WhisperModel {
                         ctx,
                         session: SessionCache::default(),
-                        latest: AtomicU64::new(0),
                         threads,
-                    }))
+                    })));
+                    if flash {
+                        let model = Arc::downgrade(&model);
+                        // Not part of loading, as questions are refused until that's done. Nor for
+                        // a model that was replaced while it loaded
+                        Handle::current().spawn_blocking(move || {
+                            if let Some(model) = model.upgrade()
+                                && let LoadedEngine::Whisper(whisper) = &model.engine
+                            {
+                                whisper.warm_up();
+                            }
+                        });
+                    }
+                    Some(model)
                 }
                 Err(e) => {
                     error(t!("error.stt_model"), e);
@@ -619,6 +976,127 @@ impl Whisper {
             }
         }));
     }
+}
+
+/// The languages with a voice, and those `getting` one (being set up), which count as having one.
+fn voices(config: &RawConfig, getting: &[ArrayStr<2>]) -> Vec<ArrayStr<2>> {
+    let mut voices = config.voices().keys().copied().collect::<Vec<_>>();
+    for &lang in getting {
+        if !voices.contains(&lang) {
+            voices.push(lang);
+        }
+    }
+    voices
+}
+
+/// Automatic's Whisper, as the menu names it.
+const TURBO_NAME: &str = "Whisper large-v3-turbo";
+
+/// The engine Automatic uses, as the menu names it.
+fn engine_name(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Parakeet => parakeet::NAME,
+        Engine::Whisper => TURBO_NAME,
+    }
+}
+
+/// `langs` as the app names them.
+fn language_names(langs: &[ArrayStr<2>]) -> String {
+    let names = langs.iter().map(|&lang| language::ui_name(lang));
+    names.collect::<Vec<_>>().join(", ")
+}
+
+/// That the model `name` doesn't hear `langs`.
+fn doesnt_hear(name: &str, langs: &[ArrayStr<2>]) -> String {
+    t!("audio.stt_doesnt_hear", engine = name, languages = language_names(langs))
+}
+
+/// Why Automatic wants the engine it does. `whisper_does`: Whisper is wanted and not downloaded.
+fn why_text(
+    ui: &mut egui::Ui,
+    why: &Why,
+    heard: Option<ArrayStr<2>>,
+    voices: &[ArrayStr<2>],
+    whisper_does: bool,
+) {
+    let point = || {
+        t!(
+            "audio.stt_point",
+            menu = t!("engineer"),
+            setting = t!("engineer.heard_language")
+        )
+    };
+    let text = match why {
+        Why::Known(langs) => t!("audio.stt_parakeet", languages = language_names(langs)),
+        Why::Unknown(langs) => {
+            let mut text = doesnt_hear(parakeet::NAME, langs);
+            // Several voices in languages Parakeet knows: one of them can be the one heard
+            let known = voices.iter().filter(|&&lang| engine::parakeet_knows(lang));
+            if heard.is_none() && known.count() > 1 {
+                text = format!("{text} {}", point());
+            }
+            if whisper_does {
+                text = format!("{text} {}", t!("audio.stt_whisper_does"));
+            }
+            text
+        }
+        Why::Ambiguous(langs) => format!(
+            "{} {}",
+            t!("audio.stt_ambiguous", languages = language_names(langs)),
+            point()
+        ),
+        Why::AnyLanguage => t!("audio.stt_any").into(),
+    };
+    ui.label(text);
+}
+
+/// The settings that only apply to Whisper.
+fn whisper_settings(ui: &mut egui::Ui, config: &mut Config) {
+    config.maybe_update(|raw| {
+        raw.min_confidence
+            .edit(*raw.min_confidence(), |confidence| {
+                ui.add(
+                    egui::Slider::new(confidence, 0.0..=1.0)
+                        .text(t!("audio.language_confidence"))
+                        .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
+                        .custom_parser(|text| {
+                            let text = text.trim().trim_end_matches('%').trim();
+                            text.parse::<f64>().ok().map(|percent| percent / 100.0)
+                        }),
+                )
+                .on_hover_text(t!("audio.language_confidence_hover"))
+                .changed()
+            })
+    });
+    // Without a GPU backend built in, it runs on the CPU either way
+    if GPU_BACKEND {
+        // Changing it reloads the model, in `poll`
+        config.maybe_update(|raw| {
+            raw.whisper_gpu.edit(*raw.whisper_gpu(), |gpu| {
+                ui.checkbox(gpu, t!("audio.whisper_gpu"))
+                    .on_hover_text(t!("audio.whisper_gpu_hover"))
+                    .changed()
+            })
+        });
+    }
+}
+
+/// `text`, with the sign of something to set up.
+fn warning(ui: &mut egui::Ui, text: String) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new(egui_phosphor::bold::WARNING).color(SETUP_COLOR));
+        ui.label(text);
+    });
+}
+
+/// The button to delete a model of `size` bytes, unless it's `used`. Returns whether it was
+/// clicked.
+fn delete_button(ui: &mut egui::Ui, size: Option<u64>, used: bool) -> bool {
+    let size = size.map_or("?".into(), size_text);
+    ui.add_enabled(!used, egui::Button::new(egui_phosphor::bold::TRASH))
+        .on_hover_text(t!("audio.delete", size = size))
+        .on_disabled_hover_text(t!("audio.delete_in_use"))
+        .clicked()
 }
 
 /// What an event does to the talk button's recording.
@@ -737,12 +1215,78 @@ impl<T: Send + 'static> Drop for DropInBackground<T> {
     }
 }
 
-/// One loaded model generation. Workers serialize access instead of allocating a second state.
+/// One loaded model generation, kept by the recordings that started with it.
+struct LoadedModel {
+    engine: LoadedEngine,
+    /// The last recording finished: earlier ones still waiting aren't heard
+    latest: AtomicU64,
+}
+
+impl LoadedModel {
+    fn new(engine: LoadedEngine) -> Self {
+        Self {
+            engine,
+            latest: AtomicU64::new(0),
+        }
+    }
+}
+
+enum LoadedEngine {
+    Whisper(WhisperModel),
+    Parakeet(Parakeet),
+}
+
+/// The languages an engine can hear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Knows {
+    Everything,
+    English,
+    /// Those of [`engine::parakeet_knows`]
+    Parakeet,
+}
+
+impl LoadedEngine {
+    fn knows(&self) -> Knows {
+        match self {
+            Self::Whisper(whisper) if whisper.ctx.is_multilingual() => Knows::Everything,
+            Self::Whisper(_) => Knows::English,
+            Self::Parakeet(_) => Knows::Parakeet,
+        }
+    }
+}
+
+/// Workers serialize access instead of allocating a second state.
 struct WhisperModel {
     ctx: WhisperContext,
     session: SessionCache<WhisperSession>,
-    latest: AtomicU64,
     threads: NonZeroUsize,
+}
+
+impl WhisperModel {
+    /// Transcribes a second of silence. The driver builds its shaders the first time after installing
+    /// Bono or the driver, which takes seconds that the first question would wait for.
+    fn warm_up(&self) {
+        let start = Instant::now();
+        let silence = self.session.run(
+            || self.new_session(),
+            |session| session.speech_to_text(arrstr!("en"), &[0.0; 16000]),
+        );
+        match silence {
+            Ok(_) => log::debug!("Warmed up speech to text in {:?}", start.elapsed()),
+            Err(e) => log::warn!("Unable to warm up speech to text: {e}"),
+        }
+    }
+
+    fn new_session(&self) -> anyhow::Result<WhisperSession> {
+        let start = Instant::now();
+        let state = self.ctx.create_state()?;
+        log::debug!("Created whisper's state in {:?}", start.elapsed());
+        Ok(WhisperSession {
+            state,
+            threads: self.threads,
+            multilingual: self.ctx.is_multilingual(),
+        })
+    }
 }
 
 /// Access only on blocking workers: initialization, use and destruction can all be expensive.
@@ -782,8 +1326,9 @@ impl<T> SessionCache<T> {
     }
 }
 
-/// A recording retains its model generation, including when settings change mid-recording.
-struct PendingSession(DropInBackground<Arc<WhisperModel>>);
+/// A recording retains its model generation, including when settings or the engine change
+/// mid-recording.
+struct PendingSession(DropInBackground<Arc<LoadedModel>>);
 
 pub struct WhisperSession {
     state: WhisperState,
@@ -829,100 +1374,125 @@ impl PendingSession {
         }
 
         return spawn_blocking(move || {
-            let start = Instant::now();
             let samples = recv.recv()??;
-            log::debug!("Sample count: {}", samples.len());
-            if samples.len() < MIN_SAMPLES {
-                return Ok(Heard::TooShort);
-            }
-            let (voices, min_confidence, heard_language, spoken_language) = {
-                let config = config.get();
-                let voices = config.voices().keys().copied().collect::<Vec<_>>();
-                (
-                    voices,
-                    *config.min_confidence(),
-                    *config.heard_language(),
-                    config.engineer_reply_language(),
-                )
-            };
-
-            let model = self.0.into_inner();
-            if let Some(problem) = transcription_problem(
-                model.ctx.is_multilingual(),
-                heard_language,
-                spoken_language,
-                &voices,
-            ) {
-                return Ok(problem);
-            }
-            // Whisper makes words up for silence, so it never hears it
-            if !voiced(&samples) {
-                log::debug!("Only silence on the radio");
-                return Ok(Heard::Nothing);
-            }
-            // With a fixed reply language, the input needs no voice of its own.
-            let candidates = match spoken_language {
-                Some(_) => (0..=whisper_rs::get_lang_max_id())
-                    .filter_map(|id| whisper_language(id as usize))
-                    .collect::<Vec<_>>(),
-                None => voices.clone(),
-            };
-            model.session.run(
-                || {
-                    anyhow::ensure!(model.latest.load(Ordering::Relaxed) == ticket, "Superseded recording");
-                    let start = Instant::now();
-                    let state = model.ctx.create_state()?;
-                    log::debug!("Created whisper's state in {:?}", start.elapsed());
-                    Ok(WhisperSession {
-                        state,
-                        threads: model.threads,
-                        multilingual: model.ctx.is_multilingual(),
-                    })
-                },
-                |session| {
-                    if model.latest.load(Ordering::Relaxed) != ticket {
-                        return Ok(Heard::Nothing);
-                    }
-                    let waited = start.elapsed();
-                    let detect = Instant::now();
-                    let spoken = Spoken::resolve(session.multilingual, heard_language, &voices, || {
-                        // Only detection needs this separate pass. Full transcription prepares
-                        // its own mel, so a fixed language goes straight to `speech_to_text`.
-                        session.state.pcm_to_mel(&samples, session.threads.get())?;
-                        session.detect_language(&candidates, min_confidence)
-                    })?;
-                    if model.latest.load(Ordering::Relaxed) != ticket {
-                        return Ok(Heard::Nothing);
-                    }
-                    let transcribe = Instant::now();
-                    // Something said in a language without a voice is still transcribed: if it's no
-                    // words after all, it was noise
-                    let heard = match spoken {
-                        Spoken::Voiced(lang) => match session.speech_to_text(lang, &samples)? {
-                            text if text.is_empty() => Heard::Nothing,
-                            text => Heard::Question {
-                                text,
-                                lang,
-                                released,
-                            },
-                        },
-                        Spoken::Unvoiced(lang) => match session.speech_to_text(lang, &samples)? {
-                            text if text.is_empty() => Heard::Nothing,
-                            text => Heard::Unvoiced { text, lang },
-                        },
-                        Spoken::Unclear => Heard::Nothing,
-                    };
-                    log::debug!(
-                        "Speech to text took {:?}: waited {waited:?} for the state, {:?} \
-                         resolving the language (including mel preparation for detection), {:?} transcribing",
-                        start.elapsed(),
-                        transcribe - detect,
-                        transcribe.elapsed(),
-                    );
-                    return Ok(heard);
-                },
-            )
+            self.0.into_inner().hear(&samples, &config, ticket, released)
         });
+    }
+}
+
+impl LoadedModel {
+    /// What was said in `samples`, the recording `ticket` (released at `released`). Blocks.
+    fn hear(
+        &self,
+        samples: &[f32],
+        config: &Config,
+        ticket: u64,
+        released: Instant,
+    ) -> anyhow::Result<Heard> {
+        let start = Instant::now();
+        log::debug!("Sample count: {}", samples.len());
+        if samples.len() < MIN_SAMPLES {
+            return Ok(Heard::TooShort);
+        }
+        let (voices, min_confidence, heard_language, spoken_language) = {
+            let config = config.get();
+            let voices = config.voices().keys().copied().collect::<Vec<_>>();
+            (
+                voices,
+                *config.min_confidence(),
+                *config.heard_language(),
+                config.engineer_reply_language(),
+            )
+        };
+
+        if let Some(problem) = transcription_problem(
+            self.engine.knows(),
+            heard_language,
+            spoken_language,
+            &voices,
+        ) {
+            return Ok(problem);
+        }
+        // Whisper makes words up for silence, so it never hears it
+        if !voiced(samples) {
+            log::debug!("Only silence on the radio");
+            return Ok(Heard::Nothing);
+        }
+        let superseded = || self.latest.load(Ordering::Relaxed) != ticket;
+        let model = match &self.engine {
+            LoadedEngine::Whisper(model) => model,
+            LoadedEngine::Parakeet(parakeet) => {
+                if superseded() {
+                    return Ok(Heard::Nothing);
+                }
+                let text = speech(&parakeet.transcribe(samples)?);
+                log::debug!("Speech to text took {:?} with Parakeet", start.elapsed());
+                return Ok(match text.is_empty() {
+                    true => Heard::Nothing,
+                    // Parakeet doesn't say which language it heard: it's only known if there's one
+                    false => Heard::Question {
+                        text,
+                        lang: only_language(heard_language, &voices),
+                        released,
+                    },
+                });
+            }
+        };
+        // With a fixed reply language, the input needs no voice of its own.
+        let candidates = match spoken_language {
+            Some(_) => (0..=whisper_rs::get_lang_max_id())
+                .filter_map(|id| whisper_language(id as usize))
+                .collect::<Vec<_>>(),
+            None => voices.clone(),
+        };
+        model.session.run(
+            || {
+                anyhow::ensure!(!superseded(), "Superseded recording");
+                model.new_session()
+            },
+            |session| {
+                if superseded() {
+                    return Ok(Heard::Nothing);
+                }
+                let waited = start.elapsed();
+                let detect = Instant::now();
+                let spoken = Spoken::resolve(session.multilingual, heard_language, &voices, || {
+                    // Only detection needs this separate pass. Full transcription prepares
+                    // its own mel, so a fixed language goes straight to `speech_to_text`.
+                    session.state.pcm_to_mel(samples, session.threads.get())?;
+                    session.detect_language(&candidates, min_confidence)
+                })?;
+                if superseded() {
+                    return Ok(Heard::Nothing);
+                }
+                let transcribe = Instant::now();
+                // Something said in a language without a voice is still transcribed: if it's no
+                // words after all, it was noise
+                let heard = match spoken {
+                    Spoken::Voiced(lang) => match session.speech_to_text(lang, samples)? {
+                        text if text.is_empty() => Heard::Nothing,
+                        text => Heard::Question {
+                            text,
+                            lang: Some(lang),
+                            released,
+                        },
+                    },
+                    Spoken::Unvoiced(lang) => match session.speech_to_text(lang, samples)? {
+                        text if text.is_empty() => Heard::Nothing,
+                        text => Heard::Unvoiced { text, lang },
+                    },
+                    Spoken::Unclear => Heard::Nothing,
+                };
+                log::debug!(
+                    "Speech to text took {:?}: waited {waited:?} for the state, {:?} \
+                     resolving the language (including mel preparation for detection), {:?} transcribing",
+                    start.elapsed(),
+                    transcribe - detect,
+                    transcribe.elapsed(),
+                );
+                return Ok(heard);
+            },
+        )
     }
 }
 
@@ -953,7 +1523,7 @@ impl WhisperSession {
     /// What was said in `lang`: empty if it's no words.
     fn speech_to_text(&mut self, lang: ArrayStr<2>, samples: &[f32]) -> anyhow::Result<String> {
         // Use greedy decoding on both CPU and GPU, keeping the default full audio
-        // context and temperature fallback.
+        // context and temperature fallback. A shorter context makes turbo repeat what was said.
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
         params.set_n_threads(c_int::try_from(self.threads.get()).unwrap_or(c_int::MAX));
@@ -1017,7 +1587,7 @@ fn voiced(samples: &[f32]) -> bool {
 
 /// Reject incompatible settings before inference or language detection starts.
 fn transcription_problem(
-    multilingual: bool,
+    knows: Knows,
     heard_language: Option<ArrayStr<2>>,
     spoken_language: Option<ArrayStr<2>>,
     voices: &[ArrayStr<2>],
@@ -1025,15 +1595,39 @@ fn transcription_problem(
     if voices.is_empty() {
         return Some(Heard::NoVoice(None));
     }
-    if !multilingual {
-        if let Some(lang) = heard_language.filter(|lang| *lang != arrstr!("en")) {
-            return Some(Heard::UnsupportedLanguage(lang));
+    match knows {
+        Knows::Everything => {}
+        Knows::English => {
+            if let Some(lang) = heard_language.filter(|lang| *lang != arrstr!("en")) {
+                return Some(Heard::UnsupportedLanguage(lang));
+            }
+            if spoken_language.is_none() && !voices.contains(&arrstr!("en")) {
+                return Some(Heard::NoVoice(Some(arrstr!("en"))));
+            }
         }
-        if spoken_language.is_none() && !voices.contains(&arrstr!("en")) {
-            return Some(Heard::NoVoice(Some(arrstr!("en"))));
+        // With several languages, it hears those it knows: with none, the first it doesn't
+        Knows::Parakeet => {
+            let unknown = match only_language(heard_language, voices) {
+                Some(lang) => Some(lang),
+                None if !voices.iter().any(|&lang| engine::parakeet_knows(lang)) => {
+                    voices.first().copied()
+                }
+                None => None,
+            };
+            if let Some(lang) = unknown.filter(|&lang| !engine::parakeet_knows(lang)) {
+                return Some(Heard::UnsupportedLanguage(lang));
+            }
         }
     }
     None
+}
+
+/// The language of everything said, if there's only one: the Heard language, or a lone voice's.
+fn only_language(heard: Option<ArrayStr<2>>, voices: &[ArrayStr<2>]) -> Option<ArrayStr<2>> {
+    heard.or(match voices {
+        [only] => Some(*only),
+        _ => None,
+    })
 }
 
 /// How sure whisper has to be of a language without a voice to tell the pilot there's none for
@@ -1073,13 +1667,9 @@ impl Spoken {
         voices: &[ArrayStr<2>],
         detect: impl FnOnce() -> anyhow::Result<Self>,
     ) -> anyhow::Result<Self> {
-        let fixed = if !multilingual {
-            Some(arrstr!("en"))
-        } else {
-            heard_language.or_else(|| match voices {
-                [only] => Some(*only),
-                _ => None,
-            })
+        let fixed = match multilingual {
+            false => Some(arrstr!("en")),
+            true => only_language(heard_language, voices),
         };
         match fixed {
             Some(lang) => Ok(Self::Voiced(lang)),
@@ -1280,14 +1870,28 @@ pub struct Model {
     pub sha256: Option<String>,
     pub file: String,
     pub path: Arc<Utf8Path>,
-    on_disk: tokio::sync::watch::Receiver<Option<bool>>,
     download: Option<Download>,
+    deletion: Deletion,
 }
 
 impl Model {
-    #[inline]
-    pub fn on_disk(&self) -> Option<bool> {
-        *self.on_disk.borrow()
+    /// Whether it's on disk: `None` until it's been checked, and while it's deleted.
+    pub fn on_disk(&mut self, rt: &Handle, files: &super::ModelFiles) -> Option<bool> {
+        let found = files.found(&self.path);
+        self.deletion.on_disk(rt, found)
+    }
+
+    /// The button to delete it, unless it's `used`. Returns whether it was clicked.
+    fn delete_button(&mut self, ui: &mut egui::Ui, used: bool) -> bool {
+        let clicked = delete_button(ui, self.size, used);
+        if clicked {
+            self.download = None;
+            let path = self.path.as_std_path().to_path_buf();
+            // The phonemizer inherited the file if it was started while whisper was reading it, and
+            // keeps it open
+            self.deletion.start(phonemizer::stop, vec![path]);
+        }
+        clicked
     }
 
     /// The download under way: `None` if there's none, it failed, or it's done.
@@ -1368,7 +1972,8 @@ impl Model {
                 continue;
             };
 
-            if name.contains('/') {
+            // Only files in its own folder
+            if name.contains(['/', '\\']) {
                 continue;
             }
 
@@ -1402,12 +2007,9 @@ impl Model {
                 quantization: quantization.map(ToOwned::to_owned),
                 sha256: oid,
                 file,
-                path: path.clone(),
-                on_disk: updating(Duration::from_millis(1234), None, move |_| {
-                    let path = path.clone();
-                    async move { tokio::fs::try_exists(&*path).await.ok() }
-                }),
+                path,
                 download: None,
+                deletion: Deletion::default(),
             });
         }
 
@@ -1851,19 +2453,188 @@ mod tests {
     #[test]
     fn rejects_incompatible_model_and_voice_settings_before_transcription() {
         let [en, es] = [arrstr!("en"), arrstr!("es")];
+        let (english, everything) = (Knows::English, Knows::Everything);
         assert!(
-            matches!(transcription_problem(false, None, None, &[es]), Some(Heard::NoVoice(Some(lang))) if lang == en)
+            matches!(transcription_problem(english, None, None, &[es]), Some(Heard::NoVoice(Some(lang))) if lang == en)
         );
         assert!(
-            matches!(transcription_problem(false, Some(es), Some(en), &[en]), Some(Heard::UnsupportedLanguage(lang)) if lang == es)
+            matches!(transcription_problem(english, Some(es), Some(en), &[en]), Some(Heard::UnsupportedLanguage(lang)) if lang == es)
         );
         assert!(matches!(
-            transcription_problem(true, None, None, &[]),
+            transcription_problem(everything, None, None, &[]),
             Some(Heard::NoVoice(None))
         ));
-        assert!(transcription_problem(false, None, Some(es), &[es]).is_none());
-        assert!(transcription_problem(false, Some(en), None, &[en]).is_none());
-        assert!(transcription_problem(true, Some(es), None, &[en]).is_none());
+        assert!(transcription_problem(english, None, Some(es), &[es]).is_none());
+        assert!(transcription_problem(english, Some(en), None, &[en]).is_none());
+        assert!(transcription_problem(everything, Some(es), None, &[en]).is_none());
+    }
+
+    #[test]
+    fn parakeet_refuses_the_only_language_it_does_not_know() {
+        let [es, ca] = [arrstr!("es"), arrstr!("ca")];
+        let problem = |heard, voices: &[_]| transcription_problem(Knows::Parakeet, heard, None, voices);
+        assert!(matches!(problem(Some(ca), &[es]), Some(Heard::UnsupportedLanguage(l)) if l == ca));
+        assert!(matches!(problem(None, &[ca]), Some(Heard::UnsupportedLanguage(l)) if l == ca));
+        // It hears the ones it knows, and says so when it knows none
+        assert!(problem(None, &[ca, es]).is_none());
+        let eu = arrstr!("eu");
+        assert!(matches!(problem(None, &[ca, eu]), Some(Heard::UnsupportedLanguage(l)) if l == ca));
+        assert!(problem(Some(es), &[ca]).is_none());
+        assert!(matches!(problem(Some(es), &[]), Some(Heard::NoVoice(None))));
+        // Norwegian, under any of its codes
+        assert!(problem(Some(arrstr!("nb")), &[es]).is_some());
+    }
+
+    #[test]
+    fn only_one_language_is_known_beforehand() {
+        let [es, fr] = [arrstr!("es"), arrstr!("fr")];
+        assert_eq!(only_language(Some(es), &[es, fr]), Some(es));
+        assert_eq!(only_language(None, &[fr]), Some(fr));
+        assert_eq!(only_language(None, &[es, fr]), None);
+        assert_eq!(only_language(None, &[]), None);
+    }
+
+    /// A `Whisper` for the models in `pref_path`, without Whisper's catalog.
+    fn whisper(pref_path: &Utf8Path) -> Whisper {
+        Whisper {
+            ctx: None,
+            loaded: None,
+            choosing: false,
+            loaded_gpu: false,
+            setup: None,
+            setup_started: false,
+            stream: None,
+            talk_started: Instant::now(),
+            talk_joystick: None,
+            talk_settings: (None, false),
+            catalog: MaybeDone::Done(None),
+            pref_path: Arc::from(pref_path),
+            threads: NonZeroUsize::MIN,
+            client: reqwest::Client::new(),
+            files: super::super::ModelFiles::new(),
+            parakeet: parakeet::Files::new(pref_path),
+        }
+    }
+
+    async fn config(dir: &Path) -> Config {
+        let path = dir.join("config.json");
+        std::fs::write(&path, b"{}").unwrap();
+        Config::new(&path).await.unwrap()
+    }
+
+    /// Waits until `done`, for at most 10 s.
+    fn until(mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        tokio::task::block_in_place(|| {
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn automatic_loads_what_is_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let pref_path = Utf8Path::from_path(dir.path()).unwrap();
+        let config = config(dir.path()).await;
+        let whisper = whisper(pref_path);
+        let (turbo, parakeet) = (whisper.turbo(), whisper.parakeet.model().clone());
+        let target = || whisper.target(&config.get(), &[]);
+        // English: Parakeet is wanted
+        assert_eq!(whisper.wanted(&config.get(), &[]).0, Engine::Parakeet);
+
+        until(|| target().is_some());
+        assert_eq!(target(), Some(None));
+        assert!(whisper.missing(&config.get(), &[]));
+
+        // Whisper hears until Parakeet's there
+        std::fs::create_dir_all(turbo.parent().unwrap()).unwrap();
+        std::fs::write(&*turbo, []).unwrap();
+        until(|| target() == Some(Some(turbo.clone())));
+        assert!(whisper.missing(&config.get(), &[]));
+
+        // One of Parakeet's files isn't enough
+        std::fs::create_dir_all(whisper.parakeet.folder()).unwrap();
+        let [encoder, rest @ ..] = whisper.parakeet.paths();
+        std::fs::write(&encoder, []).unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(target(), Some(Some(turbo.clone())));
+        for path in rest {
+            std::fs::write(path, []).unwrap();
+        }
+        until(|| target() == Some(Some(parakeet.clone())));
+        assert!(!whisper.missing(&config.get(), &[]));
+
+        std::fs::remove_dir_all(dir.path().join("parakeet")).unwrap();
+        std::fs::remove_file(&*turbo).unwrap();
+        until(|| target() == Some(None));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_picked_model_that_is_gone_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let pref_path = Utf8Path::from_path(dir.path()).unwrap();
+        let config = config(dir.path()).await;
+        let mut whisper = whisper(pref_path);
+        let rt = Handle::current();
+
+        let small = Arc::<Utf8Path>::from(pref_path.join("whisper").join("ggml-small.bin"));
+        let parakeet = whisper.parakeet.model().clone();
+        // Neither is loaded without its files
+        for (picked, loaded) in [(small, None), (parakeet, None)] {
+            config.update(|raw| raw.whisper_model.set(Some(picked.clone())));
+            until(|| {
+                tokio::task::block_in_place(|| whisper.poll(&rt, &config, &[]));
+                whisper.loaded == loaded && whisper.missing(&config.get(), &[])
+            });
+            assert_eq!(*config.get().whisper_model(), Some(picked));
+        }
+    }
+
+    /// Needs `BONO_PARAKEET` (Parakeet's folder) and `BONO_VOICE_ES` (a Piper voice).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn a_recording_keeps_the_engine_it_started_with() {
+        let rt = Handle::current();
+        let dir = tempfile::tempdir().unwrap();
+        let pref_path = Utf8Path::from_path(dir.path()).unwrap();
+        let config = config(dir.path()).await;
+        let mut synth = crate::synthesizer::Synthesizer::new(&rt, &config.get());
+        let es = arrstr!("es");
+        let voice = Utf8PathBuf::from(std::env::var("BONO_VOICE_ES").unwrap());
+        config.update(|raw| raw.set_voice(&rt, es, voice, &mut synth));
+
+        let mut whisper = whisper(pref_path);
+        let model = Arc::new(LoadedModel::new(LoadedEngine::Parakeet(
+            tokio::task::block_in_place(parakeet::tests::load),
+        )));
+        whisper.ctx = Some(MaybeDone::Done(Some(model.clone())));
+        let session = PendingSession(DropInBackground::new(model));
+        // The engine changes while the talk button is held
+        whisper.set_model(whisper.turbo(), false);
+
+        let samples = parakeet::tests::spoken("BONO_VOICE_ES", "¿Cuánto combustible me queda?");
+        let model = session.0.into_inner();
+        let ticket = model.latest.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let heard = tokio::task::block_in_place(|| {
+            model.hear(&samples, &config, ticket, Instant::now())
+        });
+        match heard.unwrap() {
+            // Its only voice's language
+            Heard::Question { text, lang, .. } => {
+                println!("{text}");
+                assert!(text.to_lowercase().contains("combustible"), "{text}");
+                assert_eq!(lang, Some(es));
+            }
+            _ => panic!("not heard as a question"),
+        }
+        // A newer recording finished meanwhile: this one isn't heard
+        model.latest.fetch_add(1, Ordering::Relaxed);
+        let heard = tokio::task::block_in_place(|| {
+            model.hear(&samples, &config, ticket, Instant::now())
+        });
+        assert!(matches!(heard.unwrap(), Heard::Nothing));
     }
 
     #[test]

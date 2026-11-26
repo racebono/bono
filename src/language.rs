@@ -90,20 +90,29 @@ pub fn reply_note(code: ArrayStr<2>) -> String {
     format!("[Reply in {language}.]")
 }
 
-/// The English name of the language with `code` (as the voices have it), if it's one of those
-/// built in (see the `all-languages` feature).
+/// The English name of the language with `code` (as the voices have it), if `lingua` (as built,
+/// see the `all-languages` feature) or Whisper knows it.
 pub fn name(code: ArrayStr<2>) -> Option<String> {
-    let code = match &*code {
+    let lingua = match &*code {
         // Norwegian's voices are Bokmål's
         "no" => "nb",
         code => code,
     };
-    let iso = code.parse::<lingua::IsoCode639_1>().ok()?;
-    Some(Language::from_iso_code_639_1(&iso).to_string())
+    if let Ok(iso) = lingua.parse::<lingua::IsoCode639_1>() {
+        return Some(Language::from_iso_code_639_1(&iso).to_string());
+    }
+    // `get_lang_id` panics on a NUL, which a hand-edited config could have
+    if code.contains('\0') {
+        return None;
+    }
+    let name = whisper_rs::get_lang_str_full(whisper_rs::get_lang_id(&code)?)?;
+    let mut chars = name.chars();
+    Some(chars.next()?.to_uppercase().collect::<String>() + chars.as_str())
 }
 
 /// The name of the language with `code` (as the voices have it), in the app's language: in
-/// English for those the app hasn't translated, or its code if it isn't built in either.
+/// English for those the app hasn't translated, or its code if neither `lingua` nor Whisper knows
+/// it.
 pub fn ui_name(code: ArrayStr<2>) -> String {
     use bono_i18n::t;
 
@@ -133,6 +142,14 @@ pub fn voice_code(code: ArrayStr<2>) -> ArrayStr<2> {
     }
 }
 
+/// Whether text in `code` (as the voices have it) can be told from text in other languages: whether
+/// it's one of the languages built in.
+pub fn told_apart(code: ArrayStr<2>) -> bool {
+    Language::all()
+        .into_iter()
+        .any(|language| voice_language(language) == Some(code))
+}
+
 fn voice_language(language: Language) -> Option<ArrayStr<2>> {
     let code = language.iso_code_639_1().to_string();
     ArrayStr::from_str(&code).map(voice_code)
@@ -142,6 +159,17 @@ fn voice_language(language: Language) -> Option<ArrayStr<2>> {
 mod tests {
     use super::*;
     use crate::arrstr;
+
+    #[test]
+    fn names_languages_that_are_not_built_in() {
+        assert_eq!(ui_name(arrstr!("eu")), "Basque");
+        // `lingua` names it after Bokmål, when it's built in
+        #[cfg(not(feature = "all-languages"))]
+        assert_eq!(ui_name(arrstr!("no")), "Norwegian");
+        assert_eq!(ui_name(arrstr!("xx")), "xx");
+        assert_eq!(ui_name(ArrayStr::from_str("e\0").unwrap()), "e\0");
+        assert_eq!(reply_note(arrstr!("pl")), "[Reply in Polish.]");
+    }
 
     // Driven like the app does, from outside the runtime
     #[test]
@@ -177,6 +205,13 @@ mod tests {
         let one = BTreeMap::from([(arrstr!("en"), Utf8PathBuf::from("en.onnx"))]);
         detector.update(rt, &one);
         assert_eq!(detector.detect("¿Cuánto combustible me queda?"), None);
+    }
+
+    #[test]
+    fn tells_the_languages_built_in_apart() {
+        assert!(told_apart(arrstr!("es")) && told_apart(arrstr!("fr")));
+        #[cfg(not(feature = "all-languages"))]
+        assert!(!told_apart(arrstr!("pl")));
     }
 
     #[test]

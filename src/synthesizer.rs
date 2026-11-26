@@ -45,7 +45,7 @@ use tokio::{
 };
 use unicode_normalization::UnicodeNormalization;
 
-mod phonemizer;
+pub mod phonemizer;
 mod radio;
 
 const PAD: char = '_';
@@ -705,11 +705,11 @@ pub struct Voice {
     beep: Vec<f32>,
 }
 
-/// The ONNX Runtime environment every voice's session is created in.
+/// The ONNX Runtime environment every session is created in: the voices', and Parakeet's.
 ///
 /// ONNX Runtime allows one environment per process, and `ort` refuses to build another even after the first is
-/// dropped, so it's built once and kept. A failed build is retried by the next voice.
-fn environment() -> ort::Result<&'static Environment> {
+/// dropped, so it's built once and kept. A failed build is retried by the next model loaded.
+pub(crate) fn environment() -> ort::Result<&'static Environment> {
     static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
     static BUILDING: Mutex<()> = Mutex::new(());
 
@@ -1335,13 +1335,57 @@ mod tests {
         let missing = std::env::temp_dir().join("bono-missing-voice.onnx");
         let missing = Utf8PathBuf::from_path_buf(missing).unwrap();
 
-        config.set_voice(&rt, lang, None, &mut synth);
-        stopped(&synth.inner[&lang]).await;
+        let inner = SynthesizerInner::new(rt.clone());
+        inner.set_model(None, false);
+        stopped(&inner).await;
+        synth.inner.insert(lang, inner);
 
-        config.set_voice(&rt, lang, Some(missing), &mut synth);
+        config.set_voice(&rt, lang, missing, &mut synth);
         assert_eq!(loaded(&synth.inner[&lang]).await, Some(VoiceLoad::Failed));
         // It was loaded (and failed) by a worker that's still there for the next
         assert!(!synth.inner[&lang].stopped());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_voice_removes_every_language_it_speaks() {
+        let rt = Handle::current();
+        let (en, es, ca) = (
+            crate::arrstr!("en"),
+            crate::arrstr!("es"),
+            crate::arrstr!("ca"),
+        );
+        let mut synth = Synthesizer {
+            inner: BTreeMap::new(),
+        };
+        let mut config = RawConfig::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| Utf8PathBuf::try_from(dir.path().join(name)).unwrap();
+        let (removed, kept) = (path("removed.onnx"), path("kept.onnx"));
+        config.set_voice(&rt, en, removed.clone(), &mut synth);
+        // Set by hand in the config file
+        config.set_voice(&rt, es, removed.clone(), &mut synth);
+        config.set_voice(&rt, ca, kept.clone(), &mut synth);
+
+        let workers = config.remove_voice(&removed, &mut synth);
+        assert_eq!(*config.voices(), BTreeMap::from([(ca, kept.clone())]));
+        assert_eq!(synth.inner.keys().copied().collect::<Vec<_>>(), [ca]);
+        assert_eq!(synth.load(en), None);
+
+        // Another is picked while the one before is still being unloaded
+        config.set_voice(&rt, en, kept, &mut synth);
+        let loads = workers
+            .iter()
+            .map(|worker| worker.load.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(loads.len(), 2);
+        rt.spawn_blocking(move || drop(workers)).await.unwrap();
+        // Their threads are done with everything they held
+        assert!(loads.iter().all(|load| Arc::strong_count(load) == 1));
+        assert!(!synth.inner[&en].stopped());
+        assert!(synth.load(en).is_some());
+
+        // Nobody speaks with it any more: nothing to remove
+        assert!(config.remove_voice(&removed, &mut synth).is_empty());
     }
 
     #[test]
@@ -1477,6 +1521,45 @@ mod tests {
         };
         assert_eq!(error.to_string(), no_model().to_string());
         assert!(next(&mut output).await.is_none());
+    }
+
+    /// Needs a Piper voice: `BONO_VOICE` is the path to its `.onnx`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn a_voice_removed_mid_speech_can_be_deleted_once_its_unloaded() {
+        let model = Utf8PathBuf::from(std::env::var("BONO_VOICE").expect("BONO_VOICE isn't set"));
+        let dir = tempfile::tempdir().unwrap();
+        let copy = Utf8PathBuf::try_from(dir.path().join("voice.onnx")).unwrap();
+        let json = |path: &Utf8Path| path.with_added_extension("json");
+        std::fs::copy(&model, &copy).unwrap();
+        std::fs::copy(json(&model), json(&copy)).unwrap();
+
+        let (rt, en) = (Handle::current(), crate::arrstr!("en"));
+        let mut synth = Synthesizer {
+            inner: BTreeMap::new(),
+        };
+        let mut config = RawConfig::default();
+        config.set_voice(&rt, en, copy.clone(), &mut synth);
+        let effects = Effects {
+            radio: 0.65,
+            beep_volume: 1.0,
+            speed: 1.0,
+        };
+        let (input, mut output) = synth.stream(&rt, en, effects);
+        input.push("Copy. ".repeat(32));
+        assert!(!next(&mut output).await.unwrap().unwrap().samples.is_empty());
+
+        let workers = config.remove_voice(&copy, &mut synth);
+        let deleted = rt.spawn_blocking(move || {
+            drop(workers);
+            std::fs::remove_file(&copy)?;
+            std::fs::remove_file(json(&copy))
+        });
+        // What it had to say comes out, and then it ends
+        while let Some(speech) = next(&mut output).await {
+            assert!(!speech.unwrap().samples.is_empty());
+        }
+        deleted.await.unwrap().unwrap();
     }
 
     /// Needs a Piper voice: `BONO_VOICE` is the path to its `.onnx`.

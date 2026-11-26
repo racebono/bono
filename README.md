@@ -2,7 +2,7 @@
 
 Bono is a desktop AI race engineer and spotter for sim racing. Ask questions by voice or text and get spoken answers grounded in live telemetry: fuel range, tyre condition, lap times, nearby cars, and race standings.
 
-Built in Rust with SDL3 and egui, Bono uses local Whisper speech recognition and Piper text-to-speech. The engineer supports Bono Cloud, Claude, Ollama, and OpenAI-compatible APIs. An automatic spotter reads telemetry directly to call traffic, flags, car alerts, and weather changes. It keeps quiet in qualifying sessions unless **In qualifying** is turned on in its menu. With **Lap times in qualifying** on, it calls the time of each qualifying lap, even while otherwise quiet. It calls the start of a race, and its restart after a red flag, unless **Race starts** is turned off.
+Built in Rust with SDL3 and egui, Bono uses local speech recognition and Piper text-to-speech. It hears the 25 European languages that NVIDIA's Parakeet knows with Parakeet, on the processor, so it doesn't slow the simulator down, and other languages with Whisper. The engineer supports Bono Cloud, Claude, Ollama, and OpenAI-compatible APIs. An automatic spotter reads telemetry directly to call traffic, flags, car alerts, and weather changes. It keeps quiet in qualifying sessions unless **In qualifying** is turned on in its menu. With **Lap times in qualifying** on, it calls the time of each qualifying lap, even while otherwise quiet. It calls the start of a race, and its restart after a red flag, unless **Race starts** is turned off, and a car closing to within a second behind in a race, unless **Car behind** is turned off.
 
 ## Simulator support
 
@@ -22,7 +22,7 @@ Launch `bono.exe` from a packaged build, keeping its `assets/`, `phonemizer/`, a
 
 The first-run setup guide walks through:
 
-1. Choosing the interface language and downloading speech models.
+1. Choosing the interface language and the languages you speak, and downloading speech models.
 2. Detecting your simulator and setting up its plugin, if needed.
 3. Selecting a language-model provider and model.
 4. Choosing and testing your microphone.
@@ -30,13 +30,13 @@ The first-run setup guide walks through:
 6. Binding a push-to-talk key or wheel button, plus an optional conversation-reset button.
 7. Performing a radio check.
 
-Reopen the guide from Settings at any time. Start your simulator, enter a session, and ask questions such as “How many laps of fuel do I have?” or “What was my last lap time?” You can also type in the chat. Voice recognition requires a Whisper model; spoken replies require a Piper voice and the phonemizer helper.
+Reopen the guide from Settings at any time. Start your simulator, enter a session, and ask questions such as “How many laps of fuel do I have?” or “What was my last lap time?” You can also type in the chat. Voice recognition requires Parakeet or a Whisper model; spoken replies require a Piper voice and the phonemizer helper.
 
 ## Updates
 
 Packaged Windows builds update themselves from this repository's GitHub releases. A stable build follows stable releases; a nightly build follows nightlies. The **Update** menu shows the running version and whether a newer one is available. At launch, a newer version is offered in a popup.
 
-Downloading and installing are separate steps. **Download** fetches the release's `bono-windows-x86_64.zip`, checks its size and SHA-256, and unpacks it into the installation's `update/` folder. The Update menu then shows a sign. **Install and restart** closes Bono, puts the new version in place and opens it again. Each file and folder at the top of the new version replaces the installation's by renaming, after moving the old one to `update/backup/`. If anything can't be replaced, everything moved goes back, the old version opens, and the Update menu says what went wrong. Other files in the installation folder stay. Settings, Whisper models and Piper voices live in the per-user preference directory, so every version keeps them. The installation folder must be writable, and only one running Bono per installation can update it. Installing needs Bono to be able to start an installer that outlives it, which some programs that launch others prevent; start Bono by itself then. Development builds don't update themselves.
+Downloading and installing are separate steps. **Download** fetches the release's `bono-windows-x86_64.zip`, checks its size and SHA-256, and unpacks it into the installation's `update/` folder. The Update menu then shows a sign. **Install and restart** closes Bono, puts the new version in place and opens it again. Each file and folder at the top of the new version replaces the installation's by renaming, after moving the old one to `update/backup/`. If anything can't be replaced, everything moved goes back, the old version opens, and the Update menu says what went wrong. Other files in the installation folder stay, except the CUDA libraries of older versions, which the new version removes. Settings, speech-to-text models and Piper voices live in the per-user preference directory, so every version keeps them. The installation folder must be writable, and only one running Bono per installation can update it. Installing needs Bono to be able to start an installer that outlives it, which some programs that launch others prevent; start Bono by itself then. Development builds don't update themselves.
 
 A stable build is newer when its release tag (`v0.2.0` or `0.2.0`) is a higher version than the running app's Cargo version. Releasing therefore requires bumping `version` in `Cargo.toml` first, and the release workflow refuses tags that don't match it. A nightly is the most recently published `nightly-*` prerelease that has its zip, unless the running app's own nightly was published at the same time or later. A release whose zip is still uploading, or whose zip has no SHA-256 digest on GitHub, isn't offered.
 
@@ -55,13 +55,15 @@ Claude's **Prompt cache lifetime** setting defaults to `1h`; choose `5m` for sho
 
 Speech recognition and synthesis run locally. With a remote language-model endpoint, questions and telemetry returned by the engineer's tools are sent to that endpoint. Initial speech-model downloads require internet access.
 
-In the **Engineer** menu, **Spoken language** fixes the language of replies using an installed voice; **Pilot's language** follows the input as before. **Heard language** independently fixes the pilot's input language, so you can speak one language and receive replies in another. Non-English input requires a multilingual speech-to-text model. With **Automatic** input, speech language detection is skipped when only one voice language is installed; selecting an input language always skips detection. The spotter keeps its own language setting.
+In the **Engineer** menu, **Spoken language** fixes the language of replies using an installed voice; **Pilot's language** follows the input as before. **Heard language** independently fixes the pilot's input language, so you can speak one language and receive replies in another. In the **Speech To Text** menu, **Automatic** (recommended) picks the model from these languages: Parakeet when it knows every one of them and they can be told apart from the text it writes (it doesn't say which language it heard), and Whisper large-v3-turbo otherwise. The languages are the Heard language if one is set, or else those with a voice, or else the app's. With a fixed reply language, Automatic input and several voices, it's Whisper, as any language may be spoken then. While the model it wants isn't downloaded, the other one listens, and the menu offers the download. **Choose a model** picks one by hand. Non-English input requires a multilingual Whisper model or Parakeet. With **Automatic** input, speech language detection is skipped when only one voice language is installed; selecting an input language always skips detection. The spotter keeps its own language setting.
 
 ## Troubleshooting
 
 ### Speech recognition is very slow while driving
 
-Whisper runs on the same GPU as your simulator. With VSync off (or no frame-rate cap), the simulator renders as many frames as it can and keeps the GPU fully busy, so transcribing a question can take 10–30 seconds instead of about one. Enable VSync or cap the frame rate in the simulator to leave the GPU some headroom. Alternatively, untick **Use the GPU** in the Speech To Text menu to run Whisper on the CPU instead.
+Parakeet runs on the processor, never on the GPU, so a busy GPU doesn't slow it down. The Speech To Text menu says which model is in use and why; Automatic only uses Whisper for languages Parakeet doesn't know, or that can't be told apart, and choosing a single **Heard language** that Parakeet knows switches to it.
+
+Whisper runs on the same GPU as your simulator. With VSync off (or no frame-rate cap), the simulator renders as many frames as it can and keeps the GPU fully busy, so transcribing a question can take many seconds instead of less than one. Enable VSync or cap the frame rate in the simulator to leave the GPU some headroom: it helps the most, and the simulator loses fewer frames too. On NVIDIA RTX cards, Whisper uses flash attention, which is much less work for the GPU. Alternatively, untick **Use the GPU** in the Speech To Text menu to run Whisper on the CPU instead, preferably with a smaller model. It uses half of the CPU's threads, and slows down when the simulator leaves it too few.
 
 The log (`%APPDATA%\bono\bono\output.log` on Windows) records how long each transcription stage took.
 
@@ -144,7 +146,7 @@ remains necessary for the authorization-code exchange.
 - A recent Rust toolchain with Cargo and Rust 2024 edition support. The project does not currently pin a Rust version.
 - A C/C++ build toolchain, CMake, and Clang/libclang for generated bindings and native dependencies.
 - On Windows: Visual Studio Build Tools with C++ tools and the Windows SDK, plus Ninja on `PATH`. The repository configures CMake to use Ninja for `x86_64-pc-windows-msvc`.
-- For the default build: the CUDA toolkit and Vulkan SDK. A CPU-only build is available below.
+- For the default build: the Vulkan SDK (CI uses 1.4.341.1). An older one may leave out what makes flash attention fast on RTX cards. A CPU-only build is available below.
 - Internet access to fetch Cargo dependencies and build-time resources. The Windows build downloads the RaceRoom API header.
 
 SDL3 and SQLite are built from source through Cargo dependencies.
@@ -158,7 +160,7 @@ cargo build -p bono-phonemizer
 cargo run -p bono
 ```
 
-Without the CUDA and Vulkan SDKs, use the CPU-only build:
+Without the Vulkan SDK, use the CPU-only build:
 
 ```sh
 cargo build -p bono-phonemizer
@@ -182,7 +184,7 @@ With Just installed, `just lmu` runs the same build. The resulting `target/debug
 
 Cargo features control Whisper acceleration:
 
-- `cuda` and `vulkan` are enabled by default; they require their respective SDKs (`CUDA_PATH` on Windows and `VULKAN_SDK`).
+- `vulkan` is enabled by default; it requires the Vulkan SDK (`VULKAN_SDK`).
 - `hipblas` enables ROCm on Linux (`HIP_PATH`).
 - `intel-sycl` enables Intel oneAPI (`icx`/`icpx`).
 - `openblas` enables OpenBLAS (`BLAS_INCLUDE_DIRS`, optionally `OPENBLAS_PATH`).
@@ -201,9 +203,9 @@ Apple targets enable Metal automatically. The optional `all-languages` feature e
 cargo xtask dist
 ```
 
-This builds release binaries and recreates `dist/` with the application, assets, phonemizer, espeak-ng data and license, and (on Windows) the LMU plugin. Windows packaging therefore requires the LMU installation and SDK headers. The task uses the application's default CUDA and Vulkan features; it does not forward extra Cargo feature flags.
+This builds release binaries and recreates `dist/` with the application, assets, phonemizer, espeak-ng data and license, and (on Windows) the LMU plugin. Windows packaging therefore requires the LMU installation and SDK headers. The task uses the application's default Vulkan feature; it does not forward extra Cargo feature flags.
 
-Windows packaging also includes DirectML, the Vulkan loader, and app-local x64 Visual C++ runtime DLLs for the application and phonemizer. Visual C++ redistributables are located through `VCToolsRedistDir` or Visual Studio (`vswhere`); the Vulkan loader comes from `VULKAN_SDK/Bin` or the installed Windows runtime. Missing required runtimes stop packaging. The Visual C++ installer is included in `dist/prerequisites`: run it before using the LMU plugin, which is loaded by the game process. Windows and compatible GPU drivers remain prerequisites; Whisper and Piper models are downloaded by the application.
+Windows packaging also includes DirectML, the Vulkan loader, and app-local x64 Visual C++ runtime DLLs for the application and phonemizer. Visual C++ redistributables are located through `VCToolsRedistDir` or Visual Studio (`vswhere`); the Vulkan loader comes from `VULKAN_SDK/Bin` or the installed Windows runtime. Missing required runtimes stop packaging. The Visual C++ installer is included in `dist/prerequisites`: run it before using the LMU plugin, which is loaded by the game process. Windows and compatible GPU drivers remain prerequisites; Speech-to-text models and Piper voices are downloaded by the application.
 
 Release builds load assets next to the executable, so use the complete `dist/` folder when running or distributing a release.
 
@@ -229,8 +231,8 @@ cargo test -p bono-sim -p bono-i18n -p bono-phonemizer
 
 Some integration tests are ignored by default because they require live provider credentials, a recorded telemetry database, a voice model, or iRacing's saved telemetry (`BONO_IRACING_TELEMETRY`, a folder of `.ibt` files, for `sim::iracing::tests`). See the tests in `src/provider/`, `src/engineer.rs`, and `src/synthesizer.rs` before enabling them. Building or testing the entire workspace on Windows also builds the LMU plugin and requires its game SDK.
 
-Settings are saved as `config.json` in SDL's per-user preference directory for organization/application `bono`/`bono`. Downloaded Whisper models and Piper voices are stored beneath that directory in `whisper/` and `piper/`. Prefer changing settings through the interface.
+Settings are saved as `config.json` in SDL's per-user preference directory for organization/application `bono`/`bono`. Downloaded Whisper models, Parakeet and Piper voices are stored beneath that directory in `whisper/`, `parakeet/` and `piper/`. Prefer changing settings through the interface.
 
 ## License
 
-The main project is licensed under the [MIT License](LICENSE). The separate `bono-phonemizer` helper links espeak-ng and is licensed under [GPL-3.0-or-later](phonemizer/COPYING). Downloaded voice models and other third-party dependencies carry their own licenses.
+The main project is licensed under the [MIT License](LICENSE). The separate `bono-phonemizer` helper links espeak-ng and is licensed under [GPL-3.0-or-later](phonemizer/COPYING). Downloaded voice models and other third-party dependencies carry their own licenses. Parakeet TDT 0.6B v3 is by NVIDIA, under CC-BY-4.0; its ONNX conversion is by istupakov.

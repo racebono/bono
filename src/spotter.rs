@@ -2008,14 +2008,17 @@ impl Logic {
             && t > GAP_BEHIND_AFTER
             && race_gap
         {
+            // Followed while turned off too, so turning it on doesn't call a car already there
             self.gap_armed = false;
-            calls.raise(
-                match gap < CLOSE_BEHIND {
-                    true => "car close behind",
-                    false => "car within a second behind",
-                },
-                false,
-            );
+            if *config.gap_behind() {
+                calls.raise(
+                    match gap < CLOSE_BEHIND {
+                        true => "car close behind",
+                        false => "car within a second behind",
+                    },
+                    false,
+                );
+            }
         }
     }
 
@@ -4822,6 +4825,32 @@ mod tests {
         // Dropped back and closed again
         assert!(at(30.3, 1.6).is_empty());
         assert_eq!(at(30.4, 0.1), ["car close behind"]);
+    }
+
+    #[test]
+    fn car_behind_call_can_be_turned_off() {
+        let on = SpotterConfig::default();
+        let mut off = SpotterConfig::default();
+        off.gap_behind.set(false);
+        let mut logic = Logic::default();
+        let scoring = Scoring {
+            session_type: Some("race".into()),
+            ..Scoring::default()
+        };
+        let mut at = |config: &SpotterConfig, t: f64, gap: f64| {
+            let mut p = player(t);
+            p.gap_behind = Some(gap);
+            texts(logic.update(config, &p, &[], &Wheels::default(), Some(&scoring)))
+        };
+
+        assert!(at(&off, 30.0, 2.0).is_empty());
+        assert!(at(&off, 30.1, 0.8).is_empty());
+        assert!(at(&off, 30.2, 1.6).is_empty());
+        assert!(at(&off, 30.3, 0.1).is_empty());
+        // Turned on with the car already there: called the next time it closes
+        assert!(at(&on, 30.4, 0.8).is_empty());
+        assert!(at(&on, 30.5, 1.6).is_empty());
+        assert_eq!(at(&on, 30.6, 0.8), ["car within a second behind"]);
     }
 
     #[test]

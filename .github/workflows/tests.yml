@@ -24,6 +24,9 @@ jobs:
                 shell: pwsh
         env:
             CARGO_TERM_COLOR: always
+            # The build is cached and restored on runners with other CPUs, so ggml mustn't use the
+            # instructions of the CPU that built it (such as AVX-512): elsewhere they crash the tests.
+            GGML_NATIVE: "OFF"
         steps:
             - uses: actions/checkout@v6
               with:
@@ -94,6 +97,9 @@ jobs:
             - name: Cache Cargo dependencies
               uses: Swatinem/rust-cache@v2
               with:
+                  # A new prefix starts a new cache: v0's hold ggml builds tuned for the runner's CPU,
+                  # and Cargo doesn't rebuild them when GGML_NATIVE changes.
+                  prefix-key: v1-rust
                   cache-on-failure: true
                   # PR caches can't be restored by other PRs; only master's are shared.
                   save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -104,7 +110,7 @@ jobs:
                   cargo build --locked -p bono-phonemizer
                   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-            # CPU-only: the tests don't exercise the CUDA or Vulkan Whisper backends.
+            # CPU-only: the tests don't exercise the Vulkan Whisper backend.
             - name: Run tests
               env:
                   LMU_SDK: ${{ steps.lmu-sdk.outputs.available }}

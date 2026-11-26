@@ -72,6 +72,14 @@ impl Config {
         self.send.send_modify(f);
     }
 
+    /// Settings for a test: unlike [`Self::new`], the app's language (process-wide) is left alone.
+    #[cfg(test)]
+    pub fn from_raw(raw: RawConfig) -> Self {
+        Self {
+            send: tokio::sync::watch::channel(raw).0,
+        }
+    }
+
     #[inline]
     pub fn maybe_update(&self, f: impl FnOnce(&mut RawConfig) -> bool) {
         self.send.send_if_modified(f);
@@ -303,7 +311,7 @@ settings! {
         /// Whether the engineer may request pit stops in LMU: Bono binds Pit Request to F11 when it
         /// has no key, and brings LMU to the front for a moment to press it
         pub pit_requests: bool = true,
-        /// Changed with `set_voice`, which loads the voice too
+        /// Changed with `set_voice` and `remove_voice`, which load and unload the voice too
         voices: BTreeMap<ArrayStr<2>, Utf8PathBuf> = BTreeMap::new(),
         pub whisper_model: Option<Arc<Utf8Path>> = None,
         /// Whether speech to text runs on the GPU, when Bono was built with a GPU backend. Off, it
@@ -354,18 +362,11 @@ impl RawConfig {
         &mut self,
         rt: &Handle,
         lang: ArrayStr<2>,
-        model: Option<Utf8PathBuf>,
+        model: Utf8PathBuf,
         synth: &mut Synthesizer,
     ) {
         let mut voices = self.voices().clone();
-        match model.clone() {
-            Some(model) => {
-                voices.insert(lang, model);
-            }
-            None => {
-                voices.remove(&lang);
-            }
-        }
+        voices.insert(lang, model.clone());
         self.voices.set(voices);
 
         let inner = synth
@@ -378,7 +379,36 @@ impl RawConfig {
             // Dropping it joins its thread
             rt.spawn_blocking(move || drop(stopped));
         }
-        inner.set_model(model, *self.voice_gpu());
+        inner.set_model(Some(model), *self.voice_gpu());
+    }
+
+    /// Takes `lang`'s voice out of the settings. Returns what spoke it: dropping it waits until the
+    /// voice is unloaded, so it's done off the UI thread.
+    pub fn remove_language(
+        &mut self,
+        lang: ArrayStr<2>,
+        synth: &mut Synthesizer,
+    ) -> Option<SynthesizerInner> {
+        let mut voices = self.voices().clone();
+        voices.remove(&lang)?;
+        self.voices.set(voices);
+        synth.inner.remove(&lang)
+    }
+
+    /// Removes the languages whose voice is `model`. Returns what spoke them: dropping it waits
+    /// until the voice is unloaded, so it's done off the UI thread.
+    pub fn remove_voice(
+        &mut self,
+        model: &Utf8Path,
+        synth: &mut Synthesizer,
+    ) -> Vec<SynthesizerInner> {
+        let mut voices = self.voices().clone();
+        let removed = voices.extract_if(.., |_, path| path == model);
+        let workers = removed
+            .filter_map(|(lang, _)| synth.inner.remove(&lang))
+            .collect();
+        self.voices.set(voices);
+        workers
     }
 }
 
@@ -597,6 +627,8 @@ settings! {
         /// Below this speed (m/s: the garage, the grid, a spin) it stays quiet
         pub min_speed: f64 = 8.0,
 
+        /// Whether a car closing from behind in a race is called
+        pub gap_behind: bool = true,
         /// A car this many seconds behind or closer is called...
         pub gap_behind_on: f64 = 1.0,
         /// ...again only once the gap has opened to at least this
