@@ -206,6 +206,11 @@ CREATE TABLE sessions_now (
     tank_capacity_l REAL, stops_needed INTEGER, plan_source TEXT
 );
 CREATE TABLE rules_now (name TEXT, session_type TEXT, value TEXT);
+CREATE TABLE earlier_laps (
+    session_type TEXT, session_number INTEGER, before_restart INTEGER, lap INTEGER, time_s REAL,
+    complete INTEGER, green INTEGER, invalid INTEGER, pit INTEGER, fuel_used_l REAL,
+    energy_used_pct REAL, wetness_avg_pct REAL, track_c REAL, compound TEXT
+);
 CREATE TABLE setup_now (
     name TEXT PRIMARY KEY, value TEXT, step INTEGER, min_step INTEGER, max_step INTEGER,
     saved_value TEXT, changed_lap INTEGER
@@ -224,7 +229,7 @@ const STREAM_TABLES: [&str; 5] = [
     "corner_passes",
     "corner_pass_wheels",
 ];
-const NOW_TABLES: [&str; 11] = [
+const NOW_TABLES: [&str; 12] = [
     "race_state",
     "cars_now",
     "drivers_now",
@@ -234,6 +239,7 @@ const NOW_TABLES: [&str; 11] = [
     "forecast_now",
     "sessions_now",
     "rules_now",
+    "earlier_laps",
     "setup_now",
     "setup_changes",
 ];
@@ -1155,6 +1161,25 @@ impl Lap {
             stopped: self.pit || self.refuelled,
         }
     }
+
+    /// The virtual energy it used as a percentage, when the simulator reports a fraction.
+    fn energy_used_pct(&self) -> Option<f64> {
+        self.energy_used
+            .filter(|_| self.energy_start.is_some_and(|e| e <= 1.0))
+            .map(|used| used * 100.0)
+    }
+}
+
+/// One of the player's complete laps of an earlier epoch of the weekend, for `earlier_laps`.
+pub(super) struct EarlierLap {
+    pub session_type: Option<String>,
+    pub session_number: Option<i64>,
+    /// Of the same session as the epoch after it: from before a restart of it
+    pub before_restart: bool,
+    pub lap: Lap,
+    pub wetness_avg_pct: Option<f64>,
+    pub track_c: Option<f64>,
+    pub compound: Option<String>,
 }
 
 /// LMU reports tire_wear as the fraction REMAINING (1.0 = new) even though the schema says worn.
@@ -2846,14 +2871,7 @@ impl Writer<'_> {
                 ("fuel_used_l", real(lap.fuel_used)),
                 ("energy_start_pct", real(energy_percent(lap.energy_start))),
                 ("energy_end_pct", real(energy_percent(lap.energy_end))),
-                (
-                    "energy_used_pct",
-                    real(
-                        lap.energy_used
-                            .filter(|_| lap.energy_start.is_some_and(|e| e <= 1.0))
-                            .map(|used| used * 100.0),
-                    ),
-                ),
+                ("energy_used_pct", real(lap.energy_used_pct())),
                 ("gap_ahead_end_s", real(lap.gap_ahead_end)),
                 ("gap_behind_end_s", real(lap.gap_behind_end)),
             ],
@@ -3038,6 +3056,8 @@ pub(super) struct Stream {
     /// The simulator's timing sectors' ends as last seen whole, and the session start, track and
     /// sector count they're for: a window of the laps can miss lines the session has crossed
     timing: Option<((i64, String, i64), Vec<f64>)>,
+    /// The player's complete laps of the weekend's earlier epochs, oldest first (see `carry_over`)
+    earlier: Vec<EarlierLap>,
 }
 
 impl Stream {
@@ -3214,6 +3234,10 @@ impl Stream {
     fn enter_epoch(&mut self, conn: &Connection, epoch: Epoch) -> rusqlite::Result<()> {
         // Read before anything changes: failing, it's tried again next tick
         let start = session_start(conn, epoch.telemetry_from)?;
+        match self.carry_over(conn, epoch)? {
+            Some(laps) => self.earlier.extend(laps),
+            None => self.earlier.clear(),
+        }
         self.epoch = epoch;
         self.session_cursor = epoch.session_from - 1;
         self.cautions.clear();
@@ -3232,6 +3256,126 @@ impl Stream {
         self.checked_layout = None;
         self.timing = None;
         self.start_session(conn, start)
+    }
+
+    /// The player's complete laps of the epoch being left for `epoch`, for `earlier_laps`; `None`
+    /// when `epoch` is of another weekend (a new event, or the recording cleared), and those kept
+    /// so far are the last one's. Only an epoch the stream followed adds laps: one it never read
+    /// adds nothing, and one it was behind on only what it had read. Bono's recording starts
+    /// afresh when Bono starts, so normally that's every epoch, read to its end.
+    fn carry_over(
+        &self,
+        conn: &Connection,
+        epoch: Epoch,
+    ) -> rusqlite::Result<Option<Vec<EarlierLap>>> {
+        // Without epochs, no weekend to tell from the next
+        let (Some(old), Some(new)) = (self.epoch.id, epoch.id) else {
+            return Ok(None);
+        };
+        // The same epoch read again (a recreated file): its laps are read again too
+        if old == new {
+            return Ok(Some(Vec::new()));
+        }
+        // A clear empties the recording and starts an epoch with a newer id: one older than the
+        // oldest left is of the last weekend. The same test the snapshot's weekend makes
+        let weekend = scalar::<i64>(conn, "SELECT MIN(id) FROM epoch", [])?;
+        if weekend.is_none_or(|weekend| old < weekend) {
+            return Ok(None);
+        }
+        let Some((player, car)) =
+            (self.player).and_then(|player| self.cars.get(&player).map(|car| (player, car)))
+        else {
+            return Ok(Some(Vec::new()));
+        };
+        let (from, to) = (self.epoch.session_from, epoch.session_from);
+        let session = |row: Option<Row>| {
+            row.map(|r| {
+                (
+                    r.text("session_type").map(str::to_owned),
+                    r.i("session_number"),
+                )
+            })
+        };
+        let last = session(row(
+            conn,
+            "SELECT session_type, session_number FROM session WHERE id >= ? AND id < ? \
+             ORDER BY id DESC LIMIT 1",
+            [from, to],
+        )?);
+        let next = session(row(
+            conn,
+            "SELECT session_type, session_number FROM session WHERE id >= ? ORDER BY id LIMIT 1",
+            [to],
+        )?);
+        // The same session again: its clock went back
+        let before_restart = last.as_ref().is_some_and(|(kind, _)| kind.is_some()) && last == next;
+        let (session_type, session_number) = last.unwrap_or_default();
+
+        // Read once each, not once a lap: a weekend's standings run to millions of rows
+        let weather = rows(
+            conn,
+            "SELECT session_time, track_wetness_average, track_temperature FROM session \
+             WHERE id >= ? AND id < ? AND session_time IS NOT NULL ORDER BY id",
+            [from, to],
+        )?
+        .iter()
+        .map(|r| {
+            (
+                r.f("session_time").unwrap_or(0.0),
+                percent(r.f("track_wetness_average")),
+                r.f("track_temperature"),
+            )
+        })
+        .collect::<Vec<_>>();
+        let compounds = rows(
+            conn,
+            "SELECT session_time, front_tire_compound_name FROM standings \
+             WHERE id >= ? AND id < ? AND vehicle_id = ? AND session_time IS NOT NULL ORDER BY id",
+            [self.epoch.standings_from, epoch.standings_from, player],
+        )?
+        .iter()
+        .map(|r| {
+            (
+                r.f("session_time").unwrap_or(0.0),
+                r.text("front_tire_compound_name").map(str::to_owned),
+            )
+        })
+        .collect::<Vec<_>>();
+        let average = |values: Vec<f64>| {
+            (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+        };
+
+        let mut laps = Vec::new();
+        for lap in car.laps(conn, player)? {
+            if !lap.complete {
+                continue;
+            }
+            let during = lap.start.zip(lap.end).map_or(Vec::new(), |(start, end)| {
+                // A row's written only as something changes: the one in effect at the start counts
+                let first = weather.iter().rposition(|(t, ..)| *t <= start);
+                weather[first.unwrap_or(0)..]
+                    .iter()
+                    .filter(|(t, ..)| *t <= end)
+                    .collect()
+            });
+            let compound = lap.end.and_then(|end| {
+                compounds
+                    .iter()
+                    .rev()
+                    .find(|(t, _)| *t <= end)
+                    .and_then(|(_, compound)| compound.clone())
+            });
+            laps.push(EarlierLap {
+                session_type: session_type.clone(),
+                session_number,
+                before_restart,
+                wetness_avg_pct: average(during.iter().filter_map(|(_, wet, _)| *wet).collect()),
+                track_c: average(during.iter().filter_map(|(.., track)| *track).collect()),
+                compound,
+                lap,
+            });
+        }
+        Ok(Some(laps))
     }
 
     /// Reads the session's new rows for when the full course yellows were. All of them at once (a
@@ -4037,6 +4181,9 @@ impl Stream {
         if let Err(e) = self.write_drivers(conn) {
             problems.push(format!("drivers_now: {e}"));
         }
+        if let Err(e) = self.write_earlier(conn) {
+            problems.push(format!("earlier_laps: {e}"));
+        }
         if let Err(e) = tx.commit() {
             self.forget_stints();
             return Err(e.into());
@@ -4083,6 +4230,37 @@ impl Stream {
                 .or_insert_with(|| numbered(*vehicle, segment(&[], runs), stint_ids));
         }
         stints
+    }
+
+    /// `earlier_laps`, in the order they were carried over.
+    fn write_earlier(&self, conn: &Connection) -> rusqlite::Result<()> {
+        for earlier in &self.earlier {
+            let lap = &earlier.lap;
+            insert(
+                conn,
+                "earlier_laps",
+                vec![
+                    (
+                        "session_type",
+                        text_or_null(earlier.session_type.as_deref()),
+                    ),
+                    ("session_number", integer(earlier.session_number)),
+                    ("before_restart", flag(earlier.before_restart)),
+                    ("lap", Value::Integer(lap.lap)),
+                    ("time_s", real(lap.time)),
+                    ("complete", flag(lap.complete)),
+                    ("green", flag(lap.green)),
+                    ("invalid", flag(lap.invalid)),
+                    ("pit", flag(lap.pit)),
+                    ("fuel_used_l", real(lap.fuel_used)),
+                    ("energy_used_pct", real(lap.energy_used_pct())),
+                    ("wetness_avg_pct", real(earlier.wetness_avg_pct)),
+                    ("track_c", real(earlier.track_c)),
+                    ("compound", text_or_null(earlier.compound.as_deref())),
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     fn write_drivers(&self, conn: &Connection) -> rusqlite::Result<()> {
@@ -12620,19 +12798,24 @@ mod tests {
     fn append(dir: &tempfile::TempDir, t: f64, laps: i64, speed: f64) {
         let mut conn = Connection::open(dir.path().join(DATABASE)).unwrap();
         let tx = conn.transaction().unwrap();
-        tx.execute(
+        append_rows(&tx, t, laps, speed);
+        tx.commit().unwrap();
+    }
+
+    /// `append`'s rows, written on `conn`.
+    fn append_rows(conn: &Connection, t: f64, laps: i64, speed: f64) {
+        conn.execute(
             "INSERT INTO telemetry (vehicle_id, is_player, session_time, lap, speed) \
              VALUES (1, 1, ?1, ?2, ?3)",
             params![t, laps + 1, speed],
         )
         .unwrap();
-        tx.execute(
+        conn.execute(
             "INSERT INTO standings (vehicle_id, is_player, session_time, laps_completed, driver) \
              VALUES (1, 1, ?1, ?2, 'Ana Lopes')",
             params![t, laps],
         )
         .unwrap();
-        tx.commit().unwrap();
     }
 
     /// A progress snapshot published now, the tables caught up first. The thread publishes none
@@ -13397,6 +13580,156 @@ mod tests {
             row,
             [["1", "\"race length from the event schedule\""]],
             "{row:?}"
+        );
+    }
+
+    /// The race in `race()` as practice 1, on a damp track at 30 C, the player on mediums.
+    const PRACTICE: &str = "
+        UPDATE session SET session_type = 'practice', session_number = 1, track_temperature = 30.0,
+            track_wetness_average = 0.25;
+        UPDATE standings SET front_tire_compound_name = 'Medium' WHERE vehicle_id = 1;
+    ";
+
+    /// A `kind` session numbered 1, the player's car on its first lap 10 s in.
+    fn session_rows(conn: &Connection, kind: &str) {
+        conn.execute(
+            "INSERT INTO session (session_time, session_type, session_number, track, \
+             track_length, phase) VALUES (10.0, ?1, 1, 'Test Ring', 1000.0, 'green')",
+            [kind],
+        )
+        .unwrap();
+        append_rows(conn, 10.0, 0, 10.0);
+    }
+
+    /// Starts epoch `id` in the recording in `dir` with a `kind` session's first rows, in one
+    /// transaction as the recorder writes them.
+    fn next_epoch(
+        dir: &tempfile::TempDir,
+        id: i64,
+        reason: bono_sim::sql::EpochReason,
+        kind: &str,
+    ) {
+        let mut conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        let tx = conn.transaction().unwrap();
+        bono_sim::sql::begin_epoch(&tx, id, reason).unwrap();
+        session_rows(&tx, kind);
+        tx.commit().unwrap();
+    }
+
+    /// The player's complete laps the stream has read in the current session.
+    async fn complete_laps(engineer: &Engineer) -> f64 {
+        number(
+            engineer,
+            "SELECT COUNT(*) FROM lap_stats WHERE vehicle_id = 1 AND complete = 1",
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn earlier_laps_keep_the_practice_laps() {
+        let (dir, engineer) = race();
+        edit_recording(&dir, PRACTICE);
+        assert_eq!(complete_laps(&engineer).await, 3.0);
+
+        next_epoch(
+            &dir,
+            i64::MAX,
+            bono_sim::sql::EpochReason::Session,
+            "qualifying",
+        );
+        let practice = |lap: &'static str| {
+            [
+                "\"practice\"",
+                "1",
+                "0",
+                lap,
+                "100",
+                "1",
+                "25",
+                "30",
+                "\"Medium\"",
+            ]
+        };
+        assert_eq!(
+            query(
+                &engineer,
+                "SELECT session_type, session_number, before_restart, lap, time_s, complete, \
+                 wetness_avg_pct, track_c, compound FROM earlier_laps ORDER BY rowid",
+            )
+            .await,
+            [practice("1"), practice("2"), practice("3")]
+        );
+        // `lap_stats` is qualifying's alone
+        assert_eq!(complete_laps(&engineer).await, 0.0);
+        assert_eq!(
+            number(
+                &engineer,
+                "SELECT COUNT(*) FROM lap_stats WHERE vehicle_id = 2"
+            )
+            .await,
+            0.0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_marks_the_laps_before_it() {
+        let (dir, engineer) = race();
+        edit_recording(&dir, "UPDATE session SET session_number = 1;");
+        assert_eq!(complete_laps(&engineer).await, 3.0);
+
+        // The same race, its clock gone back
+        next_epoch(
+            &dir,
+            i64::MAX,
+            bono_sim::sql::EpochReason::ClockRollback,
+            "race",
+        );
+        assert_eq!(
+            query(
+                &engineer,
+                "SELECT session_type, session_number, before_restart, COUNT(*) FROM earlier_laps \
+                 GROUP BY 1, 2, 3",
+            )
+            .await,
+            [["\"race\"", "1", "1", "3"]]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_event_forgets_the_earlier_laps() {
+        use bono_sim::sql::{EpochReason, clear_tables};
+        let (dir, engineer) = race();
+        edit_recording(&dir, PRACTICE);
+        assert_eq!(complete_laps(&engineer).await, 3.0);
+        next_epoch(&dir, i64::MAX - 1, EpochReason::Session, "qualifying");
+        assert_eq!(
+            number(&engineer, "SELECT COUNT(*) FROM earlier_laps").await,
+            3.0
+        );
+
+        // The recording cleared for another event: a newer epoch, the oldest one left
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        clear_tables(&conn, Some(i64::MAX)).unwrap();
+        session_rows(&conn, "practice");
+        assert_eq!(
+            number(&engineer, "SELECT COUNT(*) FROM earlier_laps").await,
+            0.0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clear_carries_none_of_the_last_events_laps() {
+        let (dir, engineer) = race();
+        edit_recording(&dir, PRACTICE);
+        assert_eq!(complete_laps(&engineer).await, 3.0);
+
+        // Cleared straight after the practice's laps: they're the last event's
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        bono_sim::sql::clear_tables(&conn, Some(i64::MAX)).unwrap();
+        session_rows(&conn, "practice");
+        assert_eq!(
+            number(&engineer, "SELECT COUNT(*) FROM earlier_laps").await,
+            0.0
         );
     }
 }
