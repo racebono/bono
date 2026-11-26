@@ -4,7 +4,7 @@
 #![cfg(windows)]
 
 use bono_sim::{
-    recorder::{self, ForecastSource, Recorder},
+    recorder::{self, Recorder, WebRead, WebSource},
     sql::EpochReason,
     sys::{bono_session_info, bono_standing, bono_telemetry},
 };
@@ -43,10 +43,13 @@ pub struct LmuRecorder(
 /// for the writer on the game's thread, so a hung web API can hold the game's exit for both requests'
 /// timeouts, 6 s at most. They need the writer's own thread as nothing else should wait on them, and
 /// the wait only happens if the API stops answering just as the game closes.
-fn web_api(numbers: Arc<CarNumbers>) -> ForecastSource {
+fn web_api(numbers: Arc<CarNumbers>) -> WebSource {
     Box::new(move |session_time| {
         numbers.refresh();
-        forecast::fetch(session_time)
+        WebRead {
+            forecast: forecast::fetch(session_time),
+            event: None,
+        }
     })
 }
 

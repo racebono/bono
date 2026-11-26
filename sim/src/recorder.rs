@@ -15,7 +15,8 @@
 use crate::{
     setup::Setup,
     sql::{
-        self, EpochReason, ForecastWriter, ScoringWriter, SetDate, SetupWriter, TelemetryWriter,
+        self, EpochReason, Event, EventWriter, ForecastWriter, ScoringWriter, SetDate, SetupWriter,
+        TelemetryWriter,
     },
     sys::{bono_forecast_point, bono_session_info, bono_standing, bono_telemetry},
 };
@@ -42,14 +43,20 @@ pub const DEFAULT_OPPONENT_FREQUENCY: u32 = 5;
 /// Drops updates rather than growing without limit if the writer ever falls behind.
 const MAX_QUEUED_TELEMETRY: usize = 50_000;
 const MAX_QUEUED_SCORING: usize = 100;
-/// How often the forecast is read.
-const FORECAST_CHECK: Duration = Duration::from_secs(30);
+/// How often the web source is read.
+const WEB_CHECK: Duration = Duration::from_secs(30);
 /// How often the writer looks for a new settings.json.
 const SETTINGS_CHECK: Duration = Duration::from_secs(2);
 
-/// Reads the forecast on the writer thread, given the session time of the last scoring update.
-/// `None` when it can't be read this time.
-pub type ForecastSource = Box<dyn FnMut(f64) -> Option<Vec<bono_forecast_point>> + Send>;
+/// What a web source read: each part `None` when it can't be read this time.
+pub struct WebRead {
+    pub forecast: Option<Vec<bono_forecast_point>>,
+    pub event: Option<Event>,
+}
+
+/// Reads the simulator's web API on the writer thread, given the session time of the last scoring
+/// update.
+pub type WebSource = Box<dyn FnMut(f64) -> WebRead + Send>;
 
 /// Deletes the database in `dir`, with its WAL companions, if it can.
 pub fn remove_database(dir: &Path) {
@@ -91,18 +98,18 @@ pub struct Recorder {
 
 impl Recorder {
     /// Starts recording into a new database in `dir`, replacing one left by an earlier run.
-    pub fn new(dir: impl Into<PathBuf>, forecast: Option<ForecastSource>) -> std::io::Result<Self> {
+    pub fn new(dir: impl Into<PathBuf>, web: Option<WebSource>) -> std::io::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
         // A database left behind (the game crashed, or something still had it open when it closed)
         // would mix two runs. If it's still open, it's emptied instead, once the writer has it
         let left_over = try_remove_database(&dir).is_err();
 
-        Self::start(dir, forecast, left_over, None, 0.0)
+        Self::start(dir, web, left_over, None, 0.0)
     }
 
     /// Restarts a stopped writer without deleting earlier sessions.
-    pub fn restart(&mut self, forecast: Option<ForecastSource>) -> std::io::Result<()> {
+    pub fn restart(&mut self, web: Option<WebSource>) -> std::io::Result<()> {
         if !self.failed() {
             return Ok(());
         }
@@ -127,10 +134,10 @@ impl Recorder {
         };
         let mut restarted = Self::start(
             self.dir.clone(),
-            forecast,
+            web,
             self.shared.reset_pending.load(Ordering::Relaxed),
             Some(queue),
-            // Before its writer starts, which reads the forecast as of it
+            // Before its writer starts, which reads the web source as of it
             f64::from_bits(self.shared.session_time.load(Ordering::Relaxed)),
         )?;
         std::mem::swap(
@@ -159,7 +166,7 @@ impl Recorder {
     /// epoch. `session_time` is where the session is, as far as the scoring said.
     fn start(
         dir: PathBuf,
-        forecast: Option<ForecastSource>,
+        web: Option<WebSource>,
         left_over: bool,
         queue: Option<Queue>,
         session_time: f64,
@@ -199,7 +206,7 @@ impl Recorder {
                     clear_requests: settings.clear,
                     settings_modified: None,
                     next_settings_check: Instant::now() + SETTINGS_CHECK,
-                    forecast,
+                    web,
                 };
                 move || {
                     let result = catch_unwind(AssertUnwindSafe(|| writer.run(&shared)));
@@ -452,6 +459,16 @@ impl Recorder {
         self.shared.wake.notify_one();
     }
 
+    /// Queues the event's sessions and rules, written only if they changed (see `EventWriter`). A
+    /// newer one replaces one still waiting.
+    pub fn push_event(&self, event: Event) {
+        if self.failed() {
+            return;
+        }
+        lock(&self.shared.queue).event = Some(event);
+        self.shared.wake.notify_one();
+    }
+
     /// Starts an epoch: the updates queued from now on are another session's, or another part of
     /// the timeline. For adapters that know (a session starting, the clock jumping); the recorder
     /// also starts one itself from the scoring, see `push_scoring`. What's known about the cars
@@ -510,6 +527,8 @@ impl Recorder {
         queue.scoring.clear();
         queue.boundaries.clear();
         queue.setup = None;
+        // The last event's: the next one is pushed after the clear
+        queue.event = None;
         queue.clear = true;
         // In the same breath as the clear: the writer never clears without the epoch that follows
         self.start_epoch(&mut tracking, &mut queue, EpochReason::Cleared);
@@ -539,7 +558,7 @@ struct Shared {
     opponent_frequency: AtomicU32,
     /// -1 before the first scoring update with the player's car
     player_id: AtomicI64,
-    /// The session time of the last scoring update (an `f64`), for when the forecast was read
+    /// The session time of the last scoring update (an `f64`), for when the web source was read
     session_time: AtomicU64,
     /// The last scoring update's session type and number, for when a setup was written
     session: Mutex<(Option<String>, Option<i64>)>,
@@ -562,6 +581,8 @@ struct Queue {
     scoring: Vec<(i64, bono_session_info, Vec<bono_standing>)>,
     /// The player's setup, the latest pushed: its epoch, and how much telemetry was waiting before it
     setup: Option<(i64, Setup, Pushed, usize)>,
+    /// The event's sessions and rules, the latest pushed. Not an epoch's: it's the whole event's
+    event: Option<Event>,
     /// `clear` was called: the writer deletes what was recorded
     clear: bool,
 }
@@ -572,6 +593,7 @@ impl Queue {
             && self.scoring.is_empty()
             && self.boundaries.is_empty()
             && self.setup.is_none()
+            && self.event.is_none()
     }
 }
 
@@ -725,7 +747,7 @@ struct Writer {
     clear_requests: i64,
     settings_modified: Option<SystemTime>,
     next_settings_check: Instant,
-    forecast: Option<ForecastSource>,
+    web: Option<WebSource>,
 }
 
 impl Writer {
@@ -748,7 +770,8 @@ impl Writer {
         let mut scoring_writer = ScoringWriter::new(&conn)?;
         let mut forecast_writer = ForecastWriter::new(&conn)?;
         let mut setup_writer = SetupWriter::new(&conn)?;
-        let mut next_forecast = Instant::now();
+        let mut event_writer = EventWriter::new(&conn)?;
+        let mut next_web_read = Instant::now();
 
         let mut telemetry = Vec::new();
         let mut scoring = Vec::new();
@@ -759,7 +782,7 @@ impl Writer {
         // again until it changes
         let mut last_setup: Option<(Setup, Pushed)> = None;
         loop {
-            let (mut clear, mut setup) = {
+            let (mut clear, mut setup, event) = {
                 let queue = lock(&shared.queue);
                 // Wakes now and then even with nothing to write, to look at settings.json
                 let (mut queue, _) = shared
@@ -777,7 +800,11 @@ impl Writer {
                 std::mem::swap(&mut telemetry, &mut queue.telemetry);
                 std::mem::swap(&mut scoring, &mut queue.scoring);
                 std::mem::swap(&mut boundaries, &mut queue.boundaries);
-                (std::mem::take(&mut queue.clear), queue.setup.take())
+                (
+                    std::mem::take(&mut queue.clear),
+                    queue.setup.take(),
+                    queue.event.take(),
+                )
             };
 
             // Another event: the setup is the new one's, when it comes
@@ -826,8 +853,9 @@ impl Writer {
                 telemetry_writer.cleared();
                 scoring_writer.reset();
                 forecast_writer.reset();
+                event_writer.reset();
                 setup_writer.reset();
-                next_forecast = Instant::now();
+                next_web_read = Instant::now();
                 written = None;
             }
 
@@ -913,16 +941,27 @@ impl Writer {
                 boundaries.clear();
             }
 
-            // The forecast, now and then, after what's waiting has been written. A source that doesn't
-            // answer only skips it this time. Not while stopping: the game waits for the writer then
-            if let Some(forecast) = &mut self.forecast
+            // After the scoring, in a transaction of its own. Still the event's after the app
+            // clears the data: written again into the emptied recording
+            if let Some(event) = event {
+                event_writer.write(event)?;
+            }
+
+            // The web source, now and then, after what's waiting has been written. A part that
+            // doesn't answer only skips it this time. Not while stopping: the game waits for the
+            // writer then
+            if let Some(web) = &mut self.web
                 && !shared.stop.load(Ordering::Relaxed)
-                && Instant::now() >= next_forecast
+                && Instant::now() >= next_web_read
             {
-                next_forecast = Instant::now() + FORECAST_CHECK;
+                next_web_read = Instant::now() + WEB_CHECK;
                 let session_time = f64::from_bits(shared.session_time.load(Ordering::Relaxed));
-                if let Some(points) = forecast(session_time) {
+                let read = web(session_time);
+                if let Some(points) = read.forecast {
                     forecast_writer.write(points)?;
+                }
+                if let Some(event) = read.event {
+                    event_writer.write(event)?;
                 }
             }
         }
@@ -982,7 +1021,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sys::bono_forecast_point;
+    use crate::sys::{bono_event_session, bono_forecast_point};
 
     fn standing(vehicle_id: i64, is_player: bool, lap_distance: f64) -> bono_standing {
         let mut standing = bono_standing::default();
@@ -999,12 +1038,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // The writer doesn't read the forecast once stopping, so the test waits for it first
         let (asked_tx, asked) = std::sync::mpsc::channel();
-        let forecast: ForecastSource = Box::new(move |session_time| {
+        let forecast: WebSource = Box::new(move |session_time| {
             let _ = asked_tx.send(());
             let mut point = bono_forecast_point::default();
             point.session_time = Some(session_time).into();
             point.sky_text = Some("Clear".to_owned()).into();
-            Some(vec![point])
+            WebRead {
+                forecast: Some(vec![point]),
+                event: None,
+            }
         });
         let recorder = Recorder::new(dir.path(), Some(forecast)).unwrap();
 
@@ -1460,10 +1502,13 @@ mod tests {
         // The writer asks for the forecast after its first write, and waits there until told to go
         let (asked_tx, asked) = std::sync::mpsc::channel();
         let (go, wait) = std::sync::mpsc::channel::<()>();
-        let forecast: ForecastSource = Box::new(move |_| {
+        let forecast: WebSource = Box::new(move |_| {
             let _ = asked_tx.send(());
             let _ = wait.recv();
-            None
+            WebRead {
+                forecast: None,
+                event: None,
+            }
         });
         let recorder = Recorder::new(dir.path(), Some(forecast)).unwrap();
         let score = |kind: &str, time: f64, player: i64| {
@@ -1788,10 +1833,13 @@ mod tests {
         let (asked_tx, asked) = std::sync::mpsc::channel();
         let (go, wait) = std::sync::mpsc::channel::<()>();
         let wait = std::sync::Mutex::new(wait);
-        let forecast: ForecastSource = Box::new(move |_| {
+        let forecast: WebSource = Box::new(move |_| {
             let _ = asked_tx.send(());
             let _ = lock(&wait).recv();
-            None
+            WebRead {
+                forecast: None,
+                event: None,
+            }
         });
         let recorder = Recorder::new(dir.path(), Some(forecast)).unwrap();
         recorder.push_scoring(bono_session_info::default(), vec![standing(1, true, 0.0)]);
@@ -1969,6 +2017,62 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         drop(recorder);
+    }
+
+    /// An event of one race.
+    fn race_event() -> Event {
+        let mut race = bono_event_session::default();
+        race.event_order = Some(0).into();
+        race.session_type = Some("race".to_owned()).into();
+        race.session_number = Some(1).into();
+        race.length_time = Some(1200.0).into();
+        race.finish = Some("time".to_owned()).into();
+        Event {
+            sessions: vec![race],
+            rules: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pushed_event_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_event(race_event());
+        written(&recorder);
+        drop(recorder);
+
+        assert_eq!(rows_in(dir.path(), "event_session"), 1);
+    }
+
+    #[test]
+    fn web_source_event_is_written_with_the_forecast() {
+        let dir = tempfile::tempdir().unwrap();
+        let web: WebSource = Box::new(|_| WebRead {
+            forecast: None,
+            event: Some(race_event()),
+        });
+        let recorder = Recorder::new(dir.path(), Some(web)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rows_in(dir.path(), "event_session") != 1 {
+            assert!(Instant::now() < deadline, "the event was never written");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(recorder);
+    }
+
+    /// The writer forgets the last event on a clear: the same event is written again, into the
+    /// emptied recording.
+    #[test]
+    fn a_cleared_recording_writes_the_next_event_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), None).unwrap();
+        recorder.push_event(race_event());
+        written(&recorder);
+        recorder.clear();
+        recorder.push_event(race_event());
+        drop(recorder);
+
+        assert_eq!(rows_in(dir.path(), "event_session"), 1);
     }
 
     #[test]

@@ -429,6 +429,7 @@ impl Converter {
             new_event,
             setup: None,
             new_epoch,
+            event: None,
         })
     }
 }

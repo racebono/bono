@@ -818,6 +818,7 @@ impl Converter {
             // The recorder tells another session, the clock going back and replays from the
             // scoring
             new_epoch: None,
+            event: None,
         })
     }
 
