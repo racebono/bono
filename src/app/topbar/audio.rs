@@ -401,12 +401,16 @@ impl AudioTopbar {
     }
 
     /// Stop using an unplugged microphone, including any unfinished recording.
-    pub fn microphone_removed(&mut self, which: u32) -> bool {
+    pub fn microphone_removed(&mut self, config: &Config, which: u32) -> bool {
         if !self.microphone.removed(which) {
             return false;
         }
-        self.discarded |= self.whisper.recording();
-        self.whisper.cancel_recording();
+        if self.whisper.recording() {
+            self.whisper.cancel_recording();
+            self.discarded = true;
+            // The pilot may not see the notice, and would talk on to a microphone that's gone
+            self.close_beep(config);
+        }
         self.meter = None;
         true
     }

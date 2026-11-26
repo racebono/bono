@@ -225,7 +225,8 @@ impl App {
                 iscapture: true,
                 ..
             } => {
-                if self.state.gui.topbar.audio.microphone_removed(which) {
+                let state = &mut self.state;
+                if state.gui.topbar.audio.microphone_removed(&state.config, which) {
                     self.state.engineer.microphone_removed();
                 }
             }
