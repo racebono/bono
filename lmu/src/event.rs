@@ -65,6 +65,17 @@ fn parse(info: &str, settings: &str, session_time: f64) -> Option<Event> {
         _ => "unknown",
     };
 
+    // `lmu.cpp` numbers a session by the game's slot for it. Practice has four slots, each switched
+    // on or off (`SESSSET_pract1`..`4`), so the k-th practice runs in the k-th slot that's on. If
+    // the slots that are on don't match the practices scheduled, their numbers aren't known.
+    let practice_slots: Vec<i64> = (1..=4)
+        .filter(|slot| number(&format!("pract{slot}")) == Some(1.0))
+        .collect();
+    let practices = scheduled
+        .iter()
+        .filter(|entry| entry.get("name").and_then(Value::as_str) == Some("PRACTICE"))
+        .count();
+
     let mut sessions: Vec<bono_event_session> = Vec::new();
     for (order, entry) in scheduled.iter().enumerate() {
         let name = entry.get("name").and_then(Value::as_str);
@@ -73,12 +84,19 @@ fn parse(info: &str, settings: &str, session_time: f64) -> Option<Event> {
             continue;
         };
 
-        // Counted from 1 within its type, as `lmu.cpp` numbers the session; it gives warm-up none
         let earlier = sessions
             .iter()
             .filter(|session| session.session_type.as_deref() == Some(session_type))
             .count();
-        let session_number = (session_type != "warmup").then_some(earlier as i64 + 1);
+        // Qualifying and race slots are used from the first, so counting within the type numbers
+        // them as the game does. Warm-up has a single slot and no number
+        let session_number = match session_type {
+            "practice" => (practice_slots.len() == practices)
+                .then(|| practice_slots.get(earlier).copied())
+                .flatten(),
+            "warmup" => None,
+            _ => Some(earlier as i64 + 1),
+        };
 
         // Practice, qualifying and warm-up run on time. 0 minutes means the default
         let finish = if session_type == "race" {
@@ -352,6 +370,34 @@ mod tests {
         assert_eq!(warmup.session_type.as_deref(), Some("warmup"));
         assert_eq!(warmup.session_number.get(), None);
         assert_eq!(warmup.length_time.get(), Some(600.0));
+        assert_eq!(event.sessions[2].session_number.get(), Some(1));
+    }
+
+    #[test]
+    fn practice_numbers_follow_the_enabled_slots() {
+        let settings = offline_with(&[("SESSSET_pract1", 0.into()), ("SESSSET_pract2", 1.into())]);
+
+        let event = parse(INFO_OFFLINE, &settings, 0.0).unwrap();
+        let practice = &event.sessions[0];
+        assert_eq!(practice.session_type.as_deref(), Some("practice"));
+        assert_eq!(practice.session_number.get(), Some(2));
+        // The start time and rubber are practice 1's settings
+        assert_eq!(practice.start_time_of_day.get(), None);
+        assert_eq!(practice.track_rubber.as_deref(), None);
+    }
+
+    #[test]
+    fn practice_numbers_unknown_when_slots_disagree() {
+        let info = r#"{"scheduledSessions": [
+            {"lengthTime": 60, "name": "PRACTICE"},
+            {"lengthTime": 60, "name": "PRACTICE"},
+            {"lengthTime": 72, "name": "RACE"}
+        ]}"#;
+
+        let event = parse(info, OFFLINE, 0.0).unwrap();
+        assert_eq!(event.sessions[0].session_number.get(), None);
+        assert_eq!(event.sessions[1].session_number.get(), None);
+        assert_eq!(event.sessions[0].start_time_of_day.get(), None);
         assert_eq!(event.sessions[2].session_number.get(), Some(1));
     }
 
