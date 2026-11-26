@@ -1038,6 +1038,11 @@ impl Speech {
         Self::tone(Radio::beep, volume)
     }
 
+    /// The radio's lower beep at `volume`, telling the pilot the microphone closed.
+    pub fn talk_close_beep(volume: f32) -> Self {
+        Self::tone(Radio::close_beep, volume)
+    }
+
     /// The radio's low double tone at `volume`, for when the engineer can't answer: there's no
     /// voice to do it with.
     pub fn no_beep(volume: f32) -> Self {

@@ -225,7 +225,8 @@ impl App {
                 iscapture: true,
                 ..
             } => {
-                if self.state.gui.topbar.audio.microphone_removed(which) {
+                let state = &mut self.state;
+                if state.gui.topbar.audio.microphone_removed(&state.config, which) {
                     self.state.engineer.microphone_removed();
                 }
             }
@@ -246,10 +247,13 @@ impl App {
             }
             _ => {}
         }
-        // A text field taking the talk button's release mustn't leave the microphone open
-        if self.ui.on_event(&event).consumed
-            && !(self.state.gui.topbar.audio.whisper).ends_recording(&self.state.config, &event)
-        {
+        // The press a button being changed waits for doesn't do what the button did until now
+        let changes_button = self.state.gui.changing_button()
+            && matches!(event, Event::KeyDown { .. } | Event::JoyButtonDown { .. });
+        // A text field taking the event mustn't leave the microphone open
+        let consumed = self.ui.on_event(&event).consumed
+            && !(self.state.gui.topbar.audio.whisper).ends_recording(&self.state.config, &event);
+        if changes_button || consumed {
             return AppResult::Continue;
         }
 
@@ -334,9 +338,16 @@ impl AppState {
         self.engineer
             .follow_recording(rt, self.simulators.current_mut());
 
-        // Its answer waits while the pilot holds the talk button. Told before what was heard: a
-        // release is seen no later than what was said before it
+        // Its answer waits while the pilot talks, and for the closing beep after: told first, so the
+        // answer doesn't carry on in between. Both are told before what was heard: the pilot
+        // stopping is seen no later than what was said before it
+        self.engineer.beep(self.gui.topbar.audio.beeping());
         self.engineer.talk(self.gui.topbar.audio.recording());
+        // Nothing is on its way from a recording thrown away, unless one before it is still heard
+        let audio = &mut self.gui.topbar.audio;
+        if audio.take_discarded() && !audio.transcribing() {
+            self.engineer.recording_discarded();
+        }
         // What the pilot says on the radio goes to the engineer, and its answers come back
         if let Some(heard) = self.gui.topbar.audio.transcription(rt) {
             self.engineer.hear(
@@ -496,7 +507,8 @@ impl Gui {
         {
             self.onboarding.open();
         }
-        let question = self.chat.update(ui, engineer);
+        let talk_toggle = *config.get().talk_toggle();
+        let question = self.chat.update(ui, engineer, talk_toggle);
         self.onboarding.update(
             rt,
             ss,
@@ -511,6 +523,11 @@ impl Gui {
         // Not over the setup guide
         (self.topbar.update).popup(ui.ctx(), self.onboarding.is_open());
         question
+    }
+
+    /// Whether a button being changed waits for a press.
+    fn changing_button(&self) -> bool {
+        self.topbar.settings.changing_button() || self.onboarding.changing_button()
     }
 
     fn event(&mut self, rt: &Handle, config: &Config, event: &Event) -> bool {

@@ -145,6 +145,11 @@
         "es": "Mantén pulsado el botón de hablar, o escribe abajo, para preguntar al ingeniero.",
         "ca": "Mantén premut el botó de parlar, o escriu a sota, per preguntar a l'enginyer."
     },
+    "chat.empty_toggle": {
+        "en": "Press the talk button, or type below, to ask the engineer.",
+        "es": "Pulsa el botón de hablar, o escribe abajo, para preguntar al ingeniero.",
+        "ca": "Prem el botó de parlar, o escriu a sota, per preguntar a l'enginyer."
+    },
     "chat.pilot": {
         "en": "Pilot",
         "es": "Piloto",
@@ -375,6 +380,26 @@
         "es": "Cambiar botón de hablar",
         "ca": "Canvia el botó de parlar"
     },
+    "settings.talk_toggle": {
+        "en": "Press to toggle talking",
+        "es": "Pulsar para activar y desactivar el micrófono",
+        "ca": "Prem per activar i desactivar el micròfon"
+    },
+    "settings.talk_toggle_hover": {
+        "en": "Press the talk button once to start talking and press it again to stop, instead of holding it down. After a minute the microphone closes by itself, and what you said is discarded",
+        "es": "Pulsa el botón de hablar una vez para empezar a hablar y vuélvelo a pulsar para parar, en lugar de mantenerlo pulsado. Pasado un minuto, el micrófono se cierra solo y lo que hayas dicho se descarta",
+        "ca": "Prem el botó de parlar un cop per començar a parlar i torna'l a prémer per parar, en comptes de mantenir-lo premut. Passat un minut, el micròfon es tanca sol i el que hagis dit es descarta"
+    },
+    "settings.talk_close_beep": {
+        "en": "Beep when you stop talking",
+        "es": "Pitido al dejar de hablar",
+        "ca": "Xiulet en deixar de parlar"
+    },
+    "settings.talk_close_beep_hover": {
+        "en": "Play a lower beep when you press the talk button again to stop talking",
+        "es": "Reproduce un pitido más grave al volver a pulsar el botón de hablar para dejar de hablar",
+        "ca": "Reprodueix un xiulet més greu en tornar a prémer el botó de parlar per deixar de parlar"
+    },
     "settings.change_session": {
         "en": "Change session button",
         "es": "Cambiar botón de sesión",
@@ -456,9 +481,9 @@
         "ca": "Xiulet de ràdio"
     },
     "volume.beep_hover": {
-        "en": "The beep when you start talking, and the roger beep that ends each transmission (from the next one on)",
-        "es": "El pitido al empezar a hablar, y el que cierra cada transmisión (a partir de la siguiente)",
-        "ca": "El xiulet en començar a parlar, i el que tanca cada transmissió (a partir de la següent)"
+        "en": "The beeps when you start (and stop) talking, and the roger beep that ends each transmission (from the next one on)",
+        "es": "Los pitidos al empezar a hablar (y al dejar de hacerlo), y el que cierra cada transmisión (a partir de la siguiente)",
+        "ca": "Els xiulets en començar a parlar (i en deixar de fer-ho), i el que tanca cada transmissió (a partir de la següent)"
     },
     "volume.radio_effect": {
         "en": "Radio effect",
@@ -2044,6 +2069,11 @@
         "es": "Mantenlo pulsado mientras hablas con el ingeniero, como una radio. Lo mejor es un botón del volante: funciona con el juego delante.",
         "ca": "Mantén-lo premut mentre parles amb l'enginyer, com una ràdio. El millor és un botó del volant: funciona amb el joc al davant."
     },
+    "onboarding.talk_body_toggle": {
+        "en": "Press it to start talking to the engineer, and press it again when you're done. A button on your wheel is best: it works while the game is in front.",
+        "es": "Púlsalo para empezar a hablar con el ingeniero y vuélvelo a pulsar cuando acabes. Lo mejor es un botón del volante: funciona con el juego delante.",
+        "ca": "Prem-lo per començar a parlar amb l'enginyer i torna'l a prémer quan acabis. El millor és un botó del volant: funciona amb el joc al davant."
+    },
     "onboarding.talk_button": {
         "en": "Talk button",
         "es": "Botón de hablar",
@@ -2079,10 +2109,20 @@
         "es": "Mantén pulsado {button} y di algo, como \"prueba de radio\".",
         "ca": "Mantén premut {button} i digues alguna cosa, com ara \"prova de ràdio\"."
     },
+    "onboarding.radio_toggle": {
+        "en": "Press {button} to start talking, say something like \"radio check\", then press it again.",
+        "es": "Pulsa {button} para empezar a hablar, di algo como \"prueba de radio\" y vuelve a pulsar.",
+        "ca": "Prem {button} per començar a parlar, digues alguna cosa com ara \"prova de ràdio\" i torna a prémer."
+    },
     "onboarding.radio_listening": {
         "en": "Listening… let go when you're done",
         "es": "Escuchando… suelta cuando acabes",
         "ca": "Escoltant… deixa'l anar quan acabis"
+    },
+    "onboarding.radio_listening_toggle": {
+        "en": "Listening… press again when you're done",
+        "es": "Escuchando… vuelve a pulsar cuando acabes",
+        "ca": "Escoltant… torna a prémer quan acabis"
     },
     "onboarding.radio_understanding": {
         "en": "Understanding…",

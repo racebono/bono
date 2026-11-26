@@ -80,7 +80,7 @@ impl Button {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConfigButton {
     Key(#[serde(with = "scancode")] Scancode),
     Joystick {

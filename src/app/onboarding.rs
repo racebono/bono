@@ -104,7 +104,7 @@ pub struct Onboarding {
     session_button: ChangeButton,
     /// The radio check: how long the chat was when it started, so it shows what was said since
     radio_from: usize,
-    /// The radio check: the talk button was held, and what was said hasn't been heard yet
+    /// The radio check: the pilot talked, and what was said hasn't been heard yet
     listened: bool,
     /// The radio check: how many times the pilot was understood, when the talk button was last
     /// pressed
@@ -151,6 +151,11 @@ impl Onboarding {
 
     pub fn is_open(&self) -> bool {
         self.step.is_some()
+    }
+
+    /// Whether a button being changed waits for a press.
+    pub fn changing_button(&self) -> bool {
+        self.talk_button.is_waiting() || self.session_button.is_waiting()
     }
 
     pub fn update(
@@ -362,17 +367,21 @@ impl Onboarding {
     }
 
     fn talk_button(&mut self, rt: &Handle, ss: &Subsystems, ui: &mut egui::Ui, config: &Config) {
-        ui.heading(t!("onboarding.talk_title"));
-        ui.label(t!("onboarding.talk_body"));
-        ui.add_space(8.0);
-
-        let (talk, session) = {
+        let (talk, session, toggle) = {
             let config = config.get();
             (
                 config.talk_button().clone(),
                 config.session_button().clone(),
+                *config.talk_toggle(),
             )
         };
+
+        ui.heading(t!("onboarding.talk_title"));
+        ui.label(match toggle {
+            true => t!("onboarding.talk_body_toggle"),
+            false => t!("onboarding.talk_body"),
+        });
+        ui.add_space(8.0);
 
         let label = format!(
             "{}: {}",
@@ -389,6 +398,7 @@ impl Onboarding {
         if let Some(button) = pressed {
             config.update(|raw| raw.talk_button.set(Some(button)));
         }
+        settings::talk_options(ui, config);
 
         ui.add_space(8.0);
         let label = format!(
@@ -418,11 +428,12 @@ impl Onboarding {
         ui.label(t!("onboarding.radio_body"));
         ui.add_space(8.0);
 
-        let (talk, has_voice) = {
+        let (talk, toggle, has_voice) = {
             let config = config.get();
             let lang = audio.guide_language(&config);
             (
                 config.talk_button().clone(),
+                *config.talk_toggle(),
                 config.voices().contains_key(&lang),
             )
         };
@@ -456,14 +467,18 @@ impl Onboarding {
             ui.colored_label(ui.visuals().warn_fg_color, t!("onboarding.radio_not_ready"));
             return;
         }
-        ui.strong(t!("onboarding.radio_hold", button = button_name(talk)));
+        let button = button_name(talk);
+        ui.strong(match toggle {
+            true => t!("onboarding.radio_toggle", button = button),
+            false => t!("onboarding.radio_hold", button = button),
+        });
 
         let said = &engineer.chat()[self.radio_from.min(engineer.chat().len())..];
         let pilot_lines = (said.iter())
             .filter(|entry| entry.speaker == Speaker::Pilot)
             .count();
         // Something said that came out as nothing: no new line for the pilot. Silence is heard
-        // before a frame may see it transcribing, so it's whether the button was held
+        // before a frame may see it transcribing, so it's whether the pilot talked
         let transcribing = audio.transcribing();
         if audio.recording() {
             self.pilot_lines = pilot_lines;
@@ -476,13 +491,13 @@ impl Onboarding {
 
         ui.horizontal(|ui| {
             if audio.recording() {
+                let listening = match toggle {
+                    true => t!("onboarding.radio_listening_toggle"),
+                    false => t!("onboarding.radio_listening"),
+                };
                 ui.colored_label(
                     ui.visuals().error_fg_color,
-                    format!(
-                        "{} {}",
-                        egui_phosphor::bold::MICROPHONE,
-                        t!("onboarding.radio_listening")
-                    ),
+                    format!("{} {listening}", egui_phosphor::bold::MICROPHONE),
                 );
             } else if transcribing {
                 ui.spinner();
