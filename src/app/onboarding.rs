@@ -846,10 +846,7 @@ fn plan(
 ) -> (Answer, Option<Engine>) {
     let voices = config.voices().keys().copied().collect::<Vec<_>>();
     let usable = audio.usable_voices(config, synth);
-    let mut answer = answer(ticked, &voices, &usable, config.engineer_reply_language());
-    // The spotter's fixed language keeps its voice too
-    let spotter = *config.spotter.language();
-    answer.remove.retain(|&lang| Some(lang) != spotter);
+    let answer = answer(ticked, &voices, &usable, config.engineer_reply_language());
     let whisper = &audio.whisper;
     let picked = match config.whisper_model() {
         None => Picked::None,
