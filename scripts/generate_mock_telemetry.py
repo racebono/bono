@@ -30,7 +30,7 @@ def columns():
                 line = next(lines)
                 body += '\n' + line
             result[match[1]] = re.findall(r'X\((f64|i64|boolean|string),\s*(\w+)(?:,\s*\w+)?\)', body)
-    assert len(result) == 8, result.keys()
+    assert len(result) == 10, result.keys()
     return result
 
 
