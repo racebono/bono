@@ -274,6 +274,10 @@ impl Onboarding {
                             if let Some(voice) = raw.remove_language(lang, synth) {
                                 rt.spawn_blocking(move || drop(voice));
                             }
+                            // The spotter speaks the pilot's language then, not some other voice's
+                            if *raw.spotter.language() == Some(lang) {
+                                raw.spotter.language.set(None);
+                            }
                         }
                     });
                     topbar.audio.setup(&answer.get, engine);
