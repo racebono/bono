@@ -219,17 +219,28 @@ impl Voices {
     /// The languages whose voice is being set up, and is coming: not those whose download failed,
     /// nor those missing from the catalog.
     pub fn getting(&self) -> Vec<ArrayStr<2>> {
-        let coming = |setup: &Setup| match &self.catalog {
-            MaybeDone::Done(Some(catalog)) => (catalog.languages.iter())
-                .filter(|language| language.code == setup.lang)
-                .flat_map(|language| &language.voices)
-                .any(|voice| voice.is_named(setup.name) && !voice.failed()),
-            _ => true,
-        };
         (self.setup.iter())
-            .filter(|setup| coming(setup))
+            .filter(|setup| self.can_come(setup.lang, setup.name, true))
             .map(|setup| setup.lang)
             .collect()
+    }
+
+    /// Whether `lang`'s recommended voice can be set up: it's in the catalog (or the catalog isn't
+    /// known yet). Voices the guide counts are only those that can.
+    pub fn listed(&self, lang: ArrayStr<2>) -> bool {
+        recommended(&lang).is_some_and(|(lang, name)| self.can_come(lang, name, false))
+    }
+
+    /// Whether the voice `name` for `lang` is in the catalog (or it isn't known yet), and, if
+    /// `downloading`, its last download didn't fail.
+    fn can_come(&self, lang: ArrayStr<2>, name: &str, downloading: bool) -> bool {
+        match &self.catalog {
+            MaybeDone::Done(Some(catalog)) => (catalog.languages.iter())
+                .filter(|language| language.code == lang)
+                .flat_map(|language| &language.voices)
+                .any(|voice| voice.is_named(name) && !(downloading && voice.failed())),
+            _ => true,
+        }
     }
 
     /// The languages whose voice the setup guide asked for and isn't used yet, failed ones too.

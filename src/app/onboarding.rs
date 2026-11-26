@@ -10,7 +10,7 @@ use crate::{
             audio::{
                 AudioTopbar, SetupItem, SetupState, app_language,
                 engine::{self, Engine},
-                voice::{RECOMMENDED, recommended},
+                voice::RECOMMENDED,
             },
             settings::{self, ChangeButton, button_name},
             setup_label,
@@ -650,8 +650,11 @@ fn still_downloading(
             }
         }
         let automatic = raw.whisper_model().is_none();
-        // With what Retry asks for, failed ones too
-        let wanted = || audio.whisper.wanted(&raw, &langs).0;
+        // With what Retry asks for, failed ones too, if they can come
+        let coming = (langs.iter().copied())
+            .filter(|&lang| audio.voices.listed(lang))
+            .collect::<Vec<_>>();
+        let wanted = || audio.whisper.wanted(&raw, &coming).0;
         let engine = automatic.then(|| audio.whisper.setting_up().unwrap_or_else(wanted));
         (langs, engine)
     };
@@ -858,12 +861,12 @@ fn plan(
         return (answer, None);
     }
     // The voices once it's done, as Automatic will count them: those being set up too (only
-    // those with a recommended voice are)
+    // those whose recommended voice is in the catalog are)
     let mut after = (voices.iter().copied())
         .filter(|lang| !answer.remove.contains(lang))
         .collect::<Vec<_>>();
     for &lang in &answer.get {
-        if !after.contains(&lang) && recommended(&lang).is_some() {
+        if !after.contains(&lang) && audio.voices.listed(lang) {
             after.push(lang);
         }
     }

@@ -668,11 +668,12 @@ impl DeviceSelector {
 /// the Heard language; or else the `app`'s, if it has a voice or is `getting` one; or else the
 /// first that has or is; or else the app's.
 fn guide_language(config: &RawConfig, app: ArrayStr<2>, getting: &[ArrayStr<2>]) -> ArrayStr<2> {
-    let mut voiced = config.voices().keys().chain(getting).copied();
+    // In order, so it doesn't change as the voices being set up arrive
+    let voiced = (config.voices().keys().chain(getting).copied()).collect::<std::collections::BTreeSet<_>>();
     let lang = (config.engineer_reply_language())
         .or(*config.heard_language())
-        .or_else(|| voiced.clone().any(|lang| lang == app).then_some(app))
-        .or_else(|| voiced.next())
+        .or_else(|| voiced.contains(&app).then_some(app))
+        .or_else(|| voiced.first().copied())
         .unwrap_or(app);
     language::voice_code(lang)
 }
