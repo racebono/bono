@@ -26,3 +26,17 @@ language and an English spoken language, then ask Spanish questions requiring di
 answers, early acknowledgements and multiple tool calls. Every spoken part must remain
 English, including after tool results and earlier Spanish conversation. Repeat after
 changing the spoken language between questions; the latest reply note must take priority.
+
+## Misheard words
+
+Spoken questions come from speech recognition. Ask with a racing word replaced by others
+that sound like it: split in two ("over steer" as two unrelated words), a term swapped for
+an everyday word, a rival's surname spelled as a common noun, or a corner's name written
+by its sound. Include one where the intended word is clear from the telemetry or the
+earlier question, and one where two readings would be answered differently.
+
+| Case | Pass criteria |
+|---|---|
+| The meaning is clear from its sound, the telemetry or the earlier question | Answers what was meant, with the same content and length as the correctly heard question. Doesn't repeat the wrong word or mention it was misheard. |
+| Two readings would be answered differently | Asks one short question naming them, instead of guessing. |
+| The odd word doesn't change the answer | Answers directly, without asking. |

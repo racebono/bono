@@ -14,7 +14,7 @@ lmu *args:
 # On Windows, tests build in a reusable slot (scripts/slot.ps1): a new worktree only rebuilds
 # the workspace crates, not every dependency.
 
-# Test the app without CUDA or Vulkan, e.g. `just test synthesizer`
+# Test the app without Vulkan, e.g. `just test synthesizer`
 [windows]
 test *args:
     pwsh -NoProfile -File scripts/slot.ps1 just _test {{args}}

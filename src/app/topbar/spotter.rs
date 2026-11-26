@@ -1,6 +1,6 @@
 //! The spotter: whether it calls at all (and in qualifying), in which language, whether it says
-//! lap times in qualifying (even when otherwise quiet in it), and whether it calls race starts and
-//! local yellows.
+//! lap times in qualifying (even when otherwise quiet in it), and whether it calls race starts,
+//! cars closing from behind and local yellows.
 
 use crate::{app::topbar::pick, config::Config, language};
 use bono_i18n::t;
@@ -40,6 +40,13 @@ impl SpotterTopbar {
                     .edit(*spotter.race_starts(), |race_starts| {
                         ui.checkbox(race_starts, t!("spotter.race_starts"))
                             .on_hover_text(t!("spotter.race_starts_hover"))
+                            .changed()
+                    });
+                changed |= spotter
+                    .gap_behind
+                    .edit(*spotter.gap_behind(), |gap_behind| {
+                        ui.checkbox(gap_behind, t!("spotter.gap_behind"))
+                            .on_hover_text(t!("spotter.gap_behind_hover"))
                             .changed()
                     });
                 changed |= spotter
