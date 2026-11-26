@@ -55,6 +55,9 @@ fn parse(info: &str, settings: &str, session_time: f64) -> Option<Event> {
         (!text.is_empty()).then(|| text.to_owned())
     };
 
+    // An answer without the finish rule isn't the event's settings (an error, or no event): the
+    // last event read stays.
+    setting("Finish_Criteria")?;
     // All sources agree only on 1 and 2; the others conflict, so the race's length isn't known then
     let race_finish = match number("Finish_Criteria") {
         Some(1.0) => "laps",
@@ -87,7 +90,9 @@ fn parse(info: &str, settings: &str, session_time: f64) -> Option<Event> {
             .get("lengthTime")
             .and_then(Value::as_f64)
             .filter(|minutes| *minutes > 0.0);
-        let laps = number("Race_Laps").filter(|laps| *laps > 0.0);
+        // A FLOAT setting: only a whole number of laps in a sane range is one
+        let laps = number("Race_Laps")
+            .filter(|laps| laps.fract() == 0.0 && (1.0..=10000.0).contains(laps));
 
         let (start_key, rubber_key) = match (session_type, session_number) {
             ("practice", Some(1)) => (
@@ -129,17 +134,16 @@ fn parse(info: &str, settings: &str, session_time: f64) -> Option<Event> {
         session.track_rubber = rubber_key.and_then(text).into();
         sessions.push(session);
     }
+    // No session it knows: not an event to replace the last one with
+    if sessions.is_empty() {
+        return None;
+    }
 
-    // 1 is the real rate
+    // Only the values seen in the game: 1 is the real rate ("Realistic"), 2 double ("X2"). Others
+    // (0, 3) aren't recorded until their meaning is checked in the game
     let multiplier = |key: &str| {
         let value = number(key)?;
-        if value == 0.0 {
-            Some("off".to_owned())
-        } else if [1.0, 2.0, 3.0].contains(&value) {
-            Some(format!("×{value}"))
-        } else {
-            None
-        }
+        [1.0, 2.0].contains(&value).then(|| format!("×{value}"))
     };
     let rules = [
         ("fuel_use_multiplier", None, multiplier("Fuel_Usage")),
@@ -274,12 +278,61 @@ mod tests {
         assert_eq!(rule(&event, "fuel_use_multiplier"), Some("×1"));
     }
 
+    /// The offline settings, with these settings' `currentValue`s changed.
+    fn offline_with(values: &[(&str, Value)]) -> String {
+        let mut settings: Value = serde_json::from_str(OFFLINE).unwrap();
+        for (key, value) in values {
+            settings[*key]["currentValue"] = value.clone();
+        }
+        settings.to_string()
+    }
+
+    #[test]
+    fn laps_finish_records_the_race_laps() {
+        let settings = offline_with(&[
+            ("SESSSET_Finish_Criteria", 1.into()),
+            ("SESSSET_Race_Laps", 30.0.into()),
+        ]);
+
+        let event = parse(INFO_OFFLINE, &settings, 0.0).unwrap();
+        let race = &event.sessions[2];
+        assert_eq!(race.finish.as_deref(), Some("laps"));
+        assert_eq!(race.length_laps.get(), Some(30));
+        assert_eq!(race.length_time.get(), None);
+    }
+
+    #[test]
+    fn race_laps_that_arent_a_sane_whole_number_are_unknown() {
+        for laps in [0.5, 30.5, 1e30, -3.0] {
+            let settings = offline_with(&[
+                ("SESSSET_Finish_Criteria", 1.into()),
+                ("SESSSET_Race_Laps", laps.into()),
+            ]);
+
+            let event = parse(INFO_OFFLINE, &settings, 0.0).unwrap();
+            assert_eq!(event.sessions[2].length_laps.get(), None, "{laps}");
+        }
+    }
+
+    #[test]
+    fn multipliers_not_seen_in_the_game_arent_recorded() {
+        for value in [0, 3] {
+            let settings = offline_with(&[
+                ("SESSSET_Fuel_Usage", value.into()),
+                ("SESSSET_Tire_Wear", value.into()),
+            ]);
+
+            let event = parse(INFO_OFFLINE, &settings, 0.0).unwrap();
+            assert_eq!(rule(&event, "fuel_use_multiplier"), None);
+            assert_eq!(rule(&event, "tire_wear_multiplier"), None);
+        }
+    }
+
     #[test]
     fn share_of_track_finish_leaves_the_race_length_unknown() {
-        let mut settings: Value = serde_json::from_str(OFFLINE).unwrap();
-        settings["SESSSET_Finish_Criteria"]["currentValue"] = 5.into();
+        let settings = offline_with(&[("SESSSET_Finish_Criteria", 5.into())]);
 
-        let event = parse(INFO_OFFLINE, &settings.to_string(), 0.0).unwrap();
+        let event = parse(INFO_OFFLINE, &settings, 0.0).unwrap();
         let race = &event.sessions[2];
         assert_eq!(race.finish.as_deref(), Some("unknown"));
         assert_eq!(race.length_time.get(), None);
@@ -306,5 +359,18 @@ mod tests {
     fn nothing_without_both_answers() {
         assert!(parse(INFO_OFFLINE, "not json", 0.0).is_none());
         assert!(parse("{}", OFFLINE, 0.0).is_none());
+    }
+
+    #[test]
+    fn no_known_session_is_no_event() {
+        assert!(parse(r#"{"scheduledSessions": []}"#, OFFLINE, 0.0).is_none());
+        let other = r#"{"scheduledSessions": [{"lengthTime": 10, "name": "OTHER"}]}"#;
+        assert!(parse(other, OFFLINE, 0.0).is_none());
+    }
+
+    #[test]
+    fn settings_without_the_finish_rule_are_no_event() {
+        assert!(parse(INFO_OFFLINE, "{}", 0.0).is_none());
+        assert!(parse(INFO_OFFLINE, r#"{"error": "not in an event"}"#, 0.0).is_none());
     }
 }

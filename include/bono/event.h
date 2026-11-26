@@ -31,7 +31,7 @@
     X(f64, session_time)                    /* when the event was read, on the clock of the last scoring update (not compared) */ \
     X(string, name)                         /* a Bono name, shared across simulators where the meaning matches */ \
     X(string, session_type)                 /* the session type the rule is for; NULL for the event */   \
-    X(string, value)                        /* readable, unit included: "x2", "12 tyres", "unlimited" */
+    X(string, value)                        /* readable, unit included: "×2", "12 tyres", "unlimited" */
 // clang-format on
 
 #define SIM_DECLARE_FIELD(type, name) bono_opt_##type##_s name;
