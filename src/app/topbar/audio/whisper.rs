@@ -582,10 +582,22 @@ impl Whisper {
         self.stream.is_some()
     }
 
-    /// Whether the pilot seems to have left the microphone open.
-    pub fn forgotten(&self) -> bool {
+    /// Whether the recording is to be thrown away: what would have ended it may not any more (the
+    /// talk button, or how it's used, changed), or the pilot seems to have left it open.
+    pub fn unwanted(&self, config: &Config) -> bool {
+        if !self.recording() {
+            return false;
+        }
+        if self.talk_settings != talk_settings(config) {
+            log::info!("The talk button changed while talking: what was recorded is discarded");
+            return true;
+        }
         let (_, toggle) = self.talk_settings;
-        self.recording() && forgotten(toggle, self.talk_started.elapsed())
+        let forgotten = forgotten(toggle, self.talk_started.elapsed());
+        if forgotten {
+            log::info!("The microphone was left open: what it recorded is discarded");
+        }
+        forgotten
     }
 
     /// Opens the microphone. When it can't be, what's heard right away says why.
@@ -666,11 +678,6 @@ impl Whisper {
     /// Called every frame: loads the model to use once it changes, and sets up the recommended
     /// one if the setup guide asked for it. `getting`: the languages whose voice is being set up.
     pub fn poll(&mut self, rt: &Handle, config: &Config, getting: &[ArrayStr<2>]) {
-        // What would have ended the recording may not any more
-        if self.recording() && self.talk_settings != talk_settings(config) {
-            self.cancel_recording();
-        }
-
         if let Some(ctx) = &mut self.ctx {
             ctx.update(rt);
         }

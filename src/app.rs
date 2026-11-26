@@ -249,10 +249,10 @@ impl App {
         // The press a button being changed waits for doesn't do what the button did until now
         let changes_button = self.state.gui.changing_button()
             && matches!(event, Event::KeyDown { .. } | Event::JoyButtonDown { .. });
-        // Neither that nor a text field taking the event may leave the microphone open
-        if (self.ui.on_event(&event).consumed || changes_button)
-            && !(self.state.gui.topbar.audio.whisper).ends_recording(&self.state.config, &event)
-        {
+        // A text field taking the event mustn't leave the microphone open
+        let consumed = self.ui.on_event(&event).consumed
+            && !(self.state.gui.topbar.audio.whisper).ends_recording(&self.state.config, &event);
+        if changes_button || consumed {
             return AppResult::Continue;
         }
 
@@ -342,6 +342,11 @@ impl AppState {
         // stopping is seen no later than what was said before it
         self.engineer.beep(self.gui.topbar.audio.beeping());
         self.engineer.talk(self.gui.topbar.audio.recording());
+        // Nothing is on its way from a recording thrown away, unless one before it is still heard
+        let audio = &mut self.gui.topbar.audio;
+        if audio.take_discarded() && !audio.transcribing() {
+            self.engineer.recording_discarded();
+        }
         // What the pilot says on the radio goes to the engineer, and its answers come back
         if let Some(heard) = self.gui.topbar.audio.transcription(rt) {
             self.engineer.hear(

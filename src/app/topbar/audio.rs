@@ -100,6 +100,8 @@ pub struct AudioTopbar {
     beep_playback: Option<(AudioStreamOwner, Drain)>,
     /// What the pilot last said on the radio, being transcribed
     transcription: Option<Task<anyhow::Result<Heard>>>,
+    /// A recording was thrown away, unheard, since [`Self::take_discarded`] was last asked
+    discarded: bool,
     /// Listening to the microphone for the setup guide: `None` until it's asked for, and
     /// `Some(None)` if it couldn't
     meter: Option<Option<MicMeter>>,
@@ -145,6 +147,7 @@ impl AudioTopbar {
             test_playback: None,
             beep_playback: None,
             transcription: None,
+            discarded: false,
             meter: None,
         }
     }
@@ -170,9 +173,9 @@ impl AudioTopbar {
         }
         self.speaker.poll(Kind::Playback);
         self.whisper.poll(rt, config, &self.voices.getting());
-        if self.whisper.forgotten() {
-            log::info!("The microphone was left open: what it recorded is discarded");
+        if self.whisper.unwanted(config) {
             self.whisper.cancel_recording();
+            self.discarded = true;
             self.close_beep(config);
         }
         self.voices.poll(rt, config, synth);
@@ -206,6 +209,11 @@ impl AudioTopbar {
     /// Whether the microphone is open: the pilot is talking.
     pub fn recording(&self) -> bool {
         self.whisper.recording()
+    }
+
+    /// Whether a recording was thrown away, unheard, since this was last asked.
+    pub fn take_discarded(&mut self) -> bool {
+        std::mem::take(&mut self.discarded)
     }
 
     /// Whether what the pilot said on the radio is being transcribed.
@@ -397,6 +405,7 @@ impl AudioTopbar {
         if !self.microphone.removed(which) {
             return false;
         }
+        self.discarded |= self.whisper.recording();
         self.whisper.cancel_recording();
         self.meter = None;
         true

@@ -582,7 +582,10 @@ impl Spotter {
             Some(Saying::Synthesizing { call, at, .. })
                 if !call.urgent && engineer.is_beeping() =>
             {
-                if self.queue.iter().any(|(queued, _)| queued.urgent) {
+                let now = Instant::now();
+                let urgent =
+                    |(queued, at): &(Raised, Instant)| queued.urgent && queued.valid_at(*at, now);
+                if self.queue.iter().any(urgent) {
                     self.queue.push_front((call.clone(), *at));
                     self.saying = None;
                 }
@@ -3135,6 +3138,28 @@ mod tests {
         // Said (with no speaker, gone at once), and the other still to say
         assert!(spotter.saying.is_none());
         assert_eq!(texts_of(&spotter.queue), ["penalty"]);
+    }
+
+    #[test]
+    fn an_expired_urgent_call_doesnt_go_ahead_of_one_waiting_for_the_talk_beep() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let mut synth = Synthesizer::new(runtime.handle(), &config.get());
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.beep(true);
+        let lang = arrstr!("en");
+        let at = Instant::now();
+
+        let (mut spotter, _send) = pending_call("penalty", false, at);
+        spotter.hear(call("car left", true), at - URGENT_FOR);
+        let rt = runtime.handle();
+        spotter.say(rt, &config, &mut synth, None, &mut engineer, lang);
+        // It still waits for the beep, with its speech
+        assert!(matches!(spotter.saying, Some(Saying::Synthesizing { .. })));
     }
 
     #[test]

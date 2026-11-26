@@ -980,6 +980,12 @@ impl Engineer {
         self.hold_front();
     }
 
+    /// What the pilot said was thrown away before being heard (the microphone was unplugged or left
+    /// open, or the talk button changed): nothing is on its way, so scheduled turns don't wait.
+    pub fn recording_discarded(&mut self) {
+        self.hearing = None;
+    }
+
     /// Holds the answer at the front of the line while the talk button's beep plays, as
     /// [`Self::hold`] does for the spotter. Only the spotter's urgent calls play over it.
     pub fn beep(&mut self, beeping: bool) {
@@ -5859,6 +5865,20 @@ mod tests {
         assert_eq!(scripted.questions().len(), turns);
         scripted.engineer.talk(false);
         scripted.hear(Heard::TooShort);
+        let message = scripted.scheduled_asked(turns);
+        assert!(message.contains(MARKER), "{message}");
+    }
+
+    #[test]
+    fn a_discarded_recording_isnt_waited_for() {
+        let mut scripted = Scripted::recorded();
+        scripted.falls_due();
+        let turns = scripted.questions().len();
+        scripted.engineer.talk(true);
+        scripted.engineer.talk(false);
+        // Thrown away rather than heard: nothing is on its way
+        scripted.engineer.recording_discarded();
+        scripted.wait(schedule::GATHER);
         let message = scripted.scheduled_asked(turns);
         assert!(message.contains(MARKER), "{message}");
     }
