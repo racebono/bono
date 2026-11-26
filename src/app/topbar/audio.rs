@@ -451,13 +451,9 @@ impl AudioTopbar {
     }
 
     /// Tells the pilot the microphone closed, if they want it to. Let go of, a held button tells
-    /// them itself.
+    /// them itself: it goes by how the recording was made, whatever the talk button does now.
     fn close_beep(&mut self, config: &Config) {
-        let wanted = {
-            let config = config.get();
-            *config.talk_toggle() && *config.talk_close_beep()
-        };
-        if wanted {
+        if self.whisper.toggled() && *config.get().talk_close_beep() {
             self.beep(config, Speech::talk_close_beep);
         }
     }

@@ -537,6 +537,8 @@ impl Whisper {
     ) -> Result<JoinHandle<anyhow::Result<Heard>>, bool> {
         let (button, toggle) = talk_settings(config);
         return match talk(button.as_ref(), event, self.talking(), toggle) {
+            // Judged by settings changed since it started: the change discards it (see `unwanted`)
+            Talk::Begin if self.recording() => Err(false),
             Talk::Begin => {
                 self.talk_settings = (button, toggle);
                 self.talk_started = Instant::now();
@@ -580,6 +582,12 @@ impl Whisper {
     #[inline]
     pub fn recording(&self) -> bool {
         self.stream.is_some()
+    }
+
+    /// Whether the last recording was made with the talk button pressed to stop talking, rather
+    /// than held.
+    pub fn toggled(&self) -> bool {
+        self.talk_settings.1
     }
 
     /// Whether the recording is to be thrown away: what would have ended it may not any more (the
