@@ -669,7 +669,15 @@ impl DeviceSelector {
 /// first that has or is; or else the app's.
 fn guide_language(config: &RawConfig, app: ArrayStr<2>, getting: &[ArrayStr<2>]) -> ArrayStr<2> {
     // In order, so it doesn't change as the voices being set up arrive
-    let voiced = (config.voices().keys().chain(getting).copied()).collect::<std::collections::BTreeSet<_>>();
+    let mut voiced =
+        (config.voices().keys().chain(getting).copied()).collect::<std::collections::BTreeSet<_>>();
+    // The spotter's language keeps its voice when it isn't one the pilot speaks: not that one, if
+    // there are others
+    if let Some(spotter) = *config.spotter.language()
+        && voiced.len() > 1
+    {
+        voiced.remove(&spotter);
+    }
     let lang = (config.engineer_reply_language())
         .or(*config.heard_language())
         .or_else(|| voiced.contains(&app).then_some(app))
@@ -1339,6 +1347,10 @@ mod guide_tests {
         assert_eq!(guide_language(&config, es, &[]), en);
         config.spoken_language.set(Some(fr));
         assert_eq!(guide_language(&config, es, &[]), arrstr!("no"));
+        // The spotter's voice, kept for it, isn't the guide's when there are others
+        config.heard_language.set(None);
+        config.spotter.language.set(Some(en));
+        assert_eq!(guide_language(&config, en, &[]), ca);
     }
 
     #[test]
