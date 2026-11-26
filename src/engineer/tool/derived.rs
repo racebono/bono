@@ -697,6 +697,7 @@ impl Data {
             [],
         )?;
         let strategy = strategy_line(conn, session_type.as_deref() == Some("race"))?;
+        let sessions = sessions_line(conn)?;
         let epoch = stream.epoch.id;
         let (weekend, new_epochs) = match epoch {
             // A recording without epochs: no weekend to tell from the next
@@ -779,6 +780,7 @@ impl Data {
             new_epochs,
             session_type,
             strategy,
+            sessions,
             clock_s: watch.counters.clock_s(),
             laps: watch.counters.laps(),
             conditions: watch
@@ -5976,6 +5978,79 @@ fn write_forecast(conn: &Connection, sc: &Scoring, now: Option<f64>) -> rusqlite
         }
     }
     Ok(())
+}
+
+/// The races still to start, as `quick` shows them, from `sessions_now` and `rules_now`: for each,
+/// how far ahead it is, its length, the fuel and tyre multipliers when they aren't ×1, and its
+/// plan in short. `None` without such a race.
+fn sessions_line(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    // In the event's order
+    let sessions = rows(conn, "SELECT * FROM sessions_now ORDER BY rowid", [])?;
+    let rules = rows(conn, "SELECT * FROM rules_now", [])?;
+    let current = sessions
+        .iter()
+        .position(|r| r.s("status") == Some("current"));
+    let mut clauses = Vec::new();
+    for (index, r) in sessions.iter().enumerate() {
+        // `write_sessions` gives a plan, or says why there's none, only to the races still to start
+        let Some(plan_source) = r.text("plan_source") else {
+            continue;
+        };
+        let kind = r.text("session_type").unwrap_or("race");
+        let name = match r.i("session_number") {
+            Some(number) => format!("{kind} {number}"),
+            None => kind.to_owned(),
+        };
+        let when = match (r.s("status"), current.and_then(|c| index.checked_sub(c))) {
+            (Some("current"), _) => " (not started)".to_owned(),
+            (_, Some(1)) => " next".to_owned(),
+            (_, Some(k)) => format!(" in {k} sessions"),
+            (_, None) => String::new(),
+        };
+        let length = match (r.s("finish"), r.f("length_min"), r.i("length_laps")) {
+            (Some("time"), Some(m), _) => format!("{m:.0} min (time)"),
+            (Some("laps"), _, Some(n)) => format!("{n} laps"),
+            (Some("time_then_laps"), Some(m), Some(n)) => format!("{m:.0} min + {n} laps"),
+            (Some("first_of_time_and_laps"), Some(m), Some(n)) => format!("{m:.0} min or {n} laps"),
+            _ => "length unknown".to_owned(),
+        };
+        let mut multipliers = String::new();
+        for (rule, label) in [
+            ("fuel_use_multiplier", "fuel"),
+            ("tire_wear_multiplier", "tyres"),
+        ] {
+            // The race's own value before the event's
+            let value = rules
+                .iter()
+                .filter(|v| {
+                    v.s("name") == Some(rule)
+                        && v.s("session_type")
+                            .is_none_or(|t| Some(t) == r.s("session_type"))
+                })
+                .min_by_key(|v| v.s("session_type").is_none())
+                .and_then(|v| v.text("value"));
+            if let Some(value) = value.filter(|value| *value != "×1") {
+                multipliers.push_str(&format!(", {label} {value}"));
+            }
+        }
+        let plan = match r.f("expected_laps") {
+            Some(laps) => {
+                let mut parts = vec![format!("plan ~{laps:.0} laps")];
+                match (r.f("fuel_to_finish_l"), r.f("energy_to_finish_pct")) {
+                    (Some(fuel), _) => parts.push(format!("{fuel:.0} L")),
+                    (None, Some(energy)) => parts.push(format!("VE {energy:.0}%")),
+                    (None, None) => {}
+                }
+                if let Some(stops) = r.i("stops_needed") {
+                    parts.push(format!("{stops} stop{}", if stops == 1 { "" } else { "s" }));
+                }
+                format!("{} (from {plan_source})", parts.join(", "))
+            }
+            None => plan_source.to_owned(),
+        };
+        clauses.push(format!("{name}{when}: {length}{multipliers}; {plan}"));
+    }
+    Ok((!clauses.is_empty()).then(|| clauses.join(" | ")))
 }
 
 /// The event's sessions, each done, current or upcoming, and its rules. The current session's laps
@@ -14165,6 +14240,51 @@ mod tests {
             .unwrap(),
             Some(0)
         );
+    }
+
+    #[test]
+    fn sessions_line_tells_the_race_ahead() {
+        let earlier = practice_laps(4, 112.0, 2.9, 2.5);
+        let fallback = fallback(&earlier).unwrap();
+        let conn = plan(
+            QUALIFYING,
+            &[
+                QUALIFYING_ROW,
+                "1 AS event_order, 'warmup' AS session_type, 1 AS session_number, \
+                 600.0 AS length_time, 'time' AS finish",
+                "2 AS event_order, 'race' AS session_type, 1 AS session_number, \
+                 4320.0 AS length_time, 'time' AS finish",
+            ],
+            &Stint::earlier(&fallback),
+        );
+        conn.execute_batch(
+            "INSERT INTO rules_now VALUES ('fuel_use_multiplier', NULL, '×2'), \
+             ('tire_wear_multiplier', NULL, '×2'), ('damage_multiplier', NULL, '×1');",
+        )
+        .unwrap();
+        assert_eq!(
+            sessions_line(&conn).unwrap().as_deref(),
+            Some(
+                "race 1 in 2 sessions: 72 min (time), fuel ×2, tyres ×2; plan ~39 laps, 113 L, \
+                 1 stop (from practice 1, 4 green laps)"
+            )
+        );
+    }
+
+    #[test]
+    fn no_sessions_line_without_a_race_ahead() {
+        let earlier = practice_laps(4, 112.0, 2.9, 2.5);
+        let fallback = fallback(&earlier).unwrap();
+        // Qualifying only
+        let conn = plan(QUALIFYING, &[QUALIFYING_ROW], &Stint::earlier(&fallback));
+        assert_eq!(sessions_line(&conn).unwrap(), None);
+        // The race under way
+        let conn = plan(
+            "'race' AS session_type, 1 AS session_number, 'green' AS phase",
+            &[QUALIFYING_ROW, RACE_ROW],
+            &Stint::earlier(&fallback),
+        );
+        assert_eq!(sessions_line(&conn).unwrap(), None);
     }
 
     #[test]

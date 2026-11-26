@@ -34,6 +34,9 @@ pub struct Progress {
     /// The pilot's fuel and virtual energy outlook, for `quick`, with the car it's of (see
     /// `derived::strategy_line`)
     pub strategy: Option<(i64, String)>,
+    /// The races still to start, their length and plan, for `quick` (see
+    /// `derived::sessions_line`)
+    pub sessions: Option<String>,
     /// Seconds of game clock, added up across sessions (see [`Counters`])
     pub clock_s: f64,
     /// Laps the pilot completed, added up across sessions (see [`Counters`])

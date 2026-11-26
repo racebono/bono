@@ -2794,6 +2794,14 @@ fn cmd_quick(ctx: &Ctx, out: &mut String) -> anyhow::Result<()> {
     if let Some(line) = sc.forecast_line(ctx.conn, now)? {
         say!(out, "FORECAST {line}");
     }
+    // As the data thread last published it, as `STRATEGY` is below
+    let sessions = lock(&ctx.shared.progress)
+        .as_ref()
+        .filter(|progress| progress.epoch == ctx.epoch.id)
+        .and_then(|progress| progress.sessions.clone());
+    if let Some(line) = sessions {
+        say!(out, "SESSIONS {line}");
+    }
     if let Some(line) = track_line(ctx, sc) {
         say!(out, "TRACK {line}");
     }
@@ -3644,6 +3652,23 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quick_shows_the_sessions_line() {
+        let (_dir, engineer) = race();
+        engineer.publish_progress().await.unwrap();
+        let quick = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(!quick.contains("SESSIONS"), "{quick}");
+        lock(&engineer.inner.shared.progress)
+            .as_mut()
+            .unwrap()
+            .sessions = Some("race 1 next: 72 min (time); no green laps yet".into());
+        let quick = run(&engineer, serde_json::json!({"command": "quick"})).await;
+        assert!(
+            quick.contains("\nSESSIONS race 1 next: 72 min (time); no green laps yet\n"),
+            "{quick}"
+        );
     }
 
     fn names(names: &[&str]) -> Vec<String> {
