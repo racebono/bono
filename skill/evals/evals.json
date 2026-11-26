@@ -1032,6 +1032,18 @@
         "Uses no symbols or abbreviations",
         "One sentence, at most 20 words excluding acknowledgement"
       ]
+    },
+    {
+      "id": 61,
+      "prompt": "how much fuel will I need for the race?",
+      "expected_output": "Practice fixture (EVAL_DB = the practice copy)",
+      "files": [],
+      "assertions": [
+        "Says the race's length isn't known and asks the pilot for it",
+        "Never states or estimates a race length, a race lap count or a fuel total for the race",
+        "At most 2 sentences, not counting a brief acknowledgement like \"Copy, checking.\" before it"
+      ],
+      "session": "practice"
     }
   ]
 }

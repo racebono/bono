@@ -1,0 +1,422 @@
+//! The event's sessions and rules from LMU's local web API: the sessions it schedules, and the
+//! settings they run under. The API is undocumented, so only settings whose meaning and unit Studio
+//! 397's `Settings.JSON` comments give, or every tool agrees on, are read; the rest are left out.
+
+use bono_sim::{
+    sql::Event,
+    sys::{bono_event_rule, bono_event_session},
+};
+use serde_json::Value;
+use std::time::Duration;
+
+const INFO_URL: &str = "http://localhost:6397/rest/sessions/GetSessionsInfoForEvent";
+const SETTINGS_URL: &str = "http://localhost:6397/rest/sessions";
+
+const SESSIONS: [(&str, &str); 4] = [
+    ("PRACTICE", "practice"),
+    ("QUALIFYING", "qualifying"),
+    ("WARMUP", "warmup"),
+    ("RACE", "race"),
+];
+
+/// The event as of `session_time`, or `None` if either request doesn't get an answer (in time).
+pub fn fetch(session_time: f64) -> Option<Event> {
+    // About 3 s per request
+    let agent = crate::local_agent(Duration::from_millis(750));
+    let get = |url: &str| -> Option<String> {
+        agent.get(url).call().ok()?.body_mut().read_to_string().ok()
+    };
+
+    let info = get(INFO_URL)?;
+    let settings = get(SETTINGS_URL)?;
+    parse(&info, &settings, session_time)
+}
+
+/// `info` is `{"scheduledSessions": [{"lengthTime": 60, "name": "QUALIFYING", ...}, ...]}`, with
+/// lengths in minutes. `settings` is `{"SESSSET_Fuel_Usage": {"currentValue": 2, "stringValue": "X2",
+/// ...}, ...}`, where `stringValue` may be in the game's language: it's only ever kept as display
+/// text.
+fn parse(info: &str, settings: &str, session_time: f64) -> Option<Event> {
+    let info = serde_json::from_str::<Value>(info).ok()?;
+    let scheduled = info.get("scheduledSessions")?.as_array()?;
+    let settings @ Value::Object(_) = serde_json::from_str::<Value>(settings).ok()? else {
+        return None;
+    };
+
+    // A setting's number and text, if there
+    let setting = |key: &str| {
+        settings
+            .get(format!("SESSSET_{key}"))
+            .filter(|setting| setting.is_object())
+    };
+    let number = |key: &str| setting(key)?.get("currentValue")?.as_f64();
+    let text = |key: &str| {
+        let text = setting(key)?.get("stringValue")?.as_str()?;
+        (!text.is_empty()).then(|| text.to_owned())
+    };
+
+    // An answer without the finish rule isn't the event's settings (an error, or no event): the
+    // last event read stays.
+    setting("Finish_Criteria")?;
+    // All sources agree only on 1 and 2; the others conflict, so the race's length isn't known then
+    let race_finish = match number("Finish_Criteria") {
+        Some(1.0) => "laps",
+        Some(2.0) => "time",
+        _ => "unknown",
+    };
+
+    // `lmu.cpp` numbers a session by the game's slot for it. Practice has four slots, each switched
+    // on or off (`SESSSET_pract1`..`4`), so the k-th practice runs in the k-th slot that's on. If
+    // the slots that are on don't match the practices scheduled, their numbers aren't known.
+    let practice_slots: Vec<i64> = (1..=4)
+        .filter(|slot| number(&format!("pract{slot}")) == Some(1.0))
+        .collect();
+    let practices = scheduled
+        .iter()
+        .filter(|entry| entry.get("name").and_then(Value::as_str) == Some("PRACTICE"))
+        .count();
+
+    let mut sessions: Vec<bono_event_session> = Vec::new();
+    for (order, entry) in scheduled.iter().enumerate() {
+        let name = entry.get("name").and_then(Value::as_str);
+        let Some((name, session_type)) = SESSIONS.into_iter().find(|(key, _)| Some(*key) == name)
+        else {
+            continue;
+        };
+
+        let earlier = sessions
+            .iter()
+            .filter(|session| session.session_type.as_deref() == Some(session_type))
+            .count();
+        // Qualifying and race slots are used from the first, so counting within the type numbers
+        // them as the game does. Warm-up has a single slot and no number
+        let session_number = match session_type {
+            "practice" => (practice_slots.len() == practices)
+                .then(|| practice_slots.get(earlier).copied())
+                .flatten(),
+            "warmup" => None,
+            _ => Some(earlier as i64 + 1),
+        };
+
+        // Practice, qualifying and warm-up run on time. 0 minutes means the default
+        let finish = if session_type == "race" {
+            race_finish
+        } else {
+            "time"
+        };
+        let minutes = entry
+            .get("lengthTime")
+            .and_then(Value::as_f64)
+            .filter(|minutes| *minutes > 0.0);
+        // A FLOAT setting: only a whole number of laps in a sane range is one
+        let laps = number("Race_Laps")
+            .filter(|laps| laps.fract() == 0.0 && (1.0..=10000.0).contains(laps));
+
+        let (start_key, rubber_key) = match (session_type, session_number) {
+            ("practice", Some(1)) => (
+                Some("practice1_starting_time"),
+                Some("pract1_realroad_init"),
+            ),
+            ("qualifying", n) => (
+                Some("qualify_starting_time"),
+                (n == Some(1)).then_some("qual1_realroad_init"),
+            ),
+            ("warmup", _) => (Some("warmup_starting_time"), None),
+            ("race", n) => (
+                Some("race_starting_time"),
+                (n == Some(1)).then_some("race_realroad_init"),
+            ),
+            _ => (None, None),
+        };
+        // Minutes after midnight; -1 is the track's default, and -2 and -3 random
+        let start = start_key
+            .and_then(number)
+            .filter(|minutes| (0.0..=1439.0).contains(minutes));
+
+        let mut session = bono_event_session::default();
+        session.session_time = Some(session_time).into();
+        session.event_order = Some(order as i64).into();
+        session.session_type = Some(session_type.to_owned()).into();
+        session.session_number = session_number.into();
+        session.name = Some(name.to_owned()).into();
+        session.length_time = minutes
+            .filter(|_| finish == "time")
+            .map(|minutes| minutes * 60.0)
+            .into();
+        session.length_laps = laps
+            .filter(|_| finish == "laps")
+            .map(|laps| laps as i64)
+            .into();
+        session.finish = Some(finish.to_owned()).into();
+        session.start_time_of_day = start.map(|minutes| minutes * 60.0).into();
+        session.track_rubber = rubber_key.and_then(text).into();
+        sessions.push(session);
+    }
+    // No session it knows: not an event to replace the last one with
+    if sessions.is_empty() {
+        return None;
+    }
+
+    // Only the values seen in the game: 1 is the real rate ("Realistic"), 2 double ("X2"). Others
+    // (0, 3) aren't recorded until their meaning is checked in the game
+    let multiplier = |key: &str| {
+        let value = number(key)?;
+        [1.0, 2.0].contains(&value).then(|| format!("×{value}"))
+    };
+    let rules = [
+        ("fuel_use_multiplier", None, multiplier("Fuel_Usage")),
+        ("tire_wear_multiplier", None, multiplier("Tire_Wear")),
+        (
+            "damage_multiplier",
+            None,
+            number("Damage_Multi").map(|percent| format!("{percent}%")),
+        ),
+        ("mechanical_failures", None, text("Mech_Failures")),
+        (
+            "tires_in_garage",
+            None,
+            number("tires_available_in_garage").map(|tires| format!("{tires} tyres")),
+        ),
+        ("tire_warmers", None, text("tire_warmers")),
+        ("parc_ferme", None, text("parc_ferme")),
+        ("formation", None, text("formation")),
+        ("flag_rules", None, text("flag_rules")),
+        ("cut_rules", None, text("cut_rules")),
+        (
+            "cuts_allowed",
+            None,
+            number("cuts_allowed").map(|cuts| cuts.to_string()),
+        ),
+        (
+            "safety_car_threshold",
+            None,
+            number("safetycar_thresh").map(|threshold| threshold.to_string()),
+        ),
+        ("time_scale", None, text("race_timescale")),
+        ("weather_mode", None, text("weather")),
+        ("private_qualifying", None, text("private_qual")),
+        (
+            "rubber_rate",
+            Some("practice"),
+            text("realroad_timescale_practice"),
+        ),
+        (
+            "rubber_rate",
+            Some("qualifying"),
+            text("realroad_timescale_qualify"),
+        ),
+        ("rubber_rate", Some("race"), text("realroad_timescale_race")),
+    ];
+    let rules = rules
+        .into_iter()
+        .filter_map(|(name, session_type, value)| {
+            let mut rule = bono_event_rule::default();
+            rule.session_time = Some(session_time).into();
+            rule.name = Some(name.to_owned()).into();
+            rule.session_type = session_type.map(str::to_owned).into();
+            rule.value = Some(value?).into();
+            Some(rule)
+        })
+        .collect();
+
+    Some(Event { sessions, rules })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const INFO_OFFLINE: &str = include_str!("fixtures/sessions_info_offline.json");
+    const INFO_ONLINE: &str = include_str!("fixtures/sessions_info_online.json");
+    const OFFLINE: &str = include_str!("fixtures/sessions_offline.json");
+    const ONLINE: &str = include_str!("fixtures/sessions_online.json");
+
+    fn rule<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
+        let rule = event
+            .rules
+            .iter()
+            .find(|rule| rule.name.as_deref() == Some(name))?;
+        rule.value.as_deref()
+    }
+
+    #[test]
+    fn parses_the_offline_event() {
+        let event = parse(INFO_OFFLINE, OFFLINE, 12.0).unwrap();
+        assert_eq!(event.sessions.len(), 3);
+
+        let [practice, qualifying, race] = &event.sessions[..] else {
+            unreachable!()
+        };
+        assert_eq!(practice.session_time.get(), Some(12.0));
+        assert_eq!(practice.event_order.get(), Some(0));
+        assert_eq!(practice.session_type.as_deref(), Some("practice"));
+        assert_eq!(practice.session_number.get(), Some(1));
+        assert_eq!(practice.name.as_deref(), Some("PRACTICE"));
+        assert_eq!(practice.length_time.get(), Some(21600.0));
+        assert_eq!(practice.finish.as_deref(), Some("time"));
+        assert_eq!(practice.start_time_of_day.get(), Some(53100.0));
+        assert_eq!(practice.track_rubber.as_deref(), Some("Preset: Medium"));
+
+        assert_eq!(qualifying.session_type.as_deref(), Some("qualifying"));
+        assert_eq!(qualifying.session_number.get(), Some(1));
+        assert_eq!(qualifying.length_time.get(), Some(3600.0));
+
+        assert_eq!(race.event_order.get(), Some(2));
+        assert_eq!(race.session_type.as_deref(), Some("race"));
+        assert_eq!(race.session_number.get(), Some(1));
+        assert_eq!(race.length_time.get(), Some(4320.0));
+        assert_eq!(race.length_laps.get(), None);
+        assert_eq!(race.finish.as_deref(), Some("time"));
+        assert_eq!(race.start_time_of_day.get(), None);
+
+        assert_eq!(rule(&event, "fuel_use_multiplier"), Some("×2"));
+        assert_eq!(rule(&event, "tire_wear_multiplier"), Some("×2"));
+        assert_eq!(rule(&event, "tires_in_garage"), Some("12 tyres"));
+        assert_eq!(rule(&event, "damage_multiplier"), Some("100%"));
+        assert_eq!(rule(&event, "safety_car_threshold"), Some("100"));
+        let rubber = event
+            .rules
+            .iter()
+            .find(|rule| rule.session_type.as_deref() == Some("qualifying"))
+            .unwrap();
+        assert_eq!(rubber.name.as_deref(), Some("rubber_rate"));
+        assert_eq!(rubber.value.as_deref(), Some("Normal"));
+    }
+
+    #[test]
+    fn parses_the_online_event() {
+        let event = parse(INFO_ONLINE, ONLINE, 0.0).unwrap();
+        let lengths: Vec<_> = event
+            .sessions
+            .iter()
+            .map(|session| session.length_time.get())
+            .collect();
+        assert_eq!(lengths, [Some(1200.0), Some(600.0), Some(1200.0)]);
+        assert_eq!(event.sessions[2].start_time_of_day.get(), Some(43200.0));
+        assert_eq!(rule(&event, "fuel_use_multiplier"), Some("×1"));
+    }
+
+    /// The offline settings, with these settings' `currentValue`s changed.
+    fn offline_with(values: &[(&str, Value)]) -> String {
+        let mut settings: Value = serde_json::from_str(OFFLINE).unwrap();
+        for (key, value) in values {
+            settings[*key]["currentValue"] = value.clone();
+        }
+        settings.to_string()
+    }
+
+    #[test]
+    fn laps_finish_records_the_race_laps() {
+        let settings = offline_with(&[
+            ("SESSSET_Finish_Criteria", 1.into()),
+            ("SESSSET_Race_Laps", 30.0.into()),
+        ]);
+
+        let event = parse(INFO_OFFLINE, &settings, 0.0).unwrap();
+        let race = &event.sessions[2];
+        assert_eq!(race.finish.as_deref(), Some("laps"));
+        assert_eq!(race.length_laps.get(), Some(30));
+        assert_eq!(race.length_time.get(), None);
+    }
+
+    #[test]
+    fn race_laps_that_arent_a_sane_whole_number_are_unknown() {
+        for laps in [0.5, 30.5, 1e30, -3.0] {
+            let settings = offline_with(&[
+                ("SESSSET_Finish_Criteria", 1.into()),
+                ("SESSSET_Race_Laps", laps.into()),
+            ]);
+
+            let event = parse(INFO_OFFLINE, &settings, 0.0).unwrap();
+            assert_eq!(event.sessions[2].length_laps.get(), None, "{laps}");
+        }
+    }
+
+    #[test]
+    fn multipliers_not_seen_in_the_game_arent_recorded() {
+        for value in [0, 3] {
+            let settings = offline_with(&[
+                ("SESSSET_Fuel_Usage", value.into()),
+                ("SESSSET_Tire_Wear", value.into()),
+            ]);
+
+            let event = parse(INFO_OFFLINE, &settings, 0.0).unwrap();
+            assert_eq!(rule(&event, "fuel_use_multiplier"), None);
+            assert_eq!(rule(&event, "tire_wear_multiplier"), None);
+        }
+    }
+
+    #[test]
+    fn share_of_track_finish_leaves_the_race_length_unknown() {
+        let settings = offline_with(&[("SESSSET_Finish_Criteria", 5.into())]);
+
+        let event = parse(INFO_OFFLINE, &settings, 0.0).unwrap();
+        let race = &event.sessions[2];
+        assert_eq!(race.finish.as_deref(), Some("unknown"));
+        assert_eq!(race.length_time.get(), None);
+        assert_eq!(race.length_laps.get(), None);
+    }
+
+    #[test]
+    fn warmup_has_no_number() {
+        let info = r#"{"scheduledSessions": [
+            {"lengthTime": 60, "name": "QUALIFYING"},
+            {"lengthTime": 10, "name": "WARMUP"},
+            {"lengthTime": 72, "name": "RACE"}
+        ]}"#;
+
+        let event = parse(info, OFFLINE, 0.0).unwrap();
+        let warmup = &event.sessions[1];
+        assert_eq!(warmup.session_type.as_deref(), Some("warmup"));
+        assert_eq!(warmup.session_number.get(), None);
+        assert_eq!(warmup.length_time.get(), Some(600.0));
+        assert_eq!(event.sessions[2].session_number.get(), Some(1));
+    }
+
+    #[test]
+    fn practice_numbers_follow_the_enabled_slots() {
+        let settings = offline_with(&[("SESSSET_pract1", 0.into()), ("SESSSET_pract2", 1.into())]);
+
+        let event = parse(INFO_OFFLINE, &settings, 0.0).unwrap();
+        let practice = &event.sessions[0];
+        assert_eq!(practice.session_type.as_deref(), Some("practice"));
+        assert_eq!(practice.session_number.get(), Some(2));
+        // The start time and rubber are practice 1's settings
+        assert_eq!(practice.start_time_of_day.get(), None);
+        assert_eq!(practice.track_rubber.as_deref(), None);
+    }
+
+    #[test]
+    fn practice_numbers_unknown_when_slots_disagree() {
+        let info = r#"{"scheduledSessions": [
+            {"lengthTime": 60, "name": "PRACTICE"},
+            {"lengthTime": 60, "name": "PRACTICE"},
+            {"lengthTime": 72, "name": "RACE"}
+        ]}"#;
+
+        let event = parse(info, OFFLINE, 0.0).unwrap();
+        assert_eq!(event.sessions[0].session_number.get(), None);
+        assert_eq!(event.sessions[1].session_number.get(), None);
+        assert_eq!(event.sessions[0].start_time_of_day.get(), None);
+        assert_eq!(event.sessions[2].session_number.get(), Some(1));
+    }
+
+    #[test]
+    fn nothing_without_both_answers() {
+        assert!(parse(INFO_OFFLINE, "not json", 0.0).is_none());
+        assert!(parse("{}", OFFLINE, 0.0).is_none());
+    }
+
+    #[test]
+    fn no_known_session_is_no_event() {
+        assert!(parse(r#"{"scheduledSessions": []}"#, OFFLINE, 0.0).is_none());
+        let other = r#"{"scheduledSessions": [{"lengthTime": 10, "name": "OTHER"}]}"#;
+        assert!(parse(other, OFFLINE, 0.0).is_none());
+    }
+
+    #[test]
+    fn settings_without_the_finish_rule_are_no_event() {
+        assert!(parse(INFO_OFFLINE, "{}", 0.0).is_none());
+        assert!(parse(INFO_OFFLINE, r#"{"error": "not in an event"}"#, 0.0).is_none());
+    }
+}

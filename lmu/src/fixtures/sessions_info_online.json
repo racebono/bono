@@ -1,0 +1,22 @@
+{
+  "scheduledSessions": [
+    {
+      "airTemp": 22,
+      "lengthTime": 20,
+      "name": "PRACTICE",
+      "rainChance": 0
+    },
+    {
+      "airTemp": 22,
+      "lengthTime": 10,
+      "name": "QUALIFYING",
+      "rainChance": 0
+    },
+    {
+      "airTemp": 22,
+      "lengthTime": 20,
+      "name": "RACE",
+      "rainChance": 0
+    }
+  ]
+}
