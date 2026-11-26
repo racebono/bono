@@ -105,9 +105,7 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS car_state_by_vehicle ON car_state (vehicle_id, telemetry_id);
 
-        -- sector: zero-based, a row per sector of the session's sector_count; standing_sector's
-        -- are telemetry's, session_sector's in the order the simulator reports them, which may
-        -- not be telemetry's: the two aren't to be joined on it
+        -- sector: zero-based, as in telemetry, a row per sector of the session's sector_count
         CREATE TABLE IF NOT EXISTS session (id INTEGER PRIMARY KEY, epoch INTEGER{session});
         CREATE TABLE IF NOT EXISTS session_sector (
             session_id INTEGER NOT NULL REFERENCES session(id), sector INTEGER NOT NULL{session_sector},

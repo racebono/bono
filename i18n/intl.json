@@ -525,6 +525,16 @@
         "es": "Dice \"verde, verde, verde\" cuando empieza la carrera, y cuando vuelve a verde justo después de una bandera roja",
         "ca": "Diu \"verd, verd, verd\" quan comença la cursa, i quan torna a verd just després d'una bandera vermella"
     },
+    "spotter.yellow_flags": {
+        "en": "Yellow flags",
+        "es": "Banderas amarillas",
+        "ca": "Banderes grogues"
+    },
+    "spotter.yellow_flags_hover": {
+        "en": "Says \"yellow flag on track\" for a local yellow in your sector or the next one. Full course yellows are always called",
+        "es": "Dice \"bandera amarilla en pista\" cuando hay una amarilla local en tu sector o en el siguiente. Las amarillas en todo el circuito se avisan siempre",
+        "ca": "Diu \"bandera groga a pista\" quan hi ha una groga local al teu sector o al següent. Les grogues a tot el circuit s'avisen sempre"
+    },
     "spotter.qualifying_lap_times": {
         "en": "Lap times in qualifying",
         "es": "Tiempos de vuelta en clasificación",

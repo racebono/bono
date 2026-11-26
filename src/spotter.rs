@@ -1041,7 +1041,8 @@ fn car(row: &Row) -> rusqlite::Result<Car> {
 struct Scoring {
     full_course_yellow: Option<String>,
     phase: Option<String>,
-    /// A local yellow in any sector
+    /// A local yellow in the player's sector or the next (or the yellow shown to the player, for
+    /// simulators that don't say which sectors are yellow), outside a full course caution
     yellow: bool,
     /// The flag shown to the player
     flag: Option<String>,
@@ -1238,10 +1239,10 @@ fn scoring(
     let session = conn
         .prepare_cached(
             "SELECT full_course_yellow, phase, \
-             EXISTS (SELECT 1 FROM session_sector WHERE session_id = session.id AND local_yellow), \
              rain, track_wetness_average, session_type, session_end_time, \
              EXISTS (SELECT 1 FROM session_sector WHERE session_id = session.id \
-                 AND local_yellow IS NOT NULL) \
+                 AND local_yellow IS NOT NULL), \
+             id, sector_count \
              FROM session WHERE (?1 IS NULL OR session_time <= ?1) AND id >= ?2 \
              ORDER BY id DESC LIMIT 1",
         )?
@@ -1250,18 +1251,19 @@ fn scoring(
                 Scoring {
                     full_course_yellow: row.get(0)?,
                     phase: row.get(1)?,
-                    yellow: row.get(2)?,
-                    rain: row.get(3)?,
-                    wetness: row.get(4)?,
-                    session_type: row.get(5)?,
-                    session_end_time: row.get(6)?,
+                    rain: row.get(2)?,
+                    wetness: row.get(3)?,
+                    session_type: row.get(4)?,
+                    session_end_time: row.get(5)?,
                     ..Scoring::default()
                 },
-                row.get::<_, bool>(7)?,
+                row.get::<_, bool>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<i64>>(8)?,
             ))
         })
         .optional()?;
-    let Some((mut scoring, sector_yellows)) = session else {
+    let Some((mut scoring, sector_yellows, session_id, sector_count)) = session else {
         return Ok(None);
     };
 
@@ -1282,7 +1284,7 @@ fn scoring(
     };
     let columns = format!(
         "flag, penalties, laps_completed, last_lap_time, {under_yellow}, {lap_time_counts}, \
-         {finish_status}"
+         {finish_status}, sector"
     );
     // Live, try the newest rows first, then look further back if the player has been in the garage
     let standing: Option<Standing> = match upto {
@@ -1319,6 +1321,7 @@ fn scoring(
         under_yellow,
         lap_time_counts,
         finish_status,
+        sector,
     )) = standing
     {
         scoring.flag = flag;
@@ -1332,9 +1335,17 @@ fn scoring(
             .full_course_yellow
             .as_deref()
             .is_some_and(|fcy| fcy != "none");
-        if !sector_yellows && !caution {
-            scoring.yellow = under_yellow.unwrap_or(false);
-        }
+        scoring.yellow = !caution
+            && match sector_yellows {
+                // The first sector comes after the last
+                true => conn
+                    .prepare_cached(
+                        "SELECT EXISTS (SELECT 1 FROM session_sector WHERE session_id = ?1 \
+                         AND local_yellow AND sector IN (?2, (?2 + 1) % ?3))",
+                    )?
+                    .query_row([Some(session_id), sector, sector_count], |row| row.get(0))?,
+                false => under_yellow.unwrap_or(false),
+            };
     }
 
     // The forecast is LMU's only, written as a whole set of rows when it changes
@@ -1363,8 +1374,8 @@ fn scoring(
     Ok(Some(scoring))
 }
 
-/// The player's flag, penalties, laps, last lap time, own yellow, whether the lap's time counts and
-/// finish status, from a standings row.
+/// The player's flag, penalties, laps, last lap time, own yellow, whether the lap's time counts,
+/// finish status and sector, from a standings row.
 type Standing = (
     Option<String>,
     Option<i64>,
@@ -1373,6 +1384,7 @@ type Standing = (
     Option<bool>,
     Option<bool>,
     Option<String>,
+    Option<i64>,
 );
 
 fn standing(row: &Row) -> rusqlite::Result<Standing> {
@@ -1384,6 +1396,7 @@ fn standing(row: &Row) -> rusqlite::Result<Standing> {
         row.get(4)?,
         row.get(5)?,
         row.get(6)?,
+        row.get(7)?,
     ))
 }
 
@@ -2148,7 +2161,7 @@ impl Logic {
         if now.phase.as_deref() == Some("stopped") && last.phase.as_deref() != Some("stopped") {
             calls.raise("red flag", true);
         }
-        if now.yellow && !last.yellow {
+        if *config.yellow_flags() && now.yellow && !last.yellow {
             calls.raise("yellow flag on track", false);
         }
         if now.flag.as_deref() == Some("blue") && last.flag.as_deref() != Some("blue") {
@@ -4282,6 +4295,28 @@ mod tests {
         assert!(step(0.9, &scoring).is_empty());
     }
 
+    #[test]
+    fn yellow_flag_calls_can_be_turned_off() {
+        let mut off = SpotterConfig::default();
+        off.yellow_flags.set(false);
+        let clear = race("green", "none");
+        let yellow = Scoring {
+            yellow: true,
+            ..clear.clone()
+        };
+        let updates = [clear.clone(), yellow];
+        assert_eq!(
+            calls_of(&SpotterConfig::default(), &updates)[1],
+            [("yellow flag on track", false)]
+        );
+        assert!(calls_of(&off, &updates)[1].is_empty());
+        // Full course yellows are still called
+        assert_eq!(
+            calls_of(&off, &[clear, race("full_course_yellow", "pending")])[1],
+            [("full course yellow", true)]
+        );
+    }
+
     /// A race in `phase`, with the full course yellow in `fcy`.
     fn race(phase: &str, fcy: &str) -> Scoring {
         Scoring {
@@ -4516,9 +4551,9 @@ mod tests {
              local_yellow INTEGER);
              CREATE TABLE standings (id INTEGER PRIMARY KEY, is_player INTEGER,
              session_time REAL, flag TEXT, penalties INTEGER, laps_completed INTEGER,
-             last_lap_time REAL);
+             last_lap_time REAL, sector INTEGER);
              INSERT INTO session (session_time) VALUES (0);
-             INSERT INTO standings VALUES (1, 1, 0, 'blue', 1, 0, NULL);",
+             INSERT INTO standings VALUES (1, 1, 0, 'blue', 1, 0, NULL, 0);",
         )
         .unwrap();
         let config = SpotterConfig::default();
@@ -4532,11 +4567,11 @@ mod tests {
         assert!(step(0.0).is_empty());
         conn.execute_batch(
             "WITH RECURSIVE ids(id) AS (SELECT 2 UNION ALL SELECT id + 1 FROM ids WHERE id < 5001)
-             INSERT INTO standings SELECT id, 0, 1, 'green', 0, 0, NULL FROM ids;",
+             INSERT INTO standings SELECT id, 0, 1, 'green', 0, 0, NULL, 0 FROM ids;",
         )
         .unwrap();
         assert!(step(1800.0).is_empty());
-        conn.execute_batch("INSERT INTO standings VALUES (5002, 1, 1801, 'blue', 1, 0, NULL);")
+        conn.execute_batch("INSERT INTO standings VALUES (5002, 1, 1801, 'blue', 1, 0, NULL, 0);")
             .unwrap();
         assert!(step(1801.0).is_empty());
         // The recorder clears the tables for a new session.
@@ -4546,13 +4581,44 @@ mod tests {
         assert_eq!(latest.flag, None);
         assert_eq!(latest.penalties, None);
         assert!(!latest.yellow);
-        // A local yellow in any of the session's sectors
+    }
+
+    #[test]
+    fn takes_yellows_in_the_players_sector_and_the_next() {
+        let conn = Connection::open_in_memory().unwrap();
+        bono_sim::sql::create_tables(&conn).unwrap();
         conn.execute_batch(
-            "INSERT INTO session_sector SELECT MAX(id), 0, 0 FROM session;
-             INSERT INTO session_sector SELECT MAX(id), 4, 1 FROM session;",
+            "INSERT INTO session (id, session_time, sector_count) VALUES (1, 0, 4);
+             INSERT INTO session_sector (session_id, sector, local_yellow)
+             VALUES (1, 0, 0), (1, 1, 0), (1, 2, 0), (1, 3, 0);
+             INSERT INTO standings (vehicle_id, is_player, session_time) VALUES (1, 1, 0);",
         )
         .unwrap();
-        assert!(scoring(&conn, None, &Epoch::ALL).unwrap().unwrap().yellow);
+        let yellow = |sector: Option<i64>, flagged: i64| {
+            conn.execute("UPDATE standings SET sector = ?1", [sector])
+                .unwrap();
+            conn.execute(
+                "UPDATE session_sector SET local_yellow = sector = ?1",
+                [flagged],
+            )
+            .unwrap();
+            scoring(&conn, None, &Epoch::ALL).unwrap().unwrap().yellow
+        };
+        for sector in 0..4 {
+            for flagged in 0..4 {
+                assert_eq!(
+                    yellow(Some(sector), flagged),
+                    flagged == sector || flagged == (sector + 1) % 4,
+                    "in sector {sector}, yellow in {flagged}"
+                );
+            }
+        }
+        // Not knowing where the player is, there's nothing to call
+        assert!(!yellow(None, 0));
+        // A full course caution is called on its own
+        conn.execute("UPDATE session SET full_course_yellow = 'pending'", [])
+            .unwrap();
+        assert!(!yellow(Some(0), 0));
     }
 
     #[test]
@@ -4630,27 +4696,27 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE session (id INTEGER PRIMARY KEY, session_time REAL,
-             full_course_yellow TEXT, phase TEXT, rain REAL, track_wetness_average REAL,
-             session_type TEXT, session_end_time REAL);
+             full_course_yellow TEXT, phase TEXT, sector_count INTEGER, rain REAL,
+             track_wetness_average REAL, session_type TEXT, session_end_time REAL);
              CREATE TABLE session_sector (session_id INTEGER, sector INTEGER,
              local_yellow INTEGER);
              CREATE TABLE standings (id INTEGER PRIMARY KEY, is_player INTEGER,
              session_time REAL, flag TEXT, penalties INTEGER, under_yellow INTEGER,
-             laps_completed INTEGER, last_lap_time REAL);
-             INSERT INTO session (session_time) VALUES (0);
+             laps_completed INTEGER, last_lap_time REAL, sector INTEGER);
+             INSERT INTO session (session_time, sector_count) VALUES (0, 2);
              INSERT INTO session_sector VALUES (1, 0, NULL), (1, 1, NULL);
-             INSERT INTO standings VALUES (1, 1, 0, 'green', 0, 1, NULL, NULL);",
+             INSERT INTO standings VALUES (1, 1, 0, 'green', 0, 1, NULL, NULL, 0);",
         )
         .unwrap();
         assert!(scoring(&conn, None, &Epoch::ALL).unwrap().unwrap().yellow);
-        conn.execute_batch("INSERT INTO standings VALUES (2, 1, 1, 'green', 0, 0, NULL, NULL);")
+        conn.execute_batch("INSERT INTO standings VALUES (2, 1, 1, 'green', 0, 0, NULL, NULL, 0);")
             .unwrap();
         assert!(!scoring(&conn, None, &Epoch::ALL).unwrap().unwrap().yellow);
 
         // Sectors that say they're clear outweigh the player's flag
         conn.execute_batch(
             "UPDATE session_sector SET local_yellow = 0;
-             INSERT INTO standings VALUES (3, 1, 2, 'green', 0, 1, NULL, NULL);",
+             INSERT INTO standings VALUES (3, 1, 2, 'green', 0, 1, NULL, NULL, 0);",
         )
         .unwrap();
         assert!(!scoring(&conn, None, &Epoch::ALL).unwrap().unwrap().yellow);

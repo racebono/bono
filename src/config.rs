@@ -620,6 +620,8 @@ settings! {
         pub qualifying_lap_times: bool = false,
         /// The race going green: at the start, and as it restarts after a red flag
         pub race_starts: bool = true,
+        /// Local yellows in the pilot's sector or the next. Full course yellows are always called
+        pub yellow_flags: bool = true,
     }
 }
 

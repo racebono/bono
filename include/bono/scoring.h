@@ -147,7 +147,7 @@
 
 // One timing sector of the session, in the `session_sector` table.
 #define SIM_SESSION_SECTOR_COLUMNS(X)                                                                     \
-    X(boolean, local_yellow, true)           /* sectors in the order the simulator reports them, which may not be telemetry's */
+    X(boolean, local_yellow, true)           /* sectors numbered as in telemetry */
 
 // One car's time in one timing sector, in the `standing_sector` table. Each is the sector on its own,
 // never cumulative from the line.
@@ -176,7 +176,7 @@ typedef struct bono_standing_sector {
 typedef struct bono_session_info {
   SIM_SESSION_COLUMNS(SIM_DECLARE_SCORING_FIELD)
 
-  // In the order the simulator reports them; the first `sector_count` (at most BONO_MAX_SECTORS)
+  // Sector by sector from the line; the first `sector_count` (at most BONO_MAX_SECTORS)
   // are written, to `session_sector`.
   bono_session_sector_s sectors[BONO_MAX_SECTORS];
 } bono_session_info_s;
