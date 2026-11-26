@@ -32,7 +32,7 @@ Raw tables (prefer derived). Filter `telemetry` by `id` (only index: `first_id..
 ## scoring
 Prefer derived (setup_now,setup_changes,race_state,cars_now,sectors_now,forecast_now).
 - `setup_set` `setup`: garage setup (diffs per change).
-- `session` `standings` `forecast`: on change (columns: `PRAGMA table_info`, `limit` 200); `standings.sector` 0-based; `session_sector` `standing_sector` (by `session_id`/`standing_id`; 0-based; session_sector yellows use sim order, don't join to car sector).
+- `session` `standings` `forecast`: on change (columns: `PRAGMA table_info`, `limit` 200); `standings.sector` 0-based; `session_sector` `standing_sector` (by `session_id`/`standing_id`; 0-based, as `standings.sector`).
 - `event_session` `event_rule`: event schedule/rules (prefer sessions_now,rules_now); newest `generation` current; `length_time` s.
 [lmu] - LMU: setup has step/min_step/max_step/saved_value; forecast populated; race finish not laps/time=`unknown`, lengths NULL; text rules may be in game's language.
 [iracing] - iRacing: no sector yellows(use cars_now.under_yellow); laps_completed=-1 until first line crossing(lap=1 on out lap and next); rivals' timing from lap progress; forecast empty; no multiplier rules.

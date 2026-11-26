@@ -332,7 +332,13 @@ namespace {
         }
         // LMU's API has room for three sectors only (mSectorFlag[3], mSector 0 to 2): every track has three.
         out.sector_count = LMU_SECTORS;
-        for (int i = 0; i < LMU_SECTORS; ++i) out.sectors[i].local_yellow = in.mSectorFlag[i] != 0;
+        // The SDK doesn't say what the flags hold, or which sector comes first ("so test"). In LMU's own telemetry
+        // logs (their "Sector1 Flag" to "Sector3 Flag" are taken to be these) a clear sector is 11 and a yellow one
+        // 1, and a car stopping in the first, second or third sector raises the third, first or second flag. They
+        // also hold 2 and 3, whose meaning is unknown: those are left unknown, not clear.
+        for (int i = 0; i < LMU_SECTORS; ++i)
+            if (in.mSectorFlag[i] == 1 || in.mSectorFlag[i] == 11)
+                out.sectors[(i + 1) % LMU_SECTORS].local_yellow = in.mSectorFlag[i] == 1;
         out.start_light = in.mStartLight;
         out.red_lights = in.mNumRedLights;
         out.in_realtime = in.mInRealtime;

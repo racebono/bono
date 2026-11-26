@@ -1039,7 +1039,7 @@ fn wheels_at(conn: &Connection, telemetry_id: i64) -> rusqlite::Result<BTreeMap<
 /// fuel_fraction) are snapshots from that moment: use telemetry for anything live.
 struct Scoring {
     session: Option<Row>,
-    /// The session row's sectors under a local yellow, zero-based, in the simulator's order
+    /// The session row's sectors under a local yellow, zero-based
     yellow_sectors: Vec<i64>,
     /// Whether the simulator says which sectors are yellow (iRacing doesn't)
     sector_yellows: bool,
@@ -1186,7 +1186,7 @@ impl Scoring {
         })
     }
 
-    /// The sectors under a local yellow, as "1,3" (numbered from 1 in the simulator's order), if any.
+    /// The sectors under a local yellow, as "1,3" (numbered from 1), if any.
     fn yellow_sectors(&self) -> Option<String> {
         (!self.yellow_sectors.is_empty()).then(|| {
             self.yellow_sectors
@@ -1301,7 +1301,7 @@ impl Scoring {
             parts.push(format!("FULL COURSE YELLOW ({fcy})"));
         }
         if let Some(yellows) = self.yellow_sectors() {
-            parts.push(format!("local yellow flag in sector index {yellows}"));
+            parts.push(format!("local yellow flag in sector {yellows}"));
         }
         if let Some(track) = s.text("track") {
             parts.push(format!("track={}", telemetry_text(track)));
@@ -1682,9 +1682,7 @@ fn scoring_alerts(ctx: &Ctx) -> anyhow::Result<(Vec<String>, Vec<String>)> {
             _ => {}
         }
         if let Some(yellows) = sc.yellow_sectors() {
-            info.push(format!(
-                "local yellow somewhere on track (sector index {yellows} as the sim reports it)"
-            ));
+            info.push(format!("local yellow in sector {yellows}"));
         }
     }
     if let Some(me) = &sc.player {

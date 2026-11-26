@@ -560,6 +560,16 @@
         "es": "En carrera, avisa cuando un coche se acerca a menos de un segundo por detrás. No afecta a los avisos de coches a tu lado",
         "ca": "En cursa, avisa quan un cotxe s'acosta a menys d'un segon per darrere. No afecta els avisos de cotxes al teu costat"
     },
+    "spotter.yellow_flags": {
+        "en": "Yellow flags",
+        "es": "Banderas amarillas",
+        "ca": "Banderes grogues"
+    },
+    "spotter.yellow_flags_hover": {
+        "en": "Says \"yellow flag on track\" for a local yellow in your sector or the next one. Full course yellows are always called",
+        "es": "Dice \"bandera amarilla en pista\" cuando hay una amarilla local en tu sector o en el siguiente. Las amarillas en todo el circuito se avisan siempre",
+        "ca": "Diu \"bandera groga a pista\" quan hi ha una groga local al teu sector o al següent. Les grogues a tot el circuit s'avisen sempre"
+    },
     "spotter.qualifying_lap_times": {
         "en": "Lap times in qualifying",
         "es": "Tiempos de vuelta en clasificación",

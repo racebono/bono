@@ -12951,10 +12951,7 @@ mod tests {
             1.0
         );
         let quick = run(&engineer, serde_json::json!({"command": "quick"})).await;
-        assert!(
-            quick.contains("sector index 2 as the sim reports it"),
-            "{quick}"
-        );
+        assert!(quick.contains("local yellow in sector 2"), "{quick}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
