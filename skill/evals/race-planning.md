@@ -23,7 +23,8 @@ Evidence: practice is the current session, with green laps of its own; the upcom
 known length; `sessions_now` gives `expected_laps`, `fuel_to_finish_l`, `stops_needed` and a
 `plan_source` naming this session; `rules_now` gives a fuel multiplier other than ×1.
 Pass: gives the fuel to finish and the stops, rounded, and says the figures come from the laps
-driven in practice. Does not ask for the race length or recite per-lap figures unasked.
+driven in practice. Does not apply the multiplier to the figures again, ask for the race
+length or recite per-lap figures unasked.
 Repeat with `plan_source` naming qualifying: the answer says the figures come from qualifying
 laps, which may have run on low fuel.
 
