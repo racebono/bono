@@ -705,11 +705,11 @@ pub struct Voice {
     beep: Vec<f32>,
 }
 
-/// The ONNX Runtime environment every voice's session is created in.
+/// The ONNX Runtime environment every session is created in: the voices', and Parakeet's.
 ///
 /// ONNX Runtime allows one environment per process, and `ort` refuses to build another even after the first is
-/// dropped, so it's built once and kept. A failed build is retried by the next voice.
-fn environment() -> ort::Result<&'static Environment> {
+/// dropped, so it's built once and kept. A failed build is retried by the next model loaded.
+pub(crate) fn environment() -> ort::Result<&'static Environment> {
     static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
     static BUILDING: Mutex<()> = Mutex::new(());
 

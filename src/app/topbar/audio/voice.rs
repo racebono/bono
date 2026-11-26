@@ -29,33 +29,105 @@ use tokio::runtime::Handle;
 const CATALOG_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/voices.json";
 const FILE_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/";
 
-/// The voice the setup guide downloads for the app's language (`locale`, e.g. `en-US`): its
-/// language, and its name in the catalog.
-fn recommended(locale: &str) -> Option<(ArrayStr<2>, &'static str)> {
+/// The voice the setup guide downloads for a language.
+pub struct Recommended {
+    pub lang: &'static str,
+    /// The language's own name
+    pub native: &'static str,
+    /// Its name in the catalog
+    pub voice: &'static str,
+}
+
+const fn voice(lang: &'static str, native: &'static str, voice: &'static str) -> Recommended {
+    Recommended {
+        lang,
+        native,
+        voice,
+    }
+}
+
+/// Every language with a voice Bono can speak: Piper also has Hebrew, Japanese, Lithuanian and Thai
+/// voices, whose phonemes aren't espeak's.
+pub const RECOMMENDED: &[Recommended] = &[
+    voice("ar", "العربية", "ar_JO-kareem-medium"),
+    voice("bg", "Български", "bg_BG-dimitar-medium"),
+    voice("bn", "বাংলা", "bn_BD-google-medium"),
+    voice("ca", "Català", "ca_ES-upc_ona-medium"),
+    voice("cs", "Čeština", "cs_CZ-jirka-medium"),
+    voice("cy", "Cymraeg", "cy_GB-gwryw_gogleddol-medium"),
+    voice("da", "Dansk", "da_DK-talesyntese-medium"),
+    voice("de", "Deutsch", "de_DE-thorsten-medium"),
+    voice("el", "Ελληνικά", "el_GR-joy-medium"),
+    voice("en", "English", "en_US-mike-medium"),
+    voice("es", "Español", "es_ES-davefx-medium"),
+    voice("et", "Eesti", "et_EE-news-medium"),
+    voice("eu", "Euskara", "eu_ES-antton-medium"),
+    voice("fa", "فارسی", "fa_IR-amir-medium"),
+    voice("fi", "Suomi", "fi_FI-harri-medium"),
+    voice("fr", "Français", "fr_FR-siwis-medium"),
+    voice("hi", "हिन्दी", "hi_IN-pratham-medium"),
+    voice("hu", "Magyar", "hu_HU-anna-medium"),
+    voice("hy", "Հայերեն", "hy_AM-gor-medium"),
+    voice("id", "Bahasa Indonesia", "id_ID-news_tts-medium"),
+    voice("is", "Íslenska", "is_IS-bui-medium"),
+    voice("it", "Italiano", "it_IT-paola-medium"),
+    voice("ka", "ქართული", "ka_GE-natia-medium"),
+    voice("kk", "Қазақша", "kk_KZ-issai-high"),
+    voice("ko", "한국어", "ko_KR-kss-medium"),
+    voice("ku", "Kurdî", "ku_TR-berfin_renas-medium"),
+    voice("lb", "Lëtzebuergesch", "lb_LU-marylux-medium"),
+    voice("lv", "Latviešu", "lv_LV-aivars-medium"),
+    voice("ml", "മലയാളം", "ml_IN-arjun-medium"),
+    voice("mr", "मराठी", "mr_IN-google-medium"),
+    voice("ne", "नेपाली", "ne_NP-chitwan-medium"),
+    voice("nl", "Nederlands", "nl_NL-alex-medium"),
+    voice("no", "Norsk", "no_NO-talesyntese-medium"),
+    voice("pl", "Polski", "pl_PL-darkman-medium"),
+    voice("pt", "Português", "pt_BR-faber-medium"),
+    voice("ro", "Română", "ro_RO-mihai-medium"),
+    voice("ru", "Русский", "ru_RU-denis-medium"),
+    voice("sk", "Slovenčina", "sk_SK-lili-medium"),
+    voice("sl", "Slovenščina", "sl_SI-artur-medium"),
+    voice("sq", "Shqip", "sq_AL-edon-medium"),
+    voice("sr", "Srpski", "sr_RS-serbski_institut-medium"),
+    voice("sv", "Svenska", "sv_SE-lisa-medium"),
+    voice("sw", "Kiswahili", "sw_CD-lanfrica-medium"),
+    voice("te", "తెలుగు", "te_IN-maya-medium"),
+    voice("tr", "Türkçe", "tr_TR-dfki-medium"),
+    voice("uk", "Українська", "uk_UA-mykyta-high"),
+    voice("ur", "اردو", "ur_PK-aegis_female-medium"),
+    voice("vi", "Tiếng Việt", "vi_VN-vais1000-medium"),
+    voice("zh", "中文", "zh_CN-huayan-medium"),
+];
+
+/// The recommended voice for the app's language (`locale`, e.g. `en-US`): its language, and its name
+/// in the catalog.
+pub(in crate::app) fn recommended(locale: &str) -> Option<(ArrayStr<2>, &'static str)> {
     let lang = locale.split('-').next()?;
-    let voice = match lang {
-        "en" => "en_US-mike-medium",
-        "es" => "es_ES-davefx-medium",
-        "ca" => "ca_ES-upc_ona-medium",
-        _ => return None,
-    };
-    Some((ArrayStr::from_str(lang)?, voice))
+    let recommended = RECOMMENDED.iter().find(|other| other.lang == lang)?;
+    Some((ArrayStr::from_str(lang)?, recommended.voice))
 }
 
 pub struct Voices {
     catalog: MaybeDone<Option<Catalog>>,
     pref_path: Arc<Utf8Path>,
     client: reqwest::Client,
-    /// The setup guide asked for the recommended voice of a language (and which it is): it's
-    /// downloaded, then used once it's on disk (unless another was picked meanwhile)
-    setup: Option<(ArrayStr<2>, &'static str)>,
-    /// The setup's download was started: one that fails isn't started again until it's asked
-    /// for again
-    setup_started: bool,
-    /// When setup first found the recommended voice ready to replace the picked one: it waits for
-    /// a check of the picked one's files started since, so a stale result doesn't replace it
-    replace_since: Option<Instant>,
+    /// The recommended voices the setup guide asked for
+    setup: Vec<Setup>,
     files: super::ModelFiles,
+}
+
+/// A recommended voice the setup guide asked for: it's downloaded, then used once it's on disk
+/// (unless another was picked meanwhile).
+struct Setup {
+    lang: ArrayStr<2>,
+    /// Its name in the catalog
+    name: &'static str,
+    /// Its download was started: one that fails isn't started again until it's asked for again
+    started: bool,
+    /// When it was first found ready to replace the picked one: it waits for a check of the
+    /// picked one's files started since, so a stale result doesn't replace it
+    replace_since: Option<Instant>,
 }
 
 impl Voices {
@@ -100,95 +172,110 @@ impl Voices {
 
         return Self {
             client: client.clone(),
-            setup: None,
-            setup_started: false,
-            replace_since: None,
+            setup: Vec::new(),
             files,
             catalog: Self::fetch_catalog(pref_path.clone(), client.clone(), 3),
             pref_path,
         };
     }
 
-    /// Called every frame: sets up the recommended voice if the setup guide asked for it.
+    /// Called every frame: sets up the recommended voices the setup guide asked for.
     pub fn poll(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer) {
-        let Some((lang, name)) = self.setup else {
+        if self.setup.is_empty() {
             return;
-        };
-        let picked = config.get().voices().get(&lang).cloned();
-        // A picked voice that didn't load is replaced (or loaded again, if it's the recommended)
-        let failed = synth.load(lang) == Some(VoiceLoad::Failed);
+        }
         let Some(Some(catalog)) = self.catalog.update(rt) else {
             return;
         };
-        let Some(voice) = find(&mut catalog.languages, lang, name) else {
-            log::warn!("The recommended voice '{name}' isn't in the catalog");
-            self.setup = None;
-            return;
-        };
-
-        // Wait until the picked voice's files are checked before deciding to keep it
-        let on_disk = match picked.as_ref().map(|path| self.files.voice_checked(path)) {
-            Some(None) => return,
-            Some(Some(on_disk)) => on_disk,
-            None => false,
-        };
-        if on_disk
-            && !failed
-            && picked
-                .as_ref()
-                .is_some_and(|path| !self.setup_started || path.as_path() != &*voice.path)
-        {
-            self.setup = None;
-            return;
-        }
-
-        let on_disk = voice.on_disk(rt, catalog.on_disk.borrow().as_ref());
-        match on_disk {
-            Some(true) => {
-                let path = voice.path.to_path_buf();
-                if let Some(picked) = picked.as_ref().filter(|picked| **picked != path) {
-                    let since = *self.replace_since.get_or_insert_with(Instant::now);
-                    match self.files.voice_checked_since(picked, Some(since)) {
-                        None => return,
-                        Some(true) if !failed => {
-                            self.setup = None;
-                            return;
-                        }
-                        Some(_) => {}
-                    }
-                }
-                config.update(|raw| raw.set_voice(rt, lang, path, synth));
-                self.setup = None;
-            }
-            Some(false) if !self.setup_started => {
-                voice.start_download(&self.client);
-                self.setup_started = true;
-            }
-            Some(false) => {}
-            // Not looked for yet
-            None => {}
-        }
+        let (files, client) = (&self.files, &self.client);
+        (self.setup).retain_mut(|setup| !set_up(rt, config, synth, catalog, files, client, setup));
     }
 
-    /// Downloads the recommended voice for the app's language (`locale`) (again, if it failed),
-    /// and uses it once it's on disk, if that language has no voice files by then.
-    pub fn setup(&mut self, locale: &str) {
+    /// Downloads the recommended voice for each of `langs` (again, if it failed), and uses each
+    /// once it's on disk, if its language has no voice files by then.
+    pub fn setup(&mut self, langs: &[ArrayStr<2>]) {
         self.retry_catalog();
-        self.setup = recommended(locale);
-        self.setup_started = false;
-        self.replace_since = None;
+        // Those asked for before and not now (the guide went Back) stop downloading
+        if let MaybeDone::Done(Some(catalog)) = &mut self.catalog {
+            for setup in self.setup.iter().filter(|setup| !langs.contains(&setup.lang)) {
+                if let Some(voice) = find(&mut catalog.languages, setup.lang, setup.name) {
+                    voice.downloads = None;
+                }
+            }
+        }
+        self.setup = (langs.iter())
+            .filter_map(|lang| {
+                let (lang, name) = recommended(lang)?;
+                Some(Setup {
+                    lang,
+                    name,
+                    started: false,
+                    replace_since: None,
+                })
+            })
+            .collect();
     }
 
-    /// The recommended voice for the app's language (`locale`), as the setup guide shows it:
-    /// `None` if there's none, or another is picked (and loaded, or loading).
-    pub fn setup_item(
+    /// The languages whose voice is being set up, and is coming: not those whose download failed,
+    /// nor those missing from the catalog.
+    pub fn getting(&self) -> Vec<ArrayStr<2>> {
+        (self.setup.iter())
+            .filter(|setup| self.can_come(setup.lang, setup.name, true))
+            .map(|setup| setup.lang)
+            .collect()
+    }
+
+    /// Whether `lang`'s recommended voice can be set up: it's in the catalog (or the catalog isn't
+    /// known yet). Voices the guide counts are only those that can.
+    pub fn listed(&self, lang: ArrayStr<2>) -> bool {
+        recommended(&lang).is_some_and(|(lang, name)| self.can_come(lang, name, false))
+    }
+
+    /// Whether the voice `name` for `lang` is in the catalog (or it isn't known yet), and, if
+    /// `downloading`, its last download didn't fail.
+    fn can_come(&self, lang: ArrayStr<2>, name: &str, downloading: bool) -> bool {
+        match &self.catalog {
+            MaybeDone::Done(Some(catalog)) => (catalog.languages.iter())
+                .filter(|language| language.code == lang)
+                .flat_map(|language| &language.voices)
+                .any(|voice| voice.is_named(name) && !(downloading && voice.failed())),
+            _ => true,
+        }
+    }
+
+    /// The languages whose voice the setup guide asked for and isn't used yet, failed ones too.
+    pub fn asked(&self) -> Vec<ArrayStr<2>> {
+        self.setup.iter().map(|setup| setup.lang).collect()
+    }
+
+    /// The recommended voices for `langs`, as the setup guide shows them.
+    pub fn setup_items(
         &mut self,
         rt: &Handle,
         config: &Config,
         synth: &Synthesizer,
-        locale: &str,
+        langs: &[ArrayStr<2>],
+    ) -> Vec<SetupItem> {
+        (langs.iter())
+            .filter_map(|&lang| self.setup_item(rt, config, synth, lang))
+            .collect()
+    }
+
+    /// The recommended voice for `lang`, as the setup guide shows it: `None` if there's none, or
+    /// another is picked (and loaded, or loading).
+    fn setup_item(
+        &mut self,
+        rt: &Handle,
+        config: &Config,
+        synth: &Synthesizer,
+        lang: ArrayStr<2>,
     ) -> Option<SetupItem> {
-        let (lang, name) = self.setup.or_else(|| recommended(locale))?;
+        let setup = self.setup.iter().find(|setup| setup.lang == lang);
+        let in_setup = setup.is_some();
+        let (lang, name) = match setup {
+            Some(setup) => (setup.lang, setup.name),
+            None => recommended(&lang)?,
+        };
         let picked = config.get().voices().get(&lang).cloned();
         let load = synth.load(lang);
         let failed = load == Some(VoiceLoad::Failed);
@@ -201,8 +288,10 @@ impl Voices {
             Some(None) => return unusable.then_some(SetupItem::Unavailable),
             Some(Some(catalog)) => catalog,
         };
-        let voice = find(&mut catalog.languages, lang, name)?;
-        if self.setup.is_none()
+        let Some(voice) = find(&mut catalog.languages, lang, name) else {
+            return Some(SetupItem::Unavailable);
+        };
+        if !in_setup
             && !failed
             && (picked.as_ref())
                 .is_some_and(|picked| *picked != *voice.path && self.files.voice(picked))
@@ -214,8 +303,10 @@ impl Voices {
         let used = (picked.as_ref()).is_some_and(|picked| *picked == *voice.path);
         let state = match (on_disk, voice.progress()) {
             (Some(true), _) if used && failed => SetupState::LoadFailed,
-            // On disk but not used, and setup isn't going to: retrying uses it
-            (Some(true), _) if self.setup.is_none() && !used => SetupState::Missing,
+            // Another voice is picked, and didn't load: Retry replaces it
+            _ if failed && !in_setup => SetupState::LoadFailed,
+            // On disk but not used, before the guide's Next: nothing to download, Next uses it
+            (Some(true), _) if !in_setup && !used => SetupState::Ready,
             // Being loaded, or setup is about to use it
             (Some(true), _) if !used || load == Some(VoiceLoad::Loading) => SetupState::Loading,
             (Some(true), _) => SetupState::Ready,
@@ -338,6 +429,65 @@ impl Voices {
         matches!(&self.catalog, MaybeDone::Done(Some(catalog))
             if (catalog.languages.iter().flat_map(|language| &language.voices))
                 .any(|voice| voice.deletion.running()))
+    }
+}
+
+/// Takes `setup` one step further. Returns whether it's done: its voice is used, or isn't needed.
+fn set_up(
+    rt: &Handle,
+    config: &Config,
+    synth: &mut Synthesizer,
+    catalog: &mut Catalog,
+    files: &super::ModelFiles,
+    client: &reqwest::Client,
+    setup: &mut Setup,
+) -> bool {
+    let (lang, name) = (setup.lang, setup.name);
+    let picked = config.get().voices().get(&lang).cloned();
+    // A picked voice that didn't load is replaced (or loaded again, if it's the recommended)
+    let failed = synth.load(lang) == Some(VoiceLoad::Failed);
+    // It stays asked for, and the guide says it's unavailable
+    let Some(voice) = find(&mut catalog.languages, lang, name) else {
+        return false;
+    };
+
+    // Wait until the picked voice's files are checked before deciding to keep it
+    let on_disk = match picked.as_ref().map(|path| files.voice_checked(path)) {
+        Some(None) => return false,
+        Some(Some(on_disk)) => on_disk,
+        None => false,
+    };
+    if on_disk
+        && !failed
+        && picked
+            .as_ref()
+            .is_some_and(|path| !setup.started || path.as_path() != &*voice.path)
+    {
+        return true;
+    }
+
+    match voice.on_disk(rt, catalog.on_disk.borrow().as_ref()) {
+        Some(true) => {
+            let path = voice.path.to_path_buf();
+            if let Some(picked) = picked.as_ref().filter(|picked| **picked != path) {
+                let since = *setup.replace_since.get_or_insert_with(Instant::now);
+                match files.voice_checked_since(picked, Some(since)) {
+                    None => return false,
+                    Some(true) if !failed => return true,
+                    Some(_) => {}
+                }
+            }
+            config.update(|raw| raw.set_voice(rt, lang, path, synth));
+            true
+        }
+        Some(false) if !setup.started => {
+            voice.start_download(client);
+            setup.started = true;
+            false
+        }
+        Some(false) => false,
+        // Not looked for yet
+        None => false,
     }
 }
 
@@ -515,7 +665,7 @@ impl Language {
         config: &mut Config,
         on_disk: Option<&(Vec<bool>, Instant)>,
         synth: &mut Synthesizer,
-        setup: &mut Option<(ArrayStr<2>, &'static str)>,
+        setup: &mut Vec<Setup>,
     ) {
         let code = self.code;
         let voices = &mut self.voices;
@@ -598,7 +748,7 @@ impl Language {
                                                 config.set_voice(rt, code, path, synth);
                                                 // A voice picked by hand is what's used, whatever
                                                 // setup was getting for its language
-                                                setup.take_if(|(lang, _)| *lang == code);
+                                                setup.retain(|setup| setup.lang != code);
                                                 updated = true;
                                             }
                                         });
@@ -619,7 +769,7 @@ impl Language {
                                     {
                                         voice.delete(config, synth);
                                         // Setup doesn't get it again
-                                        setup.take_if(|(_, name)| voice.is_named(name));
+                                        setup.retain(|setup| !voice.is_named(setup.name));
                                         updated = true;
                                     }
                                 });
@@ -787,8 +937,75 @@ fn is_relative_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrstr;
+    use crate::{
+        app::topbar::audio::engine,
+        arrstr,
+        synthesizer::{Effects, Voice as Loaded},
+    };
     use camino::Utf8PathBuf;
+    use std::{collections::BTreeSet, num::NonZeroUsize};
+
+    #[test]
+    fn recommends_one_voice_per_language() {
+        let langs = RECOMMENDED.iter().map(|voice| voice.lang).collect::<BTreeSet<_>>();
+        assert_eq!(langs.len(), RECOMMENDED.len());
+        for voice in RECOMMENDED {
+            assert!(voice.voice.starts_with(&format!("{}_", voice.lang)), "{}", voice.voice);
+            assert!(ArrayStr::<2>::from_str(voice.lang).is_some());
+        }
+        assert_eq!(recommended("en-US").unwrap().1, "en_US-mike-medium");
+        assert_eq!(recommended("es").unwrap().1, "es_ES-davefx-medium");
+        assert_eq!(recommended("ca-ES").unwrap().1, "ca_ES-upc_ona-medium");
+        // All Parakeet knows, but those without a voice Bono can speak
+        let known = (langs.iter())
+            .filter(|lang| engine::parakeet_knows(ArrayStr::from_str(lang).unwrap()))
+            .count();
+        assert_eq!(known, 25 - 3);
+        assert!(["hr", "lt", "mt"].iter().all(|lang| !langs.contains(lang)));
+    }
+
+    /// Downloads every one of them (3 GB, one at a time), and says something. `BONO_VOICES`, if set,
+    /// has the languages to check, such as `fr,de`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn recommended_voices_are_in_the_catalog_and_speak() {
+        let client = reqwest::Client::new();
+        let only = std::env::var("BONO_VOICES").ok();
+        let mut failed = Vec::new();
+        for recommended in RECOMMENDED {
+            if (only.as_ref()).is_some_and(|only| !only.split(',').any(|lang| lang == recommended.lang)) {
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let mut catalog = Catalog::fetch(Utf8Path::from_path(dir.path()).unwrap(), &client).await.unwrap();
+            let lang = ArrayStr::from_str(recommended.lang).unwrap();
+            let Some(voice) = find(&mut catalog.languages, lang, recommended.voice) else {
+                failed.push(format!("{}: not in the catalog", recommended.voice));
+                continue;
+            };
+            voice.start_download(&client);
+            while !voice.failed() && voice.progress().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            let path = voice.path.clone();
+            let spoken = tokio::task::spawn_blocking(move || -> anyhow::Result<f32> {
+                let mut voice = Loaded::load(&path, NonZeroUsize::new(4).unwrap(), false)?;
+                let effects = Effects {
+                    radio: 0.0,
+                    beep_volume: 0.0,
+                    speed: 1.0,
+                };
+                let speech = voice.synthesize("1, 2, 3.", effects)?;
+                Ok(speech.samples.len() as f32 / speech.sample_rate as f32)
+            });
+            match spoken.await.unwrap() {
+                Ok(seconds) if seconds > 0.3 => println!("{}: {seconds:.1} s", recommended.voice),
+                Ok(seconds) => failed.push(format!("{}: only {seconds} s", recommended.voice)),
+                Err(e) => failed.push(format!("{}: {e:#}", recommended.voice)),
+            }
+        }
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
 
     fn voice(path: &Utf8Path) -> Voice {
         Voice {
@@ -869,6 +1086,50 @@ mod tests {
         voice(&deleted).delete(&mut config, &mut synth);
         assert_eq!(*config.voices(), BTreeMap::from([(arrstr!("en"), used)]));
         assert!(synth.load(arrstr!("en")).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sets_up_several_voices() {
+        let rt = Handle::current();
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| Utf8PathBuf::try_from(dir.path().join(name)).unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(&config_path, b"{}").unwrap();
+        let config = Config::new(&config_path).await.unwrap();
+        let mut synth = Synthesizer::new(&rt, &RawConfig::default());
+
+        let mut voices = Voices {
+            catalog: MaybeDone::Done(None),
+            pref_path: Arc::from(Utf8Path::from_path(dir.path()).unwrap()),
+            client: reqwest::Client::new(),
+            setup: Vec::new(),
+            files: crate::app::topbar::audio::ModelFiles::new(),
+        };
+        // Without a recommended voice, there's nothing to set up
+        voices.setup(&[arrstr!("es"), arrstr!("fr"), arrstr!("xx")]);
+        assert_eq!(voices.getting(), [arrstr!("es"), arrstr!("fr")]);
+
+        // Spanish's is on disk; French's hasn't been looked for yet
+        let mut spanish = voice(&path("es.onnx"));
+        spanish.model_file = "es/es_ES/davefx/medium/es_ES-davefx-medium.onnx".into();
+        let mut french = voice(&path("fr.onnx"));
+        french.index = 1;
+        french.model_file = "fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx".into();
+        let language = |code, voice| Language {
+            code,
+            name_english: String::new(),
+            name_native: String::new(),
+            voices: vec![voice],
+        };
+        let (_send, on_disk) = tokio::sync::watch::channel(Some((vec![true], Instant::now())));
+        voices.catalog = MaybeDone::Done(Some(Catalog {
+            languages: vec![language(arrstr!("es"), spanish), language(arrstr!("fr"), french)],
+            on_disk,
+        }));
+        tokio::task::block_in_place(|| voices.poll(&rt, &config, &mut synth));
+        assert_eq!(voices.getting(), [arrstr!("fr")]);
+        assert_eq!(config.get().voices().get(&arrstr!("es")), Some(&path("es.onnx")));
+        assert_eq!(config.get().voices().get(&arrstr!("fr")), None);
     }
 
     #[test]

@@ -11,8 +11,8 @@ use crate::{
     },
     arrstr,
     config::{ArrayStr, AudioDevice, Config, RawConfig},
-    engineer::Heard,
-    error,
+    engineer::{Heard, acknowledgement},
+    error, language,
     synthesizer::{Speech, Synthesizer, VoiceLoad, plays_on},
     task::{MaybeDone, Task},
     updating,
@@ -48,8 +48,10 @@ use std::{
 };
 use tokio::{runtime::Handle, sync::oneshot::error::TryRecvError};
 
+pub(in crate::app) mod engine;
 mod gpu;
-mod voice;
+mod parakeet;
+pub(in crate::app) mod voice;
 mod whisper;
 
 const DELAY: Duration = Duration::from_secs(1);
@@ -153,11 +155,7 @@ impl AudioTopbar {
         let config = config.get();
         self.microphone.missing()
             || self.speaker.missing()
-            || config
-                .whisper_model()
-                .as_ref()
-                .is_none_or(|path| !self.files.is_file(path))
-            || self.whisper.failed()
+            || self.whisper.missing(&config, &self.voices.getting())
             || config.voices().is_empty()
             || config.voices().values().any(|path| !self.files.voice(path))
             || (config.voices().keys()).any(|&lang| synth.load(lang) == Some(VoiceLoad::Failed))
@@ -171,13 +169,13 @@ impl AudioTopbar {
             self.meter = None;
         }
         self.speaker.poll(Kind::Playback);
-        self.whisper.poll(rt, config);
+        self.whisper.poll(rt, config, &self.voices.getting());
         self.voices.poll(rt, config, synth);
         self.play_test(config);
     }
 
-    /// Says something in the engineer's voice for the app's language, on the speaker, as loud
-    /// as the engineer.
+    /// Says something in the engineer's voice for [`Self::guide_language`], on the speaker, as
+    /// loud as the engineer.
     pub fn test_voice(&mut self, rt: &Handle, config: &Config, synth: &mut Synthesizer) {
         if self.test.is_some() {
             return;
@@ -185,9 +183,14 @@ impl AudioTopbar {
         log::debug!("Start test");
         let (lang, effects) = {
             let config = config.get();
-            (app_language(config.locale()), config.synth_effects())
+            (self.guide_language(&config), config.synth_effects())
         };
-        self.test = Some(synth.synthesize(rt, lang, t!("audio.test_phrase").into(), effects));
+        self.test = Some(synth.synthesize(rt, lang, test_phrase(lang).into(), effects));
+    }
+
+    /// The language the setup guide speaks in: see [`guide_language`].
+    pub fn guide_language(&self, config: &RawConfig) -> ArrayStr<2> {
+        guide_language(config, app_language(config.locale()), &self.voices.getting())
     }
 
     /// Whether the test speech is being synthesized, or played.
@@ -281,30 +284,40 @@ impl AudioTopbar {
         }
     }
 
-    /// Downloads the recommended speech to text model, and voice for the app's language (again,
-    /// those that failed), and uses them once they're on disk (each, if none is picked by then).
-    pub fn setup(&mut self, config: &Config) {
-        let locale = config.get().locale().clone();
-        self.whisper.setup();
-        self.voices.setup(&locale);
+    /// Downloads `engine`'s model for Automatic (`None`: none), and a voice for each of `langs`
+    /// (again, those that failed), and uses them once they're on disk (each voice, if none is
+    /// picked by then).
+    pub fn setup(&mut self, langs: &[ArrayStr<2>], engine: Option<engine::Engine>) {
+        self.whisper.setup(engine);
+        self.voices.setup(langs);
     }
 
-    /// What `setup` downloads, as the setup guide shows it: each with what it's for.
+    /// The languages whose voice is set and usable: on disk, and not failed to load.
+    pub fn usable_voices(&self, config: &RawConfig, synth: &Synthesizer) -> Vec<ArrayStr<2>> {
+        (config.voices().iter())
+            .filter(|&(&lang, path)| {
+                self.files.voice(path) && synth.load(lang) != Some(VoiceLoad::Failed)
+            })
+            .map(|(&lang, _)| lang)
+            .collect()
+    }
+
+    /// What `setup` downloads for `langs`, and `engine`'s model (`None`: the model picked stays),
+    /// as the setup guide shows it: each with what it's for.
     pub fn setup_items(
         &mut self,
         rt: &Handle,
         config: &Config,
         synth: &Synthesizer,
+        langs: &[ArrayStr<2>],
+        engine: Option<engine::Engine>,
     ) -> Vec<(&'static str, SetupItem)> {
-        let locale = config.get().locale().clone();
-        let whisper = self.whisper.setup_item(rt, config);
-        let voice = self.voices.setup_item(rt, config, synth, &locale);
-        [
-            (t!("audio.speech_to_text"), whisper),
-            (t!("audio.voice"), voice),
-        ]
-        .into_iter()
-        .filter_map(|(what, item)| Some((what, item?)))
+        let whisper = self.whisper.setup_item(rt, engine);
+        let voices = self.voices.setup_items(rt, config, synth, langs);
+        let voices = voices.into_iter().map(|voice| (t!("audio.voice"), Some(voice)));
+        std::iter::once((t!("audio.speech_to_text"), whisper))
+            .chain(voices)
+            .filter_map(|(what, item)| Some((what, item?)))
         .collect()
     }
 
@@ -315,14 +328,17 @@ impl AudioTopbar {
         // Errors go to the engineer, who tells the pilot: a dialog could hide the game
         let heard = result.unwrap_or_else(Heard::Failed);
         match &heard {
-            Heard::Question { text, lang, .. } => log::info!("Pilot ({lang}): {text}"),
+            Heard::Question { text, lang, .. } => {
+                let lang = lang.as_deref().unwrap_or("language not said");
+                log::info!("Pilot ({lang}): {text}")
+            }
             Heard::Unvoiced { text, lang } => {
                 log::info!("Pilot ({lang}, without a voice): {text}")
             }
             Heard::Nothing => log::info!("Nothing understood on the radio"),
             Heard::NoVoice(_) => log::info!("No voice to answer the radio with"),
             Heard::UnsupportedLanguage(lang) => {
-                log::info!("The English-only speech model cannot hear {lang}")
+                log::info!("The speech to text model in use cannot hear {lang}")
             }
             Heard::TooShort => log::debug!("The talk button was let go too soon"),
             Heard::NotListening(why) => log::info!("Not listening to the radio: {why:?}"),
@@ -345,7 +361,7 @@ impl AudioTopbar {
             self.test_voice(rt, config, synth);
         }
 
-        self.whisper.update(rt, config, ui);
+        self.whisper.update(rt, config, ui, &self.voices.getting());
         self.voices.update(rt, config, ui, synth);
     }
 
@@ -645,6 +661,31 @@ impl DeviceSelector {
         if let Err(e) = kind.enumerate(&mut self.devices) {
             log::error!("Error updating audio devices: {e}");
         }
+    }
+}
+
+/// The language the setup guide speaks in: the fixed reply language's, if it has a voice; or else
+/// the Heard language; or else the `app`'s, if it has a voice or is `getting` one; or else the
+/// first that has or is; or else the app's.
+fn guide_language(config: &RawConfig, app: ArrayStr<2>, getting: &[ArrayStr<2>]) -> ArrayStr<2> {
+    // In order, so it doesn't change as the voices being set up arrive
+    let voiced = (config.voices().keys().chain(getting).copied()).collect::<std::collections::BTreeSet<_>>();
+    let lang = (config.engineer_reply_language())
+        .or(*config.heard_language())
+        .or_else(|| voiced.contains(&app).then_some(app))
+        .or_else(|| voiced.first().copied())
+        .unwrap_or(app);
+    language::voice_code(lang)
+}
+
+/// What the voice test says in `lang` (a voice code): the radio acknowledgement if the test
+/// phrase isn't translated into it, as that's translated into nearly every language.
+fn test_phrase(lang: ArrayStr<2>) -> &'static str {
+    let lang: &str = &lang;
+    let phrase = t!("audio.test_phrase": lang);
+    match lang == "en" || phrase != t!("audio.test_phrase": "en") {
+        true => phrase,
+        false => acknowledgement::phrase(lang).unwrap_or(phrase),
     }
 }
 
@@ -1041,11 +1082,15 @@ impl ModelFiles {
 
     /// Like [`Self::checked`], but `None` until a check that started at or after `since`.
     pub fn checked_since(&self, path: &Utf8Path, since: Option<Instant>) -> Option<bool> {
-        if let Some(&(file, started)) = self.found.borrow().get(path) {
-            if since.is_none_or(|since| started >= since) {
-                return Some(file);
-            }
-            return None;
+        let (file, started) = self.found(path)?;
+        since.is_none_or(|since| started >= since).then_some(file)
+    }
+
+    /// Whether `path` is a file, and when the check that found out started: `None` until it's been
+    /// checked.
+    pub fn found(&self, path: &Utf8Path) -> Option<(bool, Instant)> {
+        if let Some(&found) = self.found.borrow().get(path) {
+            return Some(found);
         }
         self.asked.lock().unwrap().insert(path.to_path_buf());
         None
@@ -1260,5 +1305,47 @@ mod model_files_tests {
         assert!(check().await);
         std::fs::remove_file(&path).unwrap();
         assert!(!check().await);
+    }
+}
+
+#[cfg(test)]
+mod guide_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_guide_speaks_the_pilots_language() {
+        let rt = Handle::current();
+        let [en, es, ca, fr] = [arrstr!("en"), arrstr!("es"), arrstr!("ca"), arrstr!("fr")];
+        let mut synth = Synthesizer::new(&rt, &RawConfig::default());
+        let mut config = RawConfig::default();
+        // Nothing to go by
+        assert_eq!(guide_language(&config, es, &[]), es);
+        // The voices being set up count
+        assert_eq!(guide_language(&config, es, &[ca, es]), es);
+        assert_eq!(guide_language(&config, en, &[ca, es]), ca);
+
+        for lang in [ca, es, en] {
+            config.set_voice(&rt, lang, format!("{}.onnx", &*lang).into(), &mut synth);
+        }
+        assert_eq!(guide_language(&config, es, &[]), es);
+        assert_eq!(guide_language(&config, fr, &[]), ca);
+        config.heard_language.set(Some(fr));
+        assert_eq!(guide_language(&config, es, &[]), fr);
+        // Norwegian, as its voices have it
+        config.heard_language.set(Some(arrstr!("nb")));
+        assert_eq!(guide_language(&config, es, &[]), arrstr!("no"));
+        // The fixed reply language, if it has a voice
+        config.spoken_language.set(Some(en));
+        assert_eq!(guide_language(&config, es, &[]), en);
+        config.spoken_language.set(Some(fr));
+        assert_eq!(guide_language(&config, es, &[]), arrstr!("no"));
+    }
+
+    #[test]
+    fn the_test_phrase_is_in_the_voices_language() {
+        assert_eq!(test_phrase(arrstr!("es")), t!("audio.test_phrase": "es"));
+        assert_eq!(test_phrase(arrstr!("en")), t!("audio.test_phrase": "en"));
+        // Not translated: the acknowledgement is
+        assert_eq!(test_phrase(arrstr!("fr")), t!("radio.acknowledgement": "fr"));
     }
 }
