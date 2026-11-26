@@ -4,7 +4,8 @@
 
 use crate::{
     app::topbar::setup_label,
-    sim::{ActiveSimulator, PluginStatus},
+    config::Config,
+    sim::{ActiveSimulator, IRACING_NAME, PluginStatus},
     task::MaybeDone,
 };
 use bono_i18n::t;
@@ -117,7 +118,13 @@ impl SimulatorsTopbar {
         }
     }
 
-    pub fn update(&mut self, rt: &Handle, ui: &mut egui::Ui, simulators: &mut ActiveSimulator) {
+    pub fn update(
+        &mut self,
+        rt: &Handle,
+        ui: &mut egui::Ui,
+        simulators: &mut ActiveSimulator,
+        config: &Config,
+    ) {
         if !self.open {
             self.open = true;
             self.looked = None;
@@ -152,6 +159,9 @@ impl SimulatorsTopbar {
                     }
                 }
             });
+            if sim.name() == IRACING_NAME {
+                iracing_settings(ui, config);
+            }
 
             let Some(plugin) = &found.plugin else {
                 continue;
@@ -213,6 +223,27 @@ impl SimulatorsTopbar {
             self.install = None;
         }
     }
+}
+
+/// How iRacing's replay of the live session is recorded: how far behind live counts as a replay,
+/// and whether it's kept at live.
+fn iracing_settings(ui: &mut egui::Ui, config: &Config) {
+    config.maybe_update(|raw| {
+        raw.iracing_behind_live
+            .edit(*raw.iracing_behind_live(), |secs| {
+                ui.add(egui::Slider::new(secs, 1..=30).text(t!("simulators.iracing_behind_live")))
+                    .on_hover_text(t!("simulators.iracing_behind_live_hover"))
+                    .changed()
+            })
+    });
+    config.maybe_update(|raw| {
+        raw.iracing_keep_live
+            .edit(*raw.iracing_keep_live(), |keep| {
+                ui.checkbox(keep, t!("simulators.iracing_keep_live"))
+                    .on_hover_text(t!("simulators.iracing_keep_live_hover"))
+                    .changed()
+            })
+    });
 }
 
 /// Which version of the plugin is installed, next to the one that comes with the app.

@@ -118,7 +118,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
-    # iRacing's pit commands
+    # iRacing's pit commands, and jumping its replay back to live (its SDK's broadcast messages)
     "Win32_UI_WindowsAndMessaging",
     # LMU's Pit Request key
     "Win32_UI_Input_KeyboardAndMouse",

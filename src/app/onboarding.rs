@@ -350,7 +350,7 @@ impl Onboarding {
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            self.simulators.update(rt, ui, simulators);
+            self.simulators.update(rt, ui, simulators, config);
         });
         // Games found by their process alone (iRacing) aren't looked for on the disk
         let running = simulators.simulators().any(|sim| sim.is_running());

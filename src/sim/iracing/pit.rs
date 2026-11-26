@@ -58,7 +58,7 @@ impl PitService for IracingPit {
 
     fn write(&self, menu: &PitMenu, change: &Resolved) -> anyhow::Result<()> {
         for (mode, value) in commands(menu, change) {
-            broadcast(mode, value)?;
+            super::broadcast(BROADCAST_PIT_COMMAND, mode, value)?;
         }
         Ok(())
     }
@@ -204,31 +204,6 @@ fn commands(menu: &PitMenu, change: &Resolved) -> Vec<(u16, u32)> {
         None => {}
     }
     out
-}
-
-/// Sends one `PitCommand` to iRacing, as `irsdk_broadcastMsg` does.
-fn broadcast(mode: u16, value: u32) -> anyhow::Result<()> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        HWND_BROADCAST, RegisterWindowMessageW, SendNotifyMessageW,
-    };
-    let name: Vec<u16> = "IRSDK_BROADCASTMSG\0".encode_utf16().collect();
-    let message = unsafe { RegisterWindowMessageW(name.as_ptr()) };
-    if message == 0 {
-        bail!(
-            "couldn't register iRacing's broadcast message: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    // MAKELONG(BROADCAST_PIT_COMMAND, mode)
-    let wparam = (u32::from(BROADCAST_PIT_COMMAND) | (u32::from(mode) << 16)) as usize;
-    let sent = unsafe { SendNotifyMessageW(HWND_BROADCAST, message, wparam, value as isize) };
-    if sent == 0 {
-        bail!(
-            "couldn't send iRacing a pit command: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]

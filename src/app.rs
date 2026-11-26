@@ -24,7 +24,6 @@ use sdl3::{
 use sdl3_main::AppResult;
 use std::{
     ffi::c_int,
-    num::NonZeroU32,
     ops::{Deref, DerefMut},
     sync::Arc,
     time::Duration,
@@ -305,7 +304,7 @@ pub struct AppState {
     synth: Synthesizer,
     simulators: ActiveSimulator,
     /// The recording settings last passed to the simulators
-    applied_settings: Option<(NonZeroU32, bool)>,
+    applied_settings: Option<SimulatorSettings>,
     /// Keeps the running simulator's track description next to its database
     tracks: TrackSync,
     // FIXME: Do we want this to be `MaybeDone`?
@@ -388,20 +387,23 @@ impl AppState {
     /// Passes the recording settings on to every simulator when they change (and at startup), and
     /// to a simulator again when it starts running, and follows which simulator is running.
     fn update_simulators(&mut self) {
-        let opponent_frequency = *self.config.get().opponent_frequency();
-        let pit_requests = *self.config.get().pit_requests();
-        let settings = SimulatorSettings {
-            opponent_frequency,
-            pit_requests,
+        let settings = {
+            let config = self.config.get();
+            SimulatorSettings {
+                opponent_frequency: *config.opponent_frequency(),
+                pit_requests: *config.pit_requests(),
+                iracing_keep_live: *config.iracing_keep_live(),
+                iracing_behind_live: *config.iracing_behind_live(),
+            }
         };
-        let changed = self.applied_settings != Some((opponent_frequency, pit_requests));
+        let changed = self.applied_settings.as_ref() != Some(&settings);
         for simulator in self.simulators.simulators() {
             // Reapply on process starts too: Steam's running flag can lag behind a restart.
             if simulator.started() || changed {
                 simulator.apply(&settings);
             }
         }
-        self.applied_settings = Some((opponent_frequency, pit_requests));
+        self.applied_settings = Some(settings);
 
         // Only looks: a change waiting is taken, otherwise it's looked for again next frame
         if let Some(current) = self.simulators.changed().now_or_never() {

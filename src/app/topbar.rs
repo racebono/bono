@@ -142,7 +142,7 @@ impl Topbar {
                     .config(
                         MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside),
                     )
-                    .ui(ui, |ui| self.simulators.update(rt, ui, simulators));
+                    .ui(ui, |ui| self.simulators.update(rt, ui, simulators, config));
                 if sims.is_none() {
                     self.simulators.closed();
                 }

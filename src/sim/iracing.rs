@@ -11,22 +11,109 @@ mod sdk;
 mod session;
 mod yaml;
 
+use crate::sim::pit::PitService;
 use crate::{
     sim::{
-        Simulator, SimulatorInfo, SimulatorSettings,
+        IRACING_NAME, Simulator, SimulatorInfo, SimulatorSettings,
         memory::{Read, Recording, Source},
     },
     sqlite::pool::Pool,
 };
-use convert::Converter;
+use convert::{BehindLiveFrames, Converter, FRAMES_PER_SECOND};
+use pit::IracingPit;
 use sdk::{Frame, HEADER_LEN, Header, MEMORY_NAME, VERSION, Vars};
 use session::SessionInfo;
-use crate::sim::pit::PitService;
-use pit::IracingPit;
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 /// How often the session info is read again while its update count stays the same.
 const INFO_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The pilot's settings for the live session's replay, passed from `apply` (on the UI thread) to
+/// the reader thread, which looks at them on every read: whether the replay is jumped back to live
+/// whenever it falls behind, and how far behind (seconds) it must be to count as a replay.
+static KEEP_LIVE: AtomicBool = AtomicBool::new(false);
+static BEHIND_LIVE_SECS: AtomicU32 = AtomicU32::new(3);
+
+/// How far behind live, in replay frames, `secs` seconds are, taken between 1 and 30 seconds:
+/// below a second, the lag at the live point could count as a replay.
+fn behind_live_frames(secs: u32) -> BehindLiveFrames {
+    BehindLiveFrames(secs.clamp(1, 30) as i32 * FRAMES_PER_SECOND)
+}
+
+/// How often the replay is asked to jump back to live while it stays behind: the game may take a
+/// moment to, or not do it at all.
+const PULL_EVERY: Duration = Duration::from_secs(1);
+
+/// Whether to ask the game to jump its replay back to live: only when the pilot asked for it, the
+/// replay is the live session's (not a saved one) and behind live, and it wasn't asked to lately.
+fn should_pull_live(
+    keep_live: bool,
+    replay_file: bool,
+    behind: bool,
+    last_pull: Option<Instant>,
+    now: Instant,
+) -> bool {
+    keep_live
+        && !replay_file
+        && behind
+        && last_pull.is_none_or(|at| now.duration_since(at) >= PULL_EVERY)
+}
+
+/// `irsdk_BroadcastReplaySetPlaySpeed`, with the speed and whether in slow motion as arguments.
+const BROADCAST_REPLAY_SET_PLAY_SPEED: u16 = 3;
+/// `irsdk_BroadcastReplaySearch`, with its mode as the first argument.
+const BROADCAST_REPLAY_SEARCH: u16 = 5;
+/// `irsdk_RpySrch_ToEnd`: to the end of the tape, the live session.
+const REPLAY_SEARCH_TO_END: u16 = 1;
+
+/// Sends iRacing one of its SDK's commands, as `irsdk_broadcastMsg` (`irsdk_defines.h`) does: its
+/// broadcast message, to every top-level window, with `MAKELONG(command, first)` as `wParam` and
+/// `second` as `lParam`. `SendNotifyMessageW` doesn't wait for windows of other threads.
+fn broadcast(command: u16, first: u16, second: u32) -> anyhow::Result<()> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HWND_BROADCAST, RegisterWindowMessageW, SendNotifyMessageW,
+    };
+    let name: Vec<u16> = "IRSDK_BROADCASTMSG\0".encode_utf16().collect();
+    // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the call. Registering the
+    // same name again gives the same message
+    let message = unsafe { RegisterWindowMessageW(name.as_ptr()) };
+    if message == 0 {
+        anyhow::bail!(
+            "couldn't register iRacing's broadcast message: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let wparam = (u32::from(command) | (u32::from(first) << 16)) as usize;
+    // SAFETY: a notification with plain integer arguments, no pointers
+    if unsafe { SendNotifyMessageW(HWND_BROADCAST, message, wparam, second as isize) } == 0 {
+        anyhow::bail!(
+            "couldn't send iRacing's broadcast message: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+/// Asks the game to jump its replay to the end of the tape and play it at normal speed (a paused
+/// one too).
+fn pull_to_live() {
+    for (command, first) in [
+        (BROADCAST_REPLAY_SEARCH, REPLAY_SEARCH_TO_END),
+        (BROADCAST_REPLAY_SET_PLAY_SPEED, 1),
+    ] {
+        // Each is sent anyway: a broadcast that some window didn't take may still reach iRacing
+        if let Err(e) = broadcast(command, first, 0) {
+            log::debug!("Couldn't ask iRacing to play its replay live: {e}");
+        }
+    }
+}
 
 pub struct IRacing(Recording);
 
@@ -39,7 +126,7 @@ impl IRacing {
 }
 
 impl SimulatorInfo for IRacing {
-    const NAME: &'static str = "iRacing";
+    const NAME: &'static str = IRACING_NAME;
     /// Lovely Sim Racing's track data's id for it
     const TRACK_DATA_ID: &'static str = "iracing";
     /// Mostly installed with its own launcher; Steam reporting it running isn't needed to follow
@@ -57,6 +144,8 @@ impl Simulator for IRacing {
     }
 
     fn apply(&mut self, settings: &SimulatorSettings) {
+        KEEP_LIVE.store(settings.iracing_keep_live, Ordering::Relaxed);
+        BEHIND_LIVE_SECS.store(settings.iracing_behind_live, Ordering::Relaxed);
         self.0.apply(settings);
     }
 
@@ -87,6 +176,8 @@ struct Game {
     /// The last update read
     buffer: Vec<u8>,
     converter: Converter,
+    /// When the replay was last asked to jump back to live
+    last_pull: Option<Instant>,
     warned_version: bool,
     warned_range: bool,
 }
@@ -251,10 +342,17 @@ impl Source for Game {
         let (Some((_, vars)), Some((_, _, info))) = (&self.vars, &self.info) else {
             return Read::Idle;
         };
-        match self
-            .converter
-            .convert(&Frame::new(vars, &self.buffer), info, now)
-        {
+        let frame = Frame::new(vars, &self.buffer);
+        let frames = behind_live_frames(BEHIND_LIVE_SECS.load(Ordering::Relaxed));
+        // Asked from the reader thread, never the UI's (see `pull_to_live`)
+        let behind = convert::behind_live(&frame, frames.0);
+        let keep_live = KEEP_LIVE.load(Ordering::Relaxed);
+        if should_pull_live(keep_live, info.replay, behind, self.last_pull, now) {
+            pull_to_live();
+            self.last_pull = Some(now);
+        }
+        self.converter.behind_live_frames = frames;
+        match self.converter.convert(&frame, info, now) {
             Some(update) => Read::Update(update),
             None => Read::Idle,
         }
@@ -393,6 +491,57 @@ mod tests {
     use bono_sim::recorder::{DATABASE, Recorder};
     use sdk::Ibt;
     use std::{path::Path, time::Duration};
+
+    #[test]
+    fn behind_live_frames_are_clamped() {
+        use convert::BehindLiveFrames;
+        assert_eq!(behind_live_frames(3), BehindLiveFrames(180));
+        assert_eq!(behind_live_frames(0), BehindLiveFrames(60));
+        assert_eq!(behind_live_frames(10_000), BehindLiveFrames(1800));
+    }
+
+    #[test]
+    fn off_never_pulls() {
+        let now = Instant::now();
+        assert!(!should_pull_live(false, false, true, None, now));
+    }
+
+    #[test]
+    fn never_pulls_a_replay_file() {
+        let now = Instant::now();
+        assert!(!should_pull_live(true, true, true, None, now));
+    }
+
+    #[test]
+    fn live_isnt_pulled() {
+        let now = Instant::now();
+        assert!(!should_pull_live(true, false, false, None, now));
+    }
+
+    #[test]
+    fn pulls_when_turned_on_while_behind() {
+        let now = Instant::now();
+        assert!(should_pull_live(true, false, true, None, now));
+    }
+
+    #[test]
+    fn pulls_at_most_once_a_second() {
+        let now = Instant::now();
+        assert!(!should_pull_live(
+            true,
+            false,
+            true,
+            Some(now),
+            now + Duration::from_millis(999)
+        ));
+        assert!(should_pull_live(
+            true,
+            false,
+            true,
+            Some(now),
+            now + PULL_EVERY
+        ));
+    }
 
     /// Records a saved telemetry file as if the game were sharing it live, into `dir`. Returns
     /// how many updates were recorded.
