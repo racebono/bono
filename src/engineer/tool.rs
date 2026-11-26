@@ -11,7 +11,7 @@ use crate::{
     sqlite::pool::Pool,
 };
 use anyhow::{Context as _, bail};
-use bono_sim::sql::{Epoch, active_epoch};
+use bono_sim::sql::{Epoch, active_epoch, newest_event_generation};
 use rusqlite::{
     Connection, Params, params,
     types::{FromSql, Value},
@@ -1045,6 +1045,10 @@ struct Scoring {
     sector_yellows: bool,
     cars: BTreeMap<i64, Row>,
     player: Option<Row>,
+    /// The newest `event_session` set: every session of the event, in order
+    event: Vec<Row>,
+    /// The newest `event_rule` set
+    rules: Vec<Row>,
 }
 
 /// The game's sky numbers; anything else is described with the game's own text.
@@ -1132,12 +1136,49 @@ impl Scoring {
             .get(&ctx.vehicle)
             .or_else(|| cars.values().find(|r| r.b("is_player")))
             .cloned();
+        let (event, rules) = Self::event(conn)?;
         Ok(Self {
             session,
             yellow_sectors,
             sector_yellows,
             cars,
             player,
+            event,
+            rules,
+        })
+    }
+
+    /// The newest event set: its sessions in order, and its rules. None in a recording from before
+    /// they were recorded.
+    fn event(conn: &Connection) -> rusqlite::Result<(Vec<Row>, Vec<Row>)> {
+        if !conn.table_exists(None::<&str>, "event_session")?
+            || !conn.table_exists(None::<&str>, "event_rule")?
+        {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let Some(generation) = newest_event_generation(conn)? else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        Ok((
+            rows(
+                conn,
+                "SELECT * FROM event_session WHERE generation = ? ORDER BY event_order, id",
+                [generation],
+            )?,
+            rows(
+                conn,
+                "SELECT * FROM event_rule WHERE generation = ? ORDER BY id",
+                [generation],
+            )?,
+        ))
+    }
+
+    /// The event's row for this session: the same type and number (both maybe NULL).
+    fn current_event(&self) -> Option<&Row> {
+        let s = self.session.as_ref()?;
+        let kind = s.text("session_type")?;
+        self.event.iter().find(|r| {
+            r.text("session_type") == Some(kind) && r.i("session_number") == s.i("session_number")
         })
     }
 
@@ -3303,6 +3344,8 @@ mod tests {
             sector_yellows: false,
             cars: BTreeMap::new(),
             player: None,
+            event: Vec::new(),
+            rules: Vec::new(),
         };
         let line = scoring.forecast_line(&conn, None).unwrap().unwrap();
         assert!(!line.contains('\n'), "{line}");
@@ -3344,6 +3387,8 @@ mod tests {
                 sector_yellows: false,
                 cars: BTreeMap::from([(2, leader)]),
                 player: None,
+                event: Vec::new(),
+                rules: Vec::new(),
             };
             let line = scoring.session_line(Some(1970.0)).unwrap();
             assert!(line.split(" | ").any(|part| part == expected), "{line}");
@@ -3389,6 +3434,8 @@ mod tests {
             sector_yellows: false,
             cars: BTreeMap::new(),
             player: None,
+            event: Vec::new(),
+            rules: Vec::new(),
         };
 
         let line = scoring.forecast_line(&conn, Some(2520.0)).unwrap().unwrap();

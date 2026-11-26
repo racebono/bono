@@ -198,6 +198,14 @@ CREATE TABLE forecast_now (
     part_of_session TEXT, sky TEXT, sky_text TEXT, rain_chance_pct REAL, air_c REAL,
     humidity_pct REAL, wind_speed_kmh REAL, wind_direction TEXT
 );
+CREATE TABLE sessions_now (
+    session_type TEXT, session_number INTEGER, name TEXT, status TEXT, length_min REAL,
+    length_laps INTEGER, finish TEXT, time_left_min REAL, skipped INTEGER, start_time_of_day TEXT,
+    track_rubber TEXT, compound_change_required INTEGER, expected_laps REAL, pace_s REAL,
+    fuel_per_lap_l REAL, energy_per_lap_pct REAL, fuel_to_finish_l REAL, energy_to_finish_pct REAL,
+    tank_capacity_l REAL, stops_needed INTEGER, plan_source TEXT
+);
+CREATE TABLE rules_now (name TEXT, session_type TEXT, value TEXT);
 CREATE TABLE setup_now (
     name TEXT PRIMARY KEY, value TEXT, step INTEGER, min_step INTEGER, max_step INTEGER,
     saved_value TEXT, changed_lap INTEGER
@@ -216,7 +224,7 @@ const STREAM_TABLES: [&str; 5] = [
     "corner_passes",
     "corner_pass_wheels",
 ];
-const NOW_TABLES: [&str; 9] = [
+const NOW_TABLES: [&str; 11] = [
     "race_state",
     "cars_now",
     "drivers_now",
@@ -224,6 +232,8 @@ const NOW_TABLES: [&str; 9] = [
     "wheels_now",
     "sectors_now",
     "forecast_now",
+    "sessions_now",
+    "rules_now",
     "setup_now",
     "setup_changes",
 ];
@@ -4184,6 +4194,9 @@ impl Stream {
         if let Err(e) = write_forecast(conn, sc, now) {
             problems.push(format!("forecast_now: {e}"));
         }
+        if let Err(e) = write_sessions(conn, sc, now) {
+            problems.push(format!("sessions_now: {e}"));
+        }
         Ok(())
     }
 
@@ -5168,6 +5181,25 @@ fn race_need(
         ));
     }
 
+    // A race on the grid that doesn't give its clock or laps yet: its length from the event
+    if needs.is_empty()
+        && is_race(s)
+        && matches!(
+            s.text("phase"),
+            Some("before_start" | "reconnaissance" | "grid_walk" | "formation_lap" | "countdown")
+        )
+        && let Some(event) = sc.current_event()
+        && let Some(n) = expected_laps(
+            event.text("finish").unwrap_or("unknown"),
+            event.f("length_time"),
+            event.i("length_laps"),
+            avg_time,
+            s.b("extra_lap"),
+        )
+    {
+        needs.push((n, "race length from the event schedule".into()));
+    }
+
     let Some((need, source)) = needs
         .into_iter()
         .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal))
@@ -5176,6 +5208,30 @@ fn race_need(
     };
     let note = note.map(|note| format!("; {note}")).unwrap_or_default();
     (Some(need), format!("{source}{note}"))
+}
+
+/// Laps a session of this length and finish rule lasts at this pace (seconds a lap), from its start.
+/// On time, the flag falls as the line is crossed after the clock runs out, or a lap later with an
+/// extra lap. None if the finish is unknown, or an input it needs is missing.
+pub(super) fn expected_laps(
+    finish: &str,
+    length_time: Option<f64>,
+    length_laps: Option<i64>,
+    pace: Option<f64>,
+    extra_lap: bool,
+) -> Option<f64> {
+    let on_time = || {
+        let pace = pace.filter(|p| p.is_finite() && *p > 0.0)?;
+        Some((length_time? / pace).ceil()).filter(|laps| laps.is_finite())
+    };
+    let laps = length_laps.map(|laps| laps as f64);
+    match finish {
+        "time" => Some(on_time()? + if extra_lap { 1.0 } else { 0.0 }),
+        "laps" => laps,
+        "time_then_laps" => Some(on_time()? + laps?),
+        "first_of_time_and_laps" => Some(laps?.min(on_time()?)),
+        _ => None,
+    }
 }
 
 /// Laps a level lasts, and on which lap (lap + fraction of it) it runs out.
@@ -5623,6 +5679,72 @@ fn write_forecast(conn: &Connection, sc: &Scoring, now: Option<f64>) -> rusqlite
                 ],
             )?;
         }
+    }
+    Ok(())
+}
+
+/// The event's sessions, each done, current or upcoming, and its rules. The current session's laps
+/// and time left are its own, live; the plan columns are left for later.
+fn write_sessions(conn: &Connection, sc: &Scoring, now: Option<f64>) -> rusqlite::Result<()> {
+    let current = sc.current_event();
+    let current_order = current.and_then(|r| r.i("event_order"));
+    for r in &sc.event {
+        let is_current = current.is_some_and(|current| std::ptr::eq(current, r));
+        let status = match (is_current, current_order, r.i("event_order")) {
+            (true, _, _) => "current",
+            (false, Some(current), Some(order)) if order < current => "done",
+            _ => "upcoming",
+        };
+        let (length_laps, time_left) = match is_current {
+            true => (
+                sc.session
+                    .as_ref()
+                    .and_then(|s| s.i("max_laps"))
+                    .filter(|n| *n != 0)
+                    .or(r.i("length_laps")),
+                sc.time_left(now).map(|t| t / 60.0),
+            ),
+            false => (r.i("length_laps"), None),
+        };
+        let start = r
+            .f("start_time_of_day")
+            .filter(|t| t.is_finite() && *t >= 0.0)
+            .map(|t| {
+                let minutes = (t / 60.0).round() as i64;
+                format!("{:02}:{:02}", minutes / 60 % 24, minutes % 60)
+            });
+        insert(
+            conn,
+            "sessions_now",
+            vec![
+                ("session_type", copy(r, "session_type")),
+                ("session_number", copy(r, "session_number")),
+                ("name", copy(r, "name")),
+                ("status", Value::Text(status.to_owned())),
+                ("length_min", real(r.f("length_time").map(|t| t / 60.0))),
+                ("length_laps", integer(length_laps)),
+                ("finish", copy(r, "finish")),
+                ("time_left_min", real(time_left)),
+                ("skipped", copy(r, "skipped")),
+                ("start_time_of_day", text_or_null(start.as_deref())),
+                ("track_rubber", copy(r, "track_rubber")),
+                (
+                    "compound_change_required",
+                    copy(r, "compound_change_required"),
+                ),
+            ],
+        )?;
+    }
+    for r in &sc.rules {
+        insert(
+            conn,
+            "rules_now",
+            vec![
+                ("name", copy(r, "name")),
+                ("session_type", copy(r, "session_type")),
+                ("value", copy(r, "value")),
+            ],
+        )?;
     }
     Ok(())
 }
@@ -6614,6 +6736,8 @@ mod tests {
             sector_yellows: false,
             cars: BTreeMap::from([(1, me.clone()), (2, leader)]),
             player: Some(me),
+            event: Vec::new(),
+            rules: Vec::new(),
         };
         let at = |start: f64| {
             let sql = format!("SELECT {start} AS lap_start_time");
@@ -6643,6 +6767,8 @@ mod tests {
                 sector_yellows: false,
                 cars: BTreeMap::from([(1, me.clone()), (2, leader)]),
                 player: Some(me),
+                event: Vec::new(),
+                rules: Vec::new(),
             };
             let frame =
                 BTreeMap::from([(2, columns(&conn, &format!("{start:?} AS lap_start_time")))]);
@@ -6696,6 +6822,8 @@ mod tests {
                     sector_yellows: false,
                     player: cars.get(&1).cloned(),
                     cars: cars.clone(),
+                    event: Vec::new(),
+                    rules: Vec::new(),
                 };
                 let (need, source) = race_need(&sc, &frame, 1, Some(now), 0.5, Some(100.0));
                 assert_eq!(source.contains("extra lap"), extra_lap == 1, "{source}");
@@ -11482,6 +11610,8 @@ mod tests {
             sector_yellows: false,
             cars: BTreeMap::new(),
             player: None,
+            event: Vec::new(),
+            rules: Vec::new(),
         };
         // Halfway round lap 3, as the game numbers it, with 2.6 laps of fuel at 2 L a lap: out 0.1
         // into lap 6, so lap 5 is the last it finishes. With the lap not known, it's taken for the
@@ -11697,6 +11827,8 @@ mod tests {
             sector_yellows: false,
             cars: BTreeMap::from([(1, me.clone())]),
             player: Some(me),
+            event: Vec::new(),
+            rules: Vec::new(),
         };
         let mut baseline_lap = lap_with(false, false, (1.0, 1.0));
         baseline_lap.fuel_used = Some(2.0);
@@ -11825,6 +11957,8 @@ mod tests {
             sector_yellows: false,
             cars: BTreeMap::new(),
             player: None,
+            event: Vec::new(),
+            rules: Vec::new(),
         };
         let practice = projection(
             &no_session,
@@ -13083,6 +13217,186 @@ mod tests {
             )
             .await,
             90.0
+        );
+    }
+
+    /// Runs `sql` on the recording in `dir`.
+    fn edit_recording(dir: &tempfile::TempDir, sql: &str) {
+        let conn = Connection::open(dir.path().join(DATABASE)).unwrap();
+        conn.execute_batch(sql).unwrap();
+    }
+
+    #[test]
+    fn expected_laps_follows_the_finish() {
+        let laps = |finish, laps, extra_lap| {
+            expected_laps(finish, Some(4320.0), laps, Some(112.0), extra_lap)
+        };
+        assert_eq!(laps("time", None, false), Some(39.0));
+        assert_eq!(laps("time_then_laps", Some(2), false), Some(41.0));
+        assert_eq!(laps("first_of_time_and_laps", Some(30), false), Some(30.0));
+        assert_eq!(laps("time", None, true), Some(40.0));
+        assert_eq!(laps("laps", Some(30), false), Some(30.0));
+        assert_eq!(laps("unknown", Some(30), false), None);
+        // A missing input
+        assert_eq!(expected_laps("time", Some(4320.0), None, None, false), None);
+        assert_eq!(laps("time_then_laps", None, false), None);
+    }
+
+    /// The race in `race()` as race 1 of an event of practice 1, qualifying 1 and race 1.
+    const EVENT: &str = "
+        UPDATE session SET session_number = 1;
+        INSERT INTO event_session (generation, event_order, session_type, session_number, name,
+            length_time, finish, start_time_of_day, track_rubber)
+        VALUES (1, 0, 'practice', 1, 'Practice 1', 3600.0, 'time', 52200.0, 'Green'),
+            (1, 1, 'qualifying', 1, 'Qualifying', 900.0, 'time', NULL, NULL),
+            (1, 2, 'race', 1, 'Race', 6000.0, 'time', 54000.0, NULL);
+        INSERT INTO event_rule (generation, name, value) VALUES (1, 'fuel_use_multiplier', 'x2');
+    ";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sessions_now_lists_the_event() {
+        let (dir, engineer) = race();
+        edit_recording(&dir, EVENT);
+        assert_eq!(
+            query(
+                &engineer,
+                "SELECT session_type, session_number, status, length_min, finish, \
+                 start_time_of_day, track_rubber, time_left_min IS NOT NULL, expected_laps \
+                 FROM sessions_now ORDER BY rowid",
+            )
+            .await,
+            [
+                [
+                    "\"practice\"",
+                    "1",
+                    "\"done\"",
+                    "60",
+                    "\"time\"",
+                    "\"14:30\"",
+                    "\"Green\"",
+                    "0",
+                    "NULL"
+                ],
+                [
+                    "\"qualifying\"",
+                    "1",
+                    "\"done\"",
+                    "15",
+                    "\"time\"",
+                    "NULL",
+                    "NULL",
+                    "0",
+                    "NULL"
+                ],
+                [
+                    "\"race\"",
+                    "1",
+                    "\"current\"",
+                    "100",
+                    "\"time\"",
+                    "\"15:00\"",
+                    "NULL",
+                    "1",
+                    "NULL"
+                ],
+            ]
+        );
+        assert_eq!(
+            query(&engineer, "SELECT name, session_type, value FROM rules_now").await,
+            [["\"fuel_use_multiplier\"", "NULL", "\"x2\""]]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sessions_now_uses_the_newest_set() {
+        let (dir, engineer) = race();
+        edit_recording(
+            &dir,
+            &format!(
+                "{EVENT}
+                INSERT INTO event_session (generation, event_order, session_type, session_number)
+                VALUES (2, 0, 'race', 1);"
+            ),
+        );
+        assert_eq!(
+            query(&engineer, "SELECT session_type, status FROM sessions_now").await,
+            [["\"race\"", "\"current\""]]
+        );
+        // The newest set has no rules
+        assert!(query(&engineer, "SELECT * FROM rules_now").await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_warmup_without_a_number_is_current() {
+        let (dir, engineer) = race();
+        edit_recording(
+            &dir,
+            "UPDATE session SET session_type = 'warmup', session_number = NULL;
+            INSERT INTO event_session (generation, event_order, session_type, session_number)
+            VALUES (1, 0, 'qualifying', 1), (1, 1, 'warmup', NULL), (1, 2, 'race', 1);",
+        );
+        assert_eq!(
+            query(&engineer, "SELECT status FROM sessions_now ORDER BY rowid").await,
+            [["\"done\""], ["\"current\""], ["\"upcoming\""]]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn practice_without_its_row_sees_every_race_upcoming() {
+        let (dir, engineer) = race();
+        edit_recording(
+            &dir,
+            "UPDATE session SET session_type = 'practice', session_number = 1;
+            INSERT INTO event_session (generation, event_order, session_type, session_number)
+            VALUES (1, 0, 'race', 1);",
+        );
+        assert_eq!(
+            query(&engineer, "SELECT status, time_left_min FROM sessions_now").await,
+            [["\"upcoming\"", "NULL"]]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recording_without_event_tables_still_answers() {
+        let (dir, engineer) = race();
+        edit_recording(&dir, "DROP TABLE event_session; DROP TABLE event_rule;");
+        let out = run(
+            &engineer,
+            serde_json::json!({"command": "sql", "query":
+                "SELECT (SELECT COUNT(*) FROM stints), (SELECT COUNT(*) FROM cars_now), \
+                 (SELECT COUNT(*) FROM sessions_now), (SELECT COUNT(*) FROM rules_now)"}),
+        )
+        .await;
+        assert!(!out.contains("incomplete"), "{out}");
+        let counts = out.lines().nth(2).unwrap_or_else(|| panic!("{out}"));
+        let counts = counts.split(" | ").collect::<Vec<_>>();
+        assert!(counts[0] != "0" && counts[1] != "0", "{out}");
+        assert_eq!(counts[2..], ["0", "0"], "{out}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_race_on_the_grid_takes_its_length_from_the_schedule() {
+        let (dir, engineer) = race();
+        drop(engineer);
+        edit_recording(
+            &dir,
+            &format!(
+                "{EVENT}
+                UPDATE session SET phase = 'before_start', session_end_time = NULL, max_laps = 0,
+                    time_remaining = NULL;"
+            ),
+        );
+        let engineer = reopen(&dir);
+        let row = query(
+            &engineer,
+            "SELECT s.laps_needed IS NOT NULL, s.laps_needed_source \
+             FROM stints s JOIN cars_now c ON c.current_stint_id = s.stint_id WHERE c.is_player = 1",
+        )
+        .await;
+        assert_eq!(
+            row,
+            [["1", "\"race length from the event schedule\""]],
+            "{row:?}"
         );
     }
 }
