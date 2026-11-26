@@ -45,6 +45,13 @@ addition, a follow-up, two questions in one hand-back and a different language. 
 reply, no second acknowledgement and no answer to a corrected question. These are controlled
 manual/model scenarios, not executed results.
 
+`race-planning.md` covers questions about a race still to come: its length asked in qualifying,
+fuel for it asked in practice, a strategy question on the grid before the start, and a race whose
+length isn't known. It checks that the figures say which session's laps they come from and that an
+unknown length is asked for, never guessed. These are controlled manual/model scenarios, not
+executed results. Eval 61 in `evals.json` asks for the race's fuel in the practice fixture, which
+records no schedule of the event.
+
 These cases test the race engineer's answers, not the automatic spotter. Direct side/clear
 calls, immediate alerts and imminent-rain announcements are excluded. Rival pace, longer
 weather outlooks, strategy and driving advice remain in scope.
