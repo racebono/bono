@@ -1199,9 +1199,12 @@ pub(super) struct Fallback {
 }
 
 impl EarlierLap {
-    /// Whether it's of the same session as `other` by type and number.
-    fn same_session(&self, other: &Self) -> bool {
-        (&self.session_type, self.session_number) == (&other.session_type, other.session_number)
+    /// Whether it's of the same run of laps as `other`: the same session, by type and number, and
+    /// the same epoch carried over. Back-to-back runs of one session (a restart, a rejoin) are
+    /// kept apart, as only the last can be the current session.
+    fn same_run(&self, other: &Self) -> bool {
+        (&self.session_type, self.session_number, self.run)
+            == (&other.session_type, other.session_number, other.run)
     }
 
     /// An earlier part of the current `session` (its scoring row), before a restart of it, a replay
@@ -1227,7 +1230,7 @@ fn fallback(
     session: Option<&Row>,
     car: Option<&str>,
 ) -> Option<Fallback> {
-    let mut runs = earlier.chunk_by(EarlierLap::same_session).rev();
+    let mut runs = earlier.chunk_by(EarlierLap::same_run).rev();
     runs.find_map(|laps| {
         // Another car's pace and use say nothing of this one's
         let green = laps
@@ -14771,6 +14774,16 @@ mod tests {
         };
         assert_eq!(label(2), "practice 1, 3 green laps");
         assert_eq!(label(1), "practice 1, earlier in this session, 3 green laps");
+
+        // Practice 1 restarted: only the restarted run's laps, and they're of this session
+        let mut restarted = practice_laps(3, 112.0, 2.9, 2.5);
+        restarted.extend(practice_laps(2, 110.0, 2.8, 2.4).into_iter().map(|mut lap| {
+            lap.run = 2;
+            lap
+        }));
+        let restart = fallback(&restarted, 2, Some(&practice), None).unwrap();
+        assert_eq!(restart.label, "practice 1, earlier in this session, 2 green laps");
+        assert!(restart.laps.iter().all(|lap| lap.time == Some(110.0)));
     }
 
     #[tokio::test(flavor = "multi_thread")]
