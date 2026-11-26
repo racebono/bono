@@ -284,11 +284,22 @@ impl AudioTopbar {
         }
     }
 
-    /// Downloads the recommended speech to text model, and a voice for each of `langs` (again,
-    /// those that failed), and uses them once they're on disk (each, if none is picked by then).
-    pub fn setup(&mut self, langs: &[ArrayStr<2>]) {
-        self.whisper.setup();
+    /// Downloads `engine`'s model for Automatic (`None`: none), and a voice for each of `langs`
+    /// (again, those that failed), and uses them once they're on disk (each voice, if none is
+    /// picked by then).
+    pub fn setup(&mut self, langs: &[ArrayStr<2>], engine: Option<engine::Engine>) {
+        self.whisper.setup(engine);
         self.voices.setup(langs);
+    }
+
+    /// The languages whose voice is set and usable: on disk, and not failed to load.
+    pub fn usable_voices(&self, config: &RawConfig, synth: &Synthesizer) -> Vec<ArrayStr<2>> {
+        (config.voices().iter())
+            .filter(|&(&lang, path)| {
+                self.files.voice(path) && synth.load(lang) != Some(VoiceLoad::Failed)
+            })
+            .map(|(&lang, _)| lang)
+            .collect()
     }
 
     /// What `setup` downloads for `langs`, and `engine`'s model (`None`: the model picked stays),

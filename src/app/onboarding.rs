@@ -10,7 +10,7 @@ use crate::{
             audio::{
                 AudioTopbar, SetupItem, SetupState, app_language,
                 engine::{self, Engine},
-                voice::RECOMMENDED,
+                voice::{RECOMMENDED, recommended},
             },
             settings::{self, ChangeButton, button_name},
             setup_label,
@@ -258,9 +258,14 @@ impl Onboarding {
                 // The languages are picked: what they need can start downloading
                 if step == Step::Welcome {
                     let ticked = self.ticked(&config.get());
-                    let (answer, engine) = plan(&config.get(), &topbar.audio, &ticked);
+                    let (answer, engine) = plan(&config.get(), &topbar.audio, synth, &ticked);
                     config.update(|raw| {
-                        raw.heard_language.set(answer.heard);
+                        // The same language, as it was set (Nynorsk stays Nynorsk)
+                        let heard = match (answer.heard, *raw.heard_language()) {
+                            (Some(new), Some(old)) if language::voice_code(old) == new => Some(old),
+                            (new, _) => new,
+                        };
+                        raw.heard_language.set(heard);
                         if engine.is_some() {
                             raw.whisper_model.set(None);
                         }
@@ -271,7 +276,7 @@ impl Onboarding {
                             }
                         }
                     });
-                    topbar.audio.setup(&answer.get);
+                    topbar.audio.setup(&answer.get, engine);
                 }
                 self.step = step.next(&steps);
                 if self.step == Some(Step::RadioCheck) {
@@ -312,7 +317,7 @@ impl Onboarding {
             self.ticked = Some(ticked.clone());
         }
 
-        let (answer, engine) = plan(&config.get(), audio, &ticked);
+        let (answer, engine) = plan(&config.get(), audio, synth, &ticked);
         let items = audio.setup_items(rt, config, synth, &answer.get, engine);
         if !items.is_empty() {
             ui.add_space(8.0);
@@ -644,7 +649,7 @@ fn still_downloading(
         ui.add_space(8.0);
         ui.strong(t!("onboarding.downloads_title"));
         if downloads(ui, &items, true) {
-            audio.setup(&langs);
+            audio.setup(&langs, engine);
         }
         ui.weak(t!("onboarding.downloads_continue"));
     }
@@ -753,6 +758,10 @@ fn languages_spoken(
 ) -> bool {
     let mut langs = (RECOMMENDED.iter())
         .filter_map(|voice| Some((ArrayStr::from_str(voice.lang)?, voice.native.to_owned())))
+        // Those Parakeet or Whisper can hear (Whisper has no Kurdish)
+        .filter(|&(lang, _)| {
+            engine::parakeet_knows(lang) || whisper_rs::get_lang_id(&lang).is_some()
+        })
         .collect::<Vec<_>>();
     for lang in heard.map(language::voice_code).into_iter().chain(ticked.iter().copied()) {
         if !langs.iter().any(|(other, _)| *other == lang) {
@@ -816,11 +825,13 @@ fn languages_spoken(
 fn plan(
     config: &RawConfig,
     audio: &AudioTopbar,
+    synth: &Synthesizer,
     ticked: &BTreeSet<ArrayStr<2>>,
 ) -> (Answer, Option<Engine>) {
     let voices = config.voices().keys().copied().collect::<Vec<_>>();
-    let reply = config.engineer_reply_language();
-    let answer = answer(ticked, &voices, reply);
+    let usable = audio.usable_voices(config, synth);
+    let reply = config.engineer_reply_language().filter(|lang| usable.contains(lang));
+    let answer = answer(ticked, &voices, &usable, reply);
     let whisper = &audio.whisper;
     let picked = match config.whisper_model() {
         None => Picked::None,
@@ -834,11 +845,17 @@ fn plan(
     if !becomes_automatic(picked, !whisper.missing(config, &[]), ticked) {
         return (answer, None);
     }
-    // The voices once it's done: those being set up count
+    // The voices once it's done, as Automatic will count them: those being set up too (only
+    // those with a recommended voice are)
     let mut after = (voices.iter().copied())
         .filter(|lang| !answer.remove.contains(lang))
         .collect::<Vec<_>>();
-    after.extend(&answer.get);
+    for &lang in &answer.get {
+        if !after.contains(&lang) && recommended(&lang).is_some() {
+            after.push(lang);
+        }
+    }
+    let reply = config.spoken_language().filter(|lang| after.contains(lang));
     let app = app_language(config.locale());
     let engine = engine::wanted(answer.heard, &after, reply, app).0;
     (answer, Some(engine))
@@ -869,10 +886,12 @@ struct Answer {
     remove: Vec<ArrayStr<2>>,
 }
 
-/// `voices`: the languages with a voice. `reply`: the fixed reply language, if it's usable.
+/// `voices`: the languages with a voice, and `usable` those whose voice is on disk and loads (the
+/// others are set up again). `reply`: the fixed reply language, if it's usable.
 fn answer(
     ticked: &BTreeSet<ArrayStr<2>>,
     voices: &[ArrayStr<2>],
+    usable: &[ArrayStr<2>],
     reply: Option<ArrayStr<2>>,
 ) -> Answer {
     let heard = match ticked.len() {
@@ -887,7 +906,7 @@ fn answer(
             remove: Vec::new(),
         };
     }
-    let get = ticked.iter().filter(|lang| !voices.contains(lang));
+    let get = ticked.iter().filter(|lang| !usable.contains(lang));
     // With one language heard, the other voices don't count
     let remove = (voices.iter()).filter(|lang| heard.is_none() && !ticked.contains(*lang));
     Answer {
@@ -942,7 +961,15 @@ mod tests {
     }
 
     fn answered(ticked: &[ArrayStr<2>], voices: &[ArrayStr<2>], reply: Option<ArrayStr<2>>) -> Answer {
-        answer(&ticked.iter().copied().collect(), voices, reply)
+        answer(&ticked.iter().copied().collect(), voices, voices, reply)
+    }
+
+    #[test]
+    fn a_broken_voice_is_set_up_again() {
+        // Spanish's voice is set, but its files are gone (or it doesn't load)
+        let answer = answer(&BTreeSet::from([ES, CA]), &[ES, EU], &[EU], None);
+        assert_eq!(answer.get, [CA, ES]);
+        assert_eq!(answer.remove, [EU]);
     }
 
     #[test]

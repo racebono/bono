@@ -77,12 +77,11 @@ pub struct Whisper {
     choosing: bool,
     /// Whether `ctx` was loaded to run on the GPU
     loaded_gpu: bool,
-    /// The setup guide asked for the model Automatic wants: it's downloaded, unless a model is
-    /// picked, and used by Automatic once it's on disk
-    setup: bool,
-    /// The engine whose download setup started: one that fails isn't started again until it's
-    /// asked for again
-    setup_started: Option<Engine>,
+    /// The setup guide asked for this engine's model, for Automatic: it's downloaded, unless a
+    /// model is picked, and used by Automatic once it's on disk
+    setup: Option<Engine>,
+    /// Setup's download was started: one that fails isn't started again until it's asked for again
+    setup_started: bool,
     stream: Option<WhisperStream>,
     /// The joystick whose talk button started the recording: unplugging it means the release
     /// never comes
@@ -149,8 +148,8 @@ impl Whisper {
             loaded: None,
             choosing: false,
             loaded_gpu: *config.whisper_gpu(),
-            setup: false,
-            setup_started: None,
+            setup: None,
+            setup_started: false,
             stream: None,
             talk_joystick: None,
             catalog: Self::fetch_catalog(pref_path.clone(), client.clone(), 3),
@@ -179,8 +178,6 @@ impl Whisper {
             ui.horizontal(|ui| {
                 if ui.radio(automatic, t!("audio.stt_automatic")).clicked() && !automatic {
                     self.choosing = false;
-                    // It would pick the model it downloads
-                    self.setup = false;
                     config.update(|raw| raw.whisper_model.set(None));
                 }
                 ui.weak(t!("audio.stt_recommended"));
@@ -206,7 +203,7 @@ impl Whisper {
                 if self.engine() == Some(Engine::Whisper) {
                     ui.separator();
                 }
-                self.models(rt, config, ui);
+                self.models(rt, config, ui, getting);
             }
         });
     }
@@ -215,8 +212,7 @@ impl Whisper {
     fn note(&mut self, rt: &Handle, config: &Config, ui: &mut egui::Ui, getting: &[ArrayStr<2>]) {
         let (wanted, heard, voices) = {
             let raw = config.get();
-            let voices = raw.voices().keys().copied().collect::<Vec<_>>();
-            (self.wanted(&raw, getting), *raw.heard_language(), voices)
+            (self.wanted(&raw, getting), *raw.heard_language(), voices(&raw, getting))
         };
         match engine::note(wanted, self.engine(), self.failed(), heard, &voices) {
             Note::Using(engine, why) => {
@@ -257,10 +253,18 @@ impl Whisper {
     /// The button to download `engine`'s model, or how far its download is.
     fn download(&mut self, rt: &Handle, ui: &mut egui::Ui, engine: Engine) {
         let client = self.client.clone();
-        let (progress, size) = match engine {
-            Engine::Parakeet => (self.parakeet.progress(), Some(parakeet::SIZE)),
+        let (on_disk, progress, size) = match engine {
+            Engine::Parakeet => (
+                self.parakeet.on_disk(&self.files),
+                self.parakeet.progress(),
+                Some(parakeet::SIZE),
+            ),
             Engine::Whisper => match self.recommended(rt) {
-                Some(model) => (model.download().map(Download::progress), model.size),
+                Some(model) => (
+                    model.on_disk(rt),
+                    model.download().map(Download::progress),
+                    model.size,
+                ),
                 None => {
                     // Whisper's model is only downloaded with the catalog's size and hash
                     if matches!(self.catalog, MaybeDone::Done(None)) {
@@ -278,6 +282,11 @@ impl Whisper {
             egui::ProgressBar::new(progress as f32).show_percentage().ui(ui);
             return;
         }
+        // Not checked yet: it may be there
+        if on_disk != Some(false) {
+            ui.spinner();
+            return;
+        }
         let size = size.map_or("?".into(), size_text);
         if ui.button(t!("audio.stt_download", size = size)).clicked() {
             match engine {
@@ -292,12 +301,18 @@ impl Whisper {
     }
 
     /// The models to choose from: Parakeet, then Whisper's catalog.
-    fn models(&mut self, rt: &Handle, config: &mut Config, ui: &mut egui::Ui) {
+    fn models(
+        &mut self,
+        rt: &Handle,
+        config: &mut Config,
+        ui: &mut egui::Ui,
+        getting: &[ArrayStr<2>],
+    ) {
         let picked = config.get().whisper_model().clone();
         let failed = self.failed();
         let languages = {
             let raw = config.get();
-            let voices = raw.voices().keys().copied().collect::<Vec<_>>();
+            let voices = voices(&raw, getting);
             engine::in_use(*raw.heard_language(), &voices, app_language(raw.locale()))
         };
         let parakeet_path = self.parakeet.model().clone();
@@ -388,9 +403,17 @@ impl Whisper {
                                 egui::ProgressBar::new(progress as f32).show_percentage().ui(ui);
                             }
                             (Some(false), None) => {
-                                if ui.button(egui_phosphor::bold::CLOUD_ARROW_DOWN).clicked() {
-                                    self.parakeet.start_download(&client, &self.files);
-                                }
+                                let partly = (self.parakeet.paths().iter())
+                                    .any(|path| self.files.checked(path) == Some(true));
+                                ui.horizontal(|ui| {
+                                    if ui.button(egui_phosphor::bold::CLOUD_ARROW_DOWN).clicked() {
+                                        self.parakeet.start_download(&client, &self.files);
+                                    }
+                                    // What an unfinished download left
+                                    if partly && delete_button(ui, Some(parakeet::SIZE), false) {
+                                        self.parakeet.delete();
+                                    }
+                                });
                             }
                             (None, None) => {}
                         }
@@ -476,13 +499,16 @@ impl Whisper {
         }
         // Setup doesn't get it again
         if deleted_recommended {
-            self.setup = false;
+            self.setup = None;
         }
         if let Some(path) = reload {
             // A model picked by hand is what's used, whatever setup was getting
-            self.setup = false;
+            self.setup = None;
             config.update(|raw| raw.whisper_model.set(Some(path.clone())));
-            self.set_model(path, *config.get().whisper_gpu());
+            // The one Automatic loaded is only loaded again if it failed
+            if self.loaded.as_ref() != Some(&path) || self.failed() {
+                self.set_model(path, *config.get().whisper_gpu());
+            }
         }
     }
 
@@ -619,7 +645,14 @@ impl Whisper {
             ctx.update(rt);
         }
         let gpu = *config.get().whisper_gpu();
-        let target = self.target(&config.get(), getting);
+        // While a model is deleted, a check from before may still find it: what's loaded stays
+        self.parakeet.shown_on_disk(rt, &self.files);
+        let turbo_deleted = (self.recommended(rt)).is_some_and(|model| {
+            model.on_disk(rt);
+            model.deletion.pending()
+        });
+        let deleting = self.parakeet.deleting() || turbo_deleted;
+        let target = self.target(&config.get(), getting).filter(|_| !deleting);
         if let Some(target) = target {
             let whisper = target.as_ref().is_some_and(|path| path != self.parakeet.model());
             if target != self.loaded || (whisper && gpu != self.loaded_gpu) {
@@ -633,16 +666,15 @@ impl Whisper {
             }
         }
 
-        if !self.setup {
+        let Some(wanted) = self.setup else {
             return;
-        }
+        };
         // A model picked by hand is what's used: the guide unpicks the ones it shouldn't keep
         if config.get().whisper_model().is_some() {
-            self.setup = false;
+            self.setup = None;
             return;
         }
-        let wanted = self.wanted(&config.get(), getting).0;
-        let start = self.setup_started != Some(wanted);
+        let start = !self.setup_started;
         let client = self.client.clone();
         let on_disk = match wanted {
             Engine::Parakeet => self.parakeet.on_disk(&self.files),
@@ -653,7 +685,7 @@ impl Whisper {
         };
         match on_disk {
             // Automatic uses it
-            Some(true) => self.setup = false,
+            Some(true) => self.setup = None,
             Some(false) if start => {
                 match wanted {
                     Engine::Parakeet => self.parakeet.start_download(&client, &self.files),
@@ -663,7 +695,7 @@ impl Whisper {
                         }
                     }
                 }
-                self.setup_started = Some(wanted);
+                self.setup_started = true;
             }
             Some(false) => {}
             // Not looked for yet
@@ -671,11 +703,12 @@ impl Whisper {
         }
     }
 
-    /// Downloads the model Automatic wants (again, if it failed), unless a model is picked.
-    pub fn setup(&mut self) {
+    /// Downloads `engine`'s model for Automatic (again, if it failed), unless a model is picked.
+    /// `None` sets up nothing.
+    pub fn setup(&mut self, engine: Option<Engine>) {
         self.retry_catalog();
-        self.setup = true;
-        self.setup_started = None;
+        self.setup = engine;
+        self.setup_started = false;
     }
 
     /// The model of `engine`, as the setup guide shows it: `None` for none, when the model picked
@@ -742,18 +775,9 @@ impl Whisper {
     /// What Automatic wants now, and why. `getting`: the languages whose voice is being set up,
     /// which count as having one.
     pub fn wanted(&self, config: &RawConfig, getting: &[ArrayStr<2>]) -> (Engine, Why) {
-        let mut voices = config.voices().keys().copied().collect::<Vec<_>>();
-        for &lang in getting {
-            if !voices.contains(&lang) {
-                voices.push(lang);
-            }
-        }
-        engine::wanted(
-            *config.heard_language(),
-            &voices,
-            config.engineer_reply_language(),
-            app_language(config.locale()),
-        )
+        let voices = voices(config, getting);
+        let reply = config.spoken_language().filter(|lang| voices.contains(lang));
+        engine::wanted(*config.heard_language(), &voices, reply, app_language(config.locale()))
     }
 
     /// Whether the model is missing, or didn't load: the menu and setup guide have their sign.
@@ -888,6 +912,17 @@ impl Whisper {
             }
         }));
     }
+}
+
+/// The languages with a voice, and those `getting` one (being set up), which count as having one.
+fn voices(config: &RawConfig, getting: &[ArrayStr<2>]) -> Vec<ArrayStr<2>> {
+    let mut voices = config.voices().keys().copied().collect::<Vec<_>>();
+    for &lang in getting {
+        if !voices.contains(&lang) {
+            voices.push(lang);
+        }
+    }
+    voices
 }
 
 /// Automatic's Whisper, as the menu names it.
@@ -1489,11 +1524,16 @@ fn transcription_problem(
                 return Some(Heard::NoVoice(Some(arrstr!("en"))));
             }
         }
-        // With several languages, it hears those it knows
+        // With several languages, it hears those it knows: with none, the first it doesn't
         Knows::Parakeet => {
-            if let Some(lang) = only_language(heard_language, voices)
-                .filter(|&lang| !engine::parakeet_knows(lang))
-            {
+            let unknown = match only_language(heard_language, voices) {
+                Some(lang) => Some(lang),
+                None if !voices.iter().any(|&lang| engine::parakeet_knows(lang)) => {
+                    voices.first().copied()
+                }
+                None => None,
+            };
+            if let Some(lang) = unknown.filter(|&lang| !engine::parakeet_knows(lang)) {
                 return Some(Heard::UnsupportedLanguage(lang));
             }
         }
@@ -2280,8 +2320,10 @@ mod tests {
         let problem = |heard, voices: &[_]| transcription_problem(Knows::Parakeet, heard, None, voices);
         assert!(matches!(problem(Some(ca), &[es]), Some(Heard::UnsupportedLanguage(l)) if l == ca));
         assert!(matches!(problem(None, &[ca]), Some(Heard::UnsupportedLanguage(l)) if l == ca));
-        // It hears the ones it knows
+        // It hears the ones it knows, and says so when it knows none
         assert!(problem(None, &[ca, es]).is_none());
+        let eu = arrstr!("eu");
+        assert!(matches!(problem(None, &[ca, eu]), Some(Heard::UnsupportedLanguage(l)) if l == ca));
         assert!(problem(Some(es), &[ca]).is_none());
         assert!(matches!(problem(Some(es), &[]), Some(Heard::NoVoice(None))));
         // Norwegian, under any of its codes
@@ -2304,8 +2346,8 @@ mod tests {
             loaded: None,
             choosing: false,
             loaded_gpu: false,
-            setup: false,
-            setup_started: None,
+            setup: None,
+            setup_started: false,
             stream: None,
             talk_joystick: None,
             catalog: MaybeDone::Done(None),

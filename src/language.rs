@@ -90,16 +90,24 @@ pub fn reply_note(code: ArrayStr<2>) -> String {
     format!("[Reply in {language}.]")
 }
 
-/// The English name of the language with `code` (as the voices have it), if it's one of those
-/// built in (see the `all-languages` feature).
+/// The English name of the language with `code` (as the voices have it), if `lingua` (as built,
+/// see the `all-languages` feature) or Whisper knows it.
 pub fn name(code: ArrayStr<2>) -> Option<String> {
-    let code = match &*code {
+    let lingua = match &*code {
         // Norwegian's voices are Bokmål's
         "no" => "nb",
         code => code,
     };
-    let iso = code.parse::<lingua::IsoCode639_1>().ok()?;
-    Some(Language::from_iso_code_639_1(&iso).to_string())
+    if let Ok(iso) = lingua.parse::<lingua::IsoCode639_1>() {
+        return Some(Language::from_iso_code_639_1(&iso).to_string());
+    }
+    // `get_lang_id` panics on a NUL, which a hand-edited config could have
+    if code.contains('\0') {
+        return None;
+    }
+    let name = whisper_rs::get_lang_str_full(whisper_rs::get_lang_id(&code)?)?;
+    let mut chars = name.chars();
+    Some(chars.next()?.to_uppercase().collect::<String>() + chars.as_str())
 }
 
 /// The name of the language with `code` (as the voices have it), in the app's language: in
@@ -120,14 +128,7 @@ pub fn ui_name(code: ArrayStr<2>) -> String {
         "zh" => t!("lang.zh"),
         "ja" => t!("lang.ja"),
         "ko" => t!("lang.ko"),
-        _ => {
-            let whisper = || {
-                let name = whisper_rs::get_lang_str_full(whisper_rs::get_lang_id(&code)?)?;
-                let mut chars = name.chars();
-                Some(chars.next()?.to_uppercase().collect::<String>() + chars.as_str())
-            };
-            return name(code).or_else(whisper).unwrap_or_else(|| code.to_string());
-        }
+        _ => return name(code).unwrap_or_else(|| code.to_string()),
     };
     name.to_owned()
 }
@@ -166,6 +167,8 @@ mod tests {
         #[cfg(not(feature = "all-languages"))]
         assert_eq!(ui_name(arrstr!("no")), "Norwegian");
         assert_eq!(ui_name(arrstr!("xx")), "xx");
+        assert_eq!(ui_name(ArrayStr::from_str("e\0").unwrap()), "e\0");
+        assert_eq!(reply_note(arrstr!("pl")), "[Reply in Polish.]");
     }
 
     // Driven like the app does, from outside the runtime

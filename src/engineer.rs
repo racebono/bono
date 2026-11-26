@@ -947,6 +947,12 @@ impl Engineer {
     /// The language `question` is in, when it isn't known from how it was asked: `None` if nothing
     /// tells languages apart, so the model goes by the question.
     fn question_language(&self, config: &Config, question: &str) -> Option<ArrayStr<2>> {
+        // Detection only chooses among the languages it has: with a voice's language among those it
+        // hasn't, it would name the wrong one, so the model goes by the question
+        let voices = config.get().voices().keys().copied().collect::<Vec<_>>();
+        if voices.len() > 1 && !voices.iter().all(|&lang| crate::language::told_apart(lang)) {
+            return None;
+        }
         match self.languages.detect(question) {
             Some(lang) => Some(lang),
             // Too short or ambiguous for any language in particular ("Positions."): the one the
@@ -2836,14 +2842,12 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _entered = runtime.enter();
         let rt = runtime.handle();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
         let voices = (voices.iter())
             .map(|lang| (lang.to_string(), format!("{lang}.onnx")))
             .collect::<std::collections::BTreeMap<_, _>>();
         let json = serde_json::json!({"locale": locale, "voices": voices});
-        std::fs::write(&path, json.to_string()).unwrap();
-        let config = runtime.block_on(Config::new(&path)).unwrap();
+        // Not `Config::new`, which would change the app's language for every test running
+        let config = Config::from_raw(serde_json::from_value(json).unwrap());
         let mut synth = Synthesizer::new(rt, &crate::config::RawConfig::default());
         let mut engineer = Engineer::new(reqwest::Client::new(), None);
         let start = Instant::now();

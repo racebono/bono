@@ -72,6 +72,14 @@ impl Config {
         self.send.send_modify(f);
     }
 
+    /// Settings for a test: unlike [`Self::new`], the app's language (process-wide) is left alone.
+    #[cfg(test)]
+    pub fn from_raw(raw: RawConfig) -> Self {
+        Self {
+            send: tokio::sync::watch::channel(raw).0,
+        }
+    }
+
     #[inline]
     pub fn maybe_update(&self, f: impl FnOnce(&mut RawConfig) -> bool) {
         self.send.send_if_modified(f);

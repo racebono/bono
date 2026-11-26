@@ -102,7 +102,7 @@ pub const RECOMMENDED: &[Recommended] = &[
 
 /// The recommended voice for the app's language (`locale`, e.g. `en-US`): its language, and its name
 /// in the catalog.
-fn recommended(locale: &str) -> Option<(ArrayStr<2>, &'static str)> {
+pub(in crate::app) fn recommended(locale: &str) -> Option<(ArrayStr<2>, &'static str)> {
     let lang = locale.split('-').next()?;
     let recommended = RECOMMENDED.iter().find(|other| other.lang == lang)?;
     Some((ArrayStr::from_str(lang)?, recommended.voice))
@@ -266,8 +266,8 @@ impl Voices {
         let used = (picked.as_ref()).is_some_and(|picked| *picked == *voice.path);
         let state = match (on_disk, voice.progress()) {
             (Some(true), _) if used && failed => SetupState::LoadFailed,
-            // On disk but not used, and setup isn't going to: retrying uses it
-            (Some(true), _) if !in_setup && !used => SetupState::Missing,
+            // On disk but not used, before the guide's Next: nothing to download, Next uses it
+            (Some(true), _) if !in_setup && !used => SetupState::Ready,
             // Being loaded, or setup is about to use it
             (Some(true), _) if !used || load == Some(VoiceLoad::Loading) => SetupState::Loading,
             (Some(true), _) => SetupState::Ready,

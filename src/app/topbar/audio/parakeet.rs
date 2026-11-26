@@ -151,8 +151,8 @@ impl Files {
         (self.downloads.iter().flatten().flatten()).any(Download::failed)
     }
 
-    /// Downloads those that aren't on disk, unless they're being downloaded. One that failed starts
-    /// over; the others go on.
+    /// Downloads those that aren't on disk, unless they're being downloaded: those still going go
+    /// on.
     pub fn start_download(&mut self, client: &reqwest::Client, files: &ModelFiles) {
         self.start(client, files, |_| URL.to_owned());
     }
@@ -171,8 +171,10 @@ impl Files {
         let mut downloads = self.downloads.take().unwrap_or_default();
         self.downloads = Some(std::array::from_fn(|i| {
             let file = &self.files[i];
-            // One still going, or done, isn't started over
-            if let Some(download) = downloads[i].take_if(|download| !download.failed()) {
+            // One still going isn't started over
+            if let Some(download) =
+                downloads[i].take_if(|download| !download.failed() && !download.finished())
+            {
                 return Some(download);
             }
             // Only whole, checked files are ever put in place
@@ -202,10 +204,13 @@ pub struct Parakeet {
 impl Parakeet {
     /// Loads the model in `dir`.
     pub fn load(dir: &Utf8Path, threads: NonZeroUsize) -> anyhow::Result<Self> {
+        // A panic in the crate fails loading, not the app
+        let model = std::panic::catch_unwind(AssertUnwindSafe(|| Self::model(dir, threads)))
+            .map_err(panicked)??;
         Ok(Self {
             dir: dir.to_owned(),
             threads,
-            model: Mutex::new(Self::model(dir, threads)?),
+            model: Mutex::new(model),
         })
     }
 
@@ -222,8 +227,7 @@ impl Parakeet {
     pub fn transcribe(&self, samples: &[f32]) -> anyhow::Result<String> {
         // A panic in the crate fails this recording, not the app. It poisons the lock, so the next
         // one loads the model again
-        std::panic::catch_unwind(AssertUnwindSafe(|| self.hear(samples)))
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("Parakeet panicked hearing the recording")))
+        std::panic::catch_unwind(AssertUnwindSafe(|| self.hear(samples))).map_err(panicked)?
     }
 
     fn hear(&self, samples: &[f32]) -> anyhow::Result<String> {
@@ -240,6 +244,14 @@ impl Parakeet {
         let heard = model.transcribe_samples(samples.to_vec(), 16000, 1, None)?;
         Ok(heard.text.trim().to_owned())
     }
+}
+
+/// The error for a panic in the crate, with its message.
+fn panicked(panic: Box<dyn std::any::Any + Send>) -> anyhow::Error {
+    let message = (panic.downcast_ref::<&str>().map(|message| message.to_string()))
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    anyhow::anyhow!("Parakeet panicked: {message}")
 }
 
 #[cfg(test)]
