@@ -10,3 +10,4 @@
 - **Engine map:** `cars_now.engine_map` is the fuel mixture.
 - **Damage:** mechanical and bodywork damage are unreported (NULL): never say there is no damage.
 - **Pit services and fuel estimate:** `body repair` in `pit_services_selected` is iRacing's fast repair (without it a stop still repairs, only slower). `game_fuel_per_lap_l` is fuel used over the last lap's driven distance (slow or yellow running lowers it; NULL until a lap is driven since pits, tow/reset, refuelling, or getting in).
+- **Event:** iRacing gives no fuel or tyre wear multipliers (no such `rules_now` rows): don't assume any.

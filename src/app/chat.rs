@@ -13,7 +13,13 @@ pub struct Chat {
 impl Chat {
     /// Draws the chat in the space left: the conversation, and the text box at the bottom.
     /// Returns a question typed and sent.
-    pub fn update(&mut self, ui: &mut egui::Ui, engineer: &Engineer) -> Option<String> {
+    /// `talk_toggle` is whether the talk button is pressed to talk, rather than held.
+    pub fn update(
+        &mut self,
+        ui: &mut egui::Ui,
+        engineer: &Engineer,
+        talk_toggle: bool,
+    ) -> Option<String> {
         let mut sent = None;
 
         // Before the central panel, which takes the space left
@@ -51,7 +57,10 @@ impl Chat {
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                     if engineer.chat().is_empty() {
-                        ui.weak(t!("chat.empty"));
+                        ui.weak(match talk_toggle {
+                            true => t!("chat.empty_toggle"),
+                            false => t!("chat.empty"),
+                        });
                     }
 
                     for entry in engineer.chat() {

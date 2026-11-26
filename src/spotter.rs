@@ -577,6 +577,19 @@ impl Spotter {
 
         // The call being said
         match &mut self.saying {
+            // Ready or not, it isn't said over the talk button's beep. An urgent call doesn't wait
+            // with it
+            Some(Saying::Synthesizing { call, at, .. })
+                if !call.urgent && engineer.is_beeping() =>
+            {
+                let now = Instant::now();
+                let urgent =
+                    |(queued, at): &(Raised, Instant)| queued.urgent && queued.valid_at(*at, now);
+                if self.queue.iter().any(urgent) {
+                    self.queue.push_front((call.clone(), *at));
+                    self.saying = None;
+                }
+            }
             Some(Saying::Synthesizing {
                 key, recv, call, ..
             }) => match recv.try_recv() {
@@ -610,14 +623,17 @@ impl Spotter {
             None => {}
         }
 
-        // The next call: urgent ones first, the rest once the engineer is quiet
+        // The next call: urgent ones first, the rest once the engineer and the talk button's beep
+        // are quiet
         if self.saying.is_none() {
             let now = Instant::now();
             self.queue.retain(|(call, at)| call.valid_at(*at, now));
 
             let next = match self.queue.iter().position(|(call, _)| call.urgent) {
                 Some(urgent) => Some(urgent),
-                None if !engineer.is_speaking() => (!self.queue.is_empty()).then_some(0),
+                None if !engineer.is_speaking() && !engineer.is_beeping() => {
+                    (!self.queue.is_empty()).then_some(0)
+                }
                 None => None,
             };
 
@@ -3051,6 +3067,99 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["car close behind"]
         );
+    }
+
+    /// What's left to say, after a frame, of a `call` synthesized while the talk beep plays. With
+    /// no speaker, a call said is gone at once.
+    fn left_after_talk_beep(text: &'static str, urgent: bool, queued: bool) -> (bool, usize) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let mut synth = Synthesizer::new(runtime.handle(), &config.get());
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.beep(true);
+        let lang = arrstr!("en");
+        let speech = Speech::no_beep(1.0);
+        let at = Instant::now();
+
+        let mut spotter = if queued {
+            let mut spotter = Spotter::new();
+            let key = Spotter::key(&config, lang, call(text, urgent).words(lang));
+            spotter.cache.insert(key, Arc::new(speech));
+            spotter.hear(call(text, urgent), at);
+            spotter
+        } else {
+            let (spotter, send) = pending_call(text, urgent, at);
+            assert!(send.send(Ok(speech)).is_ok());
+            spotter
+        };
+        let rt = runtime.handle();
+        spotter.say(rt, &config, &mut synth, None, &mut engineer, lang);
+        let left = (spotter.saying.is_some(), spotter.queue.len());
+
+        // It's said once the beep is over
+        engineer.beep(false);
+        spotter.say(rt, &config, &mut synth, None, &mut engineer, lang);
+        assert!(spotter.saying.is_none() && spotter.queue.is_empty());
+        left
+    }
+
+    #[test]
+    fn only_urgent_calls_play_over_the_talk_beep() {
+        assert_eq!(left_after_talk_beep("penalty", false, true), (false, 1));
+        assert_eq!(left_after_talk_beep("penalty", false, false), (true, 0));
+        assert_eq!(left_after_talk_beep("car left", true, true), (false, 0));
+        assert_eq!(left_after_talk_beep("car left", true, false), (false, 0));
+    }
+
+    #[test]
+    fn an_urgent_call_goes_ahead_of_one_waiting_for_the_talk_beep() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let mut synth = Synthesizer::new(runtime.handle(), &config.get());
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.beep(true);
+        let lang = arrstr!("en");
+        let at = Instant::now();
+
+        let (mut spotter, _send) = pending_call("penalty", false, at);
+        let key = Spotter::key(&config, lang, call("car left", true).words(lang));
+        (spotter.cache).insert(key, Arc::new(Speech::no_beep(1.0)));
+        spotter.hear(call("car left", true), at);
+        let rt = runtime.handle();
+        spotter.say(rt, &config, &mut synth, None, &mut engineer, lang);
+        // Said (with no speaker, gone at once), and the other still to say
+        assert!(spotter.saying.is_none());
+        assert_eq!(texts_of(&spotter.queue), ["penalty"]);
+    }
+
+    #[test]
+    fn an_expired_urgent_call_doesnt_go_ahead_of_one_waiting_for_the_talk_beep() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let config = runtime
+            .block_on(Config::new(dir.path().join("config.json")))
+            .unwrap();
+        let mut synth = Synthesizer::new(runtime.handle(), &config.get());
+        let mut engineer = Engineer::new(reqwest::Client::new(), None);
+        engineer.beep(true);
+        let lang = arrstr!("en");
+        let at = Instant::now();
+
+        let (mut spotter, _send) = pending_call("penalty", false, at);
+        spotter.hear(call("car left", true), at - URGENT_FOR);
+        let rt = runtime.handle();
+        spotter.say(rt, &config, &mut synth, None, &mut engineer, lang);
+        // It still waits for the beep, with its speech
+        assert!(matches!(spotter.saying, Some(Saying::Synthesizing { .. })));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::{
     config::{ArrayStr, AudioDevice, Config, RawConfig},
     engineer::{Heard, acknowledgement},
     error, language,
-    synthesizer::{Speech, Synthesizer, VoiceLoad, plays_on},
+    synthesizer::{Drain, Drained, Speech, Synthesizer, VoiceLoad, plays_on},
     task::{MaybeDone, Task},
     updating,
 };
@@ -95,11 +95,13 @@ pub struct AudioTopbar {
     pub test: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Speech>>>,
     /// The test speech's stream, kept until it's done playing (dropping it stops playback)
     test_playback: Option<AudioStreamOwner>,
-    /// The beep when the talk button is pressed, kept until the next one (dropping it stops
-    /// playback)
-    beep_playback: Option<AudioStreamOwner>,
+    /// The beep when the microphone opens or closes, kept until it's done playing (dropping it
+    /// stops playback)
+    beep_playback: Option<(AudioStreamOwner, Drain)>,
     /// What the pilot last said on the radio, being transcribed
     transcription: Option<Task<anyhow::Result<Heard>>>,
+    /// A recording was thrown away, unheard, since [`Self::take_discarded`] was last asked
+    discarded: bool,
     /// Listening to the microphone for the setup guide: `None` until it's asked for, and
     /// `Some(None)` if it couldn't
     meter: Option<Option<MicMeter>>,
@@ -145,6 +147,7 @@ impl AudioTopbar {
             test_playback: None,
             beep_playback: None,
             transcription: None,
+            discarded: false,
             meter: None,
         }
     }
@@ -170,6 +173,11 @@ impl AudioTopbar {
         }
         self.speaker.poll(Kind::Playback);
         self.whisper.poll(rt, config, &self.voices.getting());
+        if self.whisper.unwanted(config) {
+            self.whisper.cancel_recording();
+            self.discarded = true;
+            self.close_beep(config);
+        }
         self.voices.poll(rt, config, synth);
         self.play_test(config);
     }
@@ -198,9 +206,14 @@ impl AudioTopbar {
         self.test.is_some() || self.test_playback.is_some()
     }
 
-    /// Whether the microphone is open: the talk button is held.
+    /// Whether the microphone is open: the pilot is talking.
     pub fn recording(&self) -> bool {
         self.whisper.recording()
+    }
+
+    /// Whether a recording was thrown away, unheard, since this was last asked.
+    pub fn take_discarded(&mut self) -> bool {
+        std::mem::take(&mut self.discarded)
     }
 
     /// Whether what the pilot said on the radio is being transcribed.
@@ -370,8 +383,10 @@ impl AudioTopbar {
         let was_recording = self.whisper.recording();
         let microphone = self.microphone.get();
         let result = self.whisper.event(rt, &event, config, microphone);
-        if !was_recording && self.whisper.recording() {
-            self.beep(config);
+        match (was_recording, self.whisper.recording()) {
+            (false, true) => self.beep(config, Speech::talk_beep),
+            (true, false) => self.close_beep(config),
+            _ => {}
         }
 
         return match result {
@@ -386,11 +401,16 @@ impl AudioTopbar {
     }
 
     /// Stop using an unplugged microphone, including any unfinished recording.
-    pub fn microphone_removed(&mut self, which: u32) -> bool {
+    pub fn microphone_removed(&mut self, config: &Config, which: u32) -> bool {
         if !self.microphone.removed(which) {
             return false;
         }
-        self.whisper.cancel_recording();
+        if self.whisper.recording() {
+            self.whisper.cancel_recording();
+            self.discarded = true;
+            // The pilot may not see the notice, and would talk on to a microphone that's gone
+            self.close_beep(config);
+        }
         self.meter = None;
         true
     }
@@ -414,19 +434,36 @@ impl AudioTopbar {
     /// The speaker `which` is gone (unplugged): nothing plays on it any more, and if it's the one
     /// picked, nothing is played until it reconnects or another is picked. Returns whether it was.
     pub fn speaker_removed(&mut self, which: u32) -> bool {
-        for playback in [&mut self.test_playback, &mut self.beep_playback] {
-            if playback
-                .as_ref()
-                .is_some_and(|stream| plays_on(stream, which))
-            {
-                *playback = None;
-            }
-        }
+        self.test_playback.take_if(|stream| plays_on(stream, which));
+        self.beep_playback
+            .take_if(|(stream, _)| plays_on(stream, which));
         self.speaker.removed(which)
     }
 
-    /// Tells the pilot the microphone is open.
-    fn beep(&mut self, config: &Config) {
+    /// Whether the beep when the microphone opens or closes is playing.
+    pub fn beeping(&mut self) -> bool {
+        let Some((stream, drain)) = &mut self.beep_playback else {
+            return false;
+        };
+        match drain.check(stream.queued_bytes().ok(), false, Instant::now()) {
+            Drained::Playing => true,
+            Drained::Done | Drained::Stalled => {
+                self.beep_playback = None;
+                false
+            }
+        }
+    }
+
+    /// Tells the pilot the microphone closed, if they want it to. Let go of, a held button tells
+    /// them itself: it goes by how the recording was made, whatever the talk button does now.
+    fn close_beep(&mut self, config: &Config) {
+        if self.whisper.toggled() && *config.get().talk_close_beep() {
+            self.beep(config, Speech::talk_close_beep);
+        }
+    }
+
+    /// Tells the pilot the microphone opened or closed, with the `beep` made at the volume given.
+    fn beep(&mut self, config: &Config, beep: fn(f32) -> Speech) {
         let volume = {
             let config = config.get();
             config.master_volume() * config.beep_volume()
@@ -438,8 +475,8 @@ impl AudioTopbar {
         let Some(device) = self.speaker.get() else {
             return;
         };
-        match Speech::talk_beep(volume).play(device) {
-            Ok(stream) => self.beep_playback = Some(stream),
+        match beep(volume).play(device) {
+            Ok(stream) => self.beep_playback = Some((stream, Drain::new(Instant::now()))),
             Err(e) => log::warn!("Error playing the talk beep: {e}"),
         }
     }

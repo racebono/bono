@@ -24,6 +24,11 @@ impl SettingsTopbar {
         self.session_button.cancel();
     }
 
+    /// Whether a button being changed waits for a press.
+    pub fn changing_button(&self) -> bool {
+        self.talk_button.is_waiting() || self.session_button.is_waiting()
+    }
+
     /// Returns whether the setup guide was asked for.
     pub fn update(
         &mut self,
@@ -52,6 +57,7 @@ impl SettingsTopbar {
             ),
             t!("settings.press_button"),
         );
+        talk_options(ui, config);
 
         let next_session = self.session_button.update(
             rt,
@@ -133,6 +139,31 @@ impl SettingsTopbar {
     }
 }
 
+/// How the talk button works: held, or pressed to start and to stop.
+pub fn talk_options(ui: &mut egui::Ui, config: &Config) {
+    config.maybe_update(|raw| {
+        raw.talk_toggle.edit(*raw.talk_toggle(), |on| {
+            ui.checkbox(on, t!("settings.talk_toggle"))
+                .on_hover_text(t!("settings.talk_toggle_hover"))
+                .changed()
+        })
+    });
+
+    // Let go of, the button itself tells the pilot the microphone closed
+    if !*config.get().talk_toggle() {
+        return;
+    }
+    ui.indent("talk close beep", |ui| {
+        config.maybe_update(|raw| {
+            raw.talk_close_beep.edit(*raw.talk_close_beep(), |on| {
+                ui.checkbox(on, t!("settings.talk_close_beep"))
+                    .on_hover_text(t!("settings.talk_close_beep_hover"))
+                    .changed()
+            })
+        })
+    });
+}
+
 /// A button as the pilot reads it: the key, or the joystick's button.
 pub fn button_name(button: Option<ConfigButton>) -> String {
     match button {
@@ -172,6 +203,11 @@ pub struct ChangeButton {
 }
 
 impl ChangeButton {
+    /// Whether it's waiting for a press.
+    pub fn is_waiting(&self) -> bool {
+        self.waiting.is_some()
+    }
+
     /// Stops waiting for a press.
     pub fn cancel(&mut self) {
         self.waiting = None;

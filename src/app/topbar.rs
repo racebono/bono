@@ -33,7 +33,7 @@ pub(super) mod volume;
 
 pub struct Topbar {
     pub account: AccountTopbar,
-    settings: SettingsTopbar,
+    pub settings: SettingsTopbar,
     pub audio: AudioTopbar,
     volume: VolumeTopbar,
     pub provider: ProviderTopbar,
