@@ -766,8 +766,15 @@ fn languages_spoken(
         .desired_width(f32::INFINITY)
         .ui(ui);
     let search = search.trim().to_lowercase();
+    // A native name the app's font can't draw (Arabic's, Bengali's…) is shown in the app's language
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let drawn = |native: &str| ui.ctx().fonts_mut(|fonts| fonts.has_glyphs(&font, native));
     let mut rows = (langs.into_iter())
-        .map(|(lang, native)| (lang, native, language::ui_name(lang)))
+        .map(|(lang, native)| {
+            let name = language::ui_name(lang);
+            let native = if drawn(&native) { native } else { name.clone() };
+            (lang, native, name)
+        })
         .filter(|(lang, native, name)| {
             ticked.contains(lang)
                 || [native, name].iter().any(|name| name.to_lowercase().contains(&search))
@@ -776,23 +783,28 @@ fn languages_spoken(
     rows.sort_by_cached_key(|(lang, _, name)| (!ticked.contains(lang), name.clone()));
 
     let mut changed = false;
+    // Always as tall, so the guide doesn't move as the search narrows the list
     egui::ScrollArea::vertical()
         .id_salt("onboarding-languages")
         .max_height(160.0)
+        .min_scrolled_height(160.0)
+        .auto_shrink([false, false])
         .show(ui, |ui| {
             for (lang, native, name) in rows {
                 ui.horizontal(|ui| {
                     let mut on = ticked.contains(&lang);
-                    if ui.checkbox(&mut on, native).changed() {
+                    if ui.checkbox(&mut on, &native).changed() {
                         changed = true;
                         match on {
                             true => ticked.insert(lang),
                             false => ticked.remove(&lang),
                         };
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.weak(name);
-                    });
+                    if name != native {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.weak(name);
+                        });
+                    }
                 });
             }
         });
