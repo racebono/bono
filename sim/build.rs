@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const HEADERS: &[&str] = &["forecast.h", "scoring.h", "telemetry.h"];
+const HEADERS: &[&str] = &["event.h", "forecast.h", "scoring.h", "telemetry.h"];
 
 fn main() {
     let include = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../include");
