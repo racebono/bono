@@ -1067,11 +1067,15 @@ impl Scoring {
     const MAX_ROWS: i64 = 60000;
 
     fn new(ctx: &Ctx) -> anyhow::Result<Self> {
-        let conn = ctx.conn;
+        Self::load(ctx.conn, ctx.epoch, Some(ctx.vehicle))
+    }
+
+    /// The scoring of `epoch`, `vehicle`'s standings as the player's (else the is_player car's).
+    fn load(conn: &Connection, epoch: Epoch, vehicle: Option<i64>) -> anyhow::Result<Self> {
         let session = row(
             conn,
             "SELECT * FROM session WHERE id >= ? ORDER BY id DESC LIMIT 1",
-            [ctx.epoch.session_from],
+            [epoch.session_from],
         )?;
         let (yellow_sectors, sector_yellows) = match session.as_ref().and_then(|s| s.i("id")) {
             Some(id) => {
@@ -1097,7 +1101,7 @@ impl Scoring {
 
         // Walk back from the newest standings row until every car is found or the session starts:
         // the epoch's first row, or the clock going back before it in recordings without epochs
-        let first = ctx.epoch.standings_from.max(1);
+        let first = epoch.standings_from.max(1);
         let mut cars = BTreeMap::new();
         let mut hi = scalar::<i64>(conn, "SELECT MAX(id) FROM standings", [])?.unwrap_or(0);
         let (mut newer_t, mut scanned) = (None::<f64>, 0);
@@ -1132,8 +1136,8 @@ impl Scoring {
         }
 
         // ctx.vehicle is the is_player car unless `vehicle` chose another one
-        let player = cars
-            .get(&ctx.vehicle)
+        let player = vehicle
+            .and_then(|vehicle| cars.get(&vehicle))
             .or_else(|| cars.values().find(|r| r.b("is_player")))
             .cloned();
         let (event, rules) = Self::event(conn)?;
