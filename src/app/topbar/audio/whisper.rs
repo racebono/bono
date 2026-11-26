@@ -17,7 +17,6 @@ use crate::{
     error, language,
     synthesizer::phonemizer,
     task::{JoinHandle, MaybeDone, spawn, spawn_blocking},
-    updating,
 };
 use bono_i18n::t;
 use camino::Utf8Path;
@@ -253,6 +252,7 @@ impl Whisper {
     /// The button to download `engine`'s model, or how far its download is.
     fn download(&mut self, rt: &Handle, ui: &mut egui::Ui, engine: Engine) {
         let client = self.client.clone();
+        let files = self.files.clone();
         let (on_disk, progress, size) = match engine {
             Engine::Parakeet => (
                 self.parakeet.on_disk(&self.files),
@@ -261,7 +261,7 @@ impl Whisper {
             ),
             Engine::Whisper => match self.recommended(rt) {
                 Some(model) => (
-                    model.on_disk(rt),
+                    model.on_disk(rt, &files),
                     model.download().map(Download::progress),
                     model.size,
                 ),
@@ -277,7 +277,7 @@ impl Whisper {
                             }
                         }
                         // It isn't in the catalog
-                        MaybeDone::Done(Some(_)) => warning(ui, t!("onboarding.unavailable").into()),
+                        MaybeDone::Done(Some(_)) => warning(ui, t!("audio.stt_unavailable").into()),
                     }
                     return;
                 }
@@ -349,6 +349,7 @@ impl Whisper {
         let mut retry = false;
         let mut deleted_recommended = false;
         let client = self.client.clone();
+        let files = self.files.clone();
         scroll_bar_beside(ui);
         egui_extras::TableBuilder::new(ui)
             .id_salt("whisper-models")
@@ -464,7 +465,7 @@ impl Whisper {
                             }
                         });
 
-                        let on_disk = model.on_disk(rt);
+                        let on_disk = model.on_disk(rt, &files);
                         if model.deletion.pending() {
                             row.col(|ui| {
                                 ui.spinner();
@@ -504,7 +505,7 @@ impl Whisper {
             self.retry_catalog();
         }
         // Setup doesn't get it again
-        if deleted_recommended {
+        if deleted_recommended && self.setup == Some(Engine::Whisper) {
             self.setup = None;
         }
         if let Some(path) = reload {
@@ -654,8 +655,10 @@ impl Whisper {
         // While a model is deleted, a check from before may still find it: what's loaded stays
         self.parakeet.shown_on_disk(rt, &self.files);
         let files = self.files.clone();
-        let turbo_deleted = (self.recommended(rt))
-            .is_some_and(|model| model.deletion.stale(rt, files.found(&model.path)));
+        let turbo_deleted = (self.recommended(rt)).is_some_and(|model| {
+            model.on_disk(rt, &files);
+            model.deletion.pending()
+        });
         let deleting = self.parakeet.deleting() || turbo_deleted;
         let target = self.target(&config.get(), getting).filter(|_| !deleting);
         if let Some(target) = target {
@@ -681,10 +684,11 @@ impl Whisper {
         }
         let start = !self.setup_started;
         let client = self.client.clone();
+        let files = self.files.clone();
         let on_disk = match wanted {
             Engine::Parakeet => self.parakeet.on_disk(&self.files),
             Engine::Whisper => match self.recommended(rt) {
-                Some(model) => model.on_disk(rt),
+                Some(model) => model.on_disk(rt, &files),
                 None => return,
             },
         };
@@ -727,11 +731,10 @@ impl Whisper {
         }
         self.setup = engine;
         self.setup_started = false;
-        // One that couldn't be loaded is tried again
-        if self.failed()
-            && let Some(path) = self.loaded.clone()
-        {
-            self.set_model(path, self.loaded_gpu);
+        // One that couldn't be loaded is forgotten: `poll` loads what's wanted now, it too if it is
+        if self.failed() {
+            drop_in_background(self.ctx.take());
+            self.loaded = None;
         }
     }
 
@@ -768,13 +771,19 @@ impl Whisper {
                 let on_disk = self.files.checked(&path);
                 match self.catalog.update(rt) {
                     Some(Some(catalog)) => {
-                        let Some(model) = (catalog.iter_mut()).find(|model| model.file == RECOMMENDED)
-                        else {
-                            return Some(SetupItem::Unavailable);
-                        };
-                        let progress = model.download().map(Download::progress);
-                        let state = state(&path, model.on_disk(rt), progress, model.failed());
-                        (TURBO_NAME, model.size, state)
+                        match (catalog.iter_mut()).find(|model| model.file == RECOMMENDED) {
+                            Some(model) => {
+                                let progress = model.download().map(Download::progress);
+                                let on_disk = model.on_disk(rt, &self.files);
+                                let state = state(&path, on_disk, progress, model.failed());
+                                (TURBO_NAME, model.size, state)
+                            }
+                            // Not in the catalog: only what's on disk can be used
+                            None if on_disk == Some(true) => {
+                                (TURBO_NAME, None, state(&path, on_disk, None, false))
+                            }
+                            None => return Some(SetupItem::Unavailable),
+                        }
                     }
                     // It's only downloaded with the catalog's size and hash
                     _ if on_disk != Some(true) => {
@@ -835,7 +844,7 @@ impl Whisper {
             Some(path) if path == parakeet => {
                 return Some(self.parakeet.on_disk(&self.files)?.then(|| path.clone()));
             }
-            Some(path) => return Some(Some(path.clone())),
+            Some(path) => return Some(self.files.checked(path)?.then(|| path.clone())),
             None => engine::used(
                 self.wanted(config, getting).0,
                 self.parakeet.on_disk(&self.files),
@@ -1821,16 +1830,14 @@ pub struct Model {
     pub sha256: Option<String>,
     pub file: String,
     pub path: Arc<Utf8Path>,
-    /// Whether it's on disk, and when that check started
-    on_disk: tokio::sync::watch::Receiver<Option<(bool, Instant)>>,
     download: Option<Download>,
     deletion: Deletion,
 }
 
 impl Model {
     /// Whether it's on disk: `None` until it's been checked, and while it's deleted.
-    pub fn on_disk(&mut self, rt: &Handle) -> Option<bool> {
-        let found = *self.on_disk.borrow();
+    pub fn on_disk(&mut self, rt: &Handle, files: &super::ModelFiles) -> Option<bool> {
+        let found = files.found(&self.path);
         self.deletion.on_disk(rt, found)
     }
 
@@ -1960,12 +1967,7 @@ impl Model {
                 quantization: quantization.map(ToOwned::to_owned),
                 sha256: oid,
                 file,
-                path: path.clone(),
-                on_disk: updating(Duration::from_millis(1234), None, move |_| {
-                    let path = path.clone();
-                    let started = Instant::now();
-                    async move { Some((tokio::fs::try_exists(&*path).await.ok()?, started)) }
-                }),
+                path,
                 download: None,
                 deletion: Deletion::default(),
             });
@@ -2456,8 +2458,8 @@ mod tests {
 
         let small = Arc::<Utf8Path>::from(pref_path.join("whisper").join("ggml-small.bin"));
         let parakeet = whisper.parakeet.model().clone();
-        // Whisper's is loaded (and fails) as before; Parakeet isn't loaded without its files
-        for (picked, loaded) in [(small.clone(), Some(small)), (parakeet, None)] {
+        // Neither is loaded without its files
+        for (picked, loaded) in [(small, None), (parakeet, None)] {
             config.update(|raw| raw.whisper_model.set(Some(picked.clone())));
             until(|| {
                 tokio::task::block_in_place(|| whisper.poll(&rt, &config, &[]));

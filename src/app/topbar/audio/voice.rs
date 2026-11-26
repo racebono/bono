@@ -195,6 +195,14 @@ impl Voices {
     /// once it's on disk, if its language has no voice files by then.
     pub fn setup(&mut self, langs: &[ArrayStr<2>]) {
         self.retry_catalog();
+        // Those asked for before and not now (the guide went Back) stop downloading
+        if let MaybeDone::Done(Some(catalog)) = &mut self.catalog {
+            for setup in self.setup.iter().filter(|setup| !langs.contains(&setup.lang)) {
+                if let Some(voice) = find(&mut catalog.languages, setup.lang, setup.name) {
+                    voice.downloads = None;
+                }
+            }
+        }
         self.setup = (langs.iter())
             .filter_map(|lang| {
                 let (lang, name) = recommended(lang)?;
@@ -208,17 +216,18 @@ impl Voices {
             .collect();
     }
 
-    /// The languages whose voice is being set up, and is coming: not those whose download failed.
+    /// The languages whose voice is being set up, and is coming: not those whose download failed,
+    /// nor those missing from the catalog.
     pub fn getting(&self) -> Vec<ArrayStr<2>> {
-        let failed = |setup: &Setup| match &self.catalog {
+        let coming = |setup: &Setup| match &self.catalog {
             MaybeDone::Done(Some(catalog)) => (catalog.languages.iter())
                 .filter(|language| language.code == setup.lang)
                 .flat_map(|language| &language.voices)
-                .any(|voice| voice.is_named(setup.name) && voice.failed()),
-            _ => false,
+                .any(|voice| voice.is_named(setup.name) && !voice.failed()),
+            _ => true,
         };
         (self.setup.iter())
-            .filter(|setup| !failed(setup))
+            .filter(|setup| coming(setup))
             .map(|setup| setup.lang)
             .collect()
     }
@@ -283,6 +292,8 @@ impl Voices {
         let used = (picked.as_ref()).is_some_and(|picked| *picked == *voice.path);
         let state = match (on_disk, voice.progress()) {
             (Some(true), _) if used && failed => SetupState::LoadFailed,
+            // Another voice is picked, and didn't load: Retry replaces it
+            _ if failed && !in_setup => SetupState::LoadFailed,
             // On disk but not used, before the guide's Next: nothing to download, Next uses it
             (Some(true), _) if !in_setup && !used => SetupState::Ready,
             // Being loaded, or setup is about to use it
@@ -424,7 +435,7 @@ fn set_up(
     let picked = config.get().voices().get(&lang).cloned();
     // A picked voice that didn't load is replaced (or loaded again, if it's the recommended)
     let failed = synth.load(lang) == Some(VoiceLoad::Failed);
-    // It stays asked for (the guide says it's unavailable), so what Automatic wants doesn't change
+    // It stays asked for, and the guide says it's unavailable
     let Some(voice) = find(&mut catalog.languages, lang, name) else {
         return false;
     };

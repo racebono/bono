@@ -650,7 +650,8 @@ fn still_downloading(
             }
         }
         let automatic = raw.whisper_model().is_none();
-        let wanted = || audio.whisper.wanted(&raw, &audio.voices.getting()).0;
+        // With what Retry asks for, failed ones too
+        let wanted = || audio.whisper.wanted(&raw, &langs).0;
         let engine = automatic.then(|| audio.whisper.setting_up().unwrap_or_else(wanted));
         (langs, engine)
     };

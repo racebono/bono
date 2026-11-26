@@ -970,6 +970,11 @@
         "es": "Parakeet TDT 0.6B v3 de NVIDIA, CC-BY-4.0. Conversión a ONNX de istupakov.",
         "ca": "Parakeet TDT 0.6B v3 de NVIDIA, CC-BY-4.0. Conversió a ONNX d'istupakov."
     },
+    "audio.stt_unavailable": {
+        "en": "Whisper large-v3-turbo can't be found to download.",
+        "es": "No se encuentra Whisper large-v3-turbo para descargarlo.",
+        "ca": "No es troba Whisper large-v3-turbo per baixar-lo."
+    },
     "audio.stt_european": {
         "en": "25 European",
         "es": "25 europeos",

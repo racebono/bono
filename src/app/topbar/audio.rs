@@ -1160,19 +1160,6 @@ impl Deletion {
         found.map(|(on_disk, _)| on_disk)
     }
 
-    /// Whether a check that `found` (what, and when it started) may be from before the files were
-    /// deleted: while they're deleted, or it started before that ended. Unlike [`Self::on_disk`], for
-    /// another check of the same files.
-    fn stale(&mut self, rt: &Handle, found: Option<(bool, Instant)>) -> bool {
-        match &mut self.0 {
-            None => false,
-            Some(task) => match task.update(rt) {
-                None => true,
-                Some(ended) => found.is_none_or(|(_, started)| started < *ended),
-            },
-        }
-    }
-
     /// Whether it was started, and [`Self::on_disk`] doesn't know how it went yet.
     fn pending(&self) -> bool {
         self.0.is_some()
