@@ -3,6 +3,10 @@
 //! the ones the session info writes, e.g. `TrackLength: 4.0569 km`.
 
 use super::yaml::{Node, number};
+use bono_sim::{
+    sql::Event,
+    sys::{bono_event_rule, bono_event_session},
+};
 use std::collections::HashMap;
 
 #[derive(Debug, Default, Clone)]
@@ -35,6 +39,8 @@ pub struct SessionInfo {
     pub qualifying: HashMap<i64, i64>,
     /// The player's garage setup; `None` without a `CarSetup` section (the user can turn it off)
     pub setup: Option<PlayerSetup>,
+    /// The event's rules, by their Bono names, with readable values
+    pub rules: Vec<(&'static str, String)>,
 }
 
 /// The player's garage setup, from `CarSetup`: each setting by its path through the section
@@ -107,7 +113,7 @@ impl PlayerSetup {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Session {
     pub num: i64,
     /// test, practice, qualifying, warmup or race (`session.session_type`)
@@ -116,6 +122,18 @@ pub struct Session {
     pub number: i64,
     /// Each car's result so far, by car index
     pub results: HashMap<i64, Result>,
+    /// The game's name for it (`SessionName`)
+    pub name: Option<String>,
+    /// Seconds; `None` when unlimited
+    pub length_time: Option<f64>,
+    /// `None` when unlimited
+    pub length_laps: Option<i64>,
+    /// How it ends, from which lengths it has: time, laps, first_of_time_and_laps or unknown
+    pub finish: &'static str,
+    pub skipped: Option<bool>,
+    /// The game's description of the track's rubber
+    pub track_rubber: Option<String>,
+    pub compound_change_required: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -211,13 +229,69 @@ impl SessionInfo {
                     ))
                 })
                 .collect();
+            // "unlimited" isn't a number
+            let length_time = session.number("SessionTime").filter(|t| *t > 0.0);
+            let length_laps = session.int("SessionLaps").filter(|n| *n > 0);
+            let flag = |key: &str| session.int(key).map(|v| v != 0);
             info.sessions.push(Session {
                 num,
                 kind,
                 number,
                 results,
+                name: session.text("SessionName").map(str::to_owned),
+                length_time,
+                length_laps,
+                finish: match (length_time, length_laps) {
+                    (Some(_), Some(_)) => "first_of_time_and_laps",
+                    (Some(_), None) => "time",
+                    (None, Some(_)) => "laps",
+                    (None, None) => "unknown",
+                },
+                skipped: flag("SessionSkipped"),
+                track_rubber: session.text("SessionTrackRubberState").map(str::to_owned),
+                compound_change_required: flag("SessionEnforceTireCompoundChange"),
             });
         }
+
+        // The event's rules: text as the game writes it, and its 0/1 flags as no/yes. Not here
+        // because `session` already records them: `IncidentLimit`, `IsFixedSetup`, `TimeOfDay`
+        let yes_no = |text: Option<&str>| {
+            let on = text?.parse::<i64>().ok()? != 0;
+            Some(if on { "yes" } else { "no" })
+        };
+        let rules = [
+            // The field and the start
+            ("starters", o("NumStarters")),
+            ("starting_grid", o("StartingGrid")),
+            ("qualifying_scoring", o("QualifyScoring")),
+            ("cautions", o("CourseCautions")),
+            ("standing_start", yes_no(o("StandingStart"))),
+            ("short_parade_lap", yes_no(o("ShortParadeLap"))),
+            ("restarts", o("Restarts")),
+            // Laps and limits
+            ("lap_checking", o("StrictLapsChecking")),
+            ("joker_laps", o("NumJokerLaps")),
+            ("fast_repairs_limit", o("FastRepairsLimit")),
+            ("green_white_checkered_limit", o("GreenWhiteCheckeredLimit")),
+            // The weather and the date
+            ("date", o("Date")),
+            ("weather_type", o("WeatherType")),
+            ("skies", o("Skies")),
+            ("weather_temperature", o("WeatherTemp")),
+            ("wind_speed", o("WindSpeed")),
+            ("wind_direction", o("WindDirection")),
+            ("humidity", o("RelativeHumidity")),
+            ("fog", o("FogLevel")),
+            // Teams
+            ("team_racing", yes_no(w("TeamRacing"))),
+            ("min_drivers", w("MinDrivers")),
+            ("max_drivers", w("MaxDrivers")),
+            ("driver_change_rule", w("DCRuleSet")),
+        ];
+        info.rules = rules
+            .into_iter()
+            .filter_map(|(name, value)| Some((name, value?.to_owned())))
+            .collect();
 
         let drivers = doc.get("DriverInfo");
         info.player = drivers.and_then(|d| d.int("DriverCarIdx"));
@@ -330,6 +404,42 @@ impl SessionInfo {
         self.sessions.iter().find(|session| session.num == num)
     }
 
+    /// The event's sessions and rules for the recording, read at `session_time`. Each session is
+    /// typed and numbered as `session` records it.
+    pub fn event(&self, session_time: f64) -> Event {
+        let sessions = self
+            .sessions
+            .iter()
+            .map(|session| {
+                let mut row = bono_event_session::default();
+                row.session_time = Some(session_time).into();
+                row.event_order = Some(session.num).into();
+                row.session_type = session.kind.map(str::to_owned).into();
+                row.session_number = session.kind.map(|_| session.number).into();
+                row.name = session.name.clone().into();
+                row.length_time = session.length_time.into();
+                row.length_laps = session.length_laps.into();
+                row.finish = Some(session.finish.to_owned()).into();
+                row.skipped = session.skipped.into();
+                row.track_rubber = session.track_rubber.clone().into();
+                row.compound_change_required = session.compound_change_required.into();
+                row
+            })
+            .collect();
+        let rules = self
+            .rules
+            .iter()
+            .map(|(name, value)| {
+                let mut rule = bono_event_rule::default();
+                rule.session_time = Some(session_time).into();
+                rule.name = Some((*name).to_owned()).into();
+                rule.value = Some(value.clone()).into();
+                rule
+            })
+            .collect();
+        Event { sessions, rules }
+    }
+
     /// The grid a race starts from, by qualifying: each car's place overall and in its class, from
     /// 1, among the cars there are (a qualifier who's left, or watches, leaves no gap).
     pub fn grid(&self) -> HashMap<i64, (i64, i64)> {
@@ -432,10 +542,7 @@ mod tests {
         assert_eq!(session_kind("Race"), Some("race"));
     }
 
-    #[test]
-    fn reads_the_event_its_sessions_and_cars() {
-        let doc = parse(
-            "WeekendInfo:
+    const WEEKEND: &str = "WeekendInfo:
  TrackName: roadatlanta full
  TrackID: 127
  TrackLength: 4.0569 km
@@ -443,15 +550,28 @@ mod tests {
  SessionID: 5
  SubSessionID: 6
  SimMode: full
+ TeamRacing: 0
+ MinDrivers: 1
+ MaxDrivers: 1
+ DCRuleSet: None
  WeekendOptions:
   NumStarters: 20
+  StartingGrid: 2x2 inline pole on left
+  StandingStart: 1
+  ShortParadeLap: 0
+  WeatherTemp: 25.56 C
   TimeOfDay: 3:05 pm
   IsFixedSetup: 1
   IncidentLimit: 17
+  FastRepairsLimit:
 SessionInfo:
  Sessions:
  - SessionNum: 0
+   SessionLaps: unlimited
+   SessionTime: 3600.0000 sec
    SessionType: Practice
+   SessionName: PRACTICE
+   SessionSkipped: 0
    ResultsPositions:
    - Position: 1
      CarIdx: 3
@@ -460,7 +580,12 @@ SessionInfo:
  - SessionNum: 1
    SessionType: Practice
  - SessionNum: 2
+   SessionLaps: 30
+   SessionTime: 21600.0000 sec
    SessionType: Race
+   SessionName: RACE
+   SessionTrackRubberState: moderate usage
+   SessionEnforceTireCompoundChange: 1
 QualifyResultsInfo:
  Results:
  - Position: 1
@@ -494,9 +619,11 @@ SplitTimeInfo:
    SectorStartPct: 0.000000
  - SectorNum: 1
    SectorStartPct: 0.442307
-",
-        );
-        let info = SessionInfo::new(&doc);
+";
+
+    #[test]
+    fn reads_the_event_its_sessions_and_cars() {
+        let info = SessionInfo::new(&parse(WEEKEND));
         assert_eq!(info.track.as_deref(), Some("roadatlanta full"));
         assert!((info.track_length.unwrap() - 4056.9).abs() < 1e-9);
         assert_eq!(info.event, (Some(127), Some(5), Some(6)));
@@ -525,6 +652,71 @@ SplitTimeInfo:
         assert_eq!(driver.car_number.as_deref(), Some("07"));
         assert_eq!(driver.team_incidents, None);
         assert_eq!(info.sectors, [0.0, 0.442307]);
+    }
+
+    #[test]
+    fn the_event_lists_every_session_with_its_length() {
+        let event = SessionInfo::new(&parse(WEEKEND)).event(12.5);
+        assert_eq!(event.sessions.len(), 3);
+        let practice = &event.sessions[0];
+        assert_eq!(practice.session_time.get(), Some(12.5));
+        assert_eq!(practice.name.as_deref(), Some("PRACTICE"));
+        assert_eq!(practice.length_time.get(), Some(3600.0));
+        assert_eq!(practice.length_laps.get(), None);
+        assert_eq!(practice.finish.as_deref(), Some("time"));
+        assert_eq!(practice.skipped.get(), Some(false));
+        // Given neither length
+        assert_eq!(event.sessions[1].finish.as_deref(), Some("unknown"));
+        assert_eq!(event.sessions[1].skipped.get(), None);
+
+        let race = &event.sessions[2];
+        assert_eq!(race.length_time.get(), Some(21600.0));
+        assert_eq!(race.length_laps.get(), Some(30));
+        assert_eq!(race.finish.as_deref(), Some("first_of_time_and_laps"));
+        assert_eq!(race.compound_change_required.get(), Some(true));
+        assert_eq!(race.track_rubber.as_deref(), Some("moderate usage"));
+        // The time of day is the event's, which `session` records
+        assert_eq!(race.start_time_of_day.get(), None);
+    }
+
+    #[test]
+    fn event_numbers_match_the_sessions() {
+        let info = SessionInfo::new(&parse(WEEKEND));
+        let event = info.event(0.0);
+        for session in &info.sessions {
+            let row = event
+                .sessions
+                .iter()
+                .find(|row| row.event_order.get() == Some(session.num))
+                .unwrap();
+            assert_eq!(row.session_type.as_deref(), session.kind);
+            assert_eq!(row.session_number.get(), Some(session.number));
+        }
+    }
+
+    #[test]
+    fn the_event_rules_come_from_the_weekend_options() {
+        let event = SessionInfo::new(&parse(WEEKEND)).event(0.0);
+        let rule = |name: &str| {
+            let rule = event
+                .rules
+                .iter()
+                .find(|rule| rule.name.as_deref() == Some(name))?;
+            assert_eq!(rule.session_type.as_deref(), None);
+            rule.value.as_deref()
+        };
+        assert_eq!(rule("standing_start"), Some("yes"));
+        assert_eq!(rule("short_parade_lap"), Some("no"));
+        assert_eq!(rule("starting_grid"), Some("2x2 inline pole on left"));
+        assert_eq!(rule("starters"), Some("20"));
+        assert_eq!(rule("weather_temperature"), Some("25.56 C"));
+        assert_eq!(rule("team_racing"), Some("no"));
+        assert_eq!(rule("driver_change_rule"), Some("None"));
+        // Empty or missing: not recorded
+        assert_eq!(rule("fast_repairs_limit"), None);
+        assert_eq!(rule("joker_laps"), None);
+        // `session` records it
+        assert_eq!(rule("incident_limit"), None);
     }
 
     /// AI classes have no names: one goes by its car's, when it's the only model in it, and the
