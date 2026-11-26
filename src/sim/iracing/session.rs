@@ -3,7 +3,7 @@
 //! the ones the session info writes, e.g. `TrackLength: 4.0569 km`.
 
 use super::{
-    sdk::UNLIMITED_TIME,
+    sdk::{UNLIMITED_LAPS, UNLIMITED_TIME},
     yaml::{Node, number},
 };
 use bono_sim::{
@@ -236,7 +236,9 @@ impl SessionInfo {
             let length_time = session
                 .number("SessionTime")
                 .filter(|t| *t > 0.0 && *t < UNLIMITED_TIME);
-            let length_laps = session.int("SessionLaps").filter(|n| *n > 0);
+            let length_laps = session
+                .int("SessionLaps")
+                .filter(|n| *n > 0 && *n < i64::from(UNLIMITED_LAPS));
             let flag = |key: &str| session.int(key).map(|v| v != 0);
             info.sessions.push(Session {
                 num,
@@ -592,6 +594,7 @@ SessionInfo:
    SessionTrackRubberState: moderate usage
    SessionEnforceTireCompoundChange: 1
  - SessionNum: 3
+   SessionLaps: 32767
    SessionTime: 604800.0000 sec
    SessionType: Something New
 QualifyResultsInfo:
@@ -687,9 +690,10 @@ SplitTimeInfo:
         // The time of day is the event's, which `session` records
         assert_eq!(race.start_time_of_day.get(), None);
 
-        // As long as the SDK's unlimited time: no limit
+        // As long as the SDK's unlimited time and laps: no limit
         let unlimited = &event.sessions[3];
         assert_eq!(unlimited.length_time.get(), None);
+        assert_eq!(unlimited.length_laps.get(), None);
         assert_eq!(unlimited.finish.as_deref(), Some("unknown"));
     }
 
