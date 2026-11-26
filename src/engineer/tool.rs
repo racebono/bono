@@ -109,6 +109,12 @@ pub fn assemble_skill(sim: Option<&str>, has_pit: bool) -> String {
     parts.join("\n\n")
 }
 
+/// The line a question carries with the time it was asked, `now`: UTC, to the second. The model
+/// only compares these, to tell how long ago an earlier answer was given.
+pub(crate) fn asked_at(now: SystemTime) -> String {
+    format!("[Asked at {}]", humantime::format_rfc3339_seconds(now))
+}
+
 /// The tool, for one database. Cheap to clone.
 #[derive(Clone)]
 pub struct Engineer {
@@ -215,7 +221,11 @@ impl Engineer {
     }
 
     /// Attach current telemetry once, before the question enters provider history.
-    /// Use the same query and quoting as the tool; a failed read leaves the question intact.
+    /// Use the same query and quoting as the tool; a failed read leaves the question as it was,
+    /// but for the time it was asked.
+    ///
+    /// The time goes right after the question (see [`asked_at`]), in what the conversation keeps
+    /// of it: once the snapshot is dropped, it still tells how old the answer to it is.
     ///
     /// The setup's setting names come too, and what `pit` (the pit menu, in games the engineer can
     /// change it in) can take, when they aren't the ones `outline_shown` (a hash of both) says this
@@ -227,11 +237,12 @@ impl Engineer {
         outline_shown: &mut Option<u64>,
         pit: Option<&PitMenu>,
     ) -> String {
+        let asked = asked_at(SystemTime::now());
         let snapshot = match self.run(EngineerInput::command(Command::Quick)).await {
             Ok(snapshot) => snapshot,
             Err(e) => {
                 log::warn!("Error attaching the engineer's telemetry snapshot: {e:#}");
-                return question;
+                return format!("{question}\n\n{asked}");
             }
         };
         let names = match self.setup_names().await {
@@ -269,7 +280,7 @@ impl Engineer {
         }
         let pit_now = pit.map_or(String::new(), |pit| format!("\n{}", pit::current_text(pit)));
         format!(
-            "{question}{outline}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\n{snapshot}{pit_now}\n[END UNTRUSTED TELEMETRY SNAPSHOT]"
+            "{question}\n\n{asked}{outline}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\n{snapshot}{pit_now}\n[END UNTRUSTED TELEMETRY SNAPSHOT]"
         )
     }
 
@@ -3068,6 +3079,22 @@ mod tests {
     use std::num::NonZeroUsize;
 
     #[test]
+    fn asked_at_is_utc_to_the_second() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_795_716_274);
+        assert_eq!(asked_at(now), "[Asked at 2026-11-26T18:04:34Z]");
+    }
+
+    /// The time `question` says it was asked, checked to be within a few seconds of now
+    fn asked_line(question: &str) -> &str {
+        let start = question.find("\n\n[Asked at ").expect(question) + 2;
+        let line = &question[start..][..=question[start..].find(']').unwrap()];
+        let at = humantime::parse_rfc3339(&line["[Asked at ".len()..line.len() - 1]).unwrap();
+        let age = SystemTime::now().duration_since(at).unwrap_or_default();
+        assert!(age < Duration::from_secs(5), "{line}");
+        line
+    }
+
+    #[test]
     fn incident_points_are_only_mentioned_when_there_are_some() {
         assert_eq!(incident_line(None, Some(25.0)), None);
         assert_eq!(incident_line(Some(0.0), Some(25.0)), None);
@@ -3612,7 +3639,10 @@ mod tests {
         let attached = engineer
             .question_with_snapshot("Who's behind?".into(), &mut None, None)
             .await;
-        assert!(attached.starts_with("Who's behind?\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\n"));
+        let line = asked_line(&attached);
+        assert!(attached.starts_with(&format!(
+            "Who's behind?\n\n{line}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\n"
+        )));
         assert!(attached.contains(&quoted), "{attached}");
         assert!(!attached.contains(name), "{attached}");
         assert!(attached.ends_with("\n[END UNTRUSTED TELEMETRY SNAPSHOT]"));
@@ -3647,10 +3677,11 @@ mod tests {
             let attached = engineer
                 .question_with_snapshot(question.into(), &mut None, None)
                 .await;
+            let line = asked_line(&attached);
             assert_eq!(
                 attached,
                 format!(
-                    "{question}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\n{quick}\n[END UNTRUSTED TELEMETRY SNAPSHOT]"
+                    "{question}\n\n{line}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\n{quick}\n[END UNTRUSTED TELEMETRY SNAPSHOT]"
                 )
             );
         }
@@ -4045,15 +4076,20 @@ mod tests {
         let failed = engineer
             .question_with_snapshot("Gap?".into(), &mut None, None)
             .await;
-        assert_eq!(failed, "Gap?");
+        // Still with the time it was asked: an answer to it can be outdated later, too
+        let failed_at = asked_line(&failed).to_owned();
+        assert_eq!(failed, format!("Gap?\n\n{failed_at}"));
         conn.execute("ALTER TABLE unavailable RENAME TO telemetry", [])
             .unwrap();
         let recovered = engineer
             .question_with_snapshot("And now?".into(), &mut None, None)
             .await;
-        assert!(recovered.starts_with("And now?\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]"));
+        let line = asked_line(&recovered);
+        assert!(recovered.starts_with(&format!(
+            "And now?\n\n{line}\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]"
+        )));
         assert!(recovered.contains("Fischer"), "{recovered}");
-        assert_eq!(failed, "Gap?");
+        assert_eq!(failed, format!("Gap?\n\n{failed_at}"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4067,12 +4103,10 @@ mod tests {
         );
         let engineer = Engineer::new(pool);
         let question = "How are the tyres?\nPlease check.";
-        assert_eq!(
-            engineer
-                .question_with_snapshot(question.into(), &mut None, None)
-                .await,
-            question
-        );
+        let attached = engineer
+            .question_with_snapshot(question.into(), &mut None, None)
+            .await;
+        assert_eq!(attached, format!("{question}\n\n{}", asked_line(&attached)));
         // And a query says it can't be answered
         let error = engineer
             .run(

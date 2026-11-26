@@ -2745,6 +2745,21 @@ mod tests {
     }
 
     #[test]
+    fn question_message_keeps_the_asked_time() {
+        let text = "Fuel?\n\n[Asked at 2026-11-26T18:04:34Z]\n\n[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\nx\n[END UNTRUSTED TELEMETRY SNAPSHOT]";
+        let mut messages = vec![question_message(text)];
+        strip_turns(&mut messages);
+        assert_eq!(
+            messages[0].content,
+            json!([{
+                "type": "text",
+                "text": "Fuel?\n\n[Asked at 2026-11-26T18:04:34Z]",
+                "cache_control": {"type": "ephemeral"}
+            }])
+        );
+    }
+
+    #[test]
     fn no_empty_kept_block() {
         let text = "[BEGIN UNTRUSTED TELEMETRY SNAPSHOT]\nx\n[END UNTRUSTED TELEMETRY SNAPSHOT]";
         assert_eq!(

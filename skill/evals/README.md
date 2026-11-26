@@ -19,6 +19,10 @@ their stated evidence; do not run them against the existing dry database unchang
 `language.md` covers answering in the pilot's language across tool calls, earlier answers in English, ambiguous short questions and misheard words. Run it
 with `EVAL_LANG`. These are controlled manual/model scenarios, not executed results.
 
+`earlier-answers.md` covers values that change between questions (fuel, temperatures, laps left),
+answered without calling the earlier figure wrong, and genuine misreads still corrected. These are
+controlled manual/model scenarios, not executed results.
+
 `invalidated-corners.md` covers informational use of invalidated passes, clean-first improvement
 references, explicitly disclosed fallback, and missing or non-comparable evidence. These are
 controlled manual/model scenarios, not executed results.
