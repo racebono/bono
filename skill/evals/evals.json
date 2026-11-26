@@ -401,8 +401,8 @@
         "Calls `schedule` with action add and a `condition` trigger whose query returns a row only while the gap to the car one place behind in the standings (`gap_place_behind_s`, or the car `place_behind_vehicle_id` names) is under a second, not the nearest car on track (`gap_car_behind_s`)",
         "The query finds the player with `is_player = 1` or `race_state.player_vehicle_id`, never a literal `vehicle_id` number",
         "The instruction is a concise, self-contained note saying to alert the pilot when the car one place behind gets within a second, without referring back to the conversation",
-        "The reply is one short confirmation sentence that says what and when; no separate \"checking\" acknowledgement before the call",
-        "The tool reports the condition already true (the fixture's gap behind is about six tenths): the confirmation says so and that it'll call when the car drops back and closes again"
+        "Leaves `repeat` once or out (the default), so the tool adds nothing: the condition is already true (the fixture's gap behind is about six tenths)",
+        "The reply is one sentence telling the pilot now that the car behind is already within a second, with no promise of a later call; no separate \"checking\" acknowledgement before the call"
       ]
     },
     {
@@ -1031,6 +1031,19 @@
         "Says \"kilometers per hour\" (or \"kilometres per hour\"), never \"kph\", \"km/h\" or \"kmh\"",
         "Uses no symbols or abbreviations",
         "One sentence, at most 20 words excluding acknowledgement"
+      ]
+    },
+    {
+      "id": 61,
+      "prompt": "Tell me every time the car behind gets within a second.",
+      "expected_output": "Controlled synthetic fixture; scheduled request",
+      "files": [],
+      "pending": [],
+      "session": "race",
+      "assertions": [
+        "Calls `schedule` with action add, repeat `every`, and a `condition` trigger whose query returns a row only while the gap to the car one place behind in the standings (`gap_place_behind_s`, or the car `place_behind_vehicle_id` names) is under a second, finding the player with `is_player = 1` or `race_state.player_vehicle_id`, never a literal `vehicle_id` number",
+        "The tool adds it and reports the condition already true (the fixture's gap behind is about six tenths): the reply is one sentence saying so and that it'll call when the car drops back and closes again",
+        "No separate \"checking\" acknowledgement before the call"
       ]
     }
   ]

@@ -2,7 +2,7 @@
 
 Controlled manual/model scenarios, not executed results. They cover adding requests with the
 `schedule` tool, managing pending ones by talking, and the engineer's own scheduled turns,
-silent and spoken. They are evals 31 to 47 in `evals.json`, run against the synthetic race
+silent and spoken. They are evals 31 to 47 and 61 in `evals.json`, run against the synthetic race
 fixture (practice for the race-start reminder). The fixture records the player's standings gaps
 in its latest frame only, so there's a gap to the car one place behind but no gap history.
 
@@ -30,7 +30,8 @@ says nothing about these behaviours: leave these ids out of `EVAL_IDS` there.
 | Fuel at the end of every lap for the next five laps | One add: one lap, repeating, until five laps; `stale_after` keeps a lap's figure from being said after the next lap ends. Self-contained instruction. No fuel figure now. One sentence confirming what and when, with no "checking" acknowledgement first. |
 | A reminder in ten minutes | A `time` trigger of the requested length, not a clock time or lap worked out by the model. |
 | In practice: at the race start, remind me of something | A `session` trigger for the race. The instruction says it was asked in practice. |
-| Tell me if the car behind gets within a second | A condition on the car one place behind in the standings, not the nearest car on track, returning a row only while it holds and finding the player with `is_player = 1` or `race_state.player_vehicle_id`. The tool says it's already true, so the confirmation says so and that the call comes when it next happens. |
+| Tell me if the car behind gets within a second | A condition on the car one place behind in the standings, not the nearest car on track, returning a row only while it holds and finding the player with `is_player = 1` or `race_state.player_vehicle_id`. Answered once, and already true, so the tool adds nothing: the reply tells the pilot now that the car behind is within a second, without promising a later call. |
+| Tell me every time the car behind gets within a second | The same condition, repeating. The tool adds it and says it's already true, so the confirmation says so and that the call comes when it next happens. |
 | Tell me when a tyre drops below a level | A condition over a table without `is_player`, so the player comes from `race_state.player_vehicle_id` or a join; no literal vehicle id. |
 | A rival's gap every lap until I pit | A lap trigger with an `until` condition on the player's pit lane; the rival named in the instruction, not by id. |
 
