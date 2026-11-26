@@ -106,7 +106,8 @@ impl ScheduleTool {
                     "add, replace: when it fires. time and laps count from now (and, when it \
                      repeats, from its last firing); session fires when the next session starts; \
                      condition fires when its query starts returning a row (one already true \
-                     waits until it turns false and true again)."
+                     isn't added if it's answered once, and otherwise waits until it turns false \
+                     and true again)."
                 ),
                 "repeat": {
                     "type": "string",
@@ -199,6 +200,22 @@ impl ScheduleTool {
         };
         // Outside the lock: the data thread may take a while
         let notes = self.check_conditions(&mut new).await?;
+        // A one-time request whose trigger already holds is answered by now: what the pilot asked
+        // to hear is already the case, and it may never turn false and true again to fire
+        if new.repeat == Repeat::Once && new.checked.trigger == Some(true) {
+            const ANSWER: &str = "Tell them that now in one sentence, from the telemetry; they \
+                                  can ask again for the next time.";
+            return Ok(match replacing {
+                Some(id) => format!(
+                    "Nothing was changed, so {id} stays as it was: what the pilot asked to be \
+                     told about is already the case. {ANSWER}"
+                ),
+                None => format!(
+                    "Nothing was added: what the pilot asked to be told about is already the \
+                     case. {ANSWER}"
+                ),
+            });
+        }
         let summary = summary(&new);
         let kept = kept(&new);
         let id = self.stage(turn, |staging| match replacing {
@@ -803,8 +820,19 @@ mod tests {
         // One that's false now is just added
         let reply = call(&tool, add(condition(FALSE))).await.unwrap();
         assert!(!reply.contains("already true"), "{reply}");
-        // One that's true now waits for it to turn false and true again, and the reply says so
+        // One answered once that's true now isn't added: the model answers it now
         let reply = call(&tool, add(condition(TRUE))).await.unwrap();
+        assert_eq!(
+            reply,
+            "Nothing was added: what the pilot asked to be told about is already the case. Tell \
+             them that now in one sentence, from the telemetry; they can ask again for the next \
+             time."
+        );
+        // One that repeats waits for it to turn false and true again, and the reply says so
+        let mut every = add(condition(TRUE));
+        every["repeat"] = json!("every");
+        let reply = call(&tool, every).await.unwrap();
+        assert!(reply.contains("Added #2"), "{reply}");
         assert!(reply.contains("already true"), "{reply}");
         let mut stale = add(laps(1));
         stale["stale_after"] = condition(TRUE);
@@ -817,7 +845,15 @@ mod tests {
         let mut replace = add(condition(BROKEN));
         replace["action"] = json!("replace");
         replace["id"] = json!("#1");
-        call(&tool, replace).await.unwrap_err();
+        call(&tool, replace.clone()).await.unwrap_err();
+        assert!(tool.take().is_empty());
+        // And one answered once that's true now leaves the request as it was
+        replace["trigger"] = condition(TRUE);
+        let reply = call(&tool, replace).await.unwrap();
+        assert!(
+            reply.starts_with("Nothing was changed, so #1 stays as it was"),
+            "{reply}"
+        );
         assert!(tool.take().is_empty());
     }
 
