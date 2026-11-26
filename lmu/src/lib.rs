@@ -5,8 +5,8 @@
 
 use bono_sim::{
     recorder::{self, Recorder, WebRead, WebSource},
-    sql::EpochReason,
-    sys::{bono_session_info, bono_standing, bono_telemetry},
+    sql::{EpochReason, Event},
+    sys::{bono_forecast_point, bono_session_info, bono_standing, bono_telemetry},
 };
 use std::{
     ffi::OsString,
@@ -20,6 +20,7 @@ use std::{
 mod car_numbers;
 mod class_positions;
 mod condition;
+mod event;
 mod forecast;
 mod garage;
 mod lap_validity;
@@ -40,17 +41,29 @@ pub struct LmuRecorder(
 );
 
 /// What the recorder's writer thread reads from the web API now and then. Closing the recorder waits
-/// for the writer on the game's thread, so a hung web API can hold the game's exit for both requests'
-/// timeouts, 6 s at most. They need the writer's own thread as nothing else should wait on them, and
-/// the wait only happens if the API stops answering just as the game closes.
+/// for the writer on the game's thread, so a hung web API can hold the game's exit for every
+/// request's timeouts: the car numbers, the forecast and the event's two requests, about 3 s each,
+/// 12 s at most. They need the writer's own thread as nothing else should wait on them, and the wait
+/// only happens if the API stops answering just as the game closes.
 fn web_api(numbers: Arc<CarNumbers>) -> WebSource {
     Box::new(move |session_time| {
         numbers.refresh();
-        WebRead {
-            forecast: forecast::fetch(session_time),
-            event: None,
-        }
+        read_web(
+            || forecast::fetch(session_time),
+            || event::fetch(session_time),
+        )
     })
+}
+
+/// The forecast, and the event only if the forecast answered, so an API that doesn't answer costs
+/// no more than the forecast's timeouts.
+fn read_web(
+    forecast: impl FnOnce() -> Option<Vec<bono_forecast_point>>,
+    event: impl FnOnce() -> Option<Event>,
+) -> WebRead {
+    let forecast = forecast();
+    let event = if forecast.is_some() { event() } else { None };
+    WebRead { forecast, event }
 }
 
 /// A client for LMU's local web API. It's on this PC: anything slow means it isn't answering, so
@@ -257,4 +270,23 @@ unsafe fn path(dir: *const u16, len: usize) -> PathBuf {
 /// A panic can't unwind into the game (it would abort it): it's caught, and `fallback` returned.
 fn guard<T>(fallback: T, f: impl FnOnce() -> T) -> T {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(fallback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetch_failing_keeps_the_forecast() {
+        let read = read_web(|| Some(vec![bono_forecast_point::default()]), || None);
+        assert_eq!(read.forecast.map(|forecast| forecast.len()), Some(1));
+        assert!(read.event.is_none());
+    }
+
+    #[test]
+    fn a_silent_api_isnt_asked_for_the_event() {
+        let read = read_web(|| None, || panic!("asked for the event"));
+        assert!(read.forecast.is_none());
+        assert!(read.event.is_none());
+    }
 }
